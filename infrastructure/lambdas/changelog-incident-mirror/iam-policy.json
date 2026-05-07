@@ -4,7 +4,10 @@
     {
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::alpha-engine-research/changelog/incidents/*"
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/changelog/entries/*",
+        "arn:aws:s3:::alpha-engine-research/changelog/incidents/*"
+      ]
     }
   ]
 }
