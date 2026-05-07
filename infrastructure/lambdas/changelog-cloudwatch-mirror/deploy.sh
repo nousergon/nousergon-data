@@ -205,22 +205,42 @@ if $BOOTSTRAP || $WIRE_SUBS; then
     # StatementId per source — idempotent only if removed-then-added; ignore
     # ResourceConflictException on re-runs.
     PERM_SID="cwlogs-invoke-${fn}"
-    run aws lambda add-permission \
+    PERM_OUT=$(aws lambda add-permission \
       --function-name "${FUNCTION_NAME}" \
       --statement-id "${PERM_SID}" \
       --action lambda:InvokeFunction \
       --principal "logs.${REGION}.amazonaws.com" \
       --source-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP}:*" \
-      --region "${REGION}" 2>/dev/null || true
+      --region "${REGION}" 2>&1) || true
 
-    # Subscription filter — idempotent, AWS overwrites by name.
+    # IAM/Lambda permission propagation is eventually consistent —
+    # put-subscription-filter validates the resource policy and fails
+    # fast if it hasn't replicated yet. Sleep only when we just added a
+    # NEW permission (not on idempotent re-runs).
+    if echo "${PERM_OUT}" | grep -q '"Statement"'; then
+      if ! $DRY_RUN; then
+        sleep 5
+      fi
+    fi
+
+    # Subscription filter — idempotent, AWS overwrites by name. Retry once
+    # on InvalidParameterException to ride out residual IAM propagation lag.
     echo "  → ${fn}"
-    run aws logs put-subscription-filter \
+    if ! run aws logs put-subscription-filter \
       --log-group-name "${LOG_GROUP}" \
       --filter-name "${SUBSCRIPTION_FILTER_NAME}" \
       --filter-pattern "${FILTER_PATTERN}" \
       --destination-arn "${RELAY_ARN}" \
-      --region "${REGION}"
+      --region "${REGION}" 2>&1; then
+      echo "    (retrying after 10s — IAM propagation)"
+      if ! $DRY_RUN; then sleep 10; fi
+      run aws logs put-subscription-filter \
+        --log-group-name "${LOG_GROUP}" \
+        --filter-name "${SUBSCRIPTION_FILTER_NAME}" \
+        --filter-pattern "${FILTER_PATTERN}" \
+        --destination-arn "${RELAY_ARN}" \
+        --region "${REGION}"
+    fi
   done
   echo "✓ Subscription filters applied."
 fi
