@@ -1,21 +1,17 @@
 """SNS-to-S3 mirror for the system-wide changelog.
 
 Subscribed to arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts.
-For every SNS message, writes TWO JSON entries:
+For every SNS message, writes one structured incident entry to:
 
-1. Legacy event-typed prefix (preserved for the back-compat window per
-   the CLAUDE.md S3 contract — "write to BOTH old and new paths for at
-   least 1 week before removing the old path"). Aggregator still reads
-   this path until PR 4 of the schema-discipline arc.
+  s3://alpha-engine-research/changelog/entries/{YYYY-MM-DD}/{event_id}.json
 
-     s3://alpha-engine-research/changelog/incidents/{YYYY}/{MM}/
-     {DD}T{HH-MM-SS}_{topic}_{hash7}.json
+Schema 1.0.0 per alpha-engine-config/changelog/vocab.yaml. Carries the
+controlled-vocab fields required by the schema-discipline arc.
 
-2. Structured corpus (source-of-truth going forward, schema 1.0.0 per
-   alpha-engine-config/changelog/vocab.yaml). Carries the controlled-
-   vocab fields required by the schema-discipline arc.
-
-     s3://alpha-engine-research/changelog/entries/{YYYY-MM-DD}/{event_id}.json
+Legacy dual-write to changelog/incidents/{YYYY}/{MM}/{DD}T... retired
+2026-05-07 after the 1-week back-compat bake (per CLAUDE.md S3
+contract). Historical changelog/incidents/ objects remain in S3 for
+retroactive queries.
 
 This is the "incident" half of the system-wide event-mining changelog
 (deploys are written by the alpha-engine-docs append-changelog
@@ -51,7 +47,6 @@ import boto3
 
 _S3 = boto3.client("s3")
 _BUCKET = os.environ["CHANGELOG_BUCKET"]
-_LEGACY_PREFIX = os.environ.get("CHANGELOG_PREFIX", "changelog/incidents")
 _STRUCTURED_PREFIX = os.environ.get("CHANGELOG_STRUCTURED_PREFIX", "changelog/entries")
 
 SCHEMA_VERSION = "1.0.0"
@@ -83,32 +78,14 @@ def handler(event, context):
             ts = datetime.now(timezone.utc)
 
         ts_utc = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        ts_key = ts.strftime("%Y/%m/%dT%H-%M-%S")
         entry_date = ts.strftime("%Y-%m-%d")
 
         topic_name = topic_arn.split(":")[-1] if topic_arn else "sns"
         summary_src = subject or (message.splitlines()[0] if message else "(empty)")
         summary = summary_src[:240]
 
-        hash_id = sha1(message_id.encode()).hexdigest()[:7] if message_id else "0000000"
-
-        # Legacy entry — preserved verbatim from pre-schema-discipline.
-        legacy_entry = {
-            "ts_utc": ts_utc,
-            "event_type": "incident",
-            "source": topic_name,
-            "subject": subject,
-            "summary": summary,
-            "details": message,
-            "sns_message_id": message_id,
-            "topic_arn": topic_arn,
-        }
-        legacy_key = f"{_LEGACY_PREFIX}/{ts_key}_{topic_name}_{hash_id}.json"
-        _put(legacy_key, legacy_entry)
-
         # Structured entry — schema 1.0.0 for downstream mining.
-        # event_id matches the changelog-log CLI scheme so legacy +
-        # structured entries are joinable on (ts + actor + summary).
+        # event_id matches the changelog-log CLI scheme.
         ts_id = ts_utc.replace(":", "-").rstrip("Z")
         digest_input = f"{ts_utc}|{topic_name}|{summary}".encode()
         event_hash = sha1(digest_input).hexdigest()[:7]
@@ -149,8 +126,7 @@ def handler(event, context):
         _put(structured_key, structured_entry)
 
         print(
-            f"Wrote legacy=s3://{_BUCKET}/{legacy_key} "
-            f"structured=s3://{_BUCKET}/{structured_key} "
+            f"Wrote structured=s3://{_BUCKET}/{structured_key} "
             f"subject={subject[:80]!r}"
         )
         wrote += 1

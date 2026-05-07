@@ -1,21 +1,22 @@
 # `changelog-incident-mirror` Lambda
 
 Subscribed to `arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts`.
-For every SNS message, **dual-writes** two JSON entries (PR 2 of the
-schema-discipline arc, 2026-05-01 evening):
+For every SNS message, writes one structured incident entry to:
 
-1. **Structured corpus** (source-of-truth going forward, schema 1.0.0):
-   `s3://alpha-engine-research/changelog/entries/{YYYY-MM-DD}/{event_id}.json`
-2. **Legacy event-typed prefix** (back-compat window per CLAUDE.md S3 contract):
-   `s3://alpha-engine-research/changelog/incidents/{YYYY}/{MM}/{DD}T{HH-MM-SS}_{topic}_{hash7}.json`
+  `s3://alpha-engine-research/changelog/entries/{YYYY-MM-DD}/{event_id}.json`
 
-The structured entry carries controlled-vocab fields
-(`severity=high`, `subsystem=infrastructure`, `root_cause_category=infrastructure_failure`,
-`auto_emitted=true`) chosen as sensible defaults — most SNS-mirrored
-alerts are SF/Lambda failures. Operator can refine via a follow-up
-`changelog-log --event-type investigation` entry. Aggregator switches
-to reading `entries/` exclusively in PR 4 of the arc; legacy emits
-stop in PR 5.
+Schema 1.0.0 per `alpha-engine-config/changelog/vocab.yaml`. Carries
+controlled-vocab fields (`severity=high`, `subsystem=infrastructure`,
+`root_cause_category=infrastructure_failure`, `auto_emitted=true`)
+chosen as sensible defaults — most SNS-mirrored alerts are SF/Lambda
+failures. Operator can refine via a follow-up
+`changelog-log --event-type investigation` entry whose `git_refs`
+reference the original `event_id`.
+
+Legacy dual-write to `changelog/incidents/{YYYY}/{MM}/{DD}T...` retired
+2026-05-07 after the 1-week back-compat bake (per CLAUDE.md S3
+contract). Historical objects under that prefix remain in S3 for
+retroactive queries.
 
 ## Why this lives outside CloudFormation
 
@@ -131,7 +132,7 @@ aws sns publish \
   --subject "Smoke test" --message "Verify mirror works"
 
 # Check the entry landed
-aws s3 ls s3://alpha-engine-research/changelog/incidents/$(date -u +%Y/%m/%d)/ --recursive | tail
+aws s3 ls s3://alpha-engine-research/changelog/entries/$(date -u +%Y-%m-%d)/ --recursive | tail
 ```
 
 ### Retire (end-of-life)

@@ -110,6 +110,6 @@ if [[ "${SMOKE_ARG}" == "--smoke" ]]; then
     --subject "deploy.sh smoke test ${TS}" \
     --message "Verifying changelog-incident-mirror after deploy ${TS}" \
     --query 'MessageId' --output text >/dev/null
-  echo "  → Published. Entry should land in s3://alpha-engine-research/changelog/incidents/ within ~3s."
-  echo "  → Check with: aws s3 ls s3://alpha-engine-research/changelog/incidents/$(date -u +%Y/%m/%d)/ --recursive | tail"
+  echo "  → Published. Entry should land in s3://alpha-engine-research/changelog/entries/ within ~3s."
+  echo "  → Check with: aws s3 ls s3://alpha-engine-research/changelog/entries/$(date -u +%Y-%m-%d)/ --recursive | tail"
 fi

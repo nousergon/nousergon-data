@@ -1,8 +1,8 @@
 """Smoke tests for the SNS-mirror Lambda handler.
 
 Mocks boto3.client('s3').put_object so the handler runs end-to-end
-without needing AWS creds. Verifies both the legacy + structured
-entries are emitted with correct keys + payloads.
+without needing AWS creds. Verifies the structured entry is emitted
+with correct key + payload.
 
 Run from the repo root:
 
@@ -62,20 +62,14 @@ class HandlerTests(unittest.TestCase):
     def setUp(self):
         self.index, self.s3 = _import_handler()
 
-    def test_writes_two_entries_per_message(self):
+    def test_writes_one_structured_entry_per_message(self):
         result = self.index.handler(_sample_event(), context=None)
         self.assertEqual(result["wrote"], 1)
-        self.assertEqual(self.s3.put_object.call_count, 2)
-
-    def test_legacy_entry_payload(self):
-        self.index.handler(_sample_event(), context=None)
-        calls = self.s3.put_object.call_args_list
-        legacy_call = next(c for c in calls if "incidents/" in c.kwargs["Key"])
-        body = json.loads(legacy_call.kwargs["Body"].decode())
-        self.assertEqual(body["event_type"], "incident")
-        self.assertEqual(body["source"], "alpha-engine-alerts")
-        self.assertIn("DeployDriftCheck", body["details"])
-        self.assertIn("Step Function failure", body["subject"])
+        self.assertEqual(self.s3.put_object.call_count, 1)
+        # Single put lands under the structured prefix; legacy
+        # changelog/incidents/ writes retired 2026-05-07.
+        key = self.s3.put_object.call_args_list[0].kwargs["Key"]
+        self.assertTrue(key.startswith("changelog/entries/"))
 
     def test_structured_entry_payload(self):
         self.index.handler(_sample_event(), context=None)
