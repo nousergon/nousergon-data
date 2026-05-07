@@ -407,6 +407,25 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
+  EvaluatorHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-evaluator-no-heartbeat
+      AlarmDescription: Evaluator did not emit heartbeat (expected weekly — split from Backtester 2026-05-07)
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: evaluator
+      Statistic: Sum
+      Period: 604800
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
   RAGIngestionHeartbeat:
     Type: AWS::CloudWatch::Alarm
     Properties:

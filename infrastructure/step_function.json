@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. DataPhase1 and RAGIngestion are independent SF states (split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy). Each runs on its own spot — accepts +1 bootstrap cycle (~7 min) in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Backtester runs AFTER predictor training (depends on model weights). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. DataPhase1 and RAGIngestion are independent SF states (split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). Each runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
   "StartAt": "InitializeInput",
   "States": {
 
@@ -503,7 +503,7 @@
 
     "CheckSkipBacktester": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses the backtester step (which runs backtest + parity + evaluator as consolidated spot stages post-2026-04-24) and jumps to the eval-judge skip-gate (preserving the eval-pipeline states downstream — the bug fixed 2026-05-03 was that this routed directly to SaturdayHealthCheck, silently bypassing CheckSkipEvalJudge → ComputeEvalCadence → eval-judge → eval-rolling-mean for any operator who passed skip_backtester=true). The legacy {\"skip_evaluator\": true} and {\"freeze_evaluator\": true} inputs are no longer honored; freeze-evaluator is now a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses BOTH the Backtester state (backtest + parity) and the Evaluator state (evaluate.py) — they were split into independent SF states 2026-05-07 (plan: alpha-engine-docs/private/evaluator-split-260507.md), but skipping the backtester implicitly skips the evaluator since evaluate.py reads same-cohort backtest artifacts. Routes to CheckSkipEvalJudge (preserving the LLM-judge eval-pipeline states downstream — the bug fixed 2026-05-03 was that this routed directly to SaturdayHealthCheck, silently bypassing CheckSkipEvalJudge → ComputeEvalCadence → eval-judge → eval-rolling-mean for any operator who passed skip_backtester=true). To skip ONLY the evaluator (keep backtest+parity), use {\"skip_evaluator\": true}. The legacy {\"freeze_evaluator\": true} input is no longer honored; freeze-evaluator is now a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
       "Choices": [
         {
           "And": [
@@ -518,7 +518,7 @@
 
     "Backtester": {
       "Type": "Task",
-      "Comment": "Consolidated backtest + parity + evaluator on spot instance (after predictor training). Post-2026-04-24 spot_backtest.sh runs all three stages in sequence; the previous dedicated Evaluator SF state was retired. Evaluator runs in live-apply mode by default (no --freeze-evaluator flag passed); for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
+      "Comment": "Backtest + parity on spot instance (after predictor training). Post-2026-05-07 the evaluator stage was split into a separate Evaluator SF state for failure isolation + per-stage email + independent heartbeat (plan: alpha-engine-docs/private/evaluator-split-260507.md). spot_backtest.sh is invoked with --skip-stages=evaluator so this state runs only backtest + parity; the Evaluator state runs evaluate.py against the same backtest/{date}/ S3 prefix. If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -530,7 +530,7 @@
             "cd /home/ec2-user/alpha-engine-backtester",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "bash infrastructure/spot_backtest.sh 2>&1 | tee /var/log/backtester.log"
+            "bash infrastructure/spot_backtest.sh --skip-stages=evaluator 2>&1 | tee /var/log/backtester.log"
           ],
           "executionTimeout": ["7200"]
         },
@@ -590,7 +590,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipEvalJudge"
+          "Next": "CheckSkipEvaluator"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -610,6 +610,117 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+
+    "CheckSkipEvaluator": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_evaluator\": true} bypasses ONLY the Evaluator state (evaluate.py against today's backtest+parity artifacts) and routes to CheckSkipEvalJudge so the LLM-judge eval-pipeline downstream still fires. Use this when iterating on evaluator code mid-week without re-running the 121-min backtest. To skip the entire backtester+evaluator pair, use {\"skip_backtester\": true} on CheckSkipBacktester instead.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_evaluator", "IsPresent": true},
+            {"Variable": "$.skip_evaluator", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipEvalJudge"
+        }
+      ],
+      "Default": "Evaluator"
+    },
+
+    "Evaluator": {
+      "Type": "Task",
+      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-backtester",
+            "export HOME=/home/ec2-user",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity 2>&1 | tee /var/log/evaluator.log"
+          ],
+          "executionTimeout": ["3600"]
+        },
+        "TimeoutSeconds": 3600
+      },
+      "TimeoutSeconds": 3660,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 180,
+          "BackoffRate": 2.0,
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture for symmetry."
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.evaluator_result",
+      "Next": "WaitForEvaluator"
+    },
+
+    "WaitForEvaluator": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until evaluator complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.evaluator_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.evaluator_poll",
+      "Next": "CheckEvaluatorStatus"
+    },
+
+    "CheckEvaluatorStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.evaluator_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipEvalJudge"
+        },
+        {
+          "Variable": "$.evaluator_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "EvaluatorWait"
+        },
+        {
+          "Variable": "$.evaluator_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "EvaluatorWait"
+        }
+      ],
+      "Default": "ExtractEvaluatorError"
+    },
+
+    "EvaluatorWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "WaitForEvaluator"
     },
 
     "CheckSkipEvalJudge": {
@@ -1076,6 +1187,18 @@
         "phase": "Backtester",
         "source": "CheckBacktesterStatus.Default",
         "poll.$": "$.backtester_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractEvaluatorError": {
+      "Type": "Pass",
+      "Comment": "Normalize Evaluator SSM non-Success poll into $.error.",
+      "Parameters": {
+        "phase": "Evaluator",
+        "source": "CheckEvaluatorStatus.Default",
+        "poll.$": "$.evaluator_poll"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
