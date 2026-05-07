@@ -5,7 +5,10 @@
       "Sid": "WriteStructuredChangelogEntries",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::alpha-engine-research/changelog/entries/*"
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/changelog/entries/*",
+        "arn:aws:s3:::alpha-engine-research/changelog/quarantine/*"
+      ]
     },
     {
       "Sid": "WriteOwnLambdaLogs",

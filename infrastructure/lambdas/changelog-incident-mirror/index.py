@@ -45,11 +45,16 @@ from hashlib import sha1
 
 import boto3
 
+# Vendored at deploy time (deploy.sh copies _shared/vocab.py alongside
+# index.py so the import works in the Lambda runtime).
+import vocab as _vocab
+
 _S3 = boto3.client("s3")
 _BUCKET = os.environ["CHANGELOG_BUCKET"]
 _STRUCTURED_PREFIX = os.environ.get("CHANGELOG_STRUCTURED_PREFIX", "changelog/entries")
+_QUARANTINE_PREFIX = os.environ.get("CHANGELOG_QUARANTINE_PREFIX", "changelog/quarantine")
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = _vocab.SCHEMA_VERSION
 
 
 def _put(key: str, body: dict) -> None:
@@ -122,13 +127,25 @@ def handler(event, context):
                 "message_id": message_id,
             },
         }
-        structured_key = f"{_STRUCTURED_PREFIX}/{entry_date}/{event_id}.json"
-        _put(structured_key, structured_entry)
-
-        print(
-            f"Wrote structured=s3://{_BUCKET}/{structured_key} "
-            f"subject={subject[:80]!r}"
-        )
+        # Validate against the vendored vocab. Failed entries land in the
+        # quarantine prefix with a `validation_errors` field for operator
+        # triage; the corpus + retro-mining filter only see entries/.
+        validation_errors = _vocab.validate_entry(structured_entry)
+        if validation_errors:
+            structured_entry["validation_errors"] = validation_errors
+            quarantine_key = f"{_QUARANTINE_PREFIX}/{entry_date}/{event_id}.json"
+            _put(quarantine_key, structured_entry)
+            print(
+                f"QUARANTINED s3://{_BUCKET}/{quarantine_key} "
+                f"subject={subject[:80]!r} errors={validation_errors}"
+            )
+        else:
+            structured_key = f"{_STRUCTURED_PREFIX}/{entry_date}/{event_id}.json"
+            _put(structured_key, structured_entry)
+            print(
+                f"Wrote structured=s3://{_BUCKET}/{structured_key} "
+                f"subject={subject[:80]!r}"
+            )
         wrote += 1
 
     return {"statusCode": 200, "wrote": wrote}

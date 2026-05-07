@@ -54,14 +54,15 @@ fi
 # Ensure the live Lambda env has the new structured-prefix var. Idempotent —
 # overwrites in place, so re-running with no diff is harmless. Skipped on
 # --dry-run.
-ENV_PAYLOAD='Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_PREFIX=changelog/incidents,CHANGELOG_STRUCTURED_PREFIX=changelog/entries}'
+ENV_PAYLOAD='Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_PREFIX=changelog/incidents,CHANGELOG_STRUCTURED_PREFIX=changelog/entries,CHANGELOG_QUARANTINE_PREFIX=changelog/quarantine}'
 
-# Package the handler into a zip in /tmp.
+# Package the handler + vendored vocab into a zip in /tmp.
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../_shared/vocab.py" "${PKG}/vocab.py"
 ZIP="${PKG}/function.zip"
-(cd "${PKG}" && zip -q "function.zip" index.py)
+(cd "${PKG}" && zip -q "function.zip" index.py vocab.py)
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 if $DRY_RUN; then

@@ -120,12 +120,13 @@ if $BOOTSTRAP; then
     sleep 10
   fi
 
-  # 1d. Package + create function
+  # 1d. Package handler + vendored vocab + create function
   PKG=$(mktemp -d)
   trap "rm -rf '$PKG'" EXIT
   cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+  cp "${SCRIPT_DIR}/../_shared/vocab.py" "${PKG}/vocab.py"
   ZIP="${PKG}/function.zip"
-  (cd "${PKG}" && zip -q "function.zip" index.py)
+  (cd "${PKG}" && zip -q "function.zip" index.py vocab.py)
   echo "  Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -139,7 +140,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 30 \
       --memory-size 128 \
-      --environment 'Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_STRUCTURED_PREFIX=changelog/entries}' \
+      --environment 'Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_STRUCTURED_PREFIX=changelog/entries,CHANGELOG_QUARANTINE_PREFIX=changelog/quarantine}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   fi
@@ -151,8 +152,9 @@ if ! $BOOTSTRAP; then
   PKG=$(mktemp -d)
   trap "rm -rf '$PKG'" EXIT
   cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+  cp "${SCRIPT_DIR}/../_shared/vocab.py" "${PKG}/vocab.py"
   ZIP="${PKG}/function.zip"
-  (cd "${PKG}" && zip -q "function.zip" index.py)
+  (cd "${PKG}" && zip -q "function.zip" index.py vocab.py)
   echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
   echo "Updating Lambda function code: ${FUNCTION_NAME}"
@@ -171,7 +173,7 @@ if ! $BOOTSTRAP; then
   echo "Ensuring env config..."
   run aws lambda update-function-configuration \
     --function-name "${FUNCTION_NAME}" \
-    --environment 'Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_STRUCTURED_PREFIX=changelog/entries}' \
+    --environment 'Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_STRUCTURED_PREFIX=changelog/entries,CHANGELOG_QUARANTINE_PREFIX=changelog/quarantine}' \
     --region "${REGION}" \
     --query 'LastUpdateStatus' --output text
 
