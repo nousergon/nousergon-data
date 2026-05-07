@@ -24,9 +24,14 @@ HERE = Path(__file__).resolve().parent
 
 
 def _import_handler():
-    """Import index.py with boto3.client + env vars stubbed."""
+    """Import index.py with boto3.client + env vars stubbed.
+
+    Also inserts ../_shared on sys.path so ``import vocab`` (vendored at
+    deploy time alongside index.py) resolves locally during tests.
+    """
     os.environ.setdefault("CHANGELOG_BUCKET", "test-bucket")
     sys.path.insert(0, str(HERE))
+    sys.path.insert(0, str(HERE.parent / "_shared"))
 
     fake_boto3 = MagicMock()
     fake_s3_client = MagicMock()
@@ -35,6 +40,8 @@ def _import_handler():
     sys.modules["boto3"] = fake_boto3
     if "index" in sys.modules:
         del sys.modules["index"]
+    if "vocab" in sys.modules:
+        del sys.modules["vocab"]
     import index
     return index, fake_s3_client
 
@@ -216,6 +223,68 @@ class HandlerTests(unittest.TestCase):
         # ts_utc format still valid
         import re
         self.assertRegex(body["ts_utc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+class QuarantineTests(unittest.TestCase):
+    """Validation + quarantine path (ROADMAP P0 sub-item 3)."""
+
+    def setUp(self):
+        self.index, self.s3 = _import_handler()
+
+    def test_default_emit_is_valid_and_lands_in_entries(self):
+        """The Lambda's default emit shape passes vocab validation —
+        canonical-path entries land under entries/, not quarantine/."""
+        self.index.handler(_encode_subscription_event(_sample_payload()), context=None)
+        keys = [c.kwargs["Key"] for c in self.s3.put_object.call_args_list]
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("changelog/entries/"))
+
+    def test_quarantine_path_used_when_vocab_invalid(self):
+        """Forced vocab violation → entry routed to quarantine/."""
+        original_validate = self.index._vocab.validate_entry
+        try:
+            self.index._vocab.validate_entry = lambda e: ["forced-failure-for-test"]
+            self.index.handler(_encode_subscription_event(_sample_payload()), context=None)
+        finally:
+            self.index._vocab.validate_entry = original_validate
+
+        keys = [c.kwargs["Key"] for c in self.s3.put_object.call_args_list]
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("changelog/quarantine/"))
+
+    def test_quarantine_entry_carries_validation_errors_field(self):
+        original_validate = self.index._vocab.validate_entry
+        try:
+            self.index._vocab.validate_entry = lambda e: ["err-a", "err-b"]
+            self.index.handler(_encode_subscription_event(_sample_payload()), context=None)
+        finally:
+            self.index._vocab.validate_entry = original_validate
+
+        body = json.loads(self.s3.put_object.call_args_list[0].kwargs["Body"].decode())
+        self.assertEqual(body["validation_errors"], ["err-a", "err-b"])
+
+    def test_per_logevent_validation_independent(self):
+        """When a payload carries multiple logEvents, validation runs
+        per-event — valid entries to entries/, invalid to quarantine/."""
+        # Validator returns errors only when summary contains "FAIL"
+        def selective_validator(e):
+            return ["bad summary"] if "FAIL" in (e.get("summary") or "") else []
+
+        payload = _sample_payload(log_events=[
+            {"id": "good", "timestamp": 1778198400000, "message": "[ERROR] real"},
+            {"id": "bad", "timestamp": 1778198401000, "message": "[ERROR] FAIL me"},
+        ])
+        original_validate = self.index._vocab.validate_entry
+        try:
+            self.index._vocab.validate_entry = selective_validator
+            self.index.handler(_encode_subscription_event(payload), context=None)
+        finally:
+            self.index._vocab.validate_entry = original_validate
+
+        keys = sorted(c.kwargs["Key"] for c in self.s3.put_object.call_args_list)
+        self.assertEqual(len(keys), 2)
+        self.assertTrue(any("changelog/entries/" in k for k in keys))
+        self.assertTrue(any("changelog/quarantine/" in k for k in keys))
 
 
 if __name__ == "__main__":

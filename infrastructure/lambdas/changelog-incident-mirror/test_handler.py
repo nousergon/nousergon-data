@@ -27,9 +27,13 @@ def _import_handler():
     The module imports boto3 at top-level + reads CHANGELOG_BUCKET from env;
     we patch both before import so the import succeeds in a vanilla
     Python environment without boto3 installed.
+
+    Also inserts ../_shared on sys.path so ``import vocab`` (vendored at
+    deploy time alongside index.py) resolves locally during tests.
     """
     os.environ.setdefault("CHANGELOG_BUCKET", "test-bucket")
     sys.path.insert(0, str(HERE))
+    sys.path.insert(0, str(HERE.parent / "_shared"))
 
     fake_boto3 = MagicMock()
     fake_s3_client = MagicMock()
@@ -38,6 +42,8 @@ def _import_handler():
     sys.modules["boto3"] = fake_boto3
     if "index" in sys.modules:
         del sys.modules["index"]
+    if "vocab" in sys.modules:
+        del sys.modules["vocab"]
     import index
     return index, fake_s3_client
 
@@ -123,6 +129,48 @@ class HandlerTests(unittest.TestCase):
         body = json.loads(structured_call.kwargs["Body"].decode())
         # Falls back to current UTC; format is still correct
         self.assertRegex(body["ts_utc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+class QuarantineTests(unittest.TestCase):
+    """Validation + quarantine path (ROADMAP P0 sub-item 3)."""
+
+    def setUp(self):
+        self.index, self.s3 = _import_handler()
+
+    def test_default_emit_is_valid_and_lands_in_entries(self):
+        """The Lambda's default emit shape passes vocab validation —
+        canonical-path entries land under entries/, not quarantine/."""
+        self.index.handler(_sample_event(), context=None)
+        keys = [c.kwargs["Key"] for c in self.s3.put_object.call_args_list]
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("changelog/entries/"))
+
+    def test_quarantine_path_used_when_vocab_invalid(self):
+        """Force a vocab violation by monkey-patching the validator —
+        the entry must land in quarantine/, not entries/."""
+        original_validate = self.index._vocab.validate_entry
+        try:
+            self.index._vocab.validate_entry = lambda e: ["forced-failure-for-test"]
+            self.index.handler(_sample_event(), context=None)
+        finally:
+            self.index._vocab.validate_entry = original_validate
+
+        keys = [c.kwargs["Key"] for c in self.s3.put_object.call_args_list]
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("changelog/quarantine/"))
+
+    def test_quarantine_entry_carries_validation_errors_field(self):
+        """The quarantined entry serializes the validation_errors list so
+        operators reading the file can triage."""
+        original_validate = self.index._vocab.validate_entry
+        try:
+            self.index._vocab.validate_entry = lambda e: ["err-a", "err-b"]
+            self.index.handler(_sample_event(), context=None)
+        finally:
+            self.index._vocab.validate_entry = original_validate
+
+        body = json.loads(self.s3.put_object.call_args_list[0].kwargs["Body"].decode())
+        self.assertEqual(body["validation_errors"], ["err-a", "err-b"])
 
 
 if __name__ == "__main__":
