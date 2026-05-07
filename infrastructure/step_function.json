@@ -503,14 +503,14 @@
 
     "CheckSkipBacktester": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses BOTH the Backtester state (backtest + parity) and the Evaluator state (evaluate.py) — they were split into independent SF states 2026-05-07 (plan: alpha-engine-docs/private/evaluator-split-260507.md), but skipping the backtester implicitly skips the evaluator since evaluate.py reads same-cohort backtest artifacts. Routes to CheckSkipEvalJudge (preserving the LLM-judge eval-pipeline states downstream — the bug fixed 2026-05-03 was that this routed directly to SaturdayHealthCheck, silently bypassing CheckSkipEvalJudge → ComputeEvalCadence → eval-judge → eval-rolling-mean for any operator who passed skip_backtester=true). To skip ONLY the evaluator (keep backtest+parity), use {\"skip_evaluator\": true}. The legacy {\"freeze_evaluator\": true} input is no longer honored; freeze-evaluator is now a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses ONLY the Backtester state (backtest + parity); the Evaluator state still runs and gracefully degrades on missing same-cohort artifacts (evaluate.py logs a WARNING and continues — verified against the 2026-05-07 v1 validation run, where `Simulation artifact not found in S3: backtest/2026-05-07/sweep_df.parquet — evaluator will run without it` shows up cleanly). Routes to CheckSkipEvaluator so {\"skip_evaluator\": true} composes orthogonally: (a) neither flag → both run, (b) skip_backtester only → Evaluator runs against any pre-existing backtest/{date}/ artifacts, (c) skip_evaluator only → Backtester runs without grading, (d) both → both skipped. Eval-judge chain downstream is preserved in all four cases via CheckSkipEvaluator → CheckSkipEvalJudge (the 2026-05-03 silent-bypass fix is still pinned — both CheckSkipEvaluator paths converge to CheckSkipEvalJudge). The legacy {\"freeze_evaluator\": true} input is not honored; freeze-evaluator is a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_backtester", "IsPresent": true},
             {"Variable": "$.skip_backtester", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipEvalJudge"
+          "Next": "CheckSkipEvaluator"
         }
       ],
       "Default": "Backtester"

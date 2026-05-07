@@ -74,25 +74,48 @@ class TestBacktesterTransition:
 
 
 class TestSkipBacktesterPreservesEvalJudge:
-    """Pins the 2026-05-03 fix: when an operator passes
-    skip_backtester=true (e.g. for SF skip-most validation runs), the
-    skip path must still flow through the eval-judge skip-gate, not
-    leap straight to SaturdayHealthCheck.
+    """Pins the 2026-05-03 fix (eval-judge always reachable from a
+    skip_backtester=true operator) AND the 2026-05-07 simplification
+    (skip_backtester decouples from skip_evaluator). The skip-path now
+    routes to CheckSkipEvaluator, which by construction always converges
+    to CheckSkipEvalJudge regardless of which branch it takes. So the
+    silent-bypass-to-SaturdayHealthCheck class is still impossible while
+    the operator gets independent skip flags.
 
-    Caught by SF eval-pipeline-validation-5 when Research succeeded
-    + new-format captures landed on S3 but the eval-judge state
+    Caught by SF eval-pipeline-validation-5 (2026-05-03) when Research
+    succeeded + new-format captures landed on S3 but the eval-judge state
     silently never fired because skip_backtester=true had been
     short-circuiting past it.
     """
 
-    def test_skip_backtester_routes_to_eval_skip_gate(self, states):
+    def test_skip_backtester_routes_to_evaluator_gate_not_health(self, states):
         skip = states["CheckSkipBacktester"]
         choice = skip["Choices"][0]
-        # The skip-true branch must preserve the eval-judge state path.
-        assert choice["Next"] == "CheckSkipEvalJudge"
+        # The skip-true branch hits CheckSkipEvaluator (decoupled flag
+        # 2026-05-07). CheckSkipEvaluator's both branches still converge
+        # to CheckSkipEvalJudge, so eval-judge stays reachable.
+        assert choice["Next"] == "CheckSkipEvaluator"
         # Critically NOT routed to SaturdayHealthCheck — that was the
-        # silent-bypass bug.
+        # 2026-05-03 silent-bypass bug.
         assert choice["Next"] != "SaturdayHealthCheck"
+
+    def test_evaluator_skip_gate_always_reaches_eval_judge(self, states):
+        """Both branches of CheckSkipEvaluator must keep eval-judge
+        reachable — the skip path goes to CheckSkipEvalJudge directly,
+        and the run path goes to Evaluator → CheckEvaluatorStatus →
+        Success → CheckSkipEvalJudge. Together with the skip_backtester
+        decoupling, this guarantees no skip-flag combination bypasses
+        eval-judge."""
+        gate = states["CheckSkipEvaluator"]
+        skip_choice = gate["Choices"][0]
+        assert skip_choice["Next"] == "CheckSkipEvalJudge"
+        # Default routes to Evaluator, which converges back via
+        # CheckEvaluatorStatus's Success branch.
+        assert gate["Default"] == "Evaluator"
+        assert (
+            states["CheckEvaluatorStatus"]["Choices"][0]["Next"]
+            == "CheckSkipEvalJudge"
+        )
 
 
 class TestSkipEvalJudge:
