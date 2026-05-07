@@ -54,16 +54,20 @@ class TestStatesPresent:
             assert name in states, f"missing SF state: {name}"
 
 
-# ── Backtester success → eval-judge skip-gate ─────────────────────────────
+# ── Backtester success → evaluator skip-gate ──────────────────────────────
 
 
 class TestBacktesterTransition:
-    def test_success_routes_to_eval_skip_gate(self, states):
+    def test_success_routes_to_evaluator_skip_gate(self, states):
+        # Post-2026-05-07 split: Backtester success now routes to
+        # CheckSkipEvaluator (the new gate in front of the standalone
+        # Evaluator state) instead of CheckSkipEvalJudge. The evaluator
+        # then converges back into the eval-judge chain on success.
         bt = states["CheckBacktesterStatus"]
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "CheckSkipEvalJudge"
+        assert success_choice["Next"] == "CheckSkipEvaluator"
 
 
 # ── Skip gate ─────────────────────────────────────────────────────────────
