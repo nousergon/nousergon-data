@@ -56,13 +56,15 @@ class TestStatesPresent:
 
 
 class TestSkipEvaluator:
-    def test_skip_flag_bypasses_to_eval_judge_gate(self, states):
-        """Skipping the Evaluator state must NOT also skip the LLM-judge
-        chain — they're independent (evaluator = per-signal grading +
-        optimizer auto-apply against backtest artifacts; eval-judge =
-        LLM rubric scoring of decision_artifacts/). The skip path lands
-        on CheckSkipEvalJudge so the judge chain still fires unless its
-        own skip flag is set.
+    def test_skip_flag_bypasses_to_health_check(self, states):
+        """Skipping the Evaluator state routes to SaturdayHealthCheck.
+
+        Post-2026-05-07 reorder: the eval-judge chain runs BEFORE
+        Evaluator (after DataPhase2, before PredictorTraining), so by
+        the time we reach this skip-gate, judge results are already
+        persisted to S3 — there's no eval-judge chain downstream of
+        Evaluator to skip. Skipping evaluator just exits the success
+        path to the health-check observability tail.
         """
         skip = states["CheckSkipEvaluator"]
         choice = skip["Choices"][0]
@@ -72,11 +74,11 @@ class TestSkipEvaluator:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "CheckSkipEvalJudge"
-        # Critically NOT routed to SaturdayHealthCheck — that would
-        # bundle-skip both the evaluator and the entire eval-judge
-        # observability chain.
-        assert choice["Next"] != "SaturdayHealthCheck"
+        assert choice["Next"] == "SaturdayHealthCheck"
+        # Pre-reorder this routed to CheckSkipEvalJudge; post-reorder
+        # judge chain is upstream of Evaluator so there's nothing to
+        # gate downstream — exit straight to the health-check tail.
+        assert choice["Next"] != "CheckSkipEvalJudge"
 
     def test_default_runs_evaluator(self, states):
         assert states["CheckSkipEvaluator"]["Default"] == "Evaluator"
@@ -171,14 +173,17 @@ class TestEvaluatorPollLoop:
     def test_wait_for_evaluator_routes_to_check_status(self, states):
         assert states["WaitForEvaluator"]["Next"] == "CheckEvaluatorStatus"
 
-    def test_check_status_success_continues_to_eval_judge(self, states):
-        # On evaluator success the pipeline picks up the LLM-judge chain
-        # at the same skip-gate that pre-split Backtester success used.
+    def test_check_status_success_continues_to_health_check(self, states):
+        # On evaluator success the pipeline exits to the health-check
+        # observability tail. Post-2026-05-07 reorder, the eval-judge
+        # chain runs upstream of Evaluator, so there's no judge gate
+        # downstream — Evaluator is the last analytics-producing stage
+        # before health checks.
         bt = states["CheckEvaluatorStatus"]
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "CheckSkipEvalJudge"
+        assert success_choice["Next"] == "SaturdayHealthCheck"
 
     def test_check_status_in_progress_loops_to_wait(self, states):
         bt = states["CheckEvaluatorStatus"]
