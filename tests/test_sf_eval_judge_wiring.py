@@ -99,22 +99,30 @@ class TestSkipBacktesterPreservesEvalJudge:
         # 2026-05-03 silent-bypass bug.
         assert choice["Next"] != "SaturdayHealthCheck"
 
-    def test_evaluator_skip_gate_always_reaches_eval_judge(self, states):
-        """Both branches of CheckSkipEvaluator must keep eval-judge
-        reachable — the skip path goes to CheckSkipEvalJudge directly,
-        and the run path goes to Evaluator → CheckEvaluatorStatus →
-        Success → CheckSkipEvalJudge. Together with the skip_backtester
-        decoupling, this guarantees no skip-flag combination bypasses
-        eval-judge."""
+    def test_evaluator_skip_gate_always_reaches_health_check(self, states):
+        """Both branches of CheckSkipEvaluator must converge into the
+        health-check observability tail — the skip path goes to
+        SaturdayHealthCheck directly, and the run path goes to
+        Evaluator → CheckEvaluatorStatus → Success → SaturdayHealthCheck.
+
+        Post-2026-05-07 reorder: the eval-judge chain runs UPSTREAM of
+        Evaluator (after DataPhase2, before PredictorTraining), so the
+        question this class previously asked (does eval-judge stay
+        reachable from any skip-flag combination?) is now answered at
+        the upstream junction (CheckSkipDataPhase2 → CheckSkipEvalJudge
+        regardless of skip_data_phase2). At THIS junction, both
+        branches simply exit to the health-check tail; no judge gate
+        downstream to protect.
+        """
         gate = states["CheckSkipEvaluator"]
         skip_choice = gate["Choices"][0]
-        assert skip_choice["Next"] == "CheckSkipEvalJudge"
-        # Default routes to Evaluator, which converges back via
-        # CheckEvaluatorStatus's Success branch.
+        assert skip_choice["Next"] == "SaturdayHealthCheck"
         assert gate["Default"] == "Evaluator"
+        # Run path success also exits to SaturdayHealthCheck (judge
+        # already ran upstream).
         assert (
             states["CheckEvaluatorStatus"]["Choices"][0]["Next"]
-            == "CheckSkipEvalJudge"
+            == "SaturdayHealthCheck"
         )
 
 
@@ -427,7 +435,11 @@ class TestReplayConcordance:
 
 
 class TestSkipCounterfactual:
-    def test_skip_flag_bypasses_to_health_check(self, states):
+    def test_skip_flag_bypasses_to_predictor_training_gate(self, states):
+        """Skipping Counterfactual is the chain-exit path — post-2026-05-07
+        reorder, the judge chain runs upstream of PredictorTraining, so
+        bypassing Counterfactual exits to CheckSkipPredictorTraining
+        (was SaturdayHealthCheck pre-reorder)."""
         skip = states["CheckSkipCounterfactual"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -436,7 +448,7 @@ class TestSkipCounterfactual:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "SaturdayHealthCheck"
+        assert choice["Next"] == "CheckSkipPredictorTraining"
 
     def test_default_runs_counterfactual(self, states):
         assert states["CheckSkipCounterfactual"]["Default"] == "Counterfactual"
@@ -464,13 +476,21 @@ class TestCounterfactual:
         # across 8 weeks of corpus).
         assert states["Counterfactual"]["TimeoutSeconds"] == 600
 
-    def test_success_continues_to_health_check(self, states):
-        assert states["Counterfactual"]["Next"] == "SaturdayHealthCheck"
+    def test_success_exits_to_predictor_training_gate(self, states):
+        # Post-2026-05-07 reorder: Counterfactual is the last state in
+        # the judge chain; success exits to CheckSkipPredictorTraining
+        # (was SaturdayHealthCheck pre-reorder), so its persisted
+        # artifacts are available to Evaluator downstream.
+        assert states["Counterfactual"]["Next"] == "CheckSkipPredictorTraining"
 
-    def test_catch_routes_to_health_check_not_failure(self, states):
+    def test_catch_routes_to_predictor_training_gate_not_failure(self, states):
+        # Same Catch posture as the rest of the agent-justification
+        # triple — Counterfactual is observability, not load-bearing,
+        # so failures fall through to the next stage rather than
+        # halting the pipeline.
         catch = states["Counterfactual"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "SaturdayHealthCheck"
+        assert catch["Next"] == "CheckSkipPredictorTraining"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
@@ -478,3 +498,70 @@ class TestCounterfactual:
         assert "Lambda.ServiceException" in retry["ErrorEquals"]
         assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
         assert retry["MaxAttempts"] == 1
+
+
+# ── Pipeline ordering invariant ──────────────────────────────────────────
+
+
+class TestJudgeChainBeforePredictor:
+    """Pins the 2026-05-07 reorder — the eval-judge + agent-justification
+    triple (judge, rolling-mean, clustering, concordance, counterfactual)
+    must run AFTER Research/DataPhase2 and BEFORE PredictorTraining, so
+    their persisted S3 artifacts are available to Evaluator's email when
+    it runs at the end of the pipeline.
+
+    Pre-reorder ordering: Research → ... → Predictor → Backtester →
+    Evaluator → judge chain → SaturdayHealthCheck. The Evaluator email
+    was generated BEFORE judge results landed in S3, so the operator's
+    weekly review never saw rubric scores / clustering / concordance /
+    counterfactual outcomes — that was the user-surfaced gap that
+    motivated this reorder.
+
+    Post-reorder ordering: Research → DataPhase2 → judge chain →
+    Predictor → Backtester → Evaluator → SaturdayHealthCheck. The
+    judge chain's S3 outputs (decision_artifacts/_eval/, _clustering/,
+    _concordance/, _counterfactual/) are populated for the current
+    run_date by the time Evaluator's reporter.build_report() runs, so
+    they can be pulled into the weekly email.
+    """
+
+    def test_data_phase2_exits_to_judge_skip_gate_not_predictor(self, states):
+        """DataPhase2's success path enters the judge chain, not
+        predictor training. This is the load-bearing invariant — if
+        someone ever rewires DataPhase2.Next to CheckSkipPredictorTraining
+        (the pre-reorder target), the judge chain bypass is silent."""
+        assert states["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
+        assert (
+            states["CheckSkipDataPhase2"]["Choices"][0]["Next"]
+            == "CheckSkipEvalJudge"
+        )
+
+    def test_counterfactual_exits_to_predictor_skip_gate(self, states):
+        """Counterfactual is the last state in the judge chain; its
+        Next + Catch + the skip-gate above it all converge to
+        CheckSkipPredictorTraining (the entry to the next pipeline
+        stage). Pre-reorder this was SaturdayHealthCheck."""
+        assert states["Counterfactual"]["Next"] == "CheckSkipPredictorTraining"
+        assert (
+            states["Counterfactual"]["Catch"][0]["Next"]
+            == "CheckSkipPredictorTraining"
+        )
+        assert (
+            states["CheckSkipCounterfactual"]["Choices"][0]["Next"]
+            == "CheckSkipPredictorTraining"
+        )
+
+    def test_evaluator_exits_directly_to_health_check(self, states):
+        """Evaluator's success path no longer enters the judge chain
+        (judge ran upstream). It exits to SaturdayHealthCheck."""
+        success = next(
+            c for c in states["CheckEvaluatorStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        )
+        assert success["Next"] == "SaturdayHealthCheck"
+        # And the skip-evaluator path also goes to SaturdayHealthCheck
+        # (the previous pre-reorder target was CheckSkipEvalJudge).
+        assert (
+            states["CheckSkipEvaluator"]["Choices"][0]["Next"]
+            == "SaturdayHealthCheck"
+        )
