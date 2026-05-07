@@ -82,25 +82,26 @@ class TestSkipEvaluator:
         assert states["CheckSkipEvaluator"]["Default"] == "Evaluator"
 
 
-class TestSkipBacktesterAlsoSkipsEvaluator:
-    """Pins the contract that {"skip_backtester": true} skips BOTH
-    Backtester and Evaluator (since the evaluator reads same-cohort
-    backtest artifacts — running it without a fresh backtest would grade
-    against stale data). The CheckSkipBacktester skip path therefore
-    routes to CheckSkipEvalJudge (skipping past CheckSkipEvaluator
-    entirely), preserving the LLM-judge chain downstream.
+class TestSkipBacktesterRoutesThroughEvaluatorGate:
+    """Pins the contract that {"skip_backtester": true} skips ONLY the
+    Backtester state — the Evaluator gate runs next so {"skip_evaluator": true}
+    composes orthogonally. evaluate.py already gracefully degrades on
+    missing same-cohort artifacts (logs WARNING and continues, verified
+    against 2026-05-07 v1 validation run), so coupling skip-backtester to
+    skip-evaluator was over-restrictive. Pre-2026-05-07 wiring jumped
+    skip-backtester directly to CheckSkipEvalJudge, which forced the
+    operator to run a 35-min backtest just to grade existing artifacts.
     """
 
-    def test_skip_backtester_bypasses_evaluator(self, states):
+    def test_skip_backtester_routes_to_evaluator_skip_gate(self, states):
         skip = states["CheckSkipBacktester"]
         choice = skip["Choices"][0]
-        # The skip-true branch must skip past the Evaluator state.
-        # Routing to CheckSkipEvalJudge is correct — CheckSkipEvaluator
-        # is between CheckBacktesterStatus and CheckSkipEvalJudge in
-        # the success path, so jumping straight to CheckSkipEvalJudge
-        # bypasses the evaluator without re-implementing the gate.
-        assert choice["Next"] == "CheckSkipEvalJudge"
-        assert choice["Next"] != "CheckSkipEvaluator"
+        # The skip-true branch must hit the Evaluator skip-gate so the
+        # operator can compose skip flags independently.
+        assert choice["Next"] == "CheckSkipEvaluator"
+        # Critically NOT routed to CheckSkipEvalJudge — that was the
+        # over-coupled wiring that forced backtest+evaluate to bundle.
+        assert choice["Next"] != "CheckSkipEvalJudge"
 
 
 # ── Evaluator task contract ───────────────────────────────────────────────
