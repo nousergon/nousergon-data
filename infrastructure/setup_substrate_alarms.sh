@@ -17,11 +17,16 @@
 #   Fires when SubstrateChecksFailed > 0 in the trailing 24h window —
 #   safety net in case a row alarm gets accidentally deleted.
 #
-# Period 86400 (24h) with EvaluationPeriods=1 means each alarm checks
-# the most recent 24h window. treat-missing-data=notBreaching keeps
-# weekly-cadence rows quiet between emissions (a row that emits once
-# per Sat SF only has a datapoint every 7 days; missing days are not
-# alarms, only emitted-and-failed days are).
+# Period 3600 (1h) with EvaluationPeriods=24 + DatapointsToAlarm=1 keeps
+# the trailing 24h evaluation window but bumps the refresh cadence to
+# hourly. Pre-2026-05-08 the alarms used Period=86400 + EvalPeriods=1,
+# which evaluated only at 24h boundaries — Sat SF emissions at 12:00 UTC
+# Sat were not visible in alarm state until ~17:05 PT Sun (~37h lag).
+# Hourly evaluation closes the lag to <1h. treat-missing-data=notBreaching
+# keeps weekly-cadence rows quiet between emissions: a row that emits
+# once per Sat SF has a datapoint in only one of the 24 hourly periods,
+# the other 23 are treated as not-breaching, the alarm fires iff that one
+# real datapoint is < 1. Cost: 24× more eval reads/day; bounded.
 #
 # Row enumeration is sourced from the lib's transparency_inventory.yaml
 # so this script stays in sync with the inventory automatically — no
@@ -81,10 +86,11 @@ for row_id in $ROW_IDS; do
   aws cloudwatch put-metric-alarm \
     --region "$REGION" \
     --alarm-name "$alarm_name" \
-    --alarm-description "Fires when the transparency-substrate row '$row_id' fails to emit a passing measurement. The check is row-driven (alpha_engine_lib.transparency); the SF Sat pipeline runs --cadence weekly which sweeps weekly + daily rows. This alarm decrements the Phase 2 → 3 observation gate denominator for this row when it fires. treat-missing-data=notBreaching keeps weekly-cadence rows quiet between Sat-SF emissions." \
+    --alarm-description "Fires when the transparency-substrate row '$row_id' fails to emit a passing measurement. The check is row-driven (alpha_engine_lib.transparency); the SF Sat pipeline runs --cadence weekly which sweeps weekly + daily rows. This alarm decrements the Phase 2 → 3 observation gate denominator for this row when it fires. Period=3600 + EvalPeriods=24 + DatapointsToAlarm=1 keeps the trailing 24h evaluation window but evaluates hourly so alarm state reflects the most recent SF emission within ~1h instead of ~24h. treat-missing-data=notBreaching keeps weekly-cadence rows quiet between emissions." \
     --comparison-operator "LessThanThreshold" \
-    --evaluation-periods 1 \
-    --period 86400 \
+    --evaluation-periods 24 \
+    --datapoints-to-alarm 1 \
+    --period 3600 \
     --statistic "Minimum" \
     --threshold 1 \
     --treat-missing-data "notBreaching" \
@@ -103,10 +109,11 @@ echo "==> $aggregate_name"
 aws cloudwatch put-metric-alarm \
   --region "$REGION" \
   --alarm-name "$aggregate_name" \
-  --alarm-description "Aggregate safety-net alarm for the transparency substrate. Fires when SubstrateChecksFailed > 0 in any 24h window. Catches the case where a per-row alarm has been accidentally deleted — the per-row alarms are authoritative for which row failed; this alarm only confirms the substrate is observing failures. treat-missing-data=notBreaching means a substrate run with all rows passing emits zero failures and the alarm stays OK." \
+  --alarm-description "Aggregate safety-net alarm for the transparency substrate. Fires when SubstrateChecksFailed > 0 in any of the 24 trailing hourly periods. Catches the case where a per-row alarm has been accidentally deleted — the per-row alarms are authoritative for which row failed; this alarm only confirms the substrate is observing failures. Period=3600 + EvalPeriods=24 + DatapointsToAlarm=1 mirrors the per-row alarms. treat-missing-data=notBreaching means a substrate run with all rows passing emits zero failures and the alarm stays OK." \
   --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 \
-  --period 86400 \
+  --evaluation-periods 24 \
+  --datapoints-to-alarm 1 \
+  --period 3600 \
   --statistic "Maximum" \
   --threshold 0 \
   --treat-missing-data "notBreaching" \

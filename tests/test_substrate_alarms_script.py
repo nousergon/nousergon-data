@@ -133,6 +133,26 @@ class TestAlarmSemantics:
         # don't fire alarms; only emitted-and-failed days fire.
         assert '--treat-missing-data "notBreaching"' in script_text
 
+    def test_period_is_one_hour_for_hourly_refresh(self, script_text):
+        """Period=3600 (1h) is the post-2026-05-08 cadence: alarm state
+        reflects the most recent SF emission within ~1h instead of the
+        ~24-37h lag of the original Period=86400 (24h) cadence.
+        Regression for the cadence-lag P0 (ROADMAP line 2082)."""
+        assert "--period 3600" in script_text
+        # Old daily-period must not creep back in.
+        assert "--period 86400" not in script_text, (
+            "Period=86400 reintroduces the 24-37h alarm-state lag — "
+            "regression of the 2026-05-08 cadence fix"
+        )
+
+    def test_evaluation_window_stays_24_hours(self, script_text):
+        """EvalPeriods=24 × Period=3600 keeps the same 24h trailing
+        window as before — only refresh cadence changes. Pinning the
+        product so a future "tighten Period further" PR doesn't
+        accidentally narrow the actual window."""
+        assert "--evaluation-periods 24" in script_text
+        assert "--datapoints-to-alarm 1" in script_text
+
 
 class TestRegionDefault:
     def test_region_defaults_to_us_east_1(self, script_text):
