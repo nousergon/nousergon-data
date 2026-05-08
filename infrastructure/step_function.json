@@ -740,10 +740,11 @@
 
     "ComputeEvalCadence": {
       "Type": "Pass",
-      "Comment": "Extract day-of-month + ISO date from the SF execution start time so the next Choice state can branch the LLM-as-judge two-tier sampling. day_of_month <= 07 ⇒ first Saturday of the month ⇒ force_sonnet_pass=true (monthly Sonnet sweep per ROADMAP §1626). All other Saturdays run Haiku-only with the per-artifact <3 escalation gate inside the Lambda.",
+      "Comment": "Extract day-of-month + ISO date + submit timestamp from the SF execution start time. day_of_month <= 07 ⇒ first Saturday of the month ⇒ force_sonnet_pass=true (monthly Sonnet sweep per ROADMAP §1626). All other Saturdays run Haiku-only batch + per-artifact Sonnet escalation tail inside the Process Lambda. submit_iso is propagated to EvalJudgePoll so it can compute elapsed-time against the 6h fail-soft cap.",
       "Parameters": {
         "day_of_month.$": "States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), '-'), 2)",
-        "eval_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
+        "eval_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+        "submit_iso.$": "$$.Execution.StartTime"
       },
       "ResultPath": "$.eval_cadence",
       "Next": "CheckMonthlyCadence"
@@ -756,24 +757,24 @@
         {
           "Variable": "$.eval_cadence.day_of_month",
           "StringLessThan": "08",
-          "Next": "EvalJudgeFirstSaturday"
+          "Next": "EvalJudgeSubmitFirstSaturday"
         }
       ],
-      "Default": "EvalJudgeWeekly"
+      "Default": "EvalJudgeSubmitWeekly"
     },
 
-    "EvalJudgeFirstSaturday": {
+    "EvalJudgeSubmitFirstSaturday": {
       "Type": "Task",
-      "Comment": "Monthly Sonnet sweep — force_sonnet_pass=true causes the Lambda to evaluate every captured artifact with both Haiku and Sonnet (regardless of Haiku's per-artifact <3 escalation gate). Calibration insurance: catches the case where Haiku consistently scores 5/5 and would otherwise hide a real regression.",
+      "Comment": "Submit phase, monthly Sonnet sweep — force_sonnet_pass=true. Builds the (artifact × judge_model) batch payload covering both Haiku and Sonnet for every mapped artifact, submits as one Anthropic Message Batches API call, and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 §1642. 50% cost discount per Anthropic's batch contract; structurally bypasses the 15-min Lambda timeout class that nearly fired on the 2026-05-06 manual midweek SF run.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName": "alpha-engine-research-eval-judge:live",
+        "FunctionName": "alpha-engine-research-eval-judge-submit:live",
         "Payload": {
           "force_sonnet_pass": true,
           "date.$": "$.eval_cadence.eval_date"
         }
       },
-      "TimeoutSeconds": 900,
+      "TimeoutSeconds": 300,
       "Retry": [
         {
           "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
@@ -785,24 +786,134 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Comment": "Eval is observability — failures must NOT halt the pipeline. The handler already returns OK/PARTIAL/ERROR rather than throwing on per-artifact issues; this Catch covers infra-level failures (Lambda timeout, transient AWS errors).",
+          "Comment": "Eval is observability per ROADMAP §1635 — submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
           "Next": "EvalRollingMean",
           "ResultPath": "$.eval_judge_error"
         }
       ],
-      "ResultPath": "$.eval_judge_result",
-      "Next": "EvalRollingMean"
+      "ResultPath": "$.eval_judge_submit",
+      "Next": "EvalJudgePollChoice"
     },
 
-    "EvalJudgeWeekly": {
+    "EvalJudgeSubmitWeekly": {
       "Type": "Task",
-      "Comment": "Weekly Haiku-only judge run with per-artifact <3 escalation to Sonnet for borderline outputs. Per-artifact rather than batch-level escalation keeps weekly judging cost bounded while preserving diagnostic depth where it matters.",
+      "Comment": "Submit phase, weekly Haiku-only batch + Sonnet escalation tail in Process. Submits Haiku entries for every mapped artifact in one batch; the Process Lambda runs Sonnet escalations synchronously after Haiku results arrive (typically 1-3 artifacts/run, well under Process's 15-min budget). Preserves the per-artifact <3 escalation gate so weekly cost stays bounded relative to the all-pairs first-Saturday batch.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName": "alpha-engine-research-eval-judge:live",
+        "FunctionName": "alpha-engine-research-eval-judge-submit:live",
         "Payload": {
           "force_sonnet_pass": false,
           "date.$": "$.eval_cadence.eval_date"
+        }
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval is observability — submit failures must NOT halt the pipeline.",
+          "Next": "EvalRollingMean",
+          "ResultPath": "$.eval_judge_error"
+        }
+      ],
+      "ResultPath": "$.eval_judge_submit",
+      "Next": "EvalJudgePollChoice"
+    },
+
+    "EvalJudgePollChoice": {
+      "Type": "Choice",
+      "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) → route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK → enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
+      "Choices": [
+        {
+          "Variable": "$.eval_judge_submit.Payload.status",
+          "StringEquals": "EMPTY",
+          "Next": "EvalJudgeProcess"
+        },
+        {
+          "Variable": "$.eval_judge_submit.Payload.status",
+          "StringEquals": "OK",
+          "Next": "EvalJudgePollWait"
+        }
+      ],
+      "Default": "EvalRollingMean"
+    },
+
+    "EvalJudgePollWait": {
+      "Type": "Wait",
+      "Comment": "60s pause between batch status polls. Anthropic's docs target sub-1h typical batch latency with 24h hard cap; 60s polls strike a balance between pickup latency and Lambda invocation cost over the typical wait.",
+      "Seconds": 60,
+      "Next": "EvalJudgePoll"
+    },
+
+    "EvalJudgePoll": {
+      "Type": "Task",
+      "Comment": "Poll phase. Calls anthropic.messages.batches.retrieve(batch_id) and returns processing_status + request_counts + elapsed_seconds. SF Choice that follows branches on processing_status: ended → Process; in_progress → loop back to Wait; exceeded_max_wait=true → fail-soft to EvalRollingMean.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-eval-judge-poll:live",
+        "Payload": {
+          "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
+          "submit_iso.$": "$.eval_cadence.submit_iso",
+          "max_wait_seconds": 21600
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "A poll-level failure is recoverable — Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route to EvalRollingMean so the rest of the pipeline isn't blocked.",
+          "Next": "EvalRollingMean",
+          "ResultPath": "$.eval_judge_error"
+        }
+      ],
+      "ResultPath": "$.eval_judge_poll",
+      "Next": "EvalJudgePollDecision"
+    },
+
+    "EvalJudgePollDecision": {
+      "Type": "Choice",
+      "Comment": "Branch on poll status. processing_status='ended' → run Process. exceeded_max_wait=true → fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else → loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
+      "Choices": [
+        {
+          "Or": [
+            {"Variable": "$.eval_judge_poll.Payload.processing_status", "StringEquals": "ended"},
+            {"Variable": "$.eval_judge_poll.Payload.processing_status", "StringEquals": "ended_empty"}
+          ],
+          "Next": "EvalJudgeProcess"
+        },
+        {
+          "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+          "BooleanEquals": true,
+          "Next": "EvalRollingMean"
+        }
+      ],
+      "Default": "EvalJudgePollWait"
+    },
+
+    "EvalJudgeProcess": {
+      "Type": "Task",
+      "Comment": "Process phase. Streams the completed batch's results, parses each via the existing RubricEvalLLMOutput schema, persists per-artifact eval JSONs to decision_artifacts/_eval/{date}/, emits CW metrics under AlphaEngine/Eval, and runs the small synchronous Sonnet-escalation tail for any Haiku result that flagged a borderline dimension. Returns OK/PARTIAL/ERROR mirroring the legacy single-Lambda contract — no consumer (RationaleClustering, EvalRollingMean, dashboard) changes.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-eval-judge-process:live",
+        "Payload": {
+          "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
+          "plan_s3_key.$": "$.eval_judge_submit.Payload.plan_s3_key"
         }
       },
       "TimeoutSeconds": 900,
@@ -817,7 +928,7 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Comment": "Eval is observability — failures must NOT halt the pipeline.",
+          "Comment": "Eval is observability — Process failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
           "Next": "EvalRollingMean",
           "ResultPath": "$.eval_judge_error"
         }

@@ -5,9 +5,17 @@ back to SaturdayHealthCheck and accidentally drops the eval state, or
 flips the Default branch of the cadence Choice and ships every Saturday
 on the (more expensive) monthly Sonnet sweep.
 
-The corresponding alpha-engine-research Lambda
-(``alpha-engine-research-eval-judge:live``) is in PR #91; this test only
-asserts the SF wiring, not the handler shape.
+Legacy single-Lambda design (EvalJudgeFirstSaturday + EvalJudgeWeekly
+Task states) was replaced 2026-05-07 by the Anthropic Message Batches
+API chain — Submit → Poll-loop → Process — closing ROADMAP P1 §1642.
+The 50% batch cost discount + decoupled submit/pickup structurally
+bypass the Lambda 15-min timeout class that nearly fired on the
+2026-05-06 manual midweek SF run.
+
+The corresponding alpha-engine-research Lambdas
+(``alpha-engine-research-eval-judge-{submit,poll,process}:live``) are
+in the companion research-repo PR; this test only asserts the SF
+wiring, not handler shape.
 """
 
 from __future__ import annotations
@@ -41,8 +49,16 @@ class TestStatesPresent:
             "CheckSkipEvalJudge",
             "ComputeEvalCadence",
             "CheckMonthlyCadence",
-            "EvalJudgeFirstSaturday",
-            "EvalJudgeWeekly",
+            # Batches API chain (replaces EvalJudgeFirstSaturday +
+            # EvalJudgeWeekly Task states from the legacy single-Lambda
+            # design, ROADMAP P1 §1642 closure 2026-05-07).
+            "EvalJudgeSubmitFirstSaturday",
+            "EvalJudgeSubmitWeekly",
+            "EvalJudgePollChoice",
+            "EvalJudgePollWait",
+            "EvalJudgePoll",
+            "EvalJudgePollDecision",
+            "EvalJudgeProcess",
             "EvalRollingMean",
             "CheckSkipRationaleClustering",
             "RationaleClustering",
@@ -52,6 +68,13 @@ class TestStatesPresent:
             "Counterfactual",
         ):
             assert name in states, f"missing SF state: {name}"
+
+    def test_legacy_single_lambda_states_removed(self, states):
+        """The legacy single-Lambda Task states were replaced by the
+        batch chain. Pin the absence so a redrive of the old code path
+        can't silently ship under the old names."""
+        assert "EvalJudgeFirstSaturday" not in states
+        assert "EvalJudgeWeekly" not in states
 
 
 # ── Backtester success → evaluator skip-gate ──────────────────────────────
@@ -179,28 +202,40 @@ class TestComputeEvalCadence:
 
 
 class TestCheckMonthlyCadence:
-    def test_default_is_weekly(self, states):
+    def test_default_is_weekly_submit(self, states):
         # Default = the COMMON path (every other Saturday). Must NOT
-        # be EvalJudgeFirstSaturday — that would ship every weekly run
-        # on the expensive monthly Sonnet sweep.
-        assert states["CheckMonthlyCadence"]["Default"] == "EvalJudgeWeekly"
+        # be EvalJudgeSubmitFirstSaturday — that would ship every
+        # weekly run on the expensive monthly Sonnet sweep.
+        assert states["CheckMonthlyCadence"]["Default"] == "EvalJudgeSubmitWeekly"
 
     def test_first_saturday_branch_uses_lex_compare_under_08(self, states):
         choice = states["CheckMonthlyCadence"]["Choices"][0]
         assert choice["Variable"] == "$.eval_cadence.day_of_month"
         assert choice["StringLessThan"] == "08"
-        assert choice["Next"] == "EvalJudgeFirstSaturday"
+        assert choice["Next"] == "EvalJudgeSubmitFirstSaturday"
 
 
-# ── Lambda invocation contract ────────────────────────────────────────────
+class TestComputeEvalCadenceBatch:
+    """Pins the batch-chain-specific additions to ComputeEvalCadence.
+    submit_iso is propagated to EvalJudgePoll for elapsed-time +
+    fail-soft cap; without it the poll Lambda would have no signal
+    to terminate a runaway loop."""
+
+    def test_submit_iso_extracted_for_poll_elapsed_check(self, states):
+        params = states["ComputeEvalCadence"]["Parameters"]
+        assert "submit_iso.$" in params
+        assert params["submit_iso.$"] == "$$.Execution.StartTime"
 
 
-class TestEvalJudgeLambdaContract:
+# ── Lambda invocation contract — batch chain ──────────────────────────────
+
+
+class TestEvalJudgeSubmitContract:
     @pytest.mark.parametrize(
         "state_name,expected_force_sonnet",
         [
-            ("EvalJudgeFirstSaturday", True),
-            ("EvalJudgeWeekly", False),
+            ("EvalJudgeSubmitFirstSaturday", True),
+            ("EvalJudgeSubmitWeekly", False),
         ],
     )
     def test_payload_carries_correct_force_sonnet_flag(
@@ -211,57 +246,186 @@ class TestEvalJudgeLambdaContract:
 
     @pytest.mark.parametrize(
         "state_name",
-        ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
+        ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
     )
     def test_payload_passes_eval_date(self, states, state_name):
         payload = states[state_name]["Parameters"]["Payload"]
-        # SF passes the SF-execution-start-date so the Lambda evaluates
-        # the same partition the captures landed in (avoids UTC-rollover
-        # edge cases where the Lambda starts on day X+1).
         assert payload["date.$"] == "$.eval_cadence.eval_date"
 
     @pytest.mark.parametrize(
         "state_name",
-        ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
+        ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
     )
-    def test_invokes_live_alias(self, states, state_name):
+    def test_invokes_submit_lambda_live_alias(self, states, state_name):
         params = states[state_name]["Parameters"]
-        assert params["FunctionName"] == "alpha-engine-research-eval-judge:live"
+        assert (
+            params["FunctionName"]
+            == "alpha-engine-research-eval-judge-submit:live"
+        )
 
     @pytest.mark.parametrize(
         "state_name",
-        ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
+        ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
     )
-    def test_timeout_matches_lambda_max(self, states, state_name):
-        # Lambda's hard timeout is 900s (set in alpha-engine-research
-        # infrastructure/deploy.sh). SF state TimeoutSeconds must not be
-        # less — otherwise SF would kill an in-progress eval prematurely.
-        assert states[state_name]["TimeoutSeconds"] == 900
-
-
-# ── Non-blocking failure semantics ────────────────────────────────────────
-
-
-class TestEvalJudgeNonBlocking:
-    @pytest.mark.parametrize(
-        "state_name",
-        ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
-    )
-    def test_success_continues_to_rolling_mean(self, states, state_name):
-        # Eval-judge branches converge to EvalRollingMean (PR 4c)
-        # rather than SaturdayHealthCheck — ensures the rolling-mean
-        # derived metric runs every week with the freshest raw data.
-        assert states[state_name]["Next"] == "EvalRollingMean"
+    def test_submit_timeout_matches_lambda_cap(self, states, state_name):
+        # Submit Lambda is configured for 300s — plan-build + manifest
+        # write + one batch-create call all complete in seconds.
+        assert states[state_name]["TimeoutSeconds"] == 300
 
     @pytest.mark.parametrize(
         "state_name",
-        ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
+        ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
     )
-    def test_catch_routes_to_rolling_mean_not_failure(self, states, state_name):
-        # Eval is observability per ROADMAP §1635 — failures must NOT
-        # halt the pipeline. Even if eval-judge errors out at the infra
-        # level, rolling-mean still runs against whatever historical
-        # data IS available (the prior 4 weeks are unaffected).
+    def test_submit_routes_to_poll_choice_on_success(
+        self, states, state_name,
+    ):
+        assert states[state_name]["Next"] == "EvalJudgePollChoice"
+
+    @pytest.mark.parametrize(
+        "state_name",
+        ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
+    )
+    def test_submit_catch_routes_to_rolling_mean_not_failure(
+        self, states, state_name,
+    ):
+        catch = states[state_name]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "EvalRollingMean"
+
+
+class TestEvalJudgePollChoice:
+    """EvalJudgePollChoice is the first Choice after Submit. EMPTY
+    short-circuits the poll loop; OK enters the loop; anything else
+    fail-softs to EvalRollingMean. Pinning these branches matters —
+    silently routing EMPTY through the loop would burn 60s + 1
+    Lambda invocation per poll cycle for hours."""
+
+    def test_empty_routes_directly_to_process(self, states):
+        choice = next(
+            c for c in states["EvalJudgePollChoice"]["Choices"]
+            if c.get("StringEquals") == "EMPTY"
+        )
+        assert choice["Next"] == "EvalJudgeProcess"
+        assert choice["Variable"] == "$.eval_judge_submit.Payload.status"
+
+    def test_ok_routes_to_poll_wait(self, states):
+        choice = next(
+            c for c in states["EvalJudgePollChoice"]["Choices"]
+            if c.get("StringEquals") == "OK"
+        )
+        assert choice["Next"] == "EvalJudgePollWait"
+
+    def test_default_is_fail_soft_to_rolling_mean(self, states):
+        # Anything other than EMPTY/OK (ERROR, malformed) must NOT
+        # halt the pipeline.
+        assert states["EvalJudgePollChoice"]["Default"] == "EvalRollingMean"
+
+
+class TestEvalJudgePollLoop:
+    def test_poll_wait_60s(self, states):
+        # 60s polls strike a balance between pickup latency and Lambda
+        # invocation cost over Anthropic's typical sub-1h batch latency.
+        assert states["EvalJudgePollWait"]["Seconds"] == 60
+        assert states["EvalJudgePollWait"]["Next"] == "EvalJudgePoll"
+
+    def test_poll_invokes_poll_lambda_live_alias(self, states):
+        params = states["EvalJudgePoll"]["Parameters"]
+        assert (
+            params["FunctionName"]
+            == "alpha-engine-research-eval-judge-poll:live"
+        )
+
+    def test_poll_payload_passes_batch_id_and_submit_iso(self, states):
+        payload = states["EvalJudgePoll"]["Parameters"]["Payload"]
+        assert payload["batch_id.$"] == "$.eval_judge_submit.Payload.batch_id"
+        assert payload["submit_iso.$"] == "$.eval_cadence.submit_iso"
+        # 6-hour fail-soft cap matches the Poll Lambda default.
+        assert payload["max_wait_seconds"] == 21600
+
+    def test_poll_decision_ended_routes_to_process(self, states):
+        ended_choice = next(
+            c for c in states["EvalJudgePollDecision"]["Choices"]
+            if "Or" in c and any(
+                clause.get("StringEquals") == "ended"
+                for clause in c["Or"]
+            )
+        )
+        assert ended_choice["Next"] == "EvalJudgeProcess"
+        # ended_empty (synthetic empty-batch sentinel) must converge
+        # to the same Process state — it's not a separate code path
+        # in Process.
+        assert any(
+            clause.get("StringEquals") == "ended_empty"
+            for clause in ended_choice["Or"]
+        )
+
+    def test_poll_decision_max_wait_routes_to_rolling_mean(self, states):
+        max_wait_choice = next(
+            c for c in states["EvalJudgePollDecision"]["Choices"]
+            if c.get("Variable", "").endswith("exceeded_max_wait")
+        )
+        assert max_wait_choice["BooleanEquals"] is True
+        # Fail-soft — Anthropic retains batch results for 29 days, so
+        # operator can re-run Process offline against the same batch_id.
+        assert max_wait_choice["Next"] == "EvalRollingMean"
+
+    def test_poll_decision_default_loops_back_to_wait(self, states):
+        # Continue polling until ended OR max_wait exceeded.
+        assert states["EvalJudgePollDecision"]["Default"] == "EvalJudgePollWait"
+
+
+class TestEvalJudgeProcessContract:
+    def test_invokes_process_lambda_live_alias(self, states):
+        params = states["EvalJudgeProcess"]["Parameters"]
+        assert (
+            params["FunctionName"]
+            == "alpha-engine-research-eval-judge-process:live"
+        )
+
+    def test_payload_carries_batch_id_and_plan_key(self, states):
+        payload = states["EvalJudgeProcess"]["Parameters"]["Payload"]
+        assert payload["batch_id.$"] == "$.eval_judge_submit.Payload.batch_id"
+        assert (
+            payload["plan_s3_key.$"]
+            == "$.eval_judge_submit.Payload.plan_s3_key"
+        )
+
+    def test_process_timeout_matches_lambda_cap(self, states):
+        # Process Lambda has the 15-min ceiling — covers streaming
+        # results + the synchronous Sonnet-escalation tail (typically
+        # 1-3 calls × 5-8s each, well inside the cap).
+        assert states["EvalJudgeProcess"]["TimeoutSeconds"] == 900
+
+    def test_process_routes_to_rolling_mean_on_success(self, states):
+        assert states["EvalJudgeProcess"]["Next"] == "EvalRollingMean"
+
+    def test_process_catch_routes_to_rolling_mean_not_failure(self, states):
+        catch = states["EvalJudgeProcess"]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "EvalRollingMean"
+
+
+# ── Non-blocking failure semantics — preserved across the chain ──────────
+
+
+class TestBatchChainNonBlocking:
+    """Eval is observability per ROADMAP §1635 — every failure surface
+    in the batch chain must converge to EvalRollingMean so the rolling
+    metric still runs against historical data even when the current
+    week's batch fails."""
+
+    @pytest.mark.parametrize(
+        "state_name",
+        [
+            "EvalJudgeSubmitFirstSaturday",
+            "EvalJudgeSubmitWeekly",
+            "EvalJudgePoll",
+            "EvalJudgeProcess",
+        ],
+    )
+    def test_states_all_states_catch_routes_to_rolling_mean(
+        self, states, state_name,
+    ):
         catch = states[state_name]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "EvalRollingMean"
