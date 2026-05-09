@@ -302,10 +302,12 @@ def _assert_no_arctic_regression(
             f"if backfill proceeded. Source data (predictor/price_cache + daily_closes delta) "
             f"ends earlier than what ArcticDB already has. Most common cause: the price cache "
             f"mtime 'current' check skipped the weekly refresh, so the cache lags "
-            f"MorningEnrich/daily_append writes. To recover: run the prices collector with a "
-            f"forced refresh (e.g. delete or touch S3 mtime to invalidate) so the cache "
-            f"includes the prior trading day, then re-invoke backfill. "
-            f"Regressions detected (showing first 10 of {len(regressions)}): {regressions[:10]}"
+            f"MorningEnrich/daily_append writes — and ``_apply_daily_delta`` failed to bridge "
+            f"the gap (e.g. its ``slim_last_date`` was poisoned by a single freshly-refreshed "
+            f"ticker, leaving ``bdate_range`` empty on a Saturday). To recover: redrive the "
+            f"failed SF execution after confirming ``features/compute.py::_apply_daily_delta`` "
+            f"uses ``min(valid_dates)`` so per-ticker mtime variation can't suppress delta "
+            f"loading. Regressions detected (showing first 10 of {len(regressions)}): {regressions[:10]}"
         )
 
     log.info(

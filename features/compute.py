@@ -186,13 +186,24 @@ def _apply_daily_delta(
 
     Returns (updated_price_data, split_tickers).
     """
-    # Find the slim cache's last date (most common across all tickers)
+    # Find the OLDEST ticker's last_date so the delta load covers every
+    # ticker that needs catching up. ``min`` not ``max``: if even one
+    # ticker is freshly refreshed (e.g. ``prices.collect`` flagged a single
+    # stale ticker via mtime check on yfinance refresh), ``max`` would
+    # advance ``slim_last_date`` to that one ticker's end — and on a
+    # Saturday run that's exactly when ``bdate_range(slim_last_date+1,
+    # today)`` yields zero business days, so the loader returns empty and
+    # every OTHER ticker stays stuck at its older cache last_date.
+    # Origin: 2026-05-09 weekly SF — VEEV got refreshed via yfinance to
+    # 5/8, every other parquet ended at 5/6, ``max`` picked 5/8 → today
+    # 5/9 → empty bdate_range → backfill regression preflight failed at
+    # planned=5/6 < existing=5/8 across SPY/VIX/XL*/sampled-universe.
     candidate_dates = [_safe_last_date(df.index) for df in price_data.values()]
     valid_dates = [d for d in candidate_dates if d is not None]
     if not valid_dates:
         return price_data, set()
 
-    slim_last_date = max(valid_dates)
+    slim_last_date = min(valid_dates)
     today = pd.Timestamp(date_str).normalize()
 
     # Load all delta files between slim cache last date and target date
