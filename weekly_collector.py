@@ -973,6 +973,15 @@ def _finalize(
     else:
         results["status"] = "partial"
 
+    # Surface per-collector errors to Flow Doctor's ERROR-level handler.
+    # Without this, the only logger.error() that fires on a partial run is
+    # main()'s generic "non-ok status" summary line — single dedup signature
+    # across every partial run, no diagnose-context error text. The helper
+    # emits one logger.error per error-status entry with the collector name
+    # + original message, restoring per-failure alert granularity.
+    from alpha_engine_lib.collector_results import report_collector_errors
+    report_collector_errors(results["collectors"])
+
     if not dry_run and only is None:
         _write_manifest(bucket, market_prefix, run_date, results)
         _write_validation_json(bucket, market_prefix, run_date, results)
