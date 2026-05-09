@@ -28,6 +28,29 @@ universe_returns:
 daily_closes:
   s3_prefix: staging/daily_closes/
 
+# Chronic polygon coverage gaps — tickers polygon does not reliably serve.
+# MorningEnrich's `_self_heal_chronic_polygon_gaps` step yfinance-backfills
+# any ArcticDB row gap from `last_date+1` to `target_date` for each ticker
+# in this list. Adding a ticker is a deliberate operational decision (it
+# weakens the "no silent fails" stance for that ticker specifically); a
+# follow-up drift alarm flags entries here that start getting polygon
+# coverage so they can be removed. Tickers absent from this list still
+# hard-fail polygon_only when missing — preserves the strict default.
+chronic_polygon_gaps:
+  tickers:
+    BF-B:
+      reason: "Class B share — polygon serves BF.B (dot), our universe uses BF-B (dash)"
+      since: "2025-04-01"
+    BRK-B:
+      reason: "Class B share — polygon serves BRK.B, our universe uses BRK-B"
+      since: "2025-04-01"
+    MOG-A:
+      reason: "Class A share — polygon serves MOG.A, our universe uses MOG-A"
+      since: "2025-04-01"
+    PSTG:
+      reason: "Polygon coverage flaky since ~2026-04 (no clear cause)"
+      since: "2026-04-01"
+
 # Tickers that require a leading caret in yfinance (index/rate tickers)
 # Stored locally WITHOUT the caret (VIX.parquet, not ^VIX.parquet)
 caret_symbols:

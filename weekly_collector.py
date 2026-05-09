@@ -97,6 +97,23 @@ def load_config(path: str = "config.yaml") -> dict:
     )
 
 
+def _load_chronic_polygon_gaps(config: dict) -> list[str]:
+    """Return the sorted list of chronic-polygon-gap tickers from config.
+
+    Empty list when the config section is missing or malformed: the
+    chronic-gap self-heal step then becomes a no-op, preserving the
+    pre-PR strict ``polygon_only`` behavior. Adding/removing a ticker
+    requires a deliberate edit to ``data/config.yaml`` in the
+    alpha-engine-config repo (private), surfaced by drift detection if
+    polygon coverage recovers for an entry.
+    """
+    section = config.get("chronic_polygon_gaps") or {}
+    tickers = section.get("tickers") or {}
+    if not isinstance(tickers, dict):
+        return []
+    return sorted(tickers.keys())
+
+
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     """Run collectors based on mode selection."""
     if getattr(args, "morning_enrich", False):
@@ -508,6 +525,153 @@ def _should_skip_morning_enrich(
     return False, None
 
 
+def _self_heal_chronic_polygon_gaps(
+    bucket: str,
+    target_date: str,
+    chronic_tickers: list[str],
+    dry_run: bool = False,
+) -> dict:
+    """Yfinance-backfill any ArcticDB row gap for chronic-polygon-gap tickers.
+
+    For each ticker in ``chronic_tickers``:
+      1. Read ArcticDB universe ``last_date``.
+      2. If ``last_date >= target_date``, skip (already fresh — common case
+         after the first heal lands).
+      3. Else yfinance-fetch ``[last_date+1, target_date]`` OHLCV.
+      4. Append the new rows to ``predictor/price_cache/{ticker}.parquet``
+         (dedupe by date keep="last" so repeated heals are idempotent).
+      5. Invoke ``builders.backfill(ticker_filter=ticker)`` — reuses the
+         per-ticker compute_features + ArcticDB write path so the new
+         rows get the same feature schema as every other ticker.
+
+    Closes the multi-day rot caused by polygon never serving the chronic
+    gaps + the EOD yfinance pass occasionally dropping a day. Origin:
+    2026-05-09 weekly SF DataPhase1 postflight failure — PSTG ended at
+    5/5 (ArcticDB) vs SPY at 5/8 (3d stale, > 2d threshold), every other
+    chronic ticker at 5/6 (2d, just under threshold). Without this step
+    the only recovery was hand-running a yfinance backfill script.
+
+    Idempotent: tickers already at target_date are skipped, so re-running
+    after a partial completion costs only the freshness reads. Best-effort
+    per-ticker — one ticker's yfinance failure does not block the others.
+
+    Returns a summary dict with per-ticker outcomes; the caller should
+    log it (not raise) so a yfinance hiccup on a chronic gap doesn't
+    halt the whole pipeline. Postflight will catch any remaining staleness
+    via its uniform check.
+    """
+    import io as _io
+
+    import yfinance as _yf
+
+    from store.arctic_store import get_universe_lib
+
+    s3 = boto3.client("s3")
+    universe_lib = get_universe_lib(bucket)
+    target_ts = __import__("pandas").Timestamp(target_date).normalize()
+
+    summary: dict = {
+        "checked": len(chronic_tickers),
+        "healed": [],
+        "skipped_already_fresh": [],
+        "errors": [],
+    }
+
+    if not chronic_tickers:
+        return summary
+
+    import pandas as _pd
+
+    for ticker in chronic_tickers:
+        try:
+            try:
+                df_tail = universe_lib.tail(ticker, n=1).data
+                existing_last = (
+                    _pd.Timestamp(df_tail.index[-1]).normalize()
+                    if df_tail is not None and not df_tail.empty
+                    else None
+                )
+            except Exception:
+                existing_last = None
+
+            if existing_last is not None and existing_last >= target_ts:
+                summary["skipped_already_fresh"].append(
+                    {"ticker": ticker, "last_date": str(existing_last.date())}
+                )
+                continue
+
+            start_ts = (
+                (existing_last + _pd.Timedelta(days=1))
+                if existing_last is not None
+                else (target_ts - _pd.Timedelta(days=30))
+            )
+            end_excl = target_ts + _pd.Timedelta(days=1)
+
+            yf_df = _yf.download(
+                ticker,
+                start=start_ts.strftime("%Y-%m-%d"),
+                end=end_excl.strftime("%Y-%m-%d"),
+                progress=False,
+                auto_adjust=True,
+            )
+            if isinstance(yf_df.columns, _pd.MultiIndex):
+                yf_df.columns = yf_df.columns.get_level_values(0)
+
+            yf_df = yf_df[(yf_df.index >= start_ts) & (yf_df.index <= target_ts)]
+            if yf_df.empty:
+                summary["errors"].append(
+                    {"ticker": ticker, "reason": "yfinance returned no rows in target range"}
+                )
+                continue
+
+            ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
+            new_rows = yf_df[[c for c in ohlcv_cols if c in yf_df.columns]].copy()
+
+            pcache_key = f"predictor/price_cache/{ticker}.parquet"
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=pcache_key)
+                existing_pcache = _pd.read_parquet(_io.BytesIO(obj["Body"].read()))
+            except s3.exceptions.NoSuchKey:
+                existing_pcache = _pd.DataFrame(columns=ohlcv_cols)
+
+            combined_pcache = _pd.concat([existing_pcache, new_rows])
+            combined_pcache = combined_pcache[
+                ~combined_pcache.index.duplicated(keep="last")
+            ].sort_index()
+
+            if not dry_run:
+                buf = _io.BytesIO()
+                combined_pcache.to_parquet(buf, engine="pyarrow", compression="snappy")
+                buf.seek(0)
+                s3.put_object(Bucket=bucket, Key=pcache_key, Body=buf.getvalue())
+
+                from builders.backfill import backfill as _backfill
+                _backfill(bucket=bucket, ticker_filter=ticker, dry_run=False)
+
+            summary["healed"].append(
+                {
+                    "ticker": ticker,
+                    "previous_last_date": (
+                        str(existing_last.date()) if existing_last is not None else None
+                    ),
+                    "rows_added": int(len(new_rows)),
+                    "new_last_date": str(new_rows.index[-1].date()),
+                }
+            )
+            logger.info(
+                "chronic-gap self-heal: %s healed (prev=%s → new=%s, +%d rows)",
+                ticker,
+                existing_last.date() if existing_last is not None else "none",
+                new_rows.index[-1].date(),
+                len(new_rows),
+            )
+        except Exception as exc:
+            logger.exception("chronic-gap self-heal failed for %s", ticker)
+            summary["errors"].append({"ticker": ticker, "reason": str(exc)})
+
+    return summary
+
+
 def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     """Morning polygon enrichment: overwrite the prior trading day's parquet
     + ArcticDB row with polygon's authoritative OHLCV+VWAP.
@@ -720,6 +884,57 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     except Exception as e:
         logger.exception("ArcticDB daily_append (morning enrich) failed for %s", target_date)
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+
+    # ── Chronic-polygon-gap self-heal ────────────────────────────────────────
+    # Yfinance-backfills any ArcticDB universe row gap for the chronic-gap
+    # tickers (BF-B/BRK-B/MOG-A/PSTG by default — see config). Polygon does
+    # not reliably serve these, so the polygon_only daily_append above leaves
+    # them at whatever the prior EOD yfinance pass landed; on days when EOD
+    # also dropped them, the row gap compounds and postflight catches them
+    # as stale. This step closes that loop without weakening polygon_only's
+    # "no silent fails" stance for the other ~900 tickers.
+    #
+    # Best-effort: a yfinance hiccup on one chronic ticker logs + records in
+    # the result but does not halt the morning enrich. Postflight remains
+    # the load-bearing gate on freshness — if a chronic ticker is still
+    # stale after this step, postflight surfaces it.
+    chronic_tickers = _load_chronic_polygon_gaps(config)
+    if chronic_tickers:
+        logger.info("=" * 60)
+        logger.info(
+            "SELF-HEAL: chronic polygon coverage gaps (%d ticker(s): %s)",
+            len(chronic_tickers), ", ".join(chronic_tickers),
+        )
+        logger.info("=" * 60)
+        try:
+            heal_result = _self_heal_chronic_polygon_gaps(
+                bucket=bucket,
+                target_date=target_date,
+                chronic_tickers=chronic_tickers,
+                dry_run=dry_run,
+            )
+            # Always "ok" by design — chronic-gap self-heal is best-effort.
+            # Postflight is the load-bearing gate; if a chronic ticker is
+            # still stale after this step, postflight raises. Marking it
+            # "partial" on per-ticker yfinance failures would halt
+            # MorningEnrich on a transient yfinance hiccup, which would
+            # block the entire weekly pipeline for ~5 ms of yfinance flake.
+            results["collectors"]["chronic_gap_self_heal"] = {
+                "status": "ok",
+                **heal_result,
+            }
+            logger.info(
+                "chronic-gap self-heal: %d healed, %d already-fresh, %d errors",
+                len(heal_result["healed"]),
+                len(heal_result["skipped_already_fresh"]),
+                len(heal_result["errors"]),
+            )
+        except Exception as e:
+            logger.exception("Chronic-gap self-heal step failed for %s", target_date)
+            results["collectors"]["chronic_gap_self_heal"] = {
+                "status": "error",
+                "error": str(e),
+            }
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
