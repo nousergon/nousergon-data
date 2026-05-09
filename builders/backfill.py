@@ -61,6 +61,15 @@ log = logging.getLogger(__name__)
 # centralization" for the full rationale.
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 
+# Per-row data-provenance column (mirrors builders/daily_append.py).
+# Backfill sources rows from ``predictor/price_cache/*.parquet`` (10y
+# yfinance-sourced) plus the daily_closes delta (mixed polygon / yfinance
+# / fred per row). Pre-delta rows default to ``"yfinance"``; delta rows
+# get whatever source the daily_closes parquet recorded. Closes the
+# audit trail of "where did this row's value come from" at row
+# granularity even after a full backfill rewrite.
+PROVENANCE_COL = "source"
+
 
 def _load_current_constituents(s3, bucket: str) -> set[str]:
     """Load the current S&P 500 / 400 constituents set via the
@@ -540,8 +549,24 @@ def backfill(
             if "VWAP" not in featured_df.columns:
                 featured_df["VWAP"] = np.nan
 
-            keep_cols = [c for c in OHLCV_COLS if c in featured_df.columns] + \
-                        [f for f in FEATURES if f in featured_df.columns]
+            # Default provenance: every row in the price_cache + delta
+            # source data is yfinance-origin unless ``_apply_daily_delta``
+            # tagged a row with a different source (polygon / fred from
+            # the daily_closes delta). When the delta loader doesn't
+            # surface a per-row source, the column stays "yfinance" —
+            # the safer over-credit (price_cache parquets ARE yfinance-
+            # sourced; the delta overlay may upgrade specific rows to
+            # "polygon" but the row's underlying provenance origin is
+            # still the yfinance baseline if the delta loader hasn't
+            # tagged it).
+            if PROVENANCE_COL not in featured_df.columns:
+                featured_df[PROVENANCE_COL] = "yfinance"
+
+            keep_cols = (
+                [c for c in OHLCV_COLS if c in featured_df.columns]
+                + [PROVENANCE_COL]
+                + [f for f in FEATURES if f in featured_df.columns]
+            )
             symbol_df = featured_df[keep_cols].copy()
 
             for f in FEATURES:

@@ -51,7 +51,62 @@ from store.parquet_loader import load_parquet_from_s3
 log = logging.getLogger(__name__)
 
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
+
+# Per-row data-provenance column. Set by ``daily_closes.collect`` from the
+# source-mode (`polygon` / `yfinance` / `fred`) per row in the staging
+# parquet, surfaced into ``_load_daily_closes`` records, written into
+# ArcticDB universe rows alongside OHLCV. Closes the audit trail of
+# "where did this row's value come from" at row granularity. Carried as
+# a separate column from OHLCV_COLS because it's a string metadata field,
+# not a numeric one — keeping OHLCV_COLS pure simplifies the rolling-stat
+# and feature-compute call sites that iterate it expecting numerics.
+PROVENANCE_COL = "source"
 PRICE_CACHE_PREFIX = "predictor/price_cache/"
+
+
+def _align_schema_for_update(
+    new_row: pd.DataFrame, existing_series: pd.DataFrame
+) -> pd.DataFrame:
+    """Bridge schema differences between existing ArcticDB series and a new row.
+
+    ArcticDB's ``update()`` requires column-set match between existing series
+    and the row being inserted. When schemas drift across migrations (e.g.
+    the 2026-05-09 provenance ``source`` column added to write paths but
+    not yet present in pre-migration rows), un-aligned schemas cause
+    update() to fail or silently coerce.
+
+    This helper:
+      * Drops columns from ``new_row`` that aren't in ``existing_series``
+        (compatibility mode — daily_append-side writers can carry richer
+        schemas than the still-old existing series; the extra cols get
+        added by the next full backfill write).
+      * Adds NaN columns to ``new_row`` for any columns ``existing_series``
+        has but ``new_row`` doesn't (preserves the existing schema's
+        contract; the next backfill rewrites with proper values).
+      * Reorders to match ``existing_series.columns`` so update() doesn't
+        complain about positional mismatch.
+
+    Idempotent — calling it on already-aligned schemas is a no-op.
+    Used inside ``_write_row_backfill_safe`` so the migration boundary is
+    handled in one place.
+    """
+    if existing_series is None or existing_series.empty:
+        return new_row
+    existing_cols = list(existing_series.columns)
+    if list(new_row.columns) == existing_cols:
+        # Schemas already match — no-op short-circuit so the original
+        # DataFrame reference passes through (preserves mock-call
+        # identity for tests + avoids needless reordering work).
+        return new_row
+    new_cols = set(new_row.columns)
+    extra = new_cols - set(existing_cols)
+    if extra:
+        new_row = new_row.drop(columns=list(extra))
+    missing = [c for c in existing_cols if c not in new_row.columns]
+    if missing:
+        for col in missing:
+            new_row[col] = np.nan
+    return new_row[existing_cols]
 
 
 def _write_row_backfill_safe(
@@ -71,6 +126,12 @@ def _write_row_backfill_safe(
     full rewrite vs. single-row update) but fires only for rare backfill
     operations like the 2026-04-24 historical VWAP repair after the
     polygon outage.
+
+    Schema-bridges via ``_align_schema_for_update`` so writers with newer
+    columns (e.g. provenance ``source`` added 2026-05-09) don't trip
+    ArcticDB's strict-column-match contract on existing pre-migration
+    series. Once a full-series backfill writes the richer schema, all
+    subsequent updates carry the new columns.
     """
     target_ts = new_row.index[0]
 
@@ -88,6 +149,7 @@ def _write_row_backfill_safe(
     if existing_series.empty or target_ts > existing_series.index.max():
         # Append at head — fast path. update() is idempotent for same-date
         # rows (replaces in place rather than appending duplicates).
+        new_row = _align_schema_for_update(new_row, existing_series)
         lib.update(symbol, new_row)
         return "append"
 
@@ -96,6 +158,7 @@ def _write_row_backfill_safe(
     # insertion ("index must be monotonic increasing or decreasing").
     # Same-date rows are deduped with keep="last" so the new row wins
     # over any existing row at target_ts (matches update() semantics).
+    new_row = _align_schema_for_update(new_row, existing_series)
     combined = pd.concat([existing_series, new_row])
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     lib.write(symbol, combined, prune_previous_versions=True)
@@ -336,6 +399,12 @@ def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
     records = {}
     for ticker, row in df.iterrows():
         vwap_raw = row.get("VWAP")
+        # Provenance: per-row data source set by daily_closes.collect
+        # ("polygon" / "yfinance" / "fred"). Surface it on the records dict
+        # so the daily_append per-ticker loop can carry it through to the
+        # ArcticDB universe write — closes the audit trail of "where did
+        # this row's value come from" at row granularity.
+        source_raw = row.get("source")
         records[str(ticker)] = {
             "Open": float(row.get("Open", np.nan)),
             "High": float(row.get("High", np.nan)),
@@ -343,6 +412,7 @@ def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
             "Close": float(row.get("Close", np.nan)),
             "Volume": int(row.get("Volume", 0)),
             "VWAP": float(vwap_raw) if pd.notna(vwap_raw) else np.nan,
+            "source": str(source_raw) if pd.notna(source_raw) else "unknown",
         }
     if not records:
         raise RuntimeError(
@@ -808,8 +878,14 @@ def daily_append(
                 n_skip += 1
                 continue
 
+            new_row_data = {col: bar.get(col, np.nan) for col in OHLCV_COLS}
+            # Carry per-row provenance through to the ArcticDB write. Source
+            # set by daily_closes.collect (polygon / yfinance / fred); falls
+            # through to "unknown" when the staging parquet predates the
+            # provenance migration.
+            new_row_data[PROVENANCE_COL] = bar.get(PROVENANCE_COL, "unknown")
             new_row = pd.DataFrame(
-                [{col: bar.get(col, np.nan) for col in OHLCV_COLS}],
+                [new_row_data],
                 index=pd.DatetimeIndex([today_ts]),
             )
 
@@ -864,11 +940,17 @@ def daily_append(
                         ticker, len(hist), len(parquet_df), len(warmup_source),
                     )
 
-            # Combine warmup OHLCV + today's bar for feature computation
+            # Combine warmup OHLCV + today's bar for feature computation.
+            # Strip the ``source`` provenance metadata from the row going
+            # into ``compute_features`` so that step gets a clean OHLCV
+            # frame; the source value is re-attached to today_row below.
             hist_ohlcv = warmup_source[
                 [c for c in OHLCV_COLS if c in warmup_source.columns]
             ]
-            combined = pd.concat([hist_ohlcv, new_row])
+            new_row_ohlcv = new_row[
+                [c for c in OHLCV_COLS if c in new_row.columns]
+            ]
+            combined = pd.concat([hist_ohlcv, new_row_ohlcv])
             combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
             # Compute features on the combined series. `compute_features`
@@ -912,9 +994,19 @@ def daily_append(
             # a column in the featured frame. Features that failed to
             # compute arrive as NaN and are written as NaN — first-class
             # support for partial coverage.
-            keep_cols = [c for c in OHLCV_COLS if c in featured.columns] + \
-                        [f for f in FEATURES if f in featured.columns]
+            keep_cols = (
+                [c for c in OHLCV_COLS if c in featured.columns]
+                + [f for f in FEATURES if f in featured.columns]
+            )
             today_row = featured.loc[[today_ts], keep_cols].copy()
+            # Pull provenance from the new_row directly rather than relying
+            # on compute_features to preserve non-OHLCV string columns. Even
+            # if compute_features incidentally retains source through its
+            # pipeline today, that's an implementation detail of an
+            # OHLCV-shaped function — sourcing from new_row keeps the
+            # provenance contract decoupled from feature_engineer's column
+            # passthrough behaviour.
+            today_row[PROVENANCE_COL] = new_row.iloc[0][PROVENANCE_COL]
 
             # Per-ticker coverage observability: count NaN features now
             # so the eventual log + counter reflects exactly what's
@@ -934,9 +1026,16 @@ def daily_append(
             # hist.dtypes[col] is authoritative by construction.
             # Feature columns that aren't yet in storage default to
             # float32 — matches the predictor training schema.
+            #
+            # ``source`` is metadata (string), not numeric — skip the
+            # dtype-cast fallback path; if it's already in hist the cast
+            # picks up the existing string dtype, otherwise it stays
+            # object/string (default pandas inference).
             for col in today_row.columns:
                 if col in hist.columns:
                     today_row[col] = today_row[col].astype(hist.dtypes[col])
+                elif col == PROVENANCE_COL:
+                    continue  # string metadata; no float32 fallback
                 elif col in FEATURES:
                     today_row[col] = today_row[col].astype("float32")
 
