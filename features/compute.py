@@ -147,6 +147,12 @@ def _load_delta_from_daily_closes(
         for ticker, row in day_df.iterrows():
             if ticker not in ticker_rows:
                 ticker_rows[ticker] = []
+            # Per-row provenance from the daily_closes parquet's ``source``
+            # column (set by daily_closes.collect to "polygon" / "yfinance"
+            # / "fred"). Surfaced through to the delta merge in
+            # ``_apply_daily_delta`` so downstream ArcticDB writes can
+            # tag each row with where its values came from.
+            src_raw = row.get("source")
             ticker_rows[ticker].append({
                 "date":   pd.Timestamp(d),
                 "Open":   float(row.get("Open", np.nan)),
@@ -154,6 +160,7 @@ def _load_delta_from_daily_closes(
                 "Low":    float(row.get("Low", np.nan)),
                 "Close":  float(row.get("Close", np.nan)),
                 "Volume": int(row.get("Volume", 0)),
+                "source": str(src_raw) if pd.notna(src_raw) else "unknown",
             })
 
     n_tickers = len(ticker_rows)
@@ -219,6 +226,11 @@ def _apply_daily_delta(
     for ticker, slim_df in list(price_data.items()):
         base_cols = ["Open", "High", "Low", "Close", "Volume"]
         base = slim_df[[c for c in base_cols if c in slim_df.columns]].copy()
+        # Tag pre-delta rows as yfinance-origin (price_cache parquets are
+        # yfinance-sourced) so the merged frame carries provenance per
+        # row. Delta rows below override this on overlap via dedup
+        # keep="last".
+        base["source"] = "yfinance"
 
         delta = ticker_rows.get(ticker, [])
         if not delta:
@@ -227,7 +239,13 @@ def _apply_daily_delta(
 
         # Build delta DataFrame with capitalized columns (matches slim cache schema)
         delta_df = pd.DataFrame(
-            [{k: r[k] for k in ["Open", "High", "Low", "Close", "Volume"]} for r in delta],
+            [
+                {
+                    **{k: r[k] for k in ["Open", "High", "Low", "Close", "Volume"]},
+                    "source": r.get("source", "unknown"),
+                }
+                for r in delta
+            ],
             index=pd.DatetimeIndex([r["date"] for r in delta]),
         )
 
