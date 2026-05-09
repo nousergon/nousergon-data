@@ -525,6 +525,112 @@ def _should_skip_morning_enrich(
     return False, None
 
 
+def _detect_chronic_gap_polygon_recovery(
+    bucket: str,
+    target_date: str,
+    chronic_tickers: list[str],
+    daily_closes_prefix: str = "staging/daily_closes/",
+) -> dict:
+    """Drift alarm: detect when polygon STARTS covering a chronic-gap ticker.
+
+    Pairs with ``_self_heal_chronic_polygon_gaps``. The chronic_polygon_gaps
+    allowlist (alpha-engine-config #88) was added because polygon doesn't
+    reliably serve these tickers (BF-B/BRK-B/MOG-A/PSTG today). If polygon
+    coverage recovers — e.g. polygon adds a Berkshire B share class CIK
+    or fixes a flaky data feed — the allowlist entry is no longer needed
+    and should be pruned. Without active drift detection the entry would
+    persist indefinitely as a silent piece of operational debt.
+
+    Reads ``staging/daily_closes/{target_date}.parquet`` written by
+    ``daily_closes.collect(source="polygon_only")`` and counts how many
+    chronic_polygon_gaps tickers polygon DID cover today. Emits a
+    CloudWatch gauge ``AlphaEngine/Data/chronic_gap_polygon_recovery_count``
+    so an alarm can fire if the count > 0 for N consecutive Saturdays
+    (operator action: prune the allowlist entry).
+
+    Best-effort: read errors / metric-emit errors log a warning but never
+    raise — this is observability, not a load-bearing path.
+
+    Returns a summary dict; caller logs at INFO + persists in collector
+    results so the manifest carries a record.
+    """
+    summary: dict = {
+        "status": "ok",
+        "chronic_tickers_checked": len(chronic_tickers),
+        "polygon_recovered": [],
+        "absent_as_expected": [],
+        "errors": [],
+    }
+    if not chronic_tickers:
+        return summary
+
+    import io as _io
+
+    try:
+        s3 = boto3.client("s3")
+        key = f"{daily_closes_prefix.rstrip('/')}/{target_date}.parquet"
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        import pandas as _pd
+        df = _pd.read_parquet(_io.BytesIO(obj["Body"].read()))
+    except Exception as exc:
+        logger.warning(
+            "chronic-gap drift check: could not read staging/daily_closes "
+            "parquet for %s — drift alarm skipped this cycle. %s",
+            target_date, exc,
+        )
+        summary["status"] = "skipped"
+        summary["errors"].append({"reason": str(exc)})
+        return summary
+
+    # Index is ticker (collectors/daily_closes.py:251 sets index=ticker).
+    daily_closes_tickers = (
+        set(df.index.astype(str)) if df.index.size else set()
+    )
+
+    for ticker in chronic_tickers:
+        if ticker in daily_closes_tickers:
+            summary["polygon_recovered"].append(ticker)
+        else:
+            summary["absent_as_expected"].append(ticker)
+
+    n_recovered = len(summary["polygon_recovered"])
+    if n_recovered > 0:
+        logger.warning(
+            "chronic-gap drift detected: polygon now covers %d chronic_polygon_gaps "
+            "ticker(s) it did not previously serve: %s. Consider pruning these from "
+            "alpha-engine-config/predictor.yaml chronic_polygon_gaps.tickers if the "
+            "coverage persists across multiple cycles.",
+            n_recovered, summary["polygon_recovered"],
+        )
+    else:
+        logger.info(
+            "chronic-gap drift: 0 of %d chronic tickers showed up in today's "
+            "polygon_only daily_closes — allowlist still load-bearing.",
+            len(chronic_tickers),
+        )
+
+    # Emit CloudWatch metric — best-effort. Always emits (including 0) so
+    # alarm baselines are continuous; CloudWatch missing-data is harder to
+    # alarm against than a steady 0 stream.
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "chronic_gap_polygon_recovery_count",
+                "Value": float(n_recovered),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "chronic_gap_polygon_recovery_count metric emit failed: %s — "
+            "drift alarm cadence may degrade until next cycle.", exc,
+        )
+
+    return summary
+
+
 def _self_heal_chronic_polygon_gaps(
     bucket: str,
     target_date: str,
@@ -900,6 +1006,25 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     # stale after this step, postflight surfaces it.
     chronic_tickers = _load_chronic_polygon_gaps(config)
     if chronic_tickers:
+        # Drift alarm: detect polygon recovery for chronic tickers (BEFORE
+        # self-heal so the signal is a clean read of what polygon shipped
+        # today, not contaminated by our yfinance backfill). Best-effort,
+        # observability only — never raises.
+        try:
+            drift_result = _detect_chronic_gap_polygon_recovery(
+                bucket=bucket,
+                target_date=target_date,
+                chronic_tickers=chronic_tickers,
+                daily_closes_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
+            )
+            results["collectors"]["chronic_gap_drift_detection"] = drift_result
+        except Exception as e:
+            logger.warning("Chronic-gap drift detection failed (non-blocking): %s", e)
+            results["collectors"]["chronic_gap_drift_detection"] = {
+                "status": "skipped",
+                "error": str(e),
+            }
+
         logger.info("=" * 60)
         logger.info(
             "SELF-HEAL: chronic polygon coverage gaps (%d ticker(s): %s)",
