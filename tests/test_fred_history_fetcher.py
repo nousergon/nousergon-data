@@ -40,10 +40,17 @@ class TestFredHistoryMap:
     def test_hyoas_maps_to_bamlh0a0hym2(self):
         assert FRED_HISTORY_MAP["HYOAS"] == "BAMLH0A0HYM2"
 
+    def test_baa10y_maps_to_baa10y(self):
+        # Stage 2.5c: Moody's BAA Corporate Bond Yield Relative to 10Y
+        # Treasury. Full 40y FRED history (1986+) — full-corpus credit
+        # regime signal that HYOAS cannot provide (license-gated to 2023+).
+        assert FRED_HISTORY_MAP["BAA10Y"] == "BAA10Y"
+
     def test_no_unintended_entries(self):
-        # Stage 2.5b adds exactly TWO + HYOAS. Lock so a future drive-by
-        # addition doesn't slip through unreviewed.
-        assert set(FRED_HISTORY_MAP.keys()) == {"TWO", "HYOAS"}
+        # Stage 2.5b shipped TWO + HYOAS; Stage 2.5c added BAA10Y.
+        # Lock so a future drive-by addition doesn't slip through
+        # unreviewed.
+        assert set(FRED_HISTORY_MAP.keys()) == {"TWO", "HYOAS", "BAA10Y"}
 
 
 # ── fetch_fred_history ──────────────────────────────────────────────────

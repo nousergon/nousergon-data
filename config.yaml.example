@@ -95,7 +95,10 @@ caret_symbols:
 # Always-download tickers (benchmarks, macro, sector ETFs)
 # TWO + HYOAS added 2026-05-10 (Stage 2.5 regime-conditioning rebuild) —
 # FRED-only, no yfinance caret. Forward-only collection from this date;
-# historical backfill is a follow-up PR.
+# historical backfill via collectors/fred_history.py (Stage 2.5b).
+# BAA10Y added 2026-05-10 (Stage 2.5c) — full 40y FRED history (1986+),
+# the credit-regime signal HYOAS can't provide across the full training
+# corpus (HYOAS license-gated to 2023+ on FRED).
 always_download:
   - SPY
   - VIX
@@ -104,6 +107,7 @@ always_download:
   - IRX
   - TWO
   - HYOAS
+  - BAA10Y
   - GLD
   - USO
   - XLK
