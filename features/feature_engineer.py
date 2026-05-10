@@ -53,6 +53,10 @@ FEATURE_CFG: dict = {
     "obv_fast": 5,
     "obv_slow": 20,
     "rsi_slope_window": 5,
+    # v3.2 risk feature windows (Stage 2 of regime-conditioning rebuild)
+    "beta_window": 60,
+    "vol_of_vol_window": 30,
+    "max_drawdown_window": 60,
 }
 
 _FC = FEATURE_CFG
@@ -131,6 +135,21 @@ FEATURES = [
     "intraday_return_5d",
     "dist_from_5d_high",
     "dist_from_20d_high",
+    # v3.2 additions — per-ticker risk features (Stage 2 of regime-
+    # conditioning rebuild). Cross-sectionally varying institutional risk
+    # metrics that capture distinct dimensions LightGBM trees can split on:
+    #   - beta_60d:        market sensitivity (systematic exposure)
+    #   - idio_vol_60d:    residual vol after removing market-beta exposure
+    #                      (idiosyncratic risk)
+    #   - vol_of_vol_30d:  stability of vol regime (regime persistence)
+    #   - max_drawdown_60d: worst peak-to-trough drawdown within 60d window
+    #                      (left-tail risk; distinct from dist_from_52w_high
+    #                      which is current depth-from-rolling-high)
+    "beta_60d",
+    "idio_vol_60d",
+    "vol_of_vol_30d",
+    "max_drawdown_60d",
+    "realized_vol_63d",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer
@@ -485,6 +504,65 @@ def compute_features(
     # realized_vol_20d
     daily_returns = close.pct_change()
     df["realized_vol_20d"] = daily_returns.rolling(_FC["realized_vol_window"]).std() * np.sqrt(_52w)
+
+    # realized_vol_63d — 3-month realized vol (Stage 2 regime-conditioning).
+    # Captures a slower vol regime than 20d. Pair with 20d to give the GBM
+    # a vol-term-structure signal (steep upward slope = vol expansion;
+    # flat / inverted = mean-revert regime).
+    df["realized_vol_63d"] = daily_returns.rolling(63).std() * np.sqrt(_52w)
+
+    # ── v3.2: Per-ticker risk features (Stage 2 regime-conditioning rebuild) ──
+    # Four institutional risk dimensions that capture cross-sectional
+    # variation distinct from the existing volatility features. Each varies
+    # per-ticker on a given date (rank-norm pipeline-compatible) and gives
+    # the volatility GBM new splits the existing 6 vol features can't make.
+    _beta_w = _FC["beta_window"]
+    _vov_w = _FC["vol_of_vol_window"]
+    _mdd_w = _FC["max_drawdown_window"]
+
+    # beta_60d: 60d rolling regression slope of stock log-returns vs SPY
+    # log-returns. Captures systematic market exposure. NaN when no SPY
+    # series available or rolling window is incomplete.
+    log_returns = np.log(close / close.shift(1))
+    if spy_series is not None:
+        spy_aligned_for_beta = spy_series.reindex(df.index).astype(float)
+        spy_log_returns = np.log(spy_aligned_for_beta / spy_aligned_for_beta.shift(1))
+        # rolling cov(stock, spy) / var(spy)
+        rolling_cov = log_returns.rolling(window=_beta_w, min_periods=_beta_w).cov(spy_log_returns)
+        rolling_spy_var = spy_log_returns.rolling(window=_beta_w, min_periods=_beta_w).var()
+        df["beta_60d"] = (rolling_cov / rolling_spy_var.replace(0, float("nan"))).astype(float)
+    else:
+        df["beta_60d"] = float("nan")
+
+    # idio_vol_60d: residual vol after removing market-beta exposure.
+    # residual = stock_log_return - beta * spy_log_return; std × sqrt(252).
+    # Captures idiosyncratic risk.
+    if spy_series is not None:
+        residual_returns = log_returns - df["beta_60d"] * spy_log_returns
+        df["idio_vol_60d"] = (
+            residual_returns.rolling(window=_beta_w, min_periods=_beta_w).std()
+            * np.sqrt(_52w)
+        ).astype(float)
+    else:
+        df["idio_vol_60d"] = float("nan")
+
+    # vol_of_vol_30d: 30d rolling stdev of realized_vol_20d. Captures the
+    # stability of the vol regime — a stock whose realized vol oscillates
+    # carries different risk than one whose vol is stable.
+    df["vol_of_vol_30d"] = df["realized_vol_20d"].rolling(
+        window=_vov_w, min_periods=_vov_w,
+    ).std()
+
+    # max_drawdown_60d: worst peak-to-trough drawdown WITHIN the trailing
+    # 60d window. Distinct from dist_from_52w_high (current depth from
+    # rolling-252-high): captures the deepest historical drawdown that
+    # occurred during the recent 60d, even if the stock has since
+    # recovered. Always non-positive.
+    rolling_max_60 = close.rolling(window=_mdd_w, min_periods=_mdd_w).max()
+    drawdown_series = (close / rolling_max_60) - 1.0
+    df["max_drawdown_60d"] = drawdown_series.rolling(
+        window=_mdd_w, min_periods=_mdd_w,
+    ).min()
 
     # volume_trend
     _vf = _FC["volume_fast"]
