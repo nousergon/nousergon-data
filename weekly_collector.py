@@ -333,11 +333,13 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         sr_db_path = db_path
         if sr_db_path:
             try:
+                sr_cfg = config.get("signal_returns") or {}
                 sr_result = signal_returns.collect(
                     bucket=bucket,
                     db_path=sr_db_path,
                     signals_prefix=ur_cfg.get("signals_prefix", "signals"),
                     dry_run=dry_run,
+                    forward_days=int(sr_cfg.get("forward_days", 21)),
                 )
                 results["collectors"]["signal_returns"] = sr_result
             except Exception as e:
