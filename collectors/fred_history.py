@@ -45,7 +45,17 @@ _FRED_TIMEOUT = 30  # longer than _fred_latest's 15s — date-range responses ar
 # impact daily_closes' single-latest fetch behaviour.
 FRED_HISTORY_MAP: dict[str, str] = {
     "TWO": "DGS2",
+    # ICE BofA US HY Index OAS — only 3y of FRED public history (2023+),
+    # license-restricted. Forward observation grows; recent walk-forward
+    # folds get HY-specific regime conditioning.
     "HYOAS": "BAMLH0A0HYM2",
+    # Moody's BAA Corporate Bond Yield Relative to 10Y Treasury — full
+    # 40y FRED history (1986+), daily, percent. Captures the credit-
+    # regime signal across the full predictor training corpus that
+    # HYOAS can't (BAMLH0A0HYM2 is licence-gated to 2023+ on FRED).
+    # BBB-rated spread vs HY's below-BBB; both belong in the institutional
+    # credit-regime feature set per AQR/Two Sigma factor models.
+    "BAA10Y": "BAA10Y",
 }
 
 

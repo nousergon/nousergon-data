@@ -34,23 +34,31 @@ class TestFredIndexMapAdditions:
         # vol spikes in many cycles.
         assert _FRED_INDEX_MAP.get("HYOAS") == "BAMLH0A0HYM2"
 
+    def test_baa10y_maps_to_baa10y(self):
+        # Stage 2.5c: Moody's BAA Corporate Bond Yield Relative to 10Y
+        # Treasury — full 40y FRED history (1986+), the credit-regime
+        # signal HYOAS cannot provide across the full predictor training
+        # corpus.
+        assert _FRED_INDEX_MAP.get("BAA10Y") == "BAA10Y"
+
     def test_existing_mappings_unchanged(self):
-        # Regression: ensure the Stage 2.5 additions didn't perturb the
-        # existing mappings.
+        # Regression: ensure the additions didn't perturb the existing
+        # mappings.
         assert _FRED_INDEX_MAP["VIX"] == "VIXCLS"
         assert _FRED_INDEX_MAP["VIX3M"] == "VXVCLS"
         assert _FRED_INDEX_MAP["TNX"] == "DGS10"
         assert _FRED_INDEX_MAP["IRX"] == "DTB3"
 
     def test_no_yfinance_caret_for_fred_only_symbols(self):
-        # TWO and HYOAS are FRED-only — no yfinance caret prefix should
-        # be configured for them. Verifies the integration path
-        # routes them through FRED fallback only.
+        # TWO, HYOAS, BAA10Y are FRED-only — no yfinance caret prefix.
+        # Verifies the integration path routes them through FRED fallback only.
         from collectors.prices import _CARET_SYMBOLS
         assert "TWO" not in _CARET_SYMBOLS
         assert "HYOAS" not in _CARET_SYMBOLS
+        assert "BAA10Y" not in _CARET_SYMBOLS
 
     def test_index_map_total_size(self):
-        # Stage 2.5 adds exactly 2 entries — TWO + HYOAS. Lock so a
-        # future drive-by addition doesn't slip through unreviewed.
-        assert len(_FRED_INDEX_MAP) == 6
+        # Stage 2.5 (TWO + HYOAS) + 2.5c (BAA10Y) add 3 entries on top of
+        # the original 4 (VIX/VIX3M/TNX/IRX). Lock so a future drive-by
+        # addition doesn't slip through unreviewed.
+        assert len(_FRED_INDEX_MAP) == 7

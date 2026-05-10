@@ -81,6 +81,12 @@ _FRED_INDEX_MAP = {
     # spikes in many cycles, and stays wide during recoveries when vol
     # has already calmed. Institutional risk-factor models include it.
     "HYOAS": "BAMLH0A0HYM2",
+    # Moody's BAA Corporate Bond Yield Relative to 10Y Treasury, percent.
+    # Full 40y FRED history (1986+) — the credit-regime signal HYOAS can't
+    # provide across the full predictor training corpus (HYOAS is license-
+    # gated to 2023+ on FRED). BBB-rated spread vs HY's below-BBB; both
+    # belong in the institutional credit-regime feature set.
+    "BAA10Y": "BAA10Y",
 }
 
 
