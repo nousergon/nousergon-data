@@ -82,6 +82,13 @@ def collect(
     # Step 2: Backfill score_performance returns via universe_returns JOIN
     results["backfill_score_returns"] = _backfill_score_returns(db_path, dry_run)
 
+    # Step 2b: Drift gate — emit canonical-context coverage as a CW gauge
+    # so an alarm fires if the producer ever regresses (e.g. signals.json
+    # shape drift, seed-path bug, schema migration skew). Closes the loop
+    # on the 2026-05-09 producer-side bug class.
+    if not dry_run:
+        results["context_coverage_drift"] = _emit_context_coverage_metric(db_path)
+
     # Step 3: Seed predictor_outcomes
     results["seed_predictor_outcomes"] = _seed_predictor_outcomes(
         s3, bucket, db_path, dry_run,
@@ -669,6 +676,118 @@ def _ensure_predictor_outcomes_schema(conn) -> None:
         if col not in cols:
             conn.execute(f"ALTER TABLE predictor_outcomes ADD COLUMN {col} {col_type}")
     conn.commit()
+
+
+# Canonical context columns the producer-side seed must populate.
+# Source of truth for the drift-gate query; mirrors the columns added by
+# alpha-engine-research migration #12 (calibrator-v1 context).
+_CANONICAL_CONTEXT_COLUMNS = (
+    "quant_score",
+    "qual_score",
+    "conviction",
+    "sector_modifier",
+    "market_regime",
+)
+
+# Effective date for the drift gate — first Saturday SF run AFTER this PR
+# merges. Rows with `score_date >= _DRIFT_EFFECTIVE_DATE` are counted
+# against the producer's coverage contract. Pre-cutover rows are excluded
+# so the gate isn't polluted by legacy NULLs the backfill step is still
+# catching up on.
+_DRIFT_EFFECTIVE_DATE = "2026-05-17"
+
+
+def _emit_context_coverage_metric(db_path: str) -> dict:
+    """Drift-detection CloudWatch gauge for the canonical-context contract.
+
+    Producer-side: after seed + backfill complete, query score_performance
+    for rows with score_date >= _DRIFT_EFFECTIVE_DATE and compute the
+    percentage that have ALL 5 canonical context columns populated
+    (non-NULL). Emit as ``AlphaEngine/Data/score_performance_canonical_coverage_pct``
+    so an alarm can fire if the percentage drops below the contract
+    threshold for any cycle.
+
+    Always emits (including 100.0) so alarm baselines are continuous;
+    CloudWatch missing-data is harder to alarm against than a steady
+    series. Best-effort: read / metric-emit errors log a warning but
+    never raise — this is observability, not a load-bearing path.
+
+    Mirrors the chronic-gap drift detection pattern at
+    weekly_collector.py:_check_chronic_gap_polygon_recovery.
+    """
+    summary: dict = {"status": "ok"}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM score_performance WHERE score_date >= ?",
+                (_DRIFT_EFFECTIVE_DATE,),
+            ).fetchone()[0]
+            if total == 0:
+                # Pre-cutover, or no new data this cycle. Coverage is
+                # undefined; report 100.0 so the alarm doesn't fire on a
+                # legitimately-empty window.
+                summary.update(
+                    rows_post_cutoff=0,
+                    rows_fully_populated=0,
+                    coverage_pct=100.0,
+                    note="no rows past effective_date — coverage undefined",
+                )
+            else:
+                null_clause = " OR ".join(
+                    f"{col} IS NULL" for col in _CANONICAL_CONTEXT_COLUMNS
+                )
+                nulls = conn.execute(
+                    f"SELECT COUNT(*) FROM score_performance "
+                    f"WHERE score_date >= ? AND ({null_clause})",
+                    (_DRIFT_EFFECTIVE_DATE,),
+                ).fetchone()[0]
+                populated = total - nulls
+                coverage_pct = (populated / total) * 100.0
+                summary.update(
+                    rows_post_cutoff=total,
+                    rows_fully_populated=populated,
+                    coverage_pct=round(coverage_pct, 2),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "context_coverage_metric: DB read failed — drift alarm "
+            "cadence may degrade until next cycle. %s", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+        return summary
+
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "score_performance_canonical_coverage_pct",
+                "Value": float(summary["coverage_pct"]),
+                "Unit": "Percent",
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "score_performance_canonical_coverage_pct metric emit failed: "
+            "%s — drift alarm cadence may degrade until next cycle.", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+
+    if summary["status"] == "ok" and summary.get("coverage_pct", 100.0) < 100.0:
+        logger.warning(
+            "Canonical context coverage drift: %.2f%% (%d/%d post-%s rows "
+            "fully populated). Expected 100%%. Producer-side regression — "
+            "investigate _seed_score_performance / signals.json shape.",
+            summary["coverage_pct"], summary["rows_fully_populated"],
+            summary["rows_post_cutoff"], _DRIFT_EFFECTIVE_DATE,
+        )
+
+    return summary
 
 
 def _list_signal_dates(s3, bucket: str, prefix: str) -> list[str]:

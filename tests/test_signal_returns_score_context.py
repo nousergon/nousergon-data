@@ -25,7 +25,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from collectors.signal_returns import (
+    _CANONICAL_CONTEXT_COLUMNS,
+    _DRIFT_EFFECTIVE_DATE,
     _backfill_score_context,
+    _emit_context_coverage_metric,
     _ensure_score_performance_schema,
     _extract_signal_context,
     _seed_score_performance,
@@ -310,3 +313,119 @@ class TestEnsureScorePerformanceSchema:
         for canonical_col in ("quant_score", "qual_score", "conviction",
                               "sector_modifier", "market_regime"):
             assert canonical_col in cols, f"missing {canonical_col}"
+
+
+# ── _emit_context_coverage_metric — producer-side drift gate ─────────────────
+
+
+class TestEmitContextCoverageMetric:
+    """The CW gauge AlphaEngine/Data/score_performance_canonical_coverage_pct
+    is the runtime drift detector. Contract: every row written with
+    score_date >= _DRIFT_EFFECTIVE_DATE must have ALL 5 canonical context
+    columns populated. Coverage_pct drops below 100 → alarm fires."""
+
+    def _seed_row(self, db, symbol, score_date, **extras):
+        with sqlite3.connect(db) as conn:
+            _ensure_score_performance_schema(conn)
+            cols = ["symbol", "score_date", "score", "price_on_date", *extras.keys()]
+            vals = [symbol, score_date, 78.0, 200.0, *extras.values()]
+            placeholders = ", ".join("?" for _ in cols)
+            conn.execute(
+                f"INSERT INTO score_performance ({', '.join(cols)}) VALUES ({placeholders})",
+                vals,
+            )
+            conn.commit()
+
+    def test_full_coverage_emits_100(self, tmp_db, monkeypatch):
+        ctx = dict(quant_score=80.0, qual_score=72.0, conviction="rising",
+                   sector_modifier=1.05, market_regime="bull")
+        self._seed_row(tmp_db, "AAPL", _DRIFT_EFFECTIVE_DATE, **ctx)
+        self._seed_row(tmp_db, "MSFT", _DRIFT_EFFECTIVE_DATE, **ctx)
+
+        cw = MagicMock()
+        monkeypatch.setattr("collectors.signal_returns.boto3.client",
+                            lambda svc: cw if svc == "cloudwatch" else MagicMock())
+
+        out = _emit_context_coverage_metric(tmp_db)
+        assert out["status"] == "ok"
+        assert out["coverage_pct"] == 100.0
+        assert out["rows_post_cutoff"] == 2
+        assert out["rows_fully_populated"] == 2
+
+        cw.put_metric_data.assert_called_once()
+        call = cw.put_metric_data.call_args
+        assert call.kwargs["Namespace"] == "AlphaEngine/Data"
+        metric = call.kwargs["MetricData"][0]
+        assert metric["MetricName"] == "score_performance_canonical_coverage_pct"
+        assert metric["Value"] == 100.0
+        assert metric["Unit"] == "Percent"
+
+    def test_partial_coverage_emits_below_100(self, tmp_db, monkeypatch):
+        full_ctx = dict(quant_score=80.0, qual_score=72.0, conviction="rising",
+                        sector_modifier=1.05, market_regime="bull")
+        partial_ctx = dict(quant_score=80.0)  # missing 4 fields
+        self._seed_row(tmp_db, "AAPL", _DRIFT_EFFECTIVE_DATE, **full_ctx)
+        self._seed_row(tmp_db, "MSFT", _DRIFT_EFFECTIVE_DATE, **partial_ctx)
+
+        cw = MagicMock()
+        monkeypatch.setattr("collectors.signal_returns.boto3.client",
+                            lambda svc: cw if svc == "cloudwatch" else MagicMock())
+
+        out = _emit_context_coverage_metric(tmp_db)
+        assert out["coverage_pct"] == 50.0
+        assert out["rows_post_cutoff"] == 2
+        assert out["rows_fully_populated"] == 1
+
+    def test_pre_cutover_rows_excluded_from_gate(self, tmp_db, monkeypatch):
+        """Legacy NULL rows seeded before the producer fix must not pollute
+        the drift gauge — the gauge is forward-looking."""
+        # Row pre-effective-date with all NULLs — must not count against coverage
+        self._seed_row(tmp_db, "AAPL", "2026-04-01")  # no canonical kwargs
+        # Row post-effective-date with full context
+        full_ctx = dict(quant_score=80.0, qual_score=72.0, conviction="rising",
+                        sector_modifier=1.05, market_regime="bull")
+        self._seed_row(tmp_db, "MSFT", _DRIFT_EFFECTIVE_DATE, **full_ctx)
+
+        cw = MagicMock()
+        monkeypatch.setattr("collectors.signal_returns.boto3.client",
+                            lambda svc: cw if svc == "cloudwatch" else MagicMock())
+
+        out = _emit_context_coverage_metric(tmp_db)
+        assert out["rows_post_cutoff"] == 1
+        assert out["coverage_pct"] == 100.0
+
+    def test_empty_post_cutoff_reports_100(self, tmp_db, monkeypatch):
+        """No rows past effective_date — coverage undefined, report 100
+        so the alarm doesn't fire on a legitimately-empty window."""
+        cw = MagicMock()
+        monkeypatch.setattr("collectors.signal_returns.boto3.client",
+                            lambda svc: cw if svc == "cloudwatch" else MagicMock())
+
+        out = _emit_context_coverage_metric(tmp_db)
+        assert out["rows_post_cutoff"] == 0
+        assert out["coverage_pct"] == 100.0
+        assert "no rows past effective_date" in out["note"]
+
+    def test_metric_emit_failure_is_non_fatal(self, tmp_db, monkeypatch):
+        """CW throttling / network errors must not break the collector."""
+        full_ctx = dict(quant_score=80.0, qual_score=72.0, conviction="rising",
+                        sector_modifier=1.05, market_regime="bull")
+        self._seed_row(tmp_db, "AAPL", _DRIFT_EFFECTIVE_DATE, **full_ctx)
+
+        cw = MagicMock()
+        cw.put_metric_data.side_effect = RuntimeError("CW throttled")
+        monkeypatch.setattr("collectors.signal_returns.boto3.client",
+                            lambda svc: cw if svc == "cloudwatch" else MagicMock())
+
+        out = _emit_context_coverage_metric(tmp_db)
+        assert out["status"] == "skipped"
+        assert "CW throttled" in out["error"]
+
+    def test_canonical_columns_constant_matches_seed_insert(self):
+        """Tripwire: if someone adds a 6th canonical column to the seed
+        INSERT they must also add it here, or the drift gate becomes
+        blind to that field's NULLs."""
+        assert set(_CANONICAL_CONTEXT_COLUMNS) == {
+            "quant_score", "qual_score", "conviction",
+            "sector_modifier", "market_regime",
+        }
