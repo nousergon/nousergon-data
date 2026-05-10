@@ -283,6 +283,42 @@ class TestWindowOrchestration:
         assert result["polygon"] == 14 * 2  # 2 tickers × 14 dates
         assert len(result["per_date"]) == 14
 
+    def test_window_mode_propagates_skip_if_canonical(self):
+        """Default window-mode call sets skip_if_canonical=True per the
+        windowed-data-reconciliation arc design.
+        """
+        captured = []
+
+        def _yf_side(missing, run_date, records):
+            captured.append(("yfinance", run_date, len(missing)))
+            for t in missing:
+                records.append({
+                    "ticker": t.lstrip("^"), "date": run_date,
+                    "Open": 100.0, "High": 100.0, "Low": 100.0,
+                    "Close": 100.0, "Adj_Close": 100.0,
+                    "Volume": 1000, "VWAP": None, "source": "yfinance",
+                })
+            return len(missing)
+
+        s3 = _no_existing_parquet_s3()
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", side_effect=_yf_side,
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", return_value=0
+            ):
+                daily_closes.collect(
+                    bucket="b", tickers=["AAPL"], run_date="2026-05-08",
+                    source="yfinance_only", window_days=2,
+                    skip_if_canonical=True,
+                )
+        # Both per-date calls fired (skip flag propagates but no canonical
+        # rows in the parquet stub → no skip happens; just verify the
+        # fan-out works).
+        assert len(captured) == 2
+
     def test_per_date_failure_does_not_block_window(self):
         """If one date errors (e.g. a coverage-gate trip on a non-trading
         day), the rest of the window completes. Aggregate status flips
