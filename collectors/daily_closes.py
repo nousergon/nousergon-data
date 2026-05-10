@@ -126,6 +126,7 @@ def collect(
     dry_run: bool = False,
     source: str = "auto",
     window_days: int = 1,
+    skip_if_canonical: bool = False,
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -148,8 +149,37 @@ def collect(
                 and call this collector once per date. Polygon stays bounded
                 at ``window_days`` ``grouped-daily`` calls in total — one
                 per date — which is the only way to honor the free-tier
-                rate limit. Per-cell skip-if-canonical logic for cost
-                minimization on yfinance is a follow-up PR.
+                rate limit. Window-mode callers are also expected to set
+                ``skip_if_canonical=True`` so steady-state yfinance batch
+                cost stays near zero (most cells already have an
+                authoritative source from prior pass days).
+        skip_if_canonical: bool = False
+                When True, the per-date fetch reads the existing
+                ``staging/daily_closes/{date}.parquet`` (if any), extracts
+                the set of "canonical" tickers (rows where
+                ``source ∈ {"yfinance", "polygon"}`` AND ``Close`` is not
+                null), and skips fetching those tickers from yfinance.
+                Existing canonical rows are then merged into the output
+                parquet. Implements the source-precedence-ladder skip-set
+                semantic from the windowed-data-reconciliation arc:
+
+                  - ``yfinance_only`` mode: skips canonical tickers (any
+                    source already populated), so yfinance only fetches
+                    cells that are NaN. Coverage gate evaluates the
+                    merged-output denominator (existing canonical rows
+                    contribute as if freshly fetched).
+                  - ``polygon_only`` mode: flag is *ignored*. Per
+                    2026-05-10 design decision (option a) polygon always
+                    re-overwrites within the window — this catches
+                    corporate-action backfills that retroactively shift
+                    polygon's adjusted close. The 14/day grouped-daily
+                    contract still holds because polygon makes one call
+                    per date in the window regardless of skip behavior.
+                  - ``auto`` mode: flag applied to the yfinance step
+                    only; polygon step always runs.
+
+                Default False preserves legacy single-date overwrite
+                semantics for non-window callers.
 
     Returns:
         Single-date mode (``window_days=1``): dict with ``status``,
@@ -186,6 +216,7 @@ def collect(
             dry_run=dry_run,
             source=source,
             window_days=window_days,
+            skip_if_canonical=skip_if_canonical,
         )
 
     s3 = boto3.client("s3")
@@ -198,6 +229,14 @@ def collect(
     # Skip-on-exists short-circuit (yfinance_only + auto only) returns inside
     # the live branch since dry_run by definition isn't going to write.
     existing_close_for_discrepancy: dict[str, float] | None = None
+    # When skip_if_canonical=True, ``canonical_existing_rows`` carries
+    # the records dicts for tickers in the existing parquet that already
+    # have an authoritative source (yfinance / polygon) and a non-null
+    # Close. They get merged into the output records before write so
+    # the parquet preserves prior canonical state across the window
+    # scan. Empty when skip_if_canonical=False (legacy overwrite path).
+    canonical_existing_rows: list[dict] = []
+    canonical_skip_set: set[str] = set()
     from botocore.exceptions import ClientError
     head = None
     try:
@@ -235,6 +274,49 @@ def collect(
                     "(%s) — proceeding with overwrite without discrepancy comparison",
                     exc,
                 )
+        elif skip_if_canonical:
+            # yfinance_only / auto + skip_if_canonical=True: read the
+            # full parquet, extract canonical rows so they survive into
+            # the merged output. Bypass the post-close-skip short-circuit
+            # below — the whole point of windowed reconciliation is to
+            # fill NaN cells in older dates that legacy logic would skip.
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                existing_df = pd.read_parquet(
+                    io.BytesIO(obj["Body"].read()), engine="pyarrow",
+                )
+                if "source" in existing_df.columns:
+                    for t in existing_df.index:
+                        row = existing_df.loc[t]
+                        row_source = row.get("source")
+                        row_close = row.get("Close")
+                        if (
+                            row_source in ("yfinance", "polygon")
+                            and pd.notna(row_close)
+                        ):
+                            canonical_skip_set.add(str(t))
+                            preserved = {"ticker": str(t)}
+                            preserved.update(row.to_dict())
+                            canonical_existing_rows.append(preserved)
+                logger.info(
+                    "[skip_if_canonical] %s: %d existing canonical "
+                    "tickers will be preserved; yfinance fetch reduced "
+                    "to %d non-canonical",
+                    run_date, len(canonical_skip_set),
+                    len(tickers) - len(canonical_skip_set),
+                )
+            except Exception as exc:
+                # Read failure → fall back to legacy overwrite (existing
+                # parquet is opaque to us; safer to refetch than to lose
+                # data preservation invariant silently).
+                logger.warning(
+                    "[skip_if_canonical] %s: failed to read existing "
+                    "parquet (%s) — falling back to legacy refetch + "
+                    "overwrite for this date",
+                    run_date, exc,
+                )
+                canonical_skip_set = set()
+                canonical_existing_rows = []
         elif not dry_run and _is_post_close_write(last_modified, run_date):
             logger.info(
                 "Daily closes already exist for %s (post-close at %s, source=%s) — skipping",
@@ -281,9 +363,39 @@ def collect(
     # 2026-04-17 → 2026-04-23 VWAP=None contamination.
     captured_tickers = {r["ticker"] for r in records}
     missing = [t for t in tickers if t.lstrip("^") not in captured_tickers]
+    # When skip_if_canonical=True (yfinance_only / auto window mode), drop
+    # tickers that already have an authoritative source in the existing
+    # parquet — those rows will be merged from ``canonical_existing_rows``
+    # before write, so refetching them would just churn API budget.
+    if canonical_skip_set:
+        before = len(missing)
+        missing = [t for t in missing if t.lstrip("^") not in canonical_skip_set]
+        logger.info(
+            "[skip_if_canonical] %s: yfinance fetch list %d → %d "
+            "(skipped %d canonical)",
+            run_date, before, len(missing), before - len(missing),
+        )
     yfinance_count = 0
     if missing and source != "polygon_only":
         yfinance_count = _fetch_yfinance_closes(missing, run_date, records)
+
+    # Merge preserved canonical rows from the existing parquet into the
+    # records list. These are tickers we deliberately skipped fetching
+    # — they survive into the output unchanged. Polygon-only mode has
+    # ``canonical_existing_rows`` empty by construction (skip flag
+    # ignored per option (a)), so the legacy overwrite path is preserved.
+    if canonical_existing_rows:
+        already_captured = {r["ticker"] for r in records}
+        merged_in = 0
+        for row in canonical_existing_rows:
+            if row["ticker"] not in already_captured:
+                records.append(row)
+                merged_in += 1
+        logger.info(
+            "[skip_if_canonical] %s: merged %d preserved canonical rows "
+            "into output records",
+            run_date, merged_in,
+        )
 
     # ── Coverage gates — per-mode hard-fails ─────────────────────────────────
     n_stock_tickers = sum(1 for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP)
@@ -374,6 +486,7 @@ def _collect_window(
     dry_run: bool,
     source: str,
     window_days: int,
+    skip_if_canonical: bool = False,
 ) -> dict:
     """Iterate ``collect`` over a backward-looking business-day window.
 
@@ -386,11 +499,13 @@ def _collect_window(
 
     Polygon call rate is bounded at ``window_days`` ``grouped-daily``
     calls total — one per date — which is the contract the free-tier
-    rate limit requires. Per-cell skip-if-canonical (skipping yfinance
-    fetches for cells that already carry an authoritative source) is a
-    follow-up PR; this PR's value is purely the structural window
-    orchestration so the SF wiring can flip ``window_days=14`` once the
-    rest of the arc lands.
+    rate limit requires.
+
+    ``skip_if_canonical=True`` propagates to every per-date call so the
+    yfinance side skips tickers that already have an authoritative
+    source in the existing parquet — keeps steady-state yfinance batch
+    cost near zero across the window. Polygon side ignores the flag
+    (option a, always overwrites).
 
     Returns an aggregate dict; see ``collect`` docstring's "Window mode"
     return-shape section for the schema.
@@ -420,6 +535,7 @@ def _collect_window(
                 dry_run=dry_run,
                 source=source,
                 window_days=1,
+                skip_if_canonical=skip_if_canonical,
             )
         except Exception as exc:
             # Per-date failures don't kill the rest of the window; record
