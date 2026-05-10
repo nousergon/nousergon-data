@@ -61,6 +61,7 @@ class TestFeatureSchema:
     def test_new_risk_features_in_features_list(self):
         for name in (
             "beta_60d", "idio_vol_60d", "vol_of_vol_30d", "max_drawdown_60d",
+            "realized_vol_63d",
         ):
             assert name in FEATURES, f"{name} missing from FEATURES list"
 
@@ -70,6 +71,7 @@ class TestFeatureSchema:
         out = compute_features(df, spy_series=spy)
         for name in (
             "beta_60d", "idio_vol_60d", "vol_of_vol_30d", "max_drawdown_60d",
+            "realized_vol_63d",
         ):
             assert name in out.columns
 
@@ -169,6 +171,37 @@ class TestVolOfVol30d:
         out = compute_features(df, spy_series=_synthetic_spy(n=400))
         finite = out["vol_of_vol_30d"].dropna()
         assert (finite >= 0).all()
+
+
+# ── realized_vol_63d ──────────────────────────────────────────────────
+
+
+class TestRealizedVol63d:
+
+    def test_realized_vol_63d_finite_after_warmup(self):
+        df = _synthetic_ohlcv(n=200)
+        out = compute_features(df, spy_series=_synthetic_spy(n=200))
+        # Warmup is 63 days; finite from index 63 onward.
+        assert np.isfinite(out["realized_vol_63d"].iloc[-1])
+        assert pd.isna(out["realized_vol_63d"].iloc[30])
+
+    def test_realized_vol_63d_nonnegative(self):
+        df = _synthetic_ohlcv(n=300)
+        out = compute_features(df, spy_series=_synthetic_spy(n=300))
+        finite = out["realized_vol_63d"].dropna()
+        assert (finite >= 0).all()
+
+    def test_realized_vol_63d_smoother_than_20d(self):
+        # 63d window is wider → vol estimate is more stable across time
+        # than 20d. Loose check: stdev of the 63d series across its
+        # finite range should be lower than stdev of the 20d series over
+        # the same range. Stochastic, generous tolerance.
+        df = _synthetic_ohlcv(n=400, seed=42)
+        out = compute_features(df, spy_series=_synthetic_spy(n=400))
+        # Compare on the slice where both are finite.
+        rv20 = out["realized_vol_20d"].iloc[63:].dropna()
+        rv63 = out["realized_vol_63d"].iloc[63:].dropna()
+        assert rv63.std() < rv20.std()
 
 
 # ── max_drawdown_60d ──────────────────────────────────────────────────

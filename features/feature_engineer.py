@@ -149,6 +149,7 @@ FEATURES = [
     "idio_vol_60d",
     "vol_of_vol_30d",
     "max_drawdown_60d",
+    "realized_vol_63d",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer
@@ -503,6 +504,12 @@ def compute_features(
     # realized_vol_20d
     daily_returns = close.pct_change()
     df["realized_vol_20d"] = daily_returns.rolling(_FC["realized_vol_window"]).std() * np.sqrt(_52w)
+
+    # realized_vol_63d — 3-month realized vol (Stage 2 regime-conditioning).
+    # Captures a slower vol regime than 20d. Pair with 20d to give the GBM
+    # a vol-term-structure signal (steep upward slope = vol expansion;
+    # flat / inverted = mean-revert regime).
+    df["realized_vol_63d"] = daily_returns.rolling(63).std() * np.sqrt(_52w)
 
     # ── v3.2: Per-ticker risk features (Stage 2 regime-conditioning rebuild) ──
     # Four institutional risk dimensions that capture cross-sectional
