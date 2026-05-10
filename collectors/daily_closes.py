@@ -40,7 +40,7 @@ import io
 import logging
 import os
 import time
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -87,6 +87,37 @@ _DISCREPANCY_WARN_PCT = 0.01    # |polygon_close - yfinance_close| / yfinance_cl
 _DISCREPANCY_ERROR_PCT = 0.05
 
 
+def _previous_business_days(run_date: str, n: int) -> list[str]:
+    """Return ``n`` business days ending on ``run_date`` (inclusive),
+    newest first. ``n=1`` returns the most-recent business day at or
+    before ``run_date``.
+
+    Used by :func:`collect` in window-scan mode to enumerate the dates
+    each pass will reconcile. Polygon's free-tier rate-limit is honored
+    by the caller — one ``grouped-daily`` call per date in the returned
+    list, total ``n`` polygon calls regardless of universe size.
+
+    Saturday / Sunday ``run_date`` walks back to the prior Friday before
+    starting the window, so a Sat SF firing at 02:00 PT doesn't burn a
+    slot on a non-trading day. NYSE holiday handling lives downstream —
+    holidays return zero rows from polygon and an empty yfinance batch,
+    which the per-date skip logic handles gracefully.
+    """
+    if n < 1:
+        raise ValueError(f"window n must be >= 1, got {n}")
+    cur = datetime.strptime(run_date, "%Y-%m-%d").date()
+    # Normalize the starting point to a business day.
+    while cur.weekday() >= 5:  # Sat=5, Sun=6
+        cur = cur - timedelta(days=1)
+    dates: list[str] = [cur.isoformat()]
+    for _ in range(n - 1):
+        cur = cur - timedelta(days=1)
+        while cur.weekday() >= 5:
+            cur = cur - timedelta(days=1)
+        dates.append(cur.isoformat())
+    return dates
+
+
 def collect(
     bucket: str,
     tickers: list[str],
@@ -94,6 +125,7 @@ def collect(
     s3_prefix: str = "staging/daily_closes/",
     dry_run: bool = False,
     source: str = "auto",
+    window_days: int = 1,
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -108,12 +140,31 @@ def collect(
                 ``polygon_only`` (morning pass — polygon required, FRED for indices,
                 no yfinance fallback), or ``auto`` (legacy chain). See module
                 docstring for full rationale.
+        window_days: int = 1
+                Number of business days to scan, ending on ``run_date``
+                inclusive. Default 1 preserves single-date legacy behavior.
+                When > 1: iterate from oldest → newest over the window
+                (i.e. ``run_date - (window_days - 1) BDays`` → ``run_date``)
+                and call this collector once per date. Polygon stays bounded
+                at ``window_days`` ``grouped-daily`` calls in total — one
+                per date — which is the only way to honor the free-tier
+                rate limit. Per-cell skip-if-canonical logic for cost
+                minimization on yfinance is a follow-up PR.
 
     Returns:
-        dict with status, tickers_captured, method breakdown.
+        Single-date mode (``window_days=1``): dict with ``status``,
+        ``tickers_captured``, ``polygon``/``fred``/``yfinance`` counts,
+        ``source``.
+
+        Window mode (``window_days > 1``): dict with ``status``
+        (``"ok"`` if every date succeeded, ``"partial"`` if any date
+        errored), aggregated ``tickers_captured`` / ``polygon`` /
+        ``fred`` / ``yfinance`` counters across the window, ``source``,
+        ``window_days``, ``per_date`` (date → per-date result dict),
+        ``skipped_dates`` (post-close already-written dates).
 
     Raises:
-        ValueError: invalid ``source``
+        ValueError: invalid ``source`` or ``window_days < 1``
         PolygonForbiddenError: polygon 403 in ``polygon_only`` or ``auto`` mode
         RuntimeError: per-mode coverage threshold breached
     """
@@ -121,8 +172,22 @@ def collect(
         raise ValueError(
             f"Invalid source={source!r}. Must be one of {_VALID_SOURCES}."
         )
+    if window_days < 1:
+        raise ValueError(f"window_days must be >= 1, got {window_days}")
 
     run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if window_days > 1:
+        return _collect_window(
+            bucket=bucket,
+            tickers=tickers,
+            run_date=run_date,
+            s3_prefix=s3_prefix,
+            dry_run=dry_run,
+            source=source,
+            window_days=window_days,
+        )
+
     s3 = boto3.client("s3")
     key = f"{s3_prefix}{run_date}.parquet"
 
@@ -299,6 +364,89 @@ def collect(
             "tickers_captured": len(closes_df),
             "source": source,
         }
+
+
+def _collect_window(
+    bucket: str,
+    tickers: list[str],
+    run_date: str,
+    s3_prefix: str,
+    dry_run: bool,
+    source: str,
+    window_days: int,
+) -> dict:
+    """Iterate ``collect`` over a backward-looking business-day window.
+
+    Calls :func:`collect` with ``window_days=1`` per date so the
+    per-date branch reuses the existing fetch / coverage-gate / write
+    pipeline unchanged. Iterates oldest → newest so the most recent
+    date's parquet is the last one written; idempotent on re-run since
+    each per-date call goes through the same skip-on-exists path the
+    legacy single-date flow uses.
+
+    Polygon call rate is bounded at ``window_days`` ``grouped-daily``
+    calls total — one per date — which is the contract the free-tier
+    rate limit requires. Per-cell skip-if-canonical (skipping yfinance
+    fetches for cells that already carry an authoritative source) is a
+    follow-up PR; this PR's value is purely the structural window
+    orchestration so the SF wiring can flip ``window_days=14`` once the
+    rest of the arc lands.
+
+    Returns an aggregate dict; see ``collect`` docstring's "Window mode"
+    return-shape section for the schema.
+    """
+    window_dates = _previous_business_days(run_date, n=window_days)
+    aggregate: dict = {
+        "status": "ok",
+        "source": source,
+        "window_days": window_days,
+        "per_date": {},
+        "tickers_captured": 0,
+        "polygon": 0,
+        "fred": 0,
+        "yfinance": 0,
+        "skipped_dates": [],
+    }
+    # Iterate oldest → newest so the most recent date's parquet is the
+    # last one written. Matches the operator mental model "the latest
+    # date's data is the freshest on disk."
+    for d in reversed(window_dates):
+        try:
+            result = collect(
+                bucket=bucket,
+                tickers=tickers,
+                run_date=d,
+                s3_prefix=s3_prefix,
+                dry_run=dry_run,
+                source=source,
+                window_days=1,
+            )
+        except Exception as exc:
+            # Per-date failures don't kill the rest of the window; record
+            # the failure and continue. This matches the existing single-
+            # date semantics where a coverage-gate / API failure on one
+            # day doesn't block subsequent days when re-run.
+            logger.warning(
+                "[daily_closes window] date=%s source=%s failed: %s — "
+                "recording and continuing window",
+                d, source, exc,
+            )
+            aggregate["per_date"][d] = {
+                "status": "error",
+                "error": str(exc),
+                "source": source,
+            }
+            aggregate["status"] = "partial"
+            continue
+        aggregate["per_date"][d] = result
+        for k in ("tickers_captured", "polygon", "fred", "yfinance"):
+            if k in result and isinstance(result[k], int):
+                aggregate[k] += result[k]
+        if result.get("status") == "error":
+            aggregate["status"] = "partial"
+        if result.get("skipped"):
+            aggregate["skipped_dates"].append(d)
+    return aggregate
 
 
 def _fetch_polygon_closes(
