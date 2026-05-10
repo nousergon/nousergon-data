@@ -23,6 +23,15 @@ universe_returns:
   sector_map_key: predictor/price_cache/sector_map.json
   # db_path: /tmp/research.db       # optional: override local DB path (auto-downloaded from S3)
 
+# Signal returns (Phase 1) — score_performance + predictor_outcomes backfill
+signal_returns:
+  forward_days: 21                  # prediction horizon (trading days). Drives
+                                    # which universe_returns columns the
+                                    # backfill reads + records as
+                                    # predictor_outcomes.horizon_days. Must
+                                    # match the predictor's training horizon
+                                    # (cfg.FORWARD_DAYS in alpha-engine-predictor).
+
 # Daily closes (weekday OHLCV archive — intermediate staging,
 # 7-day S3 lifecycle expiration; canonical home is ArcticDB universe library)
 daily_closes:

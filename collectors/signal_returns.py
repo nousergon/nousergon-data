@@ -10,7 +10,11 @@ Must run AFTER universe_returns in the Phase 1 pipeline.
 
 Target tables in research.db:
   - score_performance: entry prices + 5d/10d/30d forward returns for BUY signals
-  - predictor_outcomes: prediction records + actual 5d alpha + correctness
+  - predictor_outcomes: prediction records + log-domain canonical alpha
+    at the configured horizon (`forward_days`, default 21d post Track A
+    cutover). New horizon-agnostic columns: actual_log_alpha, horizon_days,
+    correct. Legacy columns (actual_5d_return, correct_5d) dual-written
+    during the transition window for backtester COALESCE fallback.
 """
 
 from __future__ import annotations
@@ -26,12 +30,20 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
+# Default prediction horizon. Matches the predictor's canonical training
+# target (alpha-engine-predictor #114 Track A cutover, 2026-05-09). Should be
+# config-driven once weekly_collector exposes a `signal_returns.forward_days`
+# YAML setting; until then this constant is the source of truth and the
+# `forward_days` parameter on `collect` lets call sites override.
+_DEFAULT_FORWARD_DAYS = 21
+
 
 def collect(
     bucket: str,
     db_path: str,
     signals_prefix: str = "signals",
     dry_run: bool = False,
+    forward_days: int = _DEFAULT_FORWARD_DAYS,
 ) -> dict:
     """Seed and backfill signal performance tables in research.db.
 
@@ -40,6 +52,15 @@ def collect(
       2. Backfill score_performance returns from universe_returns JOIN
       3. Seed predictor_outcomes from S3 predictions
       4. Backfill predictor_outcomes returns from universe_returns JOIN
+
+    Args:
+        forward_days: prediction horizon in trading days. Drives which
+            universe_returns columns are read (return_{N}d / log_return_{N}d)
+            and which value is recorded in `predictor_outcomes.horizon_days`.
+            Defaults to the predictor's current canonical 21d. Schema columns
+            for the configured horizon must exist in `universe_returns` —
+            21d arithmetic + log columns added by alpha-engine-data PR
+            #197; other horizons require new schema columns first.
 
     Returns dict with status, counts for each step.
     """
@@ -60,7 +81,9 @@ def collect(
     )
 
     # Step 4: Backfill predictor_outcomes via universe_returns JOIN
-    results["backfill_predictor_returns"] = _backfill_predictor_returns(db_path, dry_run)
+    results["backfill_predictor_returns"] = _backfill_predictor_returns(
+        db_path, dry_run, forward_days=forward_days,
+    )
 
     # Upload updated research.db back to S3
     total_written = sum(r.get("rows_written", 0) for r in results.values())
@@ -292,13 +315,72 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
 # ── Step 4: Backfill predictor_outcomes ───────────────────────────────────────
 
 
-def _backfill_predictor_returns(db_path: str, dry_run: bool) -> dict:
-    """Backfill actual_5d_return and correct_5d using universe_returns JOIN."""
+def _backfill_predictor_returns(
+    db_path: str,
+    dry_run: bool,
+    forward_days: int = _DEFAULT_FORWARD_DAYS,
+) -> dict:
+    """Backfill predictor_outcomes log-domain canonical alpha at the configured horizon.
+
+    Reads `return_{N}d`, `spy_return_{N}d`, `log_return_{N}d`,
+    `log_spy_return_{N}d` from universe_returns where N=forward_days. Writes
+    horizon-agnostic `actual_log_alpha` (log(stock) - log(spy) at horizon),
+    `horizon_days`, `correct`.
+
+    Legacy columns (`actual_5d_return`, `correct_5d`) are NOT dual-written.
+    Old rows that resolved under the pre-PR-C legacy 5d-only path retain
+    their values — the backtester COALESCE pattern reads
+    `COALESCE(actual_log_alpha, actual_5d_return)` so historical reads still
+    work. New rows post-PR-C populate the canonical column only; PR F
+    retires the legacy column from new writes (already a no-op here) and
+    drops the COALESCE fallback in the backtester analytics.
+
+    The pending-row filter switches to `actual_log_alpha IS NULL` so rows
+    already populated under the legacy 5d-only path get re-resolved at the
+    new horizon when their forward window has closed in universe_returns.
+
+    Args:
+        forward_days: prediction horizon in trading days. Driver for both
+            the universe_returns column to JOIN on AND the value persisted
+            in `predictor_outcomes.horizon_days` per row.
+    """
+    h = forward_days
+    log_col = f"log_return_{h}d"
+    log_spy_col = f"log_spy_return_{h}d"
+
     try:
         conn = sqlite3.connect(db_path)
+        _ensure_predictor_outcomes_schema(conn)
 
+        # Verify the universe_returns schema has the log columns we need at
+        # this horizon. Pre-PR-A databases only have arithmetic 5d/10d/30d;
+        # 21d log columns added by alpha-engine-data #197. Fail loudly
+        # rather than silently producing wrong-domain alpha values.
+        ur_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(universe_returns)"
+        ).fetchall()}
+        missing = [c for c in (log_col, log_spy_col) if c not in ur_cols]
+        if missing:
+            conn.close()
+            return {
+                "status": "error",
+                "error": (
+                    f"universe_returns missing required log-domain columns "
+                    f"for forward_days={h}: {missing}. Run alpha-engine-data "
+                    f"PR A migration (#197) or use a horizon whose log "
+                    f"columns exist."
+                ),
+                "rows_written": 0,
+            }
+
+        # Pending rows: never-resolved (new column NULL). Includes rows that
+        # had the legacy 5d-only path populate actual_5d_return — they get
+        # re-resolved at the new horizon, the legacy column gets refreshed
+        # with whatever forward_days indicates so backtester COALESCE
+        # consumers see consistent values.
         pending = pd.read_sql_query(
-            "SELECT id, symbol, prediction_date, predicted_direction FROM predictor_outcomes WHERE actual_5d_return IS NULL",
+            "SELECT id, symbol, prediction_date, predicted_direction "
+            "FROM predictor_outcomes WHERE actual_log_alpha IS NULL",
             conn,
         )
         if pending.empty:
@@ -310,33 +392,42 @@ def _backfill_predictor_returns(db_path: str, dry_run: bool) -> dict:
             ticker = row["symbol"]
             pred_date = row["prediction_date"]
 
-            # Look up 5d return from universe_returns
             ur = conn.execute(
-                "SELECT return_5d, spy_return_5d FROM universe_returns WHERE ticker = ? AND eval_date = ?",
+                f"SELECT {log_col}, {log_spy_col} "
+                f"FROM universe_returns WHERE ticker = ? AND eval_date = ?",
                 (ticker, pred_date),
             ).fetchone()
 
             if ur is None or ur[0] is None:
+                # Either no universe_returns row for this (ticker, date), or
+                # the forward window has not yet closed (log_return_Nd
+                # NULL — gated by the universe_returns collector). Leave
+                # the predictor_outcomes row unresolved; it will be picked
+                # up on the next collector run.
                 continue
 
-            stock_return = ur[0]  # decimal
-            spy_return = ur[1] if ur[1] is not None else 0
-            actual_alpha = stock_return - spy_return
+            log_stock = ur[0]
+            log_spy = ur[1] if ur[1] is not None else 0.0
+            log_alpha = log_stock - log_spy
 
             direction = row["predicted_direction"]
             if direction == "UP":
-                correct = 1 if actual_alpha > 0 else 0
+                correct = 1 if log_alpha > 0 else 0
             elif direction == "DOWN":
-                correct = 1 if actual_alpha < 0 else 0
+                correct = 1 if log_alpha < 0 else 0
             elif direction == "FLAT":
-                correct = 1 if abs(actual_alpha) < 0.01 else 0
+                # FLAT correctness band: |log_alpha| < 0.01 log-units
+                # (≈1% arithmetic at small magnitudes via log(1+r) ≈ r).
+                correct = 1 if abs(log_alpha) < 0.01 else 0
             else:
                 continue
 
             if not dry_run:
                 conn.execute(
-                    "UPDATE predictor_outcomes SET actual_5d_return=?, correct_5d=? WHERE symbol=? AND prediction_date=?",
-                    (round(actual_alpha * 100, 4), correct, ticker, pred_date),
+                    "UPDATE predictor_outcomes SET "
+                    "actual_log_alpha=?, horizon_days=?, correct=? "
+                    "WHERE symbol=? AND prediction_date=?",
+                    (round(log_alpha, 6), h, correct, ticker, pred_date),
                 )
             resolved += 1
 
@@ -345,7 +436,11 @@ def _backfill_predictor_returns(db_path: str, dry_run: bool) -> dict:
         conn.close()
 
         if resolved:
-            logger.info("Backfilled %d predictor_outcomes via universe_returns JOIN", resolved)
+            logger.info(
+                "Backfilled %d predictor_outcomes at horizon=%dd "
+                "(log-domain canonical) via universe_returns JOIN",
+                resolved, h,
+            )
         return {"status": "ok", "rows_written": resolved}
 
     except Exception as e:
@@ -369,6 +464,28 @@ def _ensure_score_performance_schema(conn) -> None:
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE score_performance ADD COLUMN {col} {col_type}")
+    conn.commit()
+
+
+def _ensure_predictor_outcomes_schema(conn) -> None:
+    """Add horizon-agnostic columns to predictor_outcomes if not present.
+
+    Defensive idempotent migration that mirrors alpha-engine-research's
+    schema v13 (research/archive/schema.py). The data Lambda writes to
+    research.db too — if it runs BEFORE the research Lambda's cold-start
+    schema migration, the new columns wouldn't exist and the backfill
+    UPDATE would fail. Belt-and-suspenders: each ALTER is wrapped to
+    skip if the column already exists. Predictor 21d migration plan at
+    alpha-engine-docs/private/predictor-21d-migration-260509.md (PR C).
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(predictor_outcomes)").fetchall()}
+    for col, col_type in [
+        ("actual_log_alpha", "REAL"),
+        ("horizon_days", "INTEGER"),
+        ("correct", "INTEGER"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE predictor_outcomes ADD COLUMN {col} {col_type}")
     conn.commit()
 
 
