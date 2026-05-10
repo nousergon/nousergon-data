@@ -60,12 +60,27 @@ _FRED_TIMEOUT = 15
 # Map our ArcticDB ticker key (after stripping ^) to FRED series id.
 # Both yfinance (^VIX, ^TNX, ...) and FRED (VIXCLS, DGS10, ...) publish
 # these in the same scale (raw index level for VIX/VIX3M, percent for
-# TNX/IRX), so no conversion is needed before appending to ArcticDB.
+# TNX/IRX/TWO/HYOAS), so no conversion is needed before appending to
+# ArcticDB.
+#
+# TWO + HYOAS added 2026-05-10 (Stage 2.5 of regime-conditioning rebuild
+# — plan doc: alpha-engine-docs/private/regime-conditioning-260510.md).
+# Both are FRED-only (no yfinance proxy), so they only flow through the
+# FRED fallback path. Historical backfill is gated on a follow-up PR
+# adding a FRED history fetcher; this PR begins forward-only collection.
 _FRED_INDEX_MAP = {
     "VIX": "VIXCLS",
     "VIX3M": "VXVCLS",
     "TNX": "DGS10",
     "IRX": "DTB3",
+    # 2Y treasury — enables 10Y-2Y curve slope (recession-focused canonical)
+    # alongside the existing 10Y-3M (TNX-IRX cyclical).
+    "TWO": "DGS2",
+    # ICE BofA US High Yield Index Option-Adjusted Spread, percent.
+    # Major regime indicator that VIX misses — credit widens before vol
+    # spikes in many cycles, and stays wide during recoveries when vol
+    # has already calmed. Institutional risk-factor models include it.
+    "HYOAS": "BAMLH0A0HYM2",
 }
 
 

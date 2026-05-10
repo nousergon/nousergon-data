@@ -93,12 +93,17 @@ caret_symbols:
   - IRX
 
 # Always-download tickers (benchmarks, macro, sector ETFs)
+# TWO + HYOAS added 2026-05-10 (Stage 2.5 regime-conditioning rebuild) —
+# FRED-only, no yfinance caret. Forward-only collection from this date;
+# historical backfill is a follow-up PR.
 always_download:
   - SPY
   - VIX
   - VIX3M
   - TNX
   - IRX
+  - TWO
+  - HYOAS
   - GLD
   - USO
   - XLK
