@@ -119,6 +119,37 @@ def collect(
 # ── Step 1: Seed score_performance ────────────────────────────────────────────
 
 
+def _load_stance_lookup_for_date(s3, bucket: str, sig_date: str) -> dict[str, str]:
+    """Read predictions.json for ``sig_date`` and return
+    {ticker: stance}. Empty dict on any failure (S3 404, JSON parse
+    error, predictions.json without stance field).
+
+    Stance field was added to predictions.json on 2026-05-11
+    (alpha-engine-predictor#137 heuristic classifier). Predictions
+    older than that lack the field — lookup returns an empty dict
+    and the score_performance row's stance stays NULL. Backtester's
+    by_stance attribution treats NULL as "no stance recorded."
+
+    Per-date result is cached by ``_seed_score_performance`` / the
+    backfill caller so the same date isn't fetched twice per run.
+    """
+    key = f"predictor/predictions/{sig_date}.json"
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        payload = json.loads(obj["Body"].read())
+    except (ClientError, json.JSONDecodeError):
+        return {}
+    out: dict[str, str] = {}
+    for pred in payload.get("predictions") or []:
+        if not isinstance(pred, dict):
+            continue
+        ticker = pred.get("ticker")
+        stance = pred.get("stance")
+        if isinstance(ticker, str) and isinstance(stance, str):
+            out[ticker] = stance
+    return out
+
+
 def _extract_signal_context(payload: dict, ticker: str) -> dict:
     """Pull calibrator-v1 context fields for a ticker from a signals.json
     payload. Mirrors the extraction logic in alpha-engine-research's
@@ -171,12 +202,20 @@ def _seed_score_performance(
         # the canonical context is captured at the same point the BUY
         # filter runs — single source of truth per signals.json payload.
         rows_to_insert: list[tuple[str, str, float, dict]] = []
+        # Per-date stance lookups cached so we hit S3 once per sig_date
+        # instead of once per (sig_date, ticker). Stance was added to
+        # predictions.json on 2026-05-11; older dates' lookups return
+        # empty + the row's stance column stays NULL.
+        stance_by_date: dict[str, dict[str, str]] = {}
         for sig_date in signal_dates:
             try:
                 obj = s3.get_object(Bucket=bucket, Key=f"{signals_prefix}/{sig_date}/signals.json")
                 signals = json.loads(obj["Body"].read())
             except (ClientError, json.JSONDecodeError):
                 continue
+            stance_by_date.setdefault(
+                sig_date, _load_stance_lookup_for_date(s3, bucket, sig_date),
+            )
 
             for stock in signals.get("universe", []):
                 ticker = stock.get("ticker")
@@ -218,21 +257,26 @@ def _seed_score_performance(
             if price is None:
                 continue
 
+            # Stance lookup — NULL if predictor didn't score this ticker
+            # on this date or if the predictions.json for sig_date
+            # predates the stance field (2026-05-11+).
+            stance = stance_by_date.get(sig_date, {}).get(ticker)
+
             if not dry_run:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO score_performance (
                         symbol, score_date, score, price_on_date,
                         quant_score, qual_score, conviction,
-                        sector_modifier, market_regime
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        sector_modifier, market_regime, stance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker, sig_date,
                         round(float(score), 2), round(price, 2),
                         ctx["quant_score"], ctx["qual_score"],
                         ctx["conviction"], ctx["sector_modifier"],
-                        ctx["market_regime"],
+                        ctx["market_regime"], stance,
                     ),
                 )
             inserted += 1
@@ -650,6 +694,12 @@ def _ensure_score_performance_schema(conn) -> None:
         ("quant_score", "REAL"), ("qual_score", "REAL"),
         ("conviction", "TEXT"), ("sector_modifier", "REAL"),
         ("market_regime", "TEXT"),
+        # Stance taxonomy arc (alpha-engine-research migration #16,
+        # 2026-05-11). Denormalizes predictor's stance label onto the
+        # fact row at write time — Kimball dimensional pattern.
+        # Source: predictions.json per-date archive; producer-side
+        # extractor _extract_stance_for_date below.
+        ("stance", "TEXT"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE score_performance ADD COLUMN {col} {col_type}")
