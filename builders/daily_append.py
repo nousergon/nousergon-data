@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import logging
@@ -62,6 +63,21 @@ OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 # and feature-compute call sites that iterate it expecting numerics.
 PROVENANCE_COL = "source"
 PRICE_CACHE_PREFIX = "predictor/price_cache/"
+
+# Process the universe in chunks of this size through Phase 1+2 (read,
+# compute, write). The full-universe pass holds ~900 ticker histories in
+# memory simultaneously (~180MB peak resident) — on the 2GB t3.small
+# trading instance that co-existed with the 1GB daily_append working set,
+# IB Gateway, and a (now-fixed) crash-looping daemon, peak memory blew
+# past available + swap and OOM-killed the process partway through the
+# universe loop (2026-05-11 incident). Chunking caps per-iteration
+# resident memory at ~30MB / 150 tickers and gc.collect() between
+# chunks forces release of the cycled DataFrames whose BlockManager
+# reference cycles would otherwise defer freeing.
+#
+# 150 is a balance: smaller → more gc overhead + more read_batch RTTs;
+# larger → tighter on memory headroom. 900/150 = 6 chunks per run.
+UNIVERSE_CHUNK_SIZE = 150
 
 
 def _align_schema_for_update(
@@ -803,339 +819,369 @@ def daily_append(
     n_partial = 0         # rows written with ≥1 NaN feature (short-history, etc.)
     n_parquet_warmup = 0  # rows whose feature compute used parquet-enriched context
 
-    # ── 4a. Batch-read every ticker's full universe history upfront ──────────
-    # Replaces the prior per-ticker `universe_lib.read(ticker)` loop. ArcticDB's
-    # read_batch parallelizes the underlying S3 round-trips internally, cutting
-    # ~900 sequential reads at ~0.3-0.5s each (5-7 minutes wall time) down to a
-    # single batched call. The full series (no date_range slice) is required
-    # because `_write_row_backfill_safe` rewrites the full symbol on the
-    # backfill path, and most MorningEnrich runs hit backfill (target_ts is
-    # the prior trading day, already written by post-close DailyData).
-    # Missing symbols come back as DataError objects (not exceptions) — they're
-    # filtered into n_err with the same semantics as the old per-ticker
-    # `try/except Exception` branch.
-    hists_by_ticker: dict[str, pd.DataFrame] = {}
-    if not dry_run and stock_tickers:
-        t_read0 = time.time()
-        read_results = universe_lib.read_batch(
-            [ReadRequest(symbol=t) for t in stock_tickers]
-        )
-        for ticker, result in zip(stock_tickers, read_results):
-            if isinstance(result, DataError):
-                log.warning(
-                    "Ticker %s not in ArcticDB: %s",
-                    ticker, result.exception_string,
-                )
-                n_err += 1
-                continue
-            hists_by_ticker[ticker] = result.data
-        log.info(
-            "Batched universe read: %d/%d tickers in %.1fs",
-            len(hists_by_ticker), len(stock_tickers), time.time() - t_read0,
-        )
-
-    # ── 4b. Phase 1 — sequential compute pass ────────────────────────────────
-    # Per-ticker feature compute stays sequential so we don't have to reason
-    # about pandas/numpy thread safety on the shared macro series. The
-    # bottleneck this PR targets is the I/O-bound write phase below; CPU
-    # parallelism is a separate (higher-risk) lever to pull later if needed.
-    write_tasks: list[tuple[str, pd.DataFrame, pd.DataFrame, list[str]]] = []
-    for ticker in stock_tickers:
-        try:
-            # Read recent history from ArcticDB (need ~265 rows for feature warmup)
-            if dry_run:
-                n_skip += 1
-                continue
-
-            hist = hists_by_ticker.get(ticker)
-            if hist is None:
-                # Ticker was missing from ArcticDB — already counted into
-                # n_err during the batch read above, skip silently.
-                continue
-
-            # Re-running daily_append for the same date MUST overwrite the
-            # existing row by default — universe_lib.update() is idempotent
-            # for same-date rows, but the 2026-04-17 polygon-label incident
-            # showed the path matters: when MorningEnrich's polygon refresh
-            # arrives, it must overwrite yfinance's NaN-VWAP row with
-            # polygon's true volume-weighted VWAP.
-            #
-            # ``skip_if_exists`` is the source-aware opt-out: EOD post-market
-            # passes True (yfinance, immutable once written), MorningEnrich
-            # leaves False (polygon, must overwrite). Without this, an EOD
-            # re-run on a day whose row already exists hits the backfill
-            # branch in ``_write_row_backfill_safe`` (target_ts ==
-            # existing.index.max()) and rewrites the full series per ticker
-            # — 904 × ~1.5s blew the 1200s SSM timeout on the 2026-05-01
-            # EOD recovery rerun.
-            if skip_if_exists and today_ts in hist.index:
-                n_skip += 1
-                continue
-
-            # Build today's OHLCV row
-            bar = closes[ticker]
-            if np.isnan(bar["Close"]):
-                n_skip += 1
-                continue
-
-            new_row_data = {col: bar.get(col, np.nan) for col in OHLCV_COLS}
-            # Carry per-row provenance through to the ArcticDB write. Source
-            # set by daily_closes.collect (polygon / yfinance / fred); falls
-            # through to "unknown" when the staging parquet predates the
-            # provenance migration.
-            new_row_data[PROVENANCE_COL] = bar.get(PROVENANCE_COL, "unknown")
-            new_row = pd.DataFrame(
-                [new_row_data],
-                index=pd.DatetimeIndex([today_ts]),
-            )
-
-            # Warmup context — ArcticDB by default; parquet-enriched when the
-            # ArcticDB history is too short for full feature warmup.
-            #
-            # Before this change, short-history tickers (new listings, spinoffs,
-            # recent constituent adds) accumulated feature coverage one day at
-            # a time — features with 252-day rolling windows stayed NaN for
-            # up to a year after the ticker entered ArcticDB, even though the
-            # weekly backfill's 10y parquet held the full series. That state
-            # routinely caused manual polygon backfills (8 tickers in one day,
-            # 2026-04-22) just to unblock downstream consumers.
-            #
-            # When len(hist) is below the feature-warmup threshold we union
-            # the ticker's `predictor/price_cache/{T}.parquet` (full 10y
-            # adjusted OHLCV, rebuilt every Saturday by backfill.py) with
-            # ArcticDB by date. ArcticDB wins on overlapping dates because
-            # daily_append writes there every weekday — it's fresher than a
-            # parquet that can be up to 6 days old. Full-history tickers
-            # (~99% of the universe on a steady-state day) skip the parquet
-            # read entirely.
-            #
-            # `hist` (the original ArcticDB read) remains authoritative for
-            # the write schema (dtype matching via hist.dtypes[col] at the
-            # update() call below). Only the feature-compute context is
-            # enriched.
-            warmup_source = hist
-            if len(hist) < MIN_ROWS_FOR_FEATURES:
-                parquet_df = _load_parquet_warmup(s3, bucket, ticker)
-                if parquet_df is None:
-                    log.warning(
-                        "short-history-no-parquet ticker=%s arctic_rows=%d "
-                        "— falling through to NaN-feature degrade",
-                        ticker, len(hist),
-                    )
-                else:
-                    parquet_ohlcv = parquet_df[
-                        [c for c in OHLCV_COLS if c in parquet_df.columns]
-                    ]
-                    arctic_ohlcv = hist[
-                        [c for c in OHLCV_COLS if c in hist.columns]
-                    ]
-                    warmup_source = pd.concat([parquet_ohlcv, arctic_ohlcv])
-                    warmup_source = warmup_source[
-                        ~warmup_source.index.duplicated(keep="last")
-                    ].sort_index()
-                    n_parquet_warmup += 1
-                    log.info(
-                        "parquet-warmup ticker=%s arctic_rows=%d "
-                        "parquet_rows=%d stitched_rows=%d",
-                        ticker, len(hist), len(parquet_df), len(warmup_source),
-                    )
-
-            # Combine warmup OHLCV + today's bar for feature computation.
-            # Strip the ``source`` provenance metadata from the row going
-            # into ``compute_features`` so that step gets a clean OHLCV
-            # frame; the source value is re-attached to today_row below.
-            hist_ohlcv = warmup_source[
-                [c for c in OHLCV_COLS if c in warmup_source.columns]
-            ]
-            new_row_ohlcv = new_row[
-                [c for c in OHLCV_COLS if c in new_row.columns]
-            ]
-            combined = pd.concat([hist_ohlcv, new_row_ohlcv])
-            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-
-            # Compute features on the combined series. `compute_features`
-            # returns rows with NaN for features whose rolling-window
-            # warmup exceeds the available history (short-history tickers
-            # get ATR-14 computed on ≥14 rows, while 252-day features
-            # stay NaN). Rows are never dropped — see 2026-04-21 docstring
-            # in features/feature_engineer.py.
-            sector_etf_sym = sector_map.get(ticker)
-            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
-            ticker_alt = alt_data.get(ticker, {})
-
-            featured = compute_features(
-                combined,
-                spy_series=spy_series,
-                vix_series=vix_series,
-                sector_etf_series=sector_etf_series,
-                tnx_series=tnx_series,
-                irx_series=irx_series,
-                gld_series=gld_series,
-                uso_series=uso_series,
-                vix3m_series=vix3m_series,
-                earnings_data=ticker_alt.get("earnings"),
-                revision_data=ticker_alt.get("revisions"),
-                options_data=ticker_alt.get("options"),
-                fundamental_data=fundamentals.get(ticker),
-            )
-
-            if today_ts not in featured.index:
-                # Only possible if combined had a genuine upstream data
-                # issue (today's row disappeared during feature compute).
-                log.warning(
-                    "Ticker %s: today_ts missing from featured frame — "
-                    "unexpected after compute_features stopped dropping rows",
-                    ticker,
-                )
-                n_err += 1
-                continue
-
-            # Extract today's row with OHLCV + every feature that has
-            # a column in the featured frame. Features that failed to
-            # compute arrive as NaN and are written as NaN — first-class
-            # support for partial coverage.
-            keep_cols = (
-                [c for c in OHLCV_COLS if c in featured.columns]
-                + [f for f in FEATURES if f in featured.columns]
-            )
-            today_row = featured.loc[[today_ts], keep_cols].copy()
-            # Pull provenance from the new_row directly rather than relying
-            # on compute_features to preserve non-OHLCV string columns. Even
-            # if compute_features incidentally retains source through its
-            # pipeline today, that's an implementation detail of an
-            # OHLCV-shaped function — sourcing from new_row keeps the
-            # provenance contract decoupled from feature_engineer's column
-            # passthrough behaviour.
-            today_row[PROVENANCE_COL] = new_row.iloc[0][PROVENANCE_COL]
-
-            # Per-ticker coverage observability: count NaN features now
-            # so the eventual log + counter reflects exactly what's
-            # being written. Silent partial coverage is forbidden
-            # (feedback_no_silent_fails). Increment is deferred until
-            # after universe_lib.update() so an exception rolls back
-            # cleanly into n_err.
-            nan_features = [
-                f for f in FEATURES
-                if f in today_row.columns and today_row[f].isna().iloc[0]
-            ]
-
-            # Match stored schema dtype per-column. ArcticDB rejects
-            # updates whose column dtypes don't match the existing
-            # version; stored dtype varies across tickers (some Volume
-            # int64, some float64 depending on backfill vintage).
-            # hist.dtypes[col] is authoritative by construction.
-            # Feature columns that aren't yet in storage default to
-            # float32 — matches the predictor training schema.
-            #
-            # ``source`` is metadata (string), not numeric — skip the
-            # dtype-cast fallback path; if it's already in hist the cast
-            # picks up the existing string dtype, otherwise it stays
-            # object/string (default pandas inference).
-            for col in today_row.columns:
-                if col in hist.columns:
-                    today_row[col] = today_row[col].astype(hist.dtypes[col])
-                elif col == PROVENANCE_COL:
-                    continue  # string metadata; no float32 fallback
-                elif col in FEATURES:
-                    today_row[col] = today_row[col].astype("float32")
-
-            today_row.index.name = "date"
-
-            # Defer the actual ArcticDB write — collected here so Phase 2
-            # can run them in parallel via a thread pool. The previous
-            # sequential per-ticker `_write_row_backfill_safe` call took
-            # ~300-400ms × 900 = ~5 minutes wall time, the residual half
-            # of the budget after the read_batch optimization in PR #99.
-            write_tasks.append((ticker, today_row, hist, nan_features))
-
-        except Exception as exc:
-            log.warning("Failed to compute %s: %s", ticker, exc)
-            n_err += 1
-
-    # ── 4c. Phase 2 — bulk writes via ArcticDB batch API ─────────────────────
-    # 2026-05-05: replaced ThreadPoolExecutor + per-symbol lib.update() loop
-    # with `update_batch` + `write_batch`. PR #152's per-task timing
-    # instrumentation measured the prior threadpool achieving no parallelism
-    # in practice — wall ≈ 900 × 1.7s/ticker (2026-05-05 MorningEnrich
-    # incident, 1535s for 900 tickers, workers=16, hit the 30-min SSM cap).
-    # Phase 1's `read_batch` runs at 84ms/ticker against the same library,
-    # so the ArcticDB native parallelism is the right primitive — and is
-    # documented as such ("perform an update operation on a list of symbols
-    # in parallel"). Same shift PR #99 made for reads. The #152
-    # instrumentation becomes obsolete with this refactor (no per-task
-    # threadpool to time) and is removed in this PR.
+    # ── 4. Chunked universe pass ─────────────────────────────────────────────
+    # The full-universe Phase 1+2 in one shot holds ~900 ticker histories in
+    # memory simultaneously (~180MB peak resident) — on the 2GB t3.small
+    # trading instance this co-exists with the daily_append base working set,
+    # IB Gateway, daemon, and SSM agent. 2026-05-11 incident: OOM partway
+    # through the loop (PROCESS_GONE near ticker SOLS, ~876/900). Chunking
+    # caps per-iteration resident memory and gc.collect() between chunks
+    # forces release of the cycled DataFrames.
     #
-    # Path split: append-at-head (target_ts > existing.index.max(), the
-    # common morning-enrich case) → UpdatePayload + update_batch.
-    # Backfill (target_ts in middle of series, rare — historical VWAP
-    # repair etc.) → splice + WritePayload + write_batch. Mirrors
-    # `_write_row_backfill_safe`'s branching for the per-symbol path
-    # (which still serves macro_lib's small N=7-11 sequential writes).
-    update_payloads: list[UpdatePayload] = []
-    write_payloads: list[WritePayload] = []
-    payload_meta: dict[str, tuple[list[str] | None, int]] = {}  # ticker → (nan_features, hist_rows)
+    # Each chunk runs its own Phase 1 (read_batch), Phase 1.5 (per-ticker
+    # compute), and Phase 2 (update_batch + write_batch). ArcticDB's native
+    # batch parallelism is preserved within each chunk; only the outer
+    # universe iteration is chunked. n_ok / n_partial / n_skip / n_err
+    # counters accumulate across chunks unchanged.
+    n_chunks = (len(stock_tickers) + UNIVERSE_CHUNK_SIZE - 1) // UNIVERSE_CHUNK_SIZE
+    for chunk_idx in range(n_chunks):
+        chunk_start = chunk_idx * UNIVERSE_CHUNK_SIZE
+        chunk_tickers = stock_tickers[chunk_start : chunk_start + UNIVERSE_CHUNK_SIZE]
 
-    for ticker, today_row, hist, nan_features in write_tasks:
-        target_ts = today_row.index[0]
-        payload_meta[ticker] = (nan_features, len(hist))
-        if hist.empty or target_ts > hist.index.max():
-            # Append at head — fast path. update_batch with upsert=True
-            # also handles the rare "symbol doesn't exist yet" case
-            # (replaces _write_row_backfill_safe's lib.write fallback).
-            update_payloads.append(UpdatePayload(symbol=ticker, data=today_row))
-        else:
-            # Backfill — splice into existing series, full rewrite. Same
-            # logic as _write_row_backfill_safe's backfill branch.
-            combined = pd.concat([hist, today_row])
-            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-            write_payloads.append(WritePayload(symbol=ticker, data=combined))
-
-    if update_payloads or write_payloads:
-        t_write0 = time.time()
-        update_results = (
-            universe_lib.update_batch(update_payloads, upsert=True)
-            if update_payloads else []
-        )
-        write_results = (
-            universe_lib.write_batch(write_payloads, prune_previous_versions=True)
-            if write_payloads else []
-        )
-        write_wall = time.time() - t_write0
-        log.info(
-            "Batch writes: %d updates + %d backfills in %.1fs",
-            len(update_payloads), len(write_payloads), write_wall,
-        )
-
-        # Iterate results — ArcticDB returns DataError per failed symbol
-        # rather than raising, so explicit per-symbol error detection is
-        # required. Pair each result with the originating payload's symbol
-        # via positional alignment (ArcticDB guarantees i-th result
-        # corresponds to i-th payload).
-        def _aggregate(payloads, results, label: str):
-            nonlocal n_ok, n_err, n_partial
-            for payload, result in zip(payloads, results):
-                ticker = payload.symbol
+        # ── 4a. Batch-read this chunk's full universe history ────────────────
+        # Replaces the prior per-ticker `universe_lib.read(ticker)` loop. ArcticDB's
+        # read_batch parallelizes the underlying S3 round-trips internally, cutting
+        # ~900 sequential reads at ~0.3-0.5s each (5-7 minutes wall time) down to a
+        # single batched call. The full series (no date_range slice) is required
+        # because `_write_row_backfill_safe` rewrites the full symbol on the
+        # backfill path, and most MorningEnrich runs hit backfill (target_ts is
+        # the prior trading day, already written by post-close DailyData).
+        # Missing symbols come back as DataError objects (not exceptions) — they're
+        # filtered into n_err with the same semantics as the old per-ticker
+        # `try/except Exception` branch.
+        hists_by_ticker: dict[str, pd.DataFrame] = {}
+        if not dry_run and chunk_tickers:
+            t_read0 = time.time()
+            read_results = universe_lib.read_batch(
+                [ReadRequest(symbol=t) for t in chunk_tickers]
+            )
+            for ticker, result in zip(chunk_tickers, read_results):
                 if isinstance(result, DataError):
                     log.warning(
-                        "Failed to %s %s: %s (code=%s, category=%s)",
-                        label, ticker, result.exception_string,
-                        result.error_code, result.error_category,
+                        "Ticker %s not in ArcticDB: %s",
+                        ticker, result.exception_string,
                     )
                     n_err += 1
                     continue
-                nan_features, hist_rows = payload_meta[ticker]
-                if nan_features:
-                    log.warning(
-                        "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
-                        ticker, hist_rows, len(nan_features), len(FEATURES),
-                        nan_features,
-                    )
-                    n_partial += 1
-                else:
-                    n_ok += 1
+                hists_by_ticker[ticker] = result.data
+            log.info(
+                "Chunk %d/%d universe read: %d/%d tickers in %.1fs",
+                chunk_idx + 1, n_chunks,
+                len(hists_by_ticker), len(chunk_tickers), time.time() - t_read0,
+            )
 
-        _aggregate(update_payloads, update_results, "update")
-        _aggregate(write_payloads, write_results, "backfill")
+        # ── 4b. Phase 1 — sequential compute pass ────────────────────────────
+        # Per-ticker feature compute stays sequential so we don't have to reason
+        # about pandas/numpy thread safety on the shared macro series. The
+        # bottleneck this PR targets is the I/O-bound write phase below; CPU
+        # parallelism is a separate (higher-risk) lever to pull later if needed.
+        write_tasks: list[tuple[str, pd.DataFrame, pd.DataFrame, list[str]]] = []
+        for ticker in chunk_tickers:
+            try:
+                # Read recent history from ArcticDB (need ~265 rows for feature warmup)
+                if dry_run:
+                    n_skip += 1
+                    continue
+
+                hist = hists_by_ticker.get(ticker)
+                if hist is None:
+                    # Ticker was missing from ArcticDB — already counted into
+                    # n_err during the batch read above, skip silently.
+                    continue
+
+                # Re-running daily_append for the same date MUST overwrite the
+                # existing row by default — universe_lib.update() is idempotent
+                # for same-date rows, but the 2026-04-17 polygon-label incident
+                # showed the path matters: when MorningEnrich's polygon refresh
+                # arrives, it must overwrite yfinance's NaN-VWAP row with
+                # polygon's true volume-weighted VWAP.
+                #
+                # ``skip_if_exists`` is the source-aware opt-out: EOD post-market
+                # passes True (yfinance, immutable once written), MorningEnrich
+                # leaves False (polygon, must overwrite). Without this, an EOD
+                # re-run on a day whose row already exists hits the backfill
+                # branch in ``_write_row_backfill_safe`` (target_ts ==
+                # existing.index.max()) and rewrites the full series per ticker
+                # — 904 × ~1.5s blew the 1200s SSM timeout on the 2026-05-01
+                # EOD recovery rerun.
+                if skip_if_exists and today_ts in hist.index:
+                    n_skip += 1
+                    continue
+
+                # Build today's OHLCV row
+                bar = closes[ticker]
+                if np.isnan(bar["Close"]):
+                    n_skip += 1
+                    continue
+
+                new_row_data = {col: bar.get(col, np.nan) for col in OHLCV_COLS}
+                # Carry per-row provenance through to the ArcticDB write. Source
+                # set by daily_closes.collect (polygon / yfinance / fred); falls
+                # through to "unknown" when the staging parquet predates the
+                # provenance migration.
+                new_row_data[PROVENANCE_COL] = bar.get(PROVENANCE_COL, "unknown")
+                new_row = pd.DataFrame(
+                    [new_row_data],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+
+                # Warmup context — ArcticDB by default; parquet-enriched when the
+                # ArcticDB history is too short for full feature warmup.
+                #
+                # Before this change, short-history tickers (new listings, spinoffs,
+                # recent constituent adds) accumulated feature coverage one day at
+                # a time — features with 252-day rolling windows stayed NaN for
+                # up to a year after the ticker entered ArcticDB, even though the
+                # weekly backfill's 10y parquet held the full series. That state
+                # routinely caused manual polygon backfills (8 tickers in one day,
+                # 2026-04-22) just to unblock downstream consumers.
+                #
+                # When len(hist) is below the feature-warmup threshold we union
+                # the ticker's `predictor/price_cache/{T}.parquet` (full 10y
+                # adjusted OHLCV, rebuilt every Saturday by backfill.py) with
+                # ArcticDB by date. ArcticDB wins on overlapping dates because
+                # daily_append writes there every weekday — it's fresher than a
+                # parquet that can be up to 6 days old. Full-history tickers
+                # (~99% of the universe on a steady-state day) skip the parquet
+                # read entirely.
+                #
+                # `hist` (the original ArcticDB read) remains authoritative for
+                # the write schema (dtype matching via hist.dtypes[col] at the
+                # update() call below). Only the feature-compute context is
+                # enriched.
+                warmup_source = hist
+                if len(hist) < MIN_ROWS_FOR_FEATURES:
+                    parquet_df = _load_parquet_warmup(s3, bucket, ticker)
+                    if parquet_df is None:
+                        log.warning(
+                            "short-history-no-parquet ticker=%s arctic_rows=%d "
+                            "— falling through to NaN-feature degrade",
+                            ticker, len(hist),
+                        )
+                    else:
+                        parquet_ohlcv = parquet_df[
+                            [c for c in OHLCV_COLS if c in parquet_df.columns]
+                        ]
+                        arctic_ohlcv = hist[
+                            [c for c in OHLCV_COLS if c in hist.columns]
+                        ]
+                        warmup_source = pd.concat([parquet_ohlcv, arctic_ohlcv])
+                        warmup_source = warmup_source[
+                            ~warmup_source.index.duplicated(keep="last")
+                        ].sort_index()
+                        n_parquet_warmup += 1
+                        log.info(
+                            "parquet-warmup ticker=%s arctic_rows=%d "
+                            "parquet_rows=%d stitched_rows=%d",
+                            ticker, len(hist), len(parquet_df), len(warmup_source),
+                        )
+
+                # Combine warmup OHLCV + today's bar for feature computation.
+                # Strip the ``source`` provenance metadata from the row going
+                # into ``compute_features`` so that step gets a clean OHLCV
+                # frame; the source value is re-attached to today_row below.
+                hist_ohlcv = warmup_source[
+                    [c for c in OHLCV_COLS if c in warmup_source.columns]
+                ]
+                new_row_ohlcv = new_row[
+                    [c for c in OHLCV_COLS if c in new_row.columns]
+                ]
+                combined = pd.concat([hist_ohlcv, new_row_ohlcv])
+                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+
+                # Compute features on the combined series. `compute_features`
+                # returns rows with NaN for features whose rolling-window
+                # warmup exceeds the available history (short-history tickers
+                # get ATR-14 computed on ≥14 rows, while 252-day features
+                # stay NaN). Rows are never dropped — see 2026-04-21 docstring
+                # in features/feature_engineer.py.
+                sector_etf_sym = sector_map.get(ticker)
+                sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+                ticker_alt = alt_data.get(ticker, {})
+
+                featured = compute_features(
+                    combined,
+                    spy_series=spy_series,
+                    vix_series=vix_series,
+                    sector_etf_series=sector_etf_series,
+                    tnx_series=tnx_series,
+                    irx_series=irx_series,
+                    gld_series=gld_series,
+                    uso_series=uso_series,
+                    vix3m_series=vix3m_series,
+                    earnings_data=ticker_alt.get("earnings"),
+                    revision_data=ticker_alt.get("revisions"),
+                    options_data=ticker_alt.get("options"),
+                    fundamental_data=fundamentals.get(ticker),
+                )
+
+                if today_ts not in featured.index:
+                    # Only possible if combined had a genuine upstream data
+                    # issue (today's row disappeared during feature compute).
+                    log.warning(
+                        "Ticker %s: today_ts missing from featured frame — "
+                        "unexpected after compute_features stopped dropping rows",
+                        ticker,
+                    )
+                    n_err += 1
+                    continue
+
+                # Extract today's row with OHLCV + every feature that has
+                # a column in the featured frame. Features that failed to
+                # compute arrive as NaN and are written as NaN — first-class
+                # support for partial coverage.
+                keep_cols = (
+                    [c for c in OHLCV_COLS if c in featured.columns]
+                    + [f for f in FEATURES if f in featured.columns]
+                )
+                today_row = featured.loc[[today_ts], keep_cols].copy()
+                # Pull provenance from the new_row directly rather than relying
+                # on compute_features to preserve non-OHLCV string columns. Even
+                # if compute_features incidentally retains source through its
+                # pipeline today, that's an implementation detail of an
+                # OHLCV-shaped function — sourcing from new_row keeps the
+                # provenance contract decoupled from feature_engineer's column
+                # passthrough behaviour.
+                today_row[PROVENANCE_COL] = new_row.iloc[0][PROVENANCE_COL]
+
+                # Per-ticker coverage observability: count NaN features now
+                # so the eventual log + counter reflects exactly what's
+                # being written. Silent partial coverage is forbidden
+                # (feedback_no_silent_fails). Increment is deferred until
+                # after universe_lib.update() so an exception rolls back
+                # cleanly into n_err.
+                nan_features = [
+                    f for f in FEATURES
+                    if f in today_row.columns and today_row[f].isna().iloc[0]
+                ]
+
+                # Match stored schema dtype per-column. ArcticDB rejects
+                # updates whose column dtypes don't match the existing
+                # version; stored dtype varies across tickers (some Volume
+                # int64, some float64 depending on backfill vintage).
+                # hist.dtypes[col] is authoritative by construction.
+                # Feature columns that aren't yet in storage default to
+                # float32 — matches the predictor training schema.
+                #
+                # ``source`` is metadata (string), not numeric — skip the
+                # dtype-cast fallback path; if it's already in hist the cast
+                # picks up the existing string dtype, otherwise it stays
+                # object/string (default pandas inference).
+                for col in today_row.columns:
+                    if col in hist.columns:
+                        today_row[col] = today_row[col].astype(hist.dtypes[col])
+                    elif col == PROVENANCE_COL:
+                        continue  # string metadata; no float32 fallback
+                    elif col in FEATURES:
+                        today_row[col] = today_row[col].astype("float32")
+
+                today_row.index.name = "date"
+
+                # Defer the actual ArcticDB write — collected here so Phase 2
+                # can run them in parallel via a thread pool. The previous
+                # sequential per-ticker `_write_row_backfill_safe` call took
+                # ~300-400ms × 900 = ~5 minutes wall time, the residual half
+                # of the budget after the read_batch optimization in PR #99.
+                write_tasks.append((ticker, today_row, hist, nan_features))
+
+            except Exception as exc:
+                log.warning("Failed to compute %s: %s", ticker, exc)
+                n_err += 1
+
+        # ── 4c. Phase 2 — bulk writes via ArcticDB batch API ─────────────────────
+        # 2026-05-05: replaced ThreadPoolExecutor + per-symbol lib.update() loop
+        # with `update_batch` + `write_batch`. PR #152's per-task timing
+        # instrumentation measured the prior threadpool achieving no parallelism
+        # in practice — wall ≈ 900 × 1.7s/ticker (2026-05-05 MorningEnrich
+        # incident, 1535s for 900 tickers, workers=16, hit the 30-min SSM cap).
+        # Phase 1's `read_batch` runs at 84ms/ticker against the same library,
+        # so the ArcticDB native parallelism is the right primitive — and is
+        # documented as such ("perform an update operation on a list of symbols
+        # in parallel"). Same shift PR #99 made for reads. The #152
+        # instrumentation becomes obsolete with this refactor (no per-task
+        # threadpool to time) and is removed in this PR.
+        #
+        # Path split: append-at-head (target_ts > existing.index.max(), the
+        # common morning-enrich case) → UpdatePayload + update_batch.
+        # Backfill (target_ts in middle of series, rare — historical VWAP
+        # repair etc.) → splice + WritePayload + write_batch. Mirrors
+        # `_write_row_backfill_safe`'s branching for the per-symbol path
+        # (which still serves macro_lib's small N=7-11 sequential writes).
+        update_payloads: list[UpdatePayload] = []
+        write_payloads: list[WritePayload] = []
+        payload_meta: dict[str, tuple[list[str] | None, int]] = {}  # ticker → (nan_features, hist_rows)
+
+        for ticker, today_row, hist, nan_features in write_tasks:
+            target_ts = today_row.index[0]
+            payload_meta[ticker] = (nan_features, len(hist))
+            if hist.empty or target_ts > hist.index.max():
+                # Append at head — fast path. update_batch with upsert=True
+                # also handles the rare "symbol doesn't exist yet" case
+                # (replaces _write_row_backfill_safe's lib.write fallback).
+                update_payloads.append(UpdatePayload(symbol=ticker, data=today_row))
+            else:
+                # Backfill — splice into existing series, full rewrite. Same
+                # logic as _write_row_backfill_safe's backfill branch.
+                combined = pd.concat([hist, today_row])
+                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+                write_payloads.append(WritePayload(symbol=ticker, data=combined))
+
+        if update_payloads or write_payloads:
+            t_write0 = time.time()
+            update_results = (
+                universe_lib.update_batch(update_payloads, upsert=True)
+                if update_payloads else []
+            )
+            write_results = (
+                universe_lib.write_batch(write_payloads, prune_previous_versions=True)
+                if write_payloads else []
+            )
+            write_wall = time.time() - t_write0
+            log.info(
+                "Batch writes: %d updates + %d backfills in %.1fs",
+                len(update_payloads), len(write_payloads), write_wall,
+            )
+
+            # Iterate results — ArcticDB returns DataError per failed symbol
+            # rather than raising, so explicit per-symbol error detection is
+            # required. Pair each result with the originating payload's symbol
+            # via positional alignment (ArcticDB guarantees i-th result
+            # corresponds to i-th payload).
+            def _aggregate(payloads, results, label: str):
+                nonlocal n_ok, n_err, n_partial
+                for payload, result in zip(payloads, results):
+                    ticker = payload.symbol
+                    if isinstance(result, DataError):
+                        log.warning(
+                            "Failed to %s %s: %s (code=%s, category=%s)",
+                            label, ticker, result.exception_string,
+                            result.error_code, result.error_category,
+                        )
+                        n_err += 1
+                        continue
+                    nan_features, hist_rows = payload_meta[ticker]
+                    if nan_features:
+                        log.warning(
+                            "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
+                            ticker, hist_rows, len(nan_features), len(FEATURES),
+                            nan_features,
+                        )
+                        n_partial += 1
+                    else:
+                        n_ok += 1
+
+            _aggregate(update_payloads, update_results, "update")
+            _aggregate(write_payloads, write_results, "backfill")
+
+        # Free chunk-resident memory before the next iteration. Without
+        # this, ~150 ticker hist DataFrames + write_payloads.combined
+        # frames stay reachable in the chunk loop's frame scope and
+        # accumulate across iterations. gc.collect() is load-bearing
+        # because pandas' BlockManager holds reference cycles that
+        # del-alone can't break.
+        del hists_by_ticker, write_tasks, update_payloads, write_payloads
+        gc.collect()
+
 
     t_total = time.time() - t0
 
