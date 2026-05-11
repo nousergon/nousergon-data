@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# deploy.sh — Create or update the alpha-engine-spot-orphan-reaper Lambda
+# and wire its hourly EventBridge trigger.
+#
+# Backstop for the spot-side watchdog installed by the four spot launcher
+# scripts. Hourly scan terminates any alpha-engine-* tagged spot instance
+# whose age exceeds its per-tag-prefix budget + 30-min grace.
+#
+# Managed outside CloudFormation — same rationale as the
+# changelog-cloudwatch-mirror Lambda (keeps the github-actions-lambda-deploy
+# OIDC role's blast radius narrow; this Lambda has destructive ec2:Terminate
+# permission and should be operator-deployed only).
+#
+# Usage:
+#   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh             # update code only
+#   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --bootstrap # first-time create + wire EventBridge
+#   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --dry-run   # show actions, do not apply
+#   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --smoke     # invoke once with DRY_RUN=true and print scan output
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FUNCTION_NAME="alpha-engine-spot-orphan-reaper"
+ROLE_NAME="alpha-engine-spot-orphan-reaper-role"
+POLICY_NAME="alpha-engine-spot-orphan-reaper-policy"
+RULE_NAME="alpha-engine-spot-orphan-reaper-hourly"
+REGION="${AWS_REGION:-us-east-1}"
+ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
+
+DRY_RUN=false
+BOOTSTRAP=false
+SMOKE=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --bootstrap) BOOTSTRAP=true ;;
+    --smoke) SMOKE=true ;;
+    -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
+  esac
+done
+
+run() {
+  if $DRY_RUN; then
+    echo "DRY: $*"
+  else
+    "$@"
+  fi
+}
+
+# ----- 0. Validate handler ---------------------------------------------------
+
+python3 -c "
+import ast, sys
+src = open('${SCRIPT_DIR}/index.py').read()
+ast.parse(src)
+print('index.py syntax OK')
+"
+
+if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  echo "Running handler unit tests..."
+  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+fi
+
+# ----- 1. Bootstrap (first-time only) ---------------------------------------
+
+if $BOOTSTRAP; then
+  echo "Bootstrapping ${FUNCTION_NAME}..."
+
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  Creating IAM role: ${ROLE_NAME}"
+    run aws iam create-role \
+      --role-name "${ROLE_NAME}" \
+      --assume-role-policy-document "${TRUST_POLICY}" \
+      --query 'Role.RoleName' --output text
+  else
+    echo "  IAM role exists: ${ROLE_NAME}"
+  fi
+
+  echo "  Applying inline policy: ${POLICY_NAME}"
+  run aws iam put-role-policy \
+    --role-name "${ROLE_NAME}" \
+    --policy-name "${POLICY_NAME}" \
+    --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
+
+  if ! $DRY_RUN; then
+    echo "  Waiting 10s for IAM role propagation..."
+    sleep 10
+  fi
+
+  PKG=$(mktemp -d)
+  trap "rm -rf '$PKG'" EXIT
+  cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+  ZIP="${PKG}/function.zip"
+  (cd "${PKG}" && zip -q "function.zip" index.py)
+  echo "  Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
+
+  ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+  if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
+    echo "  Creating Lambda: ${FUNCTION_NAME}"
+    run aws lambda create-function \
+      --function-name "${FUNCTION_NAME}" \
+      --runtime python3.12 \
+      --role "${ROLE_ARN}" \
+      --handler index.handler \
+      --zip-file "fileb://${ZIP}" \
+      --timeout 60 \
+      --memory-size 128 \
+      --environment 'Variables={GRACE_SECONDS=1800,DRY_RUN=false}' \
+      --region "${REGION}" \
+      --query 'FunctionArn' --output text
+  fi
+
+  # EventBridge hourly trigger
+  echo "  Creating EventBridge rule: ${RULE_NAME}"
+  run aws events put-rule \
+    --name "${RULE_NAME}" \
+    --schedule-expression "cron(15 * * * ? *)" \
+    --description "Hourly scan for orphan alpha-engine spot instances" \
+    --region "${REGION}" \
+    --query 'RuleArn' --output text
+
+  FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+  run aws events put-targets \
+    --rule "${RULE_NAME}" \
+    --targets "Id=1,Arn=${FN_ARN}" \
+    --region "${REGION}"
+
+  RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
+  run aws lambda add-permission \
+    --function-name "${FUNCTION_NAME}" \
+    --statement-id "eventbridge-${RULE_NAME}" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "${RULE_ARN}" \
+    --region "${REGION}" 2>/dev/null || true
+fi
+
+# ----- 2. Update function code (always) -------------------------------------
+
+if ! $BOOTSTRAP; then
+  PKG=$(mktemp -d)
+  trap "rm -rf '$PKG'" EXIT
+  cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+  ZIP="${PKG}/function.zip"
+  (cd "${PKG}" && zip -q "function.zip" index.py)
+  echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
+
+  echo "Updating Lambda function code: ${FUNCTION_NAME}"
+  run aws lambda update-function-code \
+    --function-name "${FUNCTION_NAME}" \
+    --zip-file "fileb://${ZIP}" \
+    --region "${REGION}" \
+    --query 'LastUpdateStatus' --output text
+
+  if ! $DRY_RUN; then
+    aws lambda wait function-updated \
+      --function-name "${FUNCTION_NAME}" \
+      --region "${REGION}"
+  fi
+fi
+
+echo "✓ Code deployed."
+
+# ----- 3. Smoke (dry-run scan) ----------------------------------------------
+
+if $SMOKE; then
+  echo ""
+  echo "Smoke-testing via direct invoke (DRY_RUN override)..."
+  RESP=$(mktemp)
+  trap "rm -f '${RESP}'" EXIT
+  # Override DRY_RUN at the env layer for the smoke invoke
+  aws lambda update-function-configuration \
+    --function-name "${FUNCTION_NAME}" \
+    --environment 'Variables={GRACE_SECONDS=1800,DRY_RUN=true}' \
+    --region "${REGION}" \
+    --query 'LastUpdateStatus' --output text > /dev/null
+  aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+
+  aws lambda invoke \
+    --function-name "${FUNCTION_NAME}" \
+    --payload '{}' \
+    --region "${REGION}" \
+    "${RESP}" >/dev/null
+  cat "${RESP}"
+  echo ""
+
+  # Restore production DRY_RUN=false
+  aws lambda update-function-configuration \
+    --function-name "${FUNCTION_NAME}" \
+    --environment 'Variables={GRACE_SECONDS=1800,DRY_RUN=false}' \
+    --region "${REGION}" \
+    --query 'LastUpdateStatus' --output text > /dev/null
+fi
