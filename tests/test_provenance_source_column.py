@@ -243,6 +243,97 @@ def test_apply_daily_delta_tags_pre_delta_yfinance_and_delta_from_parquet():
     assert pd.Timestamp("2026-05-08") in polygon_dates
 
 
+def test_source_categories_constant_is_closed_set():
+    """``SOURCE_CATEGORIES`` is the closed set of values writers may assign
+    to the ``source`` column. Pinned so a writer that adds a new source
+    type (e.g. polygon flat-files) updates the categorical first instead
+    of falling through to ``"unknown"`` silently."""
+    from features.compute import SOURCE_CATEGORIES
+
+    assert SOURCE_CATEGORIES == ("polygon", "yfinance", "fred", "unknown")
+
+
+def test_make_source_series_returns_categorical_dtype():
+    """The helper must build a Categorical so callers don't accidentally
+    end up with object dtype on full-history assignments. Categorical
+    dtype is the load-bearing optimization (~50x memory reduction per
+    column on a 10y series) that makes daily_append + backfill fit on
+    a 2GB t3.small alongside daemon + IB Gateway."""
+    from features.compute import SOURCE_CATEGORIES, make_source_series
+
+    index = pd.bdate_range("2026-01-01", periods=100)
+    out = make_source_series(["yfinance"] * 100, index=index)
+    assert isinstance(out.dtype, pd.CategoricalDtype)
+    assert tuple(out.cat.categories) == SOURCE_CATEGORIES
+    assert (out == "yfinance").all()
+
+
+def test_make_source_series_coerces_unknown_values_to_unknown_category():
+    """Values not in SOURCE_CATEGORIES are remapped to "unknown" rather
+    than expanding the category set. Guarantees a fixed category code
+    space across writers — downstream readers can rely on the codes."""
+    from features.compute import SOURCE_CATEGORIES, make_source_series
+
+    out = make_source_series(["polygon", "garbage", "yfinance", "made-up"])
+    assert tuple(out.cat.categories) == SOURCE_CATEGORIES
+    assert list(out) == ["polygon", "unknown", "yfinance", "unknown"]
+
+
+def test_apply_daily_delta_produces_categorical_source_column():
+    """The biggest memory consumer: ``base["source"] = "yfinance"`` on a
+    2500-row 10y series × 900 tickers. The categorical dtype keeps the
+    per-ticker column size at ~2.5KB instead of ~125KB. Pin the dtype
+    so a future refactor that strips the categorical doesn't silently
+    regress peak memory by ~108MB on the universe-wide pass."""
+    from features.compute import _apply_daily_delta
+
+    price_data = {
+        "SPY": pd.DataFrame(
+            {
+                "Open": np.arange(100.0, 110.0),
+                "High": np.arange(101.0, 111.0),
+                "Low": np.arange(99.0, 109.0),
+                "Close": np.arange(100.5, 110.5),
+                "Volume": [1_000_000] * 10,
+            },
+            # Cache ends 2026-05-06; delta range will be 5/7 + 5/8 + 5/11.
+            index=pd.bdate_range(end="2026-05-06", periods=10),
+        ),
+    }
+    s3 = MagicMock()
+
+    class _NoSuchKey(Exception):
+        pass
+
+    s3.exceptions.NoSuchKey = _NoSuchKey
+
+    delta_5_7 = pd.DataFrame(
+        {
+            "Open": [110.0], "High": [111.0], "Low": [109.0],
+            "Close": [110.5], "Volume": [1_500_000], "source": ["polygon"],
+        },
+        index=["SPY"],
+    )
+    delta_5_7.index.name = "ticker"
+
+    def _get_object(Bucket, Key):
+        if Key == "staging/daily_closes/2026-05-07.parquet":
+            buf = io.BytesIO()
+            delta_5_7.to_parquet(buf, engine="pyarrow")
+            buf.seek(0)
+            return {"Body": MagicMock(read=lambda: buf.read())}
+        raise _NoSuchKey(Key)
+
+    s3.get_object.side_effect = _get_object
+
+    out, _ = _apply_daily_delta(s3, "test-bucket", "2026-05-08", price_data)
+    assert "source" in out["SPY"].columns
+    assert isinstance(out["SPY"]["source"].dtype, pd.CategoricalDtype)
+    # Verify both pre-delta yfinance rows and delta polygon row carry through
+    assert (out["SPY"]["source"] == "yfinance").sum() == 10
+    assert (out["SPY"]["source"] == "polygon").sum() == 1
+
+
 def test_apply_daily_delta_no_delta_files_keeps_yfinance_default():
     """When no delta files exist (e.g. the cache is current), pre-delta
     rows still get the ``yfinance`` provenance tag — the merged frame
