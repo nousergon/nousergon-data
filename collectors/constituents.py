@@ -131,6 +131,39 @@ def collect(
     }
 
 
+def _select_constituents_table(tables: list[pd.DataFrame], index_name: str) -> pd.DataFrame:
+    """Pick the constituents DataFrame from pd.read_html output.
+
+    Wikipedia inserts banner/disambiguation tables ahead of the constituents
+    table without notice (S&P 400 page added one ~2026-05; the prior
+    `tables[0]` heuristic returned a 2-col warning banner with integer column
+    names instead of the 400-row constituents table). Find by columns
+    instead of by position: must have a ticker/symbol column AND a GICS
+    sector (not sub-industry) column. Returns the first matching table —
+    on Wikipedia constituent pages this is the live roster; the second-such
+    table (recent additions/removals) lacks a GICS Sector column.
+    """
+    candidates: list[pd.DataFrame] = []
+    for df in tables:
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.copy()
+            df.columns = [" ".join(str(c) for c in col).strip() for col in df.columns]
+        cols_lower = [str(c).lower() for c in df.columns]
+        has_ticker = any("symbol" in c or "ticker" in c for c in cols_lower)
+        has_gics_sector = any(
+            "gics" in c and "sector" in c and "sub" not in c for c in cols_lower
+        )
+        if has_ticker and has_gics_sector:
+            candidates.append(df)
+    if not candidates:
+        raise RuntimeError(
+            f"No constituents table found in {index_name} Wikipedia page "
+            f"(scanned {len(tables)} tables; need columns matching symbol/ticker "
+            f"AND GICS sector). Wikipedia layout drift — extractor needs update."
+        )
+    return max(candidates, key=len)
+
+
 def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], int, int]:
     """
     Fetch constituent tickers and sector mappings from Wikipedia.
@@ -151,11 +184,7 @@ def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], in
             resp = requests.get(url, headers=_HEADERS, timeout=15)
             resp.raise_for_status()
             tables = pd.read_html(StringIO(resp.text))
-            df = tables[0]
-
-            # Flatten multi-level columns if Wikipedia returns them
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [" ".join(str(c) for c in col).strip() for col in df.columns]
+            df = _select_constituents_table(tables, index_name)
 
             col = next(
                 (c for c in df.columns if "symbol" in str(c).lower() or "ticker" in str(c).lower()),
