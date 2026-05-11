@@ -429,3 +429,225 @@ class TestEmitContextCoverageMetric:
             "quant_score", "qual_score", "conviction",
             "sector_modifier", "market_regime",
         }
+
+
+# ── Stance denormalization (Kimball pattern, 2026-05-11) ──────────────────
+
+
+def _mock_s3_with_signals_and_predictions(
+    signals_payload: dict,
+    predictions_payload: dict | None,
+) -> MagicMock:
+    """S3 mock that returns different bodies for signals.json vs
+    predictions.json — needed to test the stance denormalization
+    path which reads from BOTH per-date sources.
+
+    ``predictions_payload=None`` simulates a sig_date that predates the
+    stance field (predictor#137 shipped 2026-05-11) — get_object on
+    the predictions key raises a NoSuchKey-equivalent which the
+    extractor catches and returns an empty stance lookup.
+    """
+    from botocore.exceptions import ClientError
+
+    def _get_object(Bucket, Key):
+        body = MagicMock()
+        if Key.endswith("signals.json"):
+            body.read.return_value = json.dumps(signals_payload).encode()
+            return {"Body": body}
+        if "predictions" in Key:
+            if predictions_payload is None:
+                raise ClientError(
+                    {"Error": {"Code": "NoSuchKey", "Message": "Not found"}},
+                    "GetObject",
+                )
+            body.read.return_value = json.dumps(predictions_payload).encode()
+            return {"Body": body}
+        raise AssertionError(f"Unexpected S3 key: {Key}")
+
+    s3 = MagicMock()
+    s3.get_object.side_effect = _get_object
+    paginator = MagicMock()
+    paginator.paginate.return_value = [
+        {"CommonPrefixes": [{"Prefix": "signals/2026-05-01/"}]}
+    ]
+    s3.get_paginator.return_value = paginator
+    return s3
+
+
+def _predictions_payload(stance_by_ticker: dict[str, str]) -> dict:
+    """Minimal predictions.json payload — only the fields our stance
+    extractor reads. Real payload has many more per-ticker fields."""
+    return {
+        "date": "2026-05-01",
+        "predictions": [
+            {"ticker": t, "stance": s} for t, s in stance_by_ticker.items()
+        ],
+    }
+
+
+class TestSeedScorePerformanceStanceColumn:
+    """Verifies the stance column on score_performance is populated at
+    INSERT from predictions.json — the Kimball denormalization the
+    backtester's per-stance attribution depends on."""
+
+    def test_stance_stamped_when_predictions_provides_it(self, tmp_db):
+        sigs = _signals_payload()
+        preds = _predictions_payload({
+            "AAPL": "momentum", "MSFT": "quality", "PFE": "value",
+        })
+        s3 = _mock_s3_with_signals_and_predictions(sigs, preds)
+        for t in ("AAPL", "MSFT", "PFE"):
+            _seed_universe_close(tmp_db, t, "2026-05-01", 100.0)
+
+        out = _seed_score_performance(s3, "bucket", tmp_db, "signals", dry_run=False)
+        assert out["rows_written"] == 3
+
+        with sqlite3.connect(tmp_db) as conn:
+            rows = {
+                r[0]: r[1]
+                for r in conn.execute(
+                    "SELECT symbol, stance FROM score_performance"
+                ).fetchall()
+            }
+        assert rows == {"AAPL": "momentum", "MSFT": "quality", "PFE": "value"}
+
+    def test_stance_null_when_predictor_did_not_score_ticker(self, tmp_db):
+        """If predictions.json exists but lacks an entry for a ticker
+        (e.g., ticker outside predictor's population), stance stays NULL.
+        Backtester treats NULL as 'no stance recorded', not a default."""
+        sigs = _signals_payload()
+        preds = _predictions_payload({"AAPL": "momentum"})  # only AAPL
+        s3 = _mock_s3_with_signals_and_predictions(sigs, preds)
+        for t in ("AAPL", "MSFT", "PFE"):
+            _seed_universe_close(tmp_db, t, "2026-05-01", 100.0)
+
+        _seed_score_performance(s3, "bucket", tmp_db, "signals", dry_run=False)
+
+        with sqlite3.connect(tmp_db) as conn:
+            rows = {
+                r[0]: r[1]
+                for r in conn.execute(
+                    "SELECT symbol, stance FROM score_performance"
+                ).fetchall()
+            }
+        assert rows["AAPL"] == "momentum"
+        assert rows["MSFT"] is None
+        assert rows["PFE"] is None
+
+    def test_stance_null_when_predictions_json_missing(self, tmp_db):
+        """sig_date predates stance field (predictor#137 shipped
+        2026-05-11). predictions.json either doesn't exist or lacks
+        the field. Extractor returns empty dict, all rows for that
+        date get NULL stance — graceful degrade during the data-layer
+        transition."""
+        sigs = _signals_payload()
+        s3 = _mock_s3_with_signals_and_predictions(sigs, predictions_payload=None)
+        for t in ("AAPL", "MSFT", "PFE"):
+            _seed_universe_close(tmp_db, t, "2026-05-01", 100.0)
+
+        out = _seed_score_performance(s3, "bucket", tmp_db, "signals", dry_run=False)
+        assert out["rows_written"] == 3  # rows still get written
+
+        with sqlite3.connect(tmp_db) as conn:
+            stances = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT stance FROM score_performance"
+                ).fetchall()
+            ]
+        assert stances == [None, None, None]
+
+    def test_stance_lookup_cached_per_date(self, tmp_db):
+        """The stance extractor caches per-date — fetching predictions.json
+        once per date, not once per (date, ticker). Pinned via call-count
+        on the S3 mock so a future refactor that loses the cache
+        immediately surfaces (per-ticker S3 reads would be a real
+        regression at scale)."""
+        sigs = _signals_payload()
+        preds = _predictions_payload({"AAPL": "momentum", "MSFT": "quality", "PFE": "value"})
+        s3 = _mock_s3_with_signals_and_predictions(sigs, preds)
+        for t in ("AAPL", "MSFT", "PFE"):
+            _seed_universe_close(tmp_db, t, "2026-05-01", 100.0)
+
+        _seed_score_performance(s3, "bucket", tmp_db, "signals", dry_run=False)
+        # 3 BUY-rated tickers, but only 1 predictions.json fetch
+        # (1 unique sig_date) — not 3.
+        predictions_calls = [
+            c for c in s3.get_object.call_args_list
+            if "predictions" in (c.kwargs.get("Key", "") or (c.args[1] if len(c.args) > 1 else ""))
+        ]
+        assert len(predictions_calls) == 1, (
+            f"Expected 1 predictions.json fetch (per-date cache), got "
+            f"{len(predictions_calls)}"
+        )
+
+
+class TestLoadStanceLookupForDate:
+    """Unit tests for the standalone _load_stance_lookup_for_date helper."""
+
+    def test_returns_ticker_to_stance_mapping(self):
+        from collectors.signal_returns import _load_stance_lookup_for_date
+
+        s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = json.dumps({
+            "predictions": [
+                {"ticker": "AAPL", "stance": "momentum"},
+                {"ticker": "WING", "stance": "value"},
+            ]
+        }).encode()
+        s3.get_object.return_value = {"Body": body}
+
+        result = _load_stance_lookup_for_date(s3, "bucket", "2026-05-01")
+        assert result == {"AAPL": "momentum", "WING": "value"}
+
+    def test_returns_empty_on_s3_404(self):
+        from botocore.exceptions import ClientError
+        from collectors.signal_returns import _load_stance_lookup_for_date
+
+        s3 = MagicMock()
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}},
+            "GetObject",
+        )
+        assert _load_stance_lookup_for_date(s3, "bucket", "2026-04-01") == {}
+
+    def test_returns_empty_on_json_parse_error(self):
+        from collectors.signal_returns import _load_stance_lookup_for_date
+
+        s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = b"not valid json{"
+        s3.get_object.return_value = {"Body": body}
+        assert _load_stance_lookup_for_date(s3, "bucket", "2026-05-01") == {}
+
+    def test_skips_entries_without_stance_field(self):
+        """Predictions emitted before the stance classifier shipped
+        (predictor#137, 2026-05-11) lack the field. Skip those entries
+        — don't crash."""
+        from collectors.signal_returns import _load_stance_lookup_for_date
+
+        s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = json.dumps({
+            "predictions": [
+                {"ticker": "AAPL"},  # no stance field
+                {"ticker": "WING", "stance": "value"},
+            ]
+        }).encode()
+        s3.get_object.return_value = {"Body": body}
+
+        result = _load_stance_lookup_for_date(s3, "bucket", "2026-05-01")
+        assert result == {"WING": "value"}  # AAPL skipped, no error
+
+
+class TestEnsureScorePerformanceSchemaIncludesStance:
+    """Belt-and-suspenders ALTER must include stance — if the
+    data-collector Lambda fires against a research.db that hasn't yet
+    applied research migration v16, this defensive ALTER catches it."""
+
+    def test_stance_column_added_by_defensive_alter(self, tmp_db):
+        with sqlite3.connect(tmp_db) as conn:
+            _ensure_score_performance_schema(conn)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(score_performance)").fetchall()}
+        assert "stance" in cols
