@@ -229,20 +229,55 @@ def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], in
 
         tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
 
-        # Update local cache
+        # Update local cache with full sector mapping so a future Wikipedia
+        # outage doesn't dead-end on the empty-sector-map raise in collect().
+        # Prior cache stored only ticker symbols; the 2026-05-11 partial
+        # outage exposed that gap (S&P 500 fetch succeeded, S&P 400 failed,
+        # fallback returned 903 symbols with zero sector data → raise).
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({"ticker": tickers}).to_csv(_CACHE_PATH, index=False)
+        pd.DataFrame({
+            "ticker": tickers,
+            "gics_sector": [sector_map.get(t, "") for t in tickers],
+            "sector_etf": [sector_etf_map.get(t, "") for t in tickers],
+        }).to_csv(_CACHE_PATH, index=False)
 
         return tickers, sector_map, sector_etf_map, sp500_count, sp400_count
 
     except Exception as e:
         logger.warning("Wikipedia fetch failed (%s); trying local cache...", e)
-        if _CACHE_PATH.exists():
-            cached = pd.read_csv(_CACHE_PATH)["ticker"].tolist()
-            logger.info("Loaded %d tickers from cache", len(cached))
-            return cached, {}, {}, 0, 0
+        return _load_from_cache()
+
+
+def _load_from_cache() -> tuple[list[str], dict[str, str], dict[str, str], int, int]:
+    """Read the local cache and reconstruct ticker list + sector maps.
+
+    Backwards-compatible with the legacy ticker-only cache schema: missing
+    gics_sector / sector_etf columns return empty dicts (which then trip
+    collect()'s `Sector mapping incomplete` raise — failing loud rather
+    than writing constituents.json with missing data).
+    """
+    if not _CACHE_PATH.exists():
         logger.error("No cache found — cannot build universe")
         return [], {}, {}, 0, 0
+    df = pd.read_csv(_CACHE_PATH)
+    tickers = df["ticker"].astype(str).tolist()
+    sector_map: dict[str, str] = {}
+    sector_etf_map: dict[str, str] = {}
+    if "gics_sector" in df.columns:
+        for ticker, sector in zip(tickers, df["gics_sector"].astype(str).tolist()):
+            sector = sector.strip()
+            if sector and sector.lower() != "nan":
+                sector_map[ticker] = sector
+    if "sector_etf" in df.columns:
+        for ticker, etf in zip(tickers, df["sector_etf"].astype(str).tolist()):
+            etf = etf.strip()
+            if etf and etf.lower() != "nan":
+                sector_etf_map[ticker] = etf
+    logger.info(
+        "Loaded %d tickers from cache (sector_map=%d, sector_etf_map=%d)",
+        len(tickers), len(sector_map), len(sector_etf_map),
+    )
+    return tickers, sector_map, sector_etf_map, 0, 0
 
 
 def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:

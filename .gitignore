@@ -1,6 +1,10 @@
 # Config (contains bucket names, API keys)
 config.yaml
 
+# Constituents cache — runtime-rebuilt by collectors/constituents.py;
+# never committed (would race the live Wikipedia fetch + test pollution).
+data/constituents_cache.csv
+
 # flow-doctor.yaml was previously gitignored because it held inline credentials.
 # As of flow-doctor 0.2.0 + FLOW_DOCTOR_* env var contract, all secrets come from
 # the environment and the YAML contains only ${VAR} references — safe to commit.

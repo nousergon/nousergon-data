@@ -77,8 +77,15 @@ def test_collect_raises_when_sector_coverage_incomplete(tmp_path) -> None:
             constituents.collect(bucket="any", dry_run=True)
 
 
-def test_fetch_raises_when_sector_column_missing() -> None:
-    """If Wikipedia table column header changes, _fetch_constituents must raise."""
+def test_fetch_raises_when_sector_column_missing(tmp_path, monkeypatch) -> None:
+    """If Wikipedia table column header changes, _fetch_constituents must
+    fall through to the cache (or empty result) rather than silently
+    selecting a junk table."""
+    # Isolate the cache to a tmp path so prior tests' cache pollution
+    # doesn't disguise the missing-column signature.
+    monkeypatch.setattr(
+        constituents, "_CACHE_PATH", tmp_path / "constituents_cache.csv"
+    )
     df = pd.DataFrame({"Symbol": ["AAPL"], "Industry": ["Tech"]})  # no GICS column
     sp500_html = df.to_html(index=False)
 
@@ -86,17 +93,107 @@ def test_fetch_raises_when_sector_column_missing() -> None:
         return _FakeResp(sp500_html)
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        # _fetch_constituents catches Exception and falls back to cache; we want
-        # to verify the raise happens BEFORE the broad except — the symptom is
-        # that no sector_map gets populated, which is exactly the cache-fallback
-        # signature. The downstream collect() check catches this case.
         tickers, sector_map, _, _, _ = constituents._fetch_constituents()
 
-    # Either the cache fallback returned tickers with empty sector_map, or
-    # the cache was empty too. Either way: the post-loop validation in
-    # collect() will hard-fail on this state. That's the contract.
-    if tickers:
-        assert not sector_map or len(sector_map) < len(tickers)
+    # No tables matched the schema → empty result, which collect() then
+    # short-circuits with status=error before any S3 write.
+    assert tickers == []
+    assert sector_map == {}
+
+
+def test_cache_persists_sector_map_and_etf(tmp_path, monkeypatch) -> None:
+    """On a successful Wikipedia fetch the local cache must persist
+    ticker + GICS sector + sector ETF, so a future Wikipedia outage's
+    fallback returns a fully-populated sector_map (instead of empty,
+    which makes collect() raise 'Sector mapping incomplete')."""
+    cache_path = tmp_path / "constituents_cache.csv"
+    monkeypatch.setattr(constituents, "_CACHE_PATH", cache_path)
+
+    sp500_html = _fake_html(["AAPL", "MSFT"], ["Information Technology", "Information Technology"])
+    sp400_html = _fake_html(["JHG", "WSO"], ["Financials", "Industrials"])
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        constituents._fetch_constituents()
+
+    assert cache_path.exists()
+    cached = pd.read_csv(cache_path)
+    assert set(cached.columns) >= {"ticker", "gics_sector", "sector_etf"}
+    row_by_ticker = {r["ticker"]: r for _, r in cached.iterrows()}
+    assert row_by_ticker["AAPL"]["gics_sector"] == "Information Technology"
+    assert row_by_ticker["AAPL"]["sector_etf"] == "XLK"
+    assert row_by_ticker["JHG"]["gics_sector"] == "Financials"
+    assert row_by_ticker["JHG"]["sector_etf"] == "XLF"
+
+
+def test_cache_fallback_returns_full_sector_map(tmp_path, monkeypatch) -> None:
+    """When Wikipedia is unreachable, the cache fallback must return
+    populated sector_map + sector_etf_map so collect()'s coverage check
+    passes. Regression for the 2026-05-11 cascade: partial Wikipedia
+    outage → empty-cache fallback → collect() raise → SF cascade silent
+    MorningEnrich failure."""
+    cache_path = tmp_path / "constituents_cache.csv"
+    pd.DataFrame({
+        "ticker": ["AAPL", "MSFT", "JHG"],
+        "gics_sector": ["Information Technology", "Information Technology", "Financials"],
+        "sector_etf": ["XLK", "XLK", "XLF"],
+    }).to_csv(cache_path, index=False)
+    monkeypatch.setattr(constituents, "_CACHE_PATH", cache_path)
+
+    def fake_get(url, **kwargs):
+        raise RuntimeError("simulated Wikipedia outage")
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        tickers, sector_map, sector_etf_map, sp500_count, sp400_count = (
+            constituents._fetch_constituents()
+        )
+
+    assert tickers == ["AAPL", "MSFT", "JHG"]
+    assert sector_map == {
+        "AAPL": "Information Technology",
+        "MSFT": "Information Technology",
+        "JHG": "Financials",
+    }
+    assert sector_etf_map == {"AAPL": "XLK", "MSFT": "XLK", "JHG": "XLF"}
+    assert sp500_count == 0 and sp400_count == 0
+
+
+def test_cache_fallback_handles_legacy_ticker_only_schema(tmp_path, monkeypatch) -> None:
+    """Pre-existing caches on EC2 have only the `ticker` column. Reader
+    must tolerate that schema and return empty sector dicts (failing
+    loud in collect() rather than crashing inside _fetch_constituents)."""
+    cache_path = tmp_path / "constituents_cache.csv"
+    pd.DataFrame({"ticker": ["AAPL", "MSFT"]}).to_csv(cache_path, index=False)
+    monkeypatch.setattr(constituents, "_CACHE_PATH", cache_path)
+
+    def fake_get(url, **kwargs):
+        raise RuntimeError("simulated Wikipedia outage")
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        tickers, sector_map, sector_etf_map, _, _ = constituents._fetch_constituents()
+
+    assert tickers == ["AAPL", "MSFT"]
+    assert sector_map == {}
+    assert sector_etf_map == {}
+
+
+def test_cache_fallback_missing_cache_returns_empty(tmp_path, monkeypatch) -> None:
+    """No Wikipedia AND no cache → empty lists/dicts, not a crash. The
+    eventual `collect()` short-circuit ('No tickers fetched') handles
+    this state."""
+    cache_path = tmp_path / "constituents_cache.csv"  # does not exist
+    monkeypatch.setattr(constituents, "_CACHE_PATH", cache_path)
+
+    def fake_get(url, **kwargs):
+        raise RuntimeError("simulated Wikipedia outage")
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        tickers, sector_map, sector_etf_map, _, _ = constituents._fetch_constituents()
+
+    assert tickers == []
+    assert sector_map == {} and sector_etf_map == {}
 
 
 def test_select_constituents_table_skips_banner_table() -> None:
