@@ -50,6 +50,34 @@ FEATURE_STORE_PREFIX = "features/"
 # Large-move warning threshold (>45% daily return, e.g. stock splits, VIX spikes)
 _SPLIT_RETURN_THRESHOLD = 0.45
 
+# Closed-set of provenance source values written to the `source` column on
+# universe rows. Stored as a pandas Categorical so the in-memory cost is
+# ~1 byte per row (category code) instead of ~50 bytes per row (object
+# string pointer). On a full-universe pass through ``_apply_daily_delta``
+# (900 tickers × 2500 rows of 10y history each) the savings is ~108MB
+# peak resident memory — material on the 2GB t3.small trading instance
+# where daily_append sits alongside SSM agent + IB Gateway + (any
+# transient daemon restarts) and OOM is a real constraint. Order is
+# stable so the category codes don't shift between writers; "unknown"
+# anchors the unset / pre-migration case.
+SOURCE_CATEGORIES: tuple[str, ...] = ("polygon", "yfinance", "fred", "unknown")
+
+
+def make_source_series(values: list[str] | pd.Series, index: pd.Index | None = None) -> pd.Series:
+    """Build a categorical Series for the ``source`` provenance column.
+
+    Use this instead of `pd.Series(["yfinance"] * n)` or
+    `df["source"] = "yfinance"` anywhere the assignment covers a full-
+    history slice. Values outside SOURCE_CATEGORIES are coerced to
+    "unknown" rather than added to the category — keeps the category
+    set fixed across all writers so downstream readers can rely on it.
+    """
+    if isinstance(values, pd.Series):
+        values = values.astype(str).tolist()
+    cleaned = [v if v in SOURCE_CATEGORIES else "unknown" for v in values]
+    cat = pd.Categorical(cleaned, categories=SOURCE_CATEGORIES)
+    return pd.Series(cat, index=index)
+
 # Rows to keep per ticker before feature computation. The longest rolling
 # window is 252 rows (52w high/low); 280 provides a small buffer. Trimming
 # before the compute loop cuts base memory ~44% vs the full 2y slim cache
@@ -229,8 +257,11 @@ def _apply_daily_delta(
         # Tag pre-delta rows as yfinance-origin (price_cache parquets are
         # yfinance-sourced) so the merged frame carries provenance per
         # row. Delta rows below override this on overlap via dedup
-        # keep="last".
-        base["source"] = "yfinance"
+        # keep="last". Categorical dtype (vs object/string) cuts the
+        # per-ticker memory of this column from ~125KB to ~2.5KB — across
+        # 900 tickers that's ~108MB less peak resident memory on the
+        # universe-wide pass.
+        base["source"] = make_source_series(["yfinance"] * len(base), index=base.index)
 
         delta = ticker_rows.get(ticker, [])
         if not delta:
@@ -240,13 +271,13 @@ def _apply_daily_delta(
         # Build delta DataFrame with capitalized columns (matches slim cache schema)
         delta_df = pd.DataFrame(
             [
-                {
-                    **{k: r[k] for k in ["Open", "High", "Low", "Close", "Volume"]},
-                    "source": r.get("source", "unknown"),
-                }
+                {k: r[k] for k in ["Open", "High", "Low", "Close", "Volume"]}
                 for r in delta
             ],
             index=pd.DatetimeIndex([r["date"] for r in delta]),
+        )
+        delta_df["source"] = make_source_series(
+            [r.get("source", "unknown") for r in delta], index=delta_df.index,
         )
 
         combined = pd.concat([base, delta_df])

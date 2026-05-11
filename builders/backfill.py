@@ -38,6 +38,7 @@ from features.feature_engineer import (
 )
 from features.compute import (
     DEFAULT_BUCKET,
+    SOURCE_CATEGORIES,
     _SKIP_TICKERS,
     _apply_daily_delta,
     _is_sector_etf,
@@ -45,6 +46,7 @@ from features.compute import (
     _load_sector_map,
     _load_cached_fundamentals,
     _load_cached_alternative,
+    make_source_series,
 )
 from store.arctic_store import get_universe_lib, get_macro_lib
 
@@ -560,7 +562,13 @@ def backfill(
             # still the yfinance baseline if the delta loader hasn't
             # tagged it).
             if PROVENANCE_COL not in featured_df.columns:
-                featured_df[PROVENANCE_COL] = "yfinance"
+                # Default-fill as categorical to keep per-ticker memory
+                # ~50x smaller than object dtype (~125KB → ~2.5KB per
+                # 10y series). Saturday backfill rewrites 900 tickers
+                # universe-wide; the savings is ~108MB peak.
+                featured_df[PROVENANCE_COL] = make_source_series(
+                    ["yfinance"] * len(featured_df), index=featured_df.index,
+                )
 
             keep_cols = (
                 [c for c in OHLCV_COLS if c in featured_df.columns]
