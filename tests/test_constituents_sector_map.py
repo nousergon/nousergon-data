@@ -302,6 +302,112 @@ def test_fetch_constituents_handles_banner_table_at_index_0() -> None:
     assert sector_etf_map["S400"] == "XLI"
 
 
+def test_select_constituents_table_skips_banner_table() -> None:
+    """Wikipedia adds banner/disambiguation tables ahead of the constituents
+    table without notice. 2026-05-11 incident: the S&P 400 page inserted a
+    1-row, 2-column disambiguation-warning table at index 0, making
+    `tables[0]` return columns ``[0, 1]`` instead of the constituents
+    table at index 1. _select_constituents_table must scan for the right
+    one by columns, not position.
+    """
+    banner_df = pd.DataFrame({0: [float("nan")], 1: ["This article currently links to a large number of disambiguation pages."]})
+    constituents_df = pd.DataFrame({
+        "Symbol": [f"T{i:03d}" for i in range(100)],
+        "Security": [f"Co {i}" for i in range(100)],
+        "GICS Sector": ["Industrials"] * 100,
+        "GICS Sub-Industry": ["Misc"] * 100,
+    })
+    sub_industry_only_df = pd.DataFrame({
+        "Symbol": ["X"], "GICS Sub-Industry": ["Subindustry-Only"],
+    })
+
+    picked = constituents._select_constituents_table(
+        [banner_df, constituents_df, sub_industry_only_df], "S&P 400"
+    )
+    assert list(picked.columns) == [
+        "Symbol", "Security", "GICS Sector", "GICS Sub-Industry"
+    ]
+    assert len(picked) == 100
+
+
+def test_select_constituents_table_raises_when_no_match() -> None:
+    """If no table on the page has the expected ticker + GICS sector shape,
+    raise loudly rather than silently picking a junk table."""
+    banner_df = pd.DataFrame({0: [1], 1: ["banner"]})
+    nav_df = pd.DataFrame({"vteFoo": ["a"], "vteBar": ["b"]})
+
+    with pytest.raises(RuntimeError, match="No constituents table found"):
+        constituents._select_constituents_table([banner_df, nav_df], "S&P 400")
+
+
+def test_select_constituents_table_picks_largest_candidate() -> None:
+    """When multiple tables have Symbol + GICS Sector columns (e.g. a small
+    example/docs table alongside the live roster), pick the largest. On the
+    real S&P 500/400 pages the roster is the only such table; the largest-
+    wins rule is a defense-in-depth tiebreaker if Wikipedia ever adds an
+    additional schema-matching table."""
+    small_df = pd.DataFrame({
+        "Symbol": ["X", "Y"],
+        "GICS Sector": ["Energy", "Energy"],
+    })
+    real_df = pd.DataFrame({
+        "Symbol": [f"T{i}" for i in range(100)],
+        "GICS Sector": ["Industrials"] * 100,
+    })
+    picked = constituents._select_constituents_table([small_df, real_df], "S&P 500")
+    assert len(picked) == 100
+
+
+def test_select_constituents_table_flattens_multiindex() -> None:
+    """Wikipedia occasionally returns multi-level column headers. The
+    selector must flatten them before matching."""
+    df = pd.DataFrame({
+        ("Stock", "Symbol"): [f"T{i}" for i in range(100)],
+        ("Classification", "GICS Sector"): ["Industrials"] * 100,
+    })
+    df.columns = pd.MultiIndex.from_tuples(df.columns)
+    picked = constituents._select_constituents_table([df], "S&P 500")
+    assert any("symbol" in str(c).lower() for c in picked.columns)
+    assert any(
+        "gics" in str(c).lower() and "sector" in str(c).lower()
+        for c in picked.columns
+    )
+
+
+def test_fetch_constituents_handles_banner_table_at_index_0() -> None:
+    """End-to-end: Wikipedia page with a banner table at index 0 followed by
+    the constituents table at index 1 must still produce a populated
+    sector_map. Regression for the 2026-05-11 silent-MorningEnrich incident."""
+    banner_df = pd.DataFrame({0: [float("nan")], 1: ["disambiguation banner"]})
+    sp500_df = pd.DataFrame({
+        "Symbol": [f"S5{i:02d}" for i in range(60)],
+        "GICS Sector": ["Information Technology"] * 60,
+    })
+    sp400_df = pd.DataFrame({
+        "Symbol": [f"S4{i:02d}" for i in range(60)],
+        "GICS Sector": ["Industrials"] * 60,
+    })
+
+    sp500_html = banner_df.to_html(index=False) + sp500_df.to_html(index=False)
+    sp400_html = banner_df.to_html(index=False) + sp400_df.to_html(index=False)
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        tickers, sector_map, sector_etf_map, sp500_count, sp400_count = (
+            constituents._fetch_constituents()
+        )
+
+    assert sp500_count == 60
+    assert sp400_count == 60
+    assert len(sector_map) == 120
+    assert sector_map["S500"] == "Information Technology"
+    assert sector_map["S400"] == "Industrials"
+    assert sector_etf_map["S500"] == "XLK"
+    assert sector_etf_map["S400"] == "XLI"
+
+
 def test_collect_returns_tickers_in_dict() -> None:
     """``collect()``'s return contract MUST include the ``tickers`` list.
 
