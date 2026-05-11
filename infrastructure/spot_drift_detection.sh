@@ -57,6 +57,11 @@ KEY_FILE="$HOME/.ssh/alpha-engine-key.pem"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 SUBNET_ID="subnet-e07166ec"
 IAM_PROFILE="alpha-engine-executor-profile"
+# Spot-side watchdog budget: DriftDetection workload is ~5 min; 30 min
+# of headroom covers pip install + preflight + retries. If the workload
+# legitimately needs longer, bump this — don't silently rely on the
+# orphan reaper.
+MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-1800}"
 
 RUN_MODE="full"
 while [[ $# -gt 0 ]]; do
@@ -93,6 +98,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --subnet-id "$SUBNET_ID" \
     --iam-instance-profile Name="$IAM_PROFILE" \
     --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
+    --instance-initiated-shutdown-behavior terminate \
     --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=alpha-engine-drift-$(date +%Y%m%d)}]" \
     --region "$AWS_REGION" \
@@ -143,6 +149,18 @@ done
 run_remote() {
     ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "$@"
 }
+
+# ── Spot-side watchdog ──────────────────────────────────────────────────────
+# Dispatcher-side `trap cleanup EXIT` only fires when THIS bash script
+# exits cleanly. If the dispatcher SSM command is cancelled, the
+# dispatcher EC2 is stopped mid-run, or the shell gets SIGKILLed, the
+# trap never runs and the spot orphans until manually terminated.
+# Installs a transient systemd timer on the spot that fires
+# shutdown -h now after MAX_RUNTIME_SECONDS regardless of dispatcher
+# state. AL2023's InstanceInitiatedShutdownBehavior=terminate makes
+# the shutdown a termination (matches run-instances flag above).
+echo "==> Installing spot-side watchdog (${MAX_RUNTIME_SECONDS}s = $((MAX_RUNTIME_SECONDS / 60)) min)..."
+run_remote "sudo systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now"
 
 # ── Bootstrap python + git ───────────────────────────────────────────────────
 echo "==> Bootstrapping spot environment..."
