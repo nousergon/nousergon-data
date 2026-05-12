@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -47,6 +46,8 @@ from zoneinfo import ZoneInfo
 import boto3
 import pandas as pd
 import requests
+
+from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -803,7 +804,7 @@ def _fetch_fred_closes(
     so the legacy "today's parquet carries yesterday's FRED value" semantic
     is preserved for the current-day case.
     """
-    api_key = os.environ.get("FRED_API_KEY", "")
+    api_key = get_secret("FRED_API_KEY", required=False, default="")
     if not api_key:
         logger.warning("FRED_API_KEY not set — skipping FRED fallback for %d tickers", len(tickers))
         return 0

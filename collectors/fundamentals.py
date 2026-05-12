@@ -62,8 +62,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
+
+from alpha_engine_lib.secrets import get_secret
 
 from .finnhub_client import finnhub_get
 
@@ -205,7 +206,7 @@ def collect(
     """
     import boto3
 
-    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    api_key = get_secret("FINNHUB_API_KEY", required=False, default="")
     if not api_key:
         # Preflight is expected to catch this earlier; hard-fail here too
         # so a missing key can never land as "0 OK / N errors / all-zeros".

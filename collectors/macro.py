@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import boto3
 import numpy as np
+
+from alpha_engine_lib.secrets import get_secret
 import pandas as pd
 import requests
 import yfinance as yf
@@ -115,7 +116,7 @@ def collect(
 
 def _fetch_fred() -> dict:
     """Fetch all FRED series + compute derived metrics."""
-    api_key = os.environ.get("FRED_API_KEY", "")
+    api_key = get_secret("FRED_API_KEY", required=False, default="")
     if not api_key:
         logger.warning("FRED_API_KEY not set — skipping FRED data")
         return {k: None for k in _FRED_SERIES}

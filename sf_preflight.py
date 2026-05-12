@@ -408,8 +408,8 @@ def check_polygon_grouped_coverage(ctx: PreflightContext) -> CheckResult:
             elapsed_seconds=time.time() - t0,
         )
 
-    import os
-    if not os.environ.get("POLYGON_API_KEY"):
+    from alpha_engine_lib.secrets import get_secret
+    if not get_secret("POLYGON_API_KEY", required=False):
         # Local-laptop preflight — polygon key lives in .env on the spot
         # and on EC2. Skip without failing so the rest of the report is
         # actionable; on the spot the key is present and this fires.

@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from alpha_engine_lib.secrets import get_secret
+
 log = logging.getLogger(__name__)
 
 
@@ -31,7 +33,7 @@ def send_step_email(step_name: str, results: dict, date_str: str) -> bool:
         log.warning("Failed to build step email: %s", exc)
         return False
 
-    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").strip()
 
     if app_password:
         try:
