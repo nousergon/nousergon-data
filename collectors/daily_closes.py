@@ -39,6 +39,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -48,6 +49,19 @@ import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
+
+_FRED_API_KEY_RE = re.compile(r"api_key=[^&\s]+")
+
+
+def _scrub_api_key(msg: object) -> str:
+    """Mask the FRED ``api_key=...`` querystring fragment in any error string.
+
+    ``requests.exceptions.HTTPError`` embeds the full request URL — including
+    the ``api_key`` querystring — in its ``str()`` representation. Logging
+    that to CloudWatch leaks the credential. Always pass FRED-fetch
+    exceptions through this scrubber before logging.
+    """
+    return _FRED_API_KEY_RE.sub("api_key=***", str(msg))
 
 _NYSE_TZ = ZoneInfo("America/New_York")
 
@@ -847,7 +861,10 @@ def _fetch_fred_closes(
             })
             count += 1
         except Exception as e:
-            logger.warning("FRED fetch failed for %s (%s): %s", store_ticker, series_id, e)
+            logger.warning(
+                "FRED fetch failed for %s (%s): %s",
+                store_ticker, series_id, _scrub_api_key(e),
+            )
 
     logger.info("FRED fallback: %d/%d index tickers captured", count, len(tickers))
     return count

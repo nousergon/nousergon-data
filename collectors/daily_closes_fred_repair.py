@@ -51,6 +51,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -63,7 +64,12 @@ logger = logging.getLogger(__name__)
 
 # Import the ticker → FRED series map from the canonical home so this
 # script never drifts from the live fetcher's coverage set.
-from collectors.daily_closes import _FRED_BASE, _FRED_INDEX_MAP, _FRED_TIMEOUT
+from collectors.daily_closes import (
+    _FRED_BASE,
+    _FRED_INDEX_MAP,
+    _FRED_TIMEOUT,
+    _scrub_api_key,
+)
 
 
 def _business_days(start: str, end: str) -> list[str]:
@@ -101,9 +107,31 @@ def _fetch_fred_range(
         "observation_end": end,
         "sort_order": "asc",
     }
-    resp = requests.get(_FRED_BASE, params=params, timeout=_FRED_TIMEOUT)
-    resp.raise_for_status()
-    obs = resp.json().get("observations", [])
+    last_err: Exception | None = None
+    obs: list[dict] = []
+    for attempt in range(1, 4):
+        try:
+            resp = requests.get(_FRED_BASE, params=params, timeout=_FRED_TIMEOUT)
+            resp.raise_for_status()
+            obs = resp.json().get("observations", [])
+            break
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            if attempt < 3:
+                logger.warning(
+                    "FRED %s range attempt %d failed: %s — retrying in %ds",
+                    series_id, attempt, _scrub_api_key(e), attempt * 3,
+                )
+                time.sleep(attempt * 3)
+            else:
+                logger.error(
+                    "FRED %s range failed after 3 attempts: %s",
+                    series_id, _scrub_api_key(e),
+                )
+                raise RuntimeError(
+                    f"FRED range fetch failed for {series_id} after retries: "
+                    f"{_scrub_api_key(last_err)}"
+                ) from None
     out: dict[str, float] = {}
     for o in obs:
         val = o.get("value", ".")
