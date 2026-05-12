@@ -769,11 +769,25 @@ def _fetch_fred_closes(
     date_str: str,
     records: list[dict],
 ) -> int:
-    """Fetch the latest close for index tickers from FRED.
+    """Fetch FRED close on-or-before ``date_str`` for index tickers.
 
-    Serves the 4 index symbols not on polygon free tier (VIX, VIX3M, TNX, IRX).
-    Takes the most recent non-missing observation for each series — typically
-    T-1 when the daily pipeline runs at 6:05 AM PT.
+    Serves the index/macro symbols not on polygon free tier
+    (VIX, VIX3M, TNX, IRX, TWO, HYOAS, BAA10Y).
+
+    The query is bounded by ``observation_end=date_str`` so per-date calls
+    from the windowed-reconciliation loop return that date's actual FRED
+    value rather than today's "most recent" — the original unbounded
+    ``sort_order=desc, limit=5`` shape predated window mode and clobbered
+    every historical date in the rolling window with today's latest close
+    (FlowDoctor `polygon_only OVERWRITE VIX` ERROR alerts 2026-05-12 surfaced
+    the regression; the prior parquet's correct historical VIX was
+    overwritten with today's value on every MorningEnrich pass since the
+    2026-05-11 ``window_days: 14`` cutover).
+
+    Same-day morning call (FRED publishes T-1): observation_end=today still
+    returns the most-recent-on-or-before-today observation (typically T-1),
+    so the legacy "today's parquet carries yesterday's FRED value" semantic
+    is preserved for the current-day case.
     """
     api_key = os.environ.get("FRED_API_KEY", "")
     if not api_key:
@@ -791,6 +805,7 @@ def _fetch_fred_closes(
                 "series_id": series_id,
                 "api_key": api_key,
                 "file_type": "json",
+                "observation_end": date_str,
                 "sort_order": "desc",
                 "limit": 5,
             }
@@ -799,7 +814,20 @@ def _fetch_fred_closes(
             obs = resp.json().get("observations", [])
             latest = next((o for o in obs if o.get("value", ".") != "."), None)
             if latest is None:
-                logger.warning("FRED %s → %s: no non-missing observation", store_ticker, series_id)
+                logger.warning(
+                    "FRED %s → %s: no non-missing observation on or before %s",
+                    store_ticker, series_id, date_str,
+                )
+                continue
+            obs_date = latest.get("date")
+            if obs_date and obs_date > date_str:
+                # Defensive: refuse to stamp a future-dated FRED value onto
+                # date_str's parquet even if FRED somehow ignored observation_end.
+                logger.error(
+                    "FRED %s observation date %s > requested %s — refusing to "
+                    "write future value (likely upstream API behavior change)",
+                    store_ticker, obs_date, date_str,
+                )
                 continue
             close = float(latest["value"])
             records.append({
