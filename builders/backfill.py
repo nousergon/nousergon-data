@@ -48,7 +48,7 @@ from features.compute import (
     _load_cached_alternative,
     make_source_series,
 )
-from store.arctic_store import get_universe_lib, get_macro_lib
+from store.arctic_store import get_universe_lib, get_macro_lib, to_arctic_safe
 
 log = logging.getLogger(__name__)
 
@@ -598,7 +598,9 @@ def backfill(
                 )
 
             if not dry_run:
-                universe_lib.write(ticker, symbol_df)
+                # to_arctic_safe strips the Categorical ``source`` dtype
+                # (PR #211) before write — ArcticDB rejects categoricals.
+                universe_lib.write(ticker, to_arctic_safe(symbol_df))
 
             n_ok += 1
 
@@ -641,7 +643,7 @@ def backfill(
     else:
         macro_df = _build_macro_features_df(macro)
         if not macro_df.empty and not dry_run:
-            macro_lib.write("features", macro_df)
+            macro_lib.write("features", to_arctic_safe(macro_df))
             log.info("Wrote macro features: %d dates", len(macro_df))
 
         # Write raw macro series (SPY, VIX, etc.) for consumers that need them
@@ -651,14 +653,14 @@ def backfill(
                 if series is not None:
                     macro_series_df = pd.DataFrame({"Close": series}, index=series.index)
                     macro_series_df.index.name = "date"
-                    macro_lib.write(key, macro_series_df)
+                    macro_lib.write(key, to_arctic_safe(macro_series_df))
 
             # Write sector ETFs
             for key in macro:
                 if key.startswith("XL"):
                     sector_df = pd.DataFrame({"Close": macro[key]}, index=macro[key].index)
                     sector_df.index.name = "date"
-                    macro_lib.write(key, sector_df)
+                    macro_lib.write(key, to_arctic_safe(sector_df))
 
     # ── 6. Snapshot ──────────────────────────────────────────────────────────
     if not dry_run:

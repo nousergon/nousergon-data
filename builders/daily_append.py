@@ -46,7 +46,7 @@ from features.compute import (
 from arcticdb.version_store.library import ReadRequest, UpdatePayload, WritePayload
 from arcticdb_ext.version_store import DataError
 
-from store.arctic_store import get_universe_lib, get_macro_lib
+from store.arctic_store import get_universe_lib, get_macro_lib, to_arctic_safe
 from store.parquet_loader import load_parquet_from_s3
 from validators.price_validator import (
     ALL_ANOMALY_TYPES,
@@ -1245,13 +1245,19 @@ def daily_append(
                 # Append at head — fast path. update_batch with upsert=True
                 # also handles the rare "symbol doesn't exist yet" case
                 # (replaces _write_row_backfill_safe's lib.write fallback).
-                update_payloads.append(UpdatePayload(symbol=ticker, data=today_row))
+                # to_arctic_safe strips Categorical ``source`` dtype (PR #211)
+                # which ArcticDB's update_batch rejects.
+                update_payloads.append(
+                    UpdatePayload(symbol=ticker, data=to_arctic_safe(today_row))
+                )
             else:
                 # Backfill — splice into existing series, full rewrite. Same
                 # logic as _write_row_backfill_safe's backfill branch.
                 combined = pd.concat([hist, today_row])
                 combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-                write_payloads.append(WritePayload(symbol=ticker, data=combined))
+                write_payloads.append(
+                    WritePayload(symbol=ticker, data=to_arctic_safe(combined))
+                )
 
         if update_payloads or write_payloads:
             t_write0 = time.time()
