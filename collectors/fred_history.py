@@ -22,11 +22,12 @@ parquet contract.
 from __future__ import annotations
 
 import logging
-import os
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from alpha_engine_lib.secrets import get_secret
 from typing import Optional
 
 import boto3
@@ -80,7 +81,7 @@ def fetch_fred_history(
         available or the request fails after retries.
     """
     if api_key is None:
-        api_key = os.environ.get("FRED_API_KEY", "")
+        api_key = get_secret("FRED_API_KEY", required=False, default="")
     if not api_key:
         raise RuntimeError(
             "FRED_API_KEY not set — cannot fetch historical FRED series. "

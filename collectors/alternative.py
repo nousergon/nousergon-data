@@ -45,6 +45,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
+
+from alpha_engine_lib.secrets import get_secret
 import requests
 
 logger = logging.getLogger(__name__)
@@ -464,7 +466,7 @@ def _fmp_get(endpoint: str, params: dict | None = None) -> dict | list:
     endpoint sunsets (the 2026-04 incident) can't hide.
     """
     global _fmp_last_call, _fmp_daily_count
-    api_key = os.environ.get("FMP_API_KEY", "")
+    api_key = get_secret("FMP_API_KEY", required=False, default="")
     if not api_key:
         return []
 
@@ -752,7 +754,7 @@ def _fetch_insider(ticker: str, run_date: str) -> dict:
         "transactions": [],
     }
 
-    identity = os.environ.get("EDGAR_IDENTITY", "")
+    identity = get_secret("EDGAR_IDENTITY", required=False, default="")
     if not identity:
         return result
 
@@ -831,7 +833,7 @@ def _fetch_institutional(ticker: str) -> dict:
         "funds_decreasing": 0,
     }
 
-    identity = os.environ.get("EDGAR_IDENTITY", "")
+    identity = get_secret("EDGAR_IDENTITY", required=False, default="")
     if not identity:
         return result
 

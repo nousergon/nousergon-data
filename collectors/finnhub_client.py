@@ -29,11 +29,12 @@ or hard-fail per their no-silent-fails policy.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 
 import requests
+
+from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def finnhub_get(endpoint: str, params: dict | None = None) -> dict | list:
     timeouts). Caller decides retry / fall-through / hard-fail.
     """
     global _finnhub_last_call
-    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    api_key = get_secret("FINNHUB_API_KEY", required=False, default="")
     if not api_key:
         return []
 

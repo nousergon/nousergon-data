@@ -21,11 +21,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import time
 from datetime import date
 
 import requests
+
+from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ _CHUNK_OVERLAP = 50
 
 
 def _get_api_key() -> str:
-    key = os.environ.get("FINNHUB_API_KEY", "")
+    key = get_secret("FINNHUB_API_KEY", required=False, default="")
     if not key:
         raise RuntimeError("FINNHUB_API_KEY not set — sign up free at finnhub.io")
     return key

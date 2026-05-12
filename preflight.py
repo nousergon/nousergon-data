@@ -16,11 +16,11 @@ the single source of truth. See alpha-engine-lib README for the
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any
 
 from alpha_engine_lib.preflight import BasePreflight
+from alpha_engine_lib.secrets import get_secret
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ class DataPreflight(BasePreflight):
         """
         import requests
 
-        api_key = os.environ.get("FMP_API_KEY", "").strip()
+        api_key = (get_secret("FMP_API_KEY", required=False, default="") or "").strip()
         try:
             resp = requests.get(
                 _FMP_STABLE_PROBE_URL,
@@ -173,7 +173,7 @@ class DataPreflight(BasePreflight):
         """
         import requests
 
-        api_key = os.environ.get("POLYGON_API_KEY", "").strip()
+        api_key = (get_secret("POLYGON_API_KEY", required=False, default="") or "").strip()
         try:
             resp = requests.get(
                 _POLYGON_PROBE_URL,
@@ -206,7 +206,7 @@ class DataPreflight(BasePreflight):
         """Validate FRED network + auth via single-observation DFF call."""
         import requests
 
-        api_key = os.environ.get("FRED_API_KEY", "").strip()
+        api_key = (get_secret("FRED_API_KEY", required=False, default="") or "").strip()
         try:
             resp = requests.get(
                 _FRED_PROBE_URL,

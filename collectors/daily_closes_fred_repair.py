@@ -49,11 +49,12 @@ import argparse
 import io
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime, timedelta
 from typing import Optional
+
+from alpha_engine_lib.secrets import get_secret
 
 import boto3
 import pandas as pd
@@ -200,7 +201,7 @@ def repair(
 
     Returns a per-date summary dict.
     """
-    api_key = os.environ.get("FRED_API_KEY", "")
+    api_key = get_secret("FRED_API_KEY", required=False, default="")
     if not api_key:
         raise RuntimeError("FRED_API_KEY not set — cannot fetch FRED values")
 
