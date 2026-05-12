@@ -48,6 +48,11 @@ from arcticdb_ext.version_store import DataError
 
 from store.arctic_store import get_universe_lib, get_macro_lib
 from store.parquet_loader import load_parquet_from_s3
+from validators.price_validator import (
+    ALL_ANOMALY_TYPES,
+    DEFAULT_BLOCK_ANOMALY_TYPES,
+    validate_today_row,
+)
 
 log = logging.getLogger(__name__)
 
@@ -213,6 +218,82 @@ def _emit_missing_from_closes_metric(count: int) -> None:
 UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 UNIVERSE_FRESHNESS_MAX_STALE_DAYS = 5
 _UNIVERSE_SCAN_WORKERS = 20
+
+
+def _load_block_anomaly_types() -> frozenset[str]:
+    """Read ``DAILY_APPEND_BLOCK_ANOMALY_TYPES`` env var or fall back to defaults.
+
+    Format: JSON list of anomaly type strings, e.g. ``'["bad_ohlc",
+    "negative_or_zero_close", "extreme_daily_move"]'``. Unknown types
+    raise — silent typo would let bad rows through. Empty/unset uses the
+    conservative default set (only definitely-bad rows block).
+    """
+    raw = os.environ.get("DAILY_APPEND_BLOCK_ANOMALY_TYPES", "").strip()
+    if not raw:
+        return DEFAULT_BLOCK_ANOMALY_TYPES
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"DAILY_APPEND_BLOCK_ANOMALY_TYPES is not valid JSON: {exc}. "
+            f"Expected a JSON list of anomaly type strings."
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+        raise RuntimeError(
+            f"DAILY_APPEND_BLOCK_ANOMALY_TYPES must be a JSON list of strings, "
+            f"got {parsed!r}"
+        )
+    unknown = set(parsed) - ALL_ANOMALY_TYPES
+    if unknown:
+        raise RuntimeError(
+            f"DAILY_APPEND_BLOCK_ANOMALY_TYPES contains unknown anomaly types: "
+            f"{sorted(unknown)}. Known types: {sorted(ALL_ANOMALY_TYPES)}"
+        )
+    return frozenset(parsed)
+
+
+def _emit_quality_gate_metrics(
+    counts_by_type: dict[str, int], n_blocked: int, n_warned: int
+) -> None:
+    """Emit ``AlphaEngine/Data/daily_append_quality_*`` gauges.
+
+    Best-effort: CloudWatch errors WARN but don't fail the pipeline — the
+    per-anomaly logger.error calls above are the load-bearing Flow Doctor
+    surface; the metric catches slow drift so a chronic 1-2-ticker-per-day
+    anomaly stream surfaces before it cumulates into a regression.
+    Mirrors ``_emit_missing_from_closes_metric``.
+    """
+    if not counts_by_type and n_blocked == 0 and n_warned == 0:
+        return
+    try:
+        cw = boto3.client("cloudwatch")
+        metric_data: list[dict] = [
+            {
+                "MetricName": "daily_append_quality_blocked_count",
+                "Value": float(n_blocked),
+                "Unit": "Count",
+            },
+            {
+                "MetricName": "daily_append_quality_warned_count",
+                "Value": float(n_warned),
+                "Unit": "Count",
+            },
+        ]
+        for atype, count in counts_by_type.items():
+            metric_data.append({
+                "MetricName": "daily_append_quality_anomaly_count",
+                "Dimensions": [{"Name": "anomaly_type", "Value": atype}],
+                "Value": float(count),
+                "Unit": "Count",
+            })
+        cw.put_metric_data(Namespace="AlphaEngine/Data", MetricData=metric_data)
+    except Exception as exc:
+        log.warning(
+            "CloudWatch daily_append_quality_* metric failed: %s. "
+            "Not blocking daily_append — the per-anomaly logger.error calls "
+            "above are the load-bearing Flow Doctor surface.",
+            exc,
+        )
 
 
 def _scan_universe_and_emit_freshness_receipt(
@@ -818,6 +899,13 @@ def daily_append(
     n_err = 0             # ArcticDB read failures
     n_partial = 0         # rows written with ≥1 NaN feature (short-history, etc.)
     n_parquet_warmup = 0  # rows whose feature compute used parquet-enriched context
+    n_quality_blocked = 0  # rows refused by validate_today_row (block severity)
+    n_quality_warned = 0   # rows written but flagged by validate_today_row (warn)
+    quality_counts_by_type: dict[str, int] = {}
+
+    # Read DAILY_APPEND_BLOCK_ANOMALY_TYPES once per run (raises on malformed
+    # JSON / unknown types — fail fast before the chunked pass begins).
+    block_anomaly_types = _load_block_anomaly_types()
 
     # ── 4. Chunked universe pass ─────────────────────────────────────────────
     # The full-universe Phase 1+2 in one shot holds ~900 ticker histories in
@@ -1077,6 +1165,45 @@ def daily_append(
 
                 today_row.index.name = "date"
 
+                # ── Write-time quality gate ──────────────────────────────
+                # Runs after today_row is fully shaped (OHLCV + features +
+                # provenance + dtypes aligned) but before the row is queued
+                # for batch write. Two outcomes: block (skip queue + log
+                # error so Flow Doctor surfaces) or warn (queue write +
+                # log warning + count). DEFAULT_BLOCK_ANOMALY_TYPES
+                # blocks only definitely-bad rows (High<Low, Close<=0);
+                # operators can upgrade types via the
+                # DAILY_APPEND_BLOCK_ANOMALY_TYPES env var.
+                qg = validate_today_row(today_row, hist, ticker)
+                blocking_anomalies = [
+                    a for a in qg["anomalies"] if a["type"] in block_anomaly_types
+                ]
+                if blocking_anomalies:
+                    for a in blocking_anomalies:
+                        # logger.error so the FlowDoctorHandler picks this
+                        # up — return-dicts are invisible to it per
+                        # feedback_collector_return_dict_invisible_to_flow_doctor.
+                        log.error(
+                            "Quality gate BLOCK %s.%s: %s",
+                            ticker, a["type"], a["detail"],
+                        )
+                        quality_counts_by_type[a["type"]] = (
+                            quality_counts_by_type.get(a["type"], 0) + 1
+                        )
+                    n_quality_blocked += 1
+                    continue  # do not queue this row for write
+                if qg["anomalies"]:
+                    # All anomalies present but none blocking — warn-only.
+                    for a in qg["anomalies"]:
+                        log.warning(
+                            "Quality gate WARN %s.%s: %s",
+                            ticker, a["type"], a["detail"],
+                        )
+                        quality_counts_by_type[a["type"]] = (
+                            quality_counts_by_type.get(a["type"], 0) + 1
+                        )
+                    n_quality_warned += 1
+
                 # Defer the actual ArcticDB write — collected here so Phase 2
                 # can run them in parallel via a thread pool. The previous
                 # sequential per-ticker `_write_row_backfill_safe` call took
@@ -1194,6 +1321,10 @@ def daily_append(
         "tickers_errored": n_err,
         "tickers_parquet_warmup": n_parquet_warmup,
         "tickers_missing_from_closes": n_missing_from_closes,
+        "tickers_quality_blocked": n_quality_blocked,
+        "tickers_quality_warned": n_quality_warned,
+        "quality_anomaly_counts": dict(quality_counts_by_type),
+        "quality_block_anomaly_types": sorted(block_anomaly_types),
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
@@ -1201,14 +1332,21 @@ def daily_append(
 
     log.info(
         "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d "
-        "n_parquet_warmup=%d n_missing_from_closes=%d (of %d) | "
+        "n_parquet_warmup=%d n_missing_from_closes=%d (of %d) "
+        "quality_blocked=%d quality_warned=%d anomaly_counts=%s | "
         "macro_updated=%d sector_updated=%d | %.1fs total",
         n_ok, n_partial, n_skip, n_err, n_parquet_warmup,
         n_missing_from_closes, len(stock_tickers),
+        n_quality_blocked, n_quality_warned, dict(quality_counts_by_type),
         len(macro_updated) if not dry_run else 0,
         len(sector_updated) if not dry_run else 0,
         t_total,
     )
+
+    if not dry_run:
+        _emit_quality_gate_metrics(
+            quality_counts_by_type, n_quality_blocked, n_quality_warned,
+        )
 
     # Hard-fail on high error rate. ``n_ok == 0`` alone is NOT a failure
     # signal — it correctly occurs when every ticker hit the

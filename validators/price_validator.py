@@ -1,9 +1,16 @@
 """
 validators/price_validator.py — Data quality checks for price data.
 
-Validates OHLCV data after collection. Non-blocking — logs warnings and
-returns anomaly summary for inclusion in manifest and completion emails.
-Never blocks data writes.
+Two surfaces:
+
+- ``validate_parquet`` / ``validate_batch`` / ``validate_refreshed`` — full-history
+  inspection used by ``collectors/slim_cache.py`` + ``collectors/prices.py``;
+  non-blocking, returns anomaly summary for manifest + email rollups.
+- ``validate_today_row`` — write-time per-symbol gate used by
+  ``builders/daily_append.py``; returns structured anomalies with per-type
+  severity so the caller can hard-fail on definitely-bad rows (negative
+  prices, High<Low) while only warning on legitimately-rare-but-possible
+  signals (>50% moves on event days, single-day volume spikes).
 """
 
 from __future__ import annotations
@@ -19,6 +26,132 @@ logger = logging.getLogger(__name__)
 MAX_DAILY_RETURN = 0.50       # Flag >50% single-day price move
 MAX_VOLUME_SPIKE = 10.0       # Flag volume >10x 20-day rolling median
 MAX_GAP_TRADING_DAYS = 3      # Flag gaps >3 trading days in a parquet
+
+# ── Write-time anomaly type catalog ────────────────────────────────────────
+# Severity: "block" definitely-bad, refuse the write; "warn" allow the write
+# but emit a metric so chronic drift is visible. Caller can upgrade types via
+# the DAILY_APPEND_BLOCK_ANOMALY_TYPES env var.
+ANOMALY_BAD_OHLC = "bad_ohlc"                       # default block
+ANOMALY_NEGATIVE_OR_ZERO_CLOSE = "negative_or_zero_close"  # default block
+ANOMALY_EXTREME_DAILY_MOVE = "extreme_daily_move"   # default warn
+ANOMALY_ZERO_VOLUME = "zero_volume"                 # default warn
+ANOMALY_VOLUME_SPIKE = "volume_spike"               # default warn
+
+DEFAULT_BLOCK_ANOMALY_TYPES: frozenset[str] = frozenset({
+    ANOMALY_BAD_OHLC,
+    ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
+})
+
+ALL_ANOMALY_TYPES: frozenset[str] = frozenset({
+    ANOMALY_BAD_OHLC,
+    ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
+    ANOMALY_EXTREME_DAILY_MOVE,
+    ANOMALY_ZERO_VOLUME,
+    ANOMALY_VOLUME_SPIKE,
+})
+
+
+def validate_today_row(
+    today_row: pd.DataFrame,
+    hist: pd.DataFrame,
+    ticker: str,
+) -> dict:
+    """
+    Inspect a single-row write against its prior history for write-time gating.
+
+    ``today_row`` is the 1-row DataFrame about to be written via
+    ``universe_lib.update_batch`` / ``write_batch``; ``hist`` is the existing
+    series read via ``read_batch`` in the same pass.
+
+    Returns ``{"ticker": ..., "anomalies": [{"type", "severity", "detail"}, ...]}``.
+    Severities are *defaults* — the caller decides final block/warn behavior
+    by consulting its configured block set (allowing operators to upgrade
+    e.g. ``extreme_daily_move`` to block during a known-quiet observation
+    window).
+    """
+    anomalies: list[dict] = []
+
+    if today_row is None or today_row.empty:
+        return {"ticker": ticker, "anomalies": anomalies}
+
+    row = today_row.iloc[0]
+
+    # ── 1. OHLC relationship (bad_ohlc — default block) ────────────────────
+    if all(c in today_row.columns for c in ("High", "Low")):
+        high = row.get("High")
+        low = row.get("Low")
+        if pd.notna(high) and pd.notna(low) and high < low:
+            anomalies.append({
+                "type": ANOMALY_BAD_OHLC,
+                "severity": "block",
+                "detail": f"High={high:.4f} < Low={low:.4f}",
+            })
+
+    # ── 2. Zero or negative close (negative_or_zero_close — default block) ──
+    if "Close" in today_row.columns:
+        close = row.get("Close")
+        if pd.notna(close) and close <= 0:
+            anomalies.append({
+                "type": ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
+                "severity": "block",
+                "detail": f"Close={close:.4f}",
+            })
+
+    # ── 3. Extreme daily return vs prior close (extreme_daily_move — warn) ──
+    # Compared against hist.iloc[-1]["Close"] rather than within today_row
+    # because today_row is single-row. Skipped when hist is empty (first
+    # write for this symbol — no prior close to compare against).
+    if (
+        "Close" in today_row.columns
+        and "Close" in getattr(hist, "columns", [])
+        and not hist.empty
+    ):
+        today_close = row.get("Close")
+        prior_close = hist["Close"].iloc[-1]
+        if pd.notna(today_close) and pd.notna(prior_close) and prior_close > 0:
+            pct_change = abs(today_close - prior_close) / prior_close
+            if pct_change > MAX_DAILY_RETURN:
+                anomalies.append({
+                    "type": ANOMALY_EXTREME_DAILY_MOVE,
+                    "severity": "warn",
+                    "detail": (
+                        f"|{today_close:.4f}-{prior_close:.4f}|/{prior_close:.4f} "
+                        f"= {pct_change:.1%} > {MAX_DAILY_RETURN:.0%}"
+                    ),
+                })
+
+    # ── 4. Zero volume on trading day (zero_volume — warn) ─────────────────
+    if "Volume" in today_row.columns:
+        vol = row.get("Volume")
+        if pd.notna(vol) and vol == 0:
+            anomalies.append({
+                "type": ANOMALY_ZERO_VOLUME,
+                "severity": "warn",
+                "detail": "Volume=0",
+            })
+
+    # ── 5. Volume spike vs hist 20-day median (volume_spike — warn) ────────
+    if (
+        "Volume" in today_row.columns
+        and "Volume" in getattr(hist, "columns", [])
+        and len(hist) >= 20
+    ):
+        today_vol = row.get("Volume")
+        recent_vols = hist["Volume"].tail(20)
+        baseline = recent_vols[recent_vols > 0].median()
+        if pd.notna(today_vol) and pd.notna(baseline) and baseline > 0:
+            ratio = today_vol / baseline
+            if ratio > MAX_VOLUME_SPIKE:
+                anomalies.append({
+                    "type": ANOMALY_VOLUME_SPIKE,
+                    "severity": "warn",
+                    "detail": (
+                        f"Volume={today_vol:.0f} vs 20d-median={baseline:.0f} "
+                        f"(ratio={ratio:.1f}x > {MAX_VOLUME_SPIKE:.0f}x)"
+                    ),
+                })
+
+    return {"ticker": ticker, "anomalies": anomalies}
 
 
 def validate_parquet(df: pd.DataFrame, ticker: str) -> dict:
