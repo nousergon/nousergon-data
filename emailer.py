@@ -20,8 +20,12 @@ log = logging.getLogger(__name__)
 
 def send_step_email(step_name: str, results: dict, date_str: str) -> bool:
     """Send a completion email for a pipeline step. Never raises."""
-    sender = os.environ.get("EMAIL_SENDER", "").strip()
-    recipients = [r.strip() for r in os.environ.get("EMAIL_RECIPIENTS", "").split(",") if r.strip()]
+    sender = (get_secret("EMAIL_SENDER", required=False, default="") or "").strip()
+    recipients = [
+        r.strip()
+        for r in (get_secret("EMAIL_RECIPIENTS", required=False, default="") or "").split(",")
+        if r.strip()
+    ]
 
     if not sender or not recipients:
         log.info("Step email skipped — EMAIL_SENDER/EMAIL_RECIPIENTS not set")

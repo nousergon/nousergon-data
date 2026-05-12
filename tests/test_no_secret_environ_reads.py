@@ -18,6 +18,10 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Secret names that must NEVER be read via os.environ.get / os.getenv.
+# EMAIL_SENDER + EMAIL_RECIPIENTS aren't secrets per se but live in SSM
+# under /alpha-engine/* and route through get_secret() — pinning them
+# here prevents regressions to the bulk-load-into-os.environ shim
+# pattern that PR 8 of the .env→SSM arc retired.
 _PINNED_SECRETS = frozenset(
     [
         "ANTHROPIC_API_KEY",
@@ -33,6 +37,8 @@ _PINNED_SECRETS = frozenset(
         "EDGAR_IDENTITY",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_CHAT_ID",
+        "EMAIL_SENDER",
+        "EMAIL_RECIPIENTS",
     ]
 )
 
