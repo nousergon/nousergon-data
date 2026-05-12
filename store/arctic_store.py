@@ -21,6 +21,7 @@ import logging
 import os
 
 import arcticdb as adb
+import pandas as pd
 
 log = logging.getLogger(__name__)
 
@@ -61,3 +62,31 @@ def reset_connection():
     """Reset the singleton (useful for testing or credential rotation)."""
     global _arctic_instance
     _arctic_instance = None
+
+
+def to_arctic_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a DataFrame to dtypes ArcticDB accepts on write/update.
+
+    ArcticDB's ``_handle_categorical_columns`` raises
+    ``ArcticDbNotYetImplemented`` on any ``CategoricalDtype`` column during
+    ``update_batch`` / ``write_batch`` (verified 2026-05-12 EOD incident on
+    BRK-B). Callers may keep Categorical in-memory for memory savings
+    (PR #211: ~108MB reduction across the universe pass in
+    ``_apply_daily_delta``) — this helper is the *single* boundary between
+    that in-memory representation and the ArcticDB storage contract.
+
+    Call exactly once, immediately before every ``update_batch`` /
+    ``write_batch`` / ``write`` invocation. Empty frames and frames with no
+    categorical columns return unchanged (no copy); frames with categoricals
+    are copied + cast to object dtype (matches PR #196's pre-#211 storage
+    representation, which round-trips cleanly through ArcticDB).
+    """
+    if df.empty:
+        return df
+    cat_cols = [c for c in df.columns if isinstance(df[c].dtype, pd.CategoricalDtype)]
+    if not cat_cols:
+        return df
+    df = df.copy()
+    for col in cat_cols:
+        df[col] = df[col].astype(object)
+    return df
