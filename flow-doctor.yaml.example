@@ -1,3 +1,15 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DESCRIPTIVE / DOCUMENTATION ONLY
+#
+# Production reads the live flow-doctor config from flow-doctor.yaml in the
+# repo root (same directory as this file). Edits to this .example file
+# affect ONLY fresh-clone bootstrap + public-repo schema documentation;
+# they have ZERO effect on the live system. To change a runtime value, edit
+# flow-doctor.yaml (next to this file) — it's committed to the repo since
+# the 2026-05-01 secrets-out-of-yaml refactor that moved credentials to
+# FLOW_DOCTOR_* env vars.
+# ─────────────────────────────────────────────────────────────────────────────
+
 flow_name: data-collector
 repo: cipher813/alpha-engine-data
 owner: "@brianmcmahon"
