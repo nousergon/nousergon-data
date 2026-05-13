@@ -38,7 +38,6 @@ from data.derived.news_aggregates import (
     aggregate_and_write,
     build_news_aggregates_df,
     read_news_aggregates_parquet,
-    s3_key_for_date,
     write_news_aggregates_parquet,
 )
 
@@ -356,8 +355,12 @@ class TestS3ParquetRoundTrip:
         )
         key = write_news_aggregates_parquet(
             df_in, aggregate_date=date(2026, 5, 13), s3_client=s3,
+            run_id="2605131934",  # pin the run_id for deterministic key
         )
-        assert key == "data/news_aggregates/2026-05-13.parquet"
+        # Canonical shape: YYMMDDHHMM-encoded artifact key
+        assert key == "data/news_aggregates/2605131934_result.parquet"
+        # latest.json sidecar points at it
+        assert ("alpha-engine-research", "data/news_aggregates/latest.json") in s3._store
 
         df_out = read_news_aggregates_parquet(
             aggregate_date=date(2026, 5, 13), s3_client=s3,
@@ -403,17 +406,22 @@ class TestS3ParquetRoundTrip:
         )
         assert len(df_read) == 2
 
-    def test_s3_key_format(self):
-        assert (
-            s3_key_for_date(date(2026, 5, 13))
-            == "data/news_aggregates/2026-05-13.parquet"
+    def test_canonical_artifact_and_latest_keys(self):
+        """Canonical shape after migration: YYMMDDHHMM-encoded
+        artifact key + latest.json sidecar (both in eval_artifacts lib).
+        """
+        from alpha_engine_lib.eval_artifacts import (
+            eval_artifact_key, eval_latest_key, new_eval_run_id,
         )
-
-    def test_s3_key_custom_prefix(self):
-        assert (
-            s3_key_for_date(date(2026, 1, 1), prefix="alt/path")
-            == "alt/path/2026-01-01.parquet"
+        run_id = new_eval_run_id()
+        assert len(run_id) == 10  # YYMMDDHHMM
+        ak = eval_artifact_key(
+            "data/news_aggregates", run_id, basename="result.parquet",
         )
+        assert ak.startswith("data/news_aggregates/")
+        assert ak.endswith("_result.parquet")
+        lk = eval_latest_key("data/news_aggregates")
+        assert lk == "data/news_aggregates/latest.json"
 
 
 # ── End-to-end orchestrator helper ─────────────────────────────────────
@@ -432,7 +440,8 @@ class TestAggregateAndWrite:
             aggregate_date=date(2026, 5, 13),
             aggregator=agg, s3_client=s3,
         )
-        assert key.endswith("2026-05-13.parquet")
+        assert key.endswith("_result.parquet")
+        assert key.startswith("data/news_aggregates/")
         assert len(df) == 1
 
     def test_accepts_datetime_for_aggregate_date(self):
@@ -442,7 +451,9 @@ class TestAggregateAndWrite:
             aggregate_date=datetime(2026, 5, 13, 12, 0, tzinfo=timezone.utc),
             aggregator=None, s3_client=s3,
         )
-        assert "2026-05-13" in key
+        # Run_id is YYMMDDHHMM (time-of-write); date encoded in row + sidecar
+        assert key.startswith("data/news_aggregates/")
+        assert key.endswith("_result.parquet")
 
 
 # ── Schema version pin ────────────────────────────────────────────────

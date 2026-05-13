@@ -404,14 +404,6 @@ def _download_xml(url: str, *, http=requests) -> str | None:
 # ── S3 parquet writer ──────────────────────────────────────────────────
 
 
-def s3_key_for_filed_date(
-    filed_date: date, *, prefix: str = DEFAULT_S3_PREFIX,
-) -> str:
-    """Canonical S3 key. One parquet file per filed_date holds all
-    insider transactions filed that day across all tickers."""
-    return f"{prefix}/{filed_date.isoformat()}.parquet"
-
-
 def transactions_to_dataframe(
     transactions: list[Form4Transaction],
 ) -> pd.DataFrame:
@@ -432,22 +424,46 @@ def write_form4_parquet(
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
+    run_id: str | None = None,
 ) -> str:
-    """Write transactions for one filed_date to S3 parquet. Returns
-    the S3 key. Idempotent overwrite."""
+    """Canonical eval-artifacts shape (YYMMDDHHMM + latest.json).
+
+    ``filed_date`` is stamped onto every row already (column on
+    Form4Transaction); the key uses run_id (write time) so re-runs
+    preserve audit trail. Returns the artifact S3 key.
+    """
+    import json as _json
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key, eval_latest_key, new_eval_run_id,
+    )
+
     df = transactions_to_dataframe(transactions)
-    key = s3_key_for_filed_date(filed_date, prefix=prefix)
+    run_id = run_id or new_eval_run_id()
+    artifact_key = eval_artifact_key(prefix, run_id, basename="result.parquet")
+    latest_key = eval_latest_key(prefix)
+
     buf = BytesIO()
     df.to_parquet(buf, engine="pyarrow", index=False)
-    buf.seek(0)
     s3_client.put_object(
-        Bucket=bucket, Key=key, Body=buf.getvalue(),
+        Bucket=bucket, Key=artifact_key, Body=buf.getvalue(),
         ContentType="application/octet-stream",
     )
-    logger.info(
-        "[form4] wrote %d rows to s3://%s/%s", len(df), bucket, key,
+    s3_client.put_object(
+        Bucket=bucket, Key=latest_key,
+        Body=_json.dumps({
+            "run_id": run_id,
+            "artifact_key": artifact_key,
+            "filed_date_max": filed_date.isoformat(),
+            "schema_version": SCHEMA_VERSION,
+            "row_count": int(len(df)),
+            "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }).encode("utf-8"),
+        ContentType="application/json",
     )
-    return key
+    logger.info(
+        "[form4] wrote %d rows to s3://%s/%s", len(df), bucket, artifact_key,
+    )
+    return artifact_key
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────
@@ -485,8 +501,10 @@ def ingest_for_tickers(
         "n_parquet_writes": 0,
         "n_failures": 0,
     }
-    # Group transactions by filed_date so we write one parquet per day
-    by_filed_date: dict[date, list[Form4Transaction]] = {}
+    # Collect ALL transactions across all tickers + filed_dates; the
+    # canonical shape (YYMMDDHHMM + latest.json) writes one parquet per
+    # RUN, with filed_date preserved per row as a column.
+    all_transactions: list[Form4Transaction] = []
 
     for ticker in tickers:
         filings = _search_form4_filings(
@@ -505,33 +523,33 @@ def ingest_for_tickers(
                 filed_date=filing["filed_date"],
             )
             stats["n_transactions_parsed"] += len(transactions)
-            by_filed_date.setdefault(
-                filing["filed_date"], [],
-            ).extend(transactions)
+            all_transactions.extend(transactions)
 
     if dry_run:
         logger.info(
-            "[form4][DRY RUN] would write %d parquet files",
-            len(by_filed_date),
+            "[form4][DRY RUN] would write 1 parquet with %d transactions",
+            len(all_transactions),
         )
-        stats["n_parquet_writes"] = len(by_filed_date)
+        stats["n_parquet_writes"] = 1 if all_transactions else 0
         return stats
 
-    for filed_date, transactions in by_filed_date.items():
-        try:
-            write_form4_parquet(
-                transactions,
-                filed_date=filed_date,
-                s3_client=s3_client,
-                bucket=bucket,
-                prefix=prefix,
-            )
-            stats["n_parquet_writes"] += 1
-        except Exception as e:
-            stats["n_failures"] += 1
-            logger.warning(
-                "[form4] parquet write failed for %s: %s", filed_date, e,
-            )
+    # Single canonical write — even an empty run produces a (small)
+    # parquet + latest.json sidecar so consumers can read it.
+    max_filed = max(
+        (tx.filed_date for tx in all_transactions), default=date.today(),
+    )
+    try:
+        write_form4_parquet(
+            all_transactions,
+            filed_date=max_filed,
+            s3_client=s3_client,
+            bucket=bucket,
+            prefix=prefix,
+        )
+        stats["n_parquet_writes"] = 1
+    except Exception as e:
+        stats["n_failures"] += 1
+        logger.warning("[form4] parquet write failed: %s", e)
 
     logger.info("[form4] complete: %s", stats)
     return stats

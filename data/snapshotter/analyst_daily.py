@@ -98,15 +98,31 @@ def write_snapshot_document(
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
+    run_id: str | None = None,
 ) -> str:
-    """Write the per-day snapshot document for ``ticker`` to S3. Returns
-    the key.
+    """Write the per-ticker snapshot document under canonical
+    eval-artifacts shape:
+      artifact:   ``{prefix}/{ticker}/{run_id}_result.json``
+      latest:     ``{prefix}/{ticker}/latest.json``
 
-    Empty ``snapshots`` still writes a document with an empty
-    ``snapshots_by_source`` map — that's signal (no adapter covered
-    the ticker that day) which revisions logic uses to skip stale-vs-
-    missing distinction."""
-    key = s3_key_for(ticker, snapshot_date, prefix=prefix)
+    Each ticker has its own ``latest.json`` since the revisions reader
+    walks per-ticker time series. ``snapshot_date`` stays in the body
+    payload so the revisions module can index by date when reading
+    multiple snapshots back.
+
+    Empty ``snapshots`` still writes a document — that's signal (no
+    adapter covered the ticker that day)."""
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key, eval_latest_key, new_eval_run_id,
+    )
+
+    run_id = run_id or new_eval_run_id()
+    per_ticker_prefix = f"{prefix}/{ticker.upper()}"
+    artifact_key = eval_artifact_key(
+        per_ticker_prefix, run_id, basename="result.json",
+    )
+    latest_key = eval_latest_key(per_ticker_prefix)
+
     body = {
         "ticker": ticker,
         "snapshot_date": snapshot_date.isoformat(),
@@ -118,16 +134,27 @@ def write_snapshot_document(
         },
     }
     s3_client.put_object(
-        Bucket=bucket,
-        Key=key,
+        Bucket=bucket, Key=artifact_key,
         Body=json.dumps(body, default=str).encode("utf-8"),
+        ContentType="application/json",
+    )
+    s3_client.put_object(
+        Bucket=bucket, Key=latest_key,
+        Body=json.dumps({
+            "run_id": run_id,
+            "artifact_key": artifact_key,
+            "ticker": ticker,
+            "snapshot_date": snapshot_date.isoformat(),
+            "schema_version": SCHEMA_VERSION,
+            "written_at": body["fetched_at"],
+        }).encode("utf-8"),
         ContentType="application/json",
     )
     logger.info(
         "[analyst_snapshotter] wrote %s [%d sources] to s3://%s/%s",
-        ticker, len(snapshots), bucket, key,
+        ticker, len(snapshots), bucket, artifact_key,
     )
-    return key
+    return artifact_key
 
 
 def snapshot_universe(
@@ -203,19 +230,46 @@ def read_snapshot_document(
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
 ) -> dict | None:
-    """Read one snapshot document by (ticker, date). Returns the raw
-    JSON dict or None if no document exists.
+    """Read one snapshot document for (ticker, date).
 
-    Consumer of the derived-revisions module (PR C tail) — also useful
-    for ad-hoc inspection.
+    Canonical shape: lists ``{prefix}/{ticker}/`` and finds artifacts
+    whose YYMMDDHHMM run_id starts with the date's YYMMDD prefix.
+    Picks the most recent intra-day run when multiple exist.
+
+    Legacy fallback: tries the old ``{prefix}/{ticker}/{date}.json``
+    key shape during the transition.
+
+    Returns the raw JSON dict or None if no document exists.
     """
-    key = s3_key_for(ticker, snapshot_date, prefix=prefix)
+    # Canonical: list prefix + find by run_id date prefix.
+    # Filenames are `{prefix}/{ticker}/{YYMMDDHHMM}.json` (lib's
+    # eval_artifact_key shortcuts basename='result.json' → just .json).
+    per_ticker_prefix = f"{prefix}/{ticker.upper()}"
+    yymmdd = snapshot_date.strftime("%y%m%d")
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        resp = s3_client.list_objects_v2(
+            Bucket=bucket, Prefix=f"{per_ticker_prefix}/{yymmdd}",
+        )
+        candidates = sorted(
+            obj["Key"] for obj in (resp.get("Contents") or [])
+            if obj["Key"].endswith(".json")
+            and not obj["Key"].endswith("/latest.json")
+        )
+        if candidates:
+            # Most-recent intra-day run (sort puts latest YYMMDDHHMM last)
+            obj = s3_client.get_object(Bucket=bucket, Key=candidates[-1])
+            return json.loads(obj["Body"].read())
     except Exception as e:
         logger.debug(
-            "[analyst_snapshotter] no document at s3://%s/%s (%s)",
-            bucket, key, type(e).__name__,
+            "[analyst_snapshotter] canonical list failed for %s/%s (%s) — "
+            "trying legacy date-key fallback",
+            ticker, snapshot_date, type(e).__name__,
         )
+
+    # Legacy fallback: {prefix}/{ticker}/{date}.json
+    legacy_key = f"{prefix}/{ticker.upper()}/{snapshot_date.isoformat()}.json"
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=legacy_key)
+        return json.loads(obj["Body"].read())
+    except Exception:
         return None
-    return json.loads(obj["Body"].read())
