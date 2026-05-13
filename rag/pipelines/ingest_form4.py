@@ -548,9 +548,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Ingest SEC Form 4 (insider transactions) to S3 parquet",
     )
-    parser.add_argument(
-        "--tickers", type=str, required=True,
+    grp = parser.add_mutually_exclusive_group(required=True)
+    grp.add_argument(
+        "--tickers", type=str,
         help="Comma-separated ticker list.",
+    )
+    grp.add_argument(
+        "--from-signals", action="store_true",
+        help="Load tickers from latest signals.json on S3.",
     )
     parser.add_argument(
         "--lookback-days", type=int, default=90,
@@ -567,7 +572,14 @@ def main():
 
     import boto3
     s3 = boto3.client("s3")
-    tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    if args.tickers:
+        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    else:
+        from rag.pipelines._signals_universe import load_signals_tickers
+        tickers = load_signals_tickers(bucket=args.bucket)
+    if not tickers:
+        logger.error("[ingest_form4] no tickers — aborting")
+        return
     stats = ingest_for_tickers(
         tickers,
         lookback_days=args.lookback_days,

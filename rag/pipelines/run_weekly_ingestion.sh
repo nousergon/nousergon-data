@@ -7,7 +7,13 @@
 #   2. 8-K material events — from signals universe, 1y lookback
 #   3. Earnings transcripts (Finnhub) — from signals universe, latest 8
 #   4. Thesis history — from research.db (incremental)
-#   5. Filing change detection — analyze consecutive filings
+#   5. News pipeline (Wave 1 Gate A) — fetch via aggregator → NLP →
+#      news_aggregates parquet + RAG corpus ingest
+#   6. Form 4 insider transactions (Wave 1 Gate A) — EDGAR → parquet
+#   7. Analyst pipeline (Wave 1 Gate A) — yfinance + Finnhub snapshot
+#      → self-derived 7d/30d revisions
+#   8. Filing change detection — analyze consecutive filings
+#   9. Manifest emit — corpus snapshot for presentation layer
 #
 # Intended to run on the Saturday Step Function via SSM on the always-on
 # EC2 instance. `set -euo pipefail` plus no `|| echo "non-fatal"`
@@ -72,43 +78,81 @@ echo "========================================"
 
 # ── Step 0: Preflight — fail fast on env / connectivity drift ────────────────
 echo ""
-echo "==> Step 0/5: Preflight checks..."
+echo "==> Step 0/9: Preflight checks..."
 $PYTHON_BIN -m rag.preflight
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
-echo "==> Step 1/5: SEC filings (10-K/10-Q)..."
+echo "==> Step 1/9: SEC filings (10-K/10-Q)..."
 $PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
 # ── Step 2: 8-K material events ─────────────────────────────────────────────
 echo ""
-echo "==> Step 2/5: 8-K material events..."
+echo "==> Step 2/9: 8-K material events..."
 $PYTHON_BIN -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365 $DRY_RUN
 
 # ── Step 3: Earnings transcripts (Finnhub) ──────────────────────────────────
 # FINNHUB_API_KEY is verified by preflight; no runtime skip branch.
 echo ""
-echo "==> Step 3/5: Earnings transcripts (Finnhub)..."
+echo "==> Step 3/9: Earnings transcripts (Finnhub)..."
 $PYTHON_BIN -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ticker 8 $DRY_RUN
 
 # ── Step 4: Thesis history (v2 quant/qual from signals.json) ─────────────────
 echo ""
-echo "==> Step 4/6: Thesis history..."
+echo "==> Step 4/9: Thesis history..."
 SINCE=$(date -u -d '14 days ago' '+%Y-%m-%d' 2>/dev/null || date -u -v-14d '+%Y-%m-%d')
 $PYTHON_BIN -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
 
-# ── Step 5: Filing change detection ──────────────────────────────────────────
+# ── LM dict bootstrap (one-time per spot instance) ───────────────────────────
+# Loughran-McDonald master dictionary CSV is required by the news NLP
+# pipeline's sentiment scorer. ~10 MB free download from Notre Dame.
+# Idempotent: scripts/download_lm_dict.py overwrites if present; skip if
+# the file already exists locally on a re-run.
+LM_DICT_PATH="collectors/nlp/data/lm_master_dict.csv"
+if [ ! -f "$LM_DICT_PATH" ]; then
+    echo ""
+    echo "==> LM dict bootstrap: downloading Loughran-McDonald master dict..."
+    $PYTHON_BIN scripts/download_lm_dict.py || \
+        echo "WARN: LM dict download failed — news NLP sentiment will return zero scores"
+else
+    echo "==> LM dict bootstrap: $LM_DICT_PATH already present, skipping download"
+fi
+
+# ── Step 5: News pipeline (Wave 1 Gate A) ────────────────────────────────────
+# Fetch news via NewsAggregator (Polygon + GDELT + Yahoo RSS) → NLP pipeline
+# (Loughran-McDonald sentiment + Anthropic-Haiku event extraction) → write
+# structured aggregates parquet → ingest article narrative to RAG corpus.
 echo ""
-echo "==> Step 5/6: Filing change detection..."
+echo "==> Step 5/9: News pipeline..."
+$PYTHON_BIN -m rag.pipelines.run_news_pipeline --from-signals --hours 168 $DRY_RUN
+
+# ── Step 6: Form 4 insider transactions (Wave 1 Gate A) ──────────────────────
+# EDGAR Form 4 → structured per-(filed_date) parquet at
+# s3://alpha-engine-research/data/insider_transactions/{date}.parquet
+echo ""
+echo "==> Step 6/9: Form 4 insider transactions..."
+$PYTHON_BIN -m rag.pipelines.ingest_form4 --from-signals --lookback-days 90 $DRY_RUN
+
+# ── Step 7: Analyst pipeline (Wave 1 Gate A) ─────────────────────────────────
+# Snapshot per-(ticker, date) consensus + price targets via yfinance + Finnhub,
+# then compute 7d/30d revisions deltas from the accumulated time series.
+# Revisions become meaningful after ~4 weekly snapshots (Gate B in ROADMAP).
+echo ""
+echo "==> Step 7/9: Analyst snapshot + revisions..."
+$PYTHON_BIN -m rag.pipelines.run_analyst_pipeline --from-signals $DRY_RUN
+
+# ── Step 8: Filing change detection ──────────────────────────────────────────
+echo ""
+echo "==> Step 8/9: Filing change detection..."
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
 else
     echo "  SKIPPED in dry-run mode"
 fi
 
-# ── Step 6: Manifest emit (presentation-layer source of truth) ───────────────
+# ── Step 9: Manifest emit (presentation-layer source of truth) ───────────────
 echo ""
-echo "==> Step 6/6: Emit corpus manifest..."
+echo "==> Step 9/9: Emit corpus manifest..."
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3
 else
@@ -131,7 +175,7 @@ aws cloudwatch put-metric-data \
 echo "Heartbeat emitted: rag-ingestion"
 
 # Send completion email. With `set -euo pipefail` active, reaching this
-# point means all 5 pipelines succeeded — the hardcoded 'ok' statuses
+# point means all 9 pipelines succeeded — the hardcoded 'ok' statuses
 # are truthful rather than aspirational. PYTHON_BIN resolved at top of script.
 $PYTHON_BIN -c "
 from emailer import send_step_email
@@ -148,6 +192,9 @@ results = {
         '8k_events': {'status': 'ok'},
         'earnings_transcripts': {'status': 'ok'},
         'thesis_history': {'status': 'ok'},
+        'news_pipeline': {'status': 'ok'},
+        'form4_insider': {'status': 'ok'},
+        'analyst_pipeline': {'status': 'ok'},
         'filing_changes': {'status': 'ok'},
     },
 }
