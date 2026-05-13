@@ -32,12 +32,10 @@ from data.derived.analyst_revisions import (
     build_revision_row,
     compute_and_write_revisions,
     rows_to_dataframe,
-    s3_key_for_date,
 )
 from data.snapshotter.analyst_daily import (
     SCHEMA_VERSION as SNAPSHOT_SCHEMA_VERSION,
     read_snapshot_document,
-    s3_key_for,
     snapshot_one_ticker,
     snapshot_universe,
     write_snapshot_document,
@@ -59,6 +57,13 @@ class _InMemoryS3:
         if (Bucket, Key) not in self.store:
             raise RuntimeError("NoSuchKey")
         return {"Body": BytesIO(self.store[(Bucket, Key)])}
+
+    def list_objects_v2(self, *, Bucket, Prefix="", **kwargs):
+        contents = [
+            {"Key": key} for (b, key) in self.store
+            if b == Bucket and key.startswith(Prefix)
+        ]
+        return {"Contents": contents}
 
 
 def _now() -> datetime:
@@ -275,8 +280,16 @@ class TestSnapshotter:
             snapshot_date=date(2026, 5, 13),
             snapshots={"yfinance": snap},
             s3_client=s3,
+            run_id="2605131944",
         )
-        assert key == "data/analyst_snapshots/AAPL/2026-05-13.json"
+        # Canonical shape: YYMMDDHHMM-encoded artifact key.
+        # The lib's eval_artifact_key shortens basename='result.json' to
+        # just {run_id}.json (default-case shortcut).
+        assert key == "data/analyst_snapshots/AAPL/2605131944.json"
+        # latest.json sidecar written alongside
+        assert ("alpha-engine-research",
+                "data/analyst_snapshots/AAPL/latest.json") in s3.store
+
         doc = read_snapshot_document(
             "AAPL", date(2026, 5, 13), s3_client=s3,
         )
@@ -298,10 +311,12 @@ class TestSnapshotter:
             snapshot_date=date(2026, 5, 13), s3_client=s3,
         )
         assert stats["n_documents_written"] == 2
-        assert ("alpha-engine-research",
-                "data/analyst_snapshots/AAPL/2026-05-13.json") in s3.store
-        assert ("alpha-engine-research",
-                "data/analyst_snapshots/MSFT/2026-05-13.json") in s3.store
+        # Canonical shape: per-ticker latest.json sidecar present for each.
+        # Artifact keys carry YYMMDDHHMM run_id (varies per run) so just
+        # check the sidecar exists for both tickers.
+        keys = {key for (_b, key) in s3.store}
+        assert "data/analyst_snapshots/AAPL/latest.json" in keys
+        assert "data/analyst_snapshots/MSFT/latest.json" in keys
 
     def test_universe_orchestrator_dry_run_skips_writes(self):
         s3 = _InMemoryS3()
@@ -484,19 +499,30 @@ class TestComputeAndWriteRevisions:
             as_of_date=as_of,
             s3_client=s3,
         )
-        assert key == "data/analyst_revisions/2026-05-13.parquet"
+        # Canonical shape: artifact key uses YYMMDDHHMM run_id
+        assert key.startswith("data/analyst_revisions/")
+        assert key.endswith("_result.parquet")
         assert len(rows) == 1
         assert rows[0].mean_target_delta_30d == 20.0
-        # Parquet written
+        # Parquet + latest.json sidecar both written
         assert ("alpha-engine-research", key) in s3.store
+        assert ("alpha-engine-research",
+                "data/analyst_revisions/latest.json") in s3.store
 
 
-def test_s3_key_format():
+def test_canonical_artifact_key_shape():
+    """Canonical key shape (post-PR-1 migration) — YYMMDDHHMM run_id
+    + flat layout per the alpha_engine_lib.eval_artifacts module."""
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key, eval_latest_key, new_eval_run_id,
+    )
+    run_id = new_eval_run_id()
+    assert len(run_id) == 10
     assert (
-        s3_key_for_date(date(2026, 5, 13))
-        == "data/analyst_revisions/2026-05-13.parquet"
+        eval_artifact_key("data/analyst_revisions", run_id, basename="result.parquet")
+        == f"data/analyst_revisions/{run_id}_result.parquet"
     )
     assert (
-        s3_key_for("AAPL", date(2026, 5, 13))
-        == "data/analyst_snapshots/AAPL/2026-05-13.json"
+        eval_latest_key("data/analyst_snapshots/AAPL")
+        == "data/analyst_snapshots/AAPL/latest.json"
     )

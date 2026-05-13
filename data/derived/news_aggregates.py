@@ -45,7 +45,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import date as Date
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Iterable, Sequence
 
@@ -324,15 +324,6 @@ DEFAULT_S3_BUCKET = "alpha-engine-research"
 DEFAULT_S3_PREFIX = "data/news_aggregates"
 
 
-def s3_key_for_date(aggregate_date: Date, *, prefix: str = DEFAULT_S3_PREFIX) -> str:
-    """Canonical S3 key for one date's aggregates parquet.
-
-    Format: ``{prefix}/{YYYY-MM-DD}.parquet``. Consumers read by
-    composing date → key with this same function.
-    """
-    return f"{prefix}/{aggregate_date.isoformat()}.parquet"
-
-
 def write_news_aggregates_parquet(
     df: pd.DataFrame,
     *,
@@ -340,56 +331,117 @@ def write_news_aggregates_parquet(
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
+    run_id: str | None = None,
 ) -> str:
-    """Write the aggregates DataFrame to S3 as parquet. Returns the key.
+    """Write the aggregates DataFrame to S3 as parquet using the
+    canonical ``alpha_engine_lib.eval_artifacts`` shape: flat layout +
+    YYMMDDHHMM-encoded run_id + ``latest.json`` sidecar.
 
-    Overwrites any existing object at the key (idempotent re-run).
-    Uses pyarrow engine — no compression argument so we get default
-    snappy; safe across pyarrow/pandas versions.
+    Returns the artifact S3 key.
+
+    Re-runs on the same calendar day produce distinct artifacts
+    (different YYMMDDHHMM run_ids) and update ``latest.json`` to
+    point at the newest one. Audit-friendly: every Saturday SF
+    invocation preserved + latest is always discoverable.
+
+    ``aggregate_date`` is stamped onto every row of the parquet
+    (already a column in ``NewsTickerDailyAggregate``) so consumers
+    can filter by the canonical date without parsing the run_id.
     """
-    key = s3_key_for_date(aggregate_date, prefix=prefix)
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key,
+        eval_latest_key,
+        new_eval_run_id,
+    )
+
+    run_id = run_id or new_eval_run_id()
+    artifact_key = eval_artifact_key(prefix, run_id, basename="result.parquet")
+    latest_key = eval_latest_key(prefix)
+
+    # Write parquet body
     buf = BytesIO()
     df.to_parquet(buf, engine="pyarrow", index=False)
-    buf.seek(0)
     s3_client.put_object(
         Bucket=bucket,
-        Key=key,
+        Key=artifact_key,
         Body=buf.getvalue(),
         ContentType="application/octet-stream",
     )
-    logger.info(
-        "[news_aggregates] wrote %d rows to s3://%s/%s",
-        len(df), bucket, key,
+    # Write latest.json sidecar pointing to the artifact run_id
+    latest_payload = {
+        "run_id": run_id,
+        "artifact_key": artifact_key,
+        "aggregate_date": aggregate_date.isoformat(),
+        "schema_version": SCHEMA_VERSION,
+        "row_count": int(len(df)),
+        "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=latest_key,
+        Body=json.dumps(latest_payload).encode("utf-8"),
+        ContentType="application/json",
     )
-    return key
+    logger.info(
+        "[news_aggregates] wrote %d rows to s3://%s/%s (latest=%s)",
+        len(df), bucket, artifact_key, latest_key,
+    )
+    return artifact_key
 
 
 def read_news_aggregates_parquet(
-    aggregate_date: Date,
+    aggregate_date: Date | None = None,
     *,
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
 ) -> pd.DataFrame:
-    """Consumer-side read. Returns the parquet's DataFrame, or an
-    empty DataFrame with the canonical schema if no parquet exists for
-    the date.
+    """Consumer-side read. Resolves the canonical artifact via
+    ``latest.json`` sidecar; falls back to the legacy
+    ``{aggregate_date}.parquet`` key shape during the transition
+    window.
 
-    Schema-version-aware: callers should check the ``schema_version``
-    column and apply forward-compat shims if needed.
+    ``aggregate_date`` is only used for the legacy-shape fallback.
+    Under the canonical shape, ``latest.json`` always points at the
+    most recent run regardless of date; the parquet itself carries
+    ``aggregate_date`` per row so filtering happens at the DataFrame
+    layer.
+
+    Returns an empty DataFrame with the canonical schema when no
+    artifact exists.
     """
-    key = s3_key_for_date(aggregate_date, prefix=prefix)
+    from alpha_engine_lib.eval_artifacts import eval_latest_key
+
+    # Canonical path: read latest.json → resolve key
+    latest_key = eval_latest_key(prefix)
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        obj = s3_client.get_object(Bucket=bucket, Key=latest_key)
+        sidecar = json.loads(obj["Body"].read())
+        artifact_key = sidecar.get("artifact_key")
+        if artifact_key:
+            body = s3_client.get_object(Bucket=bucket, Key=artifact_key)
+            return pd.read_parquet(BytesIO(body["Body"].read()), engine="pyarrow")
     except Exception as e:
         logger.info(
-            "[news_aggregates] no parquet at s3://%s/%s (%s) — "
-            "returning empty DataFrame",
-            bucket, key, type(e).__name__,
+            "[news_aggregates] canonical sidecar read failed for %s (%s) — "
+            "trying legacy date-key fallback",
+            latest_key, type(e).__name__,
         )
-        return _empty_df()
-    buf = BytesIO(obj["Body"].read())
-    return pd.read_parquet(buf, engine="pyarrow")
+
+    # Legacy fallback during transition
+    if aggregate_date is not None:
+        legacy_key = f"{prefix}/{aggregate_date.isoformat()}.parquet"
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=legacy_key)
+            logger.info(
+                "[news_aggregates] read via legacy key %s — "
+                "will be removed after canonical-shape soak", legacy_key,
+            )
+            return pd.read_parquet(BytesIO(obj["Body"].read()), engine="pyarrow")
+        except Exception:
+            pass
+
+    return _empty_df()
 
 
 # ── Orchestrator-friendly helper ──────────────────────────────────────

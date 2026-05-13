@@ -30,7 +30,6 @@ from rag.pipelines.ingest_form4 import (
     _search_form4_filings,
     ingest_for_tickers,
     parse_form4_xml,
-    s3_key_for_filed_date,
     transactions_to_dataframe,
     write_form4_parquet,
 )
@@ -339,10 +338,17 @@ class TestDataFrameConversion:
 
 
 class TestS3ParquetWriter:
-    def test_s3_key_format(self):
+    def test_canonical_artifact_key_shape(self):
+        from alpha_engine_lib.eval_artifacts import (
+            eval_artifact_key, eval_latest_key,
+        )
+        ak = eval_artifact_key(
+            "data/insider_transactions", "2605131934", basename="result.parquet",
+        )
+        assert ak == "data/insider_transactions/2605131934_result.parquet"
         assert (
-            s3_key_for_filed_date(date(2026, 5, 13))
-            == "data/insider_transactions/2026-05-13.parquet"
+            eval_latest_key("data/insider_transactions")
+            == "data/insider_transactions/latest.json"
         )
 
     def test_write_and_read_back(self):
@@ -354,8 +360,13 @@ class TestS3ParquetWriter:
         )
         key = write_form4_parquet(
             txs, filed_date=date(2026, 5, 13), s3_client=s3,
+            run_id="2605131934",
         )
-        assert key == "data/insider_transactions/2026-05-13.parquet"
+        # Canonical shape
+        assert key == "data/insider_transactions/2605131934_result.parquet"
+        # latest.json sidecar exists
+        assert ("alpha-engine-research",
+                "data/insider_transactions/latest.json") in s3.store
 
         body = s3.store[("alpha-engine-research", key)]
         df = pd.read_parquet(BytesIO(body), engine="pyarrow")
@@ -458,10 +469,11 @@ class TestIngestForTickers:
         assert stats["n_transactions_parsed"] == 1
         assert stats["n_parquet_writes"] == 1
         assert stats["n_failures"] == 0
-        assert (
-            "alpha-engine-research",
-            "data/insider_transactions/2026-05-13.parquet",
-        ) in s3.store
+        # Canonical shape: latest.json sidecar always present (key for
+        # the artifact itself contains a time-of-write run_id we can't
+        # pre-compute).
+        assert ("alpha-engine-research",
+                "data/insider_transactions/latest.json") in s3.store
 
     def test_non_form4_filings_skipped_in_discovery(self, monkeypatch):
         from rag.pipelines import ingest_form4

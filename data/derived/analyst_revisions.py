@@ -265,38 +265,55 @@ def load_snapshot_time_series(
     """Load all snapshot documents for ``ticker`` in the window
     [as_of - days_back, as_of]. Returns a mapping Date → JSON document.
 
-    Missing dates are simply absent from the mapping — caller logic in
-    ``build_revision_row`` tolerates this.
-
-    Uses S3 GetObject per-date (small JSON docs, cheap). For very long
-    windows (>365 days) a list-prefix + batch read would be cheaper;
-    not needed for 30-day windows.
+    Canonical shape: list ``{prefix}/{ticker}/`` once + parse each
+    artifact's body to extract ``snapshot_date``; index by that date.
+    Cheaper than per-date GETs since one LIST + small body reads
+    cover the entire window. Tolerates the legacy
+    ``{ticker}/{date}.json`` shape during transition.
     """
+    import json as _json
     out: dict[Date, dict] = {}
-    for offset in range(days_back + 7 + 1):
-        d = as_of_date - timedelta(days=offset)
-        key = f"{snapshot_prefix}/{ticker.upper()}/{d.isoformat()}.json"
+    cutoff_earliest = as_of_date - timedelta(days=days_back + 7)
+
+    # Canonical: list the per-ticker prefix + filter to the window
+    per_ticker_prefix = f"{snapshot_prefix}/{ticker.upper()}/"
+    try:
+        resp = s3_client.list_objects_v2(
+            Bucket=bucket, Prefix=per_ticker_prefix,
+        )
+        keys = [
+            obj["Key"] for obj in (resp.get("Contents") or [])
+            if obj["Key"].endswith(".json")
+            and not obj["Key"].endswith("/latest.json")
+        ]
+    except Exception:
+        keys = []
+
+    for key in keys:
         try:
             obj = s3_client.get_object(Bucket=bucket, Key=key)
-        except Exception:
-            continue
-        import json as _json
-        try:
-            out[d] = _json.loads(obj["Body"].read())
+            doc = _json.loads(obj["Body"].read())
         except Exception as e:
             logger.warning(
                 "[analyst_revisions] failed to parse %s: %s", key, e,
             )
+            continue
+        try:
+            snap_date = Date.fromisoformat(doc.get("snapshot_date", "")[:10])
+        except (ValueError, TypeError):
+            continue
+        if cutoff_earliest <= snap_date <= as_of_date:
+            # If multiple runs landed for the same date, keep the
+            # one with the most-recent fetched_at timestamp.
+            existing = out.get(snap_date)
+            if existing is None or (
+                doc.get("fetched_at", "") > existing.get("fetched_at", "")
+            ):
+                out[snap_date] = doc
     return out
 
 
 # ── Parquet writer ─────────────────────────────────────────────────────
-
-
-def s3_key_for_date(
-    as_of_date: Date, *, prefix: str = DEFAULT_S3_PREFIX,
-) -> str:
-    return f"{prefix}/{as_of_date.isoformat()}.parquet"
 
 
 def rows_to_dataframe(rows: Iterable[AnalystRevisionRow]) -> pd.DataFrame:
@@ -314,21 +331,42 @@ def write_revisions_parquet(
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
+    run_id: str | None = None,
 ) -> str:
+    """Canonical eval-artifacts shape (YYMMDDHHMM + latest.json sidecar)."""
+    import json as _json
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key, eval_latest_key, new_eval_run_id,
+    )
+
     df = rows_to_dataframe(rows)
-    key = s3_key_for_date(as_of_date, prefix=prefix)
+    run_id = run_id or new_eval_run_id()
+    artifact_key = eval_artifact_key(prefix, run_id, basename="result.parquet")
+    latest_key = eval_latest_key(prefix)
+
     buf = BytesIO()
     df.to_parquet(buf, engine="pyarrow", index=False)
-    buf.seek(0)
     s3_client.put_object(
-        Bucket=bucket, Key=key, Body=buf.getvalue(),
+        Bucket=bucket, Key=artifact_key, Body=buf.getvalue(),
         ContentType="application/octet-stream",
+    )
+    s3_client.put_object(
+        Bucket=bucket, Key=latest_key,
+        Body=_json.dumps({
+            "run_id": run_id,
+            "artifact_key": artifact_key,
+            "as_of_date": as_of_date.isoformat(),
+            "schema_version": SCHEMA_VERSION,
+            "row_count": int(len(df)),
+            "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }).encode("utf-8"),
+        ContentType="application/json",
     )
     logger.info(
         "[analyst_revisions] wrote %d rows to s3://%s/%s",
-        len(df), bucket, key,
+        len(df), bucket, artifact_key,
     )
-    return key
+    return artifact_key
 
 
 # ── End-to-end orchestrator ────────────────────────────────────────────
