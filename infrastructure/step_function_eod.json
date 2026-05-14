@@ -368,14 +368,22 @@
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS — instance still stops to avoid cost",
+      "Comment": "Failure alert via SNS — instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
-        "TopicArn.$": "$.sns_topic_arn",
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Pipeline — FAILED",
         "Message.$": "States.Format('EOD pipeline failed. Error: {}', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Defense-in-depth: SNS publish failure must NOT block ForceStopInstance. The cost-guard fires regardless of alert delivery (avoids the 2026-05-14 incident where a malformed sns_topic_arn left the trading instance running).",
+          "Next": "ForceStopInstance",
+          "ResultPath": "$.failure_notify_error"
+        }
+      ],
       "Next": "ForceStopInstance"
     },
     "ForceStopInstance": {

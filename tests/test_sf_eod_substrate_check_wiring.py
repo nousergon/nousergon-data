@@ -206,3 +206,122 @@ class TestStopTradingInstanceUnchanged:
             "StopTradingInstance must remain a terminal End=true state on "
             "the success path — anything else is a cost-overrun risk."
         )
+
+
+class TestHandleFailureCostGuardHardening:
+    """Pin the 2026-05-14 cost-guard hardening on ``HandleFailure``.
+
+    Background: 2026-05-14 EOD recovery v2 SF execution failed at
+    ``HandleFailure`` with `Invalid parameter: TopicArn Reason: An
+    ARN must have at least 6 elements, not 5`. Root cause: the
+    recovery input payload had a malformed ``sns_topic_arn`` (colon
+    replaced with a space between ``us-east-1`` and the account ID).
+    Because ``HandleFailure`` had no ``Catch``, the SNS publish
+    failure aborted the whole SF before reaching ``ForceStopInstance``
+    — leaving the trading EC2 running until manual stop. The state's
+    own comment (`"Failure alert via SNS — instance still stops to
+    avoid cost"`) was unenforced.
+
+    Two-part fix:
+    1. Hardcode the SNS topic ARN (no ``$.sns_topic_arn`` indirection)
+       so a malformed input field can never block the cost-guard.
+    2. Catch ``States.ALL`` on ``HandleFailure`` and route to
+       ``ForceStopInstance`` so the cost-guard fires regardless of
+       SNS-side failure (throttling, IAM drift, transient outage,
+       future failure modes).
+    """
+
+    def test_topic_arn_is_literal_not_jsonpath(self, states):
+        """Hardcoded ARN — no ``TopicArn.$`` indirection.
+
+        A future PR that re-introduces the JSONPath form
+        (``TopicArn.$``) would re-open the malformed-input attack
+        surface that broke 2026-05-14 EOD recovery.
+        """
+        params = states["HandleFailure"]["Parameters"]
+        assert "TopicArn" in params, (
+            "HandleFailure.Parameters must include a literal 'TopicArn' field."
+        )
+        assert "TopicArn.$" not in params, (
+            "HandleFailure must NOT use 'TopicArn.$' (JSONPath indirection) — "
+            "the ARN is fixed and per-execution variability creates a "
+            "corruption surface (2026-05-14 incident: malformed sns_topic_arn "
+            "in recovery input → 'ARN must have at least 6 elements' → "
+            "ForceStopInstance never fired → trading EC2 left running)."
+        )
+        # Spot-check the ARN shape — exactly 6 colon-separated parts,
+        # SNS service, alpha-engine-alerts topic.
+        arn = params["TopicArn"]
+        parts = arn.split(":")
+        assert len(parts) == 6, f"SNS ARN must have 6 parts; got {len(parts)}: {arn!r}"
+        assert parts[:3] == ["arn", "aws", "sns"], f"Unexpected ARN prefix: {arn!r}"
+        assert parts[5] == "alpha-engine-alerts", (
+            f"ARN must point to alpha-engine-alerts topic; got {parts[5]!r}"
+        )
+
+    def test_handle_failure_has_catch_to_force_stop_instance(self, states):
+        """HandleFailure must Catch States.ALL → ForceStopInstance.
+
+        Defense-in-depth: even with the hardcoded ARN, any SNS-side
+        failure (throttling, IAM drift, outage) must NOT block the
+        cost-guard. The trading EC2 must always stop.
+        """
+        catches = states["HandleFailure"].get("Catch")
+        assert catches, (
+            "HandleFailure must define a 'Catch' block so SNS-side failures "
+            "(throttling, IAM drift, outage) do NOT block ForceStopInstance. "
+            "Without this, any publish failure leaves the trading EC2 running "
+            "(2026-05-14 incident)."
+        )
+        all_catch = next(
+            (c for c in catches if "States.ALL" in c.get("ErrorEquals", [])),
+            None,
+        )
+        assert all_catch is not None, (
+            "HandleFailure.Catch must include a 'States.ALL' branch — partial "
+            "catches leave failure surfaces uncovered."
+        )
+        assert all_catch["Next"] == "ForceStopInstance", (
+            f"HandleFailure Catch must route to ForceStopInstance, not "
+            f"{all_catch['Next']!r}. The cost-guard is the load-bearing "
+            "step; alert delivery is best-effort."
+        )
+
+    def test_input_schema_no_longer_requires_sns_topic_arn(self, states):
+        """Once the ARN is hardcoded, no state's Parameters or input/output
+        path should reference ``$.sns_topic_arn`` — confirms the SF input
+        schema can drop the field on the next manual recovery payload.
+
+        Walks the JSON tree (rather than grepping the serialized text) so
+        Comment fields that explain *why* the indirection was removed
+        don't trip the test.
+        """
+
+        def _walk_for_jsonpath_use(node, path="$"):
+            hits: list[str] = []
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    sub = f"{path}.{k}"
+                    if k == "Comment":
+                        # Comments document intent — they're allowed to
+                        # mention ``$.sns_topic_arn`` historically.
+                        continue
+                    if isinstance(v, str) and v == "$.sns_topic_arn":
+                        hits.append(sub)
+                    elif k.endswith(".$") and isinstance(v, str) and "sns_topic_arn" in v:
+                        hits.append(sub)
+                    else:
+                        hits.extend(_walk_for_jsonpath_use(v, sub))
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    hits.extend(_walk_for_jsonpath_use(v, f"{path}[{i}]"))
+            return hits
+
+        live_uses = _walk_for_jsonpath_use(states)
+        assert not live_uses, (
+            "No state should bind to '$.sns_topic_arn' after the 2026-05-14 "
+            "hardening — the ARN is hardcoded in HandleFailure and the input "
+            "field is no longer needed. Found live JSONPath references at: "
+            f"{live_uses}. A reintroduction means someone re-added the "
+            "indirection and re-opened the corruption surface."
+        )
