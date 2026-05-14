@@ -236,14 +236,14 @@
 
     "CheckSkipRegimeSubstrate": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps to CheckSkipResearch. Independent of skip_research — operators can skip the HMM refit while still running research (or vice versa).",
+      "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps to CheckSkipRegimeRetrospectiveEval (which independently honors its own skip flag). Independent of skip_research — operators can skip the HMM refit while still running research (or vice versa).",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_regime_substrate", "IsPresent": true},
             {"Variable": "$.skip_regime_substrate", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipResearch"
+          "Next": "CheckSkipRegimeRetrospectiveEval"
         }
       ],
       "Default": "RegimeSubstrate"
@@ -251,7 +251,7 @@
 
     "RegimeSubstrate": {
       "Type": "Task",
-      "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. The macro economist agent (Stage C) will consume this as a strong prior; macro agent remains the final regime authority. Observe-only at this stage — no production consumer reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipResearch, not HandleFailure) per the Stage A observe-only contract — a regime substrate failure during the 4-week observation period must not halt Research.",
+      "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. The macro economist agent (Stage C) will consume this as a strong prior; macro agent remains the final regime authority. Observe-only at this stage — no production consumer reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipRegimeRetrospectiveEval, not HandleFailure) per the Stage A observe-only contract — a regime substrate failure during the 4-week observation period must not halt Research.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-regime-substrate:live",
@@ -271,11 +271,56 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "CheckSkipResearch",
+          "Next": "CheckSkipRegimeRetrospectiveEval",
           "ResultPath": "$.regime_substrate_error"
         }
       ],
       "ResultPath": "$.regime_substrate_result",
+      "Next": "CheckSkipRegimeRetrospectiveEval"
+    },
+
+    "CheckSkipRegimeRetrospectiveEval": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_regime_retrospective_eval\": true} bypasses the T1 retrospective HMM smoothing eval and jumps to CheckSkipResearch. Independent of skip_regime_substrate — operator can run substrate without eval (or vice versa during ad-hoc replays).",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_regime_retrospective_eval", "IsPresent": true},
+            {"Variable": "$.skip_regime_retrospective_eval", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipResearch"
+        }
+      ],
+      "Default": "RegimeRetrospectiveEval"
+    },
+
+    "RegimeRetrospectiveEval": {
+      "Type": "Task",
+      "Comment": "Stage C.2 T1 retrospective HMM smoothing eval — pairs the macro agent's historical regime calls against the HMM forward-backward smoother's labels (8-week lag, asymmetric loss penalizing bear-misses 2×). Writes s3://alpha-engine-research/regime/retrospective/{YYMMDDHHMM}.json + latest.json sidecar carrying n_pairings + rolling 26-week agreement rate. Observe-only — feeds the dashboard's Regime page, does NOT gate anything. Failure is non-blocking (Catch routes to CheckSkipResearch) — a retrospective-eval failure must not halt Research. Returns n_pairings=0 cleanly during the cold-start window (~8 weeks after substrate Lambda starts running).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
+        "Payload": {
+          "action": "produce"
+        }
+      },
+      "TimeoutSeconds": 660,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CheckSkipResearch",
+          "ResultPath": "$.regime_retrospective_eval_error"
+        }
+      ],
+      "ResultPath": "$.regime_retrospective_eval_result",
       "Next": "CheckSkipResearch"
     },
 
