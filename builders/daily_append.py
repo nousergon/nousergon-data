@@ -1132,6 +1132,26 @@ def daily_append(
                 # passthrough behaviour.
                 today_row[PROVENANCE_COL] = new_row.iloc[0][PROVENANCE_COL]
 
+                # Match the persisted ArcticDB column order so update_batch
+                # passes its strict descriptor-equality check. Existing
+                # universe symbols were laid down with `source` between
+                # VWAP and the first feature (idx 7 in the storage layout)
+                # via `_write_row_backfill_safe` + earlier per-ticker
+                # write paths. The bare `today_row[PROVENANCE_COL] = ...`
+                # assignment above appends `source` at the END of the
+                # frame, which is fine for write_batch (full rewrite) but
+                # ArcticDB's update_batch raises StreamDescriptorMismatch
+                # when the incoming column order differs from the existing
+                # version — observed 2026-05-14 EOD: 99.9% error rate
+                # (903 / 904 tickers) with `existing` showing source idx=7
+                # and `new_val` showing source idx=71.
+                ordered_cols = (
+                    [c for c in OHLCV_COLS if c in today_row.columns]
+                    + ([PROVENANCE_COL] if PROVENANCE_COL in today_row.columns else [])
+                    + [f for f in FEATURES if f in today_row.columns]
+                )
+                today_row = today_row[ordered_cols]
+
                 # Per-ticker coverage observability: count NaN features now
                 # so the eventual log + counter reflects exactly what's
                 # being written. Silent partial coverage is forbidden

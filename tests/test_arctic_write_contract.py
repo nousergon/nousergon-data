@@ -216,3 +216,37 @@ def test_backfill_wraps_macro_writes():
     assert "macro_lib.write(\"features\", to_arctic_safe(macro_df))" in _BACKFILL_SRC
     assert "macro_lib.write(key, to_arctic_safe(macro_series_df))" in _BACKFILL_SRC
     assert "macro_lib.write(key, to_arctic_safe(sector_df))" in _BACKFILL_SRC
+
+
+def test_daily_append_today_row_column_order_matches_storage():
+    """Pin the today_row column order to [OHLCV, source, FEATURES].
+
+    2026-05-14 EOD failure: 99.9% (903 / 904) of update_batch calls failed
+    with ``StreamDescriptorMismatch`` because today_row was being built as
+    [OHLCV, FEATURES, source] (source appended at the end via the bare
+    ``today_row[PROVENANCE_COL] = …`` assignment) while every persisted
+    universe symbol carries source at idx 7 (between VWAP and the first
+    feature). ArcticDB's update_batch enforces strict column-order match
+    against the existing version's descriptor; the backfill-branch
+    write_batch path masks this because full rewrite ignores prior
+    descriptor.
+
+    The fix re-projects today_row via an explicit column order before the
+    write queue. If a future PR removes that re-projection, this test
+    fails — preventing a silent re-introduction of the same EOD outage.
+    """
+    assert (
+        "ordered_cols = (\n"
+        "                    [c for c in OHLCV_COLS if c in today_row.columns]\n"
+        "                    + ([PROVENANCE_COL] if PROVENANCE_COL in today_row.columns else [])\n"
+        "                    + [f for f in FEATURES if f in today_row.columns]\n"
+        "                )\n"
+        "                today_row = today_row[ordered_cols]"
+    ) in _DAILY_APPEND_SRC, (
+        "daily_append.py must re-project today_row to "
+        "[OHLCV, source, FEATURES] before queuing the UpdatePayload — "
+        "matches the persisted ArcticDB descriptor (source at idx 7). "
+        "The bare `today_row[PROVENANCE_COL] = …` assignment alone "
+        "appends source at the end, which trips StreamDescriptorMismatch "
+        "on update_batch (2026-05-14 EOD)."
+    )
