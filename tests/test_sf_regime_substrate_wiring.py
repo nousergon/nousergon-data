@@ -66,6 +66,10 @@ def test_regime_substrate_payload_is_produce_action() -> None:
 
 
 def test_check_skip_regime_substrate_routes_correctly() -> None:
+    """Skip path lands on CheckSkipRegimeRetrospectiveEval (not directly
+    on CheckSkipResearch) so the T1 eval still gets its own independent
+    skip-gate evaluation. Honors the "each regime step has its own
+    skip flag" invariant introduced with T1 wiring."""
     sf = _sf()
     assert "CheckSkipRegimeSubstrate" in sf["States"]
     state = sf["States"]["CheckSkipRegimeSubstrate"]
@@ -74,7 +78,7 @@ def test_check_skip_regime_substrate_routes_correctly() -> None:
     skip_choice = state["Choices"][0]
     skip_vars = skip_choice["And"]
     assert any(c.get("Variable") == "$.skip_regime_substrate" for c in skip_vars)
-    assert skip_choice["Next"] == "CheckSkipResearch"
+    assert skip_choice["Next"] == "CheckSkipRegimeRetrospectiveEval"
 
 
 def test_post_rag_control_flow_lands_on_regime_skip_gate() -> None:
@@ -99,25 +103,27 @@ def test_post_rag_control_flow_lands_on_regime_skip_gate() -> None:
 
 def test_regime_substrate_failure_is_non_blocking() -> None:
     """Stage A observe-only contract: RegimeSubstrate failure must NOT
-    halt the pipeline. The Catch[States.ALL] routes to CheckSkipResearch
-    (not HandleFailure) so Research still runs and the next Saturday
-    has another chance to fit the HMM."""
+    halt the pipeline. The Catch[States.ALL] routes to
+    CheckSkipRegimeRetrospectiveEval (not HandleFailure) so the T1 eval
+    + Research still get a chance to run."""
     sf = _sf()
     catches = sf["States"]["RegimeSubstrate"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "CheckSkipResearch", (
-        "RegimeSubstrate Catch[States.ALL] must route to CheckSkipResearch "
-        "(non-blocking), not HandleFailure (blocking). Stage A is observe-only; "
-        "a regime substrate failure during the 4-week observation period must "
-        "not halt Research."
+    assert states_all["Next"] == "CheckSkipRegimeRetrospectiveEval", (
+        "RegimeSubstrate Catch[States.ALL] must route to "
+        "CheckSkipRegimeRetrospectiveEval (non-blocking), not HandleFailure "
+        "(blocking). Stage A is observe-only; a regime substrate failure "
+        "during the 4-week observation period must not halt downstream."
     )
 
 
-def test_regime_substrate_next_is_check_skip_research() -> None:
-    """Success path also lands on CheckSkipResearch — substrate is
-    observe-only at Stage A, so it's parallel to research, not gating."""
+def test_regime_substrate_next_is_eval_skip_gate() -> None:
+    """Success path lands on CheckSkipRegimeRetrospectiveEval so the
+    T1 eval gets a chance to run (it independently honors its own
+    skip flag). Substrate + eval are sibling observe-only steps,
+    neither gates the other."""
     sf = _sf()
-    assert sf["States"]["RegimeSubstrate"]["Next"] == "CheckSkipResearch"
+    assert sf["States"]["RegimeSubstrate"]["Next"] == "CheckSkipRegimeRetrospectiveEval"
 
 
 def test_regime_substrate_timeout_is_reasonable() -> None:
@@ -129,4 +135,83 @@ def test_regime_substrate_timeout_is_reasonable() -> None:
     assert sf_timeout >= 300, (
         f"SF TimeoutSeconds for RegimeSubstrate must be >= Lambda timeout "
         f"(300s per setup-regime-lambda.sh); got {sf_timeout}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# T1 retrospective eval state — Stage C.2 T1 wiring (regime-v3 §5.3.3)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_regime_retrospective_eval_state_exists() -> None:
+    sf = _sf()
+    assert "RegimeRetrospectiveEval" in sf["States"], (
+        "Saturday SF must contain a RegimeRetrospectiveEval state — "
+        "Stage C.2 T1 wiring (regime-v3 §5.3.3)."
+    )
+    state = sf["States"]["RegimeRetrospectiveEval"]
+    assert state["Type"] == "Task"
+    assert state["Resource"] == "arn:aws:states:::lambda:invoke"
+    assert state["Parameters"]["FunctionName"] == (
+        "alpha-engine-predictor-regime-retrospective-eval:live"
+    )
+
+
+def test_regime_retrospective_eval_payload_is_produce_action() -> None:
+    """Handler-side dry_run does NOT write the artifact; production
+    SF must always invoke produce so the eval artifact lands in S3."""
+    sf = _sf()
+    payload = sf["States"]["RegimeRetrospectiveEval"]["Parameters"]["Payload"]
+    assert payload.get("action") == "produce", (
+        f"RegimeRetrospectiveEval payload must be action=produce; got {payload!r}"
+    )
+
+
+def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
+    """{\"skip_regime_retrospective_eval\": true} bypasses to
+    CheckSkipResearch. Independent of skip_regime_substrate so each
+    regime step has its own skip flag."""
+    sf = _sf()
+    assert "CheckSkipRegimeRetrospectiveEval" in sf["States"]
+    state = sf["States"]["CheckSkipRegimeRetrospectiveEval"]
+    assert state["Type"] == "Choice"
+    assert state["Default"] == "RegimeRetrospectiveEval"
+    skip_choice = state["Choices"][0]
+    skip_vars = skip_choice["And"]
+    assert any(
+        c.get("Variable") == "$.skip_regime_retrospective_eval"
+        for c in skip_vars
+    )
+    assert skip_choice["Next"] == "CheckSkipResearch"
+
+
+def test_regime_retrospective_eval_failure_is_non_blocking() -> None:
+    """Observe-only contract: a T1 eval failure must NOT halt the
+    pipeline. The Catch[States.ALL] routes to CheckSkipResearch
+    (not HandleFailure) — T1 is observability, not gating."""
+    sf = _sf()
+    catches = sf["States"]["RegimeRetrospectiveEval"]["Catch"]
+    states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
+    assert states_all["Next"] == "CheckSkipResearch", (
+        "RegimeRetrospectiveEval Catch[States.ALL] must route to "
+        "CheckSkipResearch (non-blocking), not HandleFailure (blocking). "
+        "T1 is observability; a failure must not halt Research."
+    )
+
+
+def test_regime_retrospective_eval_next_is_check_skip_research() -> None:
+    sf = _sf()
+    assert sf["States"]["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
+
+
+def test_regime_retrospective_eval_timeout_accommodates_smoother_fit() -> None:
+    """Lambda timeout is 600s (per setup-regime-retrospective-eval-lambda.sh)
+    — smoother fit + signals/ archive enumeration is heavier than substrate
+    fit. SF TimeoutSeconds must be slightly above the Lambda's own timeout."""
+    sf = _sf()
+    sf_timeout = sf["States"]["RegimeRetrospectiveEval"]["TimeoutSeconds"]
+    assert sf_timeout >= 600, (
+        f"SF TimeoutSeconds for RegimeRetrospectiveEval must be >= Lambda "
+        f"timeout (600s per setup-regime-retrospective-eval-lambda.sh); "
+        f"got {sf_timeout}"
     )

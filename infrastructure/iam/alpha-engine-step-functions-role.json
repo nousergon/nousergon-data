@@ -14,7 +14,8 @@
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-health-check*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-substrate*"
+                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-substrate*",
+                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*"
             ]
         },
         {
