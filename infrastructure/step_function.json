@@ -126,14 +126,14 @@
 
     "CheckSkipRAGIngestion": {
       "Type": "Choice",
-      "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipResearch. Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
+      "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipRegimeSubstrate. Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_rag_ingestion", "IsPresent": true},
             {"Variable": "$.skip_rag_ingestion", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipResearch"
+          "Next": "CheckSkipRegimeSubstrate"
         }
       ],
       "Default": "RAGIngestion"
@@ -212,7 +212,7 @@
         {
           "Variable": "$.rag_ingestion_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipResearch"
+          "Next": "CheckSkipRegimeSubstrate"
         },
         {
           "Variable": "$.rag_ingestion_poll.Status",
@@ -232,6 +232,51 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForRAGIngestion"
+    },
+
+    "CheckSkipRegimeSubstrate": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps to CheckSkipResearch. Independent of skip_research — operators can skip the HMM refit while still running research (or vice versa).",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_regime_substrate", "IsPresent": true},
+            {"Variable": "$.skip_regime_substrate", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipResearch"
+        }
+      ],
+      "Default": "RegimeSubstrate"
+    },
+
+    "RegimeSubstrate": {
+      "Type": "Task",
+      "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. The macro economist agent (Stage C) will consume this as a strong prior; macro agent remains the final regime authority. Observe-only at this stage — no production consumer reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipResearch, not HandleFailure) per the Stage A observe-only contract — a regime substrate failure during the 4-week observation period must not halt Research.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-regime-substrate:live",
+        "Payload": {
+          "action": "produce"
+        }
+      },
+      "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CheckSkipResearch",
+          "ResultPath": "$.regime_substrate_error"
+        }
+      ],
+      "ResultPath": "$.regime_substrate_result",
+      "Next": "CheckSkipResearch"
     },
 
     "CheckSkipResearch": {
