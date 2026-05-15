@@ -89,6 +89,20 @@ _SKIP_TICKERS = {
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
 }
+
+# Macro/index symbols ALSO promoted to full `universe` members (full OHLCV +
+# engineered features), in addition to their Close-only `macro`-library write.
+# SPY became a held core position with the 2026-05-13 portfolio-optimizer
+# cutover, so every held-position code path (eod_reconcile #181,
+# morning-planner ATR #185) needs SPY's engineered features (atr_14_pct, ...)
+# from `universe`. Members deliberately STAY in _SKIP_TICKERS so
+# prune_delisted_tickers (SPY ∉ constituents.json → would otherwise be a
+# prune candidate) and the daily_append coverage-diff accounting keep
+# treating them as non-stock — _UNIVERSE_EXTRA only widens the universe-WRITE
+# candidate set, nothing else. NOT a macro-lib teardown: VIX/TNX/IRX have no
+# tradeable OHLCV and are never held, so they stay macro-only.
+_UNIVERSE_EXTRA = frozenset({"SPY"})
+
 # Sector ETFs to skip (not individual stocks)
 _SECTOR_ETF_PREFIXES = {"XL"}
 
