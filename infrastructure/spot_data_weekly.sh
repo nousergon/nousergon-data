@@ -30,33 +30,20 @@
 # Saturday Step Function):
 #   - AWS CLI with perms to RunInstances / TerminateInstances / DescribeInstances
 #   - SSH key at ~/.ssh/alpha-engine-key.pem
-#   - .env at /home/ec2-user/.alpha-engine.env (for API keys)
 #   - alpha-engine-data checked out at the script's parent dir
+#
+# Secrets resolve from SSM at Python startup via
+# alpha_engine_lib.secrets.get_secret(); the spot's IAM profile
+# (alpha-engine-executor-profile) grants ssm:GetParameter on /alpha-engine/*.
+# No .env is sourced anywhere in this script post the 2026-05-14 .env-deprecation arc.
 
 set -euo pipefail
 
-# SSM RunCommand does not set HOME; default it for the .env/SSH lookups below.
+# SSM RunCommand does not set HOME; default it for the SSH key lookup below.
 export HOME="${HOME:-/home/ec2-user}"
 
-# ── Locate .env ──────────────────────────────────────────────────────────────
-# Step Function path first; fall back to repo-local .env for manual runs.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-ENV_FILE="$HOME/.alpha-engine.env"
-if [ ! -f "$ENV_FILE" ]; then
-    ENV_FILE="$REPO_ROOT/.env"
-fi
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-    echo "Loaded .env from $ENV_FILE"
-else
-    echo "ERROR: No .env file found (checked ~/.alpha-engine.env, repo/.env)"
-    exit 1
-fi
 
 # ── Spot configuration ──────────────────────────────────────────────────────
 # Values mirror alpha-engine-backtester/infrastructure/spot_backtest.sh so
@@ -209,12 +196,6 @@ echo "==> Cloning alpha-engine-data (branch: $BRANCH)..."
 # HTTPS clone with PAT — matches the lib-install pattern below.
 run_remote "git clone --depth 1 --branch $BRANCH https://github.com/cipher813/alpha-engine-data.git /home/ec2-user/alpha-engine-data"
 
-# ── Upload .env BEFORE pip install ──────────────────────────────────────────
-echo "==> Uploading .env to spot..."
-scp $SSH_OPTS -i "$KEY_FILE" \
-    "$ENV_FILE" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-data/.env
-
 # ── Upload alpha-engine-config/data/config.yaml ─────────────────────────────
 # weekly_collector.py's load_config() searches /home/ec2-user/alpha-engine-config/data/config.yaml
 # first. Private config repo — SCP from the dispatcher's clone (pulled daily by
@@ -245,11 +226,6 @@ run_remote bash -s <<'DEPS'
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-data
 
-set -a
-# shellcheck disable=SC1091
-source /home/ec2-user/alpha-engine-data/.env
-set +a
-
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
 else
@@ -271,7 +247,7 @@ REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
 # bootstrapped. AL2023 spots install python3.12 but have no bare `python`
 # symlink — the RAG script's `python -m ...` fails without this. Origin:
 # 2026-04-17 Saturday Step Function failure in RAG step-0 preflight.
-ENV_SOURCE="set -a; [ -f /home/ec2-user/alpha-engine-data/.env ] && source /home/ec2-user/alpha-engine-data/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHON_BIN=$REMOTE_PYTHON;"
+ENV_SOURCE="export XDG_CACHE_HOME=/tmp; export PYTHON_BIN=$REMOTE_PYTHON;"
 
 # ── Smoke-only: imports + --phase 1 --dry-run ────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then

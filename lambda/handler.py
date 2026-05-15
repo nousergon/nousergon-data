@@ -13,16 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
 import traceback
-
-# Load secrets from SSM Parameter Store (must run before any os.environ.get
-# AND before setup_logging — flow-doctor.yaml's ${FLOW_DOCTOR_GITHUB_TOKEN}
-# resolves at flow_doctor.init() time inside setup_logging).
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from ssm_secrets import load_secrets
-load_secrets()
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
 # pattern across all 5 entrypoints; see executor/main.py for reference).
