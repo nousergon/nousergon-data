@@ -176,6 +176,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python weekly_collector.py --morning-enrich 2>&1 | tee -a /var/log/morning-enrich.log"
           ],
           "executionTimeout": ["1800"]
@@ -607,6 +608,7 @@
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh",
+            "trap 'aws s3 cp /var/log/executor.log \"s3://alpha-engine-research/_ssm_logs/executor/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/main.py 2>&1 | tee -a /var/log/executor.log"
           ],
           "executionTimeout": ["300"]
