@@ -58,8 +58,6 @@ def _load_dotenv() -> None:
                 os.environ[key] = val
 
 
-from ssm_secrets import load_secrets
-load_secrets()
 _load_dotenv()
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared

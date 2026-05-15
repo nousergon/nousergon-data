@@ -28,24 +28,13 @@ set -euo pipefail
 
 export HOME="${HOME:-/home/ec2-user}"
 
-# ── Locate .env ──────────────────────────────────────────────────────────────
+# Secrets resolve from SSM at Python startup via
+# alpha_engine_lib.secrets.get_secret(); the spot's IAM profile
+# (alpha-engine-executor-profile) grants ssm:GetParameter on /alpha-engine/*.
+# No .env is sourced anywhere in this script post the 2026-05-14 .env-deprecation arc.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-ENV_FILE="$HOME/.alpha-engine.env"
-if [ ! -f "$ENV_FILE" ]; then
-    ENV_FILE="$REPO_ROOT/.env"
-fi
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-    echo "Loaded .env from $ENV_FILE"
-else
-    echo "ERROR: No .env file found (checked ~/.alpha-engine.env, repo/.env)"
-    exit 1
-fi
 
 # ── Spot configuration ──────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -180,23 +169,12 @@ for REPO in alpha-engine-data alpha-engine-predictor; do
     run_remote "git clone --depth 1 --branch $BRANCH https://github.com/cipher813/$REPO.git /home/ec2-user/$REPO"
 done
 
-# ── Upload .env BEFORE pip install ──────────────────────────────────────────
-echo "==> Uploading .env to spot..."
-scp $SSH_OPTS -i "$KEY_FILE" \
-    "$ENV_FILE" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-data/.env
-
 # ── Install dependencies ─────────────────────────────────────────────────────
 # alpha-engine-lib is public; pip installs it from git+https with no auth.
 echo "==> Installing Python dependencies..."
 run_remote bash -s <<'DEPS'
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-data
-
-set -a
-# shellcheck disable=SC1091
-source /home/ec2-user/alpha-engine-data/.env
-set +a
 
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
@@ -212,7 +190,7 @@ echo "Dependencies installed."
 DEPS
 
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-data/.env ] && source /home/ec2-user/alpha-engine-data/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONPATH=/home/ec2-user/alpha-engine-predictor;'
+ENV_SOURCE='export XDG_CACHE_HOME=/tmp; export PYTHONPATH=/home/ec2-user/alpha-engine-predictor;'
 
 # ── Smoke-only: imports + --help ─────────────────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then
