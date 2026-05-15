@@ -43,6 +43,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/data-weekly.log \"s3://alpha-engine-research/_ssm_logs/data-weekly/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash infrastructure/spot_data_weekly.sh --data-only 2>&1 | tee /var/log/data-weekly.log"
           ],
           "executionTimeout": ["5400"]
@@ -153,6 +154,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/rag-ingestion.log \"s3://alpha-engine-research/_ssm_logs/rag-ingestion/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash infrastructure/spot_data_weekly.sh --rag-only 2>&1 | tee /var/log/rag-ingestion.log"
           ],
           "executionTimeout": ["3600"]
@@ -464,6 +466,7 @@
             "cd /home/ec2-user/alpha-engine-predictor",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/predictor-training.log \"s3://alpha-engine-research/_ssm_logs/predictor-training/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
           ],
           "executionTimeout": ["5400"]
@@ -575,6 +578,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/drift-detection.log \"s3://alpha-engine-research/_ssm_logs/drift-detection/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash infrastructure/spot_drift_detection.sh 2>&1 | tee /var/log/drift-detection.log"
           ],
           "executionTimeout": ["1200"]
@@ -623,6 +627,7 @@
             "cd /home/ec2-user/alpha-engine-backtester",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash infrastructure/spot_backtest.sh --skip-stages=evaluator 2>&1 | tee /var/log/backtester.log"
           ],
           "executionTimeout": ["7200"]
@@ -734,6 +739,7 @@
             "cd /home/ec2-user/alpha-engine-backtester",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/evaluator.log \"s3://alpha-engine-research/_ssm_logs/evaluator/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity 2>&1 | tee /var/log/evaluator.log"
           ],
           "executionTimeout": ["3600"]
@@ -1217,6 +1223,7 @@
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/health-check.log \"s3://alpha-engine-research/_ssm_logs/health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
           "executionTimeout": ["60"]
@@ -1277,6 +1284,7 @@
             "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
             "pip install --quiet --upgrade -r requirements.txt",
+            "trap 'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python -m alpha_engine_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log"
           ],
           "executionTimeout": ["180"]

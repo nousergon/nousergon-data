@@ -1,6 +1,6 @@
 """SSM RunShellScript command-array hygiene checks.
 
-Two rules pinned here:
+Three rules pinned here:
 
 1. Every command array must START with `set ... pipefail`. Without it,
    `cmd | tee` silently masks non-zero exits from `cmd` (2026-05-11
@@ -14,11 +14,22 @@ Two rules pinned here:
    skips attaching `FlowDoctorHandler` and ERROR-level logs go only to
    stdout — exactly the failure mode on 2026-05-11, where two ERROR
    logs from `weekly_collector` fired but flow-doctor never escalated.
+
+3. Every command block that pipes its work to `| tee /var/log/X.log`
+   must arm an EXIT trap that ships that log to S3 before the work line.
+   SSM's `StandardOutputContent` is capped at 24KB and `StandardOutputUrl`
+   is empty (no CloudWatchOutputConfig), so when a long step exits 1 on a
+   stopped/terminated instance the actual error is unrecoverable. This is
+   a recurring diagnostic gap (MorningEnrich 2026-05-15, DataPhase1
+   2026-05-03, backtester 2026-04-22). The trap must be `|| true` so it
+   never alters the script's real exit status (the SF Catch must still
+   see the true failure).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -123,4 +134,63 @@ def test_weekday_sf_ssm_blocks_export_flow_doctor_enabled() -> None:
         "Add `\"export FLOW_DOCTOR_ENABLED=1\"` to each `commands` array. "
         "See 2026-05-11 incident — flow-doctor silently skipped because "
         "setup_logging's env-var gate falls through to 'disabled'."
+    )
+
+
+_TEE_WORK_RE = re.compile(r"\| tee (?:-a )?(/var/log/[\w.-]+\.log)")
+
+
+@pytest.mark.parametrize("sf_path", _SF_PATHS, ids=lambda p: p.name)
+def test_long_ssm_steps_ship_log_to_s3_before_work(sf_path: Path) -> None:
+    """Every `| tee /var/log/X.log` work line needs a preceding S3 EXIT trap.
+
+    Regression target: the recurring "step exits 1 but the cause is past
+    SSM's 24KB StandardOutputContent cap and the instance is gone" gap
+    (MorningEnrich 2026-05-15, DataPhase1 2026-05-03, backtester
+    2026-04-22). The fix is an EXIT trap that `aws s3 cp`s the local
+    /var/log/X.log to s3://alpha-engine-research/_ssm_logs/... — armed
+    BEFORE the long work command so it fires whether the step succeeds or
+    fails, and `|| true` so it never overrides the script's real exit
+    status (the SF Catch must still see the true failure).
+    """
+    sf_doc = json.loads(sf_path.read_text())
+    offenders: list[str] = []
+    for state_name, cmds in _iter_ssm_command_blocks(sf_doc):
+        work_idx = next(
+            (i for i, c in enumerate(cmds) if _TEE_WORK_RE.search(c)), None
+        )
+        if work_idx is None:
+            continue  # short step, output fits in the 24KB cap
+        logfile = _TEE_WORK_RE.search(cmds[work_idx]).group(1)
+        trap_idx = next(
+            (
+                i
+                for i, c in enumerate(cmds)
+                if c.startswith("trap ")
+                and "_ssm_logs" in c
+                and logfile in c
+                and c.rstrip().endswith("EXIT")
+            ),
+            None,
+        )
+        if trap_idx is None:
+            offenders.append(f"{state_name}: no S3 EXIT trap for {logfile}")
+            continue
+        if trap_idx >= work_idx:
+            offenders.append(
+                f"{state_name}: trap at idx {trap_idx} not before "
+                f"work line at idx {work_idx}"
+            )
+        if "|| true" not in cmds[trap_idx]:
+            offenders.append(
+                f"{state_name}: trap missing `|| true` (would override "
+                f"the real exit status the SF Catch needs to see)"
+            )
+    assert not offenders, (
+        f"{sf_path.name}: long SSM steps missing the S3 log-capture "
+        f"trap:\n  - " + "\n  - ".join(offenders) + "\n\n"
+        "Add `\"trap 'aws s3 cp /var/log/X.log "
+        "\\\"s3://alpha-engine-research/_ssm_logs/<slug>/...\\\" "
+        "--only-show-errors || true' EXIT\"` immediately before the "
+        "`| tee` work line. See 2026-05-15 MorningEnrich ROADMAP P0."
     )
