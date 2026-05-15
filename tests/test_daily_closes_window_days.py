@@ -15,9 +15,12 @@ These tests pin:
    once per date (the free-tier rate-limit contract).
 3. The per-date result dicts aggregate into a stable window-mode
    return shape with ``per_date`` keyed by ISO date.
-4. Per-date failures don't take down the rest of the window — the
-   aggregate's ``status`` flips to ``"partial"`` but every other date
-   completes.
+4. Fatality is TARGET-driven: a non-target *historical backfill* date
+   failing is best-effort (recorded in ``backfill_failed_dates``,
+   aggregate stays ``"ok"`` so the caller's strict roll-up does not
+   SystemExit); only the target date (newest = downstream-read)
+   failing yields aggregate ``"error"``. (Regression guard for the
+   2026-05-15 MorningEnrich exit-1 incident.)
 5. ``_previous_business_days`` skips weekends and respects ``n``.
 6. Invalid ``window_days`` (< 1) raises ``ValueError`` early.
 """
@@ -319,18 +322,13 @@ class TestWindowOrchestration:
         # fan-out works).
         assert len(captured) == 2
 
-    def test_per_date_failure_does_not_block_window(self):
-        """If one date errors (e.g. a coverage-gate trip on a non-trading
-        day), the rest of the window completes. Aggregate status flips
-        to ``partial``."""
-        captured = []
-        s3 = _no_existing_parquet_s3()
-
+    @staticmethod
+    def _yf_side_factory(captured, fail_dates):
         def _yf_side(missing, run_date, records):
             captured.append(run_date)
-            if run_date == "2026-05-07":
-                # Simulate yfinance returning nothing on this date — the
-                # coverage gate should fire and the date's call raises.
+            if run_date in fail_dates:
+                # yfinance returns nothing on this date — the coverage
+                # gate fires and the per-date call raises.
                 return 0
             for t in missing:
                 records.append({
@@ -340,25 +338,71 @@ class TestWindowOrchestration:
                     "Volume": 1000, "VWAP": None, "source": "yfinance",
                 })
             return len(missing)
+        return _yf_side
 
+    def _run_window(self, run_date, window_days, fail_dates):
+        captured = []
+        s3 = _no_existing_parquet_s3()
         with patch("collectors.daily_closes.boto3.client", return_value=s3):
             with patch.object(
                 daily_closes, "_fetch_polygon_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_yfinance_closes", side_effect=_yf_side,
+                daily_closes, "_fetch_yfinance_closes",
+                side_effect=self._yf_side_factory(captured, fail_dates),
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ):
                 result = daily_closes.collect(
-                    bucket="b", tickers=["AAPL"], run_date="2026-05-08",
-                    source="yfinance_only", window_days=3,
+                    bucket="b", tickers=["AAPL"], run_date=run_date,
+                    source="yfinance_only", window_days=window_days,
                 )
-        # All 3 dates were attempted.
-        assert sorted(captured) == ["2026-05-06", "2026-05-07", "2026-05-08"]
-        # Aggregate flagged partial because 5/7 hit the coverage gate.
-        assert result["status"] == "partial"
-        assert "2026-05-07" in result["per_date"]
+        return result, sorted(captured)
+
+    def test_non_target_backfill_failure_is_non_fatal(self):
+        """2026-05-15 regression: a NON-target historical backfill date
+        failing must NOT fail the window — aggregate stays ``"ok"`` (so
+        the caller's strict roll-up does not SystemExit(1)); the miss is
+        recorded in ``backfill_failed_dates`` for the alert channel."""
+        # window = [5/06, 5/07, 5/08]; target = newest = 5/08. 5/07 fails.
+        result, captured = self._run_window(
+            "2026-05-08", window_days=3, fail_dates={"2026-05-07"},
+        )
+        assert captured == ["2026-05-06", "2026-05-07", "2026-05-08"]
+        assert result["target_date"] == "2026-05-08"
+        # Target good ⇒ aggregate OK ⇒ caller roll-up treats as success.
+        assert result["status"] == "ok"
+        assert result["status"] in ("ok", "ok_dry_run")  # caller contract
+        # Non-target miss recorded but non-fatal.
+        assert result["backfill_failed_dates"] == ["2026-05-07"]
         assert result["per_date"]["2026-05-07"]["status"] == "error"
-        # Other dates still succeeded.
         assert result["per_date"]["2026-05-06"]["status"] == "ok"
         assert result["per_date"]["2026-05-08"]["status"] == "ok"
+
+    def test_target_date_failure_is_fatal(self):
+        """The safety property: if the TARGET (newest) date fails, the
+        aggregate is ``"error"`` so the caller halts — downstream must
+        never read a bad/absent target row."""
+        # window = [5/06, 5/07, 5/08]; target = 5/08 — make it fail.
+        result, captured = self._run_window(
+            "2026-05-08", window_days=3, fail_dates={"2026-05-08"},
+        )
+        assert captured == ["2026-05-06", "2026-05-07", "2026-05-08"]
+        assert result["target_date"] == "2026-05-08"
+        assert result["status"] == "error"
+        assert result["status"] not in ("ok", "ok_dry_run")  # caller halts
+        assert "2026-05-08" in result["error"]
+        # Backfill list excludes the target even though it errored.
+        assert result["backfill_failed_dates"] == []
+        assert result["per_date"]["2026-05-08"]["status"] == "error"
+        # Earlier dates still completed.
+        assert result["per_date"]["2026-05-06"]["status"] == "ok"
+        assert result["per_date"]["2026-05-07"]["status"] == "ok"
+
+    def test_target_ok_and_no_backfill_failures_is_ok(self):
+        """All-good window: status ok, empty backfill_failed_dates."""
+        result, captured = self._run_window(
+            "2026-05-08", window_days=3, fail_dates=set(),
+        )
+        assert captured == ["2026-05-06", "2026-05-07", "2026-05-08"]
+        assert result["status"] == "ok"
+        assert result["backfill_failed_dates"] == []

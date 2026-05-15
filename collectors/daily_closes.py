@@ -222,11 +222,18 @@ def collect(
         ``tickers_captured``, ``polygon``/``fred``/``yfinance`` counts,
         ``source``.
 
-        Window mode (``window_days > 1``): dict with ``status``
-        (``"ok"`` if every date succeeded, ``"partial"`` if any date
-        errored), aggregated ``tickers_captured`` / ``polygon`` /
-        ``fred`` / ``yfinance`` counters across the window, ``source``,
-        ``window_days``, ``per_date`` (date → per-date result dict),
+        Window mode (``window_days > 1``): dict with **target-driven**
+        ``status`` — ``"ok"`` iff the TARGET date (``target_date``, the
+        newest date in the window = the date downstream reads)
+        succeeded, regardless of non-target *historical backfill* date
+        failures; ``"error"`` only if the target date itself failed
+        (caller escalates that to a hard stop). Non-target backfill
+        failures are recorded in ``per_date`` and listed in
+        ``backfill_failed_dates`` (best-effort, NON-fatal — surfaced via
+        a WARNING for the surveillance channel, never halts the
+        pipeline). Also: aggregated ``tickers_captured`` / ``polygon`` /
+        ``fred`` / ``yfinance`` counters, ``source``, ``window_days``,
+        ``target_date``, ``per_date`` (date → per-date result dict),
         ``skipped_dates`` (post-close already-written dates).
 
     Raises:
@@ -547,16 +554,39 @@ def _collect_window(
     return-shape section for the schema.
     """
     window_dates = _previous_business_days(run_date, n=window_days)
+    # The newest date in the window is the TARGET date — the one
+    # downstream (predictor inference / eod_reconcile) actually reads.
+    # The older dates are best-effort *historical backfill*: a per-date
+    # polygon/coverage hiccup on them (same-day-403, polygon free-tier
+    # quota/rate-limit exhaustion, a transient non-overlapping
+    # grouped-daily) must NOT hard-fail the run — that would block the
+    # whole weekly/EOD pipeline on a recoverable backfill miss while the
+    # target date is perfectly good. Same best-effort discipline as the
+    # chronic-gap self-heal step in weekly_collector.py. Fatality is
+    # decided AFTER the loop, from the TARGET date only.
+    #
+    # 2026-05-15 incident: a non-target backfill date failed on a
+    # same-day recovery re-run; the old "any per-date error → aggregate
+    # 'partial'" → strict caller roll-up (weekly_collector.py:1076,
+    # `not in ("ok","ok_dry_run")` ⇒ "failed") escalated it to
+    # SystemExit(1), halting an otherwise-healthy MorningEnrich. The
+    # static "point-in-time coverage-gate" theory was falsified by a
+    # dry-run repro (coverage held ~99%); the real defect is this
+    # best-effort-vs-strict-rollup contradiction. See plan doc
+    # morningenrich-coverage-gate-260515.md §8/§9.
+    target_date = window_dates[0]
     aggregate: dict = {
         "status": "ok",
         "source": source,
         "window_days": window_days,
+        "target_date": target_date,
         "per_date": {},
         "tickers_captured": 0,
         "polygon": 0,
         "fred": 0,
         "yfinance": 0,
         "skipped_dates": [],
+        "backfill_failed_dates": [],
     }
     # Iterate oldest → newest so the most recent date's parquet is the
     # last one written. Matches the operator mental model "the latest
@@ -574,10 +604,9 @@ def _collect_window(
                 skip_if_canonical=skip_if_canonical,
             )
         except Exception as exc:
-            # Per-date failures don't kill the rest of the window; record
-            # the failure and continue. This matches the existing single-
-            # date semantics where a coverage-gate / API failure on one
-            # day doesn't block subsequent days when re-run.
+            # Record + continue. Fatality is target-driven (decided
+            # after the loop) — a non-target backfill miss is recoverable
+            # and must not halt the pipeline.
             logger.warning(
                 "[daily_closes window] date=%s source=%s failed: %s — "
                 "recording and continuing window",
@@ -588,16 +617,44 @@ def _collect_window(
                 "error": str(exc),
                 "source": source,
             }
-            aggregate["status"] = "partial"
             continue
         aggregate["per_date"][d] = result
         for k in ("tickers_captured", "polygon", "fred", "yfinance"):
             if k in result and isinstance(result[k], int):
                 aggregate[k] += result[k]
-        if result.get("status") == "error":
-            aggregate["status"] = "partial"
         if result.get("skipped"):
             aggregate["skipped_dates"].append(d)
+
+    # ── Fatality is TARGET-driven, not "any per-date error" ─────────────
+    _target = aggregate["per_date"].get(target_date)
+    _target_ok = _target is not None and _target.get("status") in (
+        "ok", "ok_dry_run",
+    )
+    aggregate["backfill_failed_dates"] = sorted(
+        d for d, r in aggregate["per_date"].items()
+        if r.get("status") == "error" and d != target_date
+    )
+    if not _target_ok:
+        # Target date itself failed (or produced no result) — FATAL. The
+        # caller's strict roll-up escalates this to SystemExit(1), which
+        # is correct: downstream must not read a bad/absent target row.
+        aggregate["status"] = "error"
+        aggregate["error"] = (
+            f"target date {target_date} failed: "
+            f"{(_target or {}).get('error', 'no result produced')}"
+        )
+    else:
+        # Target good. Non-target backfill misses (if any) are surfaced
+        # loudly for the surveillance / Flow-Doctor channel but are
+        # non-fatal (mirrors chronic-gap self-heal best-effort policy).
+        if aggregate["backfill_failed_dates"]:
+            logger.warning(
+                "[daily_closes window] target %s OK; %d non-target "
+                "backfill date(s) failed — best-effort, NON-FATAL: %s",
+                target_date, len(aggregate["backfill_failed_dates"]),
+                ", ".join(aggregate["backfill_failed_dates"]),
+            )
+        aggregate["status"] = "ok"
     return aggregate
 
 
