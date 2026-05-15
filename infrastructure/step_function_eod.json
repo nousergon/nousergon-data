@@ -15,6 +15,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/postmarket-data.log \"s3://alpha-engine-research/_ssm_logs/postmarket-data/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python weekly_collector.py --daily 2>&1 | tee /var/log/postmarket-data.log"
           ],
           "executionTimeout": ["1200"]
@@ -109,6 +110,7 @@
             "cd /home/ec2-user/alpha-engine",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/snapshot.log \"s3://alpha-engine-research/_ssm_logs/snapshot/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/snapshot_capturer.py 2>&1 | tee /var/log/snapshot.log"
           ],
           "executionTimeout": ["120"]
@@ -203,6 +205,7 @@
             "cd /home/ec2-user/alpha-engine",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/eod.log \"s3://alpha-engine-research/_ssm_logs/eod/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/eod_reconcile.py 2>&1 | tee /var/log/eod.log"
           ],
           "executionTimeout": ["120"]
@@ -297,6 +300,7 @@
             "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
             "pip install --quiet --upgrade -r requirements.txt",
+            "trap 'aws s3 cp /var/log/substrate-health-check-daily.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check-daily/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python -m alpha_engine_lib.transparency --cadence daily --alert 2>&1 | tee /var/log/substrate-health-check-daily.log"
           ],
           "executionTimeout": ["180"]
