@@ -40,6 +40,7 @@ from features.compute import (
     DEFAULT_BUCKET,
     SOURCE_CATEGORIES,
     _SKIP_TICKERS,
+    _UNIVERSE_EXTRA,
     _apply_daily_delta,
     _is_sector_etf,
     _load_parquet_from_s3,
@@ -436,10 +437,12 @@ def backfill(
 
     universe_tickers = [
         t for t in price_data
-        if t not in _SKIP_TICKERS
+        if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
         and not _is_sector_etf(t)
         and price_data[t] is not None
-        and t in constituents_set
+        # _UNIVERSE_EXTRA (SPY) is never in constituents.json — admit it
+        # explicitly; it is still written Close-only to `macro` separately.
+        and (t in constituents_set or t in _UNIVERSE_EXTRA)
     ]
     excluded_by_constituents = sorted(
         t for t in price_data

@@ -38,6 +38,7 @@ from features.feature_engineer import (
 from features.compute import (
     DEFAULT_BUCKET,
     _SKIP_TICKERS,
+    _UNIVERSE_EXTRA,
     _is_sector_etf,
     _load_sector_map,
     _load_cached_fundamentals,
@@ -889,9 +890,15 @@ def daily_append(
     vix3m_series = macro.get("VIX3M")
 
     # Filter to stock tickers only
+    # _UNIVERSE_EXTRA (SPY) is maintained as a full universe member here too;
+    # it bootstraps into `universe` on the weekly backfill and is skipped
+    # gracefully (hist None) until then. Still written Close-only to `macro`
+    # separately. SPY stays in _SKIP_TICKERS so the coverage-diff / freshness
+    # accounting below keeps treating it as non-stock.
     stock_tickers = [
         t for t in closes
-        if t not in _SKIP_TICKERS and not _is_sector_etf(t)
+        if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
+        and not _is_sector_etf(t)
     ]
 
     n_ok = 0              # fully-featured rows (all FEATURES finite)
