@@ -29,7 +29,6 @@ COPY collectors/ ${LAMBDA_TASK_ROOT}/collectors/
 COPY polygon_client.py ${LAMBDA_TASK_ROOT}/
 COPY weekly_collector.py ${LAMBDA_TASK_ROOT}/
 COPY store/ ${LAMBDA_TASK_ROOT}/store/
-COPY ssm_secrets.py ${LAMBDA_TASK_ROOT}/
 
 # flow-doctor.yaml at LAMBDA_TASK_ROOT is loaded by setup_logging() at
 # module-top of lambda/handler.py. The path resolves via:
