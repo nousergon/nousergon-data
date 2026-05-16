@@ -73,11 +73,21 @@ class DataPreflight(BasePreflight):
         # 2. S3 bucket (~ms, IAM)
         # 3. mode-specific HTTP probes (~200ms each)
         # 4. ArcticDB checks (~100ms list_libraries; ~seconds for read)
+        # AWS_REGION is a plain env var (boto3 region) — not a secret —
+        # so it stays an os.environ check. The API keys below moved to
+        # SSM via get_secret() in the .env-deprecation arc (#241/#242):
+        # every collector + the reachability probes in this file resolve
+        # them via get_secret(), so an os.environ assertion here is stale
+        # and fails spuriously on the SSM-backed spot (no .env present).
+        # Origin: 2026-05-16 Saturday SF DataPhase1 — phase1 preflight
+        # aborted "required env vars missing: ['FRED_API_KEY',
+        # 'POLYGON_API_KEY']" even though MorningEnrich (same collectors)
+        # had just fetched polygon + FRED fine via get_secret().
         self.check_env_vars("AWS_REGION")
         if self.mode == "phase1":
-            self.check_env_vars("FRED_API_KEY", "POLYGON_API_KEY")
+            self._check_secrets("FRED_API_KEY", "POLYGON_API_KEY")
         elif self.mode == "phase2":
-            self.check_env_vars("FMP_API_KEY", "FINNHUB_API_KEY", "EDGAR_IDENTITY")
+            self._check_secrets("FMP_API_KEY", "FINNHUB_API_KEY", "EDGAR_IDENTITY")
 
         self.check_s3_bucket()
 
@@ -109,6 +119,29 @@ class DataPreflight(BasePreflight):
             # Both libraries must be present — same gate as phase1 for
             # operator-clarity on partial-deploy scenarios.
             self._check_arcticdb_libraries_present(("universe", "macro"))
+
+    # ── Secret presence ──────────────────────────────────────────────────
+
+    def _check_secrets(self, *names: str) -> None:
+        """SSM-aware equivalent of ``check_env_vars`` for API-key secrets.
+
+        Post the .env-deprecation arc (#241/#242) the API keys live in
+        SSM, fetched lazily via ``get_secret()`` deeper in the run. This
+        keeps the fail-fast intent of the old ``check_env_vars`` gate —
+        abort in <1s, not 30min in — but resolves from SSM (with env
+        fallback, which ``get_secret`` handles) instead of asserting
+        ``os.environ`` directly. Raises the same RuntimeError shape so
+        operator-facing failure text is unchanged.
+        """
+        missing = [
+            n
+            for n in names
+            if not (get_secret(n, required=False, default="") or "").strip()
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Pre-flight: required secrets missing: {missing}"
+            )
 
     # ── Mode-specific primitives ─────────────────────────────────────────
 
