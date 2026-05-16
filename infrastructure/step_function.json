@@ -712,7 +712,7 @@
 
     "CheckSkipBacktester": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses ONLY the Backtester state (backtest + parity); the Evaluator state still runs and gracefully degrades on missing same-cohort artifacts (evaluate.py logs a WARNING and continues — verified against the 2026-05-07 v1 validation run, where `Simulation artifact not found in S3: backtest/2026-05-07/sweep_df.parquet — evaluator will run without it` shows up cleanly). Routes to CheckSkipEvaluator so {\"skip_evaluator\": true} composes orthogonally: (a) neither flag → both run, (b) skip_backtester only → Evaluator runs against any pre-existing backtest/{date}/ artifacts, (c) skip_evaluator only → Backtester runs without grading, (d) both → both skipped. Eval-judge chain downstream is preserved in all four cases via CheckSkipEvaluator → CheckSkipEvalJudge (the 2026-05-03 silent-bypass fix is still pinned — both CheckSkipEvaluator paths converge to CheckSkipEvalJudge). The legacy {\"freeze_evaluator\": true} input is not honored; freeze-evaluator is a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses BOTH the Backtester (backtest stage) and Parity states — it routes straight to CheckSkipEvaluator, skipping the whole backtest+parity pair (the parity stage was split into its own Parity SF state by the preflight-task-split 2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md; skip_backtester retains its original whole-pair semantics for backward compat). The Evaluator state still runs and gracefully degrades on missing same-cohort artifacts (evaluate.py logs a WARNING and continues — verified against the 2026-05-07 v1 validation run, where `Simulation artifact not found in S3: backtest/2026-05-07/sweep_df.parquet — evaluator will run without it` shows up cleanly). Routes to CheckSkipEvaluator so {\"skip_evaluator\": true} composes orthogonally: (a) neither flag → backtest+parity+evaluator run, (b) skip_backtester only → Evaluator runs against any pre-existing backtest/{date}/ artifacts, (c) skip_evaluator only → backtest+parity run without grading, (d) both → all skipped. To skip ONLY parity (keep the backtest), use {\"skip_parity\": true} on the new CheckSkipParity gate. Eval-judge chain downstream is preserved in all cases via CheckSkipEvaluator → CheckSkipEvalJudge (the 2026-05-03 silent-bypass fix is still pinned — both CheckSkipEvaluator paths converge to CheckSkipEvalJudge). The legacy {\"freeze_evaluator\": true} input is not honored; freeze-evaluator is a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
       "Choices": [
         {
           "And": [
@@ -727,7 +727,7 @@
 
     "Backtester": {
       "Type": "Task",
-      "Comment": "Backtest + parity on spot instance (after predictor training). Post-2026-05-07 the evaluator stage was split into a separate Evaluator SF state for failure isolation + per-stage email + independent heartbeat (plan: alpha-engine-docs/private/evaluator-split-260507.md). spot_backtest.sh is invoked with --skip-stages=evaluator so this state runs only backtest + parity; the Evaluator state runs evaluate.py against the same backtest/{date}/ S3 prefix. If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtest (10y simulate + param sweep, ~121 min) on spot instance, after predictor training. The parity stage was split into a separate Parity SF state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest and parity are independent preflight-bearing actions, so a parity failure must never re-run the ~121-min backtest. Post-2026-05-07 the evaluator stage was already its own state (plan: alpha-engine-docs/private/evaluator-split-260507.md). spot_backtest.sh is invoked with --skip-stages=parity,evaluator so this state runs ONLY the backtest stage; the Parity state runs --skip-stages=backtest,evaluator and the Evaluator state runs --skip-stages=backtest,parity, all against the same backtest/{date}/ S3 prefix. State name kept as Backtester (lower-churn vs renaming to Backtest — preserves DriftDetection's Next/Catch edges and all inbound wiring). If this state fails, Parity is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -740,7 +740,7 @@
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "trap 'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_backtest.sh --skip-stages=evaluator 2>&1 | tee /var/log/backtester.log"
+            "bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator 2>&1 | tee /var/log/backtester.log"
           ],
           "executionTimeout": ["7200"]
         },
@@ -800,7 +800,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipEvaluator"
+          "Next": "CheckSkipParity"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -820,6 +820,118 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+
+    "CheckSkipParity": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_parity\": true} bypasses ONLY the Parity state (backtester↔executor parity check) and routes to CheckSkipEvaluator — the completed backtest artifacts stay intact and Evaluator still runs against them. Missing flag = run as normal. Parity was split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. To skip the whole backtest+parity pair, use {\"skip_backtester\": true} on CheckSkipBacktester instead. Mirrors the skip_backtester / skip_evaluator shape.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_parity", "IsPresent": true},
+            {"Variable": "$.skip_parity", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipEvaluator"
+        }
+      ],
+      "Default": "Parity"
+    },
+
+    "Parity": {
+      "Type": "Task",
+      "Comment": "Backtester↔executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. spot_backtest.sh is invoked with --skip-stages=backtest,evaluator so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design — accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized — same Retry/Catch/Timeout pattern). If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-backtester",
+            "export HOME=/home/ec2-user",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/parity.log \"s3://alpha-engine-research/_ssm_logs/parity/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+            "bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator 2>&1 | tee /var/log/parity.log"
+          ],
+          "executionTimeout": ["7200"]
+        },
+        "TimeoutSeconds": 7200
+      },
+      "TimeoutSeconds": 7260,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 180,
+          "BackoffRate": 2.0,
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.parity_result",
+      "Next": "WaitForParity"
+    },
+
+    "WaitForParity": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until parity complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.parity_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.parity_poll",
+      "Next": "CheckParityStatus"
+    },
+
+    "CheckParityStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.parity_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipEvaluator"
+        },
+        {
+          "Variable": "$.parity_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "ParityWait"
+        },
+        {
+          "Variable": "$.parity_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "ParityWait"
+        }
+      ],
+      "Default": "ExtractParityError"
+    },
+
+    "ParityWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "WaitForParity"
     },
 
     "CheckSkipEvaluator": {
@@ -1523,6 +1635,18 @@
         "phase": "Backtester",
         "source": "CheckBacktesterStatus.Default",
         "poll.$": "$.backtester_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractParityError": {
+      "Type": "Pass",
+      "Comment": "Normalize Parity SSM non-Success poll into $.error. Mirrors ExtractBacktesterError — the soft-failure path from CheckParityStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Parameters": {
+        "phase": "Parity",
+        "source": "CheckParityStatus.Default",
+        "poll.$": "$.parity_poll"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"

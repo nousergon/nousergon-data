@@ -82,15 +82,36 @@ class TestStatesPresent:
 
 class TestBacktesterTransition:
     def test_success_routes_to_evaluator_skip_gate(self, states):
-        # Post-2026-05-07 split: Backtester success now routes to
-        # CheckSkipEvaluator (the new gate in front of the standalone
-        # Evaluator state) instead of CheckSkipEvalJudge. The evaluator
-        # then converges back into the eval-judge chain on success.
+        # Post-2026-05-07 split: Backtester success routed to
+        # CheckSkipEvaluator (the gate in front of the standalone
+        # Evaluator state).
+        #
+        # Post-2026-05-16 preflight-task-split P1: the parity stage was
+        # split out of the combined Backtester state into its own Parity
+        # quartet. Backtester (now the backtest stage only) success now
+        # routes to CheckSkipParity; CheckSkipEvaluator is reached
+        # transitively via the Parity quartet (CheckSkipParity → Parity →
+        # WaitForParity → CheckParityStatus(Success) → CheckSkipEvaluator)
+        # or the skip_parity short-circuit (CheckSkipParity →
+        # CheckSkipEvaluator). Either way the eval-judge chain stays
+        # reachable — pinned here by walking the forward path.
         bt = states["CheckBacktesterStatus"]
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "CheckSkipEvaluator"
+        assert success_choice["Next"] == "CheckSkipParity"
+
+        # skip_parity short-circuit reaches the Evaluator gate directly.
+        skip_parity = states["CheckSkipParity"]
+        assert skip_parity["Choices"][0]["Next"] == "CheckSkipEvaluator"
+        # Default = run Parity; Parity success → CheckSkipEvaluator.
+        assert skip_parity["Default"] == "Parity"
+        parity_success = next(
+            c
+            for c in states["CheckParityStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        )
+        assert parity_success["Next"] == "CheckSkipEvaluator"
 
 
 # ── Skip gate ─────────────────────────────────────────────────────────────
