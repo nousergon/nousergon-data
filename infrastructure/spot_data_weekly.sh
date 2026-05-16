@@ -66,13 +66,32 @@ SUBNET_ID="subnet-e07166ec"
 IAM_PROFILE="alpha-engine-executor-profile"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
-RUN_MODE="full"  # full | smoke-only | rag-smoke-only | rag-only | data-only
+# RUN_MODE values:
+#   full                — phase1 + rag (legacy bundled, manual/adhoc)
+#   smoke-only          — imports + --phase 1 --dry-run, then terminate
+#   rag-smoke-only      — RAG-via-SSM dry-run, then terminate
+#   rag-only            — only RAG ingestion (DataPhase1 ran earlier)
+#   data-only           — morning-enrich + phase1 + prune (legacy bundled,
+#                          manual/adhoc backward-compat — RAG separate)
+#   morning-enrich-only — ONLY weekly_collector.py --morning-enrich, then
+#                          terminate (Saturday SF MorningEnrich state)
+#   phase1-only         — ONLY weekly_collector.py --phase 1 + prune, then
+#                          terminate (Saturday SF DataPhase1 state)
+#
+# The preflight-task-split (2026-05-16, plan
+# alpha-engine-docs/private/preflight-task-split-260516.md) introduced
+# morning-enrich-only / phase1-only so the Saturday SF runs each
+# preflight-bearing action as its own SF task: a phase1 failure no longer
+# re-pays the ~28-min morning-enrich. data-only stays for manual reruns.
+RUN_MODE="full"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
         --rag-smoke-only) RUN_MODE="rag-smoke-only"; shift ;;
         --rag-only) RUN_MODE="rag-only"; shift ;;
         --data-only) RUN_MODE="data-only"; shift ;;
+        --morning-enrich-only) RUN_MODE="morning-enrich-only"; shift ;;
+        --phase1-only) RUN_MODE="phase1-only"; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -402,17 +421,37 @@ RAG_ONLY
     exit 0
 fi
 
-# ── Full run: DataPhase1 + RAGIngestion sequentially ────────────────────────
-# data-only mode skips the RAG block (used when the SF state for RAG
-# ingestion runs separately on its own spot — see step_function.json
-# DataPhase1 vs RAGIngestion states).
-if [ "$RUN_MODE" = "data-only" ]; then
-    HEADER_LABEL="DATA-ONLY RUN: DataPhase1 (RAG runs separately)"
-    SKIP_RAG_BLOCK=1
-else
-    HEADER_LABEL="FULL RUN: DataPhase1 + RAGIngestion"
-    SKIP_RAG_BLOCK=0
-fi
+# ── Full / data-only / morning-enrich-only / phase1-only run ────────────────
+# Each of morning-enrich and phase1+prune is independently gated via the
+# DO_MORNING_ENRICH / DO_PHASE1 shell flags derived from RUN_MODE so that
+# the Saturday SF can run each preflight-bearing action as its own SF task
+# (preflight-task-split 2026-05-16):
+#
+#   full                — morning-enrich + phase1 + prune + RAG
+#   data-only           — morning-enrich + phase1 + prune          (RAG separate)
+#   morning-enrich-only — morning-enrich ONLY                      (RAG separate)
+#   phase1-only         — phase1 + prune ONLY                      (RAG separate)
+#
+# MODE_LABEL feeds the spot-side S3 log key + the heartbeat dimension so a
+# morning-enrich-only run is not mislabeled "data-phase1".
+case "$RUN_MODE" in
+    data-only)
+        HEADER_LABEL="DATA-ONLY RUN: MorningEnrich + DataPhase1 (RAG runs separately)"
+        DO_MORNING_ENRICH=1; DO_PHASE1=1; SKIP_RAG_BLOCK=1
+        MODE_LABEL="data-phase1" ;;
+    morning-enrich-only)
+        HEADER_LABEL="MORNING-ENRICH-ONLY RUN (phase1 + RAG run separately)"
+        DO_MORNING_ENRICH=1; DO_PHASE1=0; SKIP_RAG_BLOCK=1
+        MODE_LABEL="morning-enrich" ;;
+    phase1-only)
+        HEADER_LABEL="PHASE1-ONLY RUN (morning-enrich + RAG run separately)"
+        DO_MORNING_ENRICH=0; DO_PHASE1=1; SKIP_RAG_BLOCK=1
+        MODE_LABEL="data-phase1" ;;
+    *)
+        HEADER_LABEL="FULL RUN: MorningEnrich + DataPhase1 + RAGIngestion"
+        DO_MORNING_ENRICH=1; DO_PHASE1=1; SKIP_RAG_BLOCK=0
+        MODE_LABEL="data-phase1" ;;
+esac
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -428,16 +467,19 @@ ${ENV_SOURCE}
 # SSM RunCommand truncates StandardOutputContent at 24KB and the spot
 # terminates before the dispatcher can scp logs back, so post-mortem
 # debugging requires the full log to land somewhere durable. Tee
-# everything below into /tmp/data-phase1.log + upload to S3 on ANY exit
+# everything below into /tmp/<mode-label>.log + upload to S3 on ANY exit
 # path (success, hard-fail, signal). Origin: 2026-05-03 SF failure where
 # the postflight error message was past the SSM truncation cutoff and
-# the spot was already gone by the time triage started.
-LOG_FILE=/tmp/data-phase1.log
+# the spot was already gone by the time triage started. The S3 key uses
+# the per-mode label (preflight-task-split 2026-05-16) so a
+# morning-enrich-only run's log does not land under data_phase1_log/.
+MODE_LABEL="${MODE_LABEL}"
+LOG_FILE=/tmp/\${MODE_LABEL}.log
 exec > >(tee -a "\$LOG_FILE") 2>&1
 
 upload_log() {
     local exit_code=\$?
-    local s3_key="health/data_phase1_log/\$(date +%Y-%m-%d)/\$(date +%Y%m%dT%H%M%SZ -u)-exit\${exit_code}.log"
+    local s3_key="health/\${MODE_LABEL//-/_}_log/\$(date +%Y-%m-%d)/\$(date +%Y%m%dT%H%M%SZ -u)-exit\${exit_code}.log"
     aws s3 cp "\$LOG_FILE" "s3://${S3_BUCKET}/\$s3_key" --region "\${AWS_REGION:-us-east-1}" 2>/dev/null \\
         && echo "[log-upload] s3://${S3_BUCKET}/\$s3_key" \\
         || echo "[log-upload] WARNING: failed to upload \$LOG_FILE to S3"
@@ -459,21 +501,33 @@ trap upload_log EXIT
 #
 # Order matters: must run BEFORE Phase 1 + builders.prune_delisted_tickers
 # so universe-state reflects the corrected Friday data.
+#
+# DO_MORNING_ENRICH / DO_PHASE1 (set on the dispatcher from RUN_MODE,
+# interpolated below) gate each preflight-bearing action independently so
+# a phase1 failure in its own SF task never re-runs a completed
+# morning-enrich (preflight-task-split 2026-05-16).
+if [ "${DO_MORNING_ENRICH}" = "1" ]; then
 echo "──────────────────────────────────────────────────────────────"
 echo "Starting weekly_collector.py --morning-enrich (Friday polygon-T+1 fill) at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
 if ! $REMOTE_PYTHON weekly_collector.py --morning-enrich 2>&1; then
-    echo "ERROR: weekly_collector.py --morning-enrich failed — Friday's polygon-authoritative daily_closes not collected. Aborting Saturday pipeline so downstream consumers don't read stale data." >&2
+    echo "ERROR: weekly_collector.py --morning-enrich failed — Friday's polygon-authoritative daily_closes not collected. Aborting so downstream consumers don't read stale data." >&2
     exit 1
 fi
 echo "MorningEnrich complete at \$(date)"
+else
+echo "──────────────────────────────────────────────────────────────"
+echo "Skipping weekly_collector.py --morning-enrich (runs in separate SF state)"
+echo "──────────────────────────────────────────────────────────────"
+fi
 
+if [ "${DO_PHASE1}" = "1" ]; then
 echo ""
 echo "──────────────────────────────────────────────────────────────"
 echo "Starting weekly_collector.py --phase 1 at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
 if ! $REMOTE_PYTHON weekly_collector.py --phase 1 2>&1; then
-    echo "ERROR: weekly_collector.py --phase 1 failed — aborting bundle before RAG." >&2
+    echo "ERROR: weekly_collector.py --phase 1 failed." >&2
     exit 1
 fi
 echo "DataPhase1 complete at \$(date)"
@@ -490,10 +544,16 @@ echo "────────────────────────�
 # getting bumped or symbols manually deleted. Constituents.json was
 # just refreshed by Phase 1 above, so this read is fresh.
 if ! $REMOTE_PYTHON -m builders.prune_delisted_tickers --apply 2>&1; then
-    echo "ERROR: prune_delisted_tickers failed — aborting bundle before RAG." >&2
+    echo "ERROR: prune_delisted_tickers failed." >&2
     exit 1
 fi
 echo "UniversePrune complete at \$(date)"
+else
+echo ""
+echo "──────────────────────────────────────────────────────────────"
+echo "Skipping weekly_collector.py --phase 1 + prune (runs in separate SF state)"
+echo "──────────────────────────────────────────────────────────────"
+fi
 
 if [ "${SKIP_RAG_BLOCK}" = "1" ]; then
     echo ""
@@ -543,14 +603,19 @@ echo "  Weekly data bundle complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
 
 # Heartbeat — one metric per sub-workload so CloudWatch alarms can
-# distinguish between a missed Phase 1, a missed prune, and a missed RAG.
-# In data-only mode the rag-ingestion heartbeat is emitted by the
-# separate RAG-only spot run, so don't double-emit here.
-if [ "$RUN_MODE" = "data-only" ]; then
-    HEARTBEAT_PROCS=("data-phase1" "universe-prune")
-else
-    HEARTBEAT_PROCS=("data-phase1" "universe-prune" "rag-ingestion")
-fi
+# distinguish between a missed MorningEnrich, a missed Phase 1, a missed
+# prune, and a missed RAG. Per the preflight-task-split (2026-05-16) each
+# mode emits only the heartbeats for the actions it actually ran so a
+# morning-enrich-only run isn't credited with a data-phase1 heartbeat
+# (and vice versa). In data-only / split modes the rag-ingestion
+# heartbeat is emitted by the separate RAG-only spot run, so don't
+# double-emit here.
+case "$RUN_MODE" in
+    morning-enrich-only) HEARTBEAT_PROCS=("morning-enrich") ;;
+    phase1-only)         HEARTBEAT_PROCS=("data-phase1" "universe-prune") ;;
+    data-only)           HEARTBEAT_PROCS=("morning-enrich" "data-phase1" "universe-prune") ;;
+    *)                   HEARTBEAT_PROCS=("morning-enrich" "data-phase1" "universe-prune" "rag-ingestion") ;;
+esac
 for proc in "${HEARTBEAT_PROCS[@]}"; do
     aws cloudwatch put-metric-data \
         --namespace "AlphaEngine" \

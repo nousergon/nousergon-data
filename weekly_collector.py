@@ -1589,7 +1589,15 @@ def main() -> None:
     # the real collection work. See alpha-engine-lib/README.md.
     from preflight import DataPreflight
     if getattr(args, "morning_enrich", False):
-        mode = "daily"  # same dep footprint: constituents + polygon + arcticdb
+        # Dedicated morning_enrich mode (preflight-task-split 2026-05-16):
+        # morning-enrich is its own Saturday SF task and needs a proper
+        # UNION entry preflight (polygon + FRED secrets + reachability +
+        # S3 writeable + ArcticDB libraries present). The previous
+        # "daily" mapping only probed ArcticDB freshness and did NOT
+        # validate polygon/FRED reachability, even though
+        # _run_morning_enrich hits polygon — so a drifted key failed
+        # 28min into the spot run instead of in <1s at the entry.
+        mode = "morning_enrich"
     elif args.daily:
         mode = "daily"
     else:

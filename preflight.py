@@ -54,6 +54,17 @@ class DataPreflight(BasePreflight):
     - ``"daily"`` — weekday DailyData step. ArcticDB must be readable
       and SPY must be ≤4 days stale (covers Fri→Tue long weekends +
       1 day of buffer).
+    - ``"morning_enrich"`` — Saturday MorningEnrich state (split out of
+      DataPhase1 by the preflight-task-split 2026-05-16, plan
+      alpha-engine-docs/private/preflight-task-split-260516.md). Its
+      checks are the UNION of what ``_run_morning_enrich`` actually
+      needs: polygon + FRED secrets + reachability, S3 read/write,
+      ArcticDB libraries present. NO ArcticDB-freshness check —
+      morning-enrich is part of what *makes* ArcticDB fresh, so
+      asserting freshness at its own entry would be circular. This is a
+      strict subset of phase1's dependency set (phase1 additionally
+      builds the universe), so per-mode preflights are correct and
+      non-overlapping in responsibility.
     - ``"phase1"`` — Saturday DataPhase1. External APIs (FRED, polygon)
       needed; no ArcticDB freshness check (phase1 is what *populates*
       ArcticDB).
@@ -61,9 +72,11 @@ class DataPreflight(BasePreflight):
       EDGAR needed.
     """
 
+    _MODES = ("daily", "morning_enrich", "phase1", "phase2")
+
     def __init__(self, bucket: str, mode: str):
         super().__init__(bucket)
-        if mode not in ("daily", "phase1", "phase2"):
+        if mode not in self._MODES:
             raise ValueError(f"DataPreflight: unknown mode {mode!r}")
         self.mode = mode
 
@@ -84,26 +97,37 @@ class DataPreflight(BasePreflight):
         # 'POLYGON_API_KEY']" even though MorningEnrich (same collectors)
         # had just fetched polygon + FRED fine via get_secret().
         self.check_env_vars("AWS_REGION")
-        if self.mode == "phase1":
+        if self.mode in ("morning_enrich", "phase1"):
+            # morning-enrich + phase1 both hit polygon + FRED. Today
+            # morning-enrich's polygon overwrite is the load-bearing call;
+            # FRED is included because the same macro collectors are in
+            # the morning-enrich code path and a drifted FRED key must
+            # fail in <1s here, not 28min into the spot run.
             self._check_secrets("FRED_API_KEY", "POLYGON_API_KEY")
         elif self.mode == "phase2":
             self._check_secrets("FMP_API_KEY", "FINNHUB_API_KEY", "EDGAR_IDENTITY")
 
         self.check_s3_bucket()
 
-        if self.mode == "phase1":
-            # Catch credential drift / upstream outages BEFORE 30 min of
-            # collector work. Net ~400ms across both probes.
+        if self.mode in ("morning_enrich", "phase1"):
+            # Catch credential drift / upstream outages BEFORE the
+            # expensive collector work (phase1 ~30min, morning-enrich
+            # ~28min). Net ~400ms across both probes.
             self._check_polygon_reachable()
             self._check_fred_reachable()
             # Bucket policies + IAM denies that HEAD doesn't catch:
             # PUT a sentinel + DELETE it. ~50ms. Caught the 2026-04-12
             # IAM-deny class on the spot's executor-role inline policy.
             self._check_s3_writeable_sentinel()
-            # Phase 1 BUILDS ArcticDB universe + macro on first run, but
-            # subsequent runs need both libraries already present. Enforce
-            # that they exist so a typo in path_prefix fails in 100ms not
-            # 50min into the run. Catches the 2026-04-14 silent-skip class.
+            # phase1 BUILDS ArcticDB universe + macro on first run;
+            # morning-enrich APPENDS the polygon-corrected Friday row to
+            # the universe library. Both need the libraries already
+            # present, so enforce existence here so a typo in path_prefix
+            # fails in 100ms not 28-50min into the run (catches the
+            # 2026-04-14 silent-skip class). Deliberately NOT a freshness
+            # check for morning_enrich — it is part of what makes
+            # ArcticDB fresh, so a freshness gate at its own entry would
+            # be circular.
             self._check_arcticdb_libraries_present(("universe", "macro"))
         elif self.mode == "phase2":
             self._check_fmp_stable_reachable()

@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. DataPhase1 and RAGIngestion are independent SF states (split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich — plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
   "StartAt": "InitializeInput",
   "States": {
 
@@ -10,7 +10,119 @@
         "merged.$": "States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'), $$.Execution.Input, false)"
       },
       "OutputPath": "$.merged",
-      "Next": "CheckSkipDataPhase1"
+      "Next": "CheckSkipMorningEnrich"
+    },
+
+    "CheckSkipMorningEnrich": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. Input like {\"skip_morning_enrich\": true} routes past the MorningEnrich state directly to the next skip-gate (CheckSkipDataPhase1). Missing flag = run as normal. MorningEnrich was split out of DataPhase1 by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run a completed morning-enrich. Useful for adhoc reruns where Friday's polygon-corrected daily_closes are already in ArcticDB but phase1 needs a re-run.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_morning_enrich", "IsPresent": true},
+            {"Variable": "$.skip_morning_enrich", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipDataPhase1"
+        }
+      ],
+      "Default": "MorningEnrich"
+    },
+
+    "MorningEnrich": {
+      "Type": "Task",
+      "Comment": "Friday polygon-T+1 daily_closes fill (weekly_collector.py --morning-enrich) on a dedicated spot EC2. Split out of DataPhase1 by the preflight-task-split (2026-05-16): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run this completed ~28-min step. Mirrors the RAGIngestion split precedent — its own spot, watchdog budget, per-state health marker, and a proper UNION entry preflight (preflight.py mode 'morning_enrich': polygon + FRED secrets + reachability + S3 writeable + ArcticDB libraries present; deliberately NO ArcticDB-freshness check — morning-enrich is part of what makes it fresh). ~7 min extra bootstrap vs the prior bundled design — accepted in exchange for never re-paying the 28-min morning-enrich on a downstream redrive.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-data",
+            "export HOME=/home/ec2-user",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+            "bash infrastructure/spot_data_weekly.sh --morning-enrich-only 2>&1 | tee /var/log/morning-enrich.log"
+          ],
+          "executionTimeout": ["5400"]
+        },
+        "TimeoutSeconds": 5400
+      },
+      "TimeoutSeconds": 5460,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.morning_enrich_result",
+      "Next": "WaitForMorningEnrich"
+    },
+
+    "WaitForMorningEnrich": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.morning_enrich_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.morning_enrich_poll",
+      "Next": "CheckMorningEnrichStatus"
+    },
+
+    "CheckMorningEnrichStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.morning_enrich_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipDataPhase1"
+        },
+        {
+          "Variable": "$.morning_enrich_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "MorningEnrichWait"
+        },
+        {
+          "Variable": "$.morning_enrich_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "MorningEnrichWait"
+        }
+      ],
+      "Default": "ExtractMorningEnrichError"
+    },
+
+    "MorningEnrichWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForMorningEnrich"
     },
 
     "CheckSkipDataPhase1": {
@@ -30,7 +142,7 @@
 
     "DataPhase1": {
       "Type": "Task",
-      "Comment": "Weekly data collection (morning-enrich + Phase 1 + universe-prune) on a dedicated spot EC2. RAG ingestion lives in the separate RAGIngestion state — split 2026-05-06 so a RAG failure no longer hides under the DataPhase1 label and so redrive granularity matches actual workloads.",
+      "Comment": "Weekly Phase 1 data collection + universe-prune (weekly_collector.py --phase 1 then builders.prune_delisted_tickers) on a dedicated spot EC2. MorningEnrich was split into its own preceding SF state by the preflight-task-split (2026-05-16): a failure here no longer re-runs the completed ~28-min morning-enrich. RAG ingestion lives in the separate RAGIngestion state (split 2026-05-06). Entry preflight is preflight.py mode 'phase1' (a strict superset of morning_enrich's dependency set — phase1 additionally builds the universe).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -44,7 +156,7 @@
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "trap 'aws s3 cp /var/log/data-weekly.log \"s3://alpha-engine-research/_ssm_logs/data-weekly/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_data_weekly.sh --data-only 2>&1 | tee /var/log/data-weekly.log"
+            "bash infrastructure/spot_data_weekly.sh --phase1-only 2>&1 | tee /var/log/data-weekly.log"
           ],
           "executionTimeout": ["5400"]
         },
@@ -1342,6 +1454,18 @@
       },
       "ResultPath": "$.notify_result",
       "End": true
+    },
+
+    "ExtractMorningEnrichError": {
+      "Type": "Pass",
+      "Comment": "Normalize MorningEnrich SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error — the soft-failure path from CheckMorningEnrichStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Parameters": {
+        "phase": "MorningEnrich",
+        "source": "CheckMorningEnrichStatus.Default",
+        "poll.$": "$.morning_enrich_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
 
     "ExtractDataPhase1Error": {

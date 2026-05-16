@@ -31,8 +31,8 @@ class TestModeValidation:
         with pytest.raises(ValueError, match="unknown mode"):
             DataPreflight(bucket=BUCKET, mode="bogus")
 
-    def test_three_known_modes_accepted(self):
-        for mode in ("phase1", "phase2", "daily"):
+    def test_known_modes_accepted(self):
+        for mode in ("phase1", "phase2", "daily", "morning_enrich"):
             DataPreflight(bucket=BUCKET, mode=mode)  # no exception
 
 
@@ -290,3 +290,141 @@ class TestRunEndToEnd:
                 status_code=200, text='[{"symbol":"AAPL"}]', json=lambda: [{"symbol": "AAPL"}]
             )
             pf.run()
+
+
+# ── morning_enrich mode (preflight-task-split 2026-05-16) ─────────────────────
+
+
+class TestMorningEnrichMode:
+    """`morning_enrich` is the dedicated entry preflight for the
+    MorningEnrich SF state (split out of DataPhase1). Its checks are the
+    UNION of what _run_morning_enrich needs: polygon + FRED secrets +
+    reachability + S3 writeable + ArcticDB libraries present. It MUST NOT
+    perform an ArcticDB-freshness check — morning-enrich is part of what
+    makes ArcticDB fresh, so a freshness gate at its own entry would be
+    circular. Previously --morning-enrich mapped to mode "daily", which
+    only probed ArcticDB freshness and never validated polygon/FRED
+    reachability — so a drifted key failed ~28min into the spot run."""
+
+    def test_morning_enrich_all_pass(self):
+        pf = _make("morning_enrich")
+        mock_s3 = MagicMock()
+        mock_s3.head_bucket.return_value = {}
+        mock_s3.put_object.return_value = {}
+        mock_s3.delete_object.return_value = {}
+        mock_arctic = MagicMock()
+        mock_arctic.list_libraries.return_value = ["universe", "macro"]
+
+        _secrets = {"POLYGON_API_KEY": "k1", "FRED_API_KEY": "k2"}
+        with patch.dict(
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
+        ), patch("boto3.client", return_value=mock_s3), patch(
+            "arcticdb.Arctic", return_value=mock_arctic
+        ), patch("requests.get") as mock_http:
+            mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
+            pf.run()
+        # Probed polygon + FRED (2 reachability HTTP calls minimum).
+        assert mock_http.call_count >= 2
+
+    def test_morning_enrich_probes_polygon_and_fred(self):
+        """The two reachability probes must actually fire (regression for
+        the old 'daily' mapping that skipped them entirely)."""
+        pf = _make("morning_enrich")
+        mock_s3 = MagicMock()
+        mock_s3.head_bucket.return_value = {}
+        mock_s3.put_object.return_value = {}
+        mock_s3.delete_object.return_value = {}
+        mock_arctic = MagicMock()
+        mock_arctic.list_libraries.return_value = ["universe", "macro"]
+
+        _secrets = {"POLYGON_API_KEY": "k1", "FRED_API_KEY": "k2"}
+        with patch.dict(
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
+        ), patch("boto3.client", return_value=mock_s3), patch(
+            "arcticdb.Arctic", return_value=mock_arctic
+        ), patch("requests.get") as mock_http:
+            mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
+            pf.run()
+        urls = [c.args[0] for c in mock_http.call_args_list]
+        assert any("polygon.io" in u for u in urls), urls
+        assert any("stlouisfed.org" in u for u in urls), urls
+
+    def test_morning_enrich_no_arcticdb_freshness_check(self):
+        """morning_enrich must NOT call check_arcticdb_fresh (it is part
+        of what makes ArcticDB fresh — a freshness gate here is circular).
+        Patch the freshness primitive and assert it's never invoked."""
+        pf = _make("morning_enrich")
+        mock_s3 = MagicMock()
+        mock_s3.head_bucket.return_value = {}
+        mock_s3.put_object.return_value = {}
+        mock_s3.delete_object.return_value = {}
+        mock_arctic = MagicMock()
+        mock_arctic.list_libraries.return_value = ["universe", "macro"]
+
+        _secrets = {"POLYGON_API_KEY": "k1", "FRED_API_KEY": "k2"}
+        with patch.dict(
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
+        ), patch("boto3.client", return_value=mock_s3), patch(
+            "arcticdb.Arctic", return_value=mock_arctic
+        ), patch("requests.get") as mock_http, patch.object(
+            DataPreflight, "check_arcticdb_fresh"
+        ) as mock_fresh:
+            mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
+            pf.run()
+            mock_fresh.assert_not_called()
+
+    def test_morning_enrich_missing_polygon_secret_short_circuits(self):
+        """Missing API-key SECRET fails fast in <1s, before HTTP / S3 /
+        ArcticDB are touched — same fail-fast contract as phase1."""
+        pf = _make("morning_enrich")
+        _secrets = {"AWS_REGION": "us-east-1", "FRED_API_KEY": "k2"}
+        with patch.dict(
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=True
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
+        ), patch("requests.get") as mock_http, patch(
+            "boto3.client"
+        ) as mock_boto, patch("arcticdb.Arctic") as mock_arctic:
+            with pytest.raises(
+                RuntimeError, match="secrets missing.*POLYGON_API_KEY"
+            ):
+                pf.run()
+            mock_http.assert_not_called()
+            mock_boto.assert_not_called()
+            mock_arctic.assert_not_called()
+
+    def test_morning_enrich_requires_arcticdb_libraries_present(self):
+        """Libraries-present gate (not freshness) must still fire — a
+        path_prefix typo must fail in 100ms not 28min."""
+        pf = _make("morning_enrich")
+        mock_s3 = MagicMock()
+        mock_s3.head_bucket.return_value = {}
+        mock_s3.put_object.return_value = {}
+        mock_s3.delete_object.return_value = {}
+        mock_arctic = MagicMock()
+        mock_arctic.list_libraries.return_value = ["macro"]  # universe missing
+
+        _secrets = {"POLYGON_API_KEY": "k1", "FRED_API_KEY": "k2"}
+        with patch.dict(
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
+        ), patch("boto3.client", return_value=mock_s3), patch(
+            "arcticdb.Arctic", return_value=mock_arctic
+        ), patch("requests.get") as mock_http:
+            mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
+            with pytest.raises(
+                RuntimeError, match=r"missing expected libraries.*universe"
+            ):
+                pf.run()
