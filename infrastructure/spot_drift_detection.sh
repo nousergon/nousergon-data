@@ -190,7 +190,11 @@ echo "Dependencies installed."
 DEPS
 
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
-ENV_SOURCE='export XDG_CACHE_HOME=/tmp; export PYTHONPATH=/home/ec2-user/alpha-engine-predictor;'
+# AWS_REGION/AWS_DEFAULT_REGION re-export: same #241 regression as
+# spot_data_weekly.sh — the spot shell no longer sources a .env, so the
+# region env vars boto3 + lib preflight depend on must be set explicitly
+# from the dispatcher-side $AWS_REGION (set above with us-east-1 fallback).
+ENV_SOURCE="export XDG_CACHE_HOME=/tmp; export PYTHONPATH=/home/ec2-user/alpha-engine-predictor; export AWS_REGION=$AWS_REGION; export AWS_DEFAULT_REGION=$AWS_REGION;"
 
 # ── Smoke-only: imports + --help ─────────────────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then

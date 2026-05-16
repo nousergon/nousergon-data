@@ -247,7 +247,16 @@ REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
 # bootstrapped. AL2023 spots install python3.12 but have no bare `python`
 # symlink — the RAG script's `python -m ...` fails without this. Origin:
 # 2026-04-17 Saturday Step Function failure in RAG step-0 preflight.
-ENV_SOURCE="export XDG_CACHE_HOME=/tmp; export PYTHON_BIN=$REMOTE_PYTHON;"
+#
+# AWS_REGION/AWS_DEFAULT_REGION: the spot shell no longer sources a .env
+# (PR 9f / #241 removed `.env` sourcing in favor of runtime get_secret()
+# SSM lookups), but AWS_REGION is a plain env var — not a secret — that
+# alpha_engine_lib.preflight.check_env_vars hard-requires, and boto3 needs
+# a default region with no .env present. Re-export it explicitly from the
+# dispatcher-side $AWS_REGION (set above with us-east-1 fallback). Origin:
+# 2026-05-16 Saturday SF DataPhase1 failure — weekly_collector --morning-enrich
+# aborted at preflight with "required env vars missing: ['AWS_REGION']".
+ENV_SOURCE="export XDG_CACHE_HOME=/tmp; export PYTHON_BIN=$REMOTE_PYTHON; export AWS_REGION=$AWS_REGION; export AWS_DEFAULT_REGION=$AWS_REGION;"
 
 # ── Smoke-only: imports + --phase 1 --dry-run ────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then
