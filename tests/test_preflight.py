@@ -208,25 +208,38 @@ class TestRunEndToEnd:
         mock_arctic = MagicMock()
         mock_arctic.list_libraries.return_value = ["universe", "macro"]
 
+        _secrets = {"POLYGON_API_KEY": "k1", "FRED_API_KEY": "k2"}
         with patch.dict(
-            "os.environ",
-            {"AWS_REGION": "us-east-1", "POLYGON_API_KEY": "k1", "FRED_API_KEY": "k2"},
-            clear=False,
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
         ), patch("boto3.client", return_value=mock_s3), patch(
             "arcticdb.Arctic", return_value=mock_arctic
         ), patch("requests.get") as mock_http:
             mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
             pf.run()
 
-    def test_phase1_missing_polygon_key_short_circuits(self):
-        """env var failure raises before HTTP/S3/ArcticDB are touched."""
+    def test_phase1_missing_polygon_secret_short_circuits(self):
+        """Missing API-key SECRET raises before HTTP/S3/ArcticDB are touched.
+
+        Post #241/#242 the keys resolve via get_secret() (SSM), not
+        os.environ — but the fail-fast short-circuit before the
+        reachability probes must still hold. Regression for the
+        2026-05-16 Saturday SF DataPhase1 phase1-preflight failure.
+        """
         pf = _make("phase1")
+        # FRED present, POLYGON absent — at the SSM layer, not env.
+        _secrets = {"AWS_REGION": "us-east-1", "FRED_API_KEY": "k2"}
         with patch.dict(
-            "os.environ", {"AWS_REGION": "us-east-1", "FRED_API_KEY": "k2"}, clear=True
-        ), patch("requests.get") as mock_http, patch("boto3.client") as mock_boto, patch(
-            "arcticdb.Arctic"
-        ) as mock_arctic:
-            with pytest.raises(RuntimeError, match="POLYGON_API_KEY"):
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=True
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
+        ), patch("requests.get") as mock_http, patch(
+            "boto3.client"
+        ) as mock_boto, patch("arcticdb.Arctic") as mock_arctic:
+            with pytest.raises(RuntimeError, match="secrets missing.*POLYGON_API_KEY"):
                 pf.run()
             mock_http.assert_not_called()
             mock_boto.assert_not_called()
@@ -262,15 +275,16 @@ class TestRunEndToEnd:
         mock_s3 = MagicMock()
         mock_s3.head_bucket.return_value = {}
 
+        _secrets = {
+            "FMP_API_KEY": "x",
+            "FINNHUB_API_KEY": "y",
+            "EDGAR_IDENTITY": "Tester test@example.com",
+        }
         with patch.dict(
-            "os.environ",
-            {
-                "AWS_REGION": "us-east-1",
-                "FMP_API_KEY": "x",
-                "FINNHUB_API_KEY": "y",
-                "EDGAR_IDENTITY": "Tester test@example.com",
-            },
-            clear=False,
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch(
+            "preflight.get_secret",
+            side_effect=lambda n, **kw: _secrets.get(n, kw.get("default", "")),
         ), patch("boto3.client", return_value=mock_s3), patch("requests.get") as mock_http:
             mock_http.return_value = MagicMock(
                 status_code=200, text='[{"symbol":"AAPL"}]', json=lambda: [{"symbol": "AAPL"}]
