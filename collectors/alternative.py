@@ -32,6 +32,14 @@ query-string tickers. On /stable, these endpoints are paid-tier (HTTP
 
 Output: one JSON file per ticker at market_data/weekly/{date}/alternative/{TICKER}.json
 plus a manifest at market_data/weekly/{date}/alternative/manifest.json.
+
+Additionally (write-both, additive) writes a flat single-file options
+projection at archive/options/{date}.json — the legacy-shaped key that
+alpha-engine-predictor's data/options_fetcher.py::load_historical_options
+reads. Producer/consumer key + shape differ (verified read-only against
+predictor origin/main 2026-05-16); this mirror starts the ≥1-week soak that
+gates the separate, later predictor-side consumer swap (yfinance
+centralization plan PR 4b). The canonical per-ticker files are untouched.
 """
 
 from __future__ import annotations
@@ -182,6 +190,67 @@ _HAS_DATA_PREDICATES = {
 }
 
 
+# ── Predictor-options mirror (write-both, additive) ──────────────────────────
+#
+# The canonical alternative-data layout is one JSON per ticker at
+# ``market_data/weekly/{date}/alternative/{TICKER}.json`` (options nested
+# under the ``options_flow`` sub-dict). That is the format research consumes
+# and is left untouched.
+#
+# alpha-engine-predictor's ``data/options_fetcher.py::load_historical_options``
+# reads a DIFFERENT, legacy-shaped key: a single flat file at
+# ``archive/options/{date}.json`` mapping ``{ticker: {put_call_ratio, iv_rank,
+# atm_iv}}``. Verified read-only against predictor origin/main 2026-05-16:
+# the consumer takes ``put_call_ratio`` raw then ``np.log()``-transforms it,
+# divides ``iv_rank`` by 100, and defaults ``atm_iv`` to 0.0 on miss. The
+# producer's ``options_flow`` already emits ``put_call_ratio`` as a raw ratio
+# and ``iv_rank`` on a 0-100 scale — exactly the units the consumer expects
+# to log/÷100. ``atm_iv`` is not surfaced by ``_fetch_options`` (it is
+# computed locally as a variable but never stored); the consumer's 0.0
+# default handles its absence gracefully.
+#
+# Per the S3-contract rule (additive only, never rename/remove, write-both
+# for ≥1 week before any consumer relies on it), the collector ADDITIVELY
+# also writes the predictor-expected key/shape alongside the canonical
+# per-ticker files. This starts the soak that gates the SEPARATE, LATER
+# predictor-side consumer swap (yfinance-centralization plan PR 4b — NOT in
+# this PR).
+
+# Predictor-expected single-file mirror key (no s3_prefix — predictor reads
+# the bucket root, matching its hardcoded ``archive/options/{date}.json``).
+_PREDICTOR_OPTIONS_MIRROR_KEY_FMT = "archive/options/{run_date}.json"
+
+
+def _build_predictor_options_mirror(
+    per_ticker_alt: dict[str, dict],
+) -> dict[str, dict]:
+    """Project the canonical per-ticker alt-data payloads down to the flat
+    ``{ticker: {put_call_ratio, iv_rank, atm_iv}}`` shape that
+    alpha-engine-predictor's ``load_historical_options`` expects.
+
+    Only tickers whose ``options_flow`` carried real data are included
+    (predictor neutral-fills missing tickers on its side, matching the
+    canonical per-ticker file's own _has_options_data gate). ``atm_iv`` is
+    emitted as 0.0 since ``_fetch_options`` does not store it — the consumer
+    defaults the same value on a missing key, so this is semantically inert
+    and forward-compatible if a future PR surfaces a real ATM IV.
+    """
+    mirror: dict[str, dict] = {}
+    for ticker, payload in per_ticker_alt.items():
+        opts = (payload or {}).get("options_flow", {}) or {}
+        if not _has_options_data(opts):
+            continue
+        mirror[ticker] = {
+            # Raw ratio — predictor log-transforms on read.
+            "put_call_ratio": opts.get("put_call_ratio"),
+            # 0-100 scale — predictor divides by 100 on read.
+            "iv_rank": opts.get("iv_rank"),
+            # Not produced by _fetch_options; predictor defaults 0.0 on miss.
+            "atm_iv": opts.get("atm_iv", 0.0),
+        }
+    return mirror
+
+
 def collect(
     bucket: str,
     s3_prefix: str,
@@ -233,6 +302,11 @@ def collect(
     # this ticker carried real (non-default) data — see _HAS_DATA_PREDICATES
     # commentary above for the silent-fail surface this protects against.
     source_ok_counts: dict[str, int] = {k: 0 for k in _HAS_DATA_PREDICATES}
+    # Accumulate successful per-ticker payloads so we can additively write
+    # the predictor-expected flat single-file mirror (write-both; see
+    # _build_predictor_options_mirror commentary). Canonical per-ticker
+    # files above are the source of truth and are left untouched.
+    per_ticker_alt: dict[str, dict] = {}
 
     for ticker in tickers:
         try:
@@ -244,6 +318,7 @@ def collect(
                 Body=json.dumps(data, indent=2, default=str),
                 ContentType="application/json",
             )
+            per_ticker_alt[ticker] = data
             succeeded += 1
             for source_name, predicate in _HAS_DATA_PREDICATES.items():
                 if predicate(data.get(source_name, {}) or {}):
@@ -272,6 +347,30 @@ def collect(
         for source in _HAS_DATA_PREDICATES
         if source_ratios[source] < min_ok_ratios[source]
     ]
+
+    # ── Predictor-options mirror (additive, write-both) ─────────────────────
+    # Project the canonical per-ticker options data down to the flat
+    # single-file shape alpha-engine-predictor's load_historical_options
+    # reads (archive/options/{date}.json). Written BEFORE the gate raises
+    # for the same reason as the manifest: the soak that gates predictor
+    # PR 4b should proceed on every run that produced options data, not
+    # only clean ones. This is a pure producer-side ADD — the canonical
+    # per-ticker files (research's consumers) are unaffected, nothing is
+    # renamed or removed.
+    predictor_options_mirror = _build_predictor_options_mirror(per_ticker_alt)
+    predictor_mirror_key = _PREDICTOR_OPTIONS_MIRROR_KEY_FMT.format(
+        run_date=run_date
+    )
+    s3.put_object(
+        Bucket=bucket,
+        Key=predictor_mirror_key,
+        Body=json.dumps(predictor_options_mirror, indent=2, default=str),
+        ContentType="application/json",
+    )
+    logger.info(
+        "Predictor options mirror: %d tickers -> s3://%s/%s (write-both)",
+        len(predictor_options_mirror), bucket, predictor_mirror_key,
+    )
 
     # Write manifest BEFORE the gate raises — operators triaging a
     # gate breach need the manifest's per-source counts to identify
