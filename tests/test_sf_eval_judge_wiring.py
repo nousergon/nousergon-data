@@ -37,7 +37,27 @@ def sf() -> dict:
 
 @pytest.fixture(scope="module")
 def states(sf) -> dict:
-    return sf["States"]
+    """Flattened state view: top-level states UNION every Parallel
+    branch's states.
+
+    Post the 2026-05-16 Research || PredictorTraining SF Parallel
+    restructure (plan
+    alpha-engine-docs/private/research-predictor-parallel-260516.md) the
+    entire eval-judge + agent-justification chain moved INSIDE Branch A
+    of the ResearchPredictorParallel state, and PredictorTraining moved
+    into Branch B. Every per-state shape assertion in this file (payload,
+    retry, timeout, Catch posture, in-chain Next edges) is still true —
+    the states just nest one level deeper. Flattening keeps those
+    assertions intact while the few tests that pinned the OLD
+    cross-boundary edges (Counterfactual → CheckSkipPredictorTraining)
+    are updated to the new branch-local terminal + post-join semantics.
+    """
+    flat: dict = dict(sf["States"])
+    for st in sf["States"].values():
+        if st.get("Type") == "Parallel":
+            for branch in st["Branches"]:
+                flat.update(branch["States"])
+    return flat
 
 
 # ── State presence ────────────────────────────────────────────────────────
@@ -620,11 +640,16 @@ class TestReplayConcordance:
 
 
 class TestSkipCounterfactual:
-    def test_skip_flag_bypasses_to_predictor_training_gate(self, states):
-        """Skipping Counterfactual is the chain-exit path — post-2026-05-07
-        reorder, the judge chain runs upstream of PredictorTraining, so
-        bypassing Counterfactual exits to CheckSkipPredictorTraining
-        (was SaturdayHealthCheck pre-reorder)."""
+    def test_skip_flag_bypasses_to_branch_a_terminal(self, states):
+        """Skipping Counterfactual is the Branch-A chain-exit path. Post
+        the 2026-05-16 Research || PredictorTraining SF Parallel
+        restructure, the eval/agent-justification chain is Branch A; its
+        exit is the branch-local terminal BranchAComplete (End:true) — a
+        branch must SUCCEED, never throw, so SF Parallel's
+        cancel-siblings-on-error default can never abandon an in-flight
+        (or completed+S3-promoted) PredictorTraining branch.
+        CheckSkipPredictorTraining now lives in the SIBLING Branch B; the
+        post-join CheckBranchOutcomes is the new sync point."""
         skip = states["CheckSkipCounterfactual"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -633,7 +658,7 @@ class TestSkipCounterfactual:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "CheckSkipPredictorTraining"
+        assert choice["Next"] == "BranchAComplete"
 
     def test_default_runs_counterfactual(self, states):
         assert states["CheckSkipCounterfactual"]["Default"] == "Counterfactual"
@@ -661,21 +686,24 @@ class TestCounterfactual:
         # across 8 weeks of corpus).
         assert states["Counterfactual"]["TimeoutSeconds"] == 600
 
-    def test_success_exits_to_predictor_training_gate(self, states):
-        # Post-2026-05-07 reorder: Counterfactual is the last state in
-        # the judge chain; success exits to CheckSkipPredictorTraining
-        # (was SaturdayHealthCheck pre-reorder), so its persisted
-        # artifacts are available to Evaluator downstream.
-        assert states["Counterfactual"]["Next"] == "CheckSkipPredictorTraining"
+    def test_success_exits_to_branch_a_terminal(self, states):
+        # Post the 2026-05-16 SF Parallel restructure: Counterfactual is
+        # the last state in Branch A (the eval/agent-justification
+        # chain); success exits to the branch-local terminal
+        # BranchAComplete (End:true). Its persisted S3 artifacts are
+        # still available to the downstream Evaluator, which now runs
+        # AFTER the Parallel join.
+        assert states["Counterfactual"]["Next"] == "BranchAComplete"
 
-    def test_catch_routes_to_predictor_training_gate_not_failure(self, states):
+    def test_catch_routes_to_branch_a_terminal_not_failure(self, states):
         # Same Catch posture as the rest of the agent-justification
-        # triple — Counterfactual is observability, not load-bearing,
-        # so failures fall through to the next stage rather than
-        # halting the pipeline.
+        # triple — Counterfactual is observability, not load-bearing, so
+        # failures fall through to the Branch-A success terminal rather
+        # than halting the pipeline (and crucially NOT to HandleFailure,
+        # which would abort the sibling PredictorTraining branch).
         catch = states["Counterfactual"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "CheckSkipPredictorTraining"
+        assert catch["Next"] == "BranchAComplete"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
@@ -721,19 +749,25 @@ class TestJudgeChainBeforePredictor:
             == "CheckSkipEvalJudge"
         )
 
-    def test_counterfactual_exits_to_predictor_skip_gate(self, states):
-        """Counterfactual is the last state in the judge chain; its
-        Next + Catch + the skip-gate above it all converge to
-        CheckSkipPredictorTraining (the entry to the next pipeline
-        stage). Pre-reorder this was SaturdayHealthCheck."""
-        assert states["Counterfactual"]["Next"] == "CheckSkipPredictorTraining"
+    def test_counterfactual_exits_to_branch_a_terminal(self, states):
+        """Counterfactual is the last state in Branch A (the eval/
+        agent-justification chain); post the 2026-05-16 SF Parallel
+        restructure its Next + Catch + the skip-gate above it all
+        converge to the branch-local success terminal BranchAComplete
+        (End:true). The Evaluator-sees-judge-artifacts ordering invariant
+        is still satisfied because Evaluator runs AFTER the Parallel
+        join, by which point Branch A has completed and its S3 artifacts
+        are landed. Pre-2026-05-07 this was SaturdayHealthCheck;
+        2026-05-07→2026-05-16 it was CheckSkipPredictorTraining;
+        post-2026-05-16 it is BranchAComplete."""
+        assert states["Counterfactual"]["Next"] == "BranchAComplete"
         assert (
             states["Counterfactual"]["Catch"][0]["Next"]
-            == "CheckSkipPredictorTraining"
+            == "BranchAComplete"
         )
         assert (
             states["CheckSkipCounterfactual"]["Choices"][0]["Next"]
-            == "CheckSkipPredictorTraining"
+            == "BranchAComplete"
         )
 
     def test_evaluator_exits_directly_to_health_check(self, states):

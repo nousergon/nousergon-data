@@ -168,9 +168,14 @@ def test_regime_retrospective_eval_payload_is_produce_action() -> None:
 
 
 def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
-    """{\"skip_regime_retrospective_eval\": true} bypasses to
-    CheckSkipResearch. Independent of skip_regime_substrate so each
-    regime step has its own skip flag."""
+    """{\"skip_regime_retrospective_eval\": true} bypasses to the
+    research-chain entry. Post the 2026-05-16 Research || PredictorTraining
+    SF Parallel restructure (plan
+    alpha-engine-docs/private/research-predictor-parallel-260516.md) the
+    research-chain entry is the ResearchPredictorParallel state (whose
+    Branch A StartAt is CheckSkipResearch) — NOT CheckSkipResearch
+    directly, which now lives inside the Parallel's Branch A. Independent
+    of skip_regime_substrate so each regime step has its own skip flag."""
     sf = _sf()
     assert "CheckSkipRegimeRetrospectiveEval" in sf["States"]
     state = sf["States"]["CheckSkipRegimeRetrospectiveEval"]
@@ -182,26 +187,42 @@ def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
         c.get("Variable") == "$.skip_regime_retrospective_eval"
         for c in skip_vars
     )
-    assert skip_choice["Next"] == "CheckSkipResearch"
+    assert skip_choice["Next"] == "ResearchPredictorParallel"
+    # The research-chain entry is now the Parallel; CheckSkipResearch
+    # moved INSIDE its Branch A (StartAt).
+    par = sf["States"]["ResearchPredictorParallel"]
+    assert par["Type"] == "Parallel"
+    assert par["Branches"][0]["StartAt"] == "CheckSkipResearch"
+    assert "CheckSkipResearch" not in sf["States"]
 
 
 def test_regime_retrospective_eval_failure_is_non_blocking() -> None:
     """Observe-only contract: a T1 eval failure must NOT halt the
-    pipeline. The Catch[States.ALL] routes to CheckSkipResearch
-    (not HandleFailure) — T1 is observability, not gating."""
+    pipeline. The Catch[States.ALL] routes to the research-chain entry
+    (post 2026-05-16 Research || PredictorTraining restructure that is
+    ResearchPredictorParallel, not HandleFailure) — T1 is observability,
+    not gating, so a failure still lets Research (now Branch A of the
+    Parallel) run."""
     sf = _sf()
     catches = sf["States"]["RegimeRetrospectiveEval"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "CheckSkipResearch", (
-        "RegimeRetrospectiveEval Catch[States.ALL] must route to "
-        "CheckSkipResearch (non-blocking), not HandleFailure (blocking). "
-        "T1 is observability; a failure must not halt Research."
+    assert states_all["Next"] == "ResearchPredictorParallel", (
+        "RegimeRetrospectiveEval Catch[States.ALL] must route to the "
+        "research-chain entry ResearchPredictorParallel (non-blocking), "
+        "not HandleFailure (blocking). T1 is observability; a failure "
+        "must not halt Research."
     )
 
 
-def test_regime_retrospective_eval_next_is_check_skip_research() -> None:
+def test_regime_retrospective_eval_next_is_research_chain_entry() -> None:
+    """Post the 2026-05-16 SF Parallel restructure the research-chain
+    entry is ResearchPredictorParallel (Branch A StartAt =
+    CheckSkipResearch)."""
     sf = _sf()
-    assert sf["States"]["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
+    assert (
+        sf["States"]["RegimeRetrospectiveEval"]["Next"]
+        == "ResearchPredictorParallel"
+    )
 
 
 def test_regime_retrospective_eval_timeout_accommodates_smoother_fit() -> None:
