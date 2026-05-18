@@ -55,7 +55,7 @@ Centralized data collection — price universe, macro, alternative data, feature
 | 10y OHLCV universe | `s3://alpha-engine-research/arcticdb/universe/` |
 | 2y inference slim cache | `s3://alpha-engine-research/arcticdb/universe_slim/` |
 | Daily OHLCV staging (7-day lifecycle) | `s3://alpha-engine-research/staging/daily_closes/{date}.parquet` |
-| Engineered features | `s3://alpha-engine-research/predictor/feature_store/{date}/` |
+| Engineered features | `s3://alpha-engine-research/features/{date}/` |
 | Weekly market data bundle | `s3://alpha-engine-research/market_data/weekly/{date}/` |
 | Phase 1 completion marker | `s3://alpha-engine-research/health/data_phase1.json` |
 | Universe returns table | `s3://alpha-engine-research/research.db` (`universe_returns`) |
