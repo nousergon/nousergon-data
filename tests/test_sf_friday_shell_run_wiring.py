@@ -258,16 +258,21 @@ def _resolve_spot_commands(state: dict, preflight_args: str) -> list[str]:
 
 
 @pytest.fixture(scope="module")
-def orig_sf() -> dict:
-    """The pre-keystone (origin/main #258) SF, for byte-identical proof."""
-    import subprocess
+def orig_spot_cmds() -> dict:
+    """Frozen pre-keystone (#258 origin/main) RESOLVED spot command lists.
 
-    raw = subprocess.check_output(
-        ["git", "show", "origin/main:infrastructure/step_function.json"],
-        cwd=_REPO_ROOT,
-        text=True,
-    )
-    return json.loads(raw)
+    Captured at commit time into a committed fixture so the byte-identical
+    proof is HERMETIC. The prior implementation shelled out to
+    `git show origin/main:infrastructure/step_function.json` at test time,
+    which fails (exit 128) in CI's shallow PR checkout where `origin/main`
+    is not a local ref — that was the keystone CI failure.
+
+    Regenerate ONLY on a deliberate, reviewed change to a spot state's
+    absent-path (`preflight_args=""`) command, by re-extracting the
+    resolved spot commands from the new `origin/main` SF.
+    """
+    p = _REPO_ROOT / "tests" / "fixtures" / "sf_prekeystone_spot_commands.json"
+    return json.loads(p.read_text())
 
 
 @pytest.fixture(scope="module")
@@ -486,17 +491,12 @@ class TestByteIdenticalAbsentPath:
 
     @pytest.mark.parametrize("name", sorted(_SPOT_STATES))
     def test_spot_command_byte_identical_when_preflight_args_empty(
-        self, sf, orig_sf, name
+        self, sf, orig_spot_cmds, name
     ):
         new_cmds = _resolve_spot_commands(
             self._state(sf, name), preflight_args=""
         )
-        orig_state = self._state(orig_sf, name)
-        op = orig_state["Parameters"]["Parameters"]
-        if "commands" in op:
-            orig_cmds = op["commands"]
-        else:
-            orig_cmds = _resolve_spot_commands(orig_state, preflight_args="")
+        orig_cmds = orig_spot_cmds[name]
         assert new_cmds == orig_cmds, (
             f"{name}: keystone changed the absent-path command — the real "
             f"Saturday run would differ.\norig={orig_cmds[-1]!r}\n"
