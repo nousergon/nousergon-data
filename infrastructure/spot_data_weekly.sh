@@ -23,8 +23,25 @@
 # Usage:
 #   ./infrastructure/spot_data_weekly.sh                   # phase1 + rag
 #   ./infrastructure/spot_data_weekly.sh --smoke-only      # quick validation, then terminate
+#   ./infrastructure/spot_data_weekly.sh --preflight-only  # boot + DataPhase1/MorningEnrich preflight, exit 0 (NO fetch/write)
+#   ./infrastructure/spot_data_weekly.sh --rag-only --preflight-only  # boot + RAG-path preflight, exit 0 (NO fetch/write)
 #   ./infrastructure/spot_data_weekly.sh --instance-type c5.xlarge   # override size
 #   ./infrastructure/spot_data_weekly.sh --branch my-branch          # override branch
+#
+# --preflight-only (Friday shell-run dry path, ROADMAP "Friday shell-run —
+# per-module dry-path activation" owed-item #1): boots the spot for real,
+# installs deps, runs the EXISTING preflight (env/secret resolution via
+# get_secret, AWS/SSM reachability, ArcticDB connect + libraries-present
+# read, S3 HEAD), then exits 0 BEFORE any collector fetch or any
+# S3/ArcticDB/config write. Hard invariant: ZERO external API data fetches
+# (the preflight's polygon/FRED *reachability probes* are sub-second
+# auth/HEAD-class calls that fetch no collector data) and ZERO
+# S3/ArcticDB/config/email/SNS mutations under this flag. The point is to
+# catch bootstrap-class breakage (lib-pin drift, sys.path collision, stale
+# ArcticDB symbol, SSM timeout, Dockerfile/image gap) ~12h before the real
+# Saturday run. Composes with --rag-only: `--rag-only --preflight-only`
+# runs ONLY the RAG-path preflight (rag.preflight: env-vars + S3 HEAD);
+# `--preflight-only` alone runs ONLY the DataPhase1/MorningEnrich preflight.
 #
 # Prerequisites on the launching host (ae-dashboard when invoked by the
 # Saturday Step Function):
@@ -84,6 +101,15 @@ IAM_PROFILE="alpha-engine-executor-profile"
 # preflight-bearing action as its own SF task: a phase1 failure no longer
 # re-pays the ~28-min morning-enrich. data-only stays for manual reruns.
 RUN_MODE="full"
+# PREFLIGHT_ONLY is a MODIFIER, orthogonal to RUN_MODE — it composes with
+# the data path (default / --data-only / --phase1-only / --morning-enrich-only)
+# AND with --rag-only. When set, every workload invocation is replaced by
+# its existing preflight + an early `exit 0`; no collector fetch or
+# S3/ArcticDB/config write code path is reachable. The preflight-task-split
+# (2026-05-16) modes still select WHICH preflight (phase1 vs morning_enrich
+# vs RAG) runs; --preflight-only only swaps "preflight + work" for
+# "preflight + exit 0".
+PREFLIGHT_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
@@ -92,6 +118,7 @@ while [[ $# -gt 0 ]]; do
         --data-only) RUN_MODE="data-only"; shift ;;
         --morning-enrich-only) RUN_MODE="morning-enrich-only"; shift ;;
         --phase1-only) RUN_MODE="phase1-only"; shift ;;
+        --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -106,6 +133,7 @@ echo "  AMI           : $AMI_ID"
 echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Run mode      : $RUN_MODE"
+echo "  Preflight-only: $PREFLIGHT_ONLY  (1 = boot + preflight + exit 0, NO fetch/write)"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
@@ -371,6 +399,57 @@ fi
 # secrets from SSM, runs the real (non-dry-run) RAG ingestion, emits only the
 # rag-ingestion heartbeat so CloudWatch state accurately reflects what ran.
 if [ "$RUN_MODE" = "rag-only" ]; then
+    if [ "$PREFLIGHT_ONLY" = "1" ]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "  RAG-ONLY PREFLIGHT-ONLY (boot + RAG preflight, NO fetch/write)"
+        echo "═══════════════════════════════════════════════════════════════"
+        # Friday shell-run dry path. Fetch the 4 RAG secrets from SSM (so
+        # rag.preflight's check_env_vars sees them) then run ONLY step 0
+        # (rag.preflight: check_env_vars + check_s3_bucket HEAD — read-only,
+        # no fetch, no write) and exit 0 BEFORE any ingest pipeline. The
+        # run_weekly_ingestion.sh --preflight-only path exits 0 right
+        # after `python -m rag.preflight` and before Step 1
+        # (ingest_sec_filings) — proof that no ingest_*/embedding/Postgres
+        # write code path is reachable. Heartbeat is deliberately NOT
+        # emitted (a preflight is not a completed ingestion).
+        run_remote bash -s <<RAG_ONLY_PREFLIGHT
+set -euo pipefail
+cd /home/ec2-user/alpha-engine-data
+${ENV_SOURCE}
+
+echo "──────────────────────────────────────────────────────────────"
+echo "Fetching RAG secrets from SSM at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
+    val=\$(aws ssm get-parameter --name /alpha-engine/\$name --with-decryption --query 'Parameter.Value' --output text --region "\${AWS_REGION:-us-east-1}" 2>/dev/null || echo "")
+    if [ -z "\$val" ]; then
+        echo "ERROR: could not fetch /alpha-engine/\$name from SSM — required for RAG preflight" >&2
+        exit 1
+    fi
+    export \$name="\$val"
+    unset val
+done
+echo "RAG secrets fetched: VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY, RAG_DATABASE_URL"
+
+echo ""
+echo "──────────────────────────────────────────────────────────────"
+echo "Starting rag/pipelines/run_weekly_ingestion.sh --preflight-only at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+if ! bash rag/pipelines/run_weekly_ingestion.sh --preflight-only 2>&1; then
+    echo "ERROR: RAG preflight failed (bootstrap-class breakage caught ~12h before Saturday)." >&2
+    exit 1
+fi
+echo "RAG preflight-only OK at \$(date)"
+RAG_ONLY_PREFLIGHT
+
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "  RAG preflight-only complete (NO fetch/write). Instance will be terminated."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit 0
+    fi
+
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo "  RAG-ONLY RUN (skipping DataPhase1)"
@@ -452,6 +531,74 @@ case "$RUN_MODE" in
         DO_MORNING_ENRICH=1; DO_PHASE1=1; SKIP_RAG_BLOCK=0
         MODE_LABEL="data-phase1" ;;
 esac
+
+# ── Data-path preflight-only (Friday shell-run dry path) ────────────────────
+# Reuses the DO_MORNING_ENRICH / DO_PHASE1 gates above to decide WHICH
+# weekly_collector preflight to run, then runs ONLY the preflight via the
+# new `weekly_collector.py ... --preflight-only` flag. That flag executes
+# DataPreflight(mode).run() (env/secret get_secret resolution, S3 HEAD,
+# polygon/FRED auth-reachability probes, ArcticDB connect + libraries-present
+# read) then sys.exit(0) BEFORE run_weekly() — run_weekly() is the sole
+# function in weekly_collector that does ANY collector fetch or any
+# S3/ArcticDB/parquet/config write, so it is statically unreachable here.
+# No prune (builders.prune_delisted_tickers writes the prune-audit JSON),
+# no RAG, no CloudWatch heartbeat, no S3 log upload — a preflight is not a
+# completed workload. Zero external API DATA fetch and zero mutation.
+#
+# Note on universe-freshness tolerance (ROADMAP owed-item #5): the Friday
+# shell-run uses the phase1 / morning_enrich preflight modes. Per
+# preflight.py::DataPreflight.run, NEITHER mode runs check_arcticdb_fresh
+# — they only do _check_arcticdb_libraries_present (a presence read, not a
+# freshness gate). morning_enrich deliberately omits a freshness check
+# (it is part of what *makes* ArcticDB fresh); phase1 *populates* ArcticDB.
+# So a Friday run that predates Friday's settled polygon aggregate does
+# NOT spuriously fail on a Thursday-last-bar: the only freshness gate
+# (check_arcticdb_fresh, macro/SPY, 4d) lives in the "daily" mode, which
+# the Saturday/Friday data path never selects. No --preflight-only-scoped
+# tolerance code is required for the data path; documented here so a
+# future mode-mapping change re-audits this invariant.
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  PREFLIGHT-ONLY: $HEADER_LABEL"
+    echo "  (boot + preflight + exit 0 — NO collector fetch, NO write)"
+    echo "═══════════════════════════════════════════════════════════════"
+    run_remote bash -s <<PREFLIGHT_WORKLOADS
+set -euo pipefail
+cd /home/ec2-user/alpha-engine-data
+${ENV_SOURCE}
+
+if [ "${DO_MORNING_ENRICH}" = "1" ]; then
+    echo "──────────────────────────────────────────────────────────────"
+    echo "weekly_collector.py --morning-enrich --preflight-only at \$(date)"
+    echo "──────────────────────────────────────────────────────────────"
+    if ! $REMOTE_PYTHON weekly_collector.py --morning-enrich --preflight-only 2>&1; then
+        echo "ERROR: morning-enrich preflight failed (bootstrap-class breakage caught ~12h before Saturday)." >&2
+        exit 1
+    fi
+fi
+
+if [ "${DO_PHASE1}" = "1" ]; then
+    echo ""
+    echo "──────────────────────────────────────────────────────────────"
+    echo "weekly_collector.py --phase 1 --preflight-only at \$(date)"
+    echo "──────────────────────────────────────────────────────────────"
+    if ! $REMOTE_PYTHON weekly_collector.py --phase 1 --preflight-only 2>&1; then
+        echo "ERROR: phase1 preflight failed (bootstrap-class breakage caught ~12h before Saturday)." >&2
+        exit 1
+    fi
+fi
+
+echo ""
+echo "Data-path preflight-only OK at \$(date) — NO fetch, NO write."
+PREFLIGHT_WORKLOADS
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Preflight-only complete (NO fetch/write). Instance will be terminated."
+    echo "═══════════════════════════════════════════════════════════════"
+    exit 0
+fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
