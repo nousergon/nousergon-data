@@ -4,9 +4,9 @@
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'), $$.Execution.Input, false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipMorningEnrich"
@@ -1408,18 +1408,10 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-backtester",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator 2>&1 | tee /var/log/backtester.log"
-          ],
           "executionTimeout": [
             "7200"
-          ]
+          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator 2>&1 | tee /var/log/backtester.log')"
         },
         "TimeoutSeconds": 7200
       },
@@ -1532,18 +1524,10 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-backtester",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/parity.log \"s3://alpha-engine-research/_ssm_logs/parity/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator 2>&1 | tee /var/log/parity.log"
-          ],
           "executionTimeout": [
             "7200"
-          ]
+          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/parity.log \"s3://alpha-engine-research/_ssm_logs/parity/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator 2>&1 | tee /var/log/parity.log')"
         },
         "TimeoutSeconds": 7200
       },
@@ -1656,18 +1640,10 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-backtester",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/evaluator.log \"s3://alpha-engine-research/_ssm_logs/evaluator/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity 2>&1 | tee /var/log/evaluator.log"
-          ],
           "executionTimeout": [
             "3600"
-          ]
+          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/evaluator.log \"s3://alpha-engine-research/_ssm_logs/evaluator/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity 2>&1 | tee /var/log/evaluator.log')"
         },
         "TimeoutSeconds": 3600
       },
