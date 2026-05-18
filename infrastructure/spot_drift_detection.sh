@@ -21,8 +21,29 @@
 # Usage:
 #   ./infrastructure/spot_drift_detection.sh
 #   ./infrastructure/spot_drift_detection.sh --smoke-only
+#   ./infrastructure/spot_drift_detection.sh --preflight-only  # boot + read-only preflight, exit 0 (NO scan/fetch/write)
 #   ./infrastructure/spot_drift_detection.sh --instance-type c5.xlarge
 #   ./infrastructure/spot_drift_detection.sh --branch my-branch
+#
+# --preflight-only (Friday shell-run dry path, ROADMAP "Friday shell-run —
+# per-module dry-path activation" — closes the DriftDetection skip-exception):
+# boots the spot for real, clones both repos, installs deps, then runs ONLY a
+# read-only preflight and `exit 0` BEFORE `monitoring.drift_detector` is ever
+# invoked. Catches bootstrap-class breakage (lib-pin drift, sys.path / sibling-
+# clone collision, missing dep, SSM/region env gap) ~12h before the real
+# Saturday run, while doing ZERO drift scan, ZERO external API data fetch, and
+# ZERO S3/CloudWatch/SNS/config writes.
+#
+# Substrate: the drift workload binary (`monitoring.drift_detector`) lives in
+# alpha-engine-predictor, not this repo, and has no --preflight-only flag of
+# its own; this repo's `preflight.py` DataPreflight modes are data-collection
+# scoped (daily / morning_enrich / phase1 / phase2) — none maps to drift. So
+# per the canonical-lib fallback the preflight here composes the canonical
+# `alpha_engine_lib.preflight.BasePreflight` directly (env-vars + S3-bucket
+# HEAD — both strictly read-only) plus an import-only smoke of the drift
+# module under the same PYTHONPATH the real run uses. No bespoke preflight
+# scaffolding is duplicated. PREFLIGHT_ONLY is a MODIFIER, orthogonal to
+# RUN_MODE — it only swaps "preflight + drift scan" for "preflight + exit 0".
 
 set -euo pipefail
 
@@ -53,9 +74,18 @@ IAM_PROFILE="alpha-engine-executor-profile"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-1800}"
 
 RUN_MODE="full"
+# PREFLIGHT_ONLY is a MODIFIER, orthogonal to RUN_MODE (mirrors the
+# spot_data_weekly.sh #259 / predictor #175 / backtester #224 pattern).
+# When set, the drift scan + heartbeat are replaced by a read-only
+# preflight + early `exit 0`; no monitoring.drift_detector code path
+# (which is the SOLE function doing any S3 read/put_object, SNS publish,
+# or CloudWatch emit) is reachable. Initialised before the parse loop
+# for `set -u` safety.
+PREFLIGHT_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
+        --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -67,6 +97,7 @@ echo "  DriftDetection Spot Run — $(date +%Y-%m-%d)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Instance type : $INSTANCE_TYPE"
 echo "  Run mode      : $RUN_MODE"
+echo "  Preflight-only: $PREFLIGHT_ONLY  (1 = boot + read-only preflight + exit 0, NO scan/fetch/write)"
 echo ""
 
 # ── Preflight ───────────────────────────────────────────────────────────────
@@ -212,6 +243,87 @@ $REMOTE_PYTHON -m monitoring.drift_detector --help 2>&1 | head -20
 SMOKE
 
     echo "==> Smoke complete — instance will be terminated."
+    exit 0
+fi
+
+# ── Preflight-only (Friday shell-run dry path) ──────────────────────────────
+# Closes the DriftDetection skip-exception in ROADMAP "Friday shell-run —
+# per-module dry-path activation". Runs ONLY a read-only preflight then
+# `exit 0` strictly BEFORE the `run_remote bash -s <<DRIFT` block below —
+# `monitoring.drift_detector` (the SOLE code that does ANY S3 get_object/
+# put_object of the drift report, SNS publish on alert, and which this
+# launcher's CloudWatch put-metric-data heartbeat trails) is therefore
+# statically unreachable here. No scan, no external API data fetch, no
+# S3/CW/SNS/config mutation — a passed preflight is a healthy outcome, so
+# the early exit is 0 (SSM/SF report Success).
+#
+# The preflight composes the canonical lib substrate directly — NO bespoke
+# scaffolding (Brian standing canonical-lib rule):
+#   * alpha_engine_lib.preflight.BasePreflight.check_env_vars("AWS_REGION")
+#     — the same fail-fast gate the data path uses; AWS_REGION/.._DEFAULT_REGION
+#     are exported via ${ENV_SOURCE} below (the #241 .env-deprecation re-export).
+#   * BasePreflight.check_s3_bucket() — a HEAD-bucket probe ONLY (read-only;
+#     proves the spot's IAM profile + region reach the drift bucket the real
+#     run reads predictor weights / slim cache / metrics from).
+#   * an import-only smoke of `monitoring.drift_detector` under the exact
+#     PYTHONPATH (sibling alpha-engine-predictor clone) the real run uses —
+#     this is what actually catches the bootstrap-class breakage a Friday
+#     dry path exists for (lib-pin drift, sys.path / sibling-clone collision,
+#     a missing/renamed dep). Importing the module runs no scan: the boto3
+#     client + drift checks live behind `def main()` / `check_drift()`, gated
+#     by `if __name__ == "__main__"`, none of which import triggers.
+# DEFAULT_BUCKET in monitoring.drift_detector is "alpha-engine-research"; the
+# preflight HEADs that same bucket so a bucket/region/IAM regression fails
+# here ~12h early instead of mid-Saturday.
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  PREFLIGHT-ONLY: DriftDetection"
+    echo "  (boot + read-only preflight + exit 0 — NO scan, NO fetch, NO write)"
+    echo "═══════════════════════════════════════════════════════════════"
+    run_remote bash -s <<PREFLIGHT_ONLY_BLOCK
+set -euo pipefail
+cd /home/ec2-user/alpha-engine-data
+${ENV_SOURCE}
+
+echo "Starting read-only preflight at \$(date)"
+if ! $REMOTE_PYTHON - <<'PYEOF'
+import sys
+
+from alpha_engine_lib.preflight import BasePreflight
+
+# Read-only canonical preflight: env-vars fail-fast + S3 bucket HEAD.
+# "alpha-engine-research" mirrors monitoring.drift_detector.DEFAULT_BUCKET.
+pf = BasePreflight("alpha-engine-research")
+pf.check_env_vars("AWS_REGION")
+pf.check_s3_bucket()
+print("preflight: BasePreflight env-vars + S3 HEAD OK (read-only)")
+
+# Import-only smoke of the drift workload under the real PYTHONPATH. This
+# imports the module (catching lib-pin / sys.path / missing-dep breakage)
+# WITHOUT invoking it: boto3 clients + scan live behind def main() /
+# check_drift(), gated by __main__, which an import does not trigger.
+import importlib
+
+mod = importlib.import_module("monitoring.drift_detector")
+assert hasattr(mod, "main") and hasattr(mod, "check_drift"), (
+    "monitoring.drift_detector missing expected entrypoints — "
+    "stale clone or API drift"
+)
+print("preflight: monitoring.drift_detector import OK (no scan invoked)")
+sys.exit(0)
+PYEOF
+then
+    echo "ERROR: DriftDetection preflight failed (bootstrap-class breakage caught ~12h before Saturday)." >&2
+    exit 1
+fi
+echo "DriftDetection preflight-only OK at \$(date) — NO scan, NO fetch, NO write."
+PREFLIGHT_ONLY_BLOCK
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Preflight-only complete (NO scan/fetch/write). Instance will be terminated."
+    echo "═══════════════════════════════════════════════════════════════"
     exit 0
 fi
 
