@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import threading
 from datetime import date, datetime, timedelta, timezone
@@ -205,6 +206,63 @@ def _emit_quality_gate_metrics(
             "load-bearing Flow Doctor surface.",
             exc,
         )
+
+
+# ── EDGAR local data dir → /tmp (Lambda read-only $HOME) ───────────────────
+#
+# edgartools (the ``edgar`` package, used by _fetch_institutional for 13F
+# data) writes its local data + HTTP response cache under a root directory
+# that defaults to ``~/.edgar`` (and ``~/.edgar/_tcache`` for the httpx
+# cache). In the DataPhase2 Lambda sandbox ``$HOME`` (``/home/sbx_user1051``)
+# is a read-only filesystem — only ``/tmp`` is writable — so every edgar
+# call raised ``[Errno 30] Read-only file system`` on 2026-05-17, leaving
+# the institutional source 0/33 populated and breaching the per-source
+# populated-ratio gate (``institutional`` threshold 0.20) → DataPhase2
+# returned ``{"status": "ERROR"}``.
+#
+# edgartools resolves ``EDGAR_LOCAL_DATA_DIR`` at *call time* (verified
+# against installed edgartools 5.28.2: edgar.paths.get_data_directory ->
+# os.getenv(ENV_EDGAR_DATA_DIR); edgar.httpclient.get_cache_directory ->
+# get_edgar_data_directory()/"_tcache"). Setting it before any
+# ``from edgar import ...`` / ``Company(...)`` runs is therefore effective,
+# and the env var alone redirects both the data dir and the _tcache HTTP
+# cache (the path that failed) — no ``$HOME`` override is required. We only
+# set it if unset so an operator-provided value still wins.
+_EDGAR_TMP_DATA_DIR = "/tmp/edgar"
+if not os.environ.get("EDGAR_LOCAL_DATA_DIR"):
+    try:
+        os.makedirs(_EDGAR_TMP_DATA_DIR, exist_ok=True)
+        os.environ["EDGAR_LOCAL_DATA_DIR"] = _EDGAR_TMP_DATA_DIR
+    except OSError as _e:  # pragma: no cover - /tmp is writable on Lambda
+        logger.warning("Could not prepare EDGAR_LOCAL_DATA_DIR: %s", _e)
+
+
+# ── Generic URL-credential scrubber ────────────────────────────────────────
+#
+# requests.exceptions.HTTPError embeds the full request URL — including any
+# ``apikey=``/``api_key=``/``token=`` querystring credential — in its
+# ``str()`` representation. The FMP-backed warnings (e.g. "EPS estimate
+# failed for AFL: 402 ... ?apikey=<KEY>&...") and Finnhub-backed warnings
+# (``token=<KEY>``) would leak the live credential to CloudWatch. Every
+# exception-logging site in this file that can carry an HTTP fetch URL
+# routes the exception through this scrubber before logging. It is a no-op
+# on strings without a matching querystring fragment (idempotent).
+#
+# Mirrors collectors/daily_closes._scrub_api_key (FRED-specific, masks only
+# ``api_key=``); kept local here because that helper is too narrow for the
+# FMP ``apikey=`` / Finnhub ``token=`` shapes and importing it would couple
+# two unrelated collectors.
+_URL_CRED_RE = re.compile(r"(?i)(api_?key|apikey|token)=[^&\s'\"]+")
+
+
+def _scrub_url_creds(msg: object) -> str:
+    """Mask ``apikey=``/``api_key=``/``token=`` querystring secrets.
+
+    Accepts an exception object or any value; stringifies then masks.
+    No-op (returns the input string unchanged) when no credential
+    fragment is present, and idempotent on already-scrubbed strings.
+    """
+    return _URL_CRED_RE.sub(lambda m: f"{m.group(1)}=***", str(msg))
 
 
 # ── Per-source populated-ratio gate ──────────────────────────────────────────
@@ -525,8 +583,9 @@ def collect(
             logger.info("Alternative data: %s -> s3://%s/%s", ticker, bucket, key)
         except Exception as e:
             failed += 1
-            errors.append({"ticker": ticker, "error": str(e)})
-            logger.warning("Alternative data failed for %s: %s", ticker, e)
+            scrubbed = _scrub_url_creds(e)
+            errors.append({"ticker": ticker, "error": scrubbed})
+            logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
 
     if n_quality_blocked or n_quality_warned:
         logger.info(
@@ -854,7 +913,7 @@ def _fetch_analyst(ticker: str) -> dict:
                     result["rating"] = "Hold"
                 result["num_analysts"] = total
     except Exception as e:
-        logger.warning("Finnhub recommendation failed for %s: %s", ticker, e)
+        logger.warning("Finnhub recommendation failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # Finnhub historical earnings surprises: list of {actual, estimate,
     # surprise, surprisePercent, period, quarter, symbol, year}, most
@@ -878,7 +937,7 @@ def _fetch_analyst(ticker: str) -> dict:
                 })
             result["earnings_surprises"] = surprises
     except Exception as e:
-        logger.warning("Finnhub earnings failed for %s: %s", ticker, e)
+        logger.warning("Finnhub earnings failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # yfinance Ticker.info: ``targetMeanPrice`` is the consensus price target;
     # ``numberOfAnalystOpinions`` is the count of analysts covering the name
@@ -898,7 +957,7 @@ def _fetch_analyst(ticker: str) -> dict:
             if n is not None:
                 result["num_analysts"] = int(n)
     except Exception as e:
-        logger.warning("yfinance target_price failed for %s: %s", ticker, e)
+        logger.warning("yfinance target_price failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
 
@@ -926,7 +985,7 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
                 or data[0].get("estimatedEpsAvg")
             )
     except Exception as e:
-        logger.warning("EPS estimate failed for %s: %s", ticker, e)
+        logger.warning("EPS estimate failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # Load prior snapshot for revision comparison
     try:
@@ -1051,7 +1110,7 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
     except ImportError:
         logger.debug("yfinance/numpy not available for options data")
     except Exception as e:
-        logger.warning("Options fetch failed for %s: %s", ticker, e)
+        logger.warning("Options fetch failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
 
@@ -1187,7 +1246,7 @@ def _fetch_institutional(ticker: str) -> dict:
                             elif current_value < prev_value:
                                 n_decreasing += 1
         except Exception as e:
-            logger.warning("13F comparison failed for %s: %s", ticker, e)
+            logger.warning("13F comparison failed for %s: %s", ticker, _scrub_url_creds(e))
 
         result["funds_increasing"] = n_accumulating
         result["funds_decreasing"] = n_decreasing
@@ -1196,7 +1255,7 @@ def _fetch_institutional(ticker: str) -> dict:
     except ImportError:
         logger.debug("edgartools not available for 13F data")
     except Exception as e:
-        logger.warning("Institutional fetch failed for %s: %s", ticker, e)
+        logger.warning("Institutional fetch failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
 
@@ -1234,7 +1293,7 @@ def _fetch_news(ticker: str) -> dict:
     except ImportError:
         logger.debug("feedparser not available for news")
     except Exception as e:
-        logger.warning("Yahoo RSS failed for %s: %s", ticker, e)
+        logger.warning("Yahoo RSS failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # EDGAR 8-K
     try:
@@ -1256,6 +1315,6 @@ def _fetch_news(ticker: str) -> dict:
                 "form_type": src.get("form_type", "8-K"),
             })
     except Exception as e:
-        logger.warning("EDGAR 8-K failed for %s: %s", ticker, e)
+        logger.warning("EDGAR 8-K failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
