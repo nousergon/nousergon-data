@@ -731,6 +731,7 @@ class TestFridayEventBridgeRule:
         block = cfn_text.split("FridayShellRunTrigger:", 1)[1].split(
             "WeekdayTrigger:", 1
         )[0]
-        # 21:30 UTC Fri = 14:30 PT (PDT) — after Friday EOD SF (~1:25 PT),
-        # ~11.5h before the real Sat 09:00 UTC firing.
-        assert "cron(30 21 ? * FRI *)" in block
+        # 20:45 UTC Fri = 1:45 PM PT (PDT) — after Friday EOD SF (~1:25 PT),
+        # ~12h before the real Sat 09:00 UTC firing. (Retimed from 21:30 UTC
+        # per operator request 2026-05-18.)
+        assert "cron(45 20 ? * FRI *)" in block

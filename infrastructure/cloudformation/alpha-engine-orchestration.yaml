@@ -152,10 +152,10 @@ Resources:
   # the shell run is a pure-skip no-op pass until those land — still a
   # valid SF/IAM/EventBridge/health-check bootstrap smoke test).
   #
-  # Cron: 21:30 UTC Fri = 14:30 PT (PDT, the dominant season) / 13:30 PT
-  # (PST). Chosen AFTER the Friday EOD SF (~1:25 PT) completes so the
+  # Cron: 20:45 UTC Fri = 1:45 PM PT (PDT, the dominant season) /
+  # 12:45 PM PT (PST). Chosen AFTER the Friday EOD SF (~1:25 PT) so the
   # shell run never collides with PostMarketData / EODReconcile /
-  # StopTradingInstance on the trading instance, and ~11.5 h BEFORE the
+  # StopTradingInstance on the trading instance, and ~12 h BEFORE the
   # real Saturday 09:00 UTC firing — a red shell-run report Friday
   # evening leaves a full operator fix window before the real run
   # consumes its weekly research/training/backtest cycle. shell_run mode
@@ -166,11 +166,11 @@ Resources:
     Properties:
       Name: alpha-engine-friday-shell-run
       Description: >-
-        Friday 21:30 UTC (14:30 PT PDT / 13:30 PT PST) — DISABLED by default —
+        Friday 20:45 UTC (1:45 PM PT PDT / 12:45 PM PT PST) — DISABLED by default —
         fires the Saturday SF with shell_run=true (full dry preflight, no API
-        calls / no S3-config-email-SNS writes) ~11.5h before the real Sat run.
+        calls / no S3-config-email-SNS writes) ~12h before the real Sat run.
         Enable via: aws events enable-rule --name alpha-engine-friday-shell-run
-      ScheduleExpression: 'cron(30 21 ? * FRI *)'
+      ScheduleExpression: 'cron(45 20 ? * FRI *)'
       State: DISABLED
       Targets:
         - Id: friday-shell-run
