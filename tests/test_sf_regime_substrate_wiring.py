@@ -56,12 +56,23 @@ def test_regime_substrate_state_exists() -> None:
 
 def test_regime_substrate_payload_is_produce_action() -> None:
     """Handler-side ``dry_run`` mode returns the payload without writing
-    to S3. Production SF must always call ``produce`` so the artifact
-    actually lands; pin to catch a misguided debugging change."""
+    to S3. Post the Friday shell-run KEYSTONE the action is routed via the
+    ``$.regime_action`` control var: InitializeInput seeds it ``"produce"``
+    (the pre-keystone hardcoded value — the real Saturday run is
+    behaviourally identical, the artifact still lands), and
+    ApplyShellRunDefaults flips it to ``"dry_run"`` ONLY under shell_run
+    (verified clean no-write dry path). Pin the routing so a misguided
+    debugging change can't hardcode dry on the production run."""
     sf = _sf()
     payload = sf["States"]["RegimeSubstrate"]["Parameters"]["Payload"]
-    assert payload.get("action") == "produce", (
-        f"RegimeSubstrate payload must be action=produce; got {payload!r}"
+    assert payload.get("action.$") == "$.regime_action", (
+        "RegimeSubstrate payload must route action via $.regime_action "
+        f"(keystone dry-routing); got {payload!r}"
+    )
+    init_expr = sf["States"]["InitializeInput"]["Parameters"]["merged.$"]
+    assert '"regime_action":"produce"' in init_expr, (
+        "InitializeInput must seed regime_action='produce' so the real "
+        "Saturday run (no shell_run) still calls produce"
     )
 
 
@@ -158,12 +169,21 @@ def test_regime_retrospective_eval_state_exists() -> None:
 
 
 def test_regime_retrospective_eval_payload_is_produce_action() -> None:
-    """Handler-side dry_run does NOT write the artifact; production
-    SF must always invoke produce so the eval artifact lands in S3."""
+    """Handler-side dry_run does NOT write the artifact. Post the Friday
+    shell-run KEYSTONE the action is routed via the ``$.regime_action``
+    control var (InitializeInput seeds ``"produce"`` → real Saturday run
+    behaviourally identical; ApplyShellRunDefaults flips to ``"dry_run"``
+    ONLY under shell_run — verified clean no-write dry path)."""
     sf = _sf()
     payload = sf["States"]["RegimeRetrospectiveEval"]["Parameters"]["Payload"]
-    assert payload.get("action") == "produce", (
-        f"RegimeRetrospectiveEval payload must be action=produce; got {payload!r}"
+    assert payload.get("action.$") == "$.regime_action", (
+        "RegimeRetrospectiveEval payload must route action via "
+        f"$.regime_action (keystone dry-routing); got {payload!r}"
+    )
+    init_expr = sf["States"]["InitializeInput"]["Parameters"]["merged.$"]
+    assert '"regime_action":"produce"' in init_expr, (
+        "InitializeInput must seed regime_action='produce' so the real "
+        "Saturday run still calls produce"
     )
 
 

@@ -1,0 +1,72 @@
+{
+  "Backtester": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "export RUN_DATE='2026-05-18'",
+    "bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator 2>&1 | tee /var/log/backtester.log"
+  ],
+  "DataPhase1": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-data",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/data-weekly.log \"s3://alpha-engine-research/_ssm_logs/data-weekly/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "bash infrastructure/spot_data_weekly.sh --phase1-only 2>&1 | tee /var/log/data-weekly.log"
+  ],
+  "Evaluator": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/evaluator.log \"s3://alpha-engine-research/_ssm_logs/evaluator/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "export RUN_DATE='2026-05-18'",
+    "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity 2>&1 | tee /var/log/evaluator.log"
+  ],
+  "MorningEnrich": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-data",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "bash infrastructure/spot_data_weekly.sh --morning-enrich-only 2>&1 | tee /var/log/morning-enrich.log"
+  ],
+  "Parity": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/parity.log \"s3://alpha-engine-research/_ssm_logs/parity/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "export RUN_DATE='2026-05-18'",
+    "bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator 2>&1 | tee /var/log/parity.log"
+  ],
+  "PredictorTraining": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
+    "cd /home/ec2-user/alpha-engine-predictor",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/predictor-training.log \"s3://alpha-engine-research/_ssm_logs/predictor-training/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
+  ],
+  "RAGIngestion": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-data",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/rag-ingestion.log \"s3://alpha-engine-research/_ssm_logs/rag-ingestion/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "bash infrastructure/spot_data_weekly.sh --rag-only 2>&1 | tee /var/log/rag-ingestion.log"
+  ]
+}

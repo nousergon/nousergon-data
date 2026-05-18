@@ -4,16 +4,16 @@
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values — preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckShellRun"
     },
     "CheckShellRun": {
       "Type": "Choice",
-      "Comment": "Friday-PM 'shell run' gate (ROADMAP 'Scheduled Friday-PM shell run', spine landed feat/sf-friday-shell-run). Input {\"shell_run\": true} (supplied by the DISABLED-by-default Friday EventBridge rule alpha-engine-friday-shell-run) routes to ApplyShellRunDefaults, which layers every skip_* flag = true UNDER the user input so the entire Saturday workload is no-op'd via the EXISTING Choice-gated skip mechanism (zero new dry paths added in the spine). shell_run absent OR false routes straight to CheckSkipMorningEnrich — BYTE-IDENTICAL to the pre-spine Saturday run (this is a strict superset; the real Sat 02:00 PT firing passes no shell_run, so this Choice always takes Default for it). Per-module --preflight-only/--dry-run paths (so spots boot + smoke instead of skip) are scoped follow-on PRs per the ROADMAP owed-work — NOT in this spine.",
+      "Comment": "Friday-PM 'shell run' gate (ROADMAP 'Scheduled Friday-PM shell run'; spine landed #258, KEYSTONE landed feat/sf-shell-run-keystone). Input {\"shell_run\": true} (supplied by the DISABLED-by-default Friday EventBridge rule alpha-engine-friday-shell-run) routes to ApplyShellRunDefaults, which now sets the dry-path control vars (preflight_args=\" --preflight-only\" for the 7 spot states, Lambda dry flags for Research/DataPhase2/RegimeSubstrate/RegimeRetrospectiveEval) and hard-skips ONLY the 5 documented no-clean-dry-path exceptions — so the Friday run BOOTS + DRY-EXECUTES the workload instead of pure-skipping it (the keystone's whole point: exercise the real bootstrap/import/lib-pin/transport paths). shell_run absent OR false routes straight to CheckSkipMorningEnrich — BYTE-IDENTICAL to the pre-spine Saturday run (this is a strict superset; the real Sat 02:00 PT firing passes no shell_run, so this Choice always takes Default for it; with preflight_args defaulting to \"\" via InitializeInput every spot command string is char-for-char unchanged and every Lambda Payload behaviourally identical).",
       "Choices": [
         {
           "And": [
@@ -33,9 +33,9 @@
     },
     "ApplyShellRunDefaults": {
       "Type": "Pass",
-      "Comment": "shell_run=true ONLY. Merges every skip_* flag = true UNDER the current state (States.JsonMerge(shellDefaults, $, false) — second arg wins) so an explicit per-flag override in the execution input still takes effect (e.g. {\"shell_run\": true, \"skip_research\": false} still runs Research). Mirrors InitializeInput's defaults-under-input JsonMerge pattern exactly. Every workload state in the Saturday SF already has a Choice-gated skip_* (verified: morning_enrich, data_phase1, rag_ingestion, regime_substrate, regime_retrospective_eval, research, data_phase2, eval_judge, rationale_clustering, replay_concordance, counterfactual, predictor_training, drift_detection, backtester, parity, evaluator) so with all 16 true the SF traverses InitializeInput → (skip every workload) → SaturdayHealthCheck → WeeklySubstrateHealthCheck → Notify. The two health-check states have NO skip gate by design — they are read-only input-freshness / substrate scans and are exactly the kind of bootstrap/transport check the shell run wants exercised Friday PM (their shell_run-aware missing-Friday-bar tolerance is ROADMAP owed-work item 5, a scoped follow-on).",
+      "Comment": "shell_run=true ONLY (keystone — replaces #258's pure-skip with dry EXECUTION). Merges the dry-path control blob UNDER the current state (States.JsonMerge(shellDefaults, $, false) — second arg wins) so an explicit per-flag override in the execution input still takes effect (e.g. {\"shell_run\": true, \"skip_backtester\": true} still skips Backtester; {\"shell_run\": true, \"preflight_args\": \"\"} would run the spots full-fat). Mirrors InitializeInput's defaults-under-input JsonMerge pattern exactly. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped: Research (dry_run_llm=true — post-#195 install_dry_run_stubs no-ops archive_writer/email_sender/upload_db/write_signals_json/save_sector_team_run/save_agent_run), DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). DOCUMENTED EXCEPTIONS still hard-skipped via the #258 mechanism (no verified clean no-write dry path): skip_drift_detection (spot_drift_detection.sh has NO --preflight-only flag), skip_eval_judge (submit handler always _persist_client_side_skips + Anthropic Batch create — no handler-level dry param), skip_rationale_clustering (_persist_analysis S3 put_object is NOT gated by dry_run — only the CloudWatch metric is), skip_replay_concordance + skip_counterfactual (alpha-engine-replay-concordance/counterfactual handler source not present in any cloned repo — cannot verify a clean dry path; routing to an unverified one is forbidden). The #258 skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_predictor_training\":true,\"skip_drift_detection\":true,\"skip_backtester\":true,\"skip_parity\":true,\"skip_evaluator\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"preflight_args\":\" --preflight-only\",\"research_dry\":true,\"data_phase2_dry\":true,\"regime_action\":\"dry_run\",\"skip_drift_detection\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipMorningEnrich"
@@ -68,16 +68,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_data_weekly.sh --morning-enrich-only 2>&1 | tee /var/log/morning-enrich.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('bash infrastructure/spot_data_weekly.sh --morning-enrich-only{} 2>&1 | tee /var/log/morning-enrich.log',$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -191,16 +182,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/data-weekly.log \"s3://alpha-engine-research/_ssm_logs/data-weekly/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_data_weekly.sh --phase1-only 2>&1 | tee /var/log/data-weekly.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/data-weekly.log \"s3://alpha-engine-research/_ssm_logs/data-weekly/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('bash infrastructure/spot_data_weekly.sh --phase1-only{} 2>&1 | tee /var/log/data-weekly.log',$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -314,15 +296,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/rag-ingestion.log \"s3://alpha-engine-research/_ssm_logs/rag-ingestion/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_data_weekly.sh --rag-only 2>&1 | tee /var/log/rag-ingestion.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/rag-ingestion.log \"s3://alpha-engine-research/_ssm_logs/rag-ingestion/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('bash infrastructure/spot_data_weekly.sh --rag-only{} 2>&1 | tee /var/log/rag-ingestion.log',$.preflight_args))",
           "executionTimeout": [
             "3600"
           ]
@@ -435,7 +409,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-regime-substrate:live",
         "Payload": {
-          "action": "produce"
+          "action.$": "$.regime_action"
         }
       },
       "TimeoutSeconds": 360,
@@ -489,7 +463,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
         "Payload": {
-          "action": "produce"
+          "action.$": "$.regime_action"
         }
       },
       "TimeoutSeconds": 660,
@@ -551,7 +525,8 @@
                 "FunctionName": "alpha-engine-research-runner:live",
                 "Payload": {
                   "weekly_run": true,
-                  "force": true
+                  "force": true,
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 900,
@@ -622,7 +597,8 @@
               "Parameters": {
                 "FunctionName": "alpha-engine-data-collector:live",
                 "Payload": {
-                  "phase": 2
+                  "phase": 2,
+                  "dry_run.$": "$.data_phase2_dry"
                 }
               },
               "TimeoutSeconds": 600,
@@ -1155,17 +1131,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands": [
-                    "set -eo pipefail",
-                    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
-                    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-                    "sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
-                    "cd /home/ec2-user/alpha-engine-predictor",
-                    "export HOME=/home/ec2-user",
-                    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-                    "trap 'aws s3 cp /var/log/predictor-training.log \"s3://alpha-engine-research/_ssm_logs/predictor-training/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-                    "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
-                  ],
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/predictor-training.log \"s3://alpha-engine-research/_ssm_logs/predictor-training/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('bash infrastructure/spot_train.sh --full-only{} 2>&1 | tee /var/log/predictor-training.log',$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -1440,7 +1406,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator 2>&1 | tee /var/log/backtester.log')"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/backtester.log \"s3://alpha-engine-research/_ssm_logs/backtester/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator{} 2>&1 | tee /var/log/backtester.log',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -1556,7 +1522,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/parity.log \"s3://alpha-engine-research/_ssm_logs/parity/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator 2>&1 | tee /var/log/parity.log')"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/parity.log \"s3://alpha-engine-research/_ssm_logs/parity/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator{} 2>&1 | tee /var/log/parity.log',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -1672,7 +1638,7 @@
           "executionTimeout": [
             "3600"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/evaluator.log \"s3://alpha-engine-research/_ssm_logs/evaluator/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity 2>&1 | tee /var/log/evaluator.log')"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/evaluator.log \"s3://alpha-engine-research/_ssm_logs/evaluator/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{} 2>&1 | tee /var/log/evaluator.log',$.preflight_args))"
         },
         "TimeoutSeconds": 3600
       },

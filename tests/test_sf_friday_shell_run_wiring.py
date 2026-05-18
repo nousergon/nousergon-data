@@ -1,4 +1,4 @@
-"""Pins the Friday-PM `shell_run` spine in the Saturday SF.
+"""Pins the Friday-PM `shell_run` spine + KEYSTONE in the Saturday SF.
 
 Origin: ROADMAP "Scheduled Friday-PM 'shell run' — automated full-fidelity
 preflight of the Saturday SF" (P1, added 2026-05-16). The *prevention* half
@@ -8,15 +8,28 @@ Saturday-SF cascade history: a Saturday-fatal break is discovered only when
 the unattended 02:00 PT Sat run fails, wasting the week's
 research/training/backtest cycle.
 
-The spine is a STRICT SUPERSET of the pre-spine Saturday SF:
+#258 shipped the SPINE (pure-skip every workload via the existing
+Choice-gated skip mechanism). The KEYSTONE (feat/sf-shell-run-keystone)
+replaces pure-skip with dry EXECUTION so the Friday run actually boots +
+exercises the real bootstrap/import/lib-pin/transport paths:
+
+The SF is a STRICT SUPERSET of the pre-spine Saturday SF:
 - A `CheckShellRun` Choice after `InitializeInput`. `shell_run` absent OR
   false → `CheckSkipMorningEnrich` (the pre-spine `InitializeInput.Next`),
-  BYTE-IDENTICAL behaviour to today's real Saturday run.
-- `shell_run=true` → `ApplyShellRunDefaults`, a Pass that merges every
-  `skip_*` flag = true UNDER the execution input (user per-flag overrides
-  still win), then → `CheckSkipMorningEnrich`. Every workload state already
-  has a Choice-gated `skip_*`, so the whole workload no-ops via the EXISTING
-  skip mechanism (no new dry paths added in the spine).
+  BYTE-IDENTICAL behaviour to today's real Saturday run. `InitializeInput`
+  seeds the dry-path control vars at their NON-DRY identity values
+  (`preflight_args=""`, `research_dry=false`, `data_phase2_dry=false`,
+  `regime_action="produce"`) so every spot `States.Format` command string is
+  char-for-char unchanged and every Lambda Payload behaviourally identical.
+- `shell_run=true` → `ApplyShellRunDefaults`, a Pass that merges the
+  dry-path control blob UNDER the execution input (user per-flag overrides
+  still win), then → `CheckSkipMorningEnrich`. The 7 SPOT states boot + run
+  dry via `preflight_args=" --preflight-only"`; the 4 verified-clean LAMBDA
+  states (Research, DataPhase2, RegimeSubstrate, RegimeRetrospectiveEval)
+  run dry via their handler's no-write dry flag; the 5 DOCUMENTED EXCEPTION
+  states with NO verified clean dry path (DriftDetection, EvalJudge,
+  RationaleClustering, ReplayConcordance, Counterfactual) are still hard
+  skipped via the #258 skip_* mechanism (which is LEFT INTACT).
 - A `CheckShellRunNotify` Choice before the success notify. shell_run
   absent/false → the unchanged `NotifyComplete`; shell_run=true →
   `NotifyShellRunComplete` (shell-run-tagged Subject, same SNS substrate).
@@ -26,9 +39,11 @@ This test catches regressions like:
   `CheckSkipMorningEnrich`, silently dropping the shell-run gate.
 - Someone makes `CheckShellRun.Default` anything other than
   `CheckSkipMorningEnrich` (breaks the strict-superset / real-Saturday path).
-- The `ApplyShellRunDefaults` merge order flips so user overrides lose, or a
-  `skip_*` flag is dropped from the defaults blob (a workload state would
-  then RUN under shell_run — a side-effecting Saturday workload on a Friday).
+- The `ApplyShellRunDefaults` merge order flips so user overrides lose.
+- A spot `States.Format` command drifts so `preflight_args=""` no longer
+  produces a byte-identical command (the real Saturday run would change).
+- A documented-exception Lambda gets routed to an unverified dry path, or a
+  verified-clean Lambda silently loses its dry flag.
 - `NotifyComplete` is mutated (the real Saturday SUCCESS email changes).
 - The Friday EventBridge rule is shipped ENABLED, or without shell_run=true,
   or pointed at a different SF.
@@ -50,10 +65,10 @@ _CFN_PATH = (
     / "alpha-engine-orchestration.yaml"
 )
 
-# The complete set of Choice-gated skip flags in the Saturday SF. If a new
-# workload state is added with a new skip_* flag, it MUST be added to
-# ApplyShellRunDefaults too (else that state RUNS under shell_run) — this
-# constant + test_shell_defaults_cover_every_skip_gate enforce that.
+# The complete set of Choice-gated skip flags in the Saturday SF. The #258
+# skip_* gates are LEFT INTACT by the keystone (they remain valid for
+# targeted operator skips) — this constant + test_skip_gates_still_intact
+# enforce that none were deleted.
 _EXPECTED_SKIPS = {
     "skip_morning_enrich",
     "skip_data_phase1",
@@ -72,6 +87,192 @@ _EXPECTED_SKIPS = {
     "skip_parity",
     "skip_evaluator",
 }
+
+# KEYSTONE: the 7 SPOT workload states. Under shell_run they BOOT + run dry
+# via preflight_args=" --preflight-only" (a States.Format suffix); with
+# preflight_args="" (the real Saturday run) the command is byte-identical.
+# Maps state name → (mode token the {} immediately follows, log file).
+_SPOT_STATES = {
+    "MorningEnrich": (
+        "bash infrastructure/spot_data_weekly.sh --morning-enrich-only",
+        "/var/log/morning-enrich.log",
+    ),
+    "DataPhase1": (
+        "bash infrastructure/spot_data_weekly.sh --phase1-only",
+        "/var/log/data-weekly.log",
+    ),
+    "RAGIngestion": (
+        "bash infrastructure/spot_data_weekly.sh --rag-only",
+        "/var/log/rag-ingestion.log",
+    ),
+    "PredictorTraining": (
+        "bash infrastructure/spot_train.sh --full-only",
+        "/var/log/predictor-training.log",
+    ),
+    "Backtester": (
+        "bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator",
+        "/var/log/backtester.log",
+    ),
+    "Parity": (
+        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator",
+        "/var/log/parity.log",
+    ),
+    "Evaluator": (
+        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
+        "/var/log/evaluator.log",
+    ),
+}
+
+# KEYSTONE: the 4 LAMBDA states with a VERIFIED clean no-write dry path.
+# state name → (Payload key carrying the dry flag, input var it references,
+# the dry value ApplyShellRunDefaults sets, the non-dry identity default).
+_DRY_LAMBDA_STATES = {
+    "Research": ("dry_run_llm.$", "$.research_dry"),
+    "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
+    "RegimeSubstrate": ("action.$", "$.regime_action"),
+    "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),
+}
+
+# KEYSTONE: the 5 documented-exception states still HARD-skipped under
+# shell_run (no verified clean no-write dry path — see PR body / the
+# ApplyShellRunDefaults Comment for the per-state reason). These are the
+# ONLY skip_* flags ApplyShellRunDefaults force-sets.
+_KEYSTONE_SKIP_EXCEPTIONS = {
+    "skip_drift_detection",
+    "skip_eval_judge",
+    "skip_rationale_clustering",
+    "skip_replay_concordance",
+    "skip_counterfactual",
+}
+
+# Dry-path control vars + their NON-DRY identity values seeded by
+# InitializeInput (so the absent path is byte-identical / behaviourally
+# identical) and the DRY values ApplyShellRunDefaults overrides them with.
+_CTRL_IDENTITY = {
+    "preflight_args": "",
+    "research_dry": False,
+    "data_phase2_dry": False,
+    "regime_action": "produce",
+}
+_CTRL_DRY = {
+    "preflight_args": " --preflight-only",
+    "research_dry": True,
+    "data_phase2_dry": True,
+    "regime_action": "dry_run",
+}
+
+
+def _eval_intrinsic_args(s: str) -> list[str]:
+    """Split a top-level comma-separated ASL-intrinsic arg list, respecting
+    single-quoted strings, nested parens, and \\' escapes."""
+    args: list[str] = []
+    depth = 0
+    i = 0
+    cur: list[str] = []
+    inq = False
+    while i < len(s):
+        c = s[i]
+        if inq:
+            if c == "\\" and i + 1 < len(s) and s[i + 1] == "'":
+                cur.append("'")
+                i += 2
+                continue
+            if c == "'":
+                inq = False
+                cur.append(c)
+                i += 1
+                continue
+            cur.append(c)
+            i += 1
+            continue
+        if c == "'":
+            inq = True
+            cur.append(c)
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    if cur:
+        args.append("".join(cur).strip())
+    return args
+
+
+def _eval_expr(e: str, ctx: dict):
+    """Resolve the subset of ASL intrinsics the spot commands.$ use:
+    string literals, $.var refs, States.Array(...), States.Format(...)."""
+    e = e.strip()
+    if e.startswith("'") and e.endswith("'"):
+        return e[1:-1].replace("\\'", "'")
+    if e.startswith("$."):
+        return ctx[e[2:]]
+    if e.startswith("States.Array("):
+        inner = e[len("States.Array(") : -1]
+        return [_eval_expr(a, ctx) for a in _eval_intrinsic_args(inner)]
+    if e.startswith("States.Format("):
+        inner = e[len("States.Format(") : -1]
+        parts = _eval_intrinsic_args(inner)
+        tmpl = _eval_expr(parts[0], ctx)
+        subs = [_eval_expr(p, ctx) for p in parts[1:]]
+        out: list[str] = []
+        si = 0
+        i = 0
+        while i < len(tmpl):
+            if tmpl[i : i + 2] == "{}":
+                out.append(str(subs[si]))
+                si += 1
+                i += 2
+            else:
+                out.append(tmpl[i])
+                i += 1
+        return "".join(out)
+    raise AssertionError(f"unhandled intrinsic in spot command: {e[:80]!r}")
+
+
+def _resolve_spot_commands(state: dict, preflight_args: str) -> list[str]:
+    """Resolve a spot state's commands.$ States.Array to the literal list,
+    binding $.preflight_args (and $.run_date for the RUN_DATE export)."""
+    p = state["Parameters"]["Parameters"]
+    assert "commands.$" in p, (
+        "spot state must use commands.$ States.Array (so the final entry "
+        "can be a States.Format interpolating $.preflight_args)"
+    )
+    return _eval_expr(
+        p["commands.$"],
+        {"preflight_args": preflight_args, "run_date": "2026-05-18"},
+    )
+
+
+@pytest.fixture(scope="module")
+def orig_spot_cmds() -> dict:
+    """Frozen pre-keystone (#258 origin/main) RESOLVED spot command lists.
+
+    Captured at commit time into a committed fixture so the byte-identical
+    proof is HERMETIC. The prior implementation shelled out to
+    `git show origin/main:infrastructure/step_function.json` at test time,
+    which fails (exit 128) in CI's shallow PR checkout where `origin/main`
+    is not a local ref — that was the keystone CI failure.
+
+    Regenerate ONLY on a deliberate, reviewed change to a spot state's
+    absent-path (`preflight_args=""`) command, by re-extracting the
+    resolved spot commands from the new `origin/main` SF.
+    """
+    p = _REPO_ROOT / "tests" / "fixtures" / "sf_prekeystone_spot_commands.json"
+    return json.loads(p.read_text())
 
 
 @pytest.fixture(scope="module")
@@ -167,11 +368,18 @@ class TestStrictSuperset:
 
 
 class TestApplyShellRunDefaults:
-    """shell_run=true ⇒ every workload state is no-op'd via the EXISTING
-    skip mechanism, and user per-flag overrides still win."""
+    """shell_run=true ⇒ spots boot dry (--preflight-only), verified-clean
+    Lambdas run dry, only the 5 documented-exception states hard-skip, and
+    user per-flag overrides still win."""
 
     def _merge_expr(self, states) -> str:
         return states["ApplyShellRunDefaults"]["Parameters"]["merged.$"]
+
+    def _blob(self, states) -> dict:
+        expr = self._merge_expr(states)
+        m = re.search(r"StringToJson\('(.+?)'\)", expr)
+        assert m, "could not extract the embedded shell-run defaults blob"
+        return json.loads(m.group(1))
 
     def test_pass_state_routes_into_existing_skip_chain(self, states):
         st = states["ApplyShellRunDefaults"]
@@ -182,32 +390,149 @@ class TestApplyShellRunDefaults:
     def test_user_input_wins_over_shell_defaults(self, states):
         # States.JsonMerge(defaults, $, false) — $ (current state, carrying
         # the user input) MUST be the 2nd arg so an explicit
-        # {"shell_run": true, "skip_research": false} still runs Research.
+        # {"shell_run": true, "skip_backtester": true} still skips it.
         expr = self._merge_expr(states)
         assert expr.startswith("States.JsonMerge(States.StringToJson(")
         assert expr.endswith(",$,false)"), (
             "user input ($) must be the 2nd JsonMerge arg so explicit "
-            "per-flag overrides win over the shell-run skip defaults"
+            "per-flag overrides win over the shell-run defaults"
         )
 
-    def test_shell_defaults_blob_is_valid_json_all_true(self, states):
-        expr = self._merge_expr(states)
-        m = re.search(r"StringToJson\('(.+?)'\)", expr)
-        assert m, "could not extract the embedded skip-defaults JSON blob"
-        blob = json.loads(m.group(1))
-        assert set(blob) == _EXPECTED_SKIPS, set(blob) ^ _EXPECTED_SKIPS
-        assert all(v is True for v in blob.values()), blob
+    def test_shell_defaults_set_dry_control_vars(self, states):
+        """ApplyShellRunDefaults must set every dry-path control var to its
+        DRY value (preflight_args=' --preflight-only' with LEADING space;
+        research/data_phase2 dry true; regime_action 'dry_run')."""
+        blob = self._blob(states)
+        for k, v in _CTRL_DRY.items():
+            assert blob.get(k) == v, (
+                f"shell-run blob {k}={blob.get(k)!r}, expected {v!r}"
+            )
+        assert blob["preflight_args"].startswith(" "), (
+            "preflight_args MUST carry its leading space INSIDE the var so "
+            'the absent-path "" yields a byte-identical spot command'
+        )
 
-    def test_shell_defaults_cover_every_skip_gate(self, states):
-        """Every Choice-gated skip_* in the SF must be force-true'd by
-        shell_run — otherwise that workload state RUNS on a Friday dry-pass
-        (a side-effecting Saturday workload firing on a Friday)."""
+    def test_shell_defaults_skip_ONLY_documented_exceptions(self, states):
+        """The keystone must NOT force all 16 skip_* true (that would pure-
+        skip the workload, defeating the point). It force-sets ONLY the 5
+        documented-exception skips (states with no verified clean dry
+        path)."""
+        blob = self._blob(states)
+        skip_keys = {k for k in blob if k.startswith("skip_")}
+        assert skip_keys == _KEYSTONE_SKIP_EXCEPTIONS, (
+            "ApplyShellRunDefaults skip_* set drifted from the documented "
+            f"exceptions: {skip_keys ^ _KEYSTONE_SKIP_EXCEPTIONS}"
+        )
+        for k in _KEYSTONE_SKIP_EXCEPTIONS:
+            assert blob[k] is True, f"{k} must be force-true'd"
+        # The verified-clean workload states must NOT be skipped (they run
+        # dry) — a regression re-adding e.g. skip_research would silently
+        # demote Research from dry-execution back to pure-skip.
+        for forbidden in (
+            "skip_morning_enrich",
+            "skip_data_phase1",
+            "skip_rag_ingestion",
+            "skip_predictor_training",
+            "skip_backtester",
+            "skip_parity",
+            "skip_evaluator",
+            "skip_research",
+            "skip_data_phase2",
+            "skip_regime_substrate",
+            "skip_regime_retrospective_eval",
+        ):
+            assert forbidden not in blob, (
+                f"{forbidden} must NOT be force-skipped under the keystone "
+                "— that state runs DRY, not skipped"
+            )
+
+    def test_skip_gates_still_intact(self, states):
+        """The keystone LEAVES the #258 Choice-gated skip_* mechanism intact
+        (still valid for targeted operator skips). None deleted."""
         gated = _all_skip_gate_flags(states)
         assert gated == _EXPECTED_SKIPS, (
-            "skip-gate flags drifted from the shell-run defaults blob: "
-            f"{gated ^ _EXPECTED_SKIPS}. Add the new flag to "
-            "ApplyShellRunDefaults (and _EXPECTED_SKIPS) so the new "
-            "workload state no-ops under shell_run."
+            "a Choice-gated skip_* was deleted/added; the keystone keeps "
+            f"the #258 skip mechanism intact: {gated ^ _EXPECTED_SKIPS}"
+        )
+
+    def test_initialize_input_seeds_nondry_identity_defaults(self, states):
+        """InitializeInput must seed every dry-control var at its NON-DRY
+        identity value so the absent path is byte/behaviour-identical and
+        the spot States.Format / Lambda Payload .$ refs always resolve."""
+        expr = states["InitializeInput"]["Parameters"]["merged.$"]
+        m = re.search(r"StringToJson\('(\{[^']*?\})'\)", expr)
+        assert m, "could not extract InitializeInput defaults blob"
+        blob = json.loads(m.group(1))
+        for k, v in _CTRL_IDENTITY.items():
+            assert blob.get(k) == v, (
+                f"InitializeInput {k}={blob.get(k)!r}, expected identity "
+                f"{v!r} (absent path must be byte-identical)"
+            )
+        # The pre-keystone run_date / sns_topic_arn defaults must survive.
+        assert "sns_topic_arn" in blob
+        assert expr.endswith(",$$.Execution.Input,false)")
+
+
+class TestByteIdenticalAbsentPath:
+    """The CORE invariant (#258 established it, the keystone must preserve
+    it): shell_run absent/false ⇒ every spot command string is char-for-
+    char identical to the pre-keystone (origin/main) SF, and every Lambda
+    Payload is behaviourally identical."""
+
+    def _state(self, sf: dict, name: str) -> dict:
+        if name in sf["States"]:
+            return sf["States"][name]
+        # Parallel-branch states (Research/DataPhase2/PredictorTraining).
+        par = sf["States"]["ResearchPredictorParallel"]
+        for br in par["Branches"]:
+            if name in br["States"]:
+                return br["States"][name]
+        raise KeyError(name)
+
+    @pytest.mark.parametrize("name", sorted(_SPOT_STATES))
+    def test_spot_command_byte_identical_when_preflight_args_empty(
+        self, sf, orig_spot_cmds, name
+    ):
+        new_cmds = _resolve_spot_commands(
+            self._state(sf, name), preflight_args=""
+        )
+        orig_cmds = orig_spot_cmds[name]
+        assert new_cmds == orig_cmds, (
+            f"{name}: keystone changed the absent-path command — the real "
+            f"Saturday run would differ.\norig={orig_cmds[-1]!r}\n"
+            f"new ={new_cmds[-1]!r}"
+        )
+
+    @pytest.mark.parametrize("name", sorted(_SPOT_STATES))
+    def test_spot_command_carries_preflight_only_under_shell_run(
+        self, sf, name
+    ):
+        token, log = _SPOT_STATES[name]
+        cmds = _resolve_spot_commands(
+            self._state(sf, name), preflight_args=" --preflight-only"
+        )
+        final = cmds[-1]
+        # {} sits immediately after the mode token (no literal space) so the
+        # leading-space-bearing var produces exactly one separating space.
+        assert final == f"{token} --preflight-only 2>&1 | tee {log}", final
+        assert "  --preflight-only" not in final, "double space — bad join"
+
+    @pytest.mark.parametrize(
+        "name,payload_key,ref", sorted(
+            (n, k, r) for n, (k, r) in _DRY_LAMBDA_STATES.items()
+        )
+    )
+    def test_dry_lambda_payload_references_control_var(
+        self, sf, name, payload_key, ref
+    ):
+        """Verified-clean Lambdas route their dry flag via a $.var ref, so
+        the absent path (control var at non-dry identity) is behaviourally
+        identical and shell_run flips it to the dry value."""
+        st = self._state(sf, name)
+        payload = st["Parameters"]["Payload"]
+        assert payload.get(payload_key) == ref, (
+            f"{name}.Payload[{payload_key}] must be {ref} (so the dry flag "
+            f"follows the control var); got {payload.get(payload_key)!r}"
         )
 
 
@@ -235,14 +560,24 @@ class TestConsolidatedNotify:
 
 
 class TestHappyPathTraversal:
-    """End-to-end: with shell_run=true the SF must reach
-    NotifyShellRunComplete having visited NO workload Task; with shell_run
-    absent it must be the pre-spine path (visits MorningEnrich etc.)."""
+    """End-to-end traversal of the deterministic gates (CheckShellRun +
+    every CheckSkip<State>). Models a Task/Wait/status-Choice as "the
+    workload RUNS, then control proceeds past it" (status checks resolve to
+    their success edge on a green run). Asserts the keystone semantics:
+    under shell_run the 7 spot + 4 dry-Lambda workload gates do NOT skip
+    (their state RUNS dry), the 5 documented-exception gates DO skip, and
+    the run still reaches NotifyShellRunComplete; absent shell_run it is the
+    pre-keystone path."""
 
-    def _trace_main(self, sf, states, shell_run: bool) -> list[str]:
-        inp = {"shell_run": True} if shell_run else {}
-        # ApplyShellRunDefaults force-sets all skips when shell_run=true.
-        skips = set(_EXPECTED_SKIPS) if shell_run else set()
+    def _trace_main(self, sf, states, shell_run: bool) -> tuple:
+        """Returns (visited_state_order, skipped_workload_set). A workload
+        that RUNS is VISITED (appears in order); a skipped workload is NOT
+        (its CheckSkip gate jumps past it)."""
+        # Under shell_run ApplyShellRunDefaults force-sets ONLY the 5
+        # documented-exception skips; all other workload gates fall through
+        # to run the (dry) state.
+        skips = set(_KEYSTONE_SKIP_EXCEPTIONS) if shell_run else set()
+        skipped_workloads: set[str] = set()
         order: list[str] = []
         seen: set[str] = set()
         cur = sf["StartAt"]
@@ -253,29 +588,48 @@ class TestHappyPathTraversal:
             t = st.get("Type")
             if t == "Choice":
                 taken = None
+                success_edge = None
+                failed_guard = False
                 for c in st.get("Choices", []):
-                    conds = c.get("And") or [c]
+                    conds = c.get("And") or c.get("Or") or [c]
                     vars_ = [
                         cc.get("Variable", "").replace("$.", "")
                         for cc in conds
                         if "Variable" in cc
                     ]
-                    # shell_run gate
-                    if vars_ == ["shell_run", "shell_run"] or vars_ == [
-                        "shell_run"
-                    ]:
-                        if inp.get("shell_run") is True:
+                    if vars_ and set(vars_) == {"shell_run"}:
+                        if shell_run:
                             taken = c["Next"]
                             break
                         continue
-                    # skip_* gate
-                    if vars_ and all(v in _EXPECTED_SKIPS for v in vars_):
+                    if vars_ and all(v.startswith("skip_") for v in vars_):
                         if all(v in skips for v in vars_):
+                            # CheckSkip<X>: skip-true → Next (past X);
+                            # Default is the workload X itself, now skipped.
+                            skipped_workloads.add(st.get("Default"))
                             taken = c["Next"]
                             break
                         continue
-                    # status checks (Success edge) — not exercised on the
-                    # all-skip happy path; fall through to Default
+                    # Status-check Choice on a GREEN happy-path trace:
+                    eqs = {
+                        cc.get("StringEquals")
+                        for cc in conds
+                        if "StringEquals" in cc
+                    }
+                    if eqs & {"Success", "OK", "SKIPPED"}:
+                        # success-continuation edge
+                        success_edge = success_edge or c["Next"]
+                    if eqs & {"FAILED", "ERROR"}:
+                        # a FAILED-guard Choice (CheckBranchOutcomes shape):
+                        # on a green run it is NOT taken → Default proceeds.
+                        failed_guard = True
+                    # InProgress/Pending wait-loop edges: ignored (the poll
+                    # resolves to Success on a green run).
+                if taken is None:
+                    if success_edge is not None:
+                        taken = success_edge
+                    elif failed_guard:
+                        taken = st.get("Default")
                 cur = taken if taken else st.get("Default")
             elif t == "Parallel":
                 cur = st.get("Next")
@@ -286,37 +640,53 @@ class TestHappyPathTraversal:
                     order.append("[END]")
                     break
                 cur = st.get("Next")
-        return order
+        return order, skipped_workloads
 
-    def test_shell_run_true_reaches_shell_notify_no_workload(
+    def test_shell_run_true_runs_workloads_dry_skips_only_exceptions(
         self, sf, states
     ):
-        order = self._trace_main(sf, states, shell_run=True)
+        order, skipped = self._trace_main(sf, states, shell_run=True)
         assert order[-1] == "[END]"
+        assert "ApplyShellRunDefaults" in order
         assert "NotifyShellRunComplete" in order
         assert "NotifyComplete" not in order
-        # No side-effecting workload Task visited on the main thread.
-        for forbidden in (
+        # The 7 spot + 2 dry-Lambda main-thread workload states are NOT
+        # skipped — their CheckSkip gate falls through so the (dry) state is
+        # VISITED. (Research/DataPhase2/PredictorTraining live inside the
+        # Parallel and aren't on this main-thread trace; their dry-routing
+        # is asserted by TestByteIdenticalAbsentPath +
+        # test_shell_defaults_skip_ONLY_documented_exceptions.)
+        for ran_dry in (
             "MorningEnrich",
             "DataPhase1",
             "RAGIngestion",
-            "RegimeSubstrate",
             "Backtester",
             "Parity",
             "Evaluator",
+            "RegimeSubstrate",
+            "RegimeRetrospectiveEval",
         ):
-            assert forbidden not in order, (
-                f"{forbidden} ran under shell_run — must be skipped"
+            assert ran_dry in order, (
+                f"{ran_dry} was NOT visited under shell_run — the keystone "
+                "runs it DRY (visited), not skip (jumped past)"
             )
+            assert ran_dry not in skipped, (
+                f"{ran_dry} was skipped under shell_run — keystone runs it "
+                "DRY"
+            )
+        # The documented-exception workload states ARE skipped (jumped
+        # past) — no verified clean dry path.
+        assert "DriftDetection" in skipped
+        assert "DriftDetection" not in order
         # Health/substrate checks DO still run (the bootstrap smoke).
         assert "SaturdayHealthCheck" in order
         assert "WeeklySubstrateHealthCheck" in order
 
-    def test_shell_run_absent_is_pre_spine_path(self, sf, states):
-        order = self._trace_main(sf, states, shell_run=False)
-        # No shell_run ⇒ Default at CheckShellRun ⇒ run the real workload.
+    def test_shell_run_absent_is_pre_keystone_path(self, sf, states):
+        order, skipped = self._trace_main(sf, states, shell_run=False)
         assert "ApplyShellRunDefaults" not in order
         assert "NotifyShellRunComplete" not in order
+        assert not skipped, "nothing skipped when shell_run absent"
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckShellRun",

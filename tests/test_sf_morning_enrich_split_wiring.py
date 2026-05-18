@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.sf_command_utils import extract_commands
+
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
@@ -166,7 +168,10 @@ class TestSsmCommandShape:
     from --data-only to --phase1-only."""
 
     def _commands(self, states, name):
-        return states[name]["Parameters"]["Parameters"]["commands"]
+        # commands.$ States.Array (keystone routed the final launch through
+        # a States.Format($.preflight_args) suffix) — resolve via the
+        # shared helper, which renders the Format element as its template.
+        return extract_commands(states[name])
 
     def test_morning_enrich_invokes_morning_enrich_only(self, states):
         joined = " ".join(self._commands(states, "MorningEnrich"))
