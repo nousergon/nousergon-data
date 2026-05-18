@@ -11,11 +11,24 @@ Two surfaces:
   severity so the caller can hard-fail on definitely-bad rows (negative
   prices, High<Low) while only warning on legitimately-rare-but-possible
   signals (>50% moves on event days, single-day volume spikes).
+- ``validate_feature_record`` — write-time per-record gate for the
+  *non-OHLCV* feature collectors (``collectors/fundamentals.py`` +
+  ``collectors/alternative.py``) that bypass ``builders/daily_append.py``
+  entirely. Same structured-anomaly + per-type-severity contract as
+  ``validate_today_row``, but the field semantics are caller-supplied
+  (a fundamentals row has no High/Low, an analyst-target field has its
+  own non-negative invariant) so the caller passes a small spec rather
+  than the validator hard-coding OHLCV column names. Covers the generic
+  data-corruption surface that is field-agnostic: NaN / inf (always bad —
+  these poison ArcticDB + every downstream mean/zscore), negative values
+  where the field is semantically non-negative, and gross outliers
+  outside a caller-declared sane band.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -36,10 +49,33 @@ ANOMALY_NEGATIVE_OR_ZERO_CLOSE = "negative_or_zero_close"  # default block
 ANOMALY_EXTREME_DAILY_MOVE = "extreme_daily_move"   # default warn
 ANOMALY_ZERO_VOLUME = "zero_volume"                 # default warn
 ANOMALY_VOLUME_SPIKE = "volume_spike"               # default warn
+# Added 2026-05-18 (ROADMAP L1243 residual): the two intra-bar checks
+# validate_today_row did not previously cover.
+ANOMALY_INTRABAR_INCONSISTENT = "intrabar_inconsistent"  # default block
+ANOMALY_NEGATIVE_VOLUME = "negative_volume"         # default block
+
+# ── Feature-collector anomaly catalog (non-OHLCV) ──────────────────────────
+# Used by validate_feature_record for fundamentals.py + alternative.py.
+ANOMALY_NAN_OR_INF = "nan_or_inf"                   # default block
+ANOMALY_NEGATIVE_WHERE_NONNEG = "negative_where_nonneg"  # default block
+ANOMALY_GROSS_OUTLIER = "gross_outlier"             # default warn
 
 DEFAULT_BLOCK_ANOMALY_TYPES: frozenset[str] = frozenset({
     ANOMALY_BAD_OHLC,
     ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
+    ANOMALY_INTRABAR_INCONSISTENT,
+    ANOMALY_NEGATIVE_VOLUME,
+})
+
+# Default block set for the feature collectors. NaN/inf and
+# negative-where-impossible are unambiguous corruption — they poison the
+# ArcticDB feature store + every downstream mean/zscore — so they block by
+# default; a gross outlier may be a legitimate extreme (e.g. a real -300%
+# ROE for a wiped-out firm) so it only warns, mirroring #215's
+# definitely-bad-blocks / rare-but-possible-warns split.
+DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES: frozenset[str] = frozenset({
+    ANOMALY_NAN_OR_INF,
+    ANOMALY_NEGATIVE_WHERE_NONNEG,
 })
 
 ALL_ANOMALY_TYPES: frozenset[str] = frozenset({
@@ -48,6 +84,14 @@ ALL_ANOMALY_TYPES: frozenset[str] = frozenset({
     ANOMALY_EXTREME_DAILY_MOVE,
     ANOMALY_ZERO_VOLUME,
     ANOMALY_VOLUME_SPIKE,
+    ANOMALY_INTRABAR_INCONSISTENT,
+    ANOMALY_NEGATIVE_VOLUME,
+})
+
+ALL_FEATURE_ANOMALY_TYPES: frozenset[str] = frozenset({
+    ANOMALY_NAN_OR_INF,
+    ANOMALY_NEGATIVE_WHERE_NONNEG,
+    ANOMALY_GROSS_OUTLIER,
 })
 
 
@@ -87,6 +131,33 @@ def validate_today_row(
                 "detail": f"High={high:.4f} < Low={low:.4f}",
             })
 
+    # ── 1b. Intra-bar consistency: Low <= Close <= High ───────────────────
+    # (intrabar_inconsistent — default block). bad_ohlc above only checks
+    # High vs Low; a split-day reporting lag or corp-action artifact can
+    # land a Close *outside* the [Low, High] band even when High >= Low,
+    # which poisons every return/vol feature derived from the bar. This is
+    # the first of the two intra-bar checks the ROADMAP L1243 residual
+    # called out as not-yet-covered by validate_today_row.
+    if all(c in today_row.columns for c in ("High", "Low", "Close")):
+        high = row.get("High")
+        low = row.get("Low")
+        close = row.get("Close")
+        if (
+            pd.notna(high)
+            and pd.notna(low)
+            and pd.notna(close)
+            and high >= low  # only meaningful when the H/L band is itself sane
+            and not (low <= close <= high)
+        ):
+            anomalies.append({
+                "type": ANOMALY_INTRABAR_INCONSISTENT,
+                "severity": "block",
+                "detail": (
+                    f"Close={close:.4f} outside [Low={low:.4f}, "
+                    f"High={high:.4f}]"
+                ),
+            })
+
     # ── 2. Zero or negative close (negative_or_zero_close — default block) ──
     if "Close" in today_row.columns:
         close = row.get("Close")
@@ -95,6 +166,20 @@ def validate_today_row(
                 "type": ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
                 "severity": "block",
                 "detail": f"Close={close:.4f}",
+            })
+
+    # ── 2b. Negative volume (negative_volume — default block) ──────────────
+    # The second ROADMAP L1243 residual intra-bar check. The existing
+    # zero_volume check (#4 below) only catches Volume==0; a negative
+    # volume is unambiguously corrupt (no such thing as negative shares
+    # traded) and must hard-fail rather than merely warn.
+    if "Volume" in today_row.columns:
+        vol = row.get("Volume")
+        if pd.notna(vol) and vol < 0:
+            anomalies.append({
+                "type": ANOMALY_NEGATIVE_VOLUME,
+                "severity": "block",
+                "detail": f"Volume={vol:.0f} < 0",
             })
 
     # ── 3. Extreme daily return vs prior close (extreme_daily_move — warn) ──
@@ -150,6 +235,107 @@ def validate_today_row(
                         f"(ratio={ratio:.1f}x > {MAX_VOLUME_SPIKE:.0f}x)"
                     ),
                 })
+
+    return {"ticker": ticker, "anomalies": anomalies}
+
+
+# Field spec for validate_feature_record. ``nonneg`` = the field is
+# semantically non-negative (a negative value is corruption, not a
+# legitimate extreme — e.g. a price target or current ratio). ``lo``/``hi``
+# = the sane band; a value outside it is flagged as a gross outlier (warn
+# by default). ``nonneg``/``lo``/``hi`` are all optional — omit a bound to
+# skip that check for the field. NaN/inf is always checked regardless.
+class FeatureFieldSpec(dict):
+    """Thin dict subclass for self-documenting field specs.
+
+    A spec is just ``{"nonneg": bool, "lo": float, "hi": float}`` with
+    every key optional. Subclassing dict keeps it JSON/`**`-friendly while
+    giving the spec a name at call sites.
+    """
+
+
+def validate_feature_record(
+    record: dict,
+    field_specs: dict[str, dict],
+    ticker: str,
+) -> dict:
+    """Inspect a single non-OHLCV feature record against per-field specs.
+
+    Used by the feature collectors (``fundamentals.py`` +
+    ``alternative.py``) that write feature-source rows bypassing
+    ``builders/daily_append.py``'s ``validate_today_row`` gate. ``record``
+    is the about-to-be-written per-ticker dict (a flat fundamentals dict,
+    or one sub-section of an alternative-data payload). ``field_specs``
+    maps field name → ``{"nonneg": bool, "lo": float, "hi": float}`` (all
+    keys optional). Only keys present in *both* ``record`` and
+    ``field_specs`` are checked; ``None`` values are skipped (the
+    collectors use ``None``/NEUTRAL as a legitimate "no data" sentinel —
+    that's the ok_ratio gate's job, not this validator's).
+
+    Returns the same ``{"ticker", "anomalies": [{"type", "severity",
+    "detail"}, ...]}`` contract as ``validate_today_row`` so the callers
+    reuse the identical block-set / metric wiring.
+
+    Severities are *defaults*; the caller decides final block/warn by
+    consulting its configured block set (see
+    ``DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES``).
+    """
+    anomalies: list[dict] = []
+
+    if not record or not field_specs:
+        return {"ticker": ticker, "anomalies": anomalies}
+
+    for field, spec in field_specs.items():
+        if field not in record:
+            continue
+        val = record[field]
+        if val is None:
+            # Legitimate "no data" sentinel — coverage is the ok_ratio
+            # gate's responsibility, not value-range validation's.
+            continue
+        # Coerce to float for numeric checks; non-numeric (e.g. a string
+        # "rating") is out of scope for value-range validation — skip it.
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+
+        # ── 1. NaN / inf (nan_or_inf — default block) ──────────────────
+        # Unambiguous corruption: a single NaN/inf in ArcticDB poisons
+        # every cross-sectional mean / zscore that touches the column.
+        if math.isnan(num) or math.isinf(num):
+            anomalies.append({
+                "type": ANOMALY_NAN_OR_INF,
+                "severity": "block",
+                "detail": f"{field}={val!r} is NaN/inf",
+            })
+            continue  # further numeric checks on NaN/inf are meaningless
+
+        # ── 2. Negative where non-negative required ────────────────────
+        # (negative_where_nonneg — default block).
+        if spec.get("nonneg") and num < 0:
+            anomalies.append({
+                "type": ANOMALY_NEGATIVE_WHERE_NONNEG,
+                "severity": "block",
+                "detail": f"{field}={num:.6g} < 0 (field declared non-negative)",
+            })
+
+        # ── 3. Gross outlier outside the sane band ─────────────────────
+        # (gross_outlier — default warn; may be a real extreme).
+        lo = spec.get("lo")
+        hi = spec.get("hi")
+        if lo is not None and num < lo:
+            anomalies.append({
+                "type": ANOMALY_GROSS_OUTLIER,
+                "severity": "warn",
+                "detail": f"{field}={num:.6g} < lo={lo:.6g}",
+            })
+        elif hi is not None and num > hi:
+            anomalies.append({
+                "type": ANOMALY_GROSS_OUTLIER,
+                "severity": "warn",
+                "detail": f"{field}={num:.6g} > hi={hi:.6g}",
+            })
 
     return {"ticker": ticker, "anomalies": anomalies}
 

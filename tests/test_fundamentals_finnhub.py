@@ -253,3 +253,120 @@ class TestCollect:
         assert result["status"] == "ok"
         assert result["n_ok"] == 9
         assert result["n_errors"] == 1
+
+
+# ── Write-time value-range gate (ROADMAP L1243, extends #215) ────────────────
+
+
+class TestFundamentalsValueRangeGate:
+    """fundamentals.py writes a feature-source snapshot bypassing
+    builders/daily_append.py's validate_today_row. This gate runs
+    validate_feature_record over each per-ticker dict before the S3
+    write. NaN/inf + negative-where-nonneg block (→ NEUTRAL); a gross
+    outlier (defeated _clip) warns. Mirrors #215's split + env loader."""
+
+    def _good(self):
+        return {"pe_ratio": 1.0, **{k: NEUTRAL[k] for k in NEUTRAL if k != "pe_ratio"}}
+
+    def test_nan_field_is_blocked_and_neutralized(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        bad = dict(self._good())
+        bad["roe"] = float("nan")
+        side_effect = [bad] + [self._good() for _ in range(9)]
+        with patch.object(fundamentals, "_fetch_single_ticker", side_effect=side_effect):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["tickers_quality_blocked"] == 1
+        assert result["quality_anomaly_counts"].get("nan_or_inf") == 1
+        # Blocked ticker counted as an error (NEUTRAL'd, not written).
+        assert result["n_errors"] == 1
+
+    def test_negative_margin_is_blocked(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        bad = dict(self._good())
+        bad["gross_margin"] = -0.2  # declared non-negative
+        side_effect = [bad] + [self._good() for _ in range(9)]
+        with patch.object(fundamentals, "_fetch_single_ticker", side_effect=side_effect):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["tickers_quality_blocked"] == 1
+        assert result["quality_anomaly_counts"].get("negative_where_nonneg") == 1
+
+    def test_gross_outlier_warns_not_blocks(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        bad = dict(self._good())
+        bad["roe"] = 9.9  # well above the hi=1.0 band (a defeated _clip)
+        side_effect = [bad] + [self._good() for _ in range(9)]
+        with patch.object(fundamentals, "_fetch_single_ticker", side_effect=side_effect):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["tickers_quality_blocked"] == 0
+        assert result["tickers_quality_warned"] == 1
+        assert result["quality_anomaly_counts"].get("gross_outlier") == 1
+        assert result["status"] == "ok"
+
+    def test_clean_run_no_quality_anomalies(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        with patch.object(fundamentals, "_fetch_single_ticker", return_value=self._good()):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(5)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["tickers_quality_blocked"] == 0
+        assert result["tickers_quality_warned"] == 0
+        assert result["quality_anomaly_counts"] == {}
+
+    def test_quality_fields_present_in_all_return_paths(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        with patch.object(fundamentals, "_fetch_single_ticker", return_value=self._good()):
+            result = fundamentals.collect(
+                bucket="test", tickers=["AAPL"], run_date="2026-04-25", dry_run=True,
+            )
+        for k in (
+            "tickers_quality_blocked", "tickers_quality_warned",
+            "quality_anomaly_counts", "quality_block_anomaly_types",
+        ):
+            assert k in result
+
+    def test_malformed_block_env_raises(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        monkeypatch.setenv("FUNDAMENTALS_BLOCK_ANOMALY_TYPES", "not-json")
+        with patch.object(fundamentals, "_fetch_single_ticker", return_value=self._good()):
+            with pytest.raises(RuntimeError, match="not valid JSON"):
+                fundamentals.collect(
+                    bucket="test", tickers=["AAPL"],
+                    run_date="2026-04-25", dry_run=True,
+                )
+
+    def test_unknown_block_type_in_env_raises(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        monkeypatch.setenv("FUNDAMENTALS_BLOCK_ANOMALY_TYPES", '["bogus_type"]')
+        with patch.object(fundamentals, "_fetch_single_ticker", return_value=self._good()):
+            with pytest.raises(RuntimeError, match="unknown anomaly types"):
+                fundamentals.collect(
+                    bucket="test", tickers=["AAPL"],
+                    run_date="2026-04-25", dry_run=True,
+                )
+
+    def test_env_can_promote_gross_outlier_to_block(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        monkeypatch.setenv(
+            "FUNDAMENTALS_BLOCK_ANOMALY_TYPES",
+            '["nan_or_inf", "negative_where_nonneg", "gross_outlier"]',
+        )
+        bad = dict(self._good())
+        bad["roe"] = 9.9
+        side_effect = [bad] + [self._good() for _ in range(9)]
+        with patch.object(fundamentals, "_fetch_single_ticker", side_effect=side_effect):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["tickers_quality_blocked"] == 1
+        assert result["quality_anomaly_counts"].get("gross_outlier") == 1

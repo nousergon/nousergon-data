@@ -6,10 +6,17 @@ import pytest
 from validators.price_validator import (
     ANOMALY_BAD_OHLC,
     ANOMALY_EXTREME_DAILY_MOVE,
+    ANOMALY_GROSS_OUTLIER,
+    ANOMALY_INTRABAR_INCONSISTENT,
+    ANOMALY_NAN_OR_INF,
     ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
+    ANOMALY_NEGATIVE_VOLUME,
+    ANOMALY_NEGATIVE_WHERE_NONNEG,
     ANOMALY_VOLUME_SPIKE,
     ANOMALY_ZERO_VOLUME,
     DEFAULT_BLOCK_ANOMALY_TYPES,
+    DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES,
+    validate_feature_record,
     validate_parquet,
     validate_today_row,
 )
@@ -220,7 +227,179 @@ class TestValidateTodayRow:
         # docs should be able to trust that flipping the env to "[]" gives
         # them pure observability mode, while leaving it unset blocks
         # bad_ohlc + negative_or_zero_close.
+        # ROADMAP L1243 residual added the two intra-bar checks
+        # (intrabar_inconsistent + negative_volume) — both unambiguous
+        # corruption, so both block by default alongside the original two.
         assert DEFAULT_BLOCK_ANOMALY_TYPES == frozenset({
             ANOMALY_BAD_OHLC,
             ANOMALY_NEGATIVE_OR_ZERO_CLOSE,
+            ANOMALY_INTRABAR_INCONSISTENT,
+            ANOMALY_NEGATIVE_VOLUME,
+        })
+
+
+class TestValidateTodayRowIntrabarChecks:
+    """ROADMAP L1243 residual: the two intra-bar checks validate_today_row
+    did not previously cover — Close outside [Low, High] and negative
+    volume. Both default-block (unambiguous corruption)."""
+
+    def test_close_above_high_blocks(self):
+        hist = _make_ohlcv()
+        # H/L band itself sane (high>=low) but Close pokes above High.
+        today = _make_today_row(close=105.0, high=101.0, low=99.0)
+        result = validate_today_row(today, hist, "BADCLOSE")
+        anomaly = next(
+            a for a in result["anomalies"]
+            if a["type"] == ANOMALY_INTRABAR_INCONSISTENT
+        )
+        assert anomaly["severity"] == "block"
+
+    def test_close_below_low_blocks(self):
+        hist = _make_ohlcv()
+        today = _make_today_row(close=90.0, high=101.0, low=99.0)
+        result = validate_today_row(today, hist, "BADCLOSE2")
+        types = {a["type"] for a in result["anomalies"]}
+        assert ANOMALY_INTRABAR_INCONSISTENT in types
+
+    def test_close_within_band_clean(self):
+        hist = _make_ohlcv()
+        today = _make_today_row(close=100.0, high=101.0, low=99.0)
+        result = validate_today_row(today, hist, "OK")
+        types = {a["type"] for a in result["anomalies"]}
+        assert ANOMALY_INTRABAR_INCONSISTENT not in types
+
+    def test_intrabar_skipped_when_hl_band_already_bad(self):
+        # When High<Low the bad_ohlc check owns the failure; the intra-bar
+        # check is meaningless against an inverted band, so it should not
+        # also fire (avoids double-counting the same corrupt bar).
+        hist = _make_ohlcv()
+        today = _make_today_row(close=100.0, high=98.0, low=102.0)
+        result = validate_today_row(today, hist, "INVERTED")
+        types = {a["type"] for a in result["anomalies"]}
+        assert ANOMALY_BAD_OHLC in types
+        assert ANOMALY_INTRABAR_INCONSISTENT not in types
+
+    def test_negative_volume_blocks(self):
+        hist = _make_ohlcv()
+        today = _make_today_row(volume=-500)
+        result = validate_today_row(today, hist, "NEGVOL")
+        anomaly = next(
+            a for a in result["anomalies"]
+            if a["type"] == ANOMALY_NEGATIVE_VOLUME
+        )
+        assert anomaly["severity"] == "block"
+
+    def test_zero_volume_still_warns_not_negative(self):
+        # Zero volume keeps its existing warn semantics — the new
+        # negative_volume block must not subsume the zero_volume warn.
+        hist = _make_ohlcv()
+        today = _make_today_row(volume=0)
+        result = validate_today_row(today, hist, "ZEROVOL")
+        types = {a["type"] for a in result["anomalies"]}
+        assert ANOMALY_ZERO_VOLUME in types
+        assert ANOMALY_NEGATIVE_VOLUME not in types
+
+
+class TestValidateFeatureRecord:
+    """ROADMAP L1243 residual: write-time value-range gate for the
+    non-OHLCV feature collectors (fundamentals.py + alternative.py)."""
+
+    SPEC = {
+        "target_price": {"nonneg": True, "lo": 0.0, "hi": 1000.0},
+        "roe": {"lo": -1.0, "hi": 1.0},
+        "rating": {"nonneg": True},  # non-numeric values are skipped
+    }
+
+    def test_clean_record_no_anomalies(self):
+        rec = {"target_price": 150.0, "roe": 0.2, "rating": "Buy"}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        assert result["anomalies"] == []
+        assert result["ticker"] == "AAPL"
+
+    def test_nan_blocks(self):
+        rec = {"target_price": float("nan")}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        anomaly = next(
+            a for a in result["anomalies"] if a["type"] == ANOMALY_NAN_OR_INF
+        )
+        assert anomaly["severity"] == "block"
+
+    def test_inf_blocks(self):
+        rec = {"roe": float("inf")}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        types = {a["type"] for a in result["anomalies"]}
+        assert ANOMALY_NAN_OR_INF in types
+
+    def test_negative_where_nonneg_blocks(self):
+        rec = {"target_price": -5.0}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        anomaly = next(
+            a for a in result["anomalies"]
+            if a["type"] == ANOMALY_NEGATIVE_WHERE_NONNEG
+        )
+        assert anomaly["severity"] == "block"
+
+    def test_negative_allowed_when_not_declared_nonneg(self):
+        # roe legitimately goes negative — only a gross-outlier band
+        # violation should fire, never negative_where_nonneg.
+        rec = {"roe": -0.5}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        assert result["anomalies"] == []
+
+    def test_gross_outlier_warns(self):
+        rec = {"roe": 9.9}  # well above hi=1.0
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        anomaly = next(
+            a for a in result["anomalies"]
+            if a["type"] == ANOMALY_GROSS_OUTLIER
+        )
+        assert anomaly["severity"] == "warn"
+
+    def test_gross_outlier_below_lo_warns(self):
+        rec = {"roe": -9.9}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        types = {a["type"] for a in result["anomalies"]}
+        assert ANOMALY_GROSS_OUTLIER in types
+
+    def test_none_value_skipped(self):
+        # None is the collectors' legitimate "no data" sentinel — coverage
+        # is the ok_ratio gate's job, not value-range validation's.
+        rec = {"target_price": None, "roe": None}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        assert result["anomalies"] == []
+
+    def test_non_numeric_value_skipped(self):
+        rec = {"rating": "Buy"}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        assert result["anomalies"] == []
+
+    def test_field_absent_from_record_skipped(self):
+        result = validate_feature_record({}, self.SPEC, "AAPL")
+        assert result["anomalies"] == []
+
+    def test_field_absent_from_spec_skipped(self):
+        rec = {"unspecified_field": float("nan")}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        # nan_or_inf only checked for spec'd fields — an unspecified field
+        # is out of this validator's contract.
+        assert result["anomalies"] == []
+
+    def test_nan_skips_further_numeric_checks(self):
+        # A NaN on a nonneg field should produce exactly one anomaly
+        # (nan_or_inf), not also negative_where_nonneg / gross_outlier.
+        rec = {"target_price": float("nan")}
+        result = validate_feature_record(rec, self.SPEC, "AAPL")
+        assert len(result["anomalies"]) == 1
+        assert result["anomalies"][0]["type"] == ANOMALY_NAN_OR_INF
+
+    def test_empty_inputs_safe(self):
+        assert validate_feature_record({}, {}, "X")["anomalies"] == []
+        assert validate_feature_record(None, self.SPEC, "X")["anomalies"] == []
+
+    def test_feature_default_block_set_constants(self):
+        # NaN/inf + negative-where-nonneg block by default; gross_outlier
+        # warns (may be a legitimate extreme).
+        assert DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES == frozenset({
+            ANOMALY_NAN_OR_INF,
+            ANOMALY_NEGATIVE_WHERE_NONNEG,
         })
