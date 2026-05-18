@@ -122,14 +122,16 @@ class TestEvaluatorTask:
         # only evaluate.py runs. If a future operator drops --skip-stages
         # the spot will re-run the full 121-min backtest and the split
         # collapses silently.
-        cmds = states["Evaluator"]["Parameters"]["Parameters"]["commands"]
+        from tests.sf_command_utils import extract_commands
+        cmds = extract_commands(states["Evaluator"])
         spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
         assert "--skip-stages=backtest,parity" in spot_cmd
 
     def test_writes_to_evaluator_log(self, states):
         # Tee output into /var/log/evaluator.log so it's distinguishable
         # from /var/log/backtester.log on the spot host.
-        cmds = states["Evaluator"]["Parameters"]["Parameters"]["commands"]
+        from tests.sf_command_utils import extract_commands
+        cmds = extract_commands(states["Evaluator"])
         spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
         assert "/var/log/evaluator.log" in spot_cmd
 

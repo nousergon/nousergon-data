@@ -254,7 +254,8 @@ class TestSsmCommandShape:
     only). The old combined --skip-stages=evaluator must NOT appear."""
 
     def _commands(self, states, name):
-        return states[name]["Parameters"]["Parameters"]["commands"]
+        from tests.sf_command_utils import extract_commands
+        return extract_commands(states[name])
 
     def test_backtester_invokes_backtest_stage_only(self, states):
         joined = " ".join(self._commands(states, "Backtester"))
