@@ -33,9 +33,9 @@
     },
     "ApplyShellRunDefaults": {
       "Type": "Pass",
-      "Comment": "shell_run=true ONLY (keystone — replaces #258's pure-skip with dry EXECUTION). Merges the dry-path control blob UNDER the current state (States.JsonMerge(shellDefaults, $, false) — second arg wins) so an explicit per-flag override in the execution input still takes effect (e.g. {\"shell_run\": true, \"skip_backtester\": true} still skips Backtester; {\"shell_run\": true, \"preflight_args\": \"\"} would run the spots full-fat). Mirrors InitializeInput's defaults-under-input JsonMerge pattern exactly. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped: Research (dry_run_llm=true — post-#195 install_dry_run_stubs no-ops archive_writer/email_sender/upload_db/write_signals_json/save_sector_team_run/save_agent_run), DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). DOCUMENTED EXCEPTIONS still hard-skipped via the #258 mechanism (no verified clean no-write dry path): skip_drift_detection (spot_drift_detection.sh has NO --preflight-only flag), skip_eval_judge (submit handler always _persist_client_side_skips + Anthropic Batch create — no handler-level dry param), skip_rationale_clustering (_persist_analysis S3 put_object is NOT gated by dry_run — only the CloudWatch metric is), skip_replay_concordance + skip_counterfactual (alpha-engine-replay-concordance/counterfactual handler source not present in any cloned repo — cannot verify a clean dry path; routing to an unverified one is forbidden). The #258 skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
+      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire — every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob UNDER the current state (States.JsonMerge(shellDefaults, $, false) — second arg wins) so an explicit per-flag override in the execution input still takes effect (e.g. {\"shell_run\": true, \"skip_backtester\": true} still skips Backtester; {\"shell_run\": true, \"preflight_args\": \"\"} would run the spots full-fat). Mirrors InitializeInput's defaults-under-input JsonMerge pattern exactly. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator, AND DriftDetection) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): Research + the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process — dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). The skip-exception rewire (this PR) flipped the prior 5 skip→dry: DriftDetection now uses the same commands.$/States.Format($.preflight_args) Option-C mechanism as the other spot states (data #261 exposed --preflight-only on spot_drift_detection.sh); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"preflight_args\":\" --preflight-only\",\"research_dry\":true,\"data_phase2_dry\":true,\"regime_action\":\"dry_run\",\"skip_drift_detection\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"preflight_args\":\" --preflight-only\",\"research_dry\":true,\"data_phase2_dry\":true,\"regime_action\":\"dry_run\"}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipMorningEnrich"
@@ -676,7 +676,8 @@
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
                 "Payload": {
                   "force_sonnet_pass": true,
-                  "date.$": "$.eval_cadence.eval_date"
+                  "date.$": "$.eval_cadence.eval_date",
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 300,
@@ -712,7 +713,8 @@
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
                 "Payload": {
                   "force_sonnet_pass": false,
-                  "date.$": "$.eval_cadence.eval_date"
+                  "date.$": "$.eval_cadence.eval_date",
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 300,
@@ -772,7 +774,8 @@
                 "Payload": {
                   "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
                   "submit_iso.$": "$.eval_cadence.submit_iso",
-                  "max_wait_seconds": 21600
+                  "max_wait_seconds": 21600,
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 60,
@@ -833,7 +836,8 @@
                 "FunctionName": "alpha-engine-research-eval-judge-process:live",
                 "Payload": {
                   "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
-                  "plan_s3_key.$": "$.eval_judge_submit.Payload.plan_s3_key"
+                  "plan_s3_key.$": "$.eval_judge_submit.Payload.plan_s3_key",
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 900,
@@ -923,7 +927,8 @@
               "Parameters": {
                 "FunctionName": "alpha-engine-research-rationale-clustering:live",
                 "Payload": {
-                  "end_time_iso.$": "$$.Execution.StartTime"
+                  "end_time_iso.$": "$$.Execution.StartTime",
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 600,
@@ -983,7 +988,8 @@
                     "claude-haiku-4-5"
                   ],
                   "window_days": 56,
-                  "max_artifacts": 150
+                  "max_artifacts": 150,
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 900,
@@ -1040,7 +1046,8 @@
                 "Payload": {
                   "end_time_iso.$": "$$.Execution.StartTime",
                   "window_days": 56,
-                  "max_depth": 3
+                  "max_depth": 3,
+                  "dry_run_llm.$": "$.research_dry"
                 }
               },
               "TimeoutSeconds": 600,
@@ -1346,15 +1353,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "export HOME=/home/ec2-user",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "trap 'aws s3 cp /var/log/drift-detection.log \"s3://alpha-engine-research/_ssm_logs/drift-detection/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash infrastructure/spot_drift_detection.sh 2>&1 | tee /var/log/drift-detection.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','trap \\'aws s3 cp /var/log/drift-detection.log \"s3://alpha-engine-research/_ssm_logs/drift-detection/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT',States.Format('bash infrastructure/spot_drift_detection.sh{} 2>&1 | tee /var/log/drift-detection.log',$.preflight_args))",
           "executionTimeout": [
             "1200"
           ]

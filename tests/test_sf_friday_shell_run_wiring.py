@@ -10,8 +10,11 @@ research/training/backtest cycle.
 
 #258 shipped the SPINE (pure-skip every workload via the existing
 Choice-gated skip mechanism). The KEYSTONE (feat/sf-shell-run-keystone)
-replaces pure-skip with dry EXECUTION so the Friday run actually boots +
-exercises the real bootstrap/import/lib-pin/transport paths:
+replaced pure-skip with dry EXECUTION for all but 5 documented exceptions.
+The SKIP-EXCEPTION REWIRE (feat/sf-rewire-close-skip-exceptions) then
+flipped those last 5 skip→dry, so the Friday run boots + exercises the
+real bootstrap/import/lib-pin/transport paths for EVERY substantive
+workload — ZERO skip-exceptions remain:
 
 The SF is a STRICT SUPERSET of the pre-spine Saturday SF:
 - A `CheckShellRun` Choice after `InitializeInput`. `shell_run` absent OR
@@ -23,13 +26,20 @@ The SF is a STRICT SUPERSET of the pre-spine Saturday SF:
   char-for-char unchanged and every Lambda Payload behaviourally identical.
 - `shell_run=true` → `ApplyShellRunDefaults`, a Pass that merges the
   dry-path control blob UNDER the execution input (user per-flag overrides
-  still win), then → `CheckSkipMorningEnrich`. The 7 SPOT states boot + run
-  dry via `preflight_args=" --preflight-only"`; the 4 verified-clean LAMBDA
-  states (Research, DataPhase2, RegimeSubstrate, RegimeRetrospectiveEval)
-  run dry via their handler's no-write dry flag; the 5 DOCUMENTED EXCEPTION
-  states with NO verified clean dry path (DriftDetection, EvalJudge,
-  RationaleClustering, ReplayConcordance, Counterfactual) are still hard
-  skipped via the #258 skip_* mechanism (which is LEFT INTACT).
+  still win), then → `CheckSkipMorningEnrich`. The 8 SPOT states boot + run
+  dry via `preflight_args=" --preflight-only"` (the rewire added
+  DriftDetection — data #261 exposed `--preflight-only` on
+  spot_drift_detection.sh, converting it from a literal `commands` array to
+  the same `commands.$`/`States.Format($.preflight_args)` Option-C
+  mechanism); the LAMBDA states run dry via their handler's no-write dry
+  flag: Research/DataPhase2/RegimeSubstrate/RegimeRetrospectiveEval from
+  the keystone, PLUS the eval-judge chain
+  (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process), RationaleClustering
+  (research #202), ReplayConcordance + Counterfactual (backtester #225) —
+  all reusing the canonical `$.research_dry` shell-run-dry signal via
+  `dry_run_llm.$`. ZERO skip-exceptions are force-set. The #258
+  Choice-gated skip_* mechanism is LEFT INTACT (still valid for targeted
+  operator skips).
 - A `CheckShellRunNotify` Choice before the success notify. shell_run
   absent/false → the unchanged `NotifyComplete`; shell_run=true →
   `NotifyShellRunComplete` (shell-run-tagged Subject, same SNS substrate).
@@ -88,9 +98,15 @@ _EXPECTED_SKIPS = {
     "skip_evaluator",
 }
 
-# KEYSTONE: the 7 SPOT workload states. Under shell_run they BOOT + run dry
-# via preflight_args=" --preflight-only" (a States.Format suffix); with
-# preflight_args="" (the real Saturday run) the command is byte-identical.
+# KEYSTONE + skip-exception rewire: the 8 SPOT workload states. Under
+# shell_run they BOOT + run dry via preflight_args=" --preflight-only" (a
+# States.Format suffix); with preflight_args="" (the real Saturday run) the
+# command is byte-identical. DriftDetection joined this set in the
+# skip-exception rewire — data #261 added --preflight-only to
+# spot_drift_detection.sh, so it was converted from a literal `commands`
+# array (hard-skipped under shell_run via skip_drift_detection) to the same
+# commands.$/States.Format($.preflight_args) Option-C mechanism the keystone
+# used for the other 7 spots.
 # Maps state name → (mode token the {} immediately follows, log file).
 _SPOT_STATES = {
     "MorningEnrich": (
@@ -121,29 +137,45 @@ _SPOT_STATES = {
         "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
+    "DriftDetection": (
+        "bash infrastructure/spot_drift_detection.sh",
+        "/var/log/drift-detection.log",
+    ),
 }
 
-# KEYSTONE: the 4 LAMBDA states with a VERIFIED clean no-write dry path.
-# state name → (Payload key carrying the dry flag, input var it references,
-# the dry value ApplyShellRunDefaults sets, the non-dry identity default).
+# KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
+# skipped) via an input-var ref so the absent path is behaviourally
+# identical. Research/DataPhase2/Regime* were dry from the keystone; the
+# skip-exception rewire ADDED the eval-judge chain + rationale-clustering
+# (research #202 added dry_run_llm) + replay-concordance + counterfactual
+# (backtester #225 added dry_run_llm) — all reusing the canonical
+# $.research_dry shell-run-dry signal (already true under shell_run / false
+# on the real run). DriftDetection is NOT here — it is a SPOT state (see
+# _SPOT_STATES) routed dry via --preflight-only, not a Lambda dry flag.
+# state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
     "Research": ("dry_run_llm.$", "$.research_dry"),
     "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
     "RegimeSubstrate": ("action.$", "$.regime_action"),
     "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),
+    # Skip-exception rewire — eval-judge chain + agent-justification triple.
+    "EvalJudgeSubmitFirstSaturday": ("dry_run_llm.$", "$.research_dry"),
+    "EvalJudgeSubmitWeekly": ("dry_run_llm.$", "$.research_dry"),
+    "EvalJudgePoll": ("dry_run_llm.$", "$.research_dry"),
+    "EvalJudgeProcess": ("dry_run_llm.$", "$.research_dry"),
+    "RationaleClustering": ("dry_run_llm.$", "$.research_dry"),
+    "ReplayConcordance": ("dry_run_llm.$", "$.research_dry"),
+    "Counterfactual": ("dry_run_llm.$", "$.research_dry"),
 }
 
-# KEYSTONE: the 5 documented-exception states still HARD-skipped under
-# shell_run (no verified clean no-write dry path — see PR body / the
-# ApplyShellRunDefaults Comment for the per-state reason). These are the
-# ONLY skip_* flags ApplyShellRunDefaults force-sets.
-_KEYSTONE_SKIP_EXCEPTIONS = {
-    "skip_drift_detection",
-    "skip_eval_judge",
-    "skip_rationale_clustering",
-    "skip_replay_concordance",
-    "skip_counterfactual",
-}
+# Skip-exception rewire (this PR): ZERO skip-exceptions remain. The
+# keystone's 5 documented hard-skips (skip_drift_detection / skip_eval_judge
+# / skip_rationale_clustering / skip_replay_concordance / skip_counterfactual)
+# were ALL flipped skip→dry — DriftDetection via the spot
+# commands.$/States.Format(--preflight-only) mechanism (data #261), the 6
+# eval Lambdas via dry_run_llm.$=$.research_dry (research #202 +
+# backtester #225). ApplyShellRunDefaults force-sets NO skip_* flag now.
+_KEYSTONE_SKIP_EXCEPTIONS: set[str] = set()
 
 # Dry-path control vars + their NON-DRY identity values seeded by
 # InitializeInput (so the absent path is byte-identical / behaviourally
@@ -412,22 +444,27 @@ class TestApplyShellRunDefaults:
             'the absent-path "" yields a byte-identical spot command'
         )
 
-    def test_shell_defaults_skip_ONLY_documented_exceptions(self, states):
-        """The keystone must NOT force all 16 skip_* true (that would pure-
-        skip the workload, defeating the point). It force-sets ONLY the 5
-        documented-exception skips (states with no verified clean dry
-        path)."""
+    def test_shell_defaults_force_set_ZERO_skip_exceptions(self, states):
+        """Skip-exception rewire: ApplyShellRunDefaults must force-set NO
+        skip_* flag at all. The keystone's 5 documented hard-skips were ALL
+        flipped skip→dry (DriftDetection → spot --preflight-only; the 6 eval
+        Lambdas → dry_run_llm.$=$.research_dry). A regression re-introducing
+        any force-set skip_* would silently demote a substantive workload
+        back to pure-skip — defeating the whole point of the shell run."""
         blob = self._blob(states)
         skip_keys = {k for k in blob if k.startswith("skip_")}
         assert skip_keys == _KEYSTONE_SKIP_EXCEPTIONS, (
-            "ApplyShellRunDefaults skip_* set drifted from the documented "
-            f"exceptions: {skip_keys ^ _KEYSTONE_SKIP_EXCEPTIONS}"
+            "ApplyShellRunDefaults must force-set ZERO skip_* (the "
+            "skip-exception rewire flipped all 5 keystone exceptions to "
+            f"dry); leaked skip_* keys: {skip_keys}"
         )
-        for k in _KEYSTONE_SKIP_EXCEPTIONS:
-            assert blob[k] is True, f"{k} must be force-true'd"
-        # The verified-clean workload states must NOT be skipped (they run
-        # dry) — a regression re-adding e.g. skip_research would silently
-        # demote Research from dry-execution back to pure-skip.
+        assert skip_keys == set(), (
+            f"ZERO skip-exceptions must remain; got {skip_keys}"
+        )
+        # NO workload state may be force-skipped — every substantive task
+        # now runs DRY under shell_run (spots via --preflight-only, Lambdas
+        # via their no-write dry flag). This explicitly includes the 5
+        # previously-excepted states (the rewire's whole purpose).
         for forbidden in (
             "skip_morning_enrich",
             "skip_data_phase1",
@@ -440,10 +477,16 @@ class TestApplyShellRunDefaults:
             "skip_data_phase2",
             "skip_regime_substrate",
             "skip_regime_retrospective_eval",
+            # The 5 ex-keystone skip-exceptions — now run DRY, not skipped.
+            "skip_drift_detection",
+            "skip_eval_judge",
+            "skip_rationale_clustering",
+            "skip_replay_concordance",
+            "skip_counterfactual",
         ):
             assert forbidden not in blob, (
-                f"{forbidden} must NOT be force-skipped under the keystone "
-                "— that state runs DRY, not skipped"
+                f"{forbidden} must NOT be force-skipped — the skip-exception "
+                "rewire runs that state DRY under shell_run, not skipped"
             )
 
     def test_skip_gates_still_intact(self, states):
@@ -563,11 +606,11 @@ class TestHappyPathTraversal:
     """End-to-end traversal of the deterministic gates (CheckShellRun +
     every CheckSkip<State>). Models a Task/Wait/status-Choice as "the
     workload RUNS, then control proceeds past it" (status checks resolve to
-    their success edge on a green run). Asserts the keystone semantics:
-    under shell_run the 7 spot + 4 dry-Lambda workload gates do NOT skip
-    (their state RUNS dry), the 5 documented-exception gates DO skip, and
-    the run still reaches NotifyShellRunComplete; absent shell_run it is the
-    pre-keystone path."""
+    their success edge on a green run). Asserts the skip-exception-rewire
+    semantics: under shell_run EVERY workload gate falls through (its state
+    RUNS dry — including DriftDetection, flipped skip→dry), ZERO
+    skip-exceptions remain, and the run still reaches
+    NotifyShellRunComplete; absent shell_run it is the pre-keystone path."""
 
     def _trace_main(self, sf, states, shell_run: bool) -> tuple:
         """Returns (visited_state_order, skipped_workload_set). A workload
@@ -642,7 +685,7 @@ class TestHappyPathTraversal:
                 cur = st.get("Next")
         return order, skipped_workloads
 
-    def test_shell_run_true_runs_workloads_dry_skips_only_exceptions(
+    def test_shell_run_true_runs_every_workload_dry_zero_skips(
         self, sf, states
     ):
         order, skipped = self._trace_main(sf, states, shell_run=True)
@@ -650,16 +693,19 @@ class TestHappyPathTraversal:
         assert "ApplyShellRunDefaults" in order
         assert "NotifyShellRunComplete" in order
         assert "NotifyComplete" not in order
-        # The 7 spot + 2 dry-Lambda main-thread workload states are NOT
-        # skipped — their CheckSkip gate falls through so the (dry) state is
-        # VISITED. (Research/DataPhase2/PredictorTraining live inside the
-        # Parallel and aren't on this main-thread trace; their dry-routing
-        # is asserted by TestByteIdenticalAbsentPath +
-        # test_shell_defaults_skip_ONLY_documented_exceptions.)
+        # Skip-exception rewire: ZERO main-thread workload states are
+        # skipped — every CheckSkip gate falls through so the (dry) state is
+        # VISITED. This now INCLUDES DriftDetection (flipped skip→dry via
+        # the spot --preflight-only mechanism). (Research/DataPhase2/eval
+        # chain/PredictorTraining live inside the Parallel and aren't on
+        # this main-thread trace; their dry-routing is asserted by
+        # TestByteIdenticalAbsentPath +
+        # test_shell_defaults_force_set_ZERO_skip_exceptions.)
         for ran_dry in (
             "MorningEnrich",
             "DataPhase1",
             "RAGIngestion",
+            "DriftDetection",
             "Backtester",
             "Parity",
             "Evaluator",
@@ -667,17 +713,17 @@ class TestHappyPathTraversal:
             "RegimeRetrospectiveEval",
         ):
             assert ran_dry in order, (
-                f"{ran_dry} was NOT visited under shell_run — the keystone "
+                f"{ran_dry} was NOT visited under shell_run — the rewire "
                 "runs it DRY (visited), not skip (jumped past)"
             )
             assert ran_dry not in skipped, (
-                f"{ran_dry} was skipped under shell_run — keystone runs it "
-                "DRY"
+                f"{ran_dry} was skipped under shell_run — the rewire runs "
+                "it DRY"
             )
-        # The documented-exception workload states ARE skipped (jumped
-        # past) — no verified clean dry path.
-        assert "DriftDetection" in skipped
-        assert "DriftDetection" not in order
+        # ZERO skip-exceptions remain — nothing is jumped past.
+        assert skipped == set(), (
+            f"skip-exception rewire leaves nothing skipped; got {skipped}"
+        )
         # Health/substrate checks DO still run (the bootstrap smoke).
         assert "SaturdayHealthCheck" in order
         assert "WeeklySubstrateHealthCheck" in order

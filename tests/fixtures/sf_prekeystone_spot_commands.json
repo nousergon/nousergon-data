@@ -19,6 +19,15 @@
     "trap 'aws s3 cp /var/log/data-weekly.log \"s3://alpha-engine-research/_ssm_logs/data-weekly/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
     "bash infrastructure/spot_data_weekly.sh --phase1-only 2>&1 | tee /var/log/data-weekly.log"
   ],
+  "DriftDetection": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-data",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "trap 'aws s3 cp /var/log/drift-detection.log \"s3://alpha-engine-research/_ssm_logs/drift-detection/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+    "bash infrastructure/spot_drift_detection.sh 2>&1 | tee /var/log/drift-detection.log"
+  ],
   "Evaluator": [
     "set -eo pipefail",
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
