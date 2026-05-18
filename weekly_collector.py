@@ -1551,6 +1551,15 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alpha Engine Weekly Data Collector")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     parser.add_argument("--dry-run", action="store_true", help="Validate without writing to S3")
+    parser.add_argument(
+        "--preflight-only", dest="preflight_only", action="store_true",
+        help="Run ONLY the entry preflight (DataPreflight: env/secret resolution, "
+             "S3 HEAD, polygon/FRED auth-reachability probes, ArcticDB connect + "
+             "libraries-present read) then exit 0 BEFORE run_weekly(). No collector "
+             "fetch, no S3/ArcticDB/parquet/config write. Friday shell-run dry path "
+             "(ROADMAP 'Friday shell-run — per-module dry-path activation' #1) — "
+             "catches bootstrap-class breakage ~12h before the real Saturday run.",
+    )
     parser.add_argument("--date", default=None, help="Override run date (YYYY-MM-DD)")
     parser.add_argument(
         "--daily", action="store_true",
@@ -1603,6 +1612,28 @@ def main() -> None:
     else:
         mode = f"phase{args.phase or 1}"
     DataPreflight(config["bucket"], mode).run()
+
+    # Friday shell-run dry path (ROADMAP "Friday shell-run — per-module
+    # dry-path activation" owed-item #1). --preflight-only exits HERE,
+    # immediately after the existing DataPreflight has passed and strictly
+    # BEFORE run_weekly(). run_weekly() is the sole function in this module
+    # that performs ANY collector fetch (polygon/FMP/FRED/yfinance) or ANY
+    # S3 / ArcticDB / parquet / config / module-health write — gating in
+    # front of it makes every fetch/write code path statically unreachable
+    # under this flag. The preflight itself only does read-only / auth
+    # probes (S3 HEAD, polygon/FRED reference-data auth calls that fetch no
+    # collector data, ArcticDB list_libraries) plus an S3 PUT+DELETE
+    # sentinel under preflight/ — that sentinel is the preflight's own
+    # liveness probe, not a data write, and it self-cleans. No external
+    # API data is fetched and no production artifact is mutated.
+    if getattr(args, "preflight_only", False):
+        logger.info(
+            "Pre-flight passed; --preflight-only set — exiting 0 before "
+            "run_weekly() (NO collector fetch, NO S3/ArcticDB/config write). "
+            "Friday shell-run dry path: bootstrap-class breakage would have "
+            "surfaced above."
+        )
+        raise SystemExit(0)
 
     results = run_weekly(config, args)
 

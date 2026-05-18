@@ -22,8 +22,16 @@
 # fires flow-doctor.
 #
 # Usage:
-#   bash rag/pipelines/run_weekly_ingestion.sh              # full run
-#   bash rag/pipelines/run_weekly_ingestion.sh --dry-run    # preview only
+#   bash rag/pipelines/run_weekly_ingestion.sh                 # full run
+#   bash rag/pipelines/run_weekly_ingestion.sh --dry-run       # preview only
+#   bash rag/pipelines/run_weekly_ingestion.sh --preflight-only # step 0 only, exit 0
+#
+# --preflight-only (Friday shell-run dry path, ROADMAP "Friday shell-run —
+# per-module dry-path activation" #1): runs ONLY Step 0 (python -m
+# rag.preflight: check_env_vars + check_s3_bucket HEAD — both read-only,
+# zero external API fetch, zero write) then exits 0 BEFORE Step 1
+# (ingest_sec_filings). No ingest_* pipeline, no Voyage embedding call,
+# no Postgres/pgvector write, no manifest emit is reachable under it.
 #
 # Prerequisites (verified by step 0):
 #   - .env with RAG_DATABASE_URL, VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY
@@ -37,9 +45,11 @@ cd "$REPO_ROOT"
 
 # Parse flags
 DRY_RUN=""
+PREFLIGHT_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN="--dry-run" ;;
+        --preflight-only) PREFLIGHT_ONLY=1 ;;
     esac
 done
 
@@ -80,6 +90,20 @@ echo "========================================"
 echo ""
 echo "==> Step 0/9: Preflight checks..."
 $PYTHON_BIN -m rag.preflight
+
+# Friday shell-run dry path: stop HERE, immediately after the existing
+# rag.preflight passed and strictly BEFORE Step 1 (the first ingest
+# pipeline). Every fetch (SEC/Finnhub/yfinance), every Voyage embedding
+# call, and every Postgres/pgvector + parquet write lives in Steps 1-9
+# below — all statically unreachable once we exit here. rag.preflight
+# itself only does check_env_vars + check_s3_bucket (S3 HEAD): read-only,
+# zero external API fetch, zero mutation.
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+    echo ""
+    echo "==> --preflight-only: rag.preflight passed — exiting 0 before Step 1"
+    echo "    (NO ingest, NO embedding, NO Postgres/parquet write)."
+    exit 0
+fi
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
