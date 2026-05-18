@@ -62,13 +62,122 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 
 from alpha_engine_lib.secrets import get_secret
 
+from validators.price_validator import (
+    ALL_FEATURE_ANOMALY_TYPES,
+    DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES,
+    validate_feature_record,
+)
+
 from .finnhub_client import finnhub_get
 
 logger = logging.getLogger(__name__)
+
+# ── Write-time value-range gate (ROADMAP L1243, extends #215) ──────────────
+# fundamentals.py writes a feature-source snapshot to S3 that bypasses
+# builders/daily_append.py's validate_today_row gate entirely. A single
+# corrupt field (NaN from a divide-by-near-zero FCF computation, or a
+# negative gross_margin from a malformed Finnhub payload) silently poisons
+# the predictor feature store + research scoring with no pipeline failure —
+# the exact FMP-zero'd-fundamentals class that already burned ~2 weeks of
+# alpha. Field specs declare the value-range invariant per output field.
+# Clipping (_clip) already bounds the *range*, so the load-bearing residual
+# this gate catches is NaN/inf (clip of NaN propagates NaN) + the
+# structural non-negativity of margin/ratio fields. lo/hi mirror the clip
+# bands so a gross outlier surfaces if a future refactor drops a _clip.
+_FUNDAMENTALS_FIELD_SPECS: dict[str, dict] = {
+    "pe_ratio":           {"lo": -3.0, "hi": 3.0},
+    "pb_ratio":           {"lo": -3.0, "hi": 3.0},
+    "debt_to_equity":     {"lo": -3.0, "hi": 3.0},
+    "revenue_growth_yoy": {"lo": -1.0, "hi": 2.0},
+    "fcf_yield":          {"lo": -0.5, "hi": 0.5},
+    "gross_margin":       {"nonneg": True, "lo": 0.0, "hi": 1.0},
+    "roe":                {"lo": -1.0, "hi": 1.0},
+    "current_ratio":      {"nonneg": True, "lo": 0.0, "hi": 3.0},
+}
+
+
+def _load_fundamentals_block_anomaly_types() -> frozenset[str]:
+    """Read ``FUNDAMENTALS_BLOCK_ANOMALY_TYPES`` env var or fall back.
+
+    Format + validation mirror ``daily_append._load_block_anomaly_types``:
+    a JSON list of feature-anomaly type strings; unknown types raise (a
+    silent typo would let corrupt rows through — NoSilentFails). Empty /
+    unset uses the conservative default (NaN/inf + negative-where-nonneg
+    block; gross_outlier warns).
+    """
+    raw = os.environ.get("FUNDAMENTALS_BLOCK_ANOMALY_TYPES", "").strip()
+    if not raw:
+        return DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"FUNDAMENTALS_BLOCK_ANOMALY_TYPES is not valid JSON: {exc}. "
+            f"Expected a JSON list of feature-anomaly type strings."
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+        raise RuntimeError(
+            f"FUNDAMENTALS_BLOCK_ANOMALY_TYPES must be a JSON list of strings, "
+            f"got {parsed!r}"
+        )
+    unknown = set(parsed) - ALL_FEATURE_ANOMALY_TYPES
+    if unknown:
+        raise RuntimeError(
+            f"FUNDAMENTALS_BLOCK_ANOMALY_TYPES contains unknown anomaly "
+            f"types: {sorted(unknown)}. Known types: "
+            f"{sorted(ALL_FEATURE_ANOMALY_TYPES)}"
+        )
+    return frozenset(parsed)
+
+
+def _emit_quality_gate_metrics(
+    counts_by_type: dict[str, int], n_blocked: int, n_warned: int
+) -> None:
+    """Emit ``AlphaEngine/Data/fundamentals_quality_*`` gauges.
+
+    Best-effort: CloudWatch errors WARN but don't fail the collector — the
+    per-anomaly logger.error calls on the block path are the load-bearing
+    Flow Doctor surface; the metric catches slow drift. Mirrors
+    ``builders.daily_append._emit_quality_gate_metrics``.
+    """
+    if not counts_by_type and n_blocked == 0 and n_warned == 0:
+        return
+    try:
+        import boto3
+
+        cw = boto3.client("cloudwatch")
+        metric_data: list[dict] = [
+            {
+                "MetricName": "fundamentals_quality_blocked_count",
+                "Value": float(n_blocked),
+                "Unit": "Count",
+            },
+            {
+                "MetricName": "fundamentals_quality_warned_count",
+                "Value": float(n_warned),
+                "Unit": "Count",
+            },
+        ]
+        for atype, count in counts_by_type.items():
+            metric_data.append({
+                "MetricName": "fundamentals_quality_anomaly_count",
+                "Dimensions": [{"Name": "anomaly_type", "Value": atype}],
+                "Value": float(count),
+                "Unit": "Count",
+            })
+        cw.put_metric_data(Namespace="AlphaEngine/Data", MetricData=metric_data)
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch fundamentals_quality_* metric failed: %s. Not "
+            "blocking — the per-anomaly logger.error calls are the "
+            "load-bearing Flow Doctor surface.",
+            exc,
+        )
 
 # Minimum fraction of requested tickers that must produce real fundamentals
 # (at least one non-zero field) for the run to be considered OK. Below
@@ -221,13 +330,61 @@ def collect(
     )
     t0 = time.time()
 
+    # Read FUNDAMENTALS_BLOCK_ANOMALY_TYPES once per run (raises on
+    # malformed env — fail fast before fetching).
+    block_anomaly_types = _load_fundamentals_block_anomaly_types()
+
     results: dict[str, dict] = {}
     n_ok = 0
     n_err = 0
+    # Write-time value-range gate accounting (parallels daily_append).
+    n_quality_blocked = 0  # records replaced with NEUTRAL (block severity)
+    n_quality_warned = 0   # records kept but flagged (warn severity)
+    quality_counts_by_type: dict[str, int] = {}
 
     for ticker in tickers:
         try:
             data = _fetch_single_ticker(ticker)
+            # ── Write-time value-range gate ─────────────────────────────
+            # Runs on the fully-shaped (clipped) per-ticker dict before it
+            # is queued for the S3 snapshot. block → drop the corrupt row
+            # to NEUTRAL + logger.error so Flow Doctor surfaces it (a
+            # NaN/inf or negative margin would otherwise poison the
+            # predictor feature store). warn → keep + log + count.
+            qg = validate_feature_record(
+                data, _FUNDAMENTALS_FIELD_SPECS, ticker
+            )
+            blocking = [
+                a for a in qg["anomalies"]
+                if a["type"] in block_anomaly_types
+            ]
+            if blocking:
+                for a in blocking:
+                    # logger.error so FlowDoctorHandler picks it up —
+                    # return-dicts are invisible to it.
+                    logger.error(
+                        "Fundamentals quality gate BLOCK %s.%s: %s",
+                        ticker, a["type"], a["detail"],
+                    )
+                    quality_counts_by_type[a["type"]] = (
+                        quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                n_quality_blocked += 1
+                # Refuse the corrupt row; NEUTRAL is the existing
+                # no-data sentinel the ok_ratio gate already accounts for.
+                results[ticker] = NEUTRAL.copy()
+                n_err += 1
+                continue
+            if qg["anomalies"]:
+                for a in qg["anomalies"]:
+                    logger.warning(
+                        "Fundamentals quality gate WARN %s.%s: %s",
+                        ticker, a["type"], a["detail"],
+                    )
+                    quality_counts_by_type[a["type"]] = (
+                        quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                n_quality_warned += 1
             results[ticker] = data
             if data != NEUTRAL:
                 n_ok += 1
@@ -242,6 +399,20 @@ def collect(
         "Fundamentals fetched in %.1fs: %d populated, %d errors, %d total (ok_ratio=%.1f%%)",
         elapsed, n_ok, n_err, len(results), ok_ratio * 100,
     )
+    if n_quality_blocked or n_quality_warned:
+        logger.info(
+            "Fundamentals quality gate: %d blocked, %d warned, counts=%s",
+            n_quality_blocked, n_quality_warned, quality_counts_by_type,
+        )
+    _emit_quality_gate_metrics(
+        quality_counts_by_type, n_quality_blocked, n_quality_warned
+    )
+    _quality_fields = {
+        "tickers_quality_blocked": n_quality_blocked,
+        "tickers_quality_warned": n_quality_warned,
+        "quality_anomaly_counts": quality_counts_by_type,
+        "quality_block_anomaly_types": sorted(block_anomaly_types),
+    }
 
     if ok_ratio < _MIN_OK_RATIO:
         msg = (
@@ -259,6 +430,7 @@ def collect(
             "n_ok": n_ok,
             "n_errors": n_err,
             "elapsed_seconds": round(elapsed, 1),
+            **_quality_fields,
         }
 
     if dry_run:
@@ -270,6 +442,7 @@ def collect(
             "n_errors": n_err,
             "elapsed_seconds": round(elapsed, 1),
             "dry_run": True,
+            **_quality_fields,
         }
 
     # Write to S3
@@ -290,4 +463,5 @@ def collect(
         "n_errors": n_err,
         "elapsed_seconds": round(elapsed, 1),
         "s3_key": key,
+        **_quality_fields,
     }

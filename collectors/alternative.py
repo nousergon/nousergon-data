@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import threading
 from datetime import date, datetime, timedelta, timezone
@@ -57,7 +58,211 @@ import boto3
 from alpha_engine_lib.secrets import get_secret
 import requests
 
+from validators.price_validator import (
+    ALL_FEATURE_ANOMALY_TYPES,
+    DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES,
+    validate_feature_record,
+)
+
 logger = logging.getLogger(__name__)
+
+
+# ── Write-time value-range gate (ROADMAP L1243, extends #215) ──────────────
+# alternative.collect writes one feature-source JSON per ticker to S3 that
+# bypasses builders/daily_append.py's validate_today_row gate entirely. A
+# corrupt numeric sub-field (a NaN put/call ratio from a 0/0 open-interest
+# divide, a negative analyst price target from a malformed yfinance .info,
+# a negative fund-increasing count) silently degrades the research qual
+# sub-score with no pipeline failure. The per-source ok_ratio gate above
+# only checks *presence* of data, not whether the present values are
+# sane — this gate closes the value-range half.
+#
+# Specs are declared per (source, field). Only numeric, semantically
+# value-constrained fields are listed; free-form / categorical fields
+# (rating string, news article lists) are out of scope for value-range
+# validation. lo/hi bands are deliberately generous — the goal is to
+# catch gross corruption, not to second-guess a legitimately extreme but
+# real metric (gross_outlier warns, never blocks by default).
+_ALT_FIELD_SPECS: dict[str, dict[str, dict]] = {
+    "analyst_consensus": {
+        "target_price": {"nonneg": True, "lo": 0.0, "hi": 1_000_000.0},
+        "num_analysts": {"nonneg": True, "lo": 0.0, "hi": 200.0},
+    },
+    "eps_revision": {
+        # EPS can legitimately be negative (loss-making firms); only flag
+        # absurd magnitudes as a gross outlier.
+        "current_estimate": {"lo": -10_000.0, "hi": 10_000.0},
+        "revision_4w": {"lo": -100_000.0, "hi": 100_000.0},
+    },
+    "options_flow": {
+        "put_call_ratio": {"nonneg": True, "lo": 0.0, "hi": 1_000.0},
+        "iv_rank": {"nonneg": True, "lo": 0.0, "hi": 100.0},
+        "expected_move_pct": {"nonneg": True, "lo": 0.0, "hi": 1_000.0},
+    },
+    "insider_activity": {
+        "net_shares_30d": {"lo": -1e12, "hi": 1e12},
+    },
+    "institutional": {
+        "funds_increasing": {"nonneg": True, "lo": 0.0, "hi": 100_000.0},
+        "funds_decreasing": {"nonneg": True, "lo": 0.0, "hi": 100_000.0},
+    },
+}
+
+
+def _load_alt_block_anomaly_types() -> frozenset[str]:
+    """Read ``ALT_BLOCK_ANOMALY_TYPES`` env var or fall back to defaults.
+
+    Format + validation mirror ``fundamentals._load_fundamentals_block_anomaly_types``
+    and ``daily_append._load_block_anomaly_types``: a JSON list of
+    feature-anomaly type strings; unknown types raise (NoSilentFails).
+    """
+    raw = os.environ.get("ALT_BLOCK_ANOMALY_TYPES", "").strip()
+    if not raw:
+        return DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"ALT_BLOCK_ANOMALY_TYPES is not valid JSON: {exc}. "
+            f"Expected a JSON list of feature-anomaly type strings."
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+        raise RuntimeError(
+            f"ALT_BLOCK_ANOMALY_TYPES must be a JSON list of strings, "
+            f"got {parsed!r}"
+        )
+    unknown = set(parsed) - ALL_FEATURE_ANOMALY_TYPES
+    if unknown:
+        raise RuntimeError(
+            f"ALT_BLOCK_ANOMALY_TYPES contains unknown anomaly types: "
+            f"{sorted(unknown)}. Known types: "
+            f"{sorted(ALL_FEATURE_ANOMALY_TYPES)}"
+        )
+    return frozenset(parsed)
+
+
+def _validate_alt_payload(
+    payload: dict, ticker: str, block_anomaly_types: frozenset[str]
+) -> tuple[list[dict], list[dict]]:
+    """Run validate_feature_record over each spec'd sub-section of an
+    alternative-data payload.
+
+    Returns ``(blocking, warning)`` anomaly lists (each anomaly dict gains
+    a ``source`` key so the caller can log which sub-section failed).
+    """
+    blocking: list[dict] = []
+    warning: list[dict] = []
+    for source, specs in _ALT_FIELD_SPECS.items():
+        section = payload.get(source)
+        if not isinstance(section, dict):
+            continue
+        qg = validate_feature_record(section, specs, ticker)
+        for a in qg["anomalies"]:
+            a = {**a, "source": source}
+            if a["type"] in block_anomaly_types:
+                blocking.append(a)
+            else:
+                warning.append(a)
+    return blocking, warning
+
+
+def _emit_quality_gate_metrics(
+    counts_by_type: dict[str, int], n_blocked: int, n_warned: int
+) -> None:
+    """Emit ``AlphaEngine/Data/alternative_quality_*`` gauges.
+
+    Best-effort: CloudWatch errors WARN but don't fail the collector.
+    Mirrors ``builders.daily_append._emit_quality_gate_metrics`` and
+    ``fundamentals._emit_quality_gate_metrics``.
+    """
+    if not counts_by_type and n_blocked == 0 and n_warned == 0:
+        return
+    try:
+        cw = boto3.client("cloudwatch")
+        metric_data: list[dict] = [
+            {
+                "MetricName": "alternative_quality_blocked_count",
+                "Value": float(n_blocked),
+                "Unit": "Count",
+            },
+            {
+                "MetricName": "alternative_quality_warned_count",
+                "Value": float(n_warned),
+                "Unit": "Count",
+            },
+        ]
+        for atype, count in counts_by_type.items():
+            metric_data.append({
+                "MetricName": "alternative_quality_anomaly_count",
+                "Dimensions": [{"Name": "anomaly_type", "Value": atype}],
+                "Value": float(count),
+                "Unit": "Count",
+            })
+        cw.put_metric_data(Namespace="AlphaEngine/Data", MetricData=metric_data)
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch alternative_quality_* metric failed: %s. Not "
+            "blocking — the per-anomaly logger.error calls are the "
+            "load-bearing Flow Doctor surface.",
+            exc,
+        )
+
+
+# ── EDGAR local data dir → /tmp (Lambda read-only $HOME) ───────────────────
+#
+# edgartools (the ``edgar`` package, used by _fetch_institutional for 13F
+# data) writes its local data + HTTP response cache under a root directory
+# that defaults to ``~/.edgar`` (and ``~/.edgar/_tcache`` for the httpx
+# cache). In the DataPhase2 Lambda sandbox ``$HOME`` (``/home/sbx_user1051``)
+# is a read-only filesystem — only ``/tmp`` is writable — so every edgar
+# call raised ``[Errno 30] Read-only file system`` on 2026-05-17, leaving
+# the institutional source 0/33 populated and breaching the per-source
+# populated-ratio gate (``institutional`` threshold 0.20) → DataPhase2
+# returned ``{"status": "ERROR"}``.
+#
+# edgartools resolves ``EDGAR_LOCAL_DATA_DIR`` at *call time* (verified
+# against installed edgartools 5.28.2: edgar.paths.get_data_directory ->
+# os.getenv(ENV_EDGAR_DATA_DIR); edgar.httpclient.get_cache_directory ->
+# get_edgar_data_directory()/"_tcache"). Setting it before any
+# ``from edgar import ...`` / ``Company(...)`` runs is therefore effective,
+# and the env var alone redirects both the data dir and the _tcache HTTP
+# cache (the path that failed) — no ``$HOME`` override is required. We only
+# set it if unset so an operator-provided value still wins.
+_EDGAR_TMP_DATA_DIR = "/tmp/edgar"
+if not os.environ.get("EDGAR_LOCAL_DATA_DIR"):
+    try:
+        os.makedirs(_EDGAR_TMP_DATA_DIR, exist_ok=True)
+        os.environ["EDGAR_LOCAL_DATA_DIR"] = _EDGAR_TMP_DATA_DIR
+    except OSError as _e:  # pragma: no cover - /tmp is writable on Lambda
+        logger.warning("Could not prepare EDGAR_LOCAL_DATA_DIR: %s", _e)
+
+
+# ── Generic URL-credential scrubber ────────────────────────────────────────
+#
+# requests.exceptions.HTTPError embeds the full request URL — including any
+# ``apikey=``/``api_key=``/``token=`` querystring credential — in its
+# ``str()`` representation. The FMP-backed warnings (e.g. "EPS estimate
+# failed for AFL: 402 ... ?apikey=<KEY>&...") and Finnhub-backed warnings
+# (``token=<KEY>``) would leak the live credential to CloudWatch. Every
+# exception-logging site in this file that can carry an HTTP fetch URL
+# routes the exception through this scrubber before logging. It is a no-op
+# on strings without a matching querystring fragment (idempotent).
+#
+# Mirrors collectors/daily_closes._scrub_api_key (FRED-specific, masks only
+# ``api_key=``); kept local here because that helper is too narrow for the
+# FMP ``apikey=`` / Finnhub ``token=`` shapes and importing it would couple
+# two unrelated collectors.
+_URL_CRED_RE = re.compile(r"(?i)(api_?key|apikey|token)=[^&\s'\"]+")
+
+
+def _scrub_url_creds(msg: object) -> str:
+    """Mask ``apikey=``/``api_key=``/``token=`` querystring secrets.
+
+    Accepts an exception object or any value; stringifies then masks.
+    No-op (returns the input string unchanged) when no credential
+    fragment is present, and idempotent on already-scrubbed strings.
+    """
+    return _URL_CRED_RE.sub(lambda m: f"{m.group(1)}=***", str(msg))
 
 
 # ── Per-source populated-ratio gate ──────────────────────────────────────────
@@ -295,9 +500,18 @@ def collect(
             "ticker_list": tickers[:10],
         }
 
+    # Read ALT_BLOCK_ANOMALY_TYPES once per run (raises on malformed env —
+    # fail fast before fetching).
+    block_anomaly_types = _load_alt_block_anomaly_types()
+
     succeeded = 0
     failed = 0
     errors = []
+    # Write-time value-range gate accounting (parallels daily_append +
+    # fundamentals).
+    n_quality_blocked = 0
+    n_quality_warned = 0
+    quality_counts_by_type: dict[str, int] = {}
     # Per-source populated counts. Increment only when the source for
     # this ticker carried real (non-default) data — see _HAS_DATA_PREDICATES
     # commentary above for the silent-fail surface this protects against.
@@ -311,6 +525,49 @@ def collect(
     for ticker in tickers:
         try:
             data = _fetch_all_alternative(ticker, run_date, bucket)
+            # ── Write-time value-range gate ─────────────────────────────
+            # Runs on the assembled per-ticker payload before the S3
+            # write. A block-severity anomaly (NaN/inf or
+            # negative-where-impossible in a numeric feature sub-field)
+            # refuses the whole ticker write — a corrupt sub-section would
+            # otherwise silently degrade the research qual sub-score. The
+            # ticker is then accounted exactly like a fetch failure so the
+            # existing failed/errors + ok_ratio machinery surfaces it.
+            blocking, warning = _validate_alt_payload(
+                data, ticker, block_anomaly_types
+            )
+            if blocking:
+                for a in blocking:
+                    # logger.error so FlowDoctorHandler picks it up.
+                    logger.error(
+                        "Alternative quality gate BLOCK %s.%s.%s: %s",
+                        ticker, a["source"], a["type"], a["detail"],
+                    )
+                    quality_counts_by_type[a["type"]] = (
+                        quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                n_quality_blocked += 1
+                failed += 1
+                errors.append({
+                    "ticker": ticker,
+                    "error": (
+                        "value-range gate blocked: "
+                        + "; ".join(
+                            f"{a['source']}.{a['type']}" for a in blocking
+                        )
+                    ),
+                })
+                continue
+            if warning:
+                for a in warning:
+                    logger.warning(
+                        "Alternative quality gate WARN %s.%s.%s: %s",
+                        ticker, a["source"], a["type"], a["detail"],
+                    )
+                    quality_counts_by_type[a["type"]] = (
+                        quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                n_quality_warned += 1
             key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
             s3.put_object(
                 Bucket=bucket,
@@ -326,8 +583,24 @@ def collect(
             logger.info("Alternative data: %s -> s3://%s/%s", ticker, bucket, key)
         except Exception as e:
             failed += 1
-            errors.append({"ticker": ticker, "error": str(e)})
-            logger.warning("Alternative data failed for %s: %s", ticker, e)
+            scrubbed = _scrub_url_creds(e)
+            errors.append({"ticker": ticker, "error": scrubbed})
+            logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
+
+    if n_quality_blocked or n_quality_warned:
+        logger.info(
+            "Alternative quality gate: %d blocked, %d warned, counts=%s",
+            n_quality_blocked, n_quality_warned, quality_counts_by_type,
+        )
+    _emit_quality_gate_metrics(
+        quality_counts_by_type, n_quality_blocked, n_quality_warned
+    )
+    _quality_fields = {
+        "tickers_quality_blocked": n_quality_blocked,
+        "tickers_quality_warned": n_quality_warned,
+        "quality_anomaly_counts": quality_counts_by_type,
+        "quality_block_anomaly_types": sorted(block_anomaly_types),
+    }
 
     # ── Per-source ok_ratio gate ────────────────────────────────────────────
     # Mirrors `fundamentals.py::_MIN_OK_RATIO` and
@@ -385,6 +658,7 @@ def collect(
         "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
         "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
+        **_quality_fields,
     }
     manifest_key = f"{s3_prefix}weekly/{run_date}/alternative/manifest.json"
     s3.put_object(
@@ -420,6 +694,7 @@ def collect(
             "source_min_ok_ratios": min_ok_ratios,
             "breached_sources": [src for src, _, _ in breached],
             "errors": errors[:20],
+            **_quality_fields,
         }
 
     status = "ok" if failed == 0 else "partial"
@@ -436,6 +711,7 @@ def collect(
         "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
         "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
+        **_quality_fields,
     }
 
 
@@ -637,7 +913,7 @@ def _fetch_analyst(ticker: str) -> dict:
                     result["rating"] = "Hold"
                 result["num_analysts"] = total
     except Exception as e:
-        logger.warning("Finnhub recommendation failed for %s: %s", ticker, e)
+        logger.warning("Finnhub recommendation failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # Finnhub historical earnings surprises: list of {actual, estimate,
     # surprise, surprisePercent, period, quarter, symbol, year}, most
@@ -661,7 +937,7 @@ def _fetch_analyst(ticker: str) -> dict:
                 })
             result["earnings_surprises"] = surprises
     except Exception as e:
-        logger.warning("Finnhub earnings failed for %s: %s", ticker, e)
+        logger.warning("Finnhub earnings failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # yfinance Ticker.info: ``targetMeanPrice`` is the consensus price target;
     # ``numberOfAnalystOpinions`` is the count of analysts covering the name
@@ -681,7 +957,7 @@ def _fetch_analyst(ticker: str) -> dict:
             if n is not None:
                 result["num_analysts"] = int(n)
     except Exception as e:
-        logger.warning("yfinance target_price failed for %s: %s", ticker, e)
+        logger.warning("yfinance target_price failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
 
@@ -709,7 +985,7 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
                 or data[0].get("estimatedEpsAvg")
             )
     except Exception as e:
-        logger.warning("EPS estimate failed for %s: %s", ticker, e)
+        logger.warning("EPS estimate failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # Load prior snapshot for revision comparison
     try:
@@ -834,7 +1110,7 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
     except ImportError:
         logger.debug("yfinance/numpy not available for options data")
     except Exception as e:
-        logger.warning("Options fetch failed for %s: %s", ticker, e)
+        logger.warning("Options fetch failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
 
@@ -970,7 +1246,7 @@ def _fetch_institutional(ticker: str) -> dict:
                             elif current_value < prev_value:
                                 n_decreasing += 1
         except Exception as e:
-            logger.warning("13F comparison failed for %s: %s", ticker, e)
+            logger.warning("13F comparison failed for %s: %s", ticker, _scrub_url_creds(e))
 
         result["funds_increasing"] = n_accumulating
         result["funds_decreasing"] = n_decreasing
@@ -979,7 +1255,7 @@ def _fetch_institutional(ticker: str) -> dict:
     except ImportError:
         logger.debug("edgartools not available for 13F data")
     except Exception as e:
-        logger.warning("Institutional fetch failed for %s: %s", ticker, e)
+        logger.warning("Institutional fetch failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
 
@@ -1017,7 +1293,7 @@ def _fetch_news(ticker: str) -> dict:
     except ImportError:
         logger.debug("feedparser not available for news")
     except Exception as e:
-        logger.warning("Yahoo RSS failed for %s: %s", ticker, e)
+        logger.warning("Yahoo RSS failed for %s: %s", ticker, _scrub_url_creds(e))
 
     # EDGAR 8-K
     try:
@@ -1039,6 +1315,6 @@ def _fetch_news(ticker: str) -> dict:
                 "form_type": src.get("form_type", "8-K"),
             })
     except Exception as e:
-        logger.warning("EDGAR 8-K failed for %s: %s", ticker, e)
+        logger.warning("EDGAR 8-K failed for %s: %s", ticker, _scrub_url_creds(e))
 
     return result
