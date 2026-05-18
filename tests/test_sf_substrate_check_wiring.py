@@ -71,7 +71,16 @@ class TestChainOrdering:
         )
 
     def test_wait_for_substrate_routes_to_notify_complete(self, states):
-        assert states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "NotifyComplete"
+        # Post Friday-PM shell-run spine (feat/sf-friday-shell-run): the
+        # success edge is gated through CheckShellRunNotify so a Friday
+        # dry-pass gets a shell-run-tagged email. The gate's Default is the
+        # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
+        # input) still ends at NotifyComplete — strict superset preserved.
+        assert (
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckShellRunNotify"
+        )
+        assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
 
 
 class TestCatchSemantics:

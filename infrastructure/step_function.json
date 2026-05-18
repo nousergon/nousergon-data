@@ -9,6 +9,35 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "CheckShellRun"
+    },
+    "CheckShellRun": {
+      "Type": "Choice",
+      "Comment": "Friday-PM 'shell run' gate (ROADMAP 'Scheduled Friday-PM shell run', spine landed feat/sf-friday-shell-run). Input {\"shell_run\": true} (supplied by the DISABLED-by-default Friday EventBridge rule alpha-engine-friday-shell-run) routes to ApplyShellRunDefaults, which layers every skip_* flag = true UNDER the user input so the entire Saturday workload is no-op'd via the EXISTING Choice-gated skip mechanism (zero new dry paths added in the spine). shell_run absent OR false routes straight to CheckSkipMorningEnrich — BYTE-IDENTICAL to the pre-spine Saturday run (this is a strict superset; the real Sat 02:00 PT firing passes no shell_run, so this Choice always takes Default for it). Per-module --preflight-only/--dry-run paths (so spots boot + smoke instead of skip) are scoped follow-on PRs per the ROADMAP owed-work — NOT in this spine.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.shell_run",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.shell_run",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ApplyShellRunDefaults"
+        }
+      ],
+      "Default": "CheckSkipMorningEnrich"
+    },
+    "ApplyShellRunDefaults": {
+      "Type": "Pass",
+      "Comment": "shell_run=true ONLY. Merges every skip_* flag = true UNDER the current state (States.JsonMerge(shellDefaults, $, false) — second arg wins) so an explicit per-flag override in the execution input still takes effect (e.g. {\"shell_run\": true, \"skip_research\": false} still runs Research). Mirrors InitializeInput's defaults-under-input JsonMerge pattern exactly. Every workload state in the Saturday SF already has a Choice-gated skip_* (verified: morning_enrich, data_phase1, rag_ingestion, regime_substrate, regime_retrospective_eval, research, data_phase2, eval_judge, rationale_clustering, replay_concordance, counterfactual, predictor_training, drift_detection, backtester, parity, evaluator) so with all 16 true the SF traverses InitializeInput → (skip every workload) → SaturdayHealthCheck → WeeklySubstrateHealthCheck → Notify. The two health-check states have NO skip gate by design — they are read-only input-freshness / substrate scans and are exactly the kind of bootstrap/transport check the shell run wants exercised Friday PM (their shell_run-aware missing-Friday-bar tolerance is ROADMAP owed-work item 5, a scoped follow-on).",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_predictor_training\":true,\"skip_drift_detection\":true,\"skip_backtester\":true,\"skip_parity\":true,\"skip_evaluator\":true}'),$,false)"
+      },
+      "OutputPath": "$.merged",
       "Next": "CheckSkipMorningEnrich"
     },
     "CheckSkipMorningEnrich": {
@@ -1859,7 +1888,39 @@
         }
       ],
       "ResultPath": "$.substrate_check_poll",
-      "Next": "NotifyComplete"
+      "Next": "CheckShellRunNotify"
+    },
+    "CheckShellRunNotify": {
+      "Type": "Choice",
+      "Comment": "Consolidated Friday-PM shell-run result notify. Reuses the EXISTING NotifyComplete SNS-publish substrate (same alpha-engine-alerts topic, same arn:aws:states:::sns:publish Resource) with a shell_run-tagged Subject/Message so the operator can tell a Friday dry-pass result apart from a real Saturday SUCCESS in their inbox. shell_run absent/false \u2192 NotifyComplete (BYTE-IDENTICAL to pre-spine). shell_run=true \u2192 NotifyShellRunComplete. No new SNS topic / Lambda / infra \u2014 the consolidated per-state pass/fail report (ROADMAP design point 5) is a scoped follow-on; the spine delivers a single shell-run-tagged success signal by reusing NotifyComplete's pattern.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.shell_run",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.shell_run",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyShellRunComplete"
+        }
+      ],
+      "Default": "NotifyComplete"
+    },
+    "NotifyShellRunComplete": {
+      "Type": "Task",
+      "Comment": "Friday-PM shell-run success notification via SNS. Mirrors NotifyComplete exactly (same topic, Resource, ResultPath, End) with a SHELL RUN-tagged Subject so a green Friday dry-pass is distinguishable from a real Saturday SUCCESS. A FAILED shell run still routes through the unchanged HandleFailure (a 'FAILED' alert whose execution timestamp/ID is clearly the Friday run is still the actionable signal the operator needs inside the Friday fix window \u2014 re-pointing HandleFailure's 20 inbound edges to a shell-run variant was deliberately NOT done: high churn, zero added operator value, and it would perturb the real Saturday failure path's risk surface).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 SHELL RUN PASSED (Friday dry-pass)",
+        "Message": "Friday-PM shell run of the Saturday pipeline completed: all workload states no-op'd via shell_run, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. Check dashboard / execution history for per-state detail."
+      },
+      "ResultPath": "$.notify_result",
+      "End": true
     },
     "NotifyComplete": {
       "Type": "Task",

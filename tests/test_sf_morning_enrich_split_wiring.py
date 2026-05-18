@@ -66,9 +66,19 @@ class TestChainOrdering:
     CheckSkipDataPhase1 → DataPhase1 (existing downstream unchanged)."""
 
     def test_initialize_input_routes_to_morning_enrich_skipgate(self, states):
-        assert states["InitializeInput"]["Next"] == "CheckSkipMorningEnrich", (
-            "InitializeInput must hand off to the MorningEnrich skip-gate "
-            "first — MorningEnrich precedes DataPhase1 post-split."
+        # Post Friday-PM shell-run spine (feat/sf-friday-shell-run):
+        # InitializeInput now hands off to the CheckShellRun gate, whose
+        # Default is the pre-spine target CheckSkipMorningEnrich. The real
+        # Saturday run (no shell_run input) therefore still reaches the
+        # MorningEnrich skip-gate first — MorningEnrich still precedes
+        # DataPhase1. Strict superset: shell_run absent ⇒ unchanged.
+        assert states["InitializeInput"]["Next"] == "CheckShellRun", (
+            "InitializeInput must hand off to the shell-run gate, whose "
+            "Default preserves the pre-spine MorningEnrich skip-gate path."
+        )
+        assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich", (
+            "CheckShellRun.Default must be CheckSkipMorningEnrich so the "
+            "real Saturday run is byte-identical pre-spine."
         )
 
     def test_skip_morning_enrich_default_runs_morning_enrich(self, states):
