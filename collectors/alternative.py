@@ -965,48 +965,130 @@ def _fetch_analyst(ticker: str) -> dict:
 # ---- 2. EPS revisions ----
 
 def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
-    """Fetch current EPS estimate and compute revision vs prior week."""
+    """Fetch current EPS estimate and compute the ~4-week estimate revision.
+
+    Source: yfinance ``Ticker.eps_trend`` (migrated 2026-05-18 off the FMP
+    ``analyst-estimates`` endpoint, which began returning 402 Payment Required
+    on the free tier ~2026-05-17 — paid-tier only — collapsing this source to
+    ~15%% populated and breaching DataPhase2's per-source populated-ratio gate
+    (``eps_revision`` floor 0.50). yfinance is already the integrated provider
+    for ``target_price``/``options_flow`` in this module, so the
+    auth/availability/idiom precedent is established).
+
+    ``eps_trend`` is itself a revision series: a DataFrame indexed by period
+    (``0q``/``+1q``/``0y``/``+1y``) with columns ``current``, ``7daysAgo``,
+    ``30daysAgo``, ``60daysAgo``, ``90daysAgo`` (consensus-mean EPS estimate
+    snapshots taken at those lookbacks).
+
+    Return contract (UNCHANGED — ``_has_revision_data`` and all downstream
+    consumers key off ``current_estimate``):
+
+    * ``current_estimate`` — the ``0y`` (current fiscal year) row's
+      ``current`` column. The annual row mirrors the prior FMP
+      ``period="annual"`` choice so the field's semantics are unchanged.
+    * ``revision_4w`` — percent change of the consensus annual EPS estimate
+      over the trailing ~4 weeks, i.e.
+      ``(current - 30daysAgo) / abs(30daysAgo) * 100`` on the ``0y`` row
+      (same semantic as the prior FMP path's "estimate now vs ~30d ago",
+      but sourced from yfinance's own 30-day-ago snapshot instead of a
+      week-old S3 archive — which removes the prior dependency on a
+      ``archive/revisions/{date}.json`` snapshot that is never written
+      anywhere in this codebase, so the old path was effectively dead).
+    * ``streak`` — count of consecutive non-negative steps in the ``0y``
+      annual estimate walking newest→oldest across
+      ``current → 7daysAgo → 30daysAgo → 60daysAgo → 90daysAgo`` (i.e. a
+      "consecutive weeks the estimate did not get cut" run length, max 4).
+      The prior FMP implementation hardcoded ``streak`` to 0 (it had no
+      multi-snapshot series to derive a streak from); this is a strictly
+      more faithful derivation of the field's intended meaning, computed
+      from the now-available snapshot series. The field/key is preserved.
+
+    ``bucket``/``run_date`` are retained in the signature (callers and the
+    legacy S3-snapshot fallback below are unaffected); they are no longer
+    required for the primary path since yfinance carries the 30-day-ago
+    snapshot inline.
+    """
     result = {
         "current_estimate": None,
         "revision_4w": None,
         "streak": 0,
     }
 
-    # /stable requires period=annual on free tier; quarter is 402 paid.
+    # ── Primary: yfinance eps_trend (free, already integrated) ──────────────
     try:
-        data = _fmp_get(
-            "analyst-estimates",
-            params={"symbol": ticker, "period": "annual", "limit": 1},
-        )
-        if isinstance(data, list) and data:
-            # /stable renames the field vs v3 — accept either shape.
-            result["current_estimate"] = (
-                data[0].get("epsAvg")
-                or data[0].get("estimatedEpsAvg")
-            )
-    except Exception as e:
-        logger.warning("EPS estimate failed for %s: %s", ticker, _scrub_url_creds(e))
+        import yfinance as yf
 
-    # Load prior snapshot for revision comparison
-    try:
-        s3 = boto3.client("s3")
-        today = datetime.strptime(run_date, "%Y-%m-%d")
-        for days_ago in range(7, 15):
-            check_date = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-            try:
-                key = f"archive/revisions/{check_date}.json"
-                obj = s3.get_object(Bucket=bucket, Key=key)
-                prior = json.loads(obj["Body"].read())
-                prior_eps = prior.get(ticker, {}).get("eps_current", 0.0)
-                if prior_eps and result["current_estimate"]:
-                    result["revision_4w"] = round(
-                        (result["current_estimate"] - prior_eps) / abs(prior_eps) * 100, 2
-                    )
-                break
-            except Exception:
-                continue
-    except Exception:
-        pass
+        et = yf.Ticker(ticker).eps_trend
+        if et is not None and not et.empty and "0y" in et.index:
+            row = et.loc["0y"]
+
+            def _f(v):
+                try:
+                    if v is None:
+                        return None
+                    fv = float(v)
+                    return fv if fv == fv else None  # drop NaN
+                except (TypeError, ValueError):
+                    return None
+
+            cur = _f(row.get("current"))
+            d30 = _f(row.get("30daysAgo"))
+            if cur is not None:
+                result["current_estimate"] = round(cur, 4)
+            if cur is not None and d30 is not None and d30 != 0:
+                result["revision_4w"] = round((cur - d30) / abs(d30) * 100, 2)
+
+            # streak: consecutive non-negative steps newest→oldest
+            seq = [
+                _f(row.get(c))
+                for c in ("current", "7daysAgo", "30daysAgo", "60daysAgo", "90daysAgo")
+            ]
+            streak = 0
+            for newer, older in zip(seq, seq[1:]):
+                if newer is None or older is None:
+                    break
+                if newer - older >= 0:
+                    streak += 1
+                else:
+                    break
+            result["streak"] = streak
+    except Exception as e:
+        # yfinance exceptions do not embed API credentials (no keyed
+        # querystring) — mirror the module's existing yfinance warning idiom
+        # (_fetch_analyst's target_price block). The _scrub_url_creds helper
+        # added by PR #255 consolidates the FMP/keyed-fetch scrub surface; it
+        # is not needed on this unkeyed path. (TODO: once #255 merges, no
+        # change required here — kept for reviewer context.)
+        logger.warning("yfinance eps_trend failed for %s: %s", ticker, e)
+
+    # ── Legacy fallback: S3 prior snapshot for revision_4w only ────────────
+    # Retained for behavioural fidelity with the pre-migration function (and
+    # to keep the bucket/run_date params load-bearing). Note: no writer of
+    # ``archive/revisions/{date}.json`` exists in this codebase, so this
+    # loop is a no-op in practice — kept only as a non-regressing safety net
+    # in case yfinance supplied a current estimate but no 30-day-ago snapshot.
+    if result["current_estimate"] is not None and result["revision_4w"] is None:
+        try:
+            s3 = boto3.client("s3")
+            today = datetime.strptime(run_date, "%Y-%m-%d")
+            for days_ago in range(7, 15):
+                check_date = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+                try:
+                    key = f"archive/revisions/{check_date}.json"
+                    obj = s3.get_object(Bucket=bucket, Key=key)
+                    prior = json.loads(obj["Body"].read())
+                    prior_eps = prior.get(ticker, {}).get("eps_current", 0.0)
+                    if prior_eps and result["current_estimate"]:
+                        result["revision_4w"] = round(
+                            (result["current_estimate"] - prior_eps)
+                            / abs(prior_eps) * 100,
+                            2,
+                        )
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     return result
 
