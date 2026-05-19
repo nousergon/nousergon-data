@@ -187,8 +187,20 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-weekday
-      Description: Weekday 13:00 UTC (6:00 AM PT) — daily data + predictor + executor
-      ScheduleExpression: 'cron(0 13 ? * MON-FRI *)'
+      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC). At the old
+      # 06:00 start the daemon was ready ~31–32 min later (06:31–06:32 PT)
+      # even on SUCCESSFUL runs — i.e. the order book/daemon was ~1–2 min
+      # LATE for the 06:30 PT open every single day. Combined with the
+      # alpha-engine-data#264 MorningEnrich speedup (~−12 min, no longer
+      # flirting with the 30-min SSM timeout), a 05:45 start gives ~22 min
+      # expected / ~32 min P99 to daemon-ready → ready ≤ 06:17 PT at the
+      # 99th percentile, comfortably before the 06:30 open with margin.
+      # NOTE (pre-existing, unchanged here): the UTC expression assumes
+      # PDT (UTC−7); during PST the effective PT start shifts an hour.
+      # That DST caveat predates this change and is intentionally left
+      # as-is — out of scope for the start-time fix.
+      Description: Weekday 12:45 UTC (5:45 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
+      ScheduleExpression: 'cron(45 12 ? * MON-FRI *)'
       State: ENABLED
       Targets:
         - Id: weekday-pipeline
