@@ -62,8 +62,40 @@ def price_cache_write_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list
     return [primary]
 
 
+def price_cache_read_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[str]:
+    """Return active READ prefixes in fallback order.
+
+    Companion to :func:`price_cache_write_prefixes` — the Wave-3 reader
+    migration (PR3+) iterates this in fallback order so the new prefix
+    is consulted first and the legacy prefix is the safety net during
+    the soak window.
+
+      * ``primary == "predictor/price_cache/"`` (the production default) →
+        ``["reference/price_cache/", "predictor/price_cache/"]``: try
+        the new prefix first (post-PR4 it's the sole survivor), fall
+        back to legacy on miss for the soak period.
+      * ``primary`` is any other string → ``[primary]`` (single-read
+        fallback, mirrors the test-friendly write-side semantics).
+
+    Callers wrap their reads in::
+
+        for prefix in price_cache_read_prefixes(s3_prefix):
+            try:
+                return s3.get_object(Bucket=bucket, Key=f"{prefix}{name}")
+            except ClientError:
+                continue
+
+    At Wave-3 PR4 cutover the legacy entry is removed here in the same
+    edit that flips the write helper — one-line change in each.
+    """
+    if primary == PRICE_CACHE_LEGACY_PREFIX:
+        return [PRICE_CACHE_NEW_PREFIX, PRICE_CACHE_LEGACY_PREFIX]
+    return [primary]
+
+
 __all__ = [
     "PRICE_CACHE_LEGACY_PREFIX",
     "PRICE_CACHE_NEW_PREFIX",
     "price_cache_write_prefixes",
+    "price_cache_read_prefixes",
 ]

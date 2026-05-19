@@ -584,17 +584,30 @@ def check_backfill_source_freshness(ctx: PreflightContext) -> CheckResult:
 
     # Backfill source = price_cache + daily_closes delta. Effective last
     # is max(price_cache_last, daily_closes_last). Read SPY parquet.
-    try:
-        obj = s3.get_object(Bucket=ctx.bucket, Key="predictor/price_cache/SPY.parquet")
-        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
-        cache_last = pd.Timestamp(df.index[-1]).normalize()
-    except Exception as exc:
+    #
+    # Wave-3 reader migration (ROADMAP L1401): try the new
+    # ``reference/price_cache/`` prefix first, fall back to legacy
+    # ``predictor/price_cache/`` during the producer write-both soak
+    # (PR1 #270 shipped 2026-05-19; soak ≥1 week to ~2026-05-26).
+    from builders._price_cache_writeboth import price_cache_read_prefixes
+
+    df = None
+    last_exc: Exception | None = None
+    for prefix in price_cache_read_prefixes():
+        try:
+            obj = s3.get_object(Bucket=ctx.bucket, Key=f"{prefix}SPY.parquet")
+            df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+            break
+        except Exception as exc:
+            last_exc = exc
+    if df is None:
         return CheckResult(
             name="backfill_source_freshness",
             status="fail",
-            message=f"price_cache SPY read raised: {exc}",
+            message=f"price_cache SPY read raised (both prefixes): {last_exc}",
             elapsed_seconds=time.time() - t0,
         )
+    cache_last = pd.Timestamp(df.index[-1]).normalize()
 
     # Daily delta — staging/daily_closes/{prior_trading_day}.parquet.
     try:

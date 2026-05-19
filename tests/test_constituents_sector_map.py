@@ -448,3 +448,50 @@ def test_collect_returns_tickers_in_dict() -> None:
         "the count is only useful as observability, not as a tickers source"
     )
     assert set(result["tickers"]) == {"AAPL", "MSFT", "JHG", "WSO"}
+
+
+def test_sector_map_writes_to_all_three_paths() -> None:
+    """Wave-3 PR3 (ROADMAP L1401): sector_map.json must be written to:
+
+      1. ``data/sector_map.json`` — canonical \"new\" data path.
+      2. ``predictor/price_cache/sector_map.json`` — legacy path (retired
+         in PR4).
+      3. ``reference/price_cache/sector_map.json`` — Wave-3 new home for
+         the predictor/price_cache/ migration. PR1 #270 missed this
+         write (it scoped only the ticker-parquet writes); without it,
+         readers that hit ``reference/`` first see a stale snapshot
+         after PR4 deletes legacy.
+    """
+    from unittest.mock import MagicMock
+
+    sp500_html = _fake_html(
+        ["AAPL"], ["Information Technology"],
+    )
+    sp400_html = _fake_html(["JHG"], ["Financials"])
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+    put_calls: list[dict] = []
+    fake_s3 = MagicMock()
+    fake_s3.put_object.side_effect = lambda **kw: put_calls.append(kw)
+
+    fake_boto3 = MagicMock()
+    fake_boto3.client.return_value = fake_s3
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get), \
+         patch("collectors.constituents.boto3", fake_boto3):
+        constituents.collect(bucket="any", dry_run=False)
+
+    sector_map_writes = [
+        c for c in put_calls if c["Key"].endswith("sector_map.json")
+    ]
+    written_keys = {c["Key"] for c in sector_map_writes}
+    assert written_keys == {
+        "data/sector_map.json",
+        "predictor/price_cache/sector_map.json",
+        "reference/price_cache/sector_map.json",
+    }, written_keys
+    # Bodies must be byte-equal — readers can pick any path safely.
+    bodies = [c["Body"] for c in sector_map_writes]
+    assert len(set(bodies)) == 1, "sector_map.json bodies diverge across paths"

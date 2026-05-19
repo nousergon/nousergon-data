@@ -109,14 +109,27 @@ def collect(
     )
     logger.info("Wrote constituents.json to s3://%s/%s (%d tickers)", bucket, key, len(tickers))
 
-    # Write sector_map.json to canonical data path + legacy predictor path
+    # Write sector_map.json to canonical data path + legacy predictor
+    # path + Wave-3 new reference/ path. The new ``reference/`` write
+    # was missing from PR1 #270 because that PR scoped only the
+    # ticker-parquet write paths (yfinance / FRED / chronic-gap);
+    # sector_map.json travels through this separate constituents
+    # collector and needs its own write-both update so the Wave-3
+    # readers don't see a stale ``reference/`` copy after PR4 retires
+    # legacy.
     sector_map_body = json.dumps(sector_etf_map, indent=2, sort_keys=True)
-    for sector_map_key in ["data/sector_map.json", "predictor/price_cache/sector_map.json"]:
+    for sector_map_key in (
+        "data/sector_map.json",
+        "predictor/price_cache/sector_map.json",
+        "reference/price_cache/sector_map.json",
+    ):
         s3.put_object(
             Bucket=bucket, Key=sector_map_key,
             Body=sector_map_body, ContentType="application/json",
         )
-    logger.info("Wrote sector_map.json to data/ and predictor/ paths")
+    logger.info(
+        "Wrote sector_map.json to data/, predictor/, and reference/ paths",
+    )
 
     # tickers is included in the return so callers don't need an S3 round-trip
     # to re-read what they just wrote. Pre-MorningEnrich preflight (PR #134)

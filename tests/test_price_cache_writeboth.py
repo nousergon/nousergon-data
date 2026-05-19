@@ -26,6 +26,7 @@ import pytest
 from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
     PRICE_CACHE_NEW_PREFIX,
+    price_cache_read_prefixes,
     price_cache_write_prefixes,
 )
 
@@ -69,6 +70,33 @@ def test_new_prefix_is_not_legacy():
     assert PRICE_CACHE_NEW_PREFIX != PRICE_CACHE_LEGACY_PREFIX
     assert PRICE_CACHE_NEW_PREFIX.startswith("reference/")
     assert PRICE_CACHE_LEGACY_PREFIX.startswith("predictor/")
+
+
+# ---------------------------------------------------------------------------
+# Read-side helper (Wave-3 PR3 reader migration)
+# ---------------------------------------------------------------------------
+
+
+def test_read_helper_default_returns_new_first_legacy_second():
+    """The read order is the WRITE order REVERSED — new prefix consulted
+    first so consumers see the post-PR4 home as soon as the soak begins;
+    legacy is the fallback during the soak window only.
+    """
+    out = price_cache_read_prefixes()
+    assert out == [PRICE_CACHE_NEW_PREFIX, PRICE_CACHE_LEGACY_PREFIX]
+
+
+def test_read_helper_explicit_legacy_returns_new_first_legacy_second():
+    out = price_cache_read_prefixes(PRICE_CACHE_LEGACY_PREFIX)
+    assert out == [PRICE_CACHE_NEW_PREFIX, PRICE_CACHE_LEGACY_PREFIX]
+
+
+def test_read_helper_custom_prefix_returns_single():
+    """Test/config-override prefix opts out of the fallback chain — mirrors
+    the write-side single-prefix semantics."""
+    custom = "some/other/prefix/"
+    out = price_cache_read_prefixes(custom)
+    assert out == [custom]
 
 
 # ---------------------------------------------------------------------------
