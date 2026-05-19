@@ -205,13 +205,6 @@ def snapshot_universe(
 # ── S3 key + serialization helpers ────────────────────────────────────
 
 
-def s3_key_for(
-    ticker: str, snapshot_date: Date, *, prefix: str = DEFAULT_S3_PREFIX,
-) -> str:
-    """Canonical key for one (ticker, date) snapshot document."""
-    return f"{prefix}/{ticker.upper()}/{snapshot_date.isoformat()}.json"
-
-
 def _serialize_snapshot(snap: AnalystSnapshot) -> dict:
     """Pydantic AnalystSnapshot → JSON-safe dict.
 
@@ -236,9 +229,6 @@ def read_snapshot_document(
     whose YYMMDDHHMM run_id starts with the date's YYMMDD prefix.
     Picks the most recent intra-day run when multiple exist.
 
-    Legacy fallback: tries the old ``{prefix}/{ticker}/{date}.json``
-    key shape during the transition.
-
     Returns the raw JSON dict or None if no document exists.
     """
     # Canonical: list prefix + find by run_id date prefix.
@@ -261,15 +251,7 @@ def read_snapshot_document(
             return json.loads(obj["Body"].read())
     except Exception as e:
         logger.debug(
-            "[analyst_snapshotter] canonical list failed for %s/%s (%s) — "
-            "trying legacy date-key fallback",
+            "[analyst_snapshotter] canonical list failed for %s/%s (%s)",
             ticker, snapshot_date, type(e).__name__,
         )
-
-    # Legacy fallback: {prefix}/{ticker}/{date}.json
-    legacy_key = f"{prefix}/{ticker.upper()}/{snapshot_date.isoformat()}.json"
-    try:
-        obj = s3_client.get_object(Bucket=bucket, Key=legacy_key)
-        return json.loads(obj["Body"].read())
-    except Exception:
-        return None
+    return None

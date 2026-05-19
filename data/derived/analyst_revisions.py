@@ -268,8 +268,7 @@ def load_snapshot_time_series(
     Canonical shape: list ``{prefix}/{ticker}/`` once + parse each
     artifact's body to extract ``snapshot_date``; index by that date.
     Cheaper than per-date GETs since one LIST + small body reads
-    cover the entire window. Tolerates the legacy
-    ``{ticker}/{date}.json`` shape during transition.
+    cover the entire window.
     """
     import json as _json
     out: dict[Date, dict] = {}

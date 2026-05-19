@@ -390,29 +390,23 @@ def write_news_aggregates_parquet(
 
 
 def read_news_aggregates_parquet(
-    aggregate_date: Date | None = None,
     *,
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
 ) -> pd.DataFrame:
-    """Consumer-side read. Resolves the canonical artifact via
-    ``latest.json`` sidecar; falls back to the legacy
-    ``{aggregate_date}.parquet`` key shape during the transition
-    window.
+    """Consumer-side read. Resolves the canonical artifact via the
+    ``latest.json`` sidecar.
 
-    ``aggregate_date`` is only used for the legacy-shape fallback.
-    Under the canonical shape, ``latest.json`` always points at the
-    most recent run regardless of date; the parquet itself carries
-    ``aggregate_date`` per row so filtering happens at the DataFrame
-    layer.
+    ``latest.json`` always points at the most recent run regardless of
+    date; the parquet itself carries ``aggregate_date`` per row so any
+    date filtering happens at the DataFrame layer.
 
     Returns an empty DataFrame with the canonical schema when no
     artifact exists.
     """
     from alpha_engine_lib.eval_artifacts import eval_latest_key
 
-    # Canonical path: read latest.json → resolve key
     latest_key = eval_latest_key(prefix)
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=latest_key)
@@ -423,23 +417,9 @@ def read_news_aggregates_parquet(
             return pd.read_parquet(BytesIO(body["Body"].read()), engine="pyarrow")
     except Exception as e:
         logger.info(
-            "[news_aggregates] canonical sidecar read failed for %s (%s) — "
-            "trying legacy date-key fallback",
+            "[news_aggregates] canonical sidecar read failed for %s (%s)",
             latest_key, type(e).__name__,
         )
-
-    # Legacy fallback during transition
-    if aggregate_date is not None:
-        legacy_key = f"{prefix}/{aggregate_date.isoformat()}.parquet"
-        try:
-            obj = s3_client.get_object(Bucket=bucket, Key=legacy_key)
-            logger.info(
-                "[news_aggregates] read via legacy key %s — "
-                "will be removed after canonical-shape soak", legacy_key,
-            )
-            return pd.read_parquet(BytesIO(obj["Body"].read()), engine="pyarrow")
-        except Exception:
-            pass
 
     return _empty_df()
 
