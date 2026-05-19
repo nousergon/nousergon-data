@@ -303,6 +303,32 @@ class TestSnapshotter:
         s3 = _InMemoryS3()
         assert read_snapshot_document("X", date(2026, 1, 1), s3_client=s3) is None
 
+    def test_legacy_date_keyed_json_is_ignored(self):
+        """Regression guard: post-#234 canonical-key migration, a
+        bare ``{prefix}/{ticker}/{date}.json`` file (the pre-migration
+        shape) must NOT be read by the canonical lister. The list
+        prefix is ``{ticker}/{YYMMDD}`` so an ``YYYY-MM-DD.json``
+        file does not match it.
+        """
+        s3 = _InMemoryS3()
+        legacy_body = json.dumps({
+            "ticker": "AAPL",
+            "snapshot_date": "2026-05-13",
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "snapshots_by_source": {},
+        }).encode("utf-8")
+        s3.put_object(
+            Bucket="alpha-engine-research",
+            Key="data/analyst_snapshots/AAPL/2026-05-13.json",
+            Body=legacy_body,
+        )
+        # Canonical reader lists by YYMMDD prefix; legacy YYYY-MM-DD key
+        # does not match → None.
+        doc = read_snapshot_document(
+            "AAPL", date(2026, 5, 13), s3_client=s3,
+        )
+        assert doc is None
+
     def test_universe_orchestrator(self):
         s3 = _InMemoryS3()
         sources = [_StaticSource("yfinance", _make_snapshot())]

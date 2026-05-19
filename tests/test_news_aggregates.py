@@ -362,21 +362,42 @@ class TestS3ParquetRoundTrip:
         # latest.json sidecar points at it
         assert ("alpha-engine-research", "data/news_aggregates/latest.json") in s3._store
 
-        df_out = read_news_aggregates_parquet(
-            aggregate_date=date(2026, 5, 13), s3_client=s3,
-        )
+        df_out = read_news_aggregates_parquet(s3_client=s3)
         assert len(df_out) == 1
         assert df_out.iloc[0]["ticker"] == "AAPL"
         assert df_out.iloc[0]["lm_sentiment_mean"] == pytest.approx(0.42)
 
     def test_missing_parquet_returns_empty_schema_df(self):
         s3 = _InMemoryS3()
-        df = read_news_aggregates_parquet(
-            aggregate_date=date(2026, 1, 1), s3_client=s3,
-        )
+        df = read_news_aggregates_parquet(s3_client=s3)
         assert len(df) == 0
         for col in NewsTickerDailyAggregate.__dataclass_fields__:
             assert col in df.columns
+
+    def test_legacy_date_keyed_parquet_is_ignored(self):
+        """Regression guard: post-#234 canonical-key migration, a
+        bare ``{prefix}/{date}.parquet`` file with NO ``latest.json``
+        sidecar must NOT be read. Canonical-only contract."""
+        s3 = _InMemoryS3()
+        articles = [_make_aggregated(fingerprint="a", tickers=("AAPL",))]
+        df_in = build_news_aggregates_df(
+            articles=articles,
+            nlp_output=NewsNLPOutput(sentiment_scores=[
+                _lm_score("a", composite=0.42, pos=2, neg=0, total=10),
+            ]),
+            aggregate_date=date(2026, 5, 13),
+        )
+        # Plant a legacy-shape parquet that the OLD fallback would have read.
+        buf = BytesIO()
+        df_in.to_parquet(buf, engine="pyarrow", index=False)
+        s3.put_object(
+            Bucket="alpha-engine-research",
+            Key="data/news_aggregates/2026-05-13.parquet",
+            Body=buf.getvalue(),
+        )
+        # No latest.json sidecar present → canonical read finds nothing.
+        df = read_news_aggregates_parquet(s3_client=s3)
+        assert len(df) == 0
 
     def test_overwrite_existing_parquet(self):
         s3 = _InMemoryS3()
@@ -401,9 +422,7 @@ class TestS3ParquetRoundTrip:
         write_news_aggregates_parquet(
             df_v2, aggregate_date=date(2026, 5, 13), s3_client=s3,
         )
-        df_read = read_news_aggregates_parquet(
-            aggregate_date=date(2026, 5, 13), s3_client=s3,
-        )
+        df_read = read_news_aggregates_parquet(s3_client=s3)
         assert len(df_read) == 2
 
     def test_canonical_artifact_and_latest_keys(self):
