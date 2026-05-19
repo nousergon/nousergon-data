@@ -76,7 +76,8 @@ def test_breadth_key_omitted_when_no_price_data_and_slim_cache_empty(monkeypatch
     """The critical regression: breadth must NEVER be serialized as null."""
     _stub_fetchers(monkeypatch)
 
-    # slim cache load returns empty dict (no parquets in S3)
+    # Both sources empty (no ArcticDB symbols, no slim parquets in S3)
+    monkeypatch.setattr(macro, "load_universe_ohlcv", lambda *a, **k: {})
     monkeypatch.setattr(macro, "load_slim_cache", lambda s3, bucket: {})
 
     written = {}
@@ -105,6 +106,10 @@ def test_breadth_key_omitted_when_slim_cache_load_raises(monkeypatch):
     def _boom(s3, bucket):
         raise RuntimeError("S3 unreachable")
 
+    def _arctic_boom(*a, **k):
+        raise RuntimeError("ArcticDB unreachable")
+
+    monkeypatch.setattr(macro, "load_universe_ohlcv", _arctic_boom)
     monkeypatch.setattr(macro, "load_slim_cache", _boom)
 
     written = {}
@@ -120,3 +125,75 @@ def test_breadth_key_omitted_when_slim_cache_load_raises(monkeypatch):
     import json
     body = json.loads(written["Body"])
     assert "breadth" not in body
+
+
+# ── Wave-4 migration: ArcticDB primary / slim fallback / parity emit ─────────
+
+
+def _universe(n=220):
+    return {
+        "AAA": _synthetic_price_frame(n, 100.0),
+        "BBB": _synthetic_price_frame(n, 250.0),
+    }
+
+
+def _collect_body(monkeypatch):
+    written = {}
+
+    class _FakeS3:
+        def put_object(self, **kwargs):
+            written.update(kwargs)
+
+    monkeypatch.setattr(macro.boto3, "client", lambda service: _FakeS3())
+    result = macro.collect(bucket="test-bucket", run_date="2026-04-11")
+    assert result["status"] == "ok"
+    import json
+    return json.loads(written["Body"])
+
+
+def test_breadth_uses_arcticdb_when_available(monkeypatch):
+    """ArcticDB is primary — breadth computed from it even if slim is empty."""
+    _stub_fetchers(monkeypatch)
+    monkeypatch.setattr(macro, "load_universe_ohlcv", lambda *a, **k: _universe())
+    monkeypatch.setattr(macro, "load_slim_cache", lambda s3, bucket: {})
+
+    body = _collect_body(monkeypatch)
+    assert isinstance(body["breadth"], dict)
+    assert body["breadth"]["n_stocks"] == 2
+
+
+def test_breadth_falls_back_to_slim_when_arcticdb_unavailable(monkeypatch, caplog):
+    """ArcticDB read fails -> slim fallback keeps breadth working."""
+    _stub_fetchers(monkeypatch)
+
+    def _arctic_boom(*a, **k):
+        raise RuntimeError("ArcticDB unreachable")
+
+    monkeypatch.setattr(macro, "load_universe_ohlcv", _arctic_boom)
+    monkeypatch.setattr(macro, "load_slim_cache", lambda s3, bucket: _universe())
+
+    with caplog.at_level("WARNING"):
+        body = _collect_body(monkeypatch)
+    assert isinstance(body["breadth"], dict)
+    assert any("falling back to slim cache" in r.message for r in caplog.records)
+
+
+def test_parity_metric_emitted_when_both_sources_present(monkeypatch, caplog):
+    """SOTA observation: dual-read emits a JSON ParityReport every run."""
+    _stub_fetchers(monkeypatch)
+    monkeypatch.setattr(macro, "load_universe_ohlcv", lambda *a, **k: _universe())
+    monkeypatch.setattr(macro, "load_slim_cache", lambda s3, bucket: _universe())
+
+    with caplog.at_level("INFO"):
+        body = _collect_body(monkeypatch)
+
+    assert isinstance(body["breadth"], dict)
+    metric_lines = [
+        r.message for r in caplog.records
+        if "WAVE4_PARITY_METRIC breadth" in r.message
+    ]
+    assert len(metric_lines) == 1
+    import json
+    payload = json.loads(metric_lines[0].split("WAVE4_PARITY_METRIC breadth ", 1)[1])
+    assert payload["passed"] is True  # identical fixtures -> parity holds
+    assert payload["max_abs_value_delta"] == 0.0

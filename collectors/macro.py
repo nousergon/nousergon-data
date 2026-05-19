@@ -27,6 +27,8 @@ import requests
 import yfinance as yf
 
 from store.parquet_loader import load_slim_cache
+from alpha_engine_lib.arcticdb import load_universe_ohlcv
+from alpha_engine_lib.reconcile import reconcile_frame_dicts
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,58 @@ _FRED_SERIES = {
     "initial_claims": "ICSA",
     "hy_credit_spread_oas": "BAMLH0A0HYM2",
 }
+
+
+def _load_breadth_prices(bucket: str) -> Optional[dict]:
+    """Load the ~900-ticker price set for breadth — ArcticDB primary,
+    slim-cache fallback, parity-observed.
+
+    Wave 4 of the predictor/price_cache_slim deletion arc. ArcticDB (via the
+    lib ``load_universe_ohlcv`` slim-equivalent reader) is the single source
+    of truth; the legacy ``predictor/price_cache_slim/`` parquet read is kept
+    as a fallback so breadth cannot break if ArcticDB is unavailable. While
+    both sources still exist we dual-read and emit a ``reconcile`` ParityReport
+    so the eventual slim deletion (PR4) is a data-driven cutover, not an
+    eyeballed one. The slim side — and this dual-read — are removed in PR4.
+
+    Returns ``None`` only if BOTH sources fail (caller then omits the breadth
+    key, preserving the existing no-null contract).
+    """
+    arctic_prices = None
+    try:
+        arctic_prices = load_universe_ohlcv(bucket)
+    except Exception as exc:  # noqa: BLE001 - fall back, don't break breadth
+        logger.warning("ArcticDB universe read for breadth failed: %s", exc)
+
+    slim_prices = None
+    try:
+        slim_prices = load_slim_cache(boto3.client("s3"), bucket)
+    except Exception as exc:  # noqa: BLE001 - parity/fallback only
+        logger.warning(
+            "Slim cache read for breadth (parity/fallback) failed: %s", exc
+        )
+
+    # SOTA observation: while both exist, emit the quantitative parity metric
+    # every run. Grep ``WAVE4_PARITY_METRIC breadth`` over the observation
+    # window before PR4 retires slim.
+    if arctic_prices and slim_prices:
+        report = reconcile_frame_dicts(
+            slim_prices, arctic_prices, value_cols=("Close",)
+        )
+        logger.info("breadth slim<->arctic %s", report.summary())
+        logger.info(
+            "WAVE4_PARITY_METRIC breadth %s", json.dumps(report.as_metrics())
+        )
+
+    if arctic_prices:
+        return arctic_prices
+    if slim_prices:
+        logger.warning(
+            "breadth falling back to slim cache — ArcticDB universe "
+            "unavailable (Wave-4 migration fallback path)"
+        )
+        return slim_prices
+    return None
 
 
 def collect(
@@ -73,18 +127,14 @@ def collect(
     macro.update(market)
 
     # Compute breadth. If the caller did not pass in price_data, load the
-    # slim cache that Phase 1 just wrote to S3 so downstream Research still
-    # gets a real breadth reading. If that load fails for any reason, we
-    # OMIT the "breadth" key entirely rather than writing null — Research
-    # has its own fallback and macro_agent reads macro_data.get("breadth", {}),
-    # which only honors the default when the key is missing.
+    # ~900-ticker price set (ArcticDB primary, slim-cache fallback — see
+    # _load_breadth_prices) so downstream Research still gets a real breadth
+    # reading. If both sources fail we OMIT the "breadth" key entirely rather
+    # than writing null — Research has its own fallback and macro_agent reads
+    # macro_data.get("breadth", {}), which only honors the default when the
+    # key is missing.
     if price_data is None:
-        try:
-            s3_read = boto3.client("s3")
-            price_data = load_slim_cache(s3_read, bucket)
-        except Exception as exc:
-            logger.warning("Failed to load slim cache for breadth: %s", exc)
-            price_data = None
+        price_data = _load_breadth_prices(bucket)
 
     if price_data:
         macro["breadth"] = _compute_market_breadth(price_data)
