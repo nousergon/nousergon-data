@@ -122,6 +122,44 @@ _POLYGON_MIN_COVERAGE = 0.95    # below this, polygon_only mode hard-fails
 _DISCREPANCY_WARN_PCT = 0.01    # |polygon_close - yfinance_close| / yfinance_close
 _DISCREPANCY_ERROR_PCT = 0.05
 
+# Share-class symbol convention bridge (Yahoo/our-universe dash → polygon dot).
+#
+# Our universe + ArcticDB key class shares with a dash + single class
+# letter (BRK-B, BF-B, MOG-A — the Yahoo convention). Polygon serves the
+# *same security* under the dot convention (BRK.B, BF.B, MOG.A). This is
+# a pure symbol-format mismatch, NOT a data gap or a delay: polygon's
+# grouped-daily bulk call we already make every morning ALREADY contains
+# these rows under the dot key (live-verified 2026-05-19 for 2026-05-18:
+# BRK.B/BF.B/MOG.A all present same-day; BRK-B/BF-B/MOG-A all absent).
+#
+# Before this bridge, `grouped.get("BRK-B")` missed, then the rate-limited
+# (5 calls/min) per-ticker fallback re-queried "BRK-B" and also missed
+# (recovered 0/N) on every one of the 14 window dates — ~12 min of pure
+# wasted retries that pushed weekday MorningEnrich past its 30-min SSM
+# timeout (2026-05-19 SIGKILL/137 → whole weekday pipeline FAILED).
+#
+# The pattern is anchored to exactly the US class-share convention — a
+# 1–5 char root, one hyphen, one uppercase class letter. It cannot
+# misfire on a normal ticker, an index/^ ticker, a sector ETF, or a
+# FRED-mapped symbol (none match `^[A-Z]{1,5}-[A-Z]$`). Future S&P
+# class shares are handled automatically — no per-ticker config upkeep
+# and no new chronic-gap entries.
+_SHARE_CLASS_RE = re.compile(r"^[A-Z]{1,5}-[A-Z]$")
+
+
+def _polygon_symbol(store_ticker: str) -> str:
+    """Map our dash store-key to polygon's symbol for query/lookup.
+
+    Returns the dot form for class-share tickers (``BRK-B`` → ``BRK.B``),
+    else the input unchanged. The return value is ONLY ever used to talk
+    to polygon (grouped-daily key lookup + the per-ticker endpoint path);
+    the stored record always keeps the original dash ``store_ticker`` so
+    ArcticDB / universe / downstream keys are unaffected.
+    """
+    if _SHARE_CLASS_RE.match(store_ticker):
+        return store_ticker.replace("-", ".")
+    return store_ticker
+
 
 def _previous_business_days(run_date: str, n: int) -> list[str]:
     """Return ``n`` business days ending on ``run_date`` (inclusive),
@@ -705,7 +743,9 @@ def _fetch_polygon_closes(
     polygon_count = 0
     for ticker in tickers:
         store_ticker = ticker.lstrip("^")
-        g = grouped.get(store_ticker)
+        # Look up by polygon's symbol (dot form for class shares), but
+        # keep ``store_ticker`` (dash) as the persisted record key.
+        g = grouped.get(_polygon_symbol(store_ticker))
         if g:
             records.append({
                 "ticker": store_ticker,
@@ -758,7 +798,11 @@ def _fetch_polygon_closes_per_ticker(
     Each ticker is one rate-limited polygon call. With the default 5
     calls/min and ~10-15 misses on a typical bulk-endpoint flake, this
     adds 2-3 minutes to MorningEnrich runtime — well under the SF's
-    DataPhase1 budget.
+    DataPhase1 budget. Class-share tickers are now recovered for free
+    by the grouped-daily dot-key lookup (see ``_polygon_symbol``) so
+    they no longer reach this fallback; ``_polygon_symbol`` is still
+    applied here for the rare case a class share is genuinely dropped
+    by the bulk endpoint on a given date.
     """
     from polygon_client import polygon_client
 
@@ -766,7 +810,9 @@ def _fetch_polygon_closes_per_ticker(
     for ticker in tickers:
         store_ticker = ticker.lstrip("^")
         try:
-            bar = polygon_client().get_single_day_bar(store_ticker, run_date)
+            bar = polygon_client().get_single_day_bar(
+                _polygon_symbol(store_ticker), run_date
+            )
         except Exception as exc:
             logger.warning(
                 "Polygon per-ticker fallback failed for %s @ %s: %s",
