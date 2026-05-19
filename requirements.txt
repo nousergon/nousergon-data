@@ -19,4 +19,4 @@ arcticdb>=6.11
 # previously listed above as direct deps; kept those direct lines for now to
 # avoid breaking pinning during the migration. Drop the duplicate direct
 # pgvector/psycopg2-binary pins once the migration soaks.
-alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.15.0
+alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.19.0
