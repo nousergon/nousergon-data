@@ -49,6 +49,10 @@ from arcticdb_ext.version_store import DataError
 
 from store.arctic_store import get_universe_lib, get_macro_lib, to_arctic_safe
 from store.parquet_loader import load_parquet_from_s3
+from builders._price_cache_writeboth import (
+    PRICE_CACHE_LEGACY_PREFIX,
+    price_cache_read_prefixes,
+)
 from validators.price_validator import (
     ALL_ANOMALY_TYPES,
     DEFAULT_BLOCK_ANOMALY_TYPES,
@@ -68,7 +72,11 @@ OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 # not a numeric one — keeping OHLCV_COLS pure simplifies the rolling-stat
 # and feature-compute call sites that iterate it expecting numerics.
 PROVENANCE_COL = "source"
-PRICE_CACHE_PREFIX = "predictor/price_cache/"
+# Legacy single-prefix constant retained for backward-compat with any caller
+# that imports it (audited 2026-05-19: only the local ``_load_parquet_warmup``,
+# which now goes through ``price_cache_read_prefixes``). Wave-3 PR4 cutover
+# deletes this constant in the same edit that flips the read helper.
+PRICE_CACHE_PREFIX = PRICE_CACHE_LEGACY_PREFIX
 
 # Process the universe in chunks of this size through Phase 1+2 (read,
 # compute, write). The full-universe pass holds ~900 ticker histories in
@@ -445,23 +453,40 @@ def _load_parquet_warmup(s3, bucket: str, ticker: str) -> pd.DataFrame | None:
     Returns None when the parquet doesn't exist (new constituent that hasn't
     been picked up by the weekly backfill yet). Hard-fails on any other
     error shape — NoSilentFails.
+
+    Wave-3 reader migration (ROADMAP L1401): iterates the
+    ``price_cache_read_prefixes`` fallback chain — new prefix
+    (``reference/price_cache/``) consulted first, legacy
+    (``predictor/price_cache/``) is the soak-window safety net.
+    "Not found" means absent in BOTH prefixes; non-404 errors hard-fail
+    on the first prefix that raises (preserving NoSilentFails).
     """
-    key = f"{PRICE_CACHE_PREFIX}{ticker}.parquet"
-    try:
-        df = load_parquet_from_s3(s3, bucket, key)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("NoSuchKey", "404"):
-            return None
-        raise RuntimeError(
-            f"parquet-warmup read failed for {ticker} (bucket={bucket}, "
-            f"key={key}): {exc}"
-        ) from exc
+    df: pd.DataFrame | None = None
+    last_key: str | None = None
+    not_found = 0
+    for prefix in price_cache_read_prefixes(PRICE_CACHE_PREFIX):
+        last_key = f"{prefix}{ticker}.parquet"
+        try:
+            df = load_parquet_from_s3(s3, bucket, last_key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                not_found += 1
+                continue
+            raise RuntimeError(
+                f"parquet-warmup read failed for {ticker} (bucket={bucket}, "
+                f"key={last_key}): {exc}"
+            ) from exc
+        break
+
+    if df is None:
+        # Absent in every active prefix → genuine "not in price cache".
+        return None
 
     if df.empty or "Close" not in df.columns:
         raise RuntimeError(
             f"parquet-warmup for {ticker}: parquet exists but invalid shape "
-            f"(empty={df.empty}, cols={list(df.columns)[:6]})"
+            f"(empty={df.empty}, cols={list(df.columns)[:6]}, key={last_key})"
         )
     return df
 

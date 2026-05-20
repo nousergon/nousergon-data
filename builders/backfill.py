@@ -50,6 +50,10 @@ from features.compute import (
     make_source_series,
 )
 from store.arctic_store import get_universe_lib, get_macro_lib, to_arctic_safe
+from builders._price_cache_writeboth import (
+    PRICE_CACHE_LEGACY_PREFIX,
+    list_price_cache_keys,
+)
 
 log = logging.getLogger(__name__)
 
@@ -100,20 +104,27 @@ def _load_current_constituents(s3, bucket: str) -> set[str]:
     return set(tickers)
 
 
-def _load_full_cache(s3, bucket: str, prefix: str = "predictor/price_cache/") -> dict[str, pd.DataFrame]:
-    """Load all 10-year price cache parquets from S3 (concurrent)."""
-    keys = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                keys.append(obj["Key"])
+def _load_full_cache(s3, bucket: str, prefix: str = PRICE_CACHE_LEGACY_PREFIX) -> dict[str, pd.DataFrame]:
+    """Load all 10-year price cache parquets from S3 (concurrent).
+
+    Wave-3 reader migration (ROADMAP L1401): when ``prefix`` is the
+    production default the listing iterates both
+    ``reference/price_cache/`` (new) and ``predictor/price_cache/``
+    (legacy) via :func:`list_price_cache_keys`, deduping by
+    ``{ticker}.parquet`` basename so each ticker is fetched once.
+    Custom prefixes (tests, ad-hoc invocations) opt out of the
+    fallback chain.
+    """
+    keys = list_price_cache_keys(s3, bucket, prefix)
 
     if not keys:
-        log.error("No parquets found in s3://%s/%s", bucket, prefix)
+        log.error("No parquets found in s3://%s/%s (read-prefix chain)", bucket, prefix)
         return {}
 
-    log.info("Downloading %d full cache parquets from s3://%s/%s ...", len(keys), bucket, prefix)
+    log.info(
+        "Downloading %d full cache parquets from s3://%s/ (read-prefix chain anchored on %s) ...",
+        len(keys), bucket, prefix,
+    )
 
     price_data: dict[str, pd.DataFrame] = {}
     errors = 0

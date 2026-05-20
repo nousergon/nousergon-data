@@ -17,12 +17,17 @@ from pathlib import Path
 import boto3
 import pandas as pd
 
+from builders._price_cache_writeboth import (
+    PRICE_CACHE_LEGACY_PREFIX,
+    list_price_cache_keys,
+)
+
 logger = logging.getLogger(__name__)
 
 
 def collect(
     bucket: str,
-    full_cache_prefix: str = "predictor/price_cache/",
+    full_cache_prefix: str = PRICE_CACHE_LEGACY_PREFIX,
     slim_prefix: str = "predictor/price_cache_slim/",
     lookback_days: int = 730,
     dry_run: bool = False,
@@ -32,8 +37,13 @@ def collect(
 
     Args:
         bucket: S3 bucket name
-        full_cache_prefix: S3 prefix for full 10y parquets
-        slim_prefix: S3 prefix for 2y slim parquets
+        full_cache_prefix: S3 prefix anchor for full 10y parquets. The
+            production default (``predictor/price_cache/``) iterates the
+            Wave-3 read fallback chain — ``reference/price_cache/`` first,
+            legacy second — via :func:`list_price_cache_keys`. Custom
+            prefixes opt out of the chain (single-prefix listing).
+        slim_prefix: S3 prefix for 2y slim parquets (Wave-3 unaffected;
+            ``predictor/price_cache_slim/`` retirement is the Wave-4 arc).
         lookback_days: calendar days of history to keep (default 730 = 2 years)
         dry_run: if True, count files but don't write
 
@@ -48,8 +58,9 @@ def collect(
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
 
-        # Download full cache parquets
-        parquet_keys = _list_parquets(s3, bucket, full_cache_prefix)
+        # Download full cache parquets (Wave-3 read-prefix chain: new first,
+        # legacy fallback during soak; deduped by ticker basename).
+        parquet_keys = list_price_cache_keys(s3, bucket, full_cache_prefix)
 
         if dry_run:
             logger.info("[dry-run] slim_cache: %d parquets would be sliced", len(parquet_keys))
@@ -127,14 +138,3 @@ def collect(
         if validation_results:
             result["validation"] = validation
         return result
-
-
-def _list_parquets(s3, bucket: str, prefix: str) -> list[str]:
-    """List all .parquet keys under the given S3 prefix."""
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                keys.append(obj["Key"])
-    return keys
