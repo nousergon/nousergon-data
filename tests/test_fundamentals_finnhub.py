@@ -52,6 +52,13 @@ def _aapl_payload(**overrides):
         "roeRfy": 0.61,
         "currentRatioAnnual": 0.93,
         "currentRatioQuarterly": 0.95,
+        # Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship
+        # pillar substrate added to NEUTRAL + _fetch_single_ticker.
+        "revenueGrowth3Y": 0.08,           # 8% 3y CAGR
+        "epsGrowth3Y": 0.12,                # 12% 3y EPS CAGR
+        "payoutRatioTTM": 0.18,             # 18% of NI paid as dividends
+        "dividendYieldIndicatedAnnual": 0.005,  # 0.5%
+        "capitalSpendingGrowth5Y": 0.10,    # 10% CAPEX growth
     }
     metric.update(overrides)
     return {"metric": metric, "metricType": "all", "symbol": "AAPL"}
@@ -180,6 +187,114 @@ class TestFetchSingleTicker:
         with patch.object(fundamentals, "finnhub_get", return_value={"metric": None}):
             data = _fetch_single_ticker("UNKNOWN")
         assert data == NEUTRAL
+
+
+# ── Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship pillar
+# substrate fields. Five new fundamental fields surfaced from existing Finnhub
+# metric=all response; no new API integrations.
+
+
+class TestPillarSubstrateFields:
+    """Growth + Stewardship pillar quant substrate added in Phase 3a."""
+
+    def test_neutral_includes_all_five_new_fields(self):
+        """NEUTRAL must enumerate the 5 new fields (so an empty / malformed
+        Finnhub payload still produces a complete fundamental record)."""
+        for field in (
+            "revenue_growth_3y",
+            "eps_growth_3y",
+            "payout_ratio",
+            "dividend_yield",
+            "capex_growth_5y",
+        ):
+            assert field in NEUTRAL, f"NEUTRAL missing {field}"
+            assert NEUTRAL[field] == 0.0
+
+    def test_full_payload_maps_growth_3y_fields(self):
+        with patch.object(fundamentals, "finnhub_get", return_value=_aapl_payload()):
+            data = _fetch_single_ticker("AAPL")
+        # _aapl_payload sets revenueGrowth3Y=0.08, epsGrowth3Y=0.12 → clip
+        # ranges (-0.5,1.5) and (-1.0,2.0) preserve the values.
+        assert data["revenue_growth_3y"] == pytest.approx(0.08)
+        assert data["eps_growth_3y"] == pytest.approx(0.12)
+
+    def test_full_payload_maps_stewardship_fields(self):
+        with patch.object(fundamentals, "finnhub_get", return_value=_aapl_payload()):
+            data = _fetch_single_ticker("AAPL")
+        assert data["payout_ratio"] == pytest.approx(0.18)
+        assert data["dividend_yield"] == pytest.approx(0.005)
+        assert data["capex_growth_5y"] == pytest.approx(0.10)
+
+    def test_revenue_growth_3y_falls_back_to_5y(self):
+        """3y CAGR is preferred; 5y is the fallback for newer listings."""
+        payload = _aapl_payload()
+        payload["metric"]["revenueGrowth3Y"] = None
+        payload["metric"]["revenueGrowth5Y"] = 0.05
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["revenue_growth_3y"] == pytest.approx(0.05)
+
+    def test_eps_growth_3y_falls_back_through_annual_5y(self):
+        payload = _aapl_payload()
+        payload["metric"]["epsGrowth3Y"] = None
+        payload["metric"]["epsBasicExclExtraItemsAnnual5Y"] = 0.07
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["eps_growth_3y"] == pytest.approx(0.07)
+
+    def test_payout_ratio_falls_back_to_annual(self):
+        payload = _aapl_payload()
+        payload["metric"]["payoutRatioTTM"] = None
+        payload["metric"]["payoutRatioAnnual"] = 0.25
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["payout_ratio"] == pytest.approx(0.25)
+
+    def test_dividend_yield_falls_back_to_ttm(self):
+        payload = _aapl_payload()
+        payload["metric"]["dividendYieldIndicatedAnnual"] = None
+        payload["metric"]["currentDividendYieldTTM"] = 0.012
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["dividend_yield"] == pytest.approx(0.012)
+
+    def test_clipping_extreme_growth_caps_at_upper_bound(self):
+        """A 500% YoY growth (e.g. post-spinoff base-effect) clips at the
+        upper bound. revenue_growth_3y cap is 1.5; eps_growth_3y cap is 2.0."""
+        payload = _aapl_payload(revenueGrowth3Y=5.0, epsGrowth3Y=10.0)
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["revenue_growth_3y"] == 1.5
+        assert data["eps_growth_3y"] == 2.0
+
+    def test_clipping_extreme_dividend_yield_caps_at_20pct(self):
+        """A 50% indicated yield (data error / micro-cap special dividend)
+        clips at 0.20 — the prior-realistic real-world ceiling for sustainable
+        dividend yields."""
+        payload = _aapl_payload(dividendYieldIndicatedAnnual=0.50)
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["dividend_yield"] == 0.20
+
+    def test_payout_ratio_clipped_above_2(self):
+        """payout_ratio > 2.0 (paying out 2x earnings — possible briefly in
+        a loss year as legacy dividend, but unsustainable) clips at 2.0."""
+        payload = _aapl_payload(payoutRatioTTM=5.0)
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["payout_ratio"] == 2.0
+
+    def test_empty_payload_still_returns_complete_neutral(self):
+        """Same coverage as the existing test, but explicitly verifies the
+        new fields are also zeroed (regression guard against future NEUTRAL
+        drift dropping them)."""
+        with patch.object(fundamentals, "finnhub_get", return_value={}):
+            data = _fetch_single_ticker("UNKNOWN")
+        assert data["revenue_growth_3y"] == 0.0
+        assert data["eps_growth_3y"] == 0.0
+        assert data["payout_ratio"] == 0.0
+        assert data["dividend_yield"] == 0.0
+        assert data["capex_growth_5y"] == 0.0
 
     def test_list_response_returns_neutral(self):
         # Finnhub typically returns dict; defensive: list response = malformed.

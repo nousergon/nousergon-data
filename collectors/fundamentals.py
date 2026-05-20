@@ -217,6 +217,12 @@ def _pick(metrics: dict, *keys: str, default: float = 0.0) -> float:
 
 
 # Neutral values for tickers where Finnhub returns nothing usable
+#
+# Phase 3a of attractiveness-pillars-260520 (2026-05-20): added 5 new
+# fundamental fields backing the Growth + Stewardship pillar quant
+# subscores. All Finnhub ``/stock/metric?metric=all`` derived — no new
+# API integrations. The composites that consume these fields are added
+# in alpha-engine-research/scoring/factor_scoring.py Phase 3b.
 NEUTRAL = {
     "pe_ratio": 0.0,
     "pb_ratio": 0.0,
@@ -226,6 +232,17 @@ NEUTRAL = {
     "gross_margin": 0.0,
     "roe": 0.0,
     "current_ratio": 0.0,
+    # Growth pillar substrate (Phase 3a) — 3y CAGR signals (smoother than
+    # TTM YoY; less noise from base-effect / single-quarter anomalies)
+    "revenue_growth_3y": 0.0,
+    "eps_growth_3y": 0.0,
+    # Stewardship pillar substrate (Phase 3a) — payout discipline +
+    # reinvestment intensity. Insider-ownership not surfaced here
+    # (Finnhub doesn't expose it via metric=all; deferred to a separate
+    # PR if/when it becomes load-bearing).
+    "payout_ratio": 0.0,
+    "dividend_yield": 0.0,
+    "capex_growth_5y": 0.0,
 }
 
 
@@ -285,6 +302,31 @@ def _fetch_single_ticker(ticker: str) -> dict:
     else:
         fcf_yield_raw = 0.0
 
+    # ── Growth pillar substrate (Phase 3a of attractiveness-pillars-260520) ──
+    # 3-year CAGR signals from Finnhub. Smoother than TTM YoY for
+    # composite ranking (base-effect noise + single-quarter anomalies
+    # average out). Annual fallbacks for newer listings without a full
+    # 3y history.
+    revenue_growth_3y_raw = _pick(metrics, "revenueGrowth3Y", "revenueGrowth5Y")
+    eps_growth_3y_raw = _pick(
+        metrics, "epsGrowth3Y", "epsBasicExclExtraItemsAnnual5Y", "epsGrowth5Y",
+    )
+
+    # ── Stewardship pillar substrate (Phase 3a) ──
+    # Payout ratio + dividend yield + capex growth proxy. Insider ownership
+    # is NOT here — Finnhub's metric=all does not surface it; would require
+    # a separate /stock/insider-transactions integration. Deferred to a
+    # follow-up if/when stewardship gains discriminative weight in the
+    # composite. The three signals here cover the "capital allocation
+    # discipline" axis: payout (return-of-capital intensity), dividend
+    # yield (vs. payout, identifies low-yield + low-payout = buyback-
+    # heavy retainers), and capex growth (reinvestment intensity).
+    payout_ratio_raw = _pick(metrics, "payoutRatioTTM", "payoutRatioAnnual")
+    dividend_yield_raw = _pick(
+        metrics, "dividendYieldIndicatedAnnual", "currentDividendYieldTTM",
+    )
+    capex_growth_5y_raw = _pick(metrics, "capitalSpendingGrowth5Y")
+
     # Finnhub returns gross margin and ROE as fractions (e.g. 0.42 for 42%);
     # FMP returned them the same way. Clipping ranges unchanged from the
     # FMP version so downstream feature-engineering / scoring sees the
@@ -298,6 +340,13 @@ def _fetch_single_ticker(ticker: str) -> dict:
         "gross_margin": _clip(gross_margin_raw, 0.0, 1.0),
         "roe": _clip(roe_raw, -1.0, 1.0),
         "current_ratio": _clip(current_ratio_raw / 3.0, 0.0, 3.0),
+        # Growth pillar quant signals
+        "revenue_growth_3y": _clip(revenue_growth_3y_raw, -0.5, 1.5),
+        "eps_growth_3y": _clip(eps_growth_3y_raw, -1.0, 2.0),
+        # Stewardship pillar quant signals
+        "payout_ratio": _clip(payout_ratio_raw, 0.0, 2.0),
+        "dividend_yield": _clip(dividend_yield_raw, 0.0, 0.20),
+        "capex_growth_5y": _clip(capex_growth_5y_raw, -1.0, 2.0),
     }
 
 

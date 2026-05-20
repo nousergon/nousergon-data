@@ -93,7 +93,7 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("dist_from_5d_high", "technical", "(Close - 5d rolling max High) / 5d rolling max High", source="yfinance", refresh="daily"),
     FeatureEntry("dist_from_20d_high", "technical", "(Close - 20d rolling max High) / 20d rolling max High", source="yfinance", refresh="daily"),
 
-    # ── Fundamental (8) — quarterly financials ────────────────────────────────
+    # ── Fundamental (13) — quarterly financials ───────────────────────────────
     FeatureEntry("pe_ratio", "fundamental", "Trailing P/E ratio, normalized (PE / 30)", source="fmp", refresh="quarterly"),
     FeatureEntry("pb_ratio", "fundamental", "Price-to-book ratio, normalized (PB / 5)", source="fmp", refresh="quarterly"),
     FeatureEntry("debt_to_equity", "fundamental", "Total debt / total equity, normalized (D/E / 2)", source="fmp", refresh="quarterly"),
@@ -102,6 +102,12 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("gross_margin", "fundamental", "Gross profit / revenue (0-1)", source="fmp", refresh="quarterly"),
     FeatureEntry("roe", "fundamental", "Return on equity (decimal)", source="fmp", refresh="quarterly"),
     FeatureEntry("current_ratio", "fundamental", "Current assets / current liabilities, normalized (CR / 3)", source="fmp", refresh="quarterly"),
+    # ── Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship pillar substrate ──
+    FeatureEntry("revenue_growth_3y", "fundamental", "3-year revenue CAGR (decimal); Growth pillar input", source="fmp", refresh="quarterly"),
+    FeatureEntry("eps_growth_3y", "fundamental", "3-year EPS CAGR (decimal); Growth pillar input", source="fmp", refresh="quarterly"),
+    FeatureEntry("payout_ratio", "fundamental", "TTM dividends / net income (0-2 clipped); Stewardship pillar input — retention rate = 1 - payout drives reinvestment", source="fmp", refresh="quarterly"),
+    FeatureEntry("dividend_yield", "fundamental", "Indicated annual dividend yield (decimal, 0-0.2 clipped); Stewardship pillar input", source="fmp", refresh="quarterly"),
+    FeatureEntry("capex_growth_5y", "fundamental", "5-year CAPEX growth (decimal); Stewardship pillar input — reinvestment intensity proxy", source="fmp", refresh="quarterly"),
 ]
 
 # Quick lookup by name

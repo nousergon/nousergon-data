@@ -124,6 +124,14 @@ FEATURES = [
     "gross_margin",
     "roe",
     "current_ratio",
+    # Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship
+    # pillar quant substrate. Surfaced from existing Finnhub metric=all
+    # response; no new API integrations.
+    "revenue_growth_3y",
+    "eps_growth_3y",
+    "payout_ratio",
+    "dividend_yield",
+    "capex_growth_5y",
     # v3.1 additions — longer-horizon + overnight/intraday decomposition +
     # reversal-native signals. Predictor ROADMAP P2: collapse FLAT +
     # test whether 5d is reversal or momentum regime. 2026-04-15: neutral
@@ -654,6 +662,12 @@ def compute_features(
         df["gross_margin"] = _safe_float(fundamental_data.get("gross_margin"), 0.0)
         df["roe"] = _safe_float(fundamental_data.get("roe"), 0.0)
         df["current_ratio"] = _safe_float(fundamental_data.get("current_ratio"), 0.0)
+        # Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship pillar substrate.
+        df["revenue_growth_3y"] = _safe_float(fundamental_data.get("revenue_growth_3y"), 0.0)
+        df["eps_growth_3y"] = _safe_float(fundamental_data.get("eps_growth_3y"), 0.0)
+        df["payout_ratio"] = _safe_float(fundamental_data.get("payout_ratio"), 0.0)
+        df["dividend_yield"] = _safe_float(fundamental_data.get("dividend_yield"), 0.0)
+        df["capex_growth_5y"] = _safe_float(fundamental_data.get("capex_growth_5y"), 0.0)
     else:
         df["pe_ratio"] = 0.0
         df["pb_ratio"] = 0.0
@@ -663,6 +677,11 @@ def compute_features(
         df["gross_margin"] = 0.0
         df["roe"] = 0.0
         df["current_ratio"] = 0.0
+        df["revenue_growth_3y"] = 0.0
+        df["eps_growth_3y"] = 0.0
+        df["payout_ratio"] = 0.0
+        df["dividend_yield"] = 0.0
+        df["capex_growth_5y"] = 0.0
 
     # Rows with NaN features are NOT dropped — see module docstring. A
     # feature whose rolling-window warmup exceeds the available history
