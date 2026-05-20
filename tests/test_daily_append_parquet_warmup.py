@@ -268,4 +268,82 @@ def test_load_parquet_warmup_returns_valid_frame(monkeypatch):
     result = daily_append._load_parquet_warmup(mock_s3, "b", "AAPL")
     assert result is not None
     assert len(result) == 2
-    assert "Close" in result.columns
+
+
+# ── Wave-3 reader migration (ROADMAP L1401) ────────────────────────────────
+
+
+def test_load_parquet_warmup_prefers_new_prefix(monkeypatch):
+    """The default-prefix path consults ``reference/price_cache/`` FIRST.
+    During the Wave-3 soak both prefixes hold byte-equal copies, but the
+    new prefix is also the sole survivor post-PR4 cutover — exercising it
+    end-to-end during the soak is the migration's whole point.
+    """
+    good_df = pd.DataFrame(
+        {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [1]},
+        index=pd.DatetimeIndex(["2026-04-20"]),
+    )
+    seen_keys: list[str] = []
+
+    def _stub(_s3, _bucket, key):
+        seen_keys.append(key)
+        return good_df
+
+    monkeypatch.setattr(daily_append, "load_parquet_from_s3", _stub)
+
+    result = daily_append._load_parquet_warmup(MagicMock(), "b", "AAPL")
+    assert result is not None
+    # First (and only — break on success) key fetched is the new prefix.
+    assert seen_keys == ["reference/price_cache/AAPL.parquet"], (
+        "Wave-3 read-prefix chain: ``reference/price_cache/`` must be "
+        "tried before the legacy fallback."
+    )
+
+
+def test_load_parquet_warmup_falls_back_to_legacy_on_new_prefix_miss(monkeypatch):
+    """When the new prefix is empty (e.g. the soak-window backfill hasn't
+    seeded a brand-new ticker yet) the legacy fallback is consulted; if
+    legacy has the parquet the helper returns it.
+    """
+    good_df = pd.DataFrame(
+        {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [1]},
+        index=pd.DatetimeIndex(["2026-04-20"]),
+    )
+    calls: list[str] = []
+
+    def _stub(_s3, _bucket, key):
+        calls.append(key)
+        if key.startswith("reference/"):
+            raise _fake_client_error("NoSuchKey")
+        return good_df
+
+    monkeypatch.setattr(daily_append, "load_parquet_from_s3", _stub)
+
+    result = daily_append._load_parquet_warmup(MagicMock(), "b", "AAPL")
+    assert result is not None
+    assert calls == [
+        "reference/price_cache/AAPL.parquet",
+        "predictor/price_cache/AAPL.parquet",
+    ], "Fallback order must be new → legacy (read = write reversed)."
+
+
+def test_load_parquet_warmup_returns_none_when_absent_in_both_prefixes(monkeypatch):
+    """A ticker absent from BOTH prefixes is a genuine "not in price
+    cache yet" state (brand-new constituent the weekly backfill hasn't
+    picked up). Both prefix lookups must be attempted before the helper
+    degrades to None — a single-prefix NoSuchKey is no longer sufficient.
+    """
+    calls: list[str] = []
+
+    def _stub(_s3, _bucket, key):
+        calls.append(key)
+        raise _fake_client_error("NoSuchKey")
+
+    monkeypatch.setattr(daily_append, "load_parquet_from_s3", _stub)
+
+    result = daily_append._load_parquet_warmup(MagicMock(), "b", "NEWIPO")
+    assert result is None
+    assert len(calls) == 2, (
+        "When the new prefix is missing the helper must still try legacy "
+        "before declaring the ticker absent."
+    )

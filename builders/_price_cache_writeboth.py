@@ -27,6 +27,8 @@ upload in ``for prefix in price_cache_write_prefixes(s3_prefix): ...``.
 
 from __future__ import annotations
 
+from typing import Any
+
 # Wave 3 PR1 — legacy primary, new mirror. The cutover PR (Wave 3 PR4) flips
 # ``PRICE_CACHE_NEW_PREFIX`` to first position and removes the legacy entry
 # from ``price_cache_write_prefixes`` (one-line edit at that time).
@@ -93,9 +95,60 @@ def price_cache_read_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[
     return [primary]
 
 
+def list_price_cache_keys(
+    s3: Any, bucket: str, primary: str = PRICE_CACHE_LEGACY_PREFIX,
+) -> list[str]:
+    """List per-ticker parquet keys across the active read prefixes.
+
+    Companion to :func:`price_cache_read_prefixes` for aggregate-read
+    sites (``builders/backfill._load_full_cache``,
+    ``collectors/slim_cache.collect``). Iterates the fallback
+    chain in read order and returns deduplicated keys by
+    ``{ticker}.parquet`` basename — first prefix wins, so the new
+    prefix takes precedence during the Wave-3 soak and is the sole
+    survivor post-PR4 cutover. Legacy fills any reference-side gaps.
+
+    Keys are returned with their full prefix attached (callers pass
+    them straight to ``s3.get_object`` / ``download_file``). Order is
+    deterministic: all unique keys discovered under the first prefix
+    in :func:`price_cache_read_prefixes` order, then any new keys
+    from the second prefix.
+
+    The single-key fallback path (one ticker, two candidate prefixes)
+    is inlined at the few call sites that need it — the predictor's
+    ``regime/features._read_parquet_close`` chokepoint and the data
+    repo's ``_load_parquet_warmup`` — mirroring the
+    :func:`price_cache_read_prefixes` semantics without a second
+    helper signature.
+    """
+    if primary != PRICE_CACHE_LEGACY_PREFIX:
+        # Custom prefix opts out of the fallback chain, matching the
+        # write/read-helper conventions for tests + config overrides.
+        prefixes: list[str] = [primary]
+    else:
+        prefixes = price_cache_read_prefixes(primary)
+
+    seen_basenames: set[str] = set()
+    out: list[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for prefix in prefixes:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".parquet"):
+                    continue
+                basename = key.rsplit("/", 1)[-1]
+                if basename in seen_basenames:
+                    continue
+                seen_basenames.add(basename)
+                out.append(key)
+    return out
+
+
 __all__ = [
     "PRICE_CACHE_LEGACY_PREFIX",
     "PRICE_CACHE_NEW_PREFIX",
     "price_cache_write_prefixes",
     "price_cache_read_prefixes",
+    "list_price_cache_keys",
 ]

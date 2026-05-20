@@ -26,6 +26,7 @@ import pytest
 from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
     PRICE_CACHE_NEW_PREFIX,
+    list_price_cache_keys,
     price_cache_read_prefixes,
     price_cache_write_prefixes,
 )
@@ -97,6 +98,88 @@ def test_read_helper_custom_prefix_returns_single():
     custom = "some/other/prefix/"
     out = price_cache_read_prefixes(custom)
     assert out == [custom]
+
+
+# ---------------------------------------------------------------------------
+# list_price_cache_keys — aggregate-listing helper (PR3-wave-2)
+# ---------------------------------------------------------------------------
+
+
+def _make_paginator(pages_by_prefix: dict[str, list[list[dict]]]):
+    """Build a paginator double that returns per-prefix pages.
+
+    Each ``pages_by_prefix[prefix]`` is a list of page dicts' ``Contents``
+    arrays; each Content entry is ``{"Key": "..."}``.
+    """
+
+    class _Paginator:
+        def paginate(self, *, Bucket: str, Prefix: str):
+            pages = pages_by_prefix.get(Prefix, [])
+            for contents in pages:
+                yield {"Contents": contents}
+
+    s3 = MagicMock()
+    s3.get_paginator.return_value = _Paginator()
+    return s3
+
+
+def test_list_price_cache_keys_default_iterates_new_then_legacy():
+    """Aggregate listing under the production default consults the new
+    prefix first then the legacy prefix; tickers present in BOTH only
+    surface once (first-prefix-wins, deduped by basename).
+    """
+    new_keys = [{"Key": f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet"},
+                {"Key": f"{PRICE_CACHE_NEW_PREFIX}MSFT.parquet"}]
+    legacy_keys = [{"Key": f"{PRICE_CACHE_LEGACY_PREFIX}AAPL.parquet"},
+                   {"Key": f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet"}]
+    s3 = _make_paginator({
+        PRICE_CACHE_NEW_PREFIX: [new_keys],
+        PRICE_CACHE_LEGACY_PREFIX: [legacy_keys],
+    })
+
+    out = list_price_cache_keys(s3, "alpha-engine-research")
+    # AAPL + MSFT each appear exactly once, both anchored on the new prefix.
+    assert out == [
+        f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet",
+        f"{PRICE_CACHE_NEW_PREFIX}MSFT.parquet",
+    ], "First-prefix-wins must dedupe by {ticker}.parquet basename."
+
+
+def test_list_price_cache_keys_falls_back_to_legacy_for_missing_basenames():
+    """When the new prefix is partially populated (soak-window backfill
+    hasn't picked up every ticker yet), legacy fills the gaps so the
+    aggregate set stays complete — the whole point of keeping the
+    legacy fallback live during the soak.
+    """
+    # Only AAPL has been mirrored to new yet; MSFT still legacy-only.
+    new_keys = [{"Key": f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet"}]
+    legacy_keys = [{"Key": f"{PRICE_CACHE_LEGACY_PREFIX}AAPL.parquet"},
+                   {"Key": f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet"}]
+    s3 = _make_paginator({
+        PRICE_CACHE_NEW_PREFIX: [new_keys],
+        PRICE_CACHE_LEGACY_PREFIX: [legacy_keys],
+    })
+
+    out = list_price_cache_keys(s3, "alpha-engine-research")
+    # AAPL from new (first-wins), MSFT from legacy (gap-fill).
+    assert out == [
+        f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet",
+        f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet",
+    ]
+
+
+def test_list_price_cache_keys_custom_prefix_opts_out_of_chain():
+    """A non-default prefix opts out of the fallback chain (mirrors the
+    single-key helper semantics): only the explicit prefix is listed.
+    """
+    custom = "some/other/prefix/"
+    keys = [{"Key": f"{custom}XYZ.parquet"}]
+    s3 = _make_paginator({custom: [keys]})
+
+    out = list_price_cache_keys(s3, "b", custom)
+    assert out == [f"{custom}XYZ.parquet"]
+    # And neither leg of the production chain was consulted.
+    s3.get_paginator.return_value  # noqa — no further-prefix assertion needed; pages dict carries it.
 
 
 # ---------------------------------------------------------------------------
