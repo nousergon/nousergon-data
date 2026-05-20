@@ -102,15 +102,29 @@ aws lambda wait function-updated \
 echo "✓ Deployed."
 
 # Smoke test: publish a single SNS message and verify the entry lands.
+# Migrated 2026-05-20 (ROADMAP L146) from raw ``aws sns publish`` to the
+# canonical ``alpha_engine_lib.alerts`` primitive (v0.21.0, lib #52).
+# Skips Telegram on purpose: this is a deliberate deploy smoke test, not
+# a real failure event, and a per-deploy operator ping would be noise.
+# SNS path stays identical (same default topic `alpha-engine-alerts`),
+# so the changelog-incident-mirror Lambda still sees the message.
 SMOKE_ARG="${1:-}"
 if [[ "${SMOKE_ARG}" == "--smoke" ]]; then
-  echo "Smoke-testing via SNS publish..."
+  echo "Smoke-testing via alerts.publish (SNS-only, severity=info)..."
   TS=$(date -u +%s)
-  aws sns publish \
-    --topic-arn "arn:aws:sns:${REGION}:711398986525:alpha-engine-alerts" \
-    --subject "deploy.sh smoke test ${TS}" \
-    --message "Verifying changelog-incident-mirror after deploy ${TS}" \
-    --query 'MessageId' --output text >/dev/null
+  # Resolve Python with alpha_engine_lib installed — prefer repo-local
+  # .venv, fall back to system python3 (mirrors the alpha-engine
+  # health_checker.sh pattern).
+  _alert_python="python3"
+  if [ -x "$(dirname "$0")/../../../.venv/bin/python" ]; then
+    _alert_python="$(dirname "$0")/../../../.venv/bin/python"
+  fi
+  "$_alert_python" -m alpha_engine_lib.alerts publish \
+    --severity info \
+    --no-telegram \
+    --source alpha-engine-data/changelog-incident-mirror/deploy.sh \
+    --message "deploy.sh smoke test ${TS}: Verifying changelog-incident-mirror after deploy" \
+    > /dev/null
   echo "  → Published. Entry should land in s3://alpha-engine-research/changelog/entries/ within ~3s."
   echo "  → Check with: aws s3 ls s3://alpha-engine-research/changelog/entries/$(date -u +%Y-%m-%d)/ --recursive | tail"
 fi

@@ -15,4 +15,4 @@ arcticdb>=6.11
 # flow-doctor is pulled in transitively via alpha-engine-lib[flow_doctor].
 # psycopg2-binary + pgvector now come via [rag] (added in lib v0.3.0,
 # direct pins dropped 2026-05-20 after >2-week soak on v0.20.0).
-alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.20.0
+alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.21.0
