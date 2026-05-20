@@ -29,6 +29,16 @@ COPY collectors/ ${LAMBDA_TASK_ROOT}/collectors/
 COPY polygon_client.py ${LAMBDA_TASK_ROOT}/
 COPY weekly_collector.py ${LAMBDA_TASK_ROOT}/
 COPY store/ ${LAMBDA_TASK_ROOT}/store/
+# validators/ — top-level imports in collectors/alternative.py +
+# collectors/fundamentals.py (added 2026-05-16 via PR #254 per-collector
+# value-range validation) require the package present in the Lambda image.
+# Latent CI failure mode 2026-05-18 → 2026-05-19 (10 consecutive canary
+# rollbacks to v87) surfaced by the Wave-3 PR3-wave-2 deploy (#273) —
+# every push that touched a deploy-triggering path since #254 failed at
+# canary with ``No module named 'validators'``. The canary correctly
+# rolled back each time so prod (v87) was unaffected; the latent break
+# only blocked any new code from ever reaching ``live``.
+COPY validators/ ${LAMBDA_TASK_ROOT}/validators/
 
 # flow-doctor.yaml at LAMBDA_TASK_ROOT is loaded by setup_logging() at
 # module-top of lambda/handler.py. The path resolves via:
