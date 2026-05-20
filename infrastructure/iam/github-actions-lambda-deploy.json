@@ -250,6 +250,26 @@
           ]
         }
       }
+    },
+    {
+      "Sid": "DashboardDeployViaSSM",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand"
+      ],
+      "Resource": [
+        "arn:aws:ec2:us-east-1:711398986525:instance/i-09b539c844515d549",
+        "arn:aws:ssm:us-east-1::document/AWS-RunShellScript"
+      ]
+    },
+    {
+      "Sid": "DashboardDeployPollCommand",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations"
+      ],
+      "Resource": "*"
     }
   ]
 }
