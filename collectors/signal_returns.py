@@ -634,11 +634,12 @@ def _backfill_predictor_returns(
                 correct = 1 if log_alpha > 0 else 0
             elif direction == "DOWN":
                 correct = 1 if log_alpha < 0 else 0
-            elif direction == "FLAT":
-                # FLAT correctness band: |log_alpha| < 0.01 log-units
-                # (≈1% arithmetic at small magnitudes via log(1+r) ≈ r).
-                correct = 1 if abs(log_alpha) < 0.01 else 0
             else:
+                # Predictor emits binary UP/DOWN only since alpha-engine-predictor
+                # #143 collapsed the 3-class FLAT scaffolding at calibrator level.
+                # Legacy rows with predicted_direction="FLAT" (or any non-binary
+                # value) fall through unresolved — finite legacy set, not load-
+                # bearing on any consumer.
                 continue
 
             if not dry_run:

@@ -288,3 +288,66 @@ class TestForwardWindowUnclosedSkipped:
                     "WHERE symbol='AAPL' AND prediction_date='2026-03-02'"
                 ).fetchone()
             assert row[0] is None
+
+
+# -- Binary UP/DOWN contract (post-#143 calibrator) ---------------------------
+
+
+def test_legacy_flat_direction_falls_through_unresolved():
+    """Predictor #143 collapsed FLAT at the calibrator level. Legacy rows
+    with predicted_direction='FLAT' should fall through the else-branch
+    (correct=NULL, actual_log_alpha=NULL), not be silently scored.
+
+    The branch was removed 2026-05-21 per ROADMAP L2009. This test pins
+    the binary-only contract so a future re-introduction of a FLAT scoring
+    branch surfaces in code review rather than silent calibrator drift.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "data.db")
+        _seed_universe_returns(db, "JPM", "2026-03-02", log_stock=0.005, log_spy=0.005)
+        _seed_predictor_outcomes(db, "JPM", "2026-03-02", "FLAT")
+        with sqlite3.connect(db) as conn:
+            _ensure_predictor_outcomes_schema(conn)
+
+        result = _backfill_predictor_returns(db, dry_run=False, forward_days=21)
+        assert result["status"] == "ok"
+        # 0 rows scored — FLAT falls through
+        assert result["rows_written"] == 0
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT actual_log_alpha, correct FROM predictor_outcomes "
+                "WHERE symbol='JPM' AND prediction_date='2026-03-02'"
+            ).fetchone()
+        # Unresolved — by design (legacy FLAT rows are a finite set, not
+        # load-bearing on any consumer per ROADMAP L2009).
+        assert row[0] is None
+        assert row[1] is None
+
+
+def test_binary_directions_still_score_correctly():
+    """UP/DOWN paths must remain intact post-FLAT-branch removal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "data.db")
+        # UP, log_alpha > 0 → correct=1
+        _seed_universe_returns(db, "AAPL", "2026-03-02", log_stock=0.05, log_spy=0.01)
+        _seed_predictor_outcomes(db, "AAPL", "2026-03-02", "UP")
+        # DOWN, log_alpha < 0 → correct=1
+        _seed_universe_returns(db, "XOM", "2026-03-02", log_stock=-0.03, log_spy=0.01)
+        _seed_predictor_outcomes(db, "XOM", "2026-03-02", "DOWN")
+        with sqlite3.connect(db) as conn:
+            _ensure_predictor_outcomes_schema(conn)
+
+        result = _backfill_predictor_returns(db, dry_run=False, forward_days=21)
+        assert result["status"] == "ok"
+        assert result["rows_written"] == 2
+
+        with sqlite3.connect(db) as conn:
+            rows = {
+                r[0]: r for r in conn.execute(
+                    "SELECT symbol, actual_log_alpha, correct FROM predictor_outcomes "
+                    "WHERE prediction_date='2026-03-02'"
+                ).fetchall()
+            }
+        assert rows["AAPL"][2] == 1  # UP + positive alpha = correct
+        assert rows["XOM"][2] == 1   # DOWN + negative alpha = correct

@@ -99,8 +99,10 @@ def synthetic_predictions():
                 "veto": False,
             },
             "JPM": {
-                "direction": "FLAT",
-                "confidence": 0.52,
+                # Binary UP/DOWN only since alpha-engine-predictor #143
+                # collapsed the FLAT class at calibrator level.
+                "direction": "DOWN",
+                "confidence": 0.04,
                 "predicted_alpha": 0.001,
                 "veto": False,
             },
@@ -196,7 +198,8 @@ class TestPredictionsContract:
         for ticker, pred in synthetic_predictions["predictions"].items():
             assert "direction" in pred
             assert "confidence" in pred
-            assert pred["direction"] in ("UP", "FLAT", "DOWN")
+            # Predictor emits binary UP/DOWN since alpha-engine-predictor #143.
+            assert pred["direction"] in ("UP", "DOWN")
             assert 0 <= pred["confidence"] <= 1
 
 
