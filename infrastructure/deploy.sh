@@ -196,6 +196,16 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
       --region "$REGION" 2>/dev/null || true
     echo "  Rolled back to version $PREV_VERSION"
   fi
+  # Independent-channel surveillance per ROADMAP L221 — this exact
+  # rollback chain fired silently 10 consecutive times across 2 days
+  # (alpha-engine-data #274 retrospective) before Brian noticed the
+  # GitHub Actions red-icon. Best-effort; trailing || true never
+  # overrides the deploy's exit 1.
+  python3 -m alpha_engine_lib.alerts publish \
+    --severity error \
+    --source "alpha-engine-data/infrastructure/deploy.sh" \
+    --message "Canary rolled back: ${FUNCTION_NAME} canary returned status='${CANARY_STATUS}', live alias reverted v${VERSION}→v${PREV_VERSION}. See CloudWatch /aws/lambda/${FUNCTION_NAME} for payload." \
+    || true
   exit 1
 fi
 echo "  Canary passed (status=$CANARY_STATUS)"
