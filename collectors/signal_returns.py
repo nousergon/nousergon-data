@@ -607,6 +607,7 @@ def _backfill_predictor_returns(
             return {"status": "ok", "rows_written": 0}
 
         resolved = 0
+        non_binary_skipped: dict[str, int] = {}
         for _, row in pending.iterrows():
             ticker = row["symbol"]
             pred_date = row["prediction_date"]
@@ -635,11 +636,20 @@ def _backfill_predictor_returns(
             elif direction == "DOWN":
                 correct = 1 if log_alpha < 0 else 0
             else:
-                # Predictor emits binary UP/DOWN only since alpha-engine-predictor
-                # #143 collapsed the 3-class FLAT scaffolding at calibrator level.
-                # Legacy rows with predicted_direction="FLAT" (or any non-binary
-                # value) fall through unresolved — finite legacy set, not load-
-                # bearing on any consumer.
+                # Per ~/Development/CLAUDE.md fail-loud-and-fast rule: a silent
+                # skip in a backfill loop is forbidden by default. Carve-out
+                # here is "finite legacy set" — the predictor has emitted
+                # binary UP/DOWN only since alpha-engine-predictor #143
+                # collapsed the 3-class FLAT scaffolding at calibrator level.
+                # Carve-out conditions: (a) failure mode = non-binary direction
+                # value (legacy FLAT or unexpected new label); (c) recording
+                # surface = WARN log + grouped counter below + the rows stay
+                # NULL-resolved so a future SELECT on `actual_log_alpha IS NULL`
+                # still surfaces them. If the counter starts growing, the
+                # predictor has regressed past the binary contract and needs
+                # a new branch added here.
+                key = str(direction) if direction is not None else "NULL"
+                non_binary_skipped[key] = non_binary_skipped.get(key, 0) + 1
                 continue
 
             if not dry_run:
@@ -661,7 +671,20 @@ def _backfill_predictor_returns(
                 "(log-domain canonical) via universe_returns JOIN",
                 resolved, h,
             )
-        return {"status": "ok", "rows_written": resolved}
+        if non_binary_skipped:
+            logger.warning(
+                "[signal_returns] skipped %d predictor_outcomes rows with "
+                "non-binary predicted_direction (legacy FLAT or unexpected "
+                "label, by value: %s). Expected post-#143: binary UP/DOWN "
+                "only. If this count grows over time, audit the predictor's "
+                "calibrator output contract.",
+                sum(non_binary_skipped.values()), non_binary_skipped,
+            )
+        return {
+            "status": "ok",
+            "rows_written": resolved,
+            "non_binary_skipped": non_binary_skipped,
+        }
 
     except Exception as e:
         logger.error("backfill_predictor_returns failed: %s", e)
