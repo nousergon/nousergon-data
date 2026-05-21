@@ -236,16 +236,26 @@ Resources:
       SourceArn: !GetAtt ResearchAlerts.Arn
 
   # --------------------------------------------------------------------------
-  # EventBridge Scheduler — Stop Trading Instance
+  # EventBridge Scheduler — Stop Trading Instance (10 PM PT backstop)
   # --------------------------------------------------------------------------
   # Note: EventBridge Scheduler uses a different API than EventBridge Rules.
   # CloudFormation support for Scheduler is via AWS::Scheduler::Schedule.
+  #
+  # Role: late-night cost-guard backstop. The EOD SF's
+  # ``StopTradingInstance`` + ``ForceStopInstance`` states are the
+  # authoritative stoppers right after market close (success or failure
+  # path). This scheduler only fires if both of those paths missed —
+  # e.g. EOD SF never started, daemon never triggered the SF, or AWS
+  # SDK call failures left the instance running past expected stop.
+  # 10:00 PM PT places it ~8 h after market close, well outside any
+  # legitimate same-day workflow.
   StopTradingSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: alpha-engine-stop-trading
-      Description: Stop trading EC2 after market close (1:30 PM PT / 20:30 UTC)
-      ScheduleExpression: 'cron(30 13 ? * MON-FRI *)'
+      Description: Cost-guard backstop — stop trading EC2 at 10 PM PT if EOD SF didn't
+      ScheduleExpression: 'cron(0 22 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: 'America/Los_Angeles'
       FlexibleTimeWindow:
         Mode: 'OFF'
       State: ENABLED
