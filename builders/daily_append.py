@@ -1305,8 +1305,29 @@ def daily_append(
             else:
                 # Backfill — splice into existing series, full rewrite. Same
                 # logic as _write_row_backfill_safe's backfill branch.
+                #
+                # Re-project combined to canonical OHLCV+source+FEATURES order
+                # BEFORE the write. pd.concat's default outer-join preserves
+                # ``hist``'s column order and appends any new columns from
+                # ``today_row`` at the end — which produces a layout that
+                # differs from ``today_row``'s canonical order. A subsequent
+                # same-or-later-date UpdatePayload (with cols in canonical
+                # order) then trips ArcticDB's StreamDescriptorMismatch.
+                # Observed 2026-05-21: PR #279 widened FEATURES with 5 new
+                # pillar fields in the middle of the list; that morning's
+                # MorningEnrich rewrote 891/904 symbols via this WRITE path
+                # (pd.concat appended the 5 new cols at the end, layout
+                # diverged from canonical); the same-day EOD's UPDATE then
+                # failed 905/905 with pillars-at-end vs pillars-in-middle.
+                # Same defect class as the today_row reorder one layer up.
                 combined = pd.concat([hist, today_row])
                 combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+                combined_ordered_cols = (
+                    [c for c in OHLCV_COLS if c in combined.columns]
+                    + ([PROVENANCE_COL] if PROVENANCE_COL in combined.columns else [])
+                    + [f for f in FEATURES if f in combined.columns]
+                )
+                combined = combined[combined_ordered_cols]
                 write_payloads.append(
                     WritePayload(symbol=ticker, data=to_arctic_safe(combined))
                 )

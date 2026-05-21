@@ -158,3 +158,43 @@ def test_writes_use_arcticdb_batch_api():
     assert "from arcticdb.version_store.library import" in src and "UpdatePayload" in src
     # Backfill path uses write_batch — kept symmetrical with update_batch.
     assert "write_batch" in src
+
+
+def test_write_path_reorders_combined_before_write_payload():
+    """The WRITE branch (``combined = pd.concat([hist, today_row])``) must
+    re-project ``combined`` to canonical OHLCV+source+FEATURES order before
+    handing it to WritePayload — same defensive reorder the UPDATE branch's
+    today_row already does.
+
+    2026-05-21 EOD regression: PR #279 inserted five pillar fields in the
+    middle of ``FEATURES``; that morning's MorningEnrich ran daily_append
+    for tickers whose ArcticDB ``last_date`` matched the target date, taking
+    the WRITE branch. ``pd.concat`` defaults to outer-join + preserves
+    ``hist``'s 72-col order, appending the five new pillar columns at the
+    end of ``combined``. WritePayload then wrote 891/904 symbols with
+    pillars-at-end. The same-day EOD's UPDATE branch (with ``today_row`` in
+    canonical pillars-in-middle order) tripped ArcticDB's
+    StreamDescriptorMismatch on 905/905 symbols, halting EOD Reconcile.
+
+    A source-grep test rather than a functional one because the batch path
+    is glued together with read_batch / update_batch / write_batch APIs that
+    aren't usefully mockable at unit-test scope — the actual defect class is
+    a missing reorder pair, easy to spot lexically.
+    """
+    src = _source()
+    write_block_anchor = "combined = pd.concat([hist, today_row])"
+    assert write_block_anchor in src, (
+        "Expected the backfill splice anchor to remain — fixed by relocating "
+        "the reorder, not by deleting the concat."
+    )
+    after_anchor = src.split(write_block_anchor, 1)[1]
+    write_payload_idx = after_anchor.index("WritePayload(symbol=ticker")
+    pre_write_payload = after_anchor[:write_payload_idx]
+    assert "combined_ordered_cols" in pre_write_payload and "combined[combined_ordered_cols]" in pre_write_payload, (
+        "WRITE-path must re-project combined to canonical OHLCV+source+FEATURES "
+        "order before WritePayload — otherwise pd.concat's default column "
+        "ordering (hist-first, new-cols-appended) silently scrambles the "
+        "schema, breaking subsequent UPDATE calls (2026-05-21 EOD regression)."
+    )
+    assert "for c in OHLCV_COLS" in pre_write_payload
+    assert "for f in FEATURES" in pre_write_payload
