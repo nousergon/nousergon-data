@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-eod-success-friday-shell-trigger:*"
+    },
+    {
+      "Sid": "StartSaturdayShellRun",
+      "Effect": "Allow",
+      "Action": ["states:StartExecution"],
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
+    }
+  ]
+}
