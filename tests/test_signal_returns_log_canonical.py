@@ -293,15 +293,21 @@ class TestForwardWindowUnclosedSkipped:
 # -- Binary UP/DOWN contract (post-#143 calibrator) ---------------------------
 
 
-def test_legacy_flat_direction_falls_through_unresolved():
+def test_legacy_flat_direction_falls_through_unresolved(caplog):
     """Predictor #143 collapsed FLAT at the calibrator level. Legacy rows
-    with predicted_direction='FLAT' should fall through the else-branch
-    (correct=NULL, actual_log_alpha=NULL), not be silently scored.
+    with predicted_direction='FLAT' fall through the else-branch (correct
+    + actual_log_alpha stay NULL), AND the skip MUST surface via a WARN
+    log + grouped counter per the ~/Development/CLAUDE.md fail-loud-and-
+    fast rule.
 
-    The branch was removed 2026-05-21 per ROADMAP L2009. This test pins
-    the binary-only contract so a future re-introduction of a FLAT scoring
-    branch surfaces in code review rather than silent calibrator drift.
+    If this test goes silent (no WARN, no counter), the backfill loop has
+    reverted to true silent-skip and the rule is violated. The PR that
+    removed the FLAT scoring branch (2026-05-21 per ROADMAP L2009) added
+    the WARN+counter in the same commit as a defense against a future
+    calibrator regression producing non-binary directions invisibly.
     """
+    import logging
+
     with tempfile.TemporaryDirectory() as tmp:
         db = str(Path(tmp) / "data.db")
         _seed_universe_returns(db, "JPM", "2026-03-02", log_stock=0.005, log_spy=0.005)
@@ -309,10 +315,18 @@ def test_legacy_flat_direction_falls_through_unresolved():
         with sqlite3.connect(db) as conn:
             _ensure_predictor_outcomes_schema(conn)
 
-        result = _backfill_predictor_returns(db, dry_run=False, forward_days=21)
+        with caplog.at_level(logging.WARNING, logger="collectors.signal_returns"):
+            result = _backfill_predictor_returns(db, dry_run=False, forward_days=21)
         assert result["status"] == "ok"
         # 0 rows scored — FLAT falls through
         assert result["rows_written"] == 0
+        # Counter pins the per-value skip count
+        assert result["non_binary_skipped"] == {"FLAT": 1}
+        # WARN log mentions the surface so ops triage is possible
+        warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("non-binary predicted_direction" in r.getMessage() for r in warn_records), (
+            "fail-loud rule: non-binary direction skip must emit a WARN log"
+        )
 
         with sqlite3.connect(db) as conn:
             row = conn.execute(
@@ -320,7 +334,9 @@ def test_legacy_flat_direction_falls_through_unresolved():
                 "WHERE symbol='JPM' AND prediction_date='2026-03-02'"
             ).fetchone()
         # Unresolved — by design (legacy FLAT rows are a finite set, not
-        # load-bearing on any consumer per ROADMAP L2009).
+        # load-bearing on any consumer per ROADMAP L2009). Future SELECT
+        # on `actual_log_alpha IS NULL` still surfaces them; counter +
+        # WARN above replace the silent-skip path.
         assert row[0] is None
         assert row[1] is None
 
@@ -351,3 +367,5 @@ def test_binary_directions_still_score_correctly():
             }
         assert rows["AAPL"][2] == 1  # UP + positive alpha = correct
         assert rows["XOM"][2] == 1   # DOWN + negative alpha = correct
+        # Counter empty on clean binary runs — non-empty is a regression signal
+        assert result["non_binary_skipped"] == {}
