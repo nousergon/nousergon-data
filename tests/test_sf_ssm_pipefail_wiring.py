@@ -15,15 +15,37 @@ Three rules pinned here:
    stdout — exactly the failure mode on 2026-05-11, where two ERROR
    logs from `weekly_collector` fired but flow-doctor never escalated.
 
-3. Every command block that pipes its work to `| tee /var/log/X.log`
-   must arm an EXIT trap that ships that log to S3 before the work line.
-   SSM's `StandardOutputContent` is capped at 24KB and `StandardOutputUrl`
-   is empty (no CloudWatchOutputConfig), so when a long step exits 1 on a
-   stopped/terminated instance the actual error is unrecoverable. This is
-   a recurring diagnostic gap (MorningEnrich 2026-05-15, DataPhase1
-   2026-05-03, backtester 2026-04-22). The trap must be `|| true` so it
-   never alters the script's real exit status (the SF Catch must still
-   see the true failure).
+3. Every long-running command block must ship its log to S3 before the
+   instance terminates. SSM's `StandardOutputContent` is capped at 24KB
+   and `StandardOutputUrl` is empty (no CloudWatchOutputConfig), so when
+   a long step exits 1 on a stopped/terminated instance the actual error
+   is otherwise unrecoverable. Recurring diagnostic gap: MorningEnrich
+   2026-05-15, DataPhase1 2026-05-03, backtester 2026-04-22.
+
+   Two equivalent forms satisfy this invariant:
+   (a) **Inline bash trap** — `trap 'aws s3 cp /var/log/X.log
+       "s3://..." --only-show-errors || true' EXIT` BEFORE a
+       `| tee /var/log/X.log` work line. Used by states whose
+       `commands` is a plain JSON array.
+   (b) **`alpha_engine_lib.ssm_log_capture` CLI** — a single
+       `python -m alpha_engine_lib.ssm_log_capture run --slug X
+       --log /var/log/X.log -- bash <launcher> ...` invocation that
+       internalizes both the trap and the tee. Used by states whose
+       `commands.$` is a `States.Array(...)` (the ASL escape surface
+       for inner single quotes is broken, so the inline-trap form
+       cannot live there — see alpha-engine-lib PR #57 / 2026-05-22
+       Friday-PM dry-pass break).
+
+   The lib CLI is the institutional chokepoint per the CLAUDE.md SOTA
+   sub-sub-rule ("Pure-Bash primitives can stay mirrored unless
+   re-expressible as a Python CLI entry callable from Bash"). The
+   inline-trap form is retained for plain `commands` arrays that have
+   never been broken by ASL escape behavior.
+
+   In either form: the log-capture step must not be able to override
+   the script's real exit status. Inline traps use `|| true`; the lib
+   CLI propagates the inner subprocess exit code verbatim and swallows
+   S3 errors at WARNING.
 """
 
 from __future__ import annotations
@@ -33,6 +55,8 @@ import re
 from pathlib import Path
 
 import pytest
+
+from tests.sf_command_utils import extract_commands
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -45,7 +69,20 @@ _SF_PATHS = [
 
 
 def _iter_ssm_command_blocks(sf_doc: dict):
-    """Yield (state_name, commands_list) for every SSM RunShellScript task."""
+    """Yield (state_name, commands_list) for every SSM RunShellScript task.
+
+    Resolves BOTH ``commands`` (plain JSON array) and ``commands.$``
+    (``States.Array(...)`` intrinsic) forms via the shared
+    :func:`tests.sf_command_utils.extract_commands` helper. This was a
+    silent test gap that masked the 2026-05-22 Friday-PM dry-pass break
+    — the original implementation only iterated ``commands``, so the
+    Saturday-SF states that PR #253 (2026-05-17) flipped to
+    ``commands.$`` form silently stopped being covered. The
+    inline-bash-trap regression that followed went undetected by this
+    file until the dry-pass actually fired in production. The
+    extraction now covers both forms; the broken-trap class cannot
+    silently slip past again.
+    """
     for state_name, state in sf_doc.get("States", {}).items():
         if state.get("Type") != "Task":
             continue
@@ -56,9 +93,10 @@ def _iter_ssm_command_blocks(sf_doc: dict):
         if params.get("DocumentName") != "AWS-RunShellScript":
             continue
         inner = params.get("Parameters", {})
-        cmds = inner.get("commands")
-        if isinstance(cmds, list):
-            yield state_name, cmds
+        if "commands" in inner and isinstance(inner["commands"], list):
+            yield state_name, list(inner["commands"])
+        elif "commands.$" in inner:
+            yield state_name, extract_commands(state)
 
 
 _DAILY_SF_PATH = _INFRA / "step_function_daily.json"
@@ -138,26 +176,59 @@ def test_weekday_sf_ssm_blocks_export_flow_doctor_enabled() -> None:
 
 
 _TEE_WORK_RE = re.compile(r"\| tee (?:-a )?(/var/log/[\w.-]+\.log)")
+_LIB_CLI_RE = re.compile(
+    r"alpha_engine_lib\.ssm_log_capture\s+run\s+.*?--slug\s+(\S+)\s+--log\s+(/var/log/[\w.-]+\.log)"
+)
 
 
 @pytest.mark.parametrize("sf_path", _SF_PATHS, ids=lambda p: p.name)
-def test_long_ssm_steps_ship_log_to_s3_before_work(sf_path: Path) -> None:
-    """Every `| tee /var/log/X.log` work line needs a preceding S3 EXIT trap.
+def test_long_ssm_steps_ship_log_to_s3(sf_path: Path) -> None:
+    """Every long SSM step must ship its log to S3 — via inline trap OR lib CLI.
 
     Regression target: the recurring "step exits 1 but the cause is past
     SSM's 24KB StandardOutputContent cap and the instance is gone" gap
     (MorningEnrich 2026-05-15, DataPhase1 2026-05-03, backtester
-    2026-04-22). The fix is an EXIT trap that `aws s3 cp`s the local
-    /var/log/X.log to s3://alpha-engine-research/_ssm_logs/... — armed
-    BEFORE the long work command so it fires whether the step succeeds or
-    fails, and `|| true` so it never overrides the script's real exit
-    status (the SF Catch must still see the true failure).
+    2026-04-22). Two satisfying shapes (see module docstring rule #3):
+
+    (a) **Inline bash trap** before `| tee /var/log/X.log` work line —
+        original form, plain `commands` JSON arrays only.
+    (b) **`alpha_engine_lib.ssm_log_capture` CLI** — single
+        `python -m alpha_engine_lib.ssm_log_capture run --slug X
+        --log /var/log/X.log -- bash <launcher>` line; internalizes the
+        trap. Required form for `commands.$ States.Array(...)` states
+        (ASL doesn't unescape `\\'` in arg strings; the inline-trap
+        form breaks there — caught by the 2026-05-22 Friday-PM
+        dry-pass).
     """
     sf_doc = json.loads(sf_path.read_text())
     offenders: list[str] = []
     for state_name, cmds in _iter_ssm_command_blocks(sf_doc):
+        # Form (b): lib CLI satisfies the invariant on its own — the
+        # tee + S3 ship + exit-code propagation are all internalized.
+        lib_idx = next(
+            (i for i, c in enumerate(cmds) if _LIB_CLI_RE.search(c)),
+            None,
+        )
+        if lib_idx is not None:
+            # Optional consistency check: slug-vs-logpath should match
+            # the canonical layout (slug == basename of logfile minus
+            # .log) — caller convention, not strictly required by the
+            # lib but it's what every state in the fleet uses today.
+            m = _LIB_CLI_RE.search(cmds[lib_idx])
+            slug, logfile = m.group(1), m.group(2)
+            log_basename = Path(logfile).stem
+            if slug != log_basename:
+                offenders.append(
+                    f"{state_name}: lib CLI slug={slug!r} doesn't match "
+                    f"log basename={log_basename!r}; S3 _ssm_logs/ tree "
+                    f"will land logs under unexpected key prefix"
+                )
+            continue
+
+        # Form (a): inline trap before `| tee` work line.
         work_idx = next(
-            (i for i, c in enumerate(cmds) if _TEE_WORK_RE.search(c)), None
+            (i for i, c in enumerate(cmds) if _TEE_WORK_RE.search(c)),
+            None,
         )
         if work_idx is None:
             continue  # short step, output fits in the 24KB cap
@@ -188,9 +259,13 @@ def test_long_ssm_steps_ship_log_to_s3_before_work(sf_path: Path) -> None:
             )
     assert not offenders, (
         f"{sf_path.name}: long SSM steps missing the S3 log-capture "
-        f"trap:\n  - " + "\n  - ".join(offenders) + "\n\n"
-        "Add `\"trap 'aws s3 cp /var/log/X.log "
+        f"surface:\n  - " + "\n  - ".join(offenders) + "\n\n"
+        "Either add `\"trap 'aws s3 cp /var/log/X.log "
         "\\\"s3://alpha-engine-research/_ssm_logs/<slug>/...\\\" "
         "--only-show-errors || true' EXIT\"` immediately before the "
-        "`| tee` work line. See 2026-05-15 MorningEnrich ROADMAP P0."
+        "`| tee` work line (only works in plain `commands` arrays), "
+        "OR switch the work line to `python -m alpha_engine_lib.ssm_log_capture "
+        "run --slug X --log /var/log/X.log -- bash <launcher>` (required "
+        "for `commands.$ States.Array(...)` states). See 2026-05-22 "
+        "Friday-PM dry-pass + alpha-engine-lib PR #57."
     )
