@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Sequence
 
 import arcticdb as adb
 import pandas as pd
@@ -27,6 +28,17 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 ARCTIC_PREFIX = "arcticdb"
+
+# Canonical universe-library schema. Persisted layout is
+# ``OHLCV_COLS + [PROVENANCE_COL] + FEATURES`` — any write that lays
+# columns down in a different order trips ArcticDB's
+# ``StreamDescriptorMismatch`` on the next update_batch (observed
+# 2026-05-14 EOD, 2026-05-21 EOD). These constants are the single
+# source of truth; ``builders/daily_append.py`` re-exports them for
+# backwards-compat with operator scripts that already import from
+# there.
+OHLCV_COLS: list[str] = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
+PROVENANCE_COL: str = "source"
 
 _arctic_instance: adb.Arctic | None = None
 
@@ -90,3 +102,67 @@ def to_arctic_safe(df: pd.DataFrame) -> pd.DataFrame:
     for col in cat_cols:
         df[col] = df[col].astype(object)
     return df
+
+
+def to_arctic_canonical(
+    df: pd.DataFrame,
+    *,
+    features: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Project a universe-shaped DataFrame to canonical
+    ``OHLCV_COLS + [PROVENANCE_COL] + FEATURES`` order, then strip
+    Categorical dtypes.
+
+    This is the chokepoint enforcing the universe library's column-order
+    contract — every WritePayload / UpdatePayload / ``lib.write`` call
+    site that writes universe symbols must go through this helper, so
+    no new caller can lay down columns in a non-canonical order and
+    silently corrupt the persisted descriptor.
+
+    Why a centralized chokepoint:
+        Per-site discipline failed twice in one week
+        (2026-05-14 UPDATE-path, 2026-05-21 WRITE-path) when FEATURES
+        widened mid-list and one of three call sites missed the
+        accompanying reorder. Both incidents required emergency operator
+        recovery — instance start + SSM migration + EOD redrive.
+        Centralizing here removes the per-call-site discipline so
+        future FEATURES widenings become safe additive changes with
+        no companion column-ordering audit.
+
+    Behaviour:
+        - Intersect-then-reorder. Columns outside
+          ``OHLCV_COLS + [PROVENANCE_COL] + features`` are DROPPED
+          (matches the prior per-site recipe).
+        - Empty frames pass through unchanged (no copy).
+        - Frames already in canonical order and free of categoricals
+          pass through unchanged (no copy).
+        - ``features`` defaults to ``features.feature_engineer.FEATURES``
+          (lazy-imported to keep ``store`` free of a top-level
+          ``features`` dependency). Pass an explicit ``features``
+          when the caller has its own contract (e.g. tests).
+
+    Call exactly once, immediately before every universe
+    ``update_batch`` / ``write_batch`` / ``write`` invocation. Macro
+    writes have a different schema and continue to use
+    ``to_arctic_safe`` directly.
+    """
+    if df.empty:
+        return df
+
+    if features is None:
+        # Lazy import — keeps the dependency direction
+        # ``builders → features`` + ``builders → store`` without
+        # forcing ``store → features`` at module load.
+        from features.feature_engineer import FEATURES as _FEATURES
+        features = _FEATURES
+
+    canonical: list[str] = (
+        [c for c in OHLCV_COLS if c in df.columns]
+        + ([PROVENANCE_COL] if PROVENANCE_COL in df.columns else [])
+        + [f for f in features if f in df.columns]
+    )
+
+    if list(df.columns) != canonical:
+        df = df[canonical]
+
+    return to_arctic_safe(df)

@@ -47,7 +47,14 @@ from features.compute import (
 from arcticdb.version_store.library import ReadRequest, UpdatePayload, WritePayload
 from arcticdb_ext.version_store import DataError
 
-from store.arctic_store import get_universe_lib, get_macro_lib, to_arctic_safe
+from store.arctic_store import (
+    OHLCV_COLS as _CANONICAL_OHLCV_COLS,
+    PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
+    get_universe_lib,
+    get_macro_lib,
+    to_arctic_canonical,
+    to_arctic_safe,
+)
 from store.parquet_loader import load_parquet_from_s3
 from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
@@ -61,17 +68,17 @@ from validators.price_validator import (
 
 log = logging.getLogger(__name__)
 
-OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
-
-# Per-row data-provenance column. Set by ``daily_closes.collect`` from the
-# source-mode (`polygon` / `yfinance` / `fred`) per row in the staging
-# parquet, surfaced into ``_load_daily_closes`` records, written into
-# ArcticDB universe rows alongside OHLCV. Closes the audit trail of
-# "where did this row's value come from" at row granularity. Carried as
-# a separate column from OHLCV_COLS because it's a string metadata field,
-# not a numeric one — keeping OHLCV_COLS pure simplifies the rolling-stat
-# and feature-compute call sites that iterate it expecting numerics.
-PROVENANCE_COL = "source"
+# OHLCV_COLS + PROVENANCE_COL are the canonical universe-library schema —
+# re-exported from store.arctic_store so the chokepoint
+# (``to_arctic_canonical``) and these per-site usages share a single
+# source of truth. Pre-2026-05-22 both were defined here AND in
+# ``store/arctic_store.py``; consolidating them removes the per-site
+# discipline that the 2026-05-14 + 2026-05-21 column-order incidents
+# both relied on. Existing operator scripts that
+# ``from builders.daily_append import OHLCV_COLS, PROVENANCE_COL``
+# continue to work via these re-exports.
+OHLCV_COLS = _CANONICAL_OHLCV_COLS
+PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 # Legacy single-prefix constant retained for backward-compat with any caller
 # that imports it (audited 2026-05-19: only the local ``_load_parquet_warmup``,
 # which now goes through ``price_cache_read_prefixes``). Wave-3 PR4 cutover
@@ -1164,25 +1171,8 @@ def daily_append(
                 # passthrough behaviour.
                 today_row[PROVENANCE_COL] = new_row.iloc[0][PROVENANCE_COL]
 
-                # Match the persisted ArcticDB column order so update_batch
-                # passes its strict descriptor-equality check. Existing
-                # universe symbols were laid down with `source` between
-                # VWAP and the first feature (idx 7 in the storage layout)
-                # via `_write_row_backfill_safe` + earlier per-ticker
-                # write paths. The bare `today_row[PROVENANCE_COL] = ...`
-                # assignment above appends `source` at the END of the
-                # frame, which is fine for write_batch (full rewrite) but
-                # ArcticDB's update_batch raises StreamDescriptorMismatch
-                # when the incoming column order differs from the existing
-                # version — observed 2026-05-14 EOD: 99.9% error rate
-                # (903 / 904 tickers) with `existing` showing source idx=7
-                # and `new_val` showing source idx=71.
-                ordered_cols = (
-                    [c for c in OHLCV_COLS if c in today_row.columns]
-                    + ([PROVENANCE_COL] if PROVENANCE_COL in today_row.columns else [])
-                    + [f for f in FEATURES if f in today_row.columns]
-                )
-                today_row = today_row[ordered_cols]
+                # Column order is enforced by ``to_arctic_canonical`` at
+                # the queue site below — no per-site reorder required.
 
                 # Per-ticker coverage observability: count NaN features now
                 # so the eventual log + counter reflects exactly what's
@@ -1297,39 +1287,28 @@ def daily_append(
                 # Append at head — fast path. update_batch with upsert=True
                 # also handles the rare "symbol doesn't exist yet" case
                 # (replaces _write_row_backfill_safe's lib.write fallback).
-                # to_arctic_safe strips Categorical ``source`` dtype (PR #211)
-                # which ArcticDB's update_batch rejects.
+                # ``to_arctic_canonical`` enforces the
+                # ``OHLCV + source + FEATURES`` column order AND strips
+                # Categorical ``source`` dtype (PR #211) — single
+                # chokepoint for both descriptor-match invariants.
                 update_payloads.append(
-                    UpdatePayload(symbol=ticker, data=to_arctic_safe(today_row))
+                    UpdatePayload(symbol=ticker, data=to_arctic_canonical(today_row))
                 )
             else:
                 # Backfill — splice into existing series, full rewrite. Same
                 # logic as _write_row_backfill_safe's backfill branch.
                 #
-                # Re-project combined to canonical OHLCV+source+FEATURES order
-                # BEFORE the write. pd.concat's default outer-join preserves
-                # ``hist``'s column order and appends any new columns from
-                # ``today_row`` at the end — which produces a layout that
-                # differs from ``today_row``'s canonical order. A subsequent
-                # same-or-later-date UpdatePayload (with cols in canonical
-                # order) then trips ArcticDB's StreamDescriptorMismatch.
-                # Observed 2026-05-21: PR #279 widened FEATURES with 5 new
-                # pillar fields in the middle of the list; that morning's
-                # MorningEnrich rewrote 891/904 symbols via this WRITE path
-                # (pd.concat appended the 5 new cols at the end, layout
-                # diverged from canonical); the same-day EOD's UPDATE then
-                # failed 905/905 with pillars-at-end vs pillars-in-middle.
-                # Same defect class as the today_row reorder one layer up.
+                # ``pd.concat``'s default outer-join preserves ``hist``'s
+                # column order and appends any new columns from
+                # ``today_row`` at the end. ``to_arctic_canonical`` below
+                # re-projects to ``OHLCV + source + FEATURES`` before the
+                # write so the persisted descriptor stays canonical and a
+                # subsequent same-or-later-date UpdatePayload doesn't trip
+                # ArcticDB's StreamDescriptorMismatch (2026-05-21 EOD).
                 combined = pd.concat([hist, today_row])
                 combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-                combined_ordered_cols = (
-                    [c for c in OHLCV_COLS if c in combined.columns]
-                    + ([PROVENANCE_COL] if PROVENANCE_COL in combined.columns else [])
-                    + [f for f in FEATURES if f in combined.columns]
-                )
-                combined = combined[combined_ordered_cols]
                 write_payloads.append(
-                    WritePayload(symbol=ticker, data=to_arctic_safe(combined))
+                    WritePayload(symbol=ticker, data=to_arctic_canonical(combined))
                 )
 
         if update_payloads or write_payloads:

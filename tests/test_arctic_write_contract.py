@@ -28,7 +28,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from store.arctic_store import to_arctic_safe
+from store.arctic_store import (
+    OHLCV_COLS,
+    PROVENANCE_COL,
+    to_arctic_canonical,
+    to_arctic_safe,
+)
 
 
 _REPO_ROOT = Path(__file__).parent.parent
@@ -176,77 +181,209 @@ _BACKFILL_SRC = (_REPO_ROOT / "builders" / "backfill.py").read_text()
 
 
 def test_daily_append_wraps_update_batch_payload():
-    """update_batch payload must go through to_arctic_safe — this is the
-    exact site that failed 2026-05-12 on BRK-B.
+    """update_batch payload must go through ``to_arctic_canonical`` —
+    the chokepoint enforces BOTH the column order
+    (2026-05-14 incident class) AND the Categorical-strip
+    (2026-05-12 BRK-B incident class).
     """
-    assert "UpdatePayload(symbol=ticker, data=to_arctic_safe(today_row))" in _DAILY_APPEND_SRC, (
+    assert "UpdatePayload(symbol=ticker, data=to_arctic_canonical(today_row))" in _DAILY_APPEND_SRC, (
         "daily_append.py's UpdatePayload data must be wrapped in "
-        "to_arctic_safe — bare today_row carries Categorical 'source' "
-        "(PR #211) which ArcticDB update_batch rejects."
+        "to_arctic_canonical — projects to OHLCV+source+FEATURES and "
+        "strips Categorical 'source' (PR #211) which ArcticDB "
+        "update_batch rejects on both descriptor + dtype mismatches."
     )
 
 
 def test_daily_append_wraps_write_batch_payload():
-    """The backfill-branch WritePayload also concatenates today_row's
-    Categorical source into a combined frame — same wrap required.
+    """The backfill-branch WritePayload concatenates ``today_row``'s
+    Categorical source into a combined frame whose
+    ``pd.concat`` outer-join may have appended novel columns at the
+    end (2026-05-21 EOD: PR #279 widened FEATURES, write-path
+    rewrote 891/904 symbols with pillars-at-end, the same-day
+    EOD UPDATE then failed 905/905). The chokepoint re-projects
+    to canonical here.
     """
-    assert "WritePayload(symbol=ticker, data=to_arctic_safe(combined))" in _DAILY_APPEND_SRC, (
+    assert "WritePayload(symbol=ticker, data=to_arctic_canonical(combined))" in _DAILY_APPEND_SRC, (
         "daily_append.py's WritePayload (backfill branch) must wrap "
-        "combined in to_arctic_safe."
+        "combined in to_arctic_canonical — re-projects to OHLCV+source"
+        "+FEATURES so the persisted descriptor stays canonical."
     )
 
 
 def test_backfill_wraps_universe_write():
-    """Saturday SF backfill writes per-ticker symbol_df with the same
-    Categorical 'source' (PR #211). Must wrap before lib.write.
+    """Saturday SF backfill writes per-ticker symbol_df via the
+    chokepoint. Single source of truth for column order + dtype.
     """
-    assert "universe_lib.write(ticker, to_arctic_safe(symbol_df))" in _BACKFILL_SRC, (
+    assert "universe_lib.write(ticker, to_arctic_canonical(symbol_df))" in _BACKFILL_SRC, (
         "backfill.py's universe_lib.write must wrap symbol_df in "
-        "to_arctic_safe — PR #211's Categorical source column flows "
-        "through here on Saturday SF."
+        "to_arctic_canonical — column-order enforcement + Categorical "
+        "strip both happen at this single boundary."
     )
 
 
 def test_backfill_wraps_macro_writes():
-    """Macro writes never use Categorical today, but uniform wrapping
-    keeps the contract single-source — and defends against a future
-    writer that adds one. Cheap because the helper short-circuits on
-    no-categorical frames.
+    """Macro writes use a different schema from universe (no FEATURES
+    column block) so they continue to use ``to_arctic_safe`` directly
+    for the Categorical strip. Uniform wrapping keeps the contract
+    single-source — and defends against a future writer that adds one.
     """
     assert "macro_lib.write(\"features\", to_arctic_safe(macro_df))" in _BACKFILL_SRC
     assert "macro_lib.write(key, to_arctic_safe(macro_series_df))" in _BACKFILL_SRC
     assert "macro_lib.write(key, to_arctic_safe(sector_df))" in _BACKFILL_SRC
 
 
-def test_daily_append_today_row_column_order_matches_storage():
-    """Pin the today_row column order to [OHLCV, source, FEATURES].
+# ── to_arctic_canonical chokepoint contract ──────────────────────────────────
+# Round-trip + drop-non-canonical + features-default behaviour. Pins the
+# institutional invariant lifted at the 2026-05-22 chokepoint PR: every
+# universe write boundary projects to ``OHLCV + source + FEATURES`` before
+# the bytes hit ArcticDB, so no caller can violate column order by accident.
 
-    2026-05-14 EOD failure: 99.9% (903 / 904) of update_batch calls failed
-    with ``StreamDescriptorMismatch`` because today_row was being built as
-    [OHLCV, FEATURES, source] (source appended at the end via the bare
-    ``today_row[PROVENANCE_COL] = …`` assignment) while every persisted
-    universe symbol carries source at idx 7 (between VWAP and the first
-    feature). ArcticDB's update_batch enforces strict column-order match
-    against the existing version's descriptor; the backfill-branch
-    write_batch path masks this because full rewrite ignores prior
-    descriptor.
 
-    The fix re-projects today_row via an explicit column order before the
-    write queue. If a future PR removes that re-projection, this test
-    fails — preventing a silent re-introduction of the same EOD outage.
+def test_to_arctic_canonical_reorders_scrambled_input():
+    """If a caller builds a frame with FEATURES inserted mid-column-list
+    in the WRONG order (the exact 2026-05-21 EOD failure shape — pillars
+    appended at the end via ``pd.concat`` outer-join), the chokepoint
+    must re-project to canonical order before the write.
     """
-    assert (
-        "ordered_cols = (\n"
-        "                    [c for c in OHLCV_COLS if c in today_row.columns]\n"
-        "                    + ([PROVENANCE_COL] if PROVENANCE_COL in today_row.columns else [])\n"
-        "                    + [f for f in FEATURES if f in today_row.columns]\n"
-        "                )\n"
-        "                today_row = today_row[ordered_cols]"
-    ) in _DAILY_APPEND_SRC, (
-        "daily_append.py must re-project today_row to "
-        "[OHLCV, source, FEATURES] before queuing the UpdatePayload — "
-        "matches the persisted ArcticDB descriptor (source at idx 7). "
-        "The bare `today_row[PROVENANCE_COL] = …` assignment alone "
-        "appends source at the end, which trips StreamDescriptorMismatch "
-        "on update_batch (2026-05-14 EOD)."
+    idx = pd.date_range("2026-05-08", periods=3, freq="B", name="date")
+    # Build in a scrambled order to mimic pd.concat([hist, today_row])
+    # when today_row carries 2 novel features absent from hist.
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "Close": [100.5, 101.5, 102.5],
+            "novel_feat_a": [0.1, 0.2, 0.3],  # appended at end
+            "Volume": [1_000_000] * 3,
+            "novel_feat_b": [0.4, 0.5, 0.6],  # appended at end
+            "source": ["yfinance"] * 3,
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "VWAP": [100.4, 101.4, 102.4],
+        },
+        index=idx,
+    )
+
+    out = to_arctic_canonical(df, features=["novel_feat_a", "novel_feat_b"])
+
+    expected = ["Open", "High", "Low", "Close", "Volume", "VWAP", "source",
+                "novel_feat_a", "novel_feat_b"]
+    assert list(out.columns) == expected, (
+        "to_arctic_canonical must re-project to OHLCV+source+FEATURES "
+        f"order; got {list(out.columns)!r}"
+    )
+
+
+def test_to_arctic_canonical_drops_unknown_columns():
+    """Columns outside OHLCV + PROVENANCE + features are silently
+    dropped (matches the pre-chokepoint per-site recipe). Defends
+    against an accidental leakage of intermediate columns into
+    persisted storage.
+    """
+    idx = pd.date_range("2026-05-08", periods=2, freq="B", name="date")
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0],
+            "Close": [100.5, 101.5],
+            "Volume": [1_000_000, 1_000_000],
+            "_internal_debug_col": ["x", "y"],
+            "source": ["polygon", "polygon"],
+        },
+        index=idx,
+    )
+
+    out = to_arctic_canonical(df, features=[])
+
+    assert "_internal_debug_col" not in out.columns
+    assert list(out.columns) == ["Open", "Close", "Volume", "source"]
+
+
+def test_to_arctic_canonical_preserves_values_and_index():
+    """Reorder is a pure projection — row values, the index, and the
+    Categorical-strip semantics survive untouched.
+    """
+    idx = pd.date_range("2026-05-08", periods=3, freq="B", name="date")
+    df = pd.DataFrame(
+        {
+            "Close": [100.0, 101.0, 102.0],
+            "source": pd.Categorical(
+                ["yfinance", "polygon", "yfinance"],
+                categories=("polygon", "yfinance", "fred", "unknown"),
+            ),
+            "Open": [99.5, 100.5, 101.5],
+        },
+        index=idx,
+    )
+
+    out = to_arctic_canonical(df, features=[])
+
+    assert list(out.columns) == ["Open", "Close", "source"]
+    assert list(out.index) == list(idx)
+    assert list(out["source"]) == ["yfinance", "polygon", "yfinance"]
+    assert out["source"].dtype == object, (
+        "to_arctic_canonical must run the Categorical-strip via "
+        "to_arctic_safe — single chokepoint for both invariants."
+    )
+
+
+def test_to_arctic_canonical_empty_passthrough():
+    """Empty frames return unchanged (no copy, no reorder)."""
+    df = pd.DataFrame()
+    out = to_arctic_canonical(df, features=[])
+    assert out is df
+    assert out.empty
+
+
+def test_to_arctic_canonical_features_default_resolves_to_feature_engineer():
+    """When ``features`` is omitted, the helper resolves the default
+    from ``features.feature_engineer.FEATURES`` — the same constant
+    every steady-state caller imports. Pins the lazy-import default
+    contract so the chokepoint is correct without per-call kwargs.
+    """
+    from features.feature_engineer import FEATURES as _CANONICAL_FEATURES
+
+    idx = pd.date_range("2026-05-08", periods=2, freq="B", name="date")
+    # Build with one real FEATURE + one bogus column. The default lookup
+    # should preserve the real FEATURE and drop the bogus column.
+    real_feat = _CANONICAL_FEATURES[0]
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0],
+            real_feat: [0.5, 0.6],
+            "_bogus_not_a_feature": [1, 2],
+        },
+        index=idx,
+    )
+
+    out = to_arctic_canonical(df)  # no features kwarg → default lookup
+
+    assert real_feat in out.columns
+    assert "_bogus_not_a_feature" not in out.columns
+    assert list(out.columns)[0] == "Open"  # OHLCV head ordering preserved
+
+
+def test_to_arctic_canonical_no_reorder_when_already_canonical():
+    """Fast-path: a frame already in canonical order and free of
+    categoricals passes through unchanged. Keeps the helper cheap
+    enough to apply uniformly at every universe write site.
+    """
+    idx = pd.date_range("2026-05-08", periods=2, freq="B", name="date")
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0],
+            "High": [101.0, 102.0],
+            "Low": [99.0, 100.0],
+            "Close": [100.5, 101.5],
+            "Volume": [1_000_000, 1_000_000],
+            "VWAP": [100.4, 101.4],
+            "source": ["polygon", "polygon"],
+            "feat_x": [0.1, 0.2],
+        },
+        index=idx,
+    )
+
+    out = to_arctic_canonical(df, features=["feat_x"])
+
+    assert out is df, (
+        "Already-canonical frames must pass through without a copy "
+        "(no reorder, no Categorical strip needed)."
     )

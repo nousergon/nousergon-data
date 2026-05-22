@@ -49,7 +49,14 @@ from features.compute import (
     _load_cached_alternative,
     make_source_series,
 )
-from store.arctic_store import get_universe_lib, get_macro_lib, to_arctic_safe
+from store.arctic_store import (
+    OHLCV_COLS as _CANONICAL_OHLCV_COLS,
+    PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
+    get_universe_lib,
+    get_macro_lib,
+    to_arctic_canonical,
+    to_arctic_safe,
+)
 from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
     list_price_cache_keys,
@@ -57,25 +64,17 @@ from builders._price_cache_writeboth import (
 
 log = logging.getLogger(__name__)
 
-# OHLCV columns to keep alongside features in ArcticDB.
-# VWAP added 2026-04-17 (Phase 7 VWAP centralization). Backfill source
-# (``predictor/price_cache/*.parquet``) is OHLCV only and predates polygon
-# adoption, so historical rows have no source for true volume-weighted VWAP.
-# Per the 2026-04-17 decision, we do NOT synthesize a ``(H+L+C)/3`` proxy —
-# that misrepresents arithmetic typical price as VWAP. Historical rows get
-# NaN VWAP; the column becomes populated from the first daily_append run
-# against a polygon-sourced daily_closes parquet. See ROADMAP "VWAP
-# centralization" for the full rationale.
-OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
-
-# Per-row data-provenance column (mirrors builders/daily_append.py).
-# Backfill sources rows from ``predictor/price_cache/*.parquet`` (10y
-# yfinance-sourced) plus the daily_closes delta (mixed polygon / yfinance
-# / fred per row). Pre-delta rows default to ``"yfinance"``; delta rows
-# get whatever source the daily_closes parquet recorded. Closes the
-# audit trail of "where did this row's value come from" at row
-# granularity even after a full backfill rewrite.
-PROVENANCE_COL = "source"
+# Canonical universe-library schema — single source of truth in
+# ``store.arctic_store``. Re-exported here for the local float32-cast
+# loop + partial-features observability log, both of which iterate
+# FEATURES / OHLCV_COLS directly. VWAP centralization rationale
+# (2026-04-17 Phase 7): historical price_cache parquets predate polygon,
+# carry no source for true volume-weighted VWAP, and we do NOT
+# synthesize a ``(H+L+C)/3`` proxy — historical rows get NaN VWAP and
+# the column populates from the first daily_append run against a
+# polygon-sourced daily_closes parquet.
+OHLCV_COLS = _CANONICAL_OHLCV_COLS
+PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 
 
 def _load_current_constituents(s3, bucket: str) -> set[str]:
@@ -584,12 +583,11 @@ def backfill(
                     ["yfinance"] * len(featured_df), index=featured_df.index,
                 )
 
-            keep_cols = (
-                [c for c in OHLCV_COLS if c in featured_df.columns]
-                + [PROVENANCE_COL]
-                + [f for f in FEATURES if f in featured_df.columns]
-            )
-            symbol_df = featured_df[keep_cols].copy()
+            # Column-order projection + drop-non-canonical happens at the
+            # write boundary via ``to_arctic_canonical``. The local copy
+            # is still needed so the float32-cast below doesn't mutate
+            # the in-memory price cache shared across the run.
+            symbol_df = featured_df.copy()
 
             for f in FEATURES:
                 if f in symbol_df.columns:
@@ -612,9 +610,13 @@ def backfill(
                 )
 
             if not dry_run:
-                # to_arctic_safe strips the Categorical ``source`` dtype
-                # (PR #211) before write — ArcticDB rejects categoricals.
-                universe_lib.write(ticker, to_arctic_safe(symbol_df))
+                # ``to_arctic_canonical`` re-projects to
+                # ``OHLCV + source + FEATURES`` order, drops non-canonical
+                # cols, and strips Categorical dtypes — single chokepoint
+                # for the universe library's column-order + dtype
+                # contract (closes the 2026-05-14 + 2026-05-21 EOD
+                # column-order recurrence class).
+                universe_lib.write(ticker, to_arctic_canonical(symbol_df))
 
             n_ok += 1
 
