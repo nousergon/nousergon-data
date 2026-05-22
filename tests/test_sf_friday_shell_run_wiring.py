@@ -432,16 +432,45 @@ class TestApplyShellRunDefaults:
         assert st["OutputPath"] == "$.merged"
         assert st["Next"] == "CheckSkipMorningEnrich"
 
-    def test_user_input_wins_over_shell_defaults(self, states):
-        # States.JsonMerge(defaults, $, false) — $ (current state, carrying
-        # the user input) MUST be the 2nd arg so an explicit
-        # {"shell_run": true, "skip_backtester": true} still skips it.
+    def test_shell_defaults_win_over_current_state(self, states):
+        """States.JsonMerge($, shellDefaults, false) — shellDefaults MUST be
+        the 2nd arg so the dry-path control vars actually take effect under
+        shell_run=true.
+
+        Why the prior order broke (2026-05-22 evening incident): the
+        previous shape was ``States.JsonMerge(shellDefaults, $, false)``
+        with the rationale "user input ($) must win for per-flag overrides
+        like {shell_run: true, skip_backtester: true}." That rationale
+        confused two distinct things: ``$`` at ApplyShellRunDefaults entry
+        is NOT raw user input — InitializeInput has already merged its
+        defaults blob ``{preflight_args: "", research_dry: false,
+        data_phase2_dry: false, regime_action: "produce"}`` into ``$``.
+        So ``$ wins`` meant the NON-DRY identity defaults won over the dry
+        shellDefaults. Result: every shell_run=true execution silently fell
+        back to a full-fat real Saturday run instead of --preflight-only.
+
+        Caught the morning after the 2026-05-22 Friday-PM dry-pass
+        post-trap-fix verification: MorningEnrich passed (trap fix worked),
+        DataPhase1 spot booted and started collecting short interest +
+        universe returns + fundamentals at full power instead of running
+        preflight-and-exiting.
+
+        Skip-flag overrides are unaffected by this fix: shellDefaults
+        contains NO skip_* keys, so a user-passed
+        ``{shell_run: true, skip_backtester: true}`` survives the merge
+        unchanged and the downstream Choice gate still skips Backtester.
+        Only the 4 keystone control vars (preflight_args / research_dry /
+        data_phase2_dry / regime_action) are forced to dry when shell_run.
+        That's the actual semantic intent — passing shell_run=true means
+        you want dry mode for ALL keystone control vars; partial-override
+        within the dry-control-var set was a footgun, not a feature.
+        """
         expr = self._merge_expr(states)
-        assert expr.startswith("States.JsonMerge(States.StringToJson(")
-        assert expr.endswith(",$,false)"), (
-            "user input ($) must be the 2nd JsonMerge arg so explicit "
-            "per-flag overrides win over the shell-run defaults"
+        assert expr.startswith("States.JsonMerge($,States.StringToJson("), (
+            f"merge expr must start with 'States.JsonMerge($,States.StringToJson(' "
+            f"so shellDefaults (the 2nd arg) wins over $. got: {expr[:80]!r}"
         )
+        assert expr.endswith(",false)")
 
     def test_shell_defaults_set_dry_control_vars(self, states):
         """ApplyShellRunDefaults must set every dry-path control var to its
