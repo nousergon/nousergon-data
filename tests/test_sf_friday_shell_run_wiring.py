@@ -291,13 +291,26 @@ def _resolve_spot_commands(state: dict, preflight_args: str) -> list[str]:
 
 @pytest.fixture(scope="module")
 def orig_spot_cmds() -> dict:
-    """Frozen pre-keystone (#258 origin/main) RESOLVED spot command lists.
+    """Frozen baseline RESOLVED spot command lists for byte-identicality.
 
     Captured at commit time into a committed fixture so the byte-identical
     proof is HERMETIC. The prior implementation shelled out to
     `git show origin/main:infrastructure/step_function.json` at test time,
     which fails (exit 128) in CI's shallow PR checkout where `origin/main`
     is not a local ref — that was the keystone CI failure.
+
+    History:
+    - Originally captured pre-keystone (#258) to prove the Friday-PM
+      shell-run mechanism didn't change the real Saturday absent path.
+    - **Regenerated 2026-05-22** as part of the inline-trap-to-lib-CLI
+      lift (alpha-engine-lib PR #57). The pre-keystone form had a broken
+      `'trap \\'aws s3 cp ...\\' EXIT'` inside `commands.$ States.Array`
+      (ASL doesn't unescape `\\'` in arg strings — caught by the
+      Friday-PM dry-pass). The baseline now reflects the lib-CLI form:
+      `python -m alpha_engine_lib.ssm_log_capture run --slug X
+      --log Y -- bash <launcher>`. The keystone's byte-identicality
+      proof against the new baseline still holds (the absent path runs
+      the same lib-CLI invocation with `preflight_args=""`).
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -550,14 +563,35 @@ class TestByteIdenticalAbsentPath:
     def test_spot_command_carries_preflight_only_under_shell_run(
         self, sf, name
     ):
+        """Under shell_run (preflight_args=" --preflight-only"), the final
+        command line must propagate --preflight-only AFTER the launcher's
+        mode token (the {} sits immediately after, leading-space-bearing
+        var produces exactly one separating space).
+
+        2026-05-22 reshape: the final line moved from
+            ``{token} --preflight-only 2>&1 | tee {log}``
+        to
+            ``/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m
+              alpha_engine_lib.ssm_log_capture run --slug X --log Y --
+              {token} --preflight-only``
+        as part of the inline-trap-to-lib-CLI lift (alpha-engine-lib PR #57).
+        The lib CLI internalizes tee + S3-ship; --preflight-only still
+        sits immediately after the launcher's mode token so the
+        orthogonal-modifier shape is preserved.
+        """
         token, log = _SPOT_STATES[name]
+        slug = Path(log).stem
         cmds = _resolve_spot_commands(
             self._state(sf, name), preflight_args=" --preflight-only"
         )
         final = cmds[-1]
-        # {} sits immediately after the mode token (no literal space) so the
-        # leading-space-bearing var produces exactly one separating space.
-        assert final == f"{token} --preflight-only 2>&1 | tee {log}", final
+        expected = (
+            "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
+            "-m alpha_engine_lib.ssm_log_capture run "
+            f"--slug {slug} --log {log} -- "
+            f"{token} --preflight-only"
+        )
+        assert final == expected, final
         assert "  --preflight-only" not in final, "double space — bad join"
 
     @pytest.mark.parametrize(

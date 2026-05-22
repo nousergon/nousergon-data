@@ -293,20 +293,25 @@ class TestSsmCommandShape:
         cmds = self._commands(states, "Parity")
         assert cmds[0].startswith("set ") and "pipefail" in cmds[0]
 
-    def test_parity_has_s3_log_trap_before_work(self, states):
+    def test_parity_log_capture_via_lib_cli(self, states):
+        """Parity's log-capture is satisfied by the lib CLI form
+        (lib v0.25.0), not by an inline `trap 'aws s3 cp ...' EXIT`
+        line. 2026-05-22 lift: the inline-trap form broke under
+        `commands.$ States.Array(...)` ASL escape semantics (caught by
+        Friday-PM dry-pass). See alpha-engine-lib PR #57 + sibling
+        states in test_sf_morning_enrich_split_wiring.py.
+        """
         cmds = self._commands(states, "Parity")
-        trap_idx = next(
-            i
-            for i, c in enumerate(cmds)
-            if c.startswith("trap ")
-            and "_ssm_logs" in c
-            and "parity.log" in c
+        work = next(
+            c for c in cmds if "alpha_engine_lib.ssm_log_capture run" in c
         )
-        work_idx = next(
-            i for i, c in enumerate(cmds) if "| tee /var/log/parity.log" in c
+        assert "--slug parity" in work
+        assert "--log /var/log/parity.log" in work
+        assert "-- bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator" in work
+        assert not any(c.startswith("trap ") for c in cmds), (
+            "Inline trap must not coexist with the lib CLI — the CLI "
+            "internalizes the trap."
         )
-        assert trap_idx < work_idx
-        assert "|| true" in cmds[trap_idx]
 
 
 class TestBudgetParity:

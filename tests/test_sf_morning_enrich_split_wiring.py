@@ -194,20 +194,36 @@ class TestSsmCommandShape:
         cmds = self._commands(states, "MorningEnrich")
         assert cmds[0].startswith("set ") and "pipefail" in cmds[0]
 
-    def test_morning_enrich_has_s3_log_trap_before_work(self, states):
+    def test_morning_enrich_log_capture_via_lib_cli(self, states):
+        """The trap-and-log-ship invariant is now satisfied by the
+        alpha_engine_lib.ssm_log_capture Python CLI (lib v0.25.0), not
+        by an inline `trap 'aws s3 cp ...' EXIT` line. The 2026-05-22
+        Friday-PM dry-pass caught the prior inline-trap form failing
+        under ASL States.Array escape semantics (`\\'` not unescaped to
+        `'` inside arg strings) — so we lifted to a Python CLI invoked
+        as a single States.Format-rendered token list with no bash
+        quoting surface. See alpha-engine-lib PR #57 + this state's
+        sibling traps across the 7 other Saturday-SF spot states.
+        """
         cmds = self._commands(states, "MorningEnrich")
-        trap_idx = next(
+        work_idx = next(
             i
             for i, c in enumerate(cmds)
-            if c.startswith("trap ")
-            and "_ssm_logs" in c
-            and "morning-enrich.log" in c
+            if "alpha_engine_lib.ssm_log_capture run" in c
         )
-        work_idx = next(
-            i for i, c in enumerate(cmds) if "| tee /var/log/morning-enrich.log" in c
+        work = cmds[work_idx]
+        # Right slug and log path
+        assert "--slug morning-enrich" in work
+        assert "--log /var/log/morning-enrich.log" in work
+        # Inner command is the morning-enrich launcher
+        assert "-- bash infrastructure/spot_data_weekly.sh --morning-enrich-only" in work
+        # No inline trap survives anywhere in this state
+        assert not any(c.startswith("trap ") for c in cmds), (
+            "Inline `trap 'aws s3 cp ...' EXIT` line must not coexist "
+            "with the lib CLI — the CLI internalizes the trap. Two "
+            "competing log-ship paths can race on the same /var/log "
+            "file."
         )
-        assert trap_idx < work_idx
-        assert "|| true" in cmds[trap_idx]
 
 
 class TestCatchSemantics:
