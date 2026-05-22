@@ -199,11 +199,15 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
   # Independent-channel surveillance per ROADMAP L221 — this exact
   # rollback chain fired silently 10 consecutive times across 2 days
   # (alpha-engine-data #274 retrospective) before Brian noticed the
-  # GitHub Actions red-icon. Best-effort; trailing || true never
+  # GitHub Actions red-icon. ``dedup_key`` collapses an image-wide
+  # rebuild that breaks N Lambdas' canaries within the hour into one
+  # alert per (Lambda, version) — lib v0.24.0 substrate (L221
+  # retrofit 2026-05-22). Best-effort; trailing || true never
   # overrides the deploy's exit 1.
   python3 -m alpha_engine_lib.alerts publish \
     --severity error \
     --source "alpha-engine-data/infrastructure/deploy.sh" \
+    --dedup-key "canary-fail-${FUNCTION_NAME}-v${VERSION}" \
     --message "Canary rolled back: ${FUNCTION_NAME} canary returned status='${CANARY_STATUS}', live alias reverted v${VERSION}→v${PREV_VERSION}. See CloudWatch /aws/lambda/${FUNCTION_NAME} for payload." \
     || true
   exit 1
