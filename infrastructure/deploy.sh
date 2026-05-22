@@ -26,44 +26,6 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region 
 ROLE_ARN="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-data-role}"
 ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${FUNCTION_NAME}"
 
-# ── Lambda env vars from master .env ──────────────────────────────────────
-# This repo IS the master — .env here is the single source of truth.
-
-LAMBDA_ENV_FILE=".env"
-
-build_lambda_env_json() {
-  if [ ! -f "$LAMBDA_ENV_FILE" ]; then
-    echo "WARNING: $LAMBDA_ENV_FILE not found — Lambda will have no env vars." >&2
-    echo ""
-    return
-  fi
-  python3 -c "
-import json
-env = {}
-with open('$LAMBDA_ENV_FILE') as f:
-    for line in f:
-        line = line.strip()
-        if line == '# LAMBDA_SKIP':
-            break
-        if not line or line.startswith('#'):
-            continue
-        if '=' not in line:
-            continue
-        key, val = line.split('=', 1)
-        key, val = key.strip(), val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('\"', \"'\"):
-            val = val[1:-1]
-        if key and val:
-            env[key] = val
-if env:
-    print(json.dumps({'Variables': env}))
-else:
-    print('')
-"
-}
-
-LAMBDA_ENV_JSON=$(build_lambda_env_json)
-
 # ── Build and deploy ───────────────────────────────────────────────────────
 
 echo "=== Building container image for $FUNCTION_NAME ==="
@@ -88,12 +50,6 @@ IMAGE_URI="$ECR_REPO:latest"
 
 echo "Deploying $FUNCTION_NAME..."
 
-ENV_ARGS=()
-if [ -n "$LAMBDA_ENV_JSON" ]; then
-  ENV_ARGS=(--environment "$LAMBDA_ENV_JSON")
-  echo "  Env vars: $(echo "$LAMBDA_ENV_JSON" | python3 -c "import sys,json; print(', '.join(json.load(sys.stdin).get('Variables',{}).keys()))")"
-fi
-
 if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" &>/dev/null; then
   EXISTING_PKG=$(aws lambda get-function-configuration \
     --function-name "$FUNCTION_NAME" --region "$REGION" \
@@ -104,14 +60,6 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" &
       --function-name "$FUNCTION_NAME" \
       --image-uri "$IMAGE_URI" \
       --region "$REGION" > /dev/null
-    if [ -n "$LAMBDA_ENV_JSON" ]; then
-      echo "  Waiting for code update..."
-      aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION" 2>/dev/null || sleep 5
-      aws lambda update-function-configuration \
-        --function-name "$FUNCTION_NAME" \
-        --environment "$LAMBDA_ENV_JSON" \
-        --region "$REGION" > /dev/null
-    fi
   else
     echo "  Migrating from zip to container image..."
     aws lambda delete-function --function-name "$FUNCTION_NAME" --region "$REGION"
@@ -123,7 +71,6 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" &
       --role "$ROLE_ARN" \
       --timeout 600 \
       --memory-size 512 \
-      "${ENV_ARGS[@]}" \
       --region "$REGION" > /dev/null
   fi
 else
@@ -134,7 +81,6 @@ else
     --role "$ROLE_ARN" \
     --timeout 600 \
     --memory-size 512 \
-    "${ENV_ARGS[@]}" \
     --region "$REGION" > /dev/null
 fi
 echo "  $FUNCTION_NAME deployed."
