@@ -62,12 +62,14 @@ _BRANCH_A_STATES = {
     "CheckSkipRationaleClustering", "RationaleClustering",
     "CheckSkipReplayConcordance", "ReplayConcordance",
     "CheckSkipCounterfactual", "Counterfactual", "ExtractResearchError",
+    "PublishResearchFailureImmediate",
     "BranchAComplete", "BranchAFailed",
 }
 _BRANCH_B_STATES = {
     "CheckSkipPredictorTraining", "PredictorTraining",
     "WaitForPredictorTraining", "CheckPredictorStatus", "PredictorWait",
-    "ExtractPredictorError", "BranchBComplete", "BranchBFailed",
+    "ExtractPredictorError", "PublishPredictorFailureImmediate",
+    "BranchBComplete", "BranchBFailed",
 }
 
 
@@ -357,12 +359,26 @@ class TestPerBranchErrorIsolation:
 
     def test_research_hardfail_routes_to_branch_a_failed(self, branch_a):
         """strict-Research hard-fail (Task Catch) + the soft-fail status
-        path (ExtractResearchError) must record FAILED, not halt the SF."""
+        path (ExtractResearchError → PublishResearchFailureImmediate) must
+        record FAILED, not halt the SF. The PublishResearchFailureImmediate
+        intermediate is the fast-SNS-alert state added 2026-05-24; both
+        success and failure paths through it terminate at BranchAFailed."""
         catch_targets = [
             c["Next"] for c in branch_a["Research"]["Catch"]
         ]
         assert catch_targets == ["BranchAFailed"]
-        assert branch_a["ExtractResearchError"]["Next"] == "BranchAFailed"
+        # ExtractError → PublishImmediate → BranchAFailed
+        assert (
+            branch_a["ExtractResearchError"]["Next"]
+            == "PublishResearchFailureImmediate"
+        )
+        publish = branch_a["PublishResearchFailureImmediate"]
+        assert publish["Type"] == "Task"
+        assert publish["Resource"] == "arn:aws:states:::sns:publish"
+        assert publish["Next"] == "BranchAFailed"
+        # SNS-publish-fails escape hatch also lands at BranchAFailed
+        for c in publish.get("Catch", []):
+            assert c["Next"] == "BranchAFailed"
         # CheckResearchStatus non-OK/SKIPPED → ExtractResearchError
         assert (
             branch_a["CheckResearchStatus"]["Default"]
@@ -375,6 +391,11 @@ class TestPerBranchErrorIsolation:
         ]
 
     def test_predictor_failure_routes_to_branch_b_failed(self, branch_b):
+        """PredictorTraining failures (Task Catch + WaitForPredictorTraining
+        Catch + CheckPredictorStatus default) route through
+        ExtractPredictorError → PublishPredictorFailureImmediate (fast SNS
+        alert added 2026-05-24) → BranchBFailed. Salvage semantics
+        preserved: SF still fails at the join via CheckBranchOutcomes."""
         assert [
             c["Next"] for c in branch_b["PredictorTraining"]["Catch"]
         ] == ["BranchBFailed"]
@@ -382,7 +403,16 @@ class TestPerBranchErrorIsolation:
             c["Next"]
             for c in branch_b["WaitForPredictorTraining"]["Catch"]
         ] == ["BranchBFailed"]
-        assert branch_b["ExtractPredictorError"]["Next"] == "BranchBFailed"
+        assert (
+            branch_b["ExtractPredictorError"]["Next"]
+            == "PublishPredictorFailureImmediate"
+        )
+        publish = branch_b["PublishPredictorFailureImmediate"]
+        assert publish["Type"] == "Task"
+        assert publish["Resource"] == "arn:aws:states:::sns:publish"
+        assert publish["Next"] == "BranchBFailed"
+        for c in publish.get("Catch", []):
+            assert c["Next"] == "BranchBFailed"
         assert (
             branch_b["CheckPredictorStatus"]["Default"]
             == "ExtractPredictorError"

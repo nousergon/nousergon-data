@@ -1084,7 +1084,27 @@
                 "payload.$": "$.research_result.Payload"
               },
               "ResultPath": "$.error",
-              "Next": "BranchAFailed"
+              "Next": "PublishResearchFailureImmediate"
+            },
+            "PublishResearchFailureImmediate": {
+              "Type": "Task",
+              "Comment": "Fire an immediate SNS failure alert when the Research branch fails, BEFORE the sibling PredictorTraining branch completes its full ~12-min train + the parent SF's parallel-join aggregation. Closes the 2026-05-24 operator-confusion gap where a mid-parallel failure surfaced only after the sibling branch's work completed (the salvage-at-join design is correct; the visibility lag was the actual problem). Branch terminus is still BranchAFailed (Pass) so the salvage semantics are preserved: SF still fails at the join via CheckBranchOutcomes; the sibling branch's completed work still persists for the next redrive's skip-set. SNS publish failure is caught and routed forward — best-effort alert must NEVER prevent the branch from properly terminating.",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.sns_topic_arn",
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — Research FAILED (early signal — SF will fail at join)', $.pipeline_label)",
+                "Message.$": "States.Format('Research branch hard-failed inside ResearchPredictorParallel. The sibling PredictorTraining branch is still running and will complete its own work; the SF will fail at the parallel-join aggregation via CheckBranchOutcomes once both branches terminate. This is an EARLY-SIGNAL alert so you do not have to wait for the join. Error: {}', States.JsonToString($.error))"
+              },
+              "ResultPath": null,
+              "Next": "BranchAFailed",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Comment": "Best-effort: a failed SNS publish must not prevent the branch from terminating cleanly. The branch still routes to BranchAFailed and the SF still fails at the join.",
+                  "ResultPath": null,
+                  "Next": "BranchAFailed"
+                }
+              ]
             },
             "BranchAComplete": {
               "Type": "Pass",
@@ -1235,7 +1255,27 @@
                 "poll.$": "$.predictor_poll"
               },
               "ResultPath": "$.error",
-              "Next": "BranchBFailed"
+              "Next": "PublishPredictorFailureImmediate"
+            },
+            "PublishPredictorFailureImmediate": {
+              "Type": "Task",
+              "Comment": "Fire an immediate SNS failure alert when PredictorTraining fails, BEFORE the sibling Research branch finishes its eval-judge / RollingMean / Counterfactual chain + the parent SF's parallel-join aggregation. Closes the 2026-05-24 operator-confusion gap where the predictor OOM surfaced only after the Research-eval chain completed (~10 min of misleading 'progress' visible while the run was already known-doomed). Branch terminus is still BranchBFailed (Pass) so the salvage semantics are preserved: SF still fails at the join via CheckBranchOutcomes; Research's eval-judge work still persists for the next redrive's skip-set. SNS publish failure is caught and routed forward — best-effort alert must NEVER prevent the branch from properly terminating.",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.sns_topic_arn",
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — PredictorTraining FAILED (early signal — SF will fail at join)', $.pipeline_label)",
+                "Message.$": "States.Format('PredictorTraining branch failed inside ResearchPredictorParallel. The sibling Research branch is still running and will complete its eval-judge / RollingMean / Counterfactual work independently; the SF will fail at the parallel-join aggregation via CheckBranchOutcomes once both branches terminate. This is an EARLY-SIGNAL alert so you do not have to wait for the join. Error: {}', States.JsonToString($.error))"
+              },
+              "ResultPath": null,
+              "Next": "BranchBFailed",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Comment": "Best-effort: a failed SNS publish must not prevent the branch from terminating cleanly. The branch still routes to BranchBFailed and the SF still fails at the join.",
+                  "ResultPath": null,
+                  "Next": "BranchBFailed"
+                }
+              ]
             },
             "BranchBComplete": {
               "Type": "Pass",
