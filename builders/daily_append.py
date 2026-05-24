@@ -232,7 +232,11 @@ def _emit_missing_from_closes_metric(count: int) -> None:
 
 
 UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
-UNIVERSE_FRESHNESS_MAX_STALE_DAYS = 5
+# Trading-day-aware staleness threshold. 3 trading days ≈ the prior
+# 5-calendar-day threshold (which was Fri→Wed under weekend buffer);
+# trading-day arithmetic handles weekends + holidays natively via
+# alpha_engine_lib.dates.trading_days_stale.
+UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
 
 
@@ -316,11 +320,13 @@ def _scan_universe_and_emit_freshness_receipt(
     s3,
     bucket: str,
     universe_lib,
-    max_stale_days: int = UNIVERSE_FRESHNESS_MAX_STALE_DAYS,
+    max_stale_trading_days: int = UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS,
     expected_tickers: list[str] | None = None,
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
-    last-row date must be within ``max_stale_days`` of today (UTC).
+    last-row date must be within ``max_stale_trading_days`` NYSE sessions
+    of today. Trading-day-aware via ``alpha_engine_lib.dates`` so weekend
+    runs don't false-fail on calendar-day weekend gaps.
 
     On all-fresh: writes ``s3://{bucket}/health/universe_freshness.json``
     so downstream consumers (predictor inference, executor, backtester)
@@ -380,7 +386,9 @@ def _scan_universe_and_emit_freshness_receipt(
     else:
         syms = all_syms
 
+    from alpha_engine_lib.dates import trading_days_stale
     today = datetime.now(timezone.utc).date()
+    today_iso = today.isoformat()
 
     def _last_date_for(sym: str) -> tuple[str, "pd.Timestamp | None", "str | None"]:
         try:
@@ -409,20 +417,21 @@ def _scan_universe_and_emit_freshness_receipt(
             + ("…" if len(read_errors) > 5 else "")
         )
 
-    ages = []  # (sym, last_date, age_days)
+    ages = []  # (sym, last_date_iso, trading_days_stale)
     for sym, last_date, _ in rows:
-        age_days = (today - last_date.date()).days
-        ages.append((sym, last_date.date().isoformat(), age_days))
+        age_trading_days = trading_days_stale(last_date.date(), today_iso)
+        ages.append((sym, last_date.date().isoformat(), age_trading_days))
 
-    stale = [(s, d, a) for s, d, a in ages if a > max_stale_days]
+    stale = [(s, d, a) for s, d, a in ages if a > max_stale_trading_days]
     stalest = max(ages, key=lambda r: r[2])
 
     if stale:
         stale.sort(key=lambda r: -r[2])
-        head = ", ".join(f"{s}({a}d, last={d})" for s, d, a in stale[:10])
+        head = ", ".join(f"{s}({a} trading-d, last={d})" for s, d, a in stale[:10])
         raise RuntimeError(
             f"Universe-freshness scan: {len(stale)} symbol(s) older than "
-            f"{max_stale_days}d threshold (stalest first): {head}"
+            f"{max_stale_trading_days} trading-day(s) threshold "
+            f"(stalest first): {head}"
             + ("…" if len(stale) > 10 else "")
         )
 
@@ -431,11 +440,11 @@ def _scan_universe_and_emit_freshness_receipt(
         "library": "universe",
         "bucket": bucket,
         "n_symbols_checked": len(syms),
-        "max_stale_days_threshold": max_stale_days,
+        "max_stale_trading_days_threshold": max_stale_trading_days,
         "all_fresh": True,
         "stalest_symbol": stalest[0],
         "stalest_last_date": stalest[1],
-        "stalest_age_days": stalest[2],
+        "stalest_age_trading_days": stalest[2],
         "scan_seconds": round(scan_seconds, 1),
         "writer": "alpha-engine-data:builders/daily_append.py",
     }
@@ -448,7 +457,7 @@ def _scan_universe_and_emit_freshness_receipt(
     )
 
     log.info(
-        "Universe-freshness receipt written: n=%d all_fresh stalest=%s(%dd) scan=%.1fs",
+        "Universe-freshness receipt written: n=%d all_fresh stalest=%s(%d trading-d) scan=%.1fs",
         len(syms), stalest[0], stalest[2], scan_seconds,
     )
     return receipt
@@ -1436,7 +1445,7 @@ def daily_append(
         result["universe_freshness_receipt"] = {
             "n_symbols_checked": receipt["n_symbols_checked"],
             "stalest_symbol": receipt["stalest_symbol"],
-            "stalest_age_days": receipt["stalest_age_days"],
+            "stalest_age_trading_days": receipt["stalest_age_trading_days"],
             "scan_seconds": receipt["scan_seconds"],
         }
 
