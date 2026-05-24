@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-pipeline-watchdog:*"
+    },
+    {
+      "Sid": "ListSFExecutions",
+      "Effect": "Allow",
+      "Action": ["states:ListExecutions"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+      ]
+    },
+    {
+      "Sid": "PublishToWatchdogTopic",
+      "Effect": "Allow",
+      "Action": ["sns:Publish"],
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts"
+    },
+    {
+      "Sid": "ReadTelegramSecretsForLibAlerts",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+      ]
+    },
+    {
+      "Sid": "DedupMarkerS3IO",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
+    }
+  ]
+}
