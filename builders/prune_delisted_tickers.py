@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 import boto3
 import pandas as pd
 
+from builders._constituents_loader import load_constituents_for_run_date
 from features.compute import DEFAULT_BUCKET, _SKIP_TICKERS, _is_sector_etf
 from store.arctic_store import get_universe_lib
 
@@ -51,25 +52,29 @@ DEFAULT_ABSENT_DAYS = 14
 AUDIT_PREFIX = "builders/prune_audit/"
 
 
-def _load_latest_constituents(s3, bucket: str) -> tuple[set[str], str]:
-    """Return (tickers_set, weekly_date_str) from the latest constituents.json."""
-    pointer_key = "market_data/latest_weekly.json"
-    obj = s3.get_object(Bucket=bucket, Key=pointer_key)
-    pointer = json.loads(obj["Body"].read())
-    weekly_date = pointer["date"]
-    prefix = pointer["s3_prefix"].rstrip("/")
-    constituents_key = f"{prefix}/constituents.json"
+def _load_latest_constituents(
+    s3, bucket: str, run_date: str | None = None,
+) -> tuple[set[str], str]:
+    """Return ``(tickers_set, weekly_date_str)`` from the current
+    constituents.json.
 
-    obj = s3.get_object(Bucket=bucket, Key=constituents_key)
-    payload = json.loads(obj["Body"].read())
-    tickers = payload.get("tickers")
-    if not tickers:
-        raise RuntimeError(
-            f"constituents.json at s3://{bucket}/{constituents_key} has no "
-            f"`tickers` field — refusing to prune against an empty universe "
-            f"(would delete every symbol)."
-        )
-    return set(tickers), weekly_date
+    Thin wrapper around
+    :func:`builders._constituents_loader.load_constituents_for_run_date`.
+    When ``run_date`` is provided (Phase-1 happy path), reads directly
+    from ``market_data/weekly/{run_date}/constituents.json``; otherwise
+    falls back to the ``latest_weekly.json`` pointer.
+
+    Lifted 2026-05-24 (ROADMAP L1397). The pre-lift implementation
+    always followed the pointer — which, during Phase-1, points at the
+    PRIOR week's partition (the constituents collector writes the new
+    weekly file first; ``_write_manifest`` advances the pointer at
+    end-of-Phase-1). Calling prune mid-Phase-1 with the stale pointer
+    pruned tickers REMOVED last week instead of this week (BK/FLO/PSTG
+    for the 5/23 cycle would have stayed in arctic for one extra week
+    before the next prune run cleared them). Same defect class as the
+    L1316 backfill TOCTOU.
+    """
+    return load_constituents_for_run_date(s3, bucket, run_date=run_date)
 
 
 def _read_last_date(universe_lib, ticker: str) -> pd.Timestamp | None:
@@ -100,6 +105,7 @@ def prune_delisted_tickers(
     apply: bool = False,
     tickers_override: list[str] | None = None,
     constituents_override: "set[str] | list[str] | None" = None,
+    run_date: str | None = None,
     today: pd.Timestamp | None = None,
 ) -> dict:
     """Prune ArcticDB universe symbols that are confirmed delistings.
@@ -126,6 +132,19 @@ def prune_delisted_tickers(
         (which has cross-module read fan-out — alternative/macro/
         features/compute all depend on it). Mutually exclusive with
         ``tickers_override``.
+    run_date
+        ``YYYY-MM-DD`` of the current Phase-1 work date. When set, the
+        constituents read goes directly to
+        ``market_data/weekly/{run_date}/constituents.json`` rather than
+        following the ``latest_weekly.json`` pointer — required for
+        in-Phase-1 callers (``weekly_collector._run_phase1``) because
+        the pointer isn't advanced until ``_write_manifest`` at end-of-
+        Phase-1. Without ``run_date``, a Phase-1 prune call sees LAST
+        week's constituents and fails to prune this-week's REMOVALS
+        (BK/FLO/PSTG for the 5/23 cycle). Mutually exclusive with
+        ``constituents_override``; ignored when ``tickers_override`` is
+        set. Closes ROADMAP L1397 (same TOCTOU defect class as L1316
+        ``backfill`` fix in data #294).
     today
         Override the staleness reference date for testing. Defaults to
         UTC midnight today.
@@ -168,10 +187,14 @@ def prune_delisted_tickers(
                 len(constituents),
             )
         else:
-            constituents, weekly_date = _load_latest_constituents(s3, bucket)
+            constituents, weekly_date = _load_latest_constituents(
+                s3, bucket, run_date=run_date,
+            )
             log.info(
-                "Latest constituents (date=%s): %d tickers",
-                weekly_date, len(constituents),
+                "Latest constituents (date=%s, source=%s): %d tickers",
+                weekly_date,
+                "run_date direct" if run_date else "latest_weekly pointer",
+                len(constituents),
             )
         # Only stocks can be pruned — never touch macro/index series or
         # sector ETFs (those aren't constituents-tracked but are still
