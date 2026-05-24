@@ -61,6 +61,7 @@ from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
     list_price_cache_keys,
 )
+from builders._constituents_loader import load_constituents_for_run_date
 from builders.daily_append import _scan_universe_and_emit_freshness_receipt
 
 log = logging.getLogger(__name__)
@@ -81,39 +82,19 @@ PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 def _load_current_constituents(s3, bucket: str, run_date: str | None = None) -> set[str]:
     """Load the current S&P 500 / 400 constituents set.
 
-    When ``run_date`` is provided (DataPhase1 happy path), reads directly from
-    ``market_data/weekly/{run_date}/constituents.json`` — the file the
-    constituents collector wrote earlier in this same Phase 1 invocation.
-    Otherwise falls back to ``market_data/latest_weekly.json`` for ad-hoc
-    callers (per-ticker recovery backfills, dry-runs, tests).
+    Thin wrapper around :func:`load_constituents_for_run_date` —
+    preserved for backwards compatibility with backfill's caller sites
+    that consume just the ticker set (not the weekly_date tuple). New
+    code should call :func:`load_constituents_for_run_date` directly.
 
-    The pointer-based fallback exists because ``_write_manifest`` only advances
-    ``latest_weekly.json`` at the *end* of Phase 1, while ``backfill`` runs in
-    the middle. Using the pointer here previously caused new constituents
-    (added to Wikipedia between Saturdays) to be excluded from the ArcticDB
-    write — the very tickers Research then asks for at preflight time,
-    tripping the 5% per-ticker error threshold (see 2026-05-23 SF failure).
+    Lifted 2026-05-24 (ROADMAP L1397): the run_date-aware constituents
+    read is now a single chokepoint at
+    :func:`builders._constituents_loader.load_constituents_for_run_date`,
+    shared with ``prune_delisted_tickers``. See module docstring there
+    for the TOCTOU defect class this closes (see 2026-05-23 SF failure).
     """
-    if run_date:
-        key = f"market_data/weekly/{run_date}/constituents.json"
-        source = f"run_date={run_date} (direct)"
-    else:
-        pointer_obj = s3.get_object(Bucket=bucket, Key="market_data/latest_weekly.json")
-        pointer = json.loads(pointer_obj["Body"].read())
-        weekly_date = pointer["date"]
-        prefix = pointer["s3_prefix"].rstrip("/")
-        key = f"{prefix}/constituents.json"
-        source = f"pointer→{weekly_date}"
-    cons_obj = s3.get_object(Bucket=bucket, Key=key)
-    payload = json.loads(cons_obj["Body"].read())
-    tickers = payload.get("tickers")
-    if not tickers:
-        raise RuntimeError(
-            f"constituents.json at s3://{bucket}/{key} ({source}) has no "
-            f"`tickers` field — refusing to filter against an empty "
-            f"constituents set (would write zero tickers to arctic universe)."
-        )
-    return set(tickers)
+    tickers, _ = load_constituents_for_run_date(s3, bucket, run_date=run_date)
+    return tickers
 
 
 def _load_full_cache(s3, bucket: str, prefix: str = PRICE_CACHE_LEGACY_PREFIX) -> dict[str, pd.DataFrame]:

@@ -374,7 +374,10 @@ def test_empty_constituents_raises(monkeypatch):
     lib = _stub_universe_lib(symbols=["AAPL"], last_dates={"AAPL": "2026-04-25"})
     _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
 
-    with pytest.raises(RuntimeError, match="empty universe"):
+    # Post-L1397 (lift-to-shared-helper): error message broadened from
+    # prune-specific "empty universe" to the shared helper's "empty
+    # constituents set" (serves both backfill and prune call sites).
+    with pytest.raises(RuntimeError, match="empty constituents set"):
         _mod.prune_delisted_tickers(
             absent_days=14, apply=True,
             today=pd.Timestamp("2026-04-28"),
