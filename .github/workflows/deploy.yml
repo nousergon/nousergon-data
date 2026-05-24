@@ -57,6 +57,23 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      # The deploy.sh canary-rollback path publishes a dedup-keyed alert via
+      # `python3 -m alpha_engine_lib.alerts publish` (deploy.sh:153) so a
+      # rolled-back deploy isn't silent on the alert channel beyond the GHA
+      # red-icon. Without alpha-engine-lib installed in the runner Python,
+      # the alerts call fails with ModuleNotFoundError and the alert never
+      # publishes — the recurring failure mode L221 retrofit was designed
+      # to fix. Pinned to the same v0.26.0 ref as requirements.txt:18 so the
+      # CI alert path and the Lambda runtime path share a single source of
+      # truth on the lib version. No extras needed (alerts uses boto3/SNS,
+      # which is preinstalled on ubuntu-latest).
+      - name: Set up Python for canary-rollback alert publish
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install alpha-engine-lib for deploy.sh alerts call
+        run: pip install "alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.26.0"
+
       - name: Deploy Phase 2 Lambda (alpha-engine-data-collector)
         working-directory: alpha-engine-data
         run: bash infrastructure/deploy.sh

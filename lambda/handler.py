@@ -133,7 +133,25 @@ def handler(event, context):
             except Exception as he:
                 logger.warning("Health marker write failed: %s", he)
 
-        if status in ("ok", "partial", "ok_dry_run"):
+        if status == "skipped" and dry_run:
+            # Canary contract: the deploy.sh canary calls with dry_run=true to
+            # verify Lambda boot + S3 read after a new version is published. If
+            # there are no tickers for run_date (e.g., Sunday deploy before next
+            # signals.json is written), the underlying collector correctly
+            # returns status='skipped' — Lambda code is fine, the upstream
+            # signals just don't exist yet. Map to canary-status 'SKIPPED'
+            # (which deploy.sh:122 already accepts as canary-OK) instead of
+            # collapsing into ERROR. Production invocations (dry_run=false)
+            # still fall through to the ERROR branch so the Saturday SF's
+            # DataPhase2 state surfaces a real "Research output empty" failure.
+            logger.info("Phase 2 dry_run skipped — no tickers (canary-safe)")
+            return {
+                "status": "SKIPPED",
+                "skip_reason": result.get("reason", "no tickers"),
+                "duration_seconds": round(duration, 1),
+                "dry_run": dry_run,
+            }
+        elif status in ("ok", "partial", "ok_dry_run"):
             logger.info(
                 "Phase 2 complete in %.0fs: %s", duration,
                 f"{result.get('tickers_processed', 0)} tickers processed"
