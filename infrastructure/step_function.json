@@ -109,7 +109,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
@@ -223,7 +224,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
@@ -337,7 +339,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
@@ -1201,8 +1204,9 @@
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "Ssm.InvocationDoesNotExistException"
-                  ],
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
                   "MaxAttempts": 10,
                   "IntervalSeconds": 30,
                   "BackoffRate": 1.5
@@ -1485,7 +1489,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
@@ -1601,7 +1606,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
@@ -1717,7 +1723,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
@@ -1808,7 +1815,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 5,
           "IntervalSeconds": 5,
@@ -1875,7 +1883,8 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException"
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 5,
           "IntervalSeconds": 5,
