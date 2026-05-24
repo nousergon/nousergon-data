@@ -247,10 +247,11 @@ class TestMacroSpyFresh:
     def test_fails_when_spy_too_stale(self):
         pf = _make_postflight()
         macro_lib = MagicMock()
-        macro_lib.read.return_value.data = _series_ending_at("2026-04-10")  # 8 days stale
+        # 2026-04-10 = Fri; run_date 4/18 (Sat) expects 4/17 (Fri) → 5 trading days behind
+        macro_lib.read.return_value.data = _series_ending_at("2026-04-10")
         pf._universe_lib = MagicMock()
         pf._macro_lib = macro_lib
-        with pytest.raises(PostflightError, match="is 8d stale"):
+        with pytest.raises(PostflightError, match="trading-day.*behind the expected last close"):
             pf._check_macro_spy_fresh()
 
     def test_fails_when_spy_empty(self):
@@ -261,6 +262,32 @@ class TestMacroSpyFresh:
         pf._macro_lib = macro_lib
         with pytest.raises(PostflightError, match="zero rows"):
             pf._check_macro_spy_fresh()
+
+    def test_ok_on_sunday_redrive_with_friday_macro(self):
+        """2026-05-24 incident regression: Sunday redrive of a Saturday SF
+        where macro.SPY carries Friday's close. Friday → Sunday is +2 calendar
+        days but 0 trading days; the migrated gate must pass via
+        ``alpha_engine_lib.dates.is_fresh_in_trading_days``.
+        """
+        pf = _make_postflight()
+        pf.run_date = "2026-05-24"  # Sunday
+        macro_lib = MagicMock()
+        macro_lib.read.return_value.data = _series_ending_at("2026-05-22")  # Friday
+        pf._universe_lib = MagicMock()
+        pf._macro_lib = macro_lib
+        pf._check_macro_spy_fresh()  # must not raise
+
+    def test_ok_on_memorial_day_monday_with_friday_macro(self):
+        """Memorial Day Monday is an NYSE holiday — Friday is still the most
+        recent close. Holiday-aware via the lib's NYSE calendar.
+        """
+        pf = _make_postflight()
+        pf.run_date = "2026-05-25"  # Memorial Day Monday
+        macro_lib = MagicMock()
+        macro_lib.read.return_value.data = _series_ending_at("2026-05-22")
+        pf._universe_lib = MagicMock()
+        pf._macro_lib = macro_lib
+        pf._check_macro_spy_fresh()  # must not raise
 
 
 # ── ArcticDB universe sample ──────────────────────────────────────────────────

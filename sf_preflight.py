@@ -59,7 +59,7 @@ DEFAULT_BUCKET = "alpha-engine-research"
 _MISSING_FROM_CLOSES_THRESHOLD = 5
 
 # Universe-freshness scan threshold from builders/daily_append.py.
-_UNIVERSE_FRESHNESS_MAX_STALE_DAYS = 5
+_UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3  # ~5 calendar days under previous threshold, now trading-day-aware
 
 # Postflight SPY freshness threshold (validators/postflight.py).
 _POSTFLIGHT_SPY_MAX_STALE_DAYS = 1
@@ -264,13 +264,19 @@ def check_universe_drift(ctx: PreflightContext) -> CheckResult:
         if last_ts is None:
             will_skip.append({"ticker": ticker, "reason": "unreadable"})
             continue
-        days_stale = (today_ts.normalize() - last_ts).days
+        # Trading-day staleness via alpha_engine_lib.dates — the prune
+        # decision is "has this ticker missed N+ NYSE sessions since its
+        # last write?", which is independent of calendar weekends/holidays.
+        from alpha_engine_lib.dates import trading_days_stale
+        days_stale = trading_days_stale(last_ts.date(), today_ts.date().isoformat())
         entry = {"ticker": ticker, "last_date": last_ts.date().isoformat(), "days_stale": days_stale}
-        # PR #134 uses absent_days=5 for the pre-MorningEnrich prune.
-        if days_stale > 5:
+        # PR #134 uses absent_days=5 calendar; under trading-day arithmetic
+        # ~3 sessions is the equivalent (a week of weekdays minus the
+        # weekend buffer that calendar arithmetic absorbed).
+        if days_stale > 3:
             will_prune.append(entry)
         else:
-            will_skip.append({**entry, "reason": "below_5d_threshold"})
+            will_skip.append({**entry, "reason": "below_3_trading_day_threshold"})
 
     # Escalate to FAIL if any straggler is "old enough to prune" (>5d stale)
     # AND we're about to launch a recovery SF that skips MorningEnrich (the
@@ -362,12 +368,13 @@ def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
         if last_ts is None:
             stale.append({"ticker": ticker, "reason": "unreadable"})
             continue
-        days_stale = (today - last_ts).days
-        if days_stale > _UNIVERSE_FRESHNESS_MAX_STALE_DAYS:
+        from alpha_engine_lib.dates import trading_days_stale
+        days_stale = trading_days_stale(last_ts.date(), today.date().isoformat())
+        if days_stale > _UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS:
             stale.append({
                 "ticker": ticker,
                 "last_date": last_ts.date().isoformat(),
-                "days_stale": days_stale,
+                "trading_days_stale": days_stale,
             })
 
     if stale:
@@ -375,7 +382,7 @@ def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
             name="universe_sample_freshness",
             status="warn",
             message=(
-                f"{len(stale)}/{len(sample)} sampled symbols >{_UNIVERSE_FRESHNESS_MAX_STALE_DAYS}d "
+                f"{len(stale)}/{len(sample)} sampled symbols >{_UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS} trading-day(s) "
                 f"stale TODAY (post-MorningEnrich would refresh, so not a hard-fail; "
                 f"flagging for visibility)"
             ),
@@ -386,7 +393,7 @@ def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
     return CheckResult(
         name="universe_sample_freshness",
         status="ok",
-        message=f"Sampled {len(sample)} symbols, all within {_UNIVERSE_FRESHNESS_MAX_STALE_DAYS}d of today",
+        message=f"Sampled {len(sample)} symbols, all within {_UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS} trading-day(s) of today",
         elapsed_seconds=time.time() - t0,
     )
 

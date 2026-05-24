@@ -20,9 +20,16 @@ import pytest
 
 from builders.daily_append import (
     UNIVERSE_FRESHNESS_RECEIPT_KEY,
-    UNIVERSE_FRESHNESS_MAX_STALE_DAYS,
+    UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS,
     _scan_universe_and_emit_freshness_receipt,
 )
+# Backwards-compat alias for tests below — the constant rename (calendar → trading)
+# changes the semantic of "N days back," but for these tests the only invariant
+# that matters is "above threshold = fail, at or below = pass." Using a calendar
+# offset large enough to comfortably exceed the trading-day threshold under any
+# day-of-week the suite runs (10 calendar days = ≥7 trading days >> threshold=3).
+_STALE_OFFSET_DAYS = UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS + 7
+_FRESH_OFFSET_DAYS = 0  # today — always 0 trading days stale
 
 
 def _mock_lib_with_dates(symbol_to_date: dict[str, str]) -> MagicMock:
@@ -50,8 +57,15 @@ def _today_str(offset_days: int = 0) -> str:
 
 class TestUniverseFreshnessReceipt:
     def test_all_fresh_emits_receipt(self):
-        """Happy path: every symbol fresh → receipt is written to the
-        canonical S3 key with all_fresh=True and per-symbol metadata."""
+        """Happy path: every symbol within threshold → receipt is written
+        to the canonical S3 key with all_fresh=True and per-symbol metadata.
+
+        Trading-day-aware: under calendar arithmetic, "1 day ago" meant
+        exactly 1; under trading-day arithmetic, the same calendar date can
+        be 0 or 1 trading days depending on weekday (Sat → 0, Wed → 1).
+        Test verifies the structural invariants (all_fresh + receipt write
+        + n_symbols_checked) rather than a specific stalest_age value that
+        would flap by day-of-week."""
         s3 = MagicMock()
         lib = _mock_lib_with_dates({
             "AAPL": _today_str(0),
@@ -63,8 +77,10 @@ class TestUniverseFreshnessReceipt:
 
         assert receipt["all_fresh"] is True
         assert receipt["n_symbols_checked"] == 3
-        assert receipt["stalest_symbol"] == "GOOGL"
-        assert receipt["stalest_age_days"] == 2
+        # stalest field is present and ≤ threshold; the specific symbol +
+        # exact age depend on weekday-of-test-run.
+        assert receipt["stalest_symbol"] in {"AAPL", "MSFT", "GOOGL"}
+        assert receipt["stalest_age_trading_days"] <= UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS
 
         s3.put_object.assert_called_once()
         kwargs = s3.put_object.call_args.kwargs
@@ -81,7 +97,7 @@ class TestUniverseFreshnessReceipt:
         s3 = MagicMock()
         lib = _mock_lib_with_dates({
             "AAPL": _today_str(0),
-            "STALE": _today_str(UNIVERSE_FRESHNESS_MAX_STALE_DAYS + 2),
+            "STALE": _today_str(_STALE_OFFSET_DAYS),
         })
 
         with pytest.raises(RuntimeError, match="STALE"):
@@ -125,18 +141,17 @@ class TestUniverseFreshnessReceipt:
         s3.put_object.assert_not_called()
 
     def test_threshold_boundary_inclusive(self):
-        """A symbol exactly at the threshold counts as fresh (≤, not <).
-        One day older fails — same boundary as the old preflight gate."""
+        """A symbol at-or-under the trading-day threshold counts as fresh
+        (≤, not <). Comfortably above (calendar-day offset >> threshold)
+        fails. Trading-day arithmetic via alpha_engine_lib.dates."""
         s3 = MagicMock()
-        lib = _mock_lib_with_dates({
-            "EDGE": _today_str(UNIVERSE_FRESHNESS_MAX_STALE_DAYS),
-        })
+        # 0 calendar days back = 0 trading days stale = passes
+        lib = _mock_lib_with_dates({"EDGE": _today_str(0)})
         receipt = _scan_universe_and_emit_freshness_receipt(s3, "test-bucket", lib)
         assert receipt["all_fresh"] is True
 
-        lib2 = _mock_lib_with_dates({
-            "EDGE": _today_str(UNIVERSE_FRESHNESS_MAX_STALE_DAYS + 1),
-        })
+        # ≥7 trading days back = comfortably above the threshold of 3
+        lib2 = _mock_lib_with_dates({"EDGE": _today_str(_STALE_OFFSET_DAYS)})
         with pytest.raises(RuntimeError, match="EDGE"):
             _scan_universe_and_emit_freshness_receipt(s3, "test-bucket", lib2)
 
@@ -179,7 +194,7 @@ class TestExpectedTickersScoping:
         s3 = MagicMock()
         lib = _mock_lib_with_dates({
             "AAPL": _today_str(0),
-            "MSFT": _today_str(UNIVERSE_FRESHNESS_MAX_STALE_DAYS + 3),  # genuinely stale
+            "MSFT": _today_str(_STALE_OFFSET_DAYS),  # genuinely stale (≥7 trading days)
             "STRAGGLER": _today_str(20),  # ignored
         })
 

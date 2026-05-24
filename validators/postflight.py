@@ -55,15 +55,19 @@ class PostflightError(RuntimeError):
 # any systematic write failure that drops >5% of tickers with near-certainty).
 _UNIVERSE_SAMPLE_SIZE = 20
 
-# Max staleness of a sampled universe ticker relative to SPY's last row.
-# >2d tolerates weekend-adjacent partial writes but catches genuine staleness.
-_UNIVERSE_MAX_STALE_VS_SPY_DAYS = 2
+# Max staleness of a sampled universe ticker relative to SPY's last row, in
+# *trading days*. >0 tolerates a single missing session (e.g. one ticker
+# caught in a partial-write race); >2 starts looking like systematic write
+# failure. Trading-day-aware via alpha_engine_lib.dates so post-Saturday
+# redrives don't trip on calendar-day weekend artifacts.
+_UNIVERSE_MAX_STALE_VS_SPY_TRADING_DAYS = 2
 
-# Minimum SPY freshness: last row must be ≥ run_date - 1 calendar day.
-# DataPhase1 for run_date=<Saturday> expects SPY to have <Friday>'s close,
-# which is run_date - 1 calendar day. Tighter than the preflight check that
-# tolerates weekend runs (Saturday 00:00 UTC ≈ Friday 5-8 PM PT).
-_MACRO_SPY_MAX_STALE_DAYS = 1
+# Minimum macro.SPY freshness in *trading days*: must carry the most recent
+# NYSE close that exists as of run_date. Holiday-aware via alpha_engine_lib.
+# dates.is_fresh_in_trading_days — replaces the calendar-day arithmetic that
+# broke every post-Saturday redrive (2026-05-24 incident). Threshold is 0 (the
+# producer just wrote; must carry the latest close, no T+1 tolerance).
+_MACRO_SPY_MAX_STALE_TRADING_DAYS = 0
 
 # Minimum constituent count for a valid constituents.json payload.
 # Matches research's ``fetch_sp500_sp400_with_sectors`` contract
@@ -135,9 +139,20 @@ class DataPostflight:
     def _check_macro_spy_fresh(self) -> None:
         """Consumer: predictor ``_verify_arctic_fresh``.
 
-        SPY lives in the ArcticDB macro library. For a Saturday run_date, SPY's
-        last row must be ≥ run_date - 1 (= the prior Friday's close).
+        SPY lives in the ArcticDB macro library. Its last row must carry the
+        most recent NYSE close that exists as of ``run_date``. Trading-day-
+        aware via ``alpha_engine_lib.dates.is_fresh_in_trading_days``:
+        Friday's close passes on Saturday/Sunday/Memorial-Day-Monday runs
+        because zero NYSE sessions have closed in between. The earlier
+        calendar-day formulation (``(run_date - last_date).days > 1``) broke
+        every post-Saturday redrive (2026-05-24 incident).
         """
+        from alpha_engine_lib.dates import (
+            is_fresh_in_trading_days,
+            trading_days_stale,
+            expected_last_close,
+        )
+
         _, macro_lib = self._open_arctic_libs()
         try:
             df = macro_lib.read("SPY", columns=["Close"]).data
@@ -155,19 +170,25 @@ class DataPostflight:
         last_ts = pd.Timestamp(df.index[-1])
         if last_ts.tzinfo is not None:
             last_ts = last_ts.tz_convert("UTC").tz_localize(None)
-        last_date = last_ts.normalize()
-        expected = pd.Timestamp(self.run_date).normalize()
-        stale_days = (expected - last_date).days
-        if stale_days > _MACRO_SPY_MAX_STALE_DAYS:
+        last_date = last_ts.normalize().date()
+
+        if not is_fresh_in_trading_days(
+            last_date, self.run_date,
+            max_stale=_MACRO_SPY_MAX_STALE_TRADING_DAYS,
+        ):
+            stale = trading_days_stale(last_date, self.run_date)
+            expected = expected_last_close(self.run_date)
             raise PostflightError(
-                f"ArcticDB macro.SPY last_date={last_date.date()} is "
-                f"{stale_days}d stale for run_date={expected.date()} "
-                f"(>{_MACRO_SPY_MAX_STALE_DAYS}d threshold). Predictor's "
-                f"_verify_arctic_fresh will reject this."
+                f"ArcticDB macro.SPY last_date={last_date} is {stale} "
+                f"trading-day(s) behind the expected last close {expected} "
+                f"for run_date={self.run_date} "
+                f"(>{_MACRO_SPY_MAX_STALE_TRADING_DAYS}d threshold). "
+                f"Predictor's _verify_arctic_fresh will reject this."
             )
         log.info(
-            "postflight: ArcticDB macro.SPY last_date=%s (%dd ≤ %dd)",
-            last_date.date(), stale_days, _MACRO_SPY_MAX_STALE_DAYS,
+            "postflight: ArcticDB macro.SPY last_date=%s "
+            "(0 trading-day(s) stale ≤ %d threshold)",
+            last_date, _MACRO_SPY_MAX_STALE_TRADING_DAYS,
         )
 
     def _check_universe_sample_fresh(self) -> None:
@@ -180,13 +201,15 @@ class DataPostflight:
         per-ticker error rate in research's ``PriceFetchError`` check at
         Lambda runtime.
         """
+        from alpha_engine_lib.dates import trading_days_stale
+
         universe_lib, macro_lib = self._open_arctic_libs()
 
         # SPY last date serves as the staleness reference (already validated above).
         spy_last = pd.Timestamp(macro_lib.read("SPY", columns=["Close"]).data.index[-1])
         if spy_last.tzinfo is not None:
             spy_last = spy_last.tz_convert("UTC").tz_localize(None)
-        spy_last = spy_last.normalize()
+        spy_last_date = spy_last.normalize().date()
 
         symbols = list(universe_lib.list_symbols())
         # Filter sector ETFs + macro symbols out of the stock sample.
@@ -222,23 +245,29 @@ class DataPostflight:
             last_ts = pd.Timestamp(df.index[-1])
             if last_ts.tzinfo is not None:
                 last_ts = last_ts.tz_convert("UTC").tz_localize(None)
-            stale = (spy_last - last_ts.normalize()).days
-            if stale > _UNIVERSE_MAX_STALE_VS_SPY_DAYS:
+            # Trading-day staleness vs SPY's last_date — calendar arithmetic
+            # would over-fail on partial writes that landed late in the
+            # session window (e.g. Friday write where one ticker landed
+            # Thursday — calendar 1d, trading 1d). Both fine here, but the
+            # primitive aligns with the system-wide convention.
+            stale = trading_days_stale(last_ts.normalize().date(), spy_last_date)
+            if stale > _UNIVERSE_MAX_STALE_VS_SPY_TRADING_DAYS:
                 stale_tickers.append((sym, stale))
 
         if stale_tickers:
             raise PostflightError(
                 f"ArcticDB universe sample has {len(stale_tickers)}/{_UNIVERSE_SAMPLE_SIZE} "
-                f"tickers >{_UNIVERSE_MAX_STALE_VS_SPY_DAYS}d stale vs SPY "
-                f"({spy_last.date()}): {stale_tickers[:5]}"
+                f"tickers >{_UNIVERSE_MAX_STALE_VS_SPY_TRADING_DAYS} trading-day(s) "
+                f"stale vs SPY ({spy_last_date}): {stale_tickers[:5]}"
                 + (" ..." if len(stale_tickers) > 5 else "")
                 + ". daily_append partial-write suspected — downstream reads "
                 "will silently drop stale tickers."
             )
         log.info(
-            "postflight: universe sample %d/%d tickers fresh (within %dd of SPY %s)",
+            "postflight: universe sample %d/%d tickers fresh "
+            "(within %d trading-day(s) of SPY %s)",
             len(sample) - len(stale_tickers), len(sample),
-            _UNIVERSE_MAX_STALE_VS_SPY_DAYS, spy_last.date(),
+            _UNIVERSE_MAX_STALE_VS_SPY_TRADING_DAYS, spy_last_date,
         )
 
     def _check_macro_json_contract(self) -> None:

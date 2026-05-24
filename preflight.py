@@ -138,11 +138,60 @@ class DataPreflight(BasePreflight):
             # constituents. daily_append writes to both libraries, so
             # macro/SPY freshness is a sufficient signal for the write
             # path being healthy end-to-end.
-            # 4-day threshold covers Fri→Tue long weekends + 1 day of buffer.
-            self.check_arcticdb_fresh("macro", "SPY", max_stale_days=4)
+            #
+            # Trading-day-aware via alpha_engine_lib.dates: max_stale=1
+            # tolerates polygon's T+1 publish latency (yesterday's close
+            # may not have been written yet at this preflight's invocation
+            # time). The earlier 4-calendar-day threshold was a workaround
+            # for weekend artifacts under calendar arithmetic; trading-day
+            # arithmetic handles weekends + holidays natively.
+            self._check_macro_spy_fresh_trading_days(max_stale=1)
             # Both libraries must be present — same gate as phase1 for
             # operator-clarity on partial-deploy scenarios.
             self._check_arcticdb_libraries_present(("universe", "macro"))
+
+    def _check_macro_spy_fresh_trading_days(self, *, max_stale: int) -> None:
+        """Trading-day-aware SPY freshness for the `daily` preflight mode.
+
+        Bypasses the lib's calendar-day ``check_arcticdb_fresh`` (which is
+        load-bearing for other helpers and will be retired separately) and
+        calls the new ``alpha_engine_lib.dates.is_fresh_in_trading_days``
+        chokepoint directly. Mirrors the postflight pattern so producer-
+        and consumer-side checks agree on what "fresh" means.
+        """
+        import pandas as pd
+        from datetime import datetime, timezone
+        from alpha_engine_lib.dates import (
+            is_fresh_in_trading_days,
+            trading_days_stale,
+            expected_last_close,
+        )
+        # Open arctic via the lib's helper which is already on the instance.
+        import arcticdb as adb
+        import os
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        bucket = os.environ.get("RESEARCH_BUCKET", "alpha-engine-research")
+        uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix=arcticdb&aws_auth=true"
+        arctic = adb.Arctic(uri)
+        macro_lib = arctic.get_library("macro")
+        df = macro_lib.read("SPY", columns=["Close"]).data
+        if df is None or df.empty:
+            raise RuntimeError("ArcticDB macro.SPY has zero rows")
+        last_ts = pd.Timestamp(df.index[-1])
+        if last_ts.tzinfo is not None:
+            last_ts = last_ts.tz_convert("UTC").tz_localize(None)
+        last_date = last_ts.normalize().date()
+        today = datetime.now(timezone.utc).date().isoformat()
+        if not is_fresh_in_trading_days(last_date, today, max_stale=max_stale):
+            stale = trading_days_stale(last_date, today)
+            expected = expected_last_close(today)
+            raise RuntimeError(
+                f"ArcticDB macro.SPY last_date={last_date} is {stale} "
+                f"trading-day(s) behind the expected last close {expected} "
+                f"as of {today} (>{max_stale} trading-day threshold)"
+            )
+        log.info("preflight: ArcticDB macro.SPY last_date=%s ≤ %d trading-day(s) stale",
+                 last_date, max_stale)
 
     # ── Secret presence ──────────────────────────────────────────────────
 
