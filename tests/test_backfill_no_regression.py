@@ -187,6 +187,9 @@ def test_full_backfill_calls_apply_daily_delta():
          patch.object(_bf, "compute_features", side_effect=lambda df, **_: df), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         _bf.backfill(ticker_filter=None)
@@ -218,6 +221,9 @@ def test_full_backfill_calls_regression_preflight():
          patch.object(_bf, "compute_features", side_effect=lambda df, **_: df), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         _bf.backfill(ticker_filter=None)
@@ -251,6 +257,9 @@ def test_ticker_filter_skips_regression_preflight():
          patch.object(_bf, "compute_features", side_effect=lambda df, **_: df), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         _bf.backfill(ticker_filter="AAPL")
@@ -318,6 +327,9 @@ def test_backfill_skips_tickers_absent_from_constituents():
          patch.object(_bf, "compute_features", side_effect=lambda df, **_: df), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         result = _bf.backfill(ticker_filter=None)

@@ -61,6 +61,7 @@ from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
     list_price_cache_keys,
 )
+from builders.daily_append import _scan_universe_and_emit_freshness_receipt
 
 log = logging.getLogger(__name__)
 
@@ -707,6 +708,47 @@ def backfill(
         except Exception as exc:
             log.warning("Snapshot creation failed (non-fatal): %s", exc)
 
+    # ── 6b. Universe-freshness receipt — Saturday DataPhase1 emit ─────────────
+    # Closes 5/23-SF P0 sweep item (d). Pre-fix the receipt only fired from
+    # the weekday `daily_append` path; the Saturday DataPhase1 backfill
+    # wrote universe symbols without emitting a corresponding freshness
+    # signature. L1316 + L1322 closes-when criteria explicitly reference
+    # `s3://alpha-engine-research/health/universe_freshness.json` containing
+    # BNY/P/SN as universe symbols — without Saturday emit, operator
+    # closure-audit takes an extra weekday-SF cycle. Per-ticker-only
+    # invocations (`ticker_filter` set) skip the emit since the receipt
+    # is a system-wide signature, not per-ticker. Skipped on dry_run for
+    # the same reason `daily_append` skips dry_run emits.
+    if not dry_run and ticker_filter is None:
+        try:
+            receipt = _scan_universe_and_emit_freshness_receipt(
+                s3=s3,
+                bucket=bucket,
+                universe_lib=universe_lib,
+                expected_tickers=sorted(constituents_set),
+            )
+            log.info(
+                "Saturday DataPhase1 universe-freshness receipt emitted: "
+                "n=%d all_fresh stalest=%s(%d trading-d)",
+                receipt["n_symbols_checked"],
+                receipt["stalest_symbol"],
+                receipt["stalest_age_trading_days"],
+            )
+        except Exception as exc:
+            # Receipt emit failure is loud-fail per [[feedback_no_silent_fails]]
+            # since the receipt IS the closure signature for L1316/L1322. A
+            # backfill that completed its writes but couldn't verify them
+            # is structurally incomplete — better to crash here so the SF
+            # Catch surfaces it than to declare backfill "ok" with a
+            # missing receipt.
+            log.error(
+                "Saturday DataPhase1 universe-freshness emit FAILED: %s. "
+                "Backfill writes are on-disk but the closure signature is "
+                "missing. Investigate before declaring this cycle done.",
+                exc,
+            )
+            raise
+
     t_total = time.time() - t0
 
     result = {
@@ -719,6 +761,9 @@ def backfill(
         "compute_seconds": round(t_compute, 1),
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
+        "universe_freshness_receipt_emitted": (
+            not dry_run and ticker_filter is None
+        ),
     }
 
     log.info("Backfill complete: %s", json.dumps(result, default=str))

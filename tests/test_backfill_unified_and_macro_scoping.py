@@ -184,6 +184,9 @@ def _run_backfill_with_mocks(**backfill_kwargs):
          patch.object(_bf, "compute_features", side_effect=_fake_compute_features), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         result = _bf.backfill(**backfill_kwargs)
@@ -274,6 +277,9 @@ def test_short_history_ticker_gets_feature_columns_written():
          patch.object(_bf, "compute_features", side_effect=_fake_compute_features), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         result = _bf.backfill(ticker_filter="NEWCO")
@@ -354,6 +360,9 @@ def test_backfill_writes_vwap_when_input_parquet_lacks_it():
          patch.object(_bf, "compute_features", side_effect=_fake_compute_features), \
          patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
          patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch.object(_bf, "_scan_universe_and_emit_freshness_receipt",
+                      return_value={"n_symbols_checked": 1, "stalest_symbol": "AAPL",
+                                    "stalest_age_trading_days": 1, "all_fresh": True}), \
          patch("builders.backfill.boto3.client") as mock_boto:
         mock_boto.return_value = MagicMock()
         result = _bf.backfill(ticker_filter="AAPL")
