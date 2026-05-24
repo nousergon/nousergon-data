@@ -185,12 +185,14 @@ _CTRL_IDENTITY = {
     "research_dry": False,
     "data_phase2_dry": False,
     "regime_action": "produce",
+    "pipeline_label": "",
 }
 _CTRL_DRY = {
     "preflight_args": " --preflight-only",
     "research_dry": True,
     "data_phase2_dry": True,
     "regime_action": "dry_run",
+    "pipeline_label": " Preflight",
 }
 
 
@@ -650,10 +652,23 @@ class TestConsolidatedNotify:
         )
 
     def test_shell_run_notify_reuses_sns_substrate(self, states):
+        """NotifyShellRunComplete surfaces the user-facing 'Saturday
+        Preflight Pipeline' label so a green Friday dry-pass is
+        distinguishable from a real Saturday SUCCESS in the operator's
+        inbox. The 'shell_run' / 'shell-run' wording is internal
+        mechanism-language (the SF Input flag); 'Preflight' is the
+        consumer-facing rename (2026-05-23) — alerts must use the
+        consumer-facing label.
+        """
         st = states["NotifyShellRunComplete"]
         assert st["Resource"] == "arn:aws:states:::sns:publish"
         assert st["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
-        assert "SHELL RUN" in st["Parameters"]["Subject"]
+        subject = st["Parameters"]["Subject"]
+        assert "Saturday Preflight Pipeline" in subject, (
+            f"Subject must surface 'Saturday Preflight Pipeline' label "
+            f"(not internal 'shell run' wording); got: {subject!r}"
+        )
+        assert "SUCCESS" in subject
         assert st["ResultPath"] == "$.notify_result"
         assert st["End"] is True
 
@@ -663,6 +678,66 @@ class TestConsolidatedNotify:
         assert choices[0]["Next"] == "NotifyShellRunComplete"
         conds = choices[0]["And"]
         assert {c["Variable"] for c in conds} == {"$.shell_run"}
+
+    def test_handle_failure_subject_is_parameterized_by_pipeline_label(self, states):
+        """2026-05-23 rename arc: HandleFailure's SNS Subject + Message
+        must use ``States.Format`` against ``$.pipeline_label`` so a
+        Preflight Pipeline failure surfaces 'Saturday Preflight Pipeline
+        — FAILED' (shell_run=true → $.pipeline_label=' Preflight') vs a
+        real Saturday SF failure surfacing 'Saturday Pipeline — FAILED'
+        ($.pipeline_label='' from InitializeInput defaults). The
+        ``pipeline_label`` token is seeded at InitializeInput + overridden
+        at ApplyShellRunDefaults — see _CTRL_IDENTITY / _CTRL_DRY.
+        """
+        st = states["HandleFailure"]
+        subject = st["Parameters"].get("Subject.$") or ""
+        assert "$.pipeline_label" in subject, (
+            f"HandleFailure Subject must reference $.pipeline_label so "
+            f"Preflight failures surface a distinct label; got: {subject!r}"
+        )
+        assert "States.Format" in subject
+        assert "Saturday" in subject
+        assert "FAILED" in subject
+        # The hardcoded literal 'Subject' field must NOT coexist with
+        # 'Subject.$' — exactly one of them sets the value, the .$ form
+        # wins per ASL semantics.
+        assert "Subject" not in st["Parameters"] or (
+            st["Parameters"].get("Subject") is None
+        )
+        # Same for Message.$ — both should be parameterized.
+        message = st["Parameters"].get("Message.$") or ""
+        assert "$.pipeline_label" in message, (
+            "HandleFailure Message must also surface the Preflight label"
+        )
+
+    def test_initialize_input_seeds_pipeline_label_at_identity(self, states):
+        """The new ``pipeline_label`` control var must default to "" in
+        InitializeInput so the real Saturday run's HandleFailure produces
+        a byte-identical Subject ('Alpha Engine Saturday Pipeline — FAILED',
+        unchanged from pre-rename)."""
+        expr = states["InitializeInput"]["Parameters"]["merged.$"]
+        m = re.search(r"StringToJson\('(\{[^']*?\})'\)", expr)
+        assert m, "could not extract InitializeInput defaults blob"
+        blob = json.loads(m.group(1))
+        assert blob.get("pipeline_label") == "", (
+            f"InitializeInput must seed pipeline_label='' (real Saturday "
+            f"identity); got {blob.get('pipeline_label')!r}"
+        )
+
+    def test_apply_shell_run_defaults_overrides_pipeline_label(self, states):
+        """ApplyShellRunDefaults must override pipeline_label to ' Preflight'
+        so HandleFailure renders 'Saturday Preflight Pipeline — FAILED'
+        under shell_run=true."""
+        expr = states["ApplyShellRunDefaults"]["Parameters"]["merged.$"]
+        # Extract the shellDefaults blob from JsonMerge($, defaults, false)
+        m = re.search(r"StringToJson\('(\{[^']*?\})'\)", expr)
+        assert m, "could not extract ApplyShellRunDefaults blob"
+        blob = json.loads(m.group(1))
+        assert blob.get("pipeline_label") == " Preflight", (
+            f"ApplyShellRunDefaults must override pipeline_label to "
+            f"' Preflight' (leading space — same convention as "
+            f"preflight_args); got {blob.get('pipeline_label')!r}"
+        )
 
 
 class TestHappyPathTraversal:

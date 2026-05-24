@@ -180,6 +180,141 @@ def test_label_lookup_table_covers_all_three_sfs():
     assert index._SF_LABELS["alpha-engine-eod-pipeline"] == "EOD SF"
 
 
+class TestPreflightLabel:
+    """2026-05-23 rename: the Saturday SF's Friday-PM dry-pass execution
+    (input ``shell_run=true``) surfaces 'Saturday Preflight SF' in the
+    Telegram message instead of 'Saturday SF', so the operator can tell
+    a green/red preflight result apart from a real Saturday result at a
+    glance. Same state machine; differentiated via execution input flag.
+    """
+
+    def _saturday_preflight_event(self, status: str):
+        return _event(status, sm_arn=SATURDAY_ARN, name="friday-shell-260523")
+
+    def test_saturday_with_shell_run_true_surfaces_preflight_label(self):
+        event = self._saturday_preflight_event("SUCCEEDED")
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.return_value = {
+            "input": '{"shell_run": true, "ec2_instance_id": ["i-X"]}',
+            "error": "",
+            "cause": "",
+        }
+        with patch("index.boto3.client", return_value=fake_sf_client):
+            index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Saturday Preflight SF — SUCCEEDED" in text, (
+            f"shell_run=true on Saturday SF must surface "
+            f"'Saturday Preflight SF' label; got: {text!r}"
+        )
+        # Default label must NOT appear (Saturday SF != Saturday Preflight SF)
+        assert "Saturday SF —" not in text
+
+    def test_saturday_without_shell_run_uses_default_label(self):
+        event = _event("SUCCEEDED", sm_arn=SATURDAY_ARN)
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.return_value = {
+            "input": '{"ec2_instance_id": ["i-X"]}',  # NO shell_run
+            "error": "",
+            "cause": "",
+        }
+        with patch("index.boto3.client", return_value=fake_sf_client):
+            index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Saturday SF — SUCCEEDED" in text
+        assert "Preflight" not in text
+
+    def test_saturday_with_shell_run_false_uses_default_label(self):
+        """Explicit shell_run=false (not just absent) must still route to
+        the default label — only shell_run=true triggers the override."""
+        event = _event("SUCCEEDED", sm_arn=SATURDAY_ARN)
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.return_value = {
+            "input": '{"shell_run": false, "ec2_instance_id": ["i-X"]}',
+            "error": "",
+            "cause": "",
+        }
+        with patch("index.boto3.client", return_value=fake_sf_client):
+            index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Saturday SF — SUCCEEDED" in text
+        assert "Preflight" not in text
+
+    def test_non_saturday_sf_with_shell_run_true_keeps_default_label(self):
+        """Defensive: shell_run=true on Weekday or EOD SF (which can't
+        actually happen in practice) keeps the default label — only the
+        Saturday SF has a Preflight variant."""
+        event = _event("SUCCEEDED", sm_arn=WEEKDAY_ARN)
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.return_value = {
+            "input": '{"shell_run": true}',
+            "error": "",
+            "cause": "",
+        }
+        with patch("index.boto3.client", return_value=fake_sf_client):
+            index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Weekday SF — SUCCEEDED" in text
+        assert "Preflight" not in text
+
+    def test_describe_execution_error_falls_back_to_default_label(self):
+        """boto3 hiccup must not break the notify path — falls back to
+        the default 'Saturday SF' label (the alert still fires)."""
+        event = _event("SUCCEEDED", sm_arn=SATURDAY_ARN)
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.side_effect = RuntimeError(
+            "API throttled"
+        )
+        with patch("index.boto3.client", return_value=fake_sf_client):
+            result = index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Saturday SF — SUCCEEDED" in text
+        assert result["telegram_sent"] is True
+
+    def test_malformed_input_json_falls_back_to_default_label(self):
+        """If DescribeExecution returns malformed input JSON, fall back
+        to the default label — never crash the notify path."""
+        event = _event("FAILED", sm_arn=SATURDAY_ARN)
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.return_value = {
+            "input": "{not valid json",
+            "error": "E",
+            "cause": "C",
+        }
+        with patch("index.boto3.client", return_value=fake_sf_client):
+            index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Saturday SF — FAILED" in text
+        # The cause enrichment STILL works — parsing input is independent
+        # of error/cause extraction.
+        assert "Cause: E: C" in text
+
+    def test_failed_preflight_includes_both_label_and_cause(self):
+        """Combined path: a FAILED Saturday Preflight SF event must
+        surface BOTH the Preflight label AND the cause enrichment from
+        a single DescribeExecution call."""
+        event = self._saturday_preflight_event("FAILED")
+        fake_sf_client = MagicMock()
+        fake_sf_client.describe_execution.return_value = {
+            "input": '{"shell_run": true}',
+            "error": "States.TaskFailed",
+            "cause": "MorningEnrich state failed",
+        }
+        with patch("index.boto3.client", return_value=fake_sf_client) as bc:
+            index.handler(event, None)
+        # Verify single boto3 client call (not duplicated for preflight + cause)
+        bc.assert_called_once_with("stepfunctions", region_name=index.REGION)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Saturday Preflight SF — FAILED" in text
+        assert "Cause: States.TaskFailed: MorningEnrich state failed" in text
+
+    def test_preflight_label_override_map_pins_saturday_only(self):
+        """The override map is intentionally Saturday-only — the
+        weekday + EOD SFs don't have a preflight variant."""
+        assert index._PREFLIGHT_LABEL_OVERRIDE == {
+            "alpha-engine-saturday-pipeline": "Saturday Preflight SF",
+        }
+
+
 def test_format_duration_handles_missing_timestamps():
     assert index._format_duration(None, None) == ""
     assert index._format_duration(1000, None) == ""
