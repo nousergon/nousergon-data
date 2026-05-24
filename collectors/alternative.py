@@ -228,6 +228,60 @@ def _emit_quality_gate_metrics(
 # and the env var alone redirects both the data dir and the _tcache HTTP
 # cache (the path that failed) — no ``$HOME`` override is required. We only
 # set it if unset so an operator-provided value still wins.
+def _holdings_to_value_dict(holdings) -> dict:
+    """Map an edgartools `ThirteenF.holdings` (or `previous.holdings`) result
+    to ``{cusip: value}`` regardless of whether the underlying API returns
+    a `pd.DataFrame` (edgartools 5.x — current) or a list-of-objects
+    (legacy edgartools 4.x — pre-2026-04-25).
+
+    Closes 5/23-SF P0 sweep L1308 (edgartools API drift). The drift happens
+    silently because edgartools changes the `holdings` return-shape across
+    minor versions without a breaking-change banner. Wrapping in a helper
+    + supporting both forms keeps the institutional data layer resilient
+    to future drift in the same direction.
+
+    Returns an empty dict if ``holdings`` is None or empty. Per-row
+    failures (missing Cusip / non-numeric Value) are logged at DEBUG and
+    skipped — single-row corruption shouldn't blank the whole report.
+    """
+    if holdings is None:
+        return {}
+    # Try DataFrame path first (edgartools 5.x). Column names per the
+    # holdings() docstring: Cusip (PascalCase), Value.
+    try:
+        import pandas as pd
+        if isinstance(holdings, pd.DataFrame):
+            if holdings.empty:
+                return {}
+            # Tolerate column-case variations (Cusip / cusip / CUSIP).
+            cusip_col = next(
+                (c for c in ("Cusip", "cusip", "CUSIP") if c in holdings.columns),
+                None,
+            )
+            value_col = next(
+                (c for c in ("Value", "value", "VALUE") if c in holdings.columns),
+                None,
+            )
+            if cusip_col is None or value_col is None:
+                logger.warning(
+                    "13F holdings DataFrame missing Cusip/Value columns "
+                    "(got %s) — empty result",
+                    list(holdings.columns),
+                )
+                return {}
+            return dict(zip(holdings[cusip_col], holdings[value_col]))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("13F DataFrame path failed: %s", exc)
+    # Legacy list-of-objects fallback (edgartools 4.x).
+    try:
+        return {h.cusip: h.value for h in holdings}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "13F holdings legacy iteration failed: %s — empty result", exc,
+        )
+        return {}
+
+
 _EDGAR_TMP_DATA_DIR = "/tmp/edgar"
 if not os.environ.get("EDGAR_LOCAL_DATA_DIR"):
     try:
@@ -1313,12 +1367,22 @@ def _fetch_institutional(ticker: str) -> dict:
             if hasattr(thirteen_f, 'previous_holding_report'):
                 prev = thirteen_f.previous_holding_report()
                 if prev is not None:
-                    current_holdings = {
-                        h.cusip: h.value for h in thirteen_f.holdings
-                    } if hasattr(thirteen_f, 'holdings') else {}
-                    prev_holdings = {
-                        h.cusip: h.value for h in prev.holdings
-                    } if hasattr(prev, 'holdings') else {}
+                    # edgartools API drift fix (L1308 / 5/23-SF P0 sweep):
+                    # `thirteen_f.holdings` now returns a `pd.DataFrame`
+                    # (aggregated holdings by security, columns include
+                    # `Cusip` + `Value` per the edgartools 5.x docstring).
+                    # The pre-fix code iterated the frame, yielding column
+                    # name strings, hence the `'str' object has no
+                    # attribute 'cusip'` AttributeError that silenced
+                    # institutional data for 29 days (2026-04-25 →
+                    # 2026-05-24 audit). Use `.itertuples()` to materialize
+                    # row records; column names are PascalCase post-drift.
+                    current_holdings = _holdings_to_value_dict(
+                        getattr(thirteen_f, 'holdings', None)
+                    )
+                    prev_holdings = _holdings_to_value_dict(
+                        getattr(prev, 'holdings', None)
+                    )
 
                     for cusip, current_value in current_holdings.items():
                         prev_value = prev_holdings.get(cusip, 0)
