@@ -27,6 +27,7 @@ returns success and is not retried.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -45,6 +46,18 @@ _SF_LABELS: dict[str, str] = {
     "alpha-engine-eod-pipeline": "EOD SF",
 }
 
+# 2026-05-23 Preflight Pipeline rename: when the Saturday SF runs as
+# the Friday-PM preflight dry-pass (input ``shell_run=true``), surface a
+# distinct ``Saturday Preflight SF`` label in the Telegram message so
+# the operator can tell the two flavors apart in the channel at a
+# glance. The state machine name is the same (the dry-pass IS the
+# Saturday SF with dry inputs per CLAUDE.md "don't add redundant paths
+# around load-bearing scheduled infra"); we differentiate via the
+# execution input flag, not via a separate SF.
+_PREFLIGHT_LABEL_OVERRIDE: dict[str, str] = {
+    "alpha-engine-saturday-pipeline": "Saturday Preflight SF",
+}
+
 _STATUS_EMOJI: dict[str, str] = {
     "RUNNING": "\U0001f680",    # 🚀
     "SUCCEEDED": "✅",       # ✅
@@ -56,8 +69,10 @@ _STATUS_EMOJI: dict[str, str] = {
 _CAUSE_MAX_CHARS = 280
 
 
-def _label_for_arn(sm_arn: str) -> str:
+def _label_for_arn(sm_arn: str, *, is_preflight: bool = False) -> str:
     name = sm_arn.rsplit(":", 1)[-1] if sm_arn else ""
+    if is_preflight and name in _PREFLIGHT_LABEL_OVERRIDE:
+        return _PREFLIGHT_LABEL_OVERRIDE[name]
     return _SF_LABELS.get(name, name or "Unknown SF")
 
 
@@ -72,18 +87,46 @@ def _format_duration(started_ms: int | None, stopped_ms: int | None) -> str:
     return f"{m}m"
 
 
-def _fetch_failure_cause(execution_arn: str) -> str:
-    """Best-effort fetch of error+cause via DescribeExecution. Never raises."""
+def _describe_execution(execution_arn: str) -> dict | None:
+    """Best-effort DescribeExecution. Returns the response dict on success,
+    ``None`` on any error. Single source for both the failure-cause
+    extraction and the preflight-input classification — combining the
+    two callers into one API call cuts the per-event boto3 cost in half
+    and keeps the test mock surface simple (one ``describe_execution``
+    call per handler invocation).
+    """
     if not execution_arn:
-        return ""
+        return None
     try:
         sf = boto3.client("stepfunctions", region_name=REGION)
-        resp = sf.describe_execution(executionArn=execution_arn)
+        return sf.describe_execution(executionArn=execution_arn)
     except Exception as exc:  # noqa: BLE001 — fire-and-forget enrichment
         logger.warning("describe_execution failed for %s: %s", execution_arn, exc)
+        return None
+
+
+def _is_preflight_execution(describe_resp: dict | None) -> bool:
+    """True iff the execution's input has ``shell_run=true``.
+
+    The Saturday SF runs as either the real Saturday firing (no
+    ``shell_run`` input, $.pipeline_label="") or the Friday-PM Preflight
+    Pipeline dry-pass (``shell_run=true``, $.pipeline_label=" Preflight").
+    """
+    if not describe_resp:
+        return False
+    try:
+        payload = json.loads(describe_resp.get("input") or "{}")
+    except (ValueError, TypeError) as exc:
+        logger.warning("could not parse execution input as JSON: %s", exc)
+        return False
+    return bool(payload.get("shell_run"))
+
+
+def _failure_cause_from(describe_resp: dict | None) -> str:
+    if not describe_resp:
         return ""
-    error = (resp.get("error") or "").strip()
-    cause = (resp.get("cause") or "").strip()
+    error = (describe_resp.get("error") or "").strip()
+    cause = (describe_resp.get("cause") or "").strip()
     if error and cause:
         snippet = f"{error}: {cause}"
     else:
@@ -96,7 +139,16 @@ def _fetch_failure_cause(execution_arn: str) -> str:
 def _build_message(detail: dict) -> tuple[str, bool]:
     """Return (text, disable_notification) for the given event detail."""
     status = detail.get("status", "UNKNOWN")
-    label = _label_for_arn(detail.get("stateMachineArn", ""))
+    # Single DescribeExecution call serving both the preflight-input
+    # classification (label override) and the FAILED-path cause
+    # enrichment. RUNNING events also benefit from the label override
+    # — knowing 'Saturday Preflight SF RUNNING' vs 'Saturday SF RUNNING'
+    # at-a-glance is the operator's main use case for the rename.
+    describe_resp = _describe_execution(detail.get("executionArn", ""))
+    is_preflight = _is_preflight_execution(describe_resp)
+    label = _label_for_arn(
+        detail.get("stateMachineArn", ""), is_preflight=is_preflight
+    )
     emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")  # 📨 fallback
     exec_name = detail.get("name", "") or "(unknown execution)"
 
@@ -111,7 +163,7 @@ def _build_message(detail: dict) -> tuple[str, bool]:
         lines.append(f"Duration: {duration}")
 
     if status == "FAILED":
-        cause = _fetch_failure_cause(detail.get("executionArn", ""))
+        cause = _failure_cause_from(describe_resp)
         if cause:
             lines.append(f"Cause: {cause}")
 

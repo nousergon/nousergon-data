@@ -394,7 +394,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         try:
             from builders.backfill import backfill
-            arctic_result = backfill(bucket=bucket, dry_run=dry_run)
+            arctic_result = backfill(bucket=bucket, dry_run=dry_run, run_date=run_date)
             results["collectors"]["arcticdb"] = arctic_result
         except Exception as e:
             logger.error("ArcticDB backfill failed: %s", e)

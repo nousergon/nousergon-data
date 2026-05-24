@@ -381,3 +381,74 @@ def test_backfill_dry_run_does_not_filter_by_constituents():
     # In dry_run, _load_current_constituents must NOT be called — we use
     # the price_data keys directly so dry-run works without S3.
     constituents_calls.assert_not_called()
+
+
+def test_load_current_constituents_run_date_bypasses_pointer():
+    """When run_date is provided, read constituents.json by the explicit
+    weekly path rather than following ``latest_weekly.json``.
+
+    The 2026-05-23 Saturday SF failure had Wikipedia adding 3 new entrants
+    (BNY/P/SN) to that morning's constituents.json; Phase 1's backfill
+    followed the still-stale pointer (last week's date), excluded those 3
+    from the ArcticDB write, and Research's preflight then tripped the 5%
+    per-ticker error threshold reading them from a library that didn't have
+    them. Run-date threading bypasses the pointer for the in-Phase-1 read.
+    """
+    import json as _json
+    from builders import backfill as _bf
+
+    new_payload = _json.dumps(
+        {"tickers": ["AAPL", "MSFT", "BNY", "P", "SN"]}
+    ).encode()
+    stale_payload = _json.dumps({"tickers": ["AAPL", "MSFT"]}).encode()
+
+    def _mock_get(Bucket, Key):
+        # The pointer must NOT be consulted on the run_date path; if the
+        # test setup ever returns the stale pointer for the explicit
+        # weekly key, the assertion below fails — making the regression
+        # impossible to ship silently.
+        if Key == "market_data/weekly/2026-05-23/constituents.json":
+            body = MagicMock()
+            body.read.return_value = new_payload
+            return {"Body": body}
+        if Key == "market_data/latest_weekly.json":
+            raise AssertionError(
+                "run_date path must not consult latest_weekly.json — "
+                "that pointer hasn't been advanced yet when backfill runs."
+            )
+        if Key.endswith("constituents.json"):
+            body = MagicMock()
+            body.read.return_value = stale_payload
+            return {"Body": body}
+        raise AssertionError(f"unexpected S3 key: {Key}")
+
+    s3 = MagicMock()
+    s3.get_object.side_effect = _mock_get
+    result = _bf._load_current_constituents(s3, "alpha-engine-research", run_date="2026-05-23")
+    assert "BNY" in result and "P" in result and "SN" in result
+    assert len(result) == 5
+
+
+def test_load_current_constituents_falls_back_to_pointer_when_no_run_date():
+    """Ad-hoc callers (CLI, per-ticker recovery) leave run_date=None and
+    must still resolve via the pointer — the legacy behavior."""
+    import json as _json
+    from builders import backfill as _bf
+
+    pointer = _json.dumps(
+        {"date": "2026-05-23", "s3_prefix": "market_data/weekly/2026-05-23/"}
+    ).encode()
+    cons = _json.dumps({"tickers": ["AAPL", "MSFT"]}).encode()
+
+    def _mock_get(Bucket, Key):
+        body = MagicMock()
+        if Key == "market_data/latest_weekly.json":
+            body.read.return_value = pointer
+        else:
+            body.read.return_value = cons
+        return {"Body": body}
+
+    s3 = MagicMock()
+    s3.get_object.side_effect = _mock_get
+    result = _bf._load_current_constituents(s3, "alpha-engine-research")
+    assert result == {"AAPL", "MSFT"}

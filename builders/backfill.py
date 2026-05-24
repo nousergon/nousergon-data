@@ -77,28 +77,40 @@ OHLCV_COLS = _CANONICAL_OHLCV_COLS
 PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 
 
-def _load_current_constituents(s3, bucket: str) -> set[str]:
-    """Load the current S&P 500 / 400 constituents set via the
-    ``market_data/latest_weekly.json`` pointer.
+def _load_current_constituents(s3, bucket: str, run_date: str | None = None) -> set[str]:
+    """Load the current S&P 500 / 400 constituents set.
 
-    Used by ``backfill`` to filter out tickers absent from the current
-    investable universe before writing arctic rows. Mirrors the
-    ``prune_delisted_tickers`` lookup so the two sites agree on what's
-    "in the universe today".
+    When ``run_date`` is provided (DataPhase1 happy path), reads directly from
+    ``market_data/weekly/{run_date}/constituents.json`` — the file the
+    constituents collector wrote earlier in this same Phase 1 invocation.
+    Otherwise falls back to ``market_data/latest_weekly.json`` for ad-hoc
+    callers (per-ticker recovery backfills, dry-runs, tests).
+
+    The pointer-based fallback exists because ``_write_manifest`` only advances
+    ``latest_weekly.json`` at the *end* of Phase 1, while ``backfill`` runs in
+    the middle. Using the pointer here previously caused new constituents
+    (added to Wikipedia between Saturdays) to be excluded from the ArcticDB
+    write — the very tickers Research then asks for at preflight time,
+    tripping the 5% per-ticker error threshold (see 2026-05-23 SF failure).
     """
-    pointer_obj = s3.get_object(Bucket=bucket, Key="market_data/latest_weekly.json")
-    pointer = json.loads(pointer_obj["Body"].read())
-    weekly_date = pointer["date"]
-    prefix = pointer["s3_prefix"].rstrip("/")
-    cons_obj = s3.get_object(Bucket=bucket, Key=f"{prefix}/constituents.json")
+    if run_date:
+        key = f"market_data/weekly/{run_date}/constituents.json"
+        source = f"run_date={run_date} (direct)"
+    else:
+        pointer_obj = s3.get_object(Bucket=bucket, Key="market_data/latest_weekly.json")
+        pointer = json.loads(pointer_obj["Body"].read())
+        weekly_date = pointer["date"]
+        prefix = pointer["s3_prefix"].rstrip("/")
+        key = f"{prefix}/constituents.json"
+        source = f"pointer→{weekly_date}"
+    cons_obj = s3.get_object(Bucket=bucket, Key=key)
     payload = json.loads(cons_obj["Body"].read())
     tickers = payload.get("tickers")
     if not tickers:
         raise RuntimeError(
-            f"constituents.json at s3://{bucket}/{prefix}/constituents.json "
-            f"(weekly_date={weekly_date}) has no `tickers` field — refusing "
-            f"to filter against an empty constituents set (would write zero "
-            f"tickers to arctic universe)."
+            f"constituents.json at s3://{bucket}/{key} ({source}) has no "
+            f"`tickers` field — refusing to filter against an empty "
+            f"constituents set (would write zero tickers to arctic universe)."
         )
     return set(tickers)
 
@@ -345,6 +357,7 @@ def backfill(
     ticker_filter: str | None = None,
     validate: bool = False,
     rebuild_macro: bool = False,
+    run_date: str | None = None,
 ) -> dict:
     """
     Run the full historical backfill: load 10y prices, compute features, write to ArcticDB.
@@ -357,6 +370,13 @@ def backfill(
         rebuild_macro: when ticker_filter is set, also rewrite the macro
             library from parquet (opt-in override — defaults to False so
             per-ticker patches don't regress macro freshness)
+        run_date: the Phase 1 run date (YYYY-MM-DD). When set, the
+            constituents filter reads ``market_data/weekly/{run_date}/
+            constituents.json`` directly instead of following the
+            ``latest_weekly.json`` pointer — required because the pointer
+            isn't advanced until ``_write_manifest`` at end-of-Phase-1,
+            so a backfill that follows the pointer mid-Phase-1 sees last
+            week's constituents and excludes this week's new entrants.
 
     Returns:
         Summary dict with counts and timing.
@@ -426,7 +446,7 @@ def backfill(
     # backfill stay coherent.
     if not dry_run:
         try:
-            constituents_set = _load_current_constituents(s3, bucket)
+            constituents_set = _load_current_constituents(s3, bucket, run_date=run_date)
             log.info(
                 "Loaded current constituents: %d tickers — backfill will only "
                 "write tickers in this set",
