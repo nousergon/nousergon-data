@@ -23,8 +23,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from rag.pipelines._cost_telemetry import (
+    CostBudgetExceededError,
     CostBufferFlushError,
     S3CostBuffer,
+    _resolve_run_budget_ceiling,
     build_news_cost_buffer,
     wrap_client_for_cost_telemetry,
 )
@@ -241,3 +243,112 @@ class TestBuildNewsCostBuffer:
         buf = build_news_cost_buffer(run_date=date(2026, 5, 25))
         assert buf._run_id == "2026-05-25"
         assert buf._agent_id == "data:news_event_extraction"
+
+
+# ── Runaway-cost circuit breaker (Phase 4 #1) ────────────────────────────
+
+
+class TestRunBudgetCeilingResolution:
+    def test_default_when_env_var_unset(self, monkeypatch):
+        monkeypatch.delenv("ALPHA_ENGINE_RUN_BUDGET_USD", raising=False)
+        assert _resolve_run_budget_ceiling() == 100.0
+
+    def test_positive_value_from_env(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "5.50")
+        assert _resolve_run_budget_ceiling() == 5.50
+
+    def test_zero_disables_enforcement(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "0")
+        assert _resolve_run_budget_ceiling() == 0.0
+
+    def test_malformed_env_var_returns_zero_not_raises(self, monkeypatch, caplog):
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "not-a-number")
+        result = _resolve_run_budget_ceiling()
+        assert result == 0.0
+        assert any(
+            "is not a number" in r.message for r in caplog.records
+        )
+
+
+class TestCostBudgetBreaker:
+    def test_under_ceiling_no_raise(self):
+        buf = S3CostBuffer(
+            run_id="2026-05-25", agent_id="data:news_event_extraction",
+            ceiling_usd=1.0,
+        )
+        # 1000 input + 200 output @ haiku-4-5 = $0.002 — well under $1.
+        cost = buf.record(_FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(input_tokens=1000, output_tokens=200),
+        ))
+        assert cost == pytest.approx(0.002, abs=1e-6)
+        assert buf.cumulative_cost_usd == pytest.approx(0.002, abs=1e-6)
+
+    def test_breach_raises_after_recording_row(self):
+        """Row is recorded BEFORE the raise so per-call detail is
+        preserved when the breaker fires. The buffer's flush() can then
+        write what was captured up to + including the breach call."""
+        buf = S3CostBuffer(
+            run_id="2026-05-25", agent_id="data:news_event_extraction",
+            ceiling_usd=0.001,  # 0.1 cent — first call WILL exceed
+        )
+        with pytest.raises(CostBudgetExceededError) as exc_info:
+            buf.record(_FakeMessage(
+                model="claude-haiku-4-5",
+                usage=_FakeUsage(input_tokens=1000, output_tokens=200),
+            ))
+        # Row was recorded (preserved for flush).
+        assert buf.row_count == 1
+        # Error carries enough context to map back to the offending run.
+        assert exc_info.value.run_id == "2026-05-25"
+        assert exc_info.value.agent_id == "data:news_event_extraction"
+        assert exc_info.value.cumulative_cost_usd == pytest.approx(0.002, abs=1e-6)
+        assert exc_info.value.ceiling_usd == 0.001
+        # Message tells operator how to adjust.
+        assert "ALPHA_ENGINE_RUN_BUDGET_USD" in str(exc_info.value)
+
+    def test_zero_ceiling_disables_enforcement(self):
+        buf = S3CostBuffer(
+            run_id="2026-05-25", agent_id="data:news_event_extraction",
+            ceiling_usd=0,
+        )
+        # 1B tokens would be impossible, but enforcement off → no raise.
+        # Use a plausible large call to keep the test honest.
+        for _ in range(100):
+            buf.record(_FakeMessage(
+                model="claude-haiku-4-5",
+                usage=_FakeUsage(input_tokens=10_000, output_tokens=2_000),
+            ))
+        # Cumulative = 100 * (10000 * 1 + 2000 * 5) / 1M = 100 * 0.02 = 2.0
+        assert buf.cumulative_cost_usd == pytest.approx(2.0, abs=1e-6)
+        assert buf.row_count == 100
+
+    def test_proxy_propagates_breaker_does_not_swallow(self):
+        """The proxy swallows generic record errors so event extraction
+        survives a malformed-response hiccup, but the runaway-cost
+        breaker MUST propagate so the safety net works."""
+        buf = S3CostBuffer(
+            run_id="2026-05-25", agent_id="data:news_event_extraction",
+            ceiling_usd=0.001,
+        )
+        underlying_client = MagicMock()
+        underlying_client.messages.create.return_value = _FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(input_tokens=1000, output_tokens=200),
+        )
+        wrapped = wrap_client_for_cost_telemetry(underlying_client, buf)
+        with pytest.raises(CostBudgetExceededError):
+            wrapped.messages.create(model="x", messages=[])
+
+    def test_ceiling_defaults_from_env(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "0.0005")
+        buf = S3CostBuffer(
+            run_id="2026-05-25", agent_id="data:news_event_extraction",
+            # ceiling_usd not passed → resolves from env at construction
+        )
+        assert buf._ceiling_usd == 0.0005
+        with pytest.raises(CostBudgetExceededError):
+            buf.record(_FakeMessage(
+                model="claude-haiku-4-5",
+                usage=_FakeUsage(input_tokens=1000, output_tokens=200),
+            ))

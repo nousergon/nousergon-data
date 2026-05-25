@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date as date_type
 from typing import Any
 
@@ -42,6 +43,72 @@ logger = logging.getLogger(__name__)
 
 _COST_BUCKET = "alpha-engine-research"
 _COST_PREFIX = "decision_artifacts/_cost_raw"
+
+# Phase 4 #1 — runaway-cost circuit breaker. Shared env var with
+# alpha-engine-research's ``llm_cost_tracker.RunBudgetExceededError``
+# so a single operator knob ceilings cost across all SF entry points.
+_RUN_BUDGET_ENV_VAR = "ALPHA_ENGINE_RUN_BUDGET_USD"
+_RUN_BUDGET_DEFAULT_USD = 100.0
+
+
+def _resolve_run_budget_ceiling() -> float:
+    """Read ``ALPHA_ENGINE_RUN_BUDGET_USD`` per-call (allows test toggling).
+
+    Mirrors ``alpha-engine-research/graph/llm_cost_tracker._resolve_run_budget_ceiling``
+    so the news-pipeline + research + executor all share the same operator
+    knob. Returns 0.0 on parse failure rather than raising — a malformed
+    env var shouldn't take down RAGIngestion; the parse-failure log is
+    loud enough that operators notice.
+
+    Returns a positive float to enforce the ceiling; zero or negative
+    disables enforcement entirely. Default $100 reflects the
+    workstream's "runaway prompt loop should fire well before the monthly
+    Anthropic bill" intent.
+    """
+    raw = os.environ.get(_RUN_BUDGET_ENV_VAR, "")
+    if not raw:
+        return _RUN_BUDGET_DEFAULT_USD
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[cost_telemetry] ALPHA_ENGINE_RUN_BUDGET_USD=%r is not a "
+            "number; disabling run-budget enforcement (set to a positive "
+            "float to enable, 0 to explicitly disable)",
+            raw,
+        )
+        return 0.0
+
+
+class CostBudgetExceededError(RuntimeError):
+    """Raised mid-run when cumulative spend exceeds the configured
+    ceiling.
+
+    Per ``[[feedback_no_silent_fails]]`` — a runaway prompt loop should
+    kill the news pipeline before it bills the org into the next decade.
+    Surfaces ``run_id`` + cumulative cost + ceiling so operators map the
+    failure back to the offending SF run. Counterpart to research's
+    ``RunBudgetExceededError`` (same env var, same default, same shape).
+    """
+
+    def __init__(
+        self, *, run_id: str, agent_id: str,
+        cumulative_cost_usd: float, ceiling_usd: float,
+    ) -> None:
+        self.run_id = run_id
+        self.agent_id = agent_id
+        self.cumulative_cost_usd = cumulative_cost_usd
+        self.ceiling_usd = ceiling_usd
+        super().__init__(
+            f"[cost_telemetry] run budget exceeded: "
+            f"run_id={run_id!r} agent_id={agent_id!r} "
+            f"cumulative_cost=${cumulative_cost_usd:.4f} > "
+            f"ceiling=${ceiling_usd:.4f}. Set "
+            f"ALPHA_ENGINE_RUN_BUDGET_USD=<higher_value> to raise the "
+            f"cap, or =0 to disable. Investigate the offending agent "
+            f"before raising the cap — a runaway prompt loop will keep "
+            f"growing."
+        )
 
 
 class CostBufferFlushError(RuntimeError):
@@ -70,12 +137,27 @@ class S3CostBuffer:
         agent_id: str,
         bucket: str = _COST_BUCKET,
         s3_client: Any | None = None,
+        ceiling_usd: float | None = None,
     ) -> None:
         self._run_id = run_id
         self._agent_id = agent_id
         self._bucket = bucket
         self._s3 = s3_client
+        # None = resolve from env at construction; explicit value =
+        # tests / operator-managed override. Resolving once at
+        # construction means a mid-run env-var change doesn't take
+        # effect until next pipeline invocation (matches research's
+        # ContextVar-per-run shape).
+        self._ceiling_usd = (
+            ceiling_usd if ceiling_usd is not None
+            else _resolve_run_budget_ceiling()
+        )
         self._rows: list[dict] = []
+        self._cumulative_cost_usd: float = 0.0
+
+    @property
+    def cumulative_cost_usd(self) -> float:
+        return self._cumulative_cost_usd
 
     def record(self, msg: Any) -> float:
         """Price ``msg``, append to buffer, return the row's USD cost.
@@ -84,6 +166,15 @@ class S3CostBuffer:
         with the buffer's ``run_id`` + ``agent_id`` stamped onto the
         record's extra_fields so the daily aggregator's by-agent_id
         breakdown surfaces this site's spend.
+
+        **Runaway-cost circuit breaker (Phase 4 #1):** raises
+        :exc:`CostBudgetExceededError` AFTER the row is recorded if
+        cumulative cost for this run exceeds
+        ``ALPHA_ENGINE_RUN_BUDGET_USD`` (default $100). The row is
+        recorded first so per-call detail is preserved in the flush — operators
+        can inspect what broke the budget without re-running. Set
+        ``ALPHA_ENGINE_RUN_BUDGET_USD=0`` (or pass ``ceiling_usd=0``) to
+        disable enforcement.
         """
         record = record_anthropic_call(
             msg,
@@ -93,7 +184,26 @@ class S3CostBuffer:
             },
         )
         self._rows.append(record)
-        return float(record["cost_usd"])
+        cost = float(record["cost_usd"])
+        self._cumulative_cost_usd += cost
+
+        if self._ceiling_usd > 0 and self._cumulative_cost_usd > self._ceiling_usd:
+            logger.error(
+                "[cost_telemetry] run budget exceeded for "
+                "run_id=%s agent_id=%s: cumulative=$%.4f > "
+                "ceiling=$%.4f (rows recorded=%d). Raising "
+                "CostBudgetExceededError to fail the run loud.",
+                self._run_id, self._agent_id,
+                self._cumulative_cost_usd, self._ceiling_usd,
+                len(self._rows),
+            )
+            raise CostBudgetExceededError(
+                run_id=self._run_id,
+                agent_id=self._agent_id,
+                cumulative_cost_usd=self._cumulative_cost_usd,
+                ceiling_usd=self._ceiling_usd,
+            )
+        return cost
 
     @property
     def row_count(self) -> int:
@@ -162,13 +272,20 @@ class _CostTrackingMessages:
         response = self._wrapped.create(*args, **kwargs)
         try:
             self._buffer.record(response)
+        except CostBudgetExceededError:
+            # Runaway-cost circuit breaker fired — propagate. This IS
+            # the whole point of the breaker; swallowing it would defeat
+            # the safety net per [[feedback_no_silent_fails]]. The
+            # pipeline's outer try/finally flushes the buffer so all
+            # rows up to the breach are preserved on S3.
+            raise
         except Exception as exc:
-            # Cost-telemetry failure must NOT bring down the producer
-            # (event extraction is the primary deliverable). Log loud +
-            # keep going. The flush step at pipeline exit still raises
-            # on S3 error per the no-silent-fails rule for the artifact
-            # write itself — per-call recording failures show up at flush
-            # time as a partial row count.
+            # Other cost-telemetry failures must NOT bring down the
+            # producer (event extraction is the primary deliverable).
+            # Log loud + keep going. The flush step at pipeline exit
+            # still raises on S3 error per the no-silent-fails rule for
+            # the artifact write itself — per-call recording failures
+            # show up at flush time as a partial row count.
             logger.warning(
                 "[cost_telemetry] per-call recording failed: %s "
                 "(token counts NOT captured for this call; pipeline "
