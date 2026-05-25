@@ -203,7 +203,8 @@ INPUT_JSON=$(cat <<EOF
 {
   "ec2_instance_id": ["$EC2_INSTANCE_ID"],
   "sns_topic_arn": "$SNS_TOPIC_ARN",
-  "enable_standalone_scanner": true
+  "enable_standalone_scanner": true,
+  "pipeline_role": "weekly"
 }
 EOF
 )
