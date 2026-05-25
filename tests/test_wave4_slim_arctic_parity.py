@@ -36,10 +36,13 @@ _SLIM_CODE_RE = re.compile(
 )
 
 
+_EXCLUDED_PREFIXES = ("tests/", ".venv/", "build/", "dist/", ".git/")
+
+
 def _production_py_files():
     for p in _REPO.rglob("*.py"):
         rel = p.relative_to(_REPO).as_posix()
-        if rel.startswith("tests/") or "/.claude/" in f"/{rel}":
+        if rel.startswith(_EXCLUDED_PREFIXES) or "/.claude/" in f"/{rel}":
             continue
         yield rel, p
 

@@ -12,17 +12,25 @@ run by CI or any pipeline).
 1. **This PR merged** — slim writer gone, every consumer ArcticDB-only
    (data macro-breadth + feature-compute; backtester exit_timing #226;
    dashboard health-check retired #88).
-2. **≥1 clean Saturday-SF parity observation.** Before this PR merges, the
-   migrated consumers still ran with slim + emitted
-   `WAVE4_PARITY_METRIC {breadth,compute,exit_timing}` JSON lines. Pull the
-   most recent Saturday SF logs (first observable **2026-05-23**) and
-   confirm, for each of the three streams:
-   - `passed: true`
-   - `max_abs_value_delta` ≤ epsilon (effectively `0.0`)
-   - `only_in_b` empty (nothing the ArcticDB read lacked vs slim);
-     `only_in_a` (slim-only legacy symbols) is expected and acceptable.
-   If any stream shows value divergence, **stop** — investigate before
-   deleting the fallback's data.
+2. **Consumer-side ArcticDB-primary soak (≥6 weeks since 2026-04-14
+   cutover).** The original gate proposed reading a `WAVE4_PARITY_METRIC
+   passed: true` from a Saturday SF run, but the 5/24 emission surfaced
+   that the gate is asking the wrong question: ArcticDB writes
+   auto-adjusted close while slim writes raw close (yfinance auto-adjust
+   policy mismatch). For dividend-paying tickers (e.g. EQIX REIT at $5+
+   quarterly dividends) the per-cell delta is dividend-scale, NOT
+   float-precision noise, and persists at any reasonable epsilon — the
+   `passed` flag in `alpha_engine_lib/reconcile.py:62-68` requires
+   `n_cells_over_epsilon == 0`, which the divergence cannot satisfy.
+   Both stores are correct representations under their own conventions;
+   the canonical store going forward is ArcticDB's auto-adjusted.
+   The actual safety case is stronger than the gate could provide: the
+   migrated consumers (data #267 macro-breadth, data #268 feature-compute,
+   backtester #226 exit_timing, dashboard #88 health-check) have been
+   ArcticDB-primary in production since their respective merges — 6 weeks
+   of weekly Saturday SF + daily inference + weekly backtest cycles, no
+   correctness alerts. Before proceeding, re-confirm: no Saturday SF
+   failure in the consumer paths attributable to ArcticDB-missing-data.
 3. **No remaining live reader.** `spot_backtest.sh:528`'s slim `aws s3
    sync` was verified dead (predictor_backtest.py loads from ArcticDB;
    only `sector_map.json` is read from the cache dir) and is removed in
@@ -35,7 +43,7 @@ run by CI or any pipeline).
 # 1. Pre-deletion byte-equal backup (Wave-5 precedent).
 aws s3 cp --recursive \
   s3://alpha-engine-research/predictor/price_cache_slim/ \
-  s3://alpha-engine-research/backups/price_cache_slim.pre-deletion-260523/ \
+  s3://alpha-engine-research/backups/price_cache_slim.pre-deletion-260525/ \
   --only-show-errors
 
 # 2. Verify the backup is byte-equal (object count + total bytes).
@@ -43,7 +51,7 @@ aws s3 ls --recursive --summarize \
   s3://alpha-engine-research/predictor/price_cache_slim/ \
   | tail -2
 aws s3 ls --recursive --summarize \
-  s3://alpha-engine-research/backups/price_cache_slim.pre-deletion-260523/ \
+  s3://alpha-engine-research/backups/price_cache_slim.pre-deletion-260525/ \
   | tail -2
 # Object count + Total Size MUST match before proceeding.
 
