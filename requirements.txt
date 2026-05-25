@@ -17,9 +17,11 @@ arcticdb>=6.11
 # direct pins dropped 2026-05-20 after >2-week soak on v0.20.0).
 # v0.30.0 + v0.31.0 add the cost-telemetry SDK adapter
 # (``metadata_from_anthropic_message``) + server-tool fee tracking
-# (``ToolFee`` / ``ToolFeeTable``) — required by Phase 0 of the cost-
-# optimization workstream to wire ``collectors/nlp/event_extraction.py``'s
-# news-article event-extraction LLM calls into the cost-telemetry stream
-# (highest-volume untracked site at ~100–300 Haiku calls/wk during
-# RAGIngestion). All additive surface — existing imports unchanged.
-alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.32.0
+# (``ToolFee`` / ``ToolFeeTable``). v0.33.0 adds the
+# ``record_anthropic_call`` capture chokepoint used by
+# ``rag/pipelines/_cost_telemetry.py`` to wire
+# ``collectors/nlp/event_extraction.py``'s news-article event-extraction
+# LLM calls into the cost-telemetry stream (highest-volume previously-
+# untracked site at ~100–300 Haiku calls/wk during RAGIngestion).
+# All additive surface — existing imports unchanged.
+alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.33.0
