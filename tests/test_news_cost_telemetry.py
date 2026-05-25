@@ -15,14 +15,12 @@ Lock down:
 
 from __future__ import annotations
 
-import io
 import json
 from datetime import date
+from io import BytesIO
 from unittest.mock import MagicMock
 
-import boto3
 import pytest
-from moto import mock_aws
 
 from rag.pipelines._cost_telemetry import (
     CostBufferFlushError,
@@ -63,12 +61,43 @@ class _FakeMessage:
         self.usage = usage
 
 
+# ── In-memory S3 mock (no moto dep, mirrors test_news_aggregates.py) ─────
+
+
+class _InMemoryS3:
+    """Minimal in-memory S3 mock supporting put_object + list/get.
+
+    Mirrors the convention from ``test_news_aggregates.py`` — keeps the
+    repo's "no moto dep" posture (CI installs only ``requirements.txt``
+    + ``pytest``).
+    """
+
+    class _NoSuchKey(Exception):
+        pass
+
+    def __init__(self) -> None:
+        self._store: dict[tuple[str, str], bytes] = {}
+
+    def put_object(self, *, Bucket, Key, Body, ContentType=None):
+        self._store[(Bucket, Key)] = Body
+        return {"ETag": "stub"}
+
+    def get_object(self, *, Bucket, Key):
+        if (Bucket, Key) not in self._store:
+            raise self._NoSuchKey(f"NoSuchKey: {Bucket}/{Key}")
+        return {"Body": BytesIO(self._store[(Bucket, Key)])}
+
+    def list_objects_v2(self, *, Bucket, Prefix=""):
+        contents = [
+            {"Key": k} for (b, k) in self._store.keys()
+            if b == Bucket and k.startswith(Prefix)
+        ]
+        return {"Contents": contents, "KeyCount": len(contents)}
+
+
 @pytest.fixture
 def mocked_s3():
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket=_BUCKET)
-        yield s3
+    yield _InMemoryS3()
 
 
 class TestS3CostBuffer:
