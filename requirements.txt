@@ -22,4 +22,4 @@ arcticdb>=6.11
 # news-article event-extraction LLM calls into the cost-telemetry stream
 # (highest-volume untracked site at ~100–300 Haiku calls/wk during
 # RAGIngestion). All additive surface — existing imports unchanged.
-alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.31.0
+alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.32.0
