@@ -1851,10 +1851,13 @@
             "source .venv/bin/activate",
             "pip install --quiet --upgrade -r requirements.txt",
             "trap 'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python -m alpha_engine_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log"
+            "python -m alpha_engine_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log",
+            "echo '--- constituents drift check ---' | tee -a /var/log/substrate-health-check.log",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log || true"
           ],
           "executionTimeout": [
-            "180"
+            "240"
           ]
         },
         "TimeoutSeconds": 180
