@@ -40,7 +40,8 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("price_vs_ma50", "technical", "Close / SMA(50) ratio", source="yfinance", refresh="daily"),
     FeatureEntry("price_vs_ma200", "technical", "Close / SMA(200) ratio", source="yfinance", refresh="daily"),
     FeatureEntry("momentum_20d", "technical", "20-day price return", source="yfinance", refresh="daily"),
-    FeatureEntry("avg_volume_20d", "technical", "20-day avg volume / global mean volume", source="yfinance", refresh="daily"),
+    FeatureEntry("avg_volume_20d", "technical", "Predictor input: 20-day avg volume / per-ticker global mean (relative liquidity ratio, ~1.0 typical). See features/SCHEMA.md for the bare-name == normalized convention.", source="yfinance", refresh="daily"),
+    FeatureEntry("avg_volume_20d_raw", "technical", "Research scanner input: 20-day avg volume in raw shares. Absolute-liquidity gate consumer (MIN_AVG_VOLUME=500_000). The _raw suffix encodes units per features/SCHEMA.md.", source="yfinance", refresh="daily"),
     FeatureEntry("dist_from_52w_high", "technical", "(Close - 52w high) / 52w high", source="yfinance", refresh="daily"),
     FeatureEntry("momentum_5d", "technical", "5-day price return", source="yfinance", refresh="daily"),
     FeatureEntry("rel_volume_ratio", "technical", "Today volume / 20-day avg volume", source="yfinance", refresh="daily"),
@@ -55,6 +56,7 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("ema_cross_8_21", "technical", "EMA(8) / EMA(21) ratio", source="yfinance", refresh="daily"),
     FeatureEntry("atr_14_pct", "technical", "ATR(14) / Close, normalized volatility", source="yfinance", refresh="daily"),
     FeatureEntry("realized_vol_20d", "technical", "20-day annualized return std dev", source="yfinance", refresh="daily"),
+    FeatureEntry("realized_vol_63d", "technical", "63-day (3-month) annualized return std dev — slower vol regime than 20d, pairs as vol-term-structure", source="yfinance", refresh="daily"),
     FeatureEntry("volume_trend", "technical", "5-day avg volume / 20-day avg volume", source="yfinance", refresh="daily"),
     FeatureEntry("obv_slope_10d", "technical", "OBV linear regression slope over 10 days", source="yfinance", refresh="daily"),
     FeatureEntry("rsi_slope_5d", "technical", "5-day RSI slope", source="yfinance", refresh="daily"),
@@ -92,6 +94,12 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("intraday_return_5d", "technical", "5d sum of intraday returns (Close_t vs Open_t)", source="yfinance", refresh="daily"),
     FeatureEntry("dist_from_5d_high", "technical", "(Close - 5d rolling max High) / 5d rolling max High", source="yfinance", refresh="daily"),
     FeatureEntry("dist_from_20d_high", "technical", "(Close - 20d rolling max High) / 20d rolling max High", source="yfinance", refresh="daily"),
+
+    # ── v3.2 per-ticker risk features (Stage 2 of regime-conditioning rebuild) ──
+    FeatureEntry("beta_60d", "technical", "60d rolling regression slope of stock log-returns vs SPY log-returns (systematic market exposure)", source="yfinance", refresh="daily"),
+    FeatureEntry("idio_vol_60d", "technical", "60d residual vol after removing beta exposure; std × sqrt(252) (idiosyncratic risk)", source="yfinance", refresh="daily"),
+    FeatureEntry("vol_of_vol_30d", "technical", "30d rolling stdev of realized_vol_20d (stability of vol regime)", source="yfinance", refresh="daily"),
+    FeatureEntry("max_drawdown_60d", "technical", "Worst peak-to-trough drawdown within trailing 60d window (non-positive decimal pct)", source="yfinance", refresh="daily"),
 
     # ── Fundamental (13) — quarterly financials ───────────────────────────────
     FeatureEntry("pe_ratio", "fundamental", "Trailing P/E ratio, normalized (PE / 30)", source="fmp", refresh="quarterly"),

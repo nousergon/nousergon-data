@@ -71,6 +71,7 @@ FEATURES = [
     "price_vs_ma200",
     "momentum_20d",
     "avg_volume_20d",
+    "avg_volume_20d_raw",
     # v1.1 additions
     "dist_from_52w_high",
     "momentum_5d",
@@ -303,12 +304,18 @@ def compute_features(
     _mom_long = _FC["momentum_long"]
     df["momentum_20d"] = (close / close.shift(_mom_long)) - 1.0
 
-    # ── Average volume (normalized) ───────────────────────────────────────────
+    # ── Average volume (raw + normalized) ─────────────────────────────────────
+    # Two consumers, two units. See features/SCHEMA.md for the suffix rule.
+    #   avg_volume_20d_raw : raw shares — Research scanner absolute-liquidity
+    #                       gate (compares to MIN_AVG_VOLUME=500_000).
+    #   avg_volume_20d     : ratio (rolling_20d / per-ticker global mean) —
+    #                       Predictor relative-liquidity input, ~1.0 typical.
     _vol_slow = _FC["volume_slow"]
+    avg_vol_20d_raw = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
+    df["avg_volume_20d_raw"] = avg_vol_20d_raw
     volume_global_mean = volume.mean()
     if volume_global_mean > 0:
-        avg_vol_20d = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
-        df["avg_volume_20d"] = avg_vol_20d / volume_global_mean
+        df["avg_volume_20d"] = avg_vol_20d_raw / volume_global_mean
     else:
         df["avg_volume_20d"] = 1.0
 
