@@ -640,16 +640,20 @@ class TestReplayConcordance:
 
 
 class TestSkipCounterfactual:
-    def test_skip_flag_bypasses_to_branch_a_terminal(self, states):
-        """Skipping Counterfactual is the Branch-A chain-exit path. Post
-        the 2026-05-16 Research || PredictorTraining SF Parallel
-        restructure, the eval/agent-justification chain is Branch A; its
-        exit is the branch-local terminal BranchAComplete (End:true) — a
-        branch must SUCCEED, never throw, so SF Parallel's
-        cancel-siblings-on-error default can never abandon an in-flight
-        (or completed+S3-promoted) PredictorTraining branch.
-        CheckSkipPredictorTraining now lives in the SIBLING Branch B; the
-        post-join CheckBranchOutcomes is the new sync point."""
+    def test_skip_flag_bypasses_to_aggregate_costs_gate(self, states):
+        """Skipping Counterfactual now lands on the AggregateCosts
+        skip-gate (ROADMAP L1146 — SF-wired daily cost aggregator
+        added 2026-05-25), not directly on BranchAComplete. The cost
+        aggregator reads cost JSONLs written by upstream LLM states
+        (Research / eval-judge / rationale-clustering / replay-
+        concordance / counterfactual); a counterfactual skip does NOT
+        invalidate those upstream rows, so the aggregator MUST still
+        run. The four observability skip flags (skip_counterfactual /
+        skip_rationale_clustering / skip_replay_concordance /
+        skip_aggregate_costs) are independent. Pre-L1146 this assertion
+        pinned ``BranchAComplete``; the L1146 wire-up reroutes through
+        ``CheckSkipAggregateCosts`` which transitively reaches the
+        Branch-A terminal."""
         skip = states["CheckSkipCounterfactual"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -658,7 +662,7 @@ class TestSkipCounterfactual:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "BranchAComplete"
+        assert choice["Next"] == "CheckSkipAggregateCosts"
 
     def test_default_runs_counterfactual(self, states):
         assert states["CheckSkipCounterfactual"]["Default"] == "Counterfactual"
@@ -686,24 +690,30 @@ class TestCounterfactual:
         # across 8 weeks of corpus).
         assert states["Counterfactual"]["TimeoutSeconds"] == 600
 
-    def test_success_exits_to_branch_a_terminal(self, states):
-        # Post the 2026-05-16 SF Parallel restructure: Counterfactual is
-        # the last state in Branch A (the eval/agent-justification
-        # chain); success exits to the branch-local terminal
-        # BranchAComplete (End:true). Its persisted S3 artifacts are
-        # still available to the downstream Evaluator, which now runs
-        # AFTER the Parallel join.
-        assert states["Counterfactual"]["Next"] == "BranchAComplete"
+    def test_success_exits_to_aggregate_costs_gate(self, states):
+        # Counterfactual is now the SECOND-to-last load-bearing state in
+        # Branch A — the L1146 wire-up (2026-05-25) inserted the
+        # AggregateCosts cost-telemetry aggregator after it. Success now
+        # exits to CheckSkipAggregateCosts, which transitively reaches
+        # BranchAComplete (End:true). Persisted S3 artifacts are still
+        # available to the downstream Evaluator, which runs AFTER the
+        # Parallel join. Pre-L1146: Counterfactual.Next == BranchAComplete.
+        assert states["Counterfactual"]["Next"] == "CheckSkipAggregateCosts"
 
-    def test_catch_routes_to_branch_a_terminal_not_failure(self, states):
+    def test_catch_routes_to_aggregate_costs_gate_not_failure(self, states):
         # Same Catch posture as the rest of the agent-justification
         # triple — Counterfactual is observability, not load-bearing, so
-        # failures fall through to the Branch-A success terminal rather
-        # than halting the pipeline (and crucially NOT to HandleFailure,
-        # which would abort the sibling PredictorTraining branch).
+        # failures fall through to the next observability step (the cost
+        # aggregator) rather than halting the pipeline (and crucially
+        # NOT to HandleFailure, which would abort the sibling
+        # PredictorTraining branch). Pre-L1146 this routed directly to
+        # BranchAComplete; the cost aggregator inserted between
+        # Counterfactual and the branch terminal is itself a separate
+        # observability layer with its own Catch routing to
+        # BranchAComplete.
         catch = states["Counterfactual"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "BranchAComplete"
+        assert catch["Next"] == "CheckSkipAggregateCosts"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
@@ -749,25 +759,28 @@ class TestJudgeChainBeforePredictor:
             == "CheckSkipEvalJudge"
         )
 
-    def test_counterfactual_exits_to_branch_a_terminal(self, states):
-        """Counterfactual is the last state in Branch A (the eval/
-        agent-justification chain); post the 2026-05-16 SF Parallel
-        restructure its Next + Catch + the skip-gate above it all
-        converge to the branch-local success terminal BranchAComplete
-        (End:true). The Evaluator-sees-judge-artifacts ordering invariant
-        is still satisfied because Evaluator runs AFTER the Parallel
-        join, by which point Branch A has completed and its S3 artifacts
-        are landed. Pre-2026-05-07 this was SaturdayHealthCheck;
-        2026-05-07→2026-05-16 it was CheckSkipPredictorTraining;
-        post-2026-05-16 it is BranchAComplete."""
-        assert states["Counterfactual"]["Next"] == "BranchAComplete"
+    def test_counterfactual_exits_to_aggregate_costs_gate(self, states):
+        """Counterfactual's three exit edges (Next + Catch + the
+        skip-gate above it) all converge on the AggregateCosts skip-gate
+        added by ROADMAP L1146 (2026-05-25). The Evaluator-sees-judge-
+        artifacts ordering invariant is still satisfied because
+        Evaluator runs AFTER the Parallel join, by which point Branch A
+        (including the inserted cost-aggregator step) has completed and
+        its S3 artifacts are landed. Edge target history:
+        pre-2026-05-07 SaturdayHealthCheck → 2026-05-07→05-16
+        CheckSkipPredictorTraining → 2026-05-16→05-25 BranchAComplete →
+        post-L1146 CheckSkipAggregateCosts. The transitive reach to
+        BranchAComplete is preserved (CheckSkipAggregateCosts.Default →
+        AggregateCosts.Next → BranchAComplete; CheckSkipAggregateCosts's
+        skip-branch → BranchAComplete directly)."""
+        assert states["Counterfactual"]["Next"] == "CheckSkipAggregateCosts"
         assert (
             states["Counterfactual"]["Catch"][0]["Next"]
-            == "BranchAComplete"
+            == "CheckSkipAggregateCosts"
         )
         assert (
             states["CheckSkipCounterfactual"]["Choices"][0]["Next"]
-            == "BranchAComplete"
+            == "CheckSkipAggregateCosts"
         )
 
     def test_evaluator_exits_directly_to_health_check(self, states):

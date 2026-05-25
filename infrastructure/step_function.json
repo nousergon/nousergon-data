@@ -1035,7 +1035,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "BranchAComplete"
+                  "Next": "CheckSkipAggregateCosts"
                 }
               ],
               "Default": "Counterfactual"
@@ -1070,12 +1070,68 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes to CheckSkipPredictorTraining (post-2026-05-07 reorder).",
-                  "Next": "BranchAComplete",
+                  "Comment": "Eval observability layer \u2014 counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes to CheckSkipAggregateCosts so the cost-telemetry aggregation step still runs even when counterfactual fails (the JSONLs the aggregator reads were written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual independently; a counterfactual failure doesn't invalidate the upstream cost rows).",
+                  "Next": "CheckSkipAggregateCosts",
                   "ResultPath": "$.counterfactual_error"
                 }
               ],
               "ResultPath": "$.counterfactual_result",
+              "Next": "CheckSkipAggregateCosts"
+            },
+            "CheckSkipAggregateCosts": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_aggregate_costs\": true} bypasses the daily cost-telemetry aggregation Lambda (used for ad-hoc reruns where the cost parquet for the date is already current, or when iterating on the aggregator script). Standalone invocation of the Lambda is always available via the deploy.sh aggregate_costs target. Independent of skip_rationale_clustering / skip_replay_concordance / skip_counterfactual \u2014 the four are independent observability paths.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_aggregate_costs",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_aggregate_costs",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "BranchAComplete"
+                }
+              ],
+              "Default": "AggregateCosts"
+            },
+            "AggregateCosts": {
+              "Type": "Task",
+              "Comment": "Daily cost-telemetry aggregation Lambda (ROADMAP L1146 \u2014 SF-wire scripts/aggregate_costs.py CLI). Reads decision_artifacts/_cost_raw/{run_date}/*.jsonl (written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual during the upstream chain), writes the daily parquet at decision_artifacts/_cost/{run_date}/cost.parquet, emits per-agent CW metrics under AlphaEngine/Cost. Placed at end of Branch A so all LLM-emitting upstream states have written their cost JSONL rows by the time the aggregator runs. Failure is non-blocking (Catch routes to BranchAComplete) \u2014 cost telemetry is observability, NOT a primary deliverable; aggregator failure does NOT regress the alpha pipeline. Status contract OK / SKIPPED / ERROR mirrors data #295 + L3277 audit \u2014 SKIPPED on no _cost_raw partitions for the date is a legitimate upstream no-op and treated as success.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-aggregate-costs:live",
+                "Payload": {
+                  "date.$": "$.run_date",
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 600,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available.",
+                  "Next": "BranchAComplete",
+                  "ResultPath": "$.aggregate_costs_error"
+                }
+              ],
+              "ResultPath": "$.aggregate_costs_result",
               "Next": "BranchAComplete"
             },
             "ExtractResearchError": {

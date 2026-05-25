@@ -91,6 +91,10 @@ _EXPECTED_SKIPS = {
     "skip_rationale_clustering",
     "skip_replay_concordance",
     "skip_counterfactual",
+    # Added 2026-05-25 (ROADMAP L1146 — SF-wire aggregate_costs.py CLI).
+    # Observability skip; independent of the three above per the
+    # CheckSkipAggregateCosts comment.
+    "skip_aggregate_costs",
     "skip_predictor_training",
     "skip_drift_detection",
     "skip_backtester",
