@@ -129,26 +129,39 @@ def main() -> int:
         logger.info("[run_news_pipeline] step 2/4 — NLP pipeline")
         from rag.pipelines._cost_telemetry import build_news_cost_buffer
         cost_buffer = build_news_cost_buffer(run_date=agg_date)
-        nlp_output = _run_nlp(articles, cost_buffer=cost_buffer)
-        logger.info(
-            "[run_news_pipeline] step 2 — sentiment_scores=%d "
-            "event_flags=%d entity_mentions=%d (%d/%d articles processed); "
-            "cost rows buffered=%d",
-            len(nlp_output.sentiment_scores),
-            len(nlp_output.event_flags),
-            len(nlp_output.entity_mentions),
-            nlp_output.n_articles_processed,
-            nlp_output.n_articles_processed + nlp_output.n_articles_failed,
-            cost_buffer.row_count,
-        )
-
-    # Flush cost-telemetry rows to S3. Per [[feedback_no_silent_fails]]
-    # the flush is hard-fail — a silent miss on the previously-dominant
-    # untracked cost slice would defeat the Phase 0 visibility goal.
-    # Pipeline-side dry-run + skip-nlp skip the flush by construction
-    # (buffer is None / empty).
-    if cost_buffer is not None and not args.dry_run:
-        cost_buffer.flush()
+        # try/finally: if the runaway-cost circuit breaker fires mid-loop
+        # (or any other exception inside _run_nlp), the flush still runs
+        # so rows up to the breach are preserved on S3. The breaker then
+        # re-raises and aborts the pipeline at the natural callsite.
+        try:
+            nlp_output = _run_nlp(articles, cost_buffer=cost_buffer)
+            logger.info(
+                "[run_news_pipeline] step 2 — sentiment_scores=%d "
+                "event_flags=%d entity_mentions=%d (%d/%d articles processed); "
+                "cost rows buffered=%d (cumulative=$%.4f)",
+                len(nlp_output.sentiment_scores),
+                len(nlp_output.event_flags),
+                len(nlp_output.entity_mentions),
+                nlp_output.n_articles_processed,
+                nlp_output.n_articles_processed + nlp_output.n_articles_failed,
+                cost_buffer.row_count,
+                cost_buffer.cumulative_cost_usd,
+            )
+        finally:
+            if cost_buffer is not None and not args.dry_run:
+                try:
+                    cost_buffer.flush()
+                except Exception as flush_exc:
+                    # On flush failure during exception unwind, log loud
+                    # but don't shadow the original exception. Per
+                    # [[feedback_no_silent_fails]] the row loss is
+                    # operator-visible via the WARN; the original
+                    # CostBudgetExceededError stays the failure-of-record.
+                    logger.error(
+                        "[run_news_pipeline] cost buffer flush FAILED "
+                        "during exception unwind — rows LOST: %s",
+                        flush_exc,
+                    )
 
     # ── Step 3: structured aggregates parquet ────────────────────
     if args.dry_run:
