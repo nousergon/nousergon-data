@@ -405,9 +405,16 @@ def _load_price_source(s3, bucket: str) -> dict | None:
         slim_data = None
 
     if combined and slim_data:
+        # L1718 / 5/23-SF P0 (m) — relax epsilon to 1e-2 per Path B
+        # (2026-05-24 operator decision). Dividend-adjustment-policy
+        # mismatch between universe (auto-adjusted) and slim (raw close);
+        # not float-precision. Slim is on the chopping block (L1718 PR4
+        # retires it); reconcile block becomes dead code post-PR4 merge.
+        # See collectors/macro.py for the full rationale block.
         report = reconcile_frame_dicts(
             slim_data, combined, value_cols=("Close",),
             require_ticker_match=False,
+            epsilon=1e-2,
         )
         log.info("compute slim<->arctic %s", report.summary())
         log.info(
