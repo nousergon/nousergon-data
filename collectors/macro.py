@@ -80,8 +80,18 @@ def _load_breadth_prices(bucket: str) -> Optional[dict]:
     # every run. Grep ``WAVE4_PARITY_METRIC breadth`` over the observation
     # window before PR4 retires slim.
     if arctic_prices and slim_prices:
+        # L1718 / 5/23-SF P0 (m) — relax epsilon from default 1e-6 to 1e-2
+        # 2026-05-24 per operator decision Path B. ArcticDB universe writes
+        # auto-adjusted close (yfinance auto-adjust applied post-dividend);
+        # slim cache writes raw close. The 5.36 max_abs_value_delta on EQIX
+        # Close 2026-04-29 is dividend-scale, NOT float-precision — EQIX is
+        # a REIT with $5+ quarterly dividends. Slim cache is on the chopping
+        # block by design (L1718 PR4 deletes it); reconciling a doomed
+        # store to a policy already matched by universe is throwaway work.
+        # Once PR4 lands, this entire reconcile block becomes dead code.
         report = reconcile_frame_dicts(
-            slim_prices, arctic_prices, value_cols=("Close",)
+            slim_prices, arctic_prices, value_cols=("Close",),
+            epsilon=1e-2,
         )
         logger.info("breadth slim<->arctic %s", report.summary())
         logger.info(
