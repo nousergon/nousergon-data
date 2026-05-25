@@ -170,7 +170,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipRAGIngestion"
+          "Next": "CheckEnableStandaloneScanner"
         }
       ],
       "Default": "DataPhase1"
@@ -250,7 +250,7 @@
         {
           "Variable": "$.data_phase1_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipRAGIngestion"
+          "Next": "CheckEnableStandaloneScanner"
         },
         {
           "Variable": "$.data_phase1_poll.Status",
@@ -269,6 +269,62 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDataPhase1"
+    },
+    "CheckEnableStandaloneScanner": {
+      "Type": "Choice",
+      "Comment": "L1995 Phase 2 gate — default-off. {\"enable_standalone_scanner\": true} routes through the new Scanner Lambda (alpha-engine-research-scanner, ROADMAP L1995 Phase 1 / research #235), which writes s3://alpha-engine-research/candidates/{run_date}/candidates.json in parallel-observe mode (Research Lambda still runs its own internal scanner — Phase 5 will cut Research over to read the artifact). Default (flag absent or false) routes straight to CheckSkipRAGIngestion — byte-identical to the pre-Phase-2 chain. Operator flips the flag for the Phase 3 soak; first scheduled flip-on Saturday is 2026-05-30 if operator opts in.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.enable_standalone_scanner",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.enable_standalone_scanner",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "Scanner"
+        }
+      ],
+      "Default": "CheckSkipRAGIngestion"
+    },
+    "Scanner": {
+      "Type": "Task",
+      "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 — alpha-engine-research #235). Reads constituents.json + feature store, runs the same run_quant_filter as Research Lambda's internal scanner, writes the candidates.json artifact for THIS run_date. Phase 2 posture: observe-only — gated by enable_standalone_scanner flag; failure is NON-BLOCKING (Catch routes to CheckSkipRAGIngestion). The artifact is parallel-observe only; no consumer reads it yet (Phase 4 will switch RAG to read it, Phase 5 will switch Research). Status contract OK / ERROR — no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true. Includes a 5/30 soak: Brian flips enable_standalone_scanner=true on the 5/30 SF input and compares candidates.json::scanner_tickers against research's signals.json::universe (minus population). Zero divergence is the Phase 3 → Phase 4 transition signal.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-scanner:live",
+        "Payload": {
+          "run_date.$": "$.run_date",
+          "dry_run_llm.$": "$.research_dry"
+        }
+      },
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Phase 2 observe-only contract — scanner failure must NOT halt the pipeline. Research Lambda's internal scanner still runs in parallel and provides the load-bearing scanner output downstream; this artifact is parallel-observe and consumer-less today (Phase 4 will flip RAG to read it). Routes forward to CheckSkipRAGIngestion so the pipeline continues exactly as it would on flag=false.",
+          "Next": "CheckSkipRAGIngestion",
+          "ResultPath": "$.scanner_error"
+        }
+      ],
+      "ResultPath": "$.scanner_result",
+      "Next": "CheckSkipRAGIngestion"
     },
     "CheckSkipRAGIngestion": {
       "Type": "Choice",

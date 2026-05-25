@@ -9,6 +9,8 @@
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-eval-judge*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-eval-rolling-mean*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-rationale-clustering*",
+                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-aggregate-costs*",
+                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-scanner*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-concordance*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-counterfactual*",
                 "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector*",

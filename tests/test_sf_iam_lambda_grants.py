@@ -58,29 +58,49 @@ def _collect_invoked_lambda_arns(sf_doc: dict) -> set[str]:
 
     Returns the set of fully-qualified ARNs (or short names that we
     convert to ARNs assuming us-east-1 + the canonical account).
+
+    Recursively walks Parallel branches so Lambda invocations nested
+    inside a Parallel state (e.g. the ResearchPredictorParallel Branch
+    A chain: Research → DataPhase2 → eval-judge chain →
+    RationaleClustering → ReplayConcordance → Counterfactual →
+    AggregateCosts) are not silently skipped. Pre-2026-05-26 the walker
+    only iterated top-level States; the aggregate-costs Lambda was
+    added 2026-05-25 (L1146.B) inside Branch A and shipped without an
+    IAM grant because this walker missed it.
     """
     found: set[str] = set()
-    for state_name, state in sf_doc.get("States", {}).items():
-        if state.get("Type") != "Task":
-            continue
-        resource = state.get("Resource", "")
-        if "lambda:invoke" not in resource and "lambda:Invoke" not in resource:
-            continue
-        params = state.get("Parameters", {})
-        fn = params.get("FunctionName") or params.get("FunctionName.$")
-        if not fn or not isinstance(fn, str):
-            continue
-        if fn.startswith("arn:aws:lambda:"):
-            arn = fn.split(":")[6] if fn.count(":") >= 6 else fn  # function name part
-            # Normalize to full ARN minus alias suffix for prefix matching
-            base = ":".join(fn.split(":")[:7])  # arn:aws:lambda:region:acct:function:NAME
-            found.add(base)
-        else:
-            # Short name with optional ":alias" — assume canonical region/acct
-            short = fn.split(":")[0]
-            found.add(
-                f"arn:aws:lambda:us-east-1:711398986525:function:{short}"
-            )
+
+    def _walk(states: dict) -> None:
+        for state_name, state in states.items():
+            if state.get("Type") == "Parallel":
+                for branch in state.get("Branches", []):
+                    _walk(branch.get("States", {}))
+                continue
+            if state.get("Type") != "Task":
+                continue
+            resource = state.get("Resource", "")
+            if (
+                "lambda:invoke" not in resource
+                and "lambda:Invoke" not in resource
+            ):
+                continue
+            params = state.get("Parameters", {})
+            fn = params.get("FunctionName") or params.get("FunctionName.$")
+            if not fn or not isinstance(fn, str):
+                continue
+            if fn.startswith("arn:aws:lambda:"):
+                arn = fn.split(":")[6] if fn.count(":") >= 6 else fn
+                # Normalize to full ARN minus alias suffix for prefix matching
+                base = ":".join(fn.split(":")[:7])
+                found.add(base)
+            else:
+                # Short name with optional ":alias" — assume canonical region/acct
+                short = fn.split(":")[0]
+                found.add(
+                    f"arn:aws:lambda:us-east-1:711398986525:function:{short}"
+                )
+
+    _walk(sf_doc.get("States", {}))
     return found
 
 
