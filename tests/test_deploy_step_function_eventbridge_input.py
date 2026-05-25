@@ -79,3 +79,132 @@ class TestEventBridgeInput:
             "enable_standalone_scanner is present but not set to true. "
             "Phase 3 requires the flag value to be true."
         )
+
+    def test_pipeline_role_set_to_weekly(self, input_json_block):
+        """Option-D 2026-05-25: every cron-triggered execution carries a
+        ``pipeline_role`` tag so page 25 / Slack / CLI consumers can filter
+        out smoke / recovery / operator-replay executions from the
+        canonical cadence run. Saturday cron = ``"weekly"``.
+
+        Dropping this field silently reverts page 25 to the pre-Option-D
+        "smoke runs displace the real weekly" behavior — operator opens
+        page 25 expecting last weekly run, sees a smoke retry instead.
+        """
+        assert re.search(
+            r'"pipeline_role"\s*:\s*"weekly"',
+            input_json_block,
+        ), (
+            "deploy_step_function.sh::INPUT_JSON must set "
+            "pipeline_role=\"weekly\" on the Saturday cron rule. If you "
+            "are intentionally changing the role taxonomy, update both "
+            "this test AND the SCRIPT in the same PR — and remember to "
+            "update the dashboard's page-25 role_filter set to match."
+        )
+
+
+# ── Daily (Weekday) cron rule ─────────────────────────────────────────────
+
+
+_DAILY_DEPLOY_PATH = _REPO_ROOT / "infrastructure" / "deploy_step_function_daily.sh"
+
+
+@pytest.fixture(scope="module")
+def daily_script_text() -> str:
+    return _DAILY_DEPLOY_PATH.read_text()
+
+
+@pytest.fixture(scope="module")
+def daily_input_json_block(daily_script_text: str) -> str:
+    m = re.search(
+        r"INPUT_JSON=\$\(cat <<EOF\n(.+?)\nEOF\n\)",
+        daily_script_text,
+        re.DOTALL,
+    )
+    assert m is not None, (
+        "INPUT_JSON heredoc not found in deploy_step_function_daily.sh"
+    )
+    return m.group(1)
+
+
+class TestWeekdayEventBridgeInput:
+    def test_pipeline_role_set_to_daily(self, daily_input_json_block):
+        """Option-D 2026-05-25 — Weekday cron rule must tag executions
+        with ``pipeline_role="daily"`` so page 25's Weekday section
+        filters past operator-replay / smoke executions to land on the
+        canonical 5:45 AM PT trading-cadence run."""
+        assert re.search(
+            r'"pipeline_role"\s*:\s*"daily"',
+            daily_input_json_block,
+        ), (
+            "deploy_step_function_daily.sh::INPUT_JSON must set "
+            "pipeline_role=\"daily\" on the Weekday cron rule."
+        )
+
+
+# ── CFN orchestration template chokepoint ─────────────────────────────────
+
+
+_CFN_ORCHESTRATION_PATH = (
+    _REPO_ROOT
+    / "infrastructure"
+    / "cloudformation"
+    / "alpha-engine-orchestration.yaml"
+)
+
+
+@pytest.fixture(scope="module")
+def orchestration_text() -> str:
+    return _CFN_ORCHESTRATION_PATH.read_text()
+
+
+class TestOrchestrationCFNPipelineRoles:
+    """The CFN template is a parallel source-of-truth to the deploy
+    scripts. When CFN is re-applied (or when a fresh region/account is
+    bootstrapped) the cron rules' Input fields come from the YAML, not
+    the .sh scripts. Both must carry pipeline_role to prevent drift
+    between the two paths.
+    """
+
+    def _trigger_block(self, text: str, name: str) -> str:
+        """Extract a single Rule block from the CFN text."""
+        # Crude but stable: split on rule names that appear at the same
+        # indent level. Each trigger block begins with the rule name +
+        # ``:`` on a leading-whitespace line and ends before the next
+        # such name. We pin against a known successor name per rule.
+        markers = {
+            "SaturdayTrigger": "FridayShellRunTrigger",
+            "FridayShellRunTrigger": "WeekdayTrigger",
+            "WeekdayTrigger": "ResearchAlerts",
+        }
+        head = text.split(f"{name}:", 1)
+        assert len(head) == 2, f"{name} block not found in orchestration CFN"
+        successor = markers[name]
+        block = head[1].split(f"{successor}:", 1)[0]
+        return block
+
+    def test_saturday_trigger_has_weekly_role(self, orchestration_text):
+        block = self._trigger_block(orchestration_text, "SaturdayTrigger")
+        assert re.search(
+            r'"pipeline_role"\s*:\s*"weekly"',
+            block,
+        ), (
+            "SaturdayTrigger Input must carry pipeline_role=\"weekly\"."
+        )
+
+    def test_friday_shell_run_trigger_has_shell_run_role(self, orchestration_text):
+        block = self._trigger_block(orchestration_text, "FridayShellRunTrigger")
+        assert re.search(
+            r'"pipeline_role"\s*:\s*"shell-run"',
+            block,
+        ), (
+            "FridayShellRunTrigger Input must carry "
+            "pipeline_role=\"shell-run\" — distinguishes the dry-pass "
+            "from the canonical weekly run on page 25."
+        )
+
+    def test_weekday_trigger_has_daily_role(self, orchestration_text):
+        block = self._trigger_block(orchestration_text, "WeekdayTrigger")
+        assert re.search(
+            r'"pipeline_role"\s*:\s*"daily"',
+            block,
+        ), "WeekdayTrigger Input must carry pipeline_role=\"daily\"."

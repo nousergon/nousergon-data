@@ -126,7 +126,8 @@ EB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-eventbridge-sfn-role"
 INPUT_JSON=$(cat <<EOF
 {
   "trading_instance_id": ["$TRADING_INSTANCE"],
-  "sns_topic_arn": "$SNS_TOPIC_ARN"
+  "sns_topic_arn": "$SNS_TOPIC_ARN",
+  "pipeline_role": "daily"
 }
 EOF
 )

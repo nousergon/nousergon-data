@@ -128,10 +128,18 @@ Resources:
         - Id: saturday-pipeline
           Arn: !Ref SaturdayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
+          # pipeline_role tag (Option-D 2026-05-25): identifies this as the
+          # canonical Saturday weekly cadence run. Page 25 filters to
+          # role="weekly" by default so smoke / recovery / operator-replay
+          # executions don't displace the real weekly run as "most recent".
+          # Ad-hoc operator launches MUST set their own pipeline_role
+          # (smoke / recovery / backfill / operator-replay) per the
+          # taxonomy in pipeline-reporting-revamp-260524.md §6.
           Input: !Sub |
             {
               "ec2_instance_id": ["${MicroInstanceId}"],
-              "sns_topic_arn": "${AlertsTopic}"
+              "sns_topic_arn": "${AlertsTopic}",
+              "pipeline_role": "weekly"
             }
 
   # Friday-PM "shell run" — automated full-fidelity dry preflight of the
@@ -176,11 +184,18 @@ Resources:
         - Id: friday-shell-run
           Arn: !Ref SaturdayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
+          # pipeline_role="shell-run" (Option-D 2026-05-25): tags this
+          # execution so page 25's role filter distinguishes Friday-PM
+          # dry-pass from the canonical Saturday weekly run. shell_run=true
+          # remains the load-bearing input field consumed by
+          # InitializeInput/CheckShellRun; pipeline_role is the surface
+          # contract that dashboard / Slack / CLI consumers filter on.
           Input: !Sub |
             {
               "ec2_instance_id": ["${MicroInstanceId}"],
               "sns_topic_arn": "${AlertsTopic}",
-              "shell_run": true
+              "shell_run": true,
+              "pipeline_role": "shell-run"
             }
 
   WeekdayTrigger:
@@ -206,11 +221,15 @@ Resources:
         - Id: weekday-pipeline
           Arn: !Ref WeekdayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
+          # pipeline_role="daily" (Option-D 2026-05-25): identifies this as
+          # the canonical weekday trading-cadence run. Page 25 filters to
+          # role="daily" by default for the Weekday section.
           Input: !Sub |
             {
               "ec2_instance_id": ["${MicroInstanceId}"],
               "trading_instance_id": ["${TradingInstanceId}"],
-              "sns_topic_arn": "${AlertsTopic}"
+              "sns_topic_arn": "${AlertsTopic}",
+              "pipeline_role": "daily"
             }
 
   # --------------------------------------------------------------------------
