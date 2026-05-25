@@ -124,18 +124,31 @@ def main() -> int:
         logger.info("[run_news_pipeline] step 2/4 — SKIPPED (--skip-nlp)")
         from collectors.nlp.pipeline import NewsNLPOutput
         nlp_output = NewsNLPOutput()
+        cost_buffer = None
     else:
         logger.info("[run_news_pipeline] step 2/4 — NLP pipeline")
-        nlp_output = _run_nlp(articles)
+        from rag.pipelines._cost_telemetry import build_news_cost_buffer
+        cost_buffer = build_news_cost_buffer(run_date=agg_date)
+        nlp_output = _run_nlp(articles, cost_buffer=cost_buffer)
         logger.info(
             "[run_news_pipeline] step 2 — sentiment_scores=%d "
-            "event_flags=%d entity_mentions=%d (%d/%d articles processed)",
+            "event_flags=%d entity_mentions=%d (%d/%d articles processed); "
+            "cost rows buffered=%d",
             len(nlp_output.sentiment_scores),
             len(nlp_output.event_flags),
             len(nlp_output.entity_mentions),
             nlp_output.n_articles_processed,
             nlp_output.n_articles_processed + nlp_output.n_articles_failed,
+            cost_buffer.row_count,
         )
+
+    # Flush cost-telemetry rows to S3. Per [[feedback_no_silent_fails]]
+    # the flush is hard-fail — a silent miss on the previously-dominant
+    # untracked cost slice would defeat the Phase 0 visibility goal.
+    # Pipeline-side dry-run + skip-nlp skip the flush by construction
+    # (buffer is None / empty).
+    if cost_buffer is not None and not args.dry_run:
+        cost_buffer.flush()
 
     # ── Step 3: structured aggregates parquet ────────────────────
     if args.dry_run:
@@ -181,9 +194,16 @@ def main() -> int:
     return 0
 
 
-def _run_nlp(articles):
+def _run_nlp(articles, *, cost_buffer=None):
     """Instantiate the default NLP pipeline (LM sentiment + Anthropic
-    event extraction) and run over the article set."""
+    event extraction) and run over the article set.
+
+    When ``cost_buffer`` is provided, the Anthropic SDK client is
+    wrapped via :func:`wrap_client_for_cost_telemetry` so every
+    ``messages.create()`` response is buffered for the per-run cost-
+    telemetry flush at end of pipeline. Pure compose at construction;
+    no change required to ``AnthropicEventExtractor``.
+    """
     from collectors.nlp.event_extraction import AnthropicEventExtractor
     from collectors.nlp.loughran_mcdonald import LoughranMcDonaldScorer
     from collectors.nlp.pipeline import NewsNLPPipeline
@@ -197,6 +217,11 @@ def _run_nlp(articles):
         api_key = get_secret("ANTHROPIC_API_KEY", required=False, default="")
         if api_key:
             client = anthropic.Anthropic(api_key=api_key)
+            if cost_buffer is not None:
+                from rag.pipelines._cost_telemetry import (
+                    wrap_client_for_cost_telemetry,
+                )
+                client = wrap_client_for_cost_telemetry(client, cost_buffer)
             event_extractor = AnthropicEventExtractor(client)
             extractors = [event_extractor]
         else:
