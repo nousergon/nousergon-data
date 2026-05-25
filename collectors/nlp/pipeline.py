@@ -117,11 +117,20 @@ class NewsNLPPipeline:
                         extractor.name, fp, e,
                     )
 
+            # Union vendor tags across all variants — Polygon keywords +
+            # GDELT event codes + Benzinga channels for the same wire
+            # story. Rule-based extractors use this as the primary
+            # classification signal; LLM extractors (if any reactivated)
+            # ignore the kwarg via the EventExtractor Protocol default.
+            article_tags: tuple[str, ...] = tuple({
+                t for v in article.variants for t in v.tags
+            })
             for extractor in self._event_extractors:
                 try:
                     events.extend(extractor.extract(
                         text=text, article_fingerprint=fp,
                         article_tickers=article.tickers,
+                        article_tags=article_tags,
                     ))
                 except Exception as e:
                     logger.warning(

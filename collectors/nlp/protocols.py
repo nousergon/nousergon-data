@@ -170,4 +170,5 @@ class EventExtractor(Protocol):
     def extract(
         self, *, text: str, article_fingerprint: str,
         article_tickers: tuple[str, ...],
+        article_tags: tuple[str, ...] = (),
     ) -> list[EventFlag]: ...

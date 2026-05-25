@@ -18,12 +18,21 @@ without changing the pipeline orchestrator:
 
 Today's free-tier implementations:
 
-  loughran_mcdonald.LoughranMcDonaldScorer — finance-domain dictionary
-                                              sentiment, the academic
-                                              gold standard
-  event_extraction.AnthropicEventExtractor  — Haiku-tier structured
-                                              event flag extraction
-                                              (we already pay Anthropic)
+  loughran_mcdonald.LoughranMcDonaldScorer            — finance-domain
+                                                        dictionary sentiment
+                                                        (academic standard)
+  rule_based_event_extraction.RuleBasedEventExtractor — deterministic event
+                                                        classification from
+                                                        vendor tags (Polygon
+                                                        keywords, GDELT codes)
+                                                        + title-keyword regex.
+                                                        Replaced the Haiku-
+                                                        backed
+                                                        AnthropicEventExtractor
+                                                        2026-05-25 per the
+                                                        "LLM calls confined
+                                                        to research module"
+                                                        architectural rule.
 
 Heavier free upgrades that drop in as new adapter classes (Phase 3+):
 
@@ -31,10 +40,6 @@ Heavier free upgrades that drop in as new adapter classes (Phase 3+):
   spacy_ner.SpacyEntityExtractor — en_core_web_sm or larger
 """
 
-from collectors.nlp.event_extraction import (
-    AnthropicEventExtractor,
-    DEFAULT_EVENT_CATEGORIES,
-)
 from collectors.nlp.loughran_mcdonald import (
     LoughranMcDonaldScorer,
     load_lm_master_dict,
@@ -48,6 +53,10 @@ from collectors.nlp.protocols import (
     SentimentScore,
     SentimentScorer,
 )
+from collectors.nlp.rule_based_event_extraction import (
+    DEFAULT_EVENT_CATEGORIES,
+    RuleBasedEventExtractor,
+)
 
 __all__ = [
     "EntityMention",
@@ -58,7 +67,7 @@ __all__ = [
     "SentimentScorer",
     "LoughranMcDonaldScorer",
     "load_lm_master_dict",
-    "AnthropicEventExtractor",
+    "RuleBasedEventExtractor",
     "DEFAULT_EVENT_CATEGORIES",
     "NewsNLPPipeline",
 ]

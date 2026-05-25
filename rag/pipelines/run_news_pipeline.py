@@ -124,44 +124,18 @@ def main() -> int:
         logger.info("[run_news_pipeline] step 2/4 — SKIPPED (--skip-nlp)")
         from collectors.nlp.pipeline import NewsNLPOutput
         nlp_output = NewsNLPOutput()
-        cost_buffer = None
     else:
-        logger.info("[run_news_pipeline] step 2/4 — NLP pipeline")
-        from rag.pipelines._cost_telemetry import build_news_cost_buffer
-        cost_buffer = build_news_cost_buffer(run_date=agg_date)
-        # try/finally: if the runaway-cost circuit breaker fires mid-loop
-        # (or any other exception inside _run_nlp), the flush still runs
-        # so rows up to the breach are preserved on S3. The breaker then
-        # re-raises and aborts the pipeline at the natural callsite.
-        try:
-            nlp_output = _run_nlp(articles, cost_buffer=cost_buffer)
-            logger.info(
-                "[run_news_pipeline] step 2 — sentiment_scores=%d "
-                "event_flags=%d entity_mentions=%d (%d/%d articles processed); "
-                "cost rows buffered=%d (cumulative=$%.4f)",
-                len(nlp_output.sentiment_scores),
-                len(nlp_output.event_flags),
-                len(nlp_output.entity_mentions),
-                nlp_output.n_articles_processed,
-                nlp_output.n_articles_processed + nlp_output.n_articles_failed,
-                cost_buffer.row_count,
-                cost_buffer.cumulative_cost_usd,
-            )
-        finally:
-            if cost_buffer is not None and not args.dry_run:
-                try:
-                    cost_buffer.flush()
-                except Exception as flush_exc:
-                    # On flush failure during exception unwind, log loud
-                    # but don't shadow the original exception. Per
-                    # [[feedback_no_silent_fails]] the row loss is
-                    # operator-visible via the WARN; the original
-                    # CostBudgetExceededError stays the failure-of-record.
-                    logger.error(
-                        "[run_news_pipeline] cost buffer flush FAILED "
-                        "during exception unwind — rows LOST: %s",
-                        flush_exc,
-                    )
+        logger.info("[run_news_pipeline] step 2/4 — NLP pipeline (rule-based, no LLM)")
+        nlp_output = _run_nlp(articles)
+        logger.info(
+            "[run_news_pipeline] step 2 — sentiment_scores=%d "
+            "event_flags=%d entity_mentions=%d (%d/%d articles processed)",
+            len(nlp_output.sentiment_scores),
+            len(nlp_output.event_flags),
+            len(nlp_output.entity_mentions),
+            nlp_output.n_articles_processed,
+            nlp_output.n_articles_processed + nlp_output.n_articles_failed,
+        )
 
     # ── Step 3: structured aggregates parquet ────────────────────
     if args.dry_run:
@@ -207,52 +181,28 @@ def main() -> int:
     return 0
 
 
-def _run_nlp(articles, *, cost_buffer=None):
-    """Instantiate the default NLP pipeline (LM sentiment + Anthropic
+def _run_nlp(articles):
+    """Instantiate the default NLP pipeline (LM sentiment + rule-based
     event extraction) and run over the article set.
 
-    When ``cost_buffer`` is provided, the Anthropic SDK client is
-    wrapped via :func:`wrap_client_for_cost_telemetry` so every
-    ``messages.create()`` response is buffered for the per-run cost-
-    telemetry flush at end of pipeline. Pure compose at construction;
-    no change required to ``AnthropicEventExtractor``.
+    Event extraction uses :class:`RuleBasedEventExtractor` — deterministic
+    classification from Polygon/GDELT/Benzinga vendor tags + title-keyword
+    regex against the ``DEFAULT_EVENT_CATEGORIES`` taxonomy. Zero
+    LLM calls, zero API spend, zero new dependencies.
+
+    Replaced ``AnthropicEventExtractor`` 2026-05-25 per
+    ``[[preference_llm_calls_confined_to_research_module]]`` after the
+    audit found the Haiku output was aggregated to scalar/list summaries
+    before any research consumer touched it (rich structured per-article
+    output was wasted). See PR body for the deeper rationale.
     """
-    from collectors.nlp.event_extraction import AnthropicEventExtractor
     from collectors.nlp.loughran_mcdonald import LoughranMcDonaldScorer
     from collectors.nlp.pipeline import NewsNLPPipeline
-
-    lm_scorer = LoughranMcDonaldScorer()  # loads bundled CSV if present
-
-    # Anthropic event extractor — uses the existing API key plumbing
-    try:
-        import anthropic
-        from alpha_engine_lib.secrets import get_secret
-        api_key = get_secret("ANTHROPIC_API_KEY", required=False, default="")
-        if api_key:
-            client = anthropic.Anthropic(api_key=api_key)
-            if cost_buffer is not None:
-                from rag.pipelines._cost_telemetry import (
-                    wrap_client_for_cost_telemetry,
-                )
-                client = wrap_client_for_cost_telemetry(client, cost_buffer)
-            event_extractor = AnthropicEventExtractor(client)
-            extractors = [event_extractor]
-        else:
-            logger.warning(
-                "[run_news_pipeline] ANTHROPIC_API_KEY missing — "
-                "skipping LLM event extraction",
-            )
-            extractors = []
-    except Exception as e:
-        logger.warning(
-            "[run_news_pipeline] event extractor init failed: %s — "
-            "skipping", e,
-        )
-        extractors = []
+    from collectors.nlp.rule_based_event_extraction import RuleBasedEventExtractor
 
     pipeline = NewsNLPPipeline(
-        sentiment_scorers=[lm_scorer],
-        event_extractors=extractors,
+        sentiment_scorers=[LoughranMcDonaldScorer()],
+        event_extractors=[RuleBasedEventExtractor()],
     )
     return pipeline.process(articles)
 
