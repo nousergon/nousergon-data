@@ -1,7 +1,7 @@
 """
 weekly_collector.py — Centralized weekly data collection for Alpha Engine.
 
-Phase 1 (before research): constituents, prices, slim cache, macro, universe returns.
+Phase 1 (before research): constituents, prices, macro, universe returns.
 Phase 2 (after research): alternative data for promoted tickers.
 
 Phase 1 runs on EC2 via SSM RunCommand (price refresh takes 15-25 min).
@@ -73,7 +73,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, prices, slim_cache, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest
+from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest
 from builders._price_cache_writeboth import (
     price_cache_write_prefixes as _price_cache_write_prefixes,
 )
@@ -136,7 +136,7 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
 
 def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
-    """Phase 1: constituents, prices, slim cache, macro, universe returns."""
+    """Phase 1: constituents, prices, macro, universe returns."""
     bucket = config["bucket"]
     price_cfg = config.get("price_cache", {})
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
@@ -214,23 +214,10 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.error("Price cache refresh failed: %s", e)
                 results["collectors"]["prices"] = {"status": "error", "error": str(e)}
 
-    # ── 3. Slim cache ────────────────────────────────────────────────────────
-    if only in (None, "slim"):
-        logger.info("=" * 60)
-        logger.info("COLLECTING: slim cache")
-        logger.info("=" * 60)
-        try:
-            slim_result = slim_cache.collect(
-                bucket=bucket,
-                full_cache_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
-                slim_prefix=price_cfg.get("slim_prefix", "predictor/price_cache_slim/"),
-                lookback_days=price_cfg.get("slim_lookback_days", 730),
-                dry_run=dry_run,
-            )
-            results["collectors"]["slim_cache"] = slim_result
-        except Exception as e:
-            logger.error("Slim cache write failed: %s", e)
-            results["collectors"]["slim_cache"] = {"status": "error", "error": str(e)}
+    # ── 3. Slim cache — REMOVED (Wave-4) ─────────────────────────────────────
+    # predictor/price_cache_slim/ deleted: every consumer (data macro-breadth
+    # + feature compute, backtester exit_timing) reads the ArcticDB universe/
+    # macro libs directly. No slim writer; the prefix is gone.
 
     # ── 4. Macro data ────────────────────────────────────────────────────────
     if only in (None, "macro"):
@@ -1589,7 +1576,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "slim", "macro", "short_interest", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
+        choices=["constituents", "prices", "macro", "short_interest", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
     )
     parser.add_argument(

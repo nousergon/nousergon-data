@@ -50,60 +50,23 @@ def test_composes_universe_and_macro_when_arcticdb_available(monkeypatch):
         monkeypatch, universe=universe, macro_frames=macro_frames,
         macro_symbols=["VIX", "XLK", "features"],  # 'features' must be ignored
     )
-    monkeypatch.setattr(compute, "_load_slim_cache", lambda s3, b: {})
 
     out = compute._load_price_source(s3=None, bucket="b")
     assert set(out) == {"AAPL", "SPY", "VIX", "XLK"}
 
 
-def test_falls_back_to_slim_when_arcticdb_fails(monkeypatch, caplog):
-    def _boom(bucket):
+def test_returns_none_when_arcticdb_fails(monkeypatch):
+    """No slim fallback post Wave-4: an ArcticDB failure -> None (caller
+    returns empty; matches pre-Wave-4 single-source-unavailable behaviour)."""
+    def _boom(*a, **k):
         raise RuntimeError("ArcticDB down")
 
     monkeypatch.setattr(compute, "load_universe_ohlcv", _boom)
-    slim = {"AAPL": _frame(), "VIX": _frame(start=18)}
-    monkeypatch.setattr(compute, "_load_slim_cache", lambda s3, b: slim)
-
-    with caplog.at_level("WARNING"):
-        out = compute._load_price_source(s3=None, bucket="b")
-    assert set(out) == {"AAPL", "VIX"}
-    assert any("falling back to slim cache" in r.message for r in caplog.records)
+    assert compute._load_price_source(s3=None, bucket="b") is None
 
 
-def test_parity_metric_emitted_when_both_present(monkeypatch, caplog):
-    universe = {"AAPL": _frame()}
-    macro_frames = {"VIX": _frame(start=18)}
-    _stub_arctic(
-        monkeypatch, universe=universe, macro_frames=macro_frames,
-        macro_symbols=["VIX"],
-    )
-    # slim carries the same data + an extra symbol the universe lib lacks;
-    # require_ticker_match=False -> set asymmetry is reported, not fatal.
-    slim = {"AAPL": _frame(), "VIX": _frame(start=18), "OLDSYM": _frame()}
-    monkeypatch.setattr(compute, "_load_slim_cache", lambda s3, b: slim)
-
-    with caplog.at_level("INFO"):
-        compute._load_price_source(s3=None, bucket="b")
-
-    lines = [
-        r.message for r in caplog.records
-        if "WAVE4_PARITY_METRIC compute" in r.message
-    ]
-    assert len(lines) == 1
-    import json
-
-    payload = json.loads(lines[0].split("WAVE4_PARITY_METRIC compute ", 1)[1])
-    assert payload["max_abs_value_delta"] == 0.0          # overlap identical
-    assert payload["passed"] is True                      # value fidelity holds
-    assert "OLDSYM" in payload["only_in_a"]               # asymmetry visible
-
-
-def test_returns_none_when_both_sources_fail(monkeypatch):
-    def _boom(*a, **k):
-        raise RuntimeError("down")
-
-    monkeypatch.setattr(compute, "load_universe_ohlcv", _boom)
-    monkeypatch.setattr(compute, "_load_slim_cache", _boom)
+def test_returns_none_when_arcticdb_empty(monkeypatch):
+    _stub_arctic(monkeypatch, universe={}, macro_frames={}, macro_symbols=[])
     assert compute._load_price_source(s3=None, bucket="b") is None
 
 

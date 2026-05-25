@@ -26,9 +26,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from store.parquet_loader import load_slim_cache
 from alpha_engine_lib.arcticdb import load_universe_ohlcv
-from alpha_engine_lib.reconcile import reconcile_frame_dicts
 
 logger = logging.getLogger(__name__)
 
@@ -48,65 +46,25 @@ _FRED_SERIES = {
 
 
 def _load_breadth_prices(bucket: str) -> Optional[dict]:
-    """Load the ~900-ticker price set for breadth — ArcticDB primary,
-    slim-cache fallback, parity-observed.
+    """Load the ~900-ticker price set for breadth from the ArcticDB
+    universe library.
 
-    Wave 4 of the predictor/price_cache_slim deletion arc. ArcticDB (via the
-    lib ``load_universe_ohlcv`` slim-equivalent reader) is the single source
-    of truth; the legacy ``predictor/price_cache_slim/`` parquet read is kept
-    as a fallback so breadth cannot break if ArcticDB is unavailable. While
-    both sources still exist we dual-read and emit a ``reconcile`` ParityReport
-    so the eventual slim deletion (PR4) is a data-driven cutover, not an
-    eyeballed one. The slim side — and this dual-read — are removed in PR4.
+    Wave-4 terminal state: ``predictor/price_cache_slim/`` is deleted;
+    ArcticDB (via the lib ``load_universe_ohlcv`` reader) is the sole
+    source. Removal of the slim fallback + dual-read was gated on the
+    6-week consumer-side ArcticDB-primary soak since the 2026-04-14
+    cutover (see PR #269 body for the full rationale).
 
-    Returns ``None`` only if BOTH sources fail (caller then omits the breadth
-    key, preserving the existing no-null contract).
+    Returns ``None`` if the ArcticDB read fails (caller then omits the
+    breadth key — the existing no-null contract; Research has its own
+    fallback). This matches the pre-Wave-4 behaviour when the single
+    price source was unavailable.
     """
-    arctic_prices = None
     try:
-        arctic_prices = load_universe_ohlcv(bucket)
-    except Exception as exc:  # noqa: BLE001 - fall back, don't break breadth
+        return load_universe_ohlcv(bucket) or None
+    except Exception as exc:  # noqa: BLE001 - omit breadth, don't write null
         logger.warning("ArcticDB universe read for breadth failed: %s", exc)
-
-    slim_prices = None
-    try:
-        slim_prices = load_slim_cache(boto3.client("s3"), bucket)
-    except Exception as exc:  # noqa: BLE001 - parity/fallback only
-        logger.warning(
-            "Slim cache read for breadth (parity/fallback) failed: %s", exc
-        )
-
-    # SOTA observation: while both exist, emit the quantitative parity metric
-    # every run. Grep ``WAVE4_PARITY_METRIC breadth`` over the observation
-    # window before PR4 retires slim.
-    if arctic_prices and slim_prices:
-        # L1718 / 5/23-SF P0 (m) — relax epsilon from default 1e-6 to 1e-2
-        # 2026-05-24 per operator decision Path B. ArcticDB universe writes
-        # auto-adjusted close (yfinance auto-adjust applied post-dividend);
-        # slim cache writes raw close. The 5.36 max_abs_value_delta on EQIX
-        # Close 2026-04-29 is dividend-scale, NOT float-precision — EQIX is
-        # a REIT with $5+ quarterly dividends. Slim cache is on the chopping
-        # block by design (L1718 PR4 deletes it); reconciling a doomed
-        # store to a policy already matched by universe is throwaway work.
-        # Once PR4 lands, this entire reconcile block becomes dead code.
-        report = reconcile_frame_dicts(
-            slim_prices, arctic_prices, value_cols=("Close",),
-            epsilon=1e-2,
-        )
-        logger.info("breadth slim<->arctic %s", report.summary())
-        logger.info(
-            "WAVE4_PARITY_METRIC breadth %s", json.dumps(report.as_metrics())
-        )
-
-    if arctic_prices:
-        return arctic_prices
-    if slim_prices:
-        logger.warning(
-            "breadth falling back to slim cache — ArcticDB universe "
-            "unavailable (Wave-4 migration fallback path)"
-        )
-        return slim_prices
-    return None
+        return None
 
 
 def collect(

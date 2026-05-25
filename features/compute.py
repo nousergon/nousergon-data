@@ -128,16 +128,12 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
 # normalized DataFrame shape without importing private helpers. Slim cache
 # (2y) is sufficient here — features only use the latest row and 2y gives
 # enough warmup for every indicator.
-from store.parquet_loader import (
-    load_parquet_from_s3 as _load_parquet_from_s3,
-    load_slim_cache as _load_slim_cache,
-)
+from store.parquet_loader import load_parquet_from_s3 as _load_parquet_from_s3
 from alpha_engine_lib.arcticdb import (
     load_universe_ohlcv,
     load_macro_series,
     open_macro_lib,
 )
-from alpha_engine_lib.reconcile import reconcile_frame_dicts
 
 
 def _safe_last_date(idx: pd.Index) -> pd.Timestamp | None:
@@ -354,82 +350,42 @@ def _extract_macro(
 
 
 def _load_price_source(s3, bucket: str) -> dict | None:
-    """The ~full-universe price+macro symbol set — ArcticDB primary,
-    slim-cache fallback, parity-observed.
+    """The ~full-universe price+macro symbol set from ArcticDB.
 
-    Wave 4 of the predictor/price_cache_slim deletion arc, riskier sibling
-    of the macro-breadth migration: this feeds the ENTIRE feature-compute
-    pipeline (price_data) AND _extract_macro. The slim cache historically
-    carried equities + SPY + the index/macro series (VIX/VIX3M/TNX/IRX/
-    GLD/USO) + the XL* sector ETFs in one flat dict. Those tenants are
-    split across two ArcticDB libs:
+    Wave-4 terminal state (predictor/price_cache_slim deleted). This feeds
+    the ENTIRE feature-compute pipeline (price_data) AND _extract_macro.
+    The set is the union of two ArcticDB libraries — the slim cache that
+    formerly carried them in one flat parquet dict no longer exists:
 
       - universe lib  -> equities + SPY      (load_universe_ohlcv)
-      - macro lib     -> VIX.../XL* series   (load_macro_series)
+      - macro lib     -> VIX/VIX3M/TNX/IRX/GLD/USO + XL* sector ETFs
+                         (load_macro_series; XL* discovered via
+                         open_macro_lib().list_symbols())
 
-    so the ArcticDB-equivalent is the union of both reads. slim is kept as
-    a fallback for the whole set (feature compute cannot run blind) and,
-    while both still exist, every run dual-reads and emits a reconcile
-    ParityReport (grep ``WAVE4_PARITY_METRIC compute``) so PR4's slim
-    deletion is a data-driven cutover. The slim side is removed in PR4.
+    The 5/23 parity observation (WAVE4_PARITY_METRIC compute) confirmed
+    slim<->ArcticDB equivalence over the overlap before the slim fallback
+    + dual-read were removed here.
 
-    require_ticker_match is False for the emitted report: the slim cache
-    legitimately carries some symbols the universe lib does not, so set
-    asymmetry is expected — it is logged in the metric fields for
-    visibility while ``passed`` reflects value fidelity over the overlap.
-
-    Returns None only if BOTH sources fail (caller then returns empty,
-    preserving the existing no-data contract).
+    Returns None if the ArcticDB read fails (caller then returns empty —
+    the existing no-data contract; matches the pre-Wave-4 behaviour when
+    the single price source was unavailable). ``s3`` is retained in the
+    signature for caller compatibility but is no longer used.
     """
-    combined: dict | None = None
     try:
         prices = load_universe_ohlcv(bucket)  # equities + SPY
         macro_syms = set(_MACRO_SLIM_KEYS.values())
         try:
             mlib = open_macro_lib(bucket)
             macro_syms |= {
-                s for s in mlib.list_symbols() if s.startswith("XL")
+                sym for sym in mlib.list_symbols() if sym.startswith("XL")
             }
         except Exception as exc:  # noqa: BLE001 - XL* discovery best-effort
             log.warning("macro-lib symbol listing failed: %s", exc)
         macro_frames = load_macro_series(bucket, macro_syms)
-        merged = {**prices, **macro_frames}
-        combined = merged or None
-    except Exception as exc:  # noqa: BLE001 - fall back, don't run blind
+        return {**prices, **macro_frames} or None
+    except Exception as exc:  # noqa: BLE001 - return empty, don't run blind
         log.warning("ArcticDB universe/macro read failed: %s", exc)
-
-    try:
-        slim_data = _load_slim_cache(s3, bucket)
-    except Exception as exc:  # noqa: BLE001 - parity/fallback only
-        log.warning("slim cache read (parity/fallback) failed: %s", exc)
-        slim_data = None
-
-    if combined and slim_data:
-        # L1718 / 5/23-SF P0 (m) — relax epsilon to 1e-2 per Path B
-        # (2026-05-24 operator decision). Dividend-adjustment-policy
-        # mismatch between universe (auto-adjusted) and slim (raw close);
-        # not float-precision. Slim is on the chopping block (L1718 PR4
-        # retires it); reconcile block becomes dead code post-PR4 merge.
-        # See collectors/macro.py for the full rationale block.
-        report = reconcile_frame_dicts(
-            slim_data, combined, value_cols=("Close",),
-            require_ticker_match=False,
-            epsilon=1e-2,
-        )
-        log.info("compute slim<->arctic %s", report.summary())
-        log.info(
-            "WAVE4_PARITY_METRIC compute %s", json.dumps(report.as_metrics())
-        )
-
-    if combined:
-        return combined
-    if slim_data:
-        log.warning(
-            "feature compute falling back to slim cache — ArcticDB "
-            "unavailable (Wave-4 migration fallback path)"
-        )
-        return slim_data
-    return None
+        return None
 
 
 def _load_prices_and_macro(
