@@ -187,11 +187,23 @@ aws iam create-role \
 
 EB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EB_ROLE_NAME}"
 
-# The EventBridge target passes the execution input with EC2 instance ID and SNS topic
+# The EventBridge target passes the execution input with EC2 instance ID and SNS topic.
+#
+# enable_standalone_scanner=true activates the L1995 Phase 2 Scanner SF state
+# (alpha-engine-research-scanner Lambda writes candidates.json in
+# parallel-observe mode). Set true from 2026-05-25 onward — the SF chain is
+# byte-identical to pre-Phase-2 except the new state writes an additional
+# S3 artifact at s3://alpha-engine-research/candidates/{run_date}/candidates.json.
+# Catch posture: scanner Lambda failure is non-blocking (routes to
+# CheckSkipRAGIngestion); the artifact is observe-only with no consumer
+# until L1995 Phase 4 wires RAGIngestion to read it. First soak cycle: Sat
+# 2026-05-30. Revert by flipping to false here + re-running this script,
+# OR by ad-hoc `aws events put-targets` with a fresh Input.
 INPUT_JSON=$(cat <<EOF
 {
   "ec2_instance_id": ["$EC2_INSTANCE_ID"],
-  "sns_topic_arn": "$SNS_TOPIC_ARN"
+  "sns_topic_arn": "$SNS_TOPIC_ARN",
+  "enable_standalone_scanner": true
 }
 EOF
 )
