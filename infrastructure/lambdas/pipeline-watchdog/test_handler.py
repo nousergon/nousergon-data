@@ -23,6 +23,7 @@ import pytest
 _lib_pkg = types.ModuleType("alpha_engine_lib")
 _tc_mod = types.ModuleType("alpha_engine_lib.trading_calendar")
 _tc_mod.last_closed_trading_day = MagicMock()
+_tc_mod.previous_trading_day = MagicMock()
 _alerts_mod = types.ModuleType("alpha_engine_lib.alerts")
 _alerts_mod.publish = MagicMock()
 _lib_pkg.trading_calendar = _tc_mod
@@ -49,6 +50,8 @@ def _reset_lib_mocks():
     side_effects don't leak."""
     _tc_mod.last_closed_trading_day.reset_mock()
     _tc_mod.last_closed_trading_day.side_effect = None
+    _tc_mod.previous_trading_day.reset_mock()
+    _tc_mod.previous_trading_day.side_effect = None
     _alerts_mod.publish.reset_mock()
     _alerts_mod.publish.side_effect = None
     _alerts_mod.publish.return_value = _make_publish_result(sns_ok=True, telegram_ok=True)
@@ -276,6 +279,8 @@ def test_handler_on_trading_day_checks_weekday_and_eod_skips_saturday():
         date(2026, 5, 26),  # pre-open call at now
         date(2026, 5, 27),  # synthetic 22:00 UTC call → returns today
     ]
+    # EOD window calc: previous_trading_day(2026-05-27) → 2026-05-26 (Tue)
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 26)
     now = _frozen_now(2026, 5, 27, 14, 0)
 
     # Mock boto3.client to return our fake client (no executions = alerts)
@@ -363,6 +368,7 @@ def test_handler_propagates_listexecutions_error_for_lambda_retry():
         date(2026, 5, 26),
         date(2026, 5, 27),
     ]
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 26)
     now = _frozen_now(2026, 5, 27, 14, 0)
 
     failing_client = MagicMock()
@@ -376,3 +382,141 @@ def test_handler_propagates_listexecutions_error_for_lambda_retry():
 
         with pytest.raises(RuntimeError, match="IAM denied"):
             index.handler({}, None)
+
+
+# ── _eod_window_seconds — trading-day-aware EOD window ──────────────────
+#
+# Codified after the 2026-05-26 morning false-positive Telegram alert:
+# the watchdog fires at 14:00 UTC, but today's EOD SF doesn't fire until
+# ~20:00 UTC (after market close at 13:00 PT + daemon shutdown). So the
+# most recent EXPECTED EOD at watchdog firing time is the PREVIOUS trading
+# day's, NOT the previous 24h of calendar time. After a holiday weekend
+# (Fri close → Mon holiday → Tue 14:00 UTC watchdog), the gap is ~66h,
+# not 24h. ``_eod_window_seconds`` returns the correct trading-day-aware
+# window so EOD's Tuesday-post-Memorial-Day check correctly captures
+# Friday's EOD execution.
+
+
+def test_eod_window_seconds_normal_wed_after_tue():
+    """Wed 14:00 UTC, prev_trading_day=Tue. Gap from Tue 20:00 UTC to
+    Wed 14:00 UTC = 18h. Window = 18h + 1h slack = 19h."""
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 26)  # Tue
+    now = datetime(2026, 5, 27, 14, 0, tzinfo=timezone.utc)  # Wed
+    seconds = index._eod_window_seconds(now)
+    assert seconds == 18 * 3600 + 3600  # 19h
+
+
+def test_eod_window_seconds_tue_post_memorial_day_holiday():
+    """Tue 2026-05-26 14:00 UTC. Memorial Day (Mon 5/25) was a holiday;
+    prev_trading_day = Fri 5/22. Gap from Fri 20:00 UTC to Tue 14:00 UTC
+    = (4 calendar days * 24h) - 6h = 90h. Window = 90h + 1h slack = 91h.
+    **This is the 2026-05-26 morning incident** — the false-positive
+    Telegram alert was caused by the prior hardcoded 24h calendar window
+    failing to include Fri's EOD execution."""
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)  # Fri (Mon was holiday)
+    now = datetime(2026, 5, 26, 14, 0, tzinfo=timezone.utc)  # Tue post-holiday
+    seconds = index._eod_window_seconds(now)
+    assert seconds == 90 * 3600 + 3600  # 91h
+
+
+def test_eod_window_seconds_mon_after_normal_weekend():
+    """Mon 14:00 UTC after a normal weekend. prev_trading_day = Fri.
+    Gap from Fri 20:00 UTC to Mon 14:00 UTC = (3 days * 24h) - 6h = 66h.
+    Window = 67h. Catches Fri's EOD."""
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 29)  # Fri
+    now = datetime(2026, 6, 1, 14, 0, tzinfo=timezone.utc)  # Mon
+    seconds = index._eod_window_seconds(now)
+    assert seconds == 66 * 3600 + 3600  # 67h
+
+
+def test_eod_window_seconds_clamps_negative_gap_to_slack():
+    """Defensive: if prev_eod_expected somehow lands after now_utc
+    (synthetic test input), window collapses to slack only — never goes
+    negative."""
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 27)  # Wed (same as now)
+    now = datetime(2026, 5, 27, 10, 0, tzinfo=timezone.utc)  # Wed 10:00 UTC, prev_eod is "today" 20:00 UTC
+    # Gap = 10:00 - 20:00 = -10h → clamped to 0, window = 0 + 1h slack = 3600s
+    seconds = index._eod_window_seconds(now)
+    assert seconds == 3600
+
+
+# ── handler integration: post-holiday EOD captures previous Fri's EOD ──
+
+
+def test_handler_post_holiday_eod_does_not_false_alert():
+    """Tue 2026-05-26 14:00 UTC after Memorial Day Mon 5/25. EOD SF's
+    last expected firing was Fri 5/22 ~20:00 UTC (~66h ago). With the
+    trading-day-aware window, the watchdog should NOT alert when Friday's
+    EOD execution is visible in the 67h window. Regression guard for the
+    2026-05-26 morning false-positive Telegram alert."""
+    # is_trading_day_now: today (Tue 5/26) IS a trading day
+    _tc_mod.last_closed_trading_day.side_effect = [
+        date(2026, 5, 22),  # at 14:00 UTC pre-open, last close was Fri (Mon was holiday)
+        date(2026, 5, 26),  # synthetic 22:00 UTC post-close, today is the session
+    ]
+    # EOD prev_trading_day → Fri 5/22
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
+    now = _frozen_now(2026, 5, 26, 14, 0)
+
+    # Fri 5/22 20:30 UTC EOD execution exists in S3 — i.e., in our mock
+    fri_eod_start = datetime(2026, 5, 22, 20, 30, tzinfo=timezone.utc)
+    # Weekday SF: today's 12:45 UTC execution (so weekday check also clears)
+    today_weekday_start = datetime(2026, 5, 26, 12, 45, tzinfo=timezone.utc)
+    fake_client = _make_sfn_client({
+        EOD_ARN: [{"startDate": fri_eod_start}],
+        WKD_ARN: [{"startDate": today_weekday_start}],
+    })
+
+    with patch("index.datetime") as mock_dt, patch("index.boto3") as mock_boto3:
+        mock_dt.now.return_value = now
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        mock_boto3.client.return_value = fake_client
+
+        summary = index.handler({}, None)
+
+    by_label = {c["sf_label"]: c for c in summary["checks"]}
+    # EOD should be CLEAR (>=1 execution in 67h window catches Fri's EOD)
+    assert by_label["EOD SF"]["checked"] is True
+    assert by_label["EOD SF"]["alert_emitted"] is False, (
+        f"EOD watchdog should not false-alert on Tue post-Memorial-Day "
+        f"when Fri's EOD is visible in the trading-day-aware window. "
+        f"Got: {by_label['EOD SF']}"
+    )
+    # Weekday should also be clear (today's 12:45 UTC execution visible in 24h window)
+    assert by_label["Weekday SF"]["alert_emitted"] is False
+
+
+def test_handler_post_holiday_eod_alerts_when_friday_eod_missing():
+    """Same Tue post-Memorial-Day setup, but Fri's EOD did NOT execute
+    (genuine outage). With 0 executions in the 67h window, watchdog
+    correctly fires. Trading-day-aware window doesn't HIDE genuine
+    outages — it just stops the false-positives."""
+    _tc_mod.last_closed_trading_day.side_effect = [
+        date(2026, 5, 22),
+        date(2026, 5, 26),
+    ]
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
+    now = _frozen_now(2026, 5, 26, 14, 0)
+
+    # NO EOD execution; Weekday execution exists so only EOD alerts
+    today_weekday_start = datetime(2026, 5, 26, 12, 45, tzinfo=timezone.utc)
+    fake_client = _make_sfn_client({
+        EOD_ARN: [],  # genuine outage
+        WKD_ARN: [{"startDate": today_weekday_start}],
+    })
+
+    with patch("index.datetime") as mock_dt, patch("index.boto3") as mock_boto3:
+        mock_dt.now.return_value = now
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        mock_boto3.client.return_value = fake_client
+
+        summary = index.handler({}, None)
+
+    by_label = {c["sf_label"]: c for c in summary["checks"]}
+    assert by_label["EOD SF"]["alert_emitted"] is True, (
+        "EOD watchdog must still alert on a GENUINE missed firing — "
+        "the trading-day-aware window must not paper over real outages."
+    )
+    assert by_label["Weekday SF"]["alert_emitted"] is False
