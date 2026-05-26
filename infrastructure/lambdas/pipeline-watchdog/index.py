@@ -24,8 +24,17 @@ plan doc §3.5.
 
   - **EOD SF** (``alpha-engine-eod-pipeline``)
       Watch-day: same condition as Weekday — EOD fires after the trading
-      day's daemon shutdown, which only happens on trading days. Alert if
-      0 executions started in the last 24h.
+      day's daemon shutdown, which only happens on trading days. Window
+      is TRADING-DAY-AWARE, NOT a fixed 24h calendar window: today's EOD
+      fires ~20:00 UTC (post market close at 13:00 PT + daemon shutdown),
+      which is AFTER the watchdog's 14:00 UTC cron firing — so the most
+      recent EXPECTED EOD execution is the PREVIOUS trading day's. The
+      window starts at ``previous_trading_day(today) @ 20:00 UTC`` +
+      slack. After a holiday weekend (Fri close → Mon holiday → Tue
+      watchdog) the gap is ~66h, not 24h. Alert if 0 executions started
+      in that window. See ``_eod_window_seconds`` for the derivation and
+      the 2026-05-26 morning false-positive Telegram alert that drove
+      this fix.
 
   - **Saturday SF** (``alpha-engine-saturday-pipeline``)
       Watch-day: TODAY is Sunday (weekday 6) — Saturday SF fires at 09:00
@@ -75,7 +84,10 @@ from typing import Optional
 import boto3
 
 from alpha_engine_lib import alerts
-from alpha_engine_lib.trading_calendar import last_closed_trading_day
+from alpha_engine_lib.trading_calendar import (
+    last_closed_trading_day,
+    previous_trading_day,
+)
 
 
 logger = logging.getLogger()
@@ -104,9 +116,80 @@ WATCHDOG_SNS_TOPIC_ARN = os.environ.get(
     f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:alpha-engine-watchdog-alerts",
 )
 
-# Per-SF expected-window seconds. EOD + Weekday fire daily, Saturday weekly.
-WINDOW_SECONDS_DAILY = 24 * 3600  # 86_400
-WINDOW_SECONDS_WEEKLY = 7 * 24 * 3600  # 604_800
+# Per-SF expected-window seconds. Weekday cron fires at 12:45 UTC, which
+# is BEFORE the watchdog's 14:00 UTC cron firing, so a 24h calendar window
+# correctly captures today's expected weekday execution. Saturday cron
+# fires at 09:00 UTC Sat, watchdog runs Sundays at 14:00 UTC → 7d calendar
+# window correctly captures that Saturday firing.
+#
+# EOD SF is the exception — it fires AFTER market close (~20:00 UTC)
+# which is AFTER the watchdog's 14:00 UTC firing today, so the most
+# recent EXPECTED EOD execution at watchdog time is the PREVIOUS
+# trading day's EOD. After a holiday weekend (Fri close → Mon holiday →
+# Tue 14:00 UTC watchdog), that gap is ~66h, not 24h. EOD uses
+# ``_eod_window_seconds`` instead of a constant.
+WINDOW_SECONDS_DAILY = 24 * 3600  # 86_400 — Weekday SF
+WINDOW_SECONDS_WEEKLY = 7 * 24 * 3600  # 604_800 — Saturday SF
+
+# EOD window slack — added to the gap-to-previous-trading-day-EOD so a
+# late EOD firing (daemon shut down slightly later than the nominal time)
+# or clock skew between watchdog + SF control plane doesn't false-positive
+# on the boundary.
+EOD_WINDOW_SLACK_SECONDS = 3600  # 1 hour
+
+# Nominal expected EOD firing time in UTC. Daemon shuts down ~13:15 PT
+# after the 13:00 PT (US market close), which is ~20:15 UTC during PDT.
+# A wider window via SLACK above absorbs the ~30 min spread.
+EOD_EXPECTED_UTC_HOUR = 20
+
+
+def _eod_window_seconds(now_utc: datetime) -> int:
+    """EOD SF runs after the trading day's market close (~20:00 UTC). At
+    the watchdog's 14:00 UTC firing time the most recent EXPECTED EOD
+    execution is the PREVIOUS trading day's EOD (today's hasn't fired
+    yet — it will fire ~6h after the watchdog runs).
+
+    Window start = previous_trading_day(today) @ ``EOD_EXPECTED_UTC_HOUR``.
+    Window seconds = ``now - window_start + slack``.
+
+    Examples:
+      - Wed 14:00 UTC, post-normal-Tue:
+          prev_td = Tue, prev_eod_expected = Tue 20:00 UTC,
+          gap = 18h, window = 18h + 1h slack = 19h.
+      - Tue 14:00 UTC, post-Memorial-Mon-holiday:
+          prev_td = Fri (because Mon was holiday), prev_eod_expected =
+          Fri 20:00 UTC, gap = 4 days × 24h − 6h = 90h, window = 90h +
+          1h slack = 91h.
+      - Mon 14:00 UTC after normal weekend:
+          prev_td = Fri, prev_eod_expected = Fri 20:00 UTC, gap = 3
+          days × 24h − 6h = 66h, window = 67h. (No false alert on
+          Monday morning post-weekend.)
+
+    Why this is the right cutover rather than "always use a 24h window
+    that we extend on holidays": the watchdog's purpose is to detect a
+    missing EXPECTED firing. The expectation is set by NYSE's session
+    calendar, not by clock arithmetic. A 24h window encodes "we expect a
+    daily firing" but the firing isn't daily on weekends and holidays.
+    Pulling the window start from ``previous_trading_day`` makes the
+    encoded expectation match the actual schedule — which is exactly
+    what ``feedback_dual_source_audit_must_assess_every_downstream_consumer``
+    + ``feedback_no_silent_fails`` argue for at substrate level.
+    """
+    prev_td = previous_trading_day(now_utc.date())
+    # Construct the previous-trading-day EOD-expected timestamp via
+    # ``now_utc.replace`` + ``timedelta`` (avoids ``datetime.combine``,
+    # which the existing test pattern's ``patch("index.datetime")`` mock
+    # doesn't proxy through to the real classmethod).
+    days_back = (now_utc.date() - prev_td).days
+    prev_eod_expected = now_utc.replace(
+        hour=EOD_EXPECTED_UTC_HOUR, minute=0, second=0, microsecond=0
+    ) - timedelta(days=days_back)
+    gap_seconds = int((now_utc - prev_eod_expected).total_seconds())
+    # Defensive: if the gap somehow goes negative (e.g., a future test
+    # passing a now_utc earlier than prev_eod_expected), clamp to the slack
+    # so the window is at least non-zero and we don't ListExecutions with
+    # a negative timedelta.
+    return max(gap_seconds, 0) + EOD_WINDOW_SLACK_SECONDS
 
 # Status filter for "real" executions — anything that actually started.
 # FAILED / TIMED_OUT / ABORTED executions still START the SF — what
@@ -202,7 +285,13 @@ def _count_executions_in_window(
                 start = exec_row.get("startDate")
                 if start is None:
                     continue
-                if not isinstance(start, datetime):
+                # Duck-type: ListExecutions returns boto3 datetime objects
+                # with tzinfo+astimezone. Skip anything that's not datetime-
+                # shaped (defensive against missing-field edge cases). Use
+                # ``hasattr`` rather than ``isinstance(start, datetime)`` so
+                # tests can patch ``index.datetime`` without false-tripping
+                # the typecheck (MagicMock isn't a type).
+                if not hasattr(start, "astimezone"):
                     continue
                 start_utc = (
                     start.astimezone(timezone.utc)
@@ -330,7 +419,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             "today is not a NYSE trading day (weekend / holiday) per "
             "alpha_engine_lib.trading_calendar"
         ),
-        window_seconds=WINDOW_SECONDS_DAILY,
+        # Trading-day-aware: previous_trading_day-based, NOT a 24h calendar
+        # window. Today's EOD fires ~20:00 UTC (after market close + daemon
+        # shutdown); watchdog runs 14:00 UTC, so the most recent EXPECTED
+        # EOD is the PREVIOUS trading day's. After a holiday weekend (Fri
+        # close → Mon holiday → Tue 14:00 UTC watchdog) the gap is ~66h,
+        # not 24h — see ``_eod_window_seconds`` for derivation. Closes the
+        # 2026-05-26 morning false-positive Telegram alert ("EOD SF has
+        # not executed in the last 24 hours") on the first trading day
+        # after Memorial Day.
+        window_seconds=_eod_window_seconds(now_utc),
     )
     saturday = _check_sf(
         sf_label="Saturday SF",
