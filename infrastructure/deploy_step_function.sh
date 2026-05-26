@@ -149,25 +149,50 @@ else
 fi
 echo "  State machine ARN: $SM_ARN"
 
-# ── 4. EventBridge Rule ────────────────────────────────────────────────────
+# ── 4. EventBridge Rule + Targets — CFN-CANONICAL ──────────────────────────
+#
+# This script no longer writes the EventBridge rule or its targets;
+# both are codified in
+# infrastructure/cloudformation/alpha-engine-orchestration.yaml as the
+# single source of truth.
+#
+# WHY (2026-05-26): PR #317 added a put-targets call here AND left the
+# CFN ``Targets:`` block intact, so the alpha-engine-saturday rule
+# (and its weekday sibling) carried TWO targets — Id="1" from this
+# script + Id="saturday-pipeline" from CFN. EventBridge dispatched
+# every weekday cron firing to BOTH targets, fanning the cron into two
+# parallel SF executions on the same trading instance. Both ran
+# MorningEnrich → both connected ArcticDB → 321 unique-symbol
+# E_NON_INCREASING_INDEX_VERSION races → the 5%-threshold daily_append
+# gate hard-failed both runs at 35.6% error rate (905 tickers,
+# n_err=322). Trading didn't happen on 5/26.
+#
+# The substrate gate that prevents recurrence is
+# ``tests/test_deploy_step_function_eventbridge_input.py``::
+#   - ``TestDeployScriptsHaveNoEventBridgeWrites`` (this script must
+#     not contain ``aws events put-rule`` or ``aws events put-targets``)
+#   - ``TestCFNTargetUniqueness`` (each cron rule has exactly 1 target
+#     in the CFN template)
+#
+# Operators applying EventBridge changes:
+#
+#   aws cloudformation deploy \
+#     --template-file infrastructure/cloudformation/alpha-engine-orchestration.yaml \
+#     --stack-name alpha-engine-orchestration \
+#     --parameter-overrides ...
+#
+# This script's remaining responsibility is the SF state machine JSON
+# (upload to S3 + update-state-machine), plus the bootstrap IAM role
+# the CFN template's EventBridgeSfnRoleArn parameter references
+# (kept here so a fresh region/account can still be bootstrapped via
+# this script alone; idempotent ``|| true`` on re-runs).
+#
+# IAM bootstrap: trust policy + role creation only. The role's INLINE
+# policy is codified in the alpha-engine repo's
+# infrastructure/iam/ directory and applied via that repo's apply.sh —
+# do NOT add inline-policy writes here (per the dual-writer incident
+# 2026-04-21/05-04/05-06 documented above the IAM block historically).
 
-echo "Creating EventBridge rule: $EVENTBRIDGE_RULE..."
-
-aws events put-rule \
-  --name "$EVENTBRIDGE_RULE" \
-  --schedule-expression "cron(0 9 ? * SAT *)" \
-  --state ENABLED \
-  --description "Saturday 09:00 UTC (02:00 AM PT Sat) — triggers full Alpha Engine pipeline. Schedule chosen so polygon's Friday daily aggregate has settled (T+1 lag) before MorningEnrich + DataPhase1 fetch it." \
-  --region "$REGION"
-
-# EventBridge needs a role to start Step Functions executions.
-# Trust policy + role creation kept here (one-time bootstrap); inline
-# policy is codified in this repo's infrastructure/iam/ directory
-# (alpha-engine-eventbridge-sfn-role.json). Apply via apply.sh, not
-# here. Prior inline block listed only the saturday SFN ARN — every
-# saturday deploy clobbered the weekday ARN that the daily script had
-# granted, breaking the next weekday auto-fire (recurred 2026-04-21,
-# 2026-05-04, 2026-05-06).
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
 EB_TRUST='{
   "Version": "2012-10-17",
@@ -185,41 +210,8 @@ aws iam create-role \
   --assume-role-policy-document "$EB_TRUST" \
   --region "$REGION" 2>/dev/null || true
 
-EB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EB_ROLE_NAME}"
-
-# The EventBridge target passes the execution input with EC2 instance ID and SNS topic.
-#
-# enable_standalone_scanner=true activates the L1995 Phase 2 Scanner SF state
-# (alpha-engine-research-scanner Lambda writes candidates.json in
-# parallel-observe mode). Set true from 2026-05-25 onward — the SF chain is
-# byte-identical to pre-Phase-2 except the new state writes an additional
-# S3 artifact at s3://alpha-engine-research/candidates/{run_date}/candidates.json.
-# Catch posture: scanner Lambda failure is non-blocking (routes to
-# CheckSkipRAGIngestion); the artifact is observe-only with no consumer
-# until L1995 Phase 4 wires RAGIngestion to read it. First soak cycle: Sat
-# 2026-05-30. Revert by flipping to false here + re-running this script,
-# OR by ad-hoc `aws events put-targets` with a fresh Input.
-INPUT_JSON=$(cat <<EOF
-{
-  "ec2_instance_id": ["$EC2_INSTANCE_ID"],
-  "sns_topic_arn": "$SNS_TOPIC_ARN",
-  "enable_standalone_scanner": true,
-  "pipeline_role": "weekly"
-}
-EOF
-)
-
-aws events put-targets \
-  --rule "$EVENTBRIDGE_RULE" \
-  --targets '[{
-    "Id": "1",
-    "Arn": "'"$SM_ARN"'",
-    "RoleArn": "'"$EB_ROLE_ARN"'",
-    "Input": '"$(echo "$INPUT_JSON" | python3 -c "import sys,json; print(json.dumps(json.dumps(json.load(sys.stdin))))")"'
-  }]' \
-  --region "$REGION"
-
-echo "  EventBridge rule: cron(0 9 ? * SAT *) -> $STATE_MACHINE_NAME"
+echo "  EventBridge rule + targets: managed by CFN orchestration template"
+echo "  EventBridge IAM role bootstrap: $EB_ROLE_NAME (idempotent)"
 
 # ── 5. Disable old crons (optional) ────────────────────────────────────────
 

@@ -103,46 +103,27 @@ fi
 echo "  State machine ARN: $SM_ARN"
 
 # ── EventBridge Rule ────────────────────────────────────────────────────────
+#
+# RULE + TARGETS ARE CFN-CANONICAL.
+#
+# This script no longer writes the EventBridge rule or its targets;
+# both are codified in
+# infrastructure/cloudformation/alpha-engine-orchestration.yaml as
+# the single source of truth. See the matching comment block in
+# infrastructure/deploy_step_function.sh for the 2026-05-26
+# duplicate-target incident that drove this consolidation, and for
+# the test chokepoints
+# (``TestDeployScriptsHaveNoEventBridgeWrites``,
+# ``TestCFNTargetUniqueness``) that fail CI on regression.
+#
+# Operators applying EventBridge changes run:
+#
+#   aws cloudformation deploy \
+#     --template-file infrastructure/cloudformation/alpha-engine-orchestration.yaml \
+#     --stack-name alpha-engine-orchestration \
+#     --parameter-overrides ...
 
-echo "Creating EventBridge rule: $EVENTBRIDGE_RULE..."
-
-# 13:00 UTC = 6:00 AM PT (Mon-Fri)
-aws events put-rule \
-  --name "$EVENTBRIDGE_RULE" \
-  --schedule-expression "cron(0 13 ? * MON-FRI *)" \
-  --state ENABLED \
-  --description "Weekday 13:00 UTC (6:00 AM PT) — daily data + predictor + executor start" \
-  --region "$REGION"
-
-# Reuse EventBridge role from Saturday pipeline.
-# IAM policy on this role is codified in alpha-engine/infrastructure/iam/
-# (alpha-engine-eventbridge-sfn-role/) — apply via `apply.sh` from that
-# repo, not inline here. The previous inline block on this script + the
-# saturday script wrote the same role policy with different ARN sets and
-# clobbered each other; the saturday-only write hit prod three times
-# (2026-04-21, 2026-05-04, 2026-05-06) before the role was codified.
-EB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-eventbridge-sfn-role"
-
-INPUT_JSON=$(cat <<EOF
-{
-  "trading_instance_id": ["$TRADING_INSTANCE"],
-  "sns_topic_arn": "$SNS_TOPIC_ARN",
-  "pipeline_role": "daily"
-}
-EOF
-)
-
-aws events put-targets \
-  --rule "$EVENTBRIDGE_RULE" \
-  --targets '[{
-    "Id": "1",
-    "Arn": "'"$SM_ARN"'",
-    "RoleArn": "'"$EB_ROLE_ARN"'",
-    "Input": '"$(echo "$INPUT_JSON" | python3 -c "import sys,json; print(json.dumps(json.dumps(json.load(sys.stdin))))")"'
-  }]' \
-  --region "$REGION"
-
-echo "  EventBridge rule: cron(0 13 ? * MON-FRI *) -> $STATE_MACHINE_NAME"
+echo "  EventBridge rule: managed by CFN orchestration template (see comment above)"
 
 # ── Disable old rules (optional) ───────────────────────────────────────────
 

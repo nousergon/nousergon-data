@@ -125,6 +125,16 @@ Resources:
       ScheduleExpression: 'cron(0 9 ? * SAT *)'
       State: ENABLED
       Targets:
+        # SINGLE TARGET PER RULE. EventBridge dispatches the cron event
+        # to every target on a rule; a duplicate target ID fans the
+        # trigger to two parallel SF executions. The Tuesday 5/26
+        # weekday-pipeline failure (321 E_NON_INCREASING_INDEX_VERSION
+        # ArcticDB races during MorningEnrich) was caused by exactly
+        # that — PR #317 added a parallel target via the deploy script
+        # alongside this CFN target. The substrate gate is the
+        # TestCFNTargetUniqueness chokepoint, which fails CI if any
+        # cron rule grows a second target. SoT for this rule is THIS
+        # FILE; the deploy scripts no longer touch EventBridge.
         - Id: saturday-pipeline
           Arn: !Ref SaturdayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
@@ -135,10 +145,21 @@ Resources:
           # Ad-hoc operator launches MUST set their own pipeline_role
           # (smoke / recovery / backfill / operator-replay) per the
           # taxonomy in pipeline-reporting-revamp-260524.md §6.
+          #
+          # enable_standalone_scanner=true activates the L1995 Phase 2
+          # Scanner SF state (alpha-engine-research-scanner Lambda
+          # writes candidates.json in parallel-observe mode). Set true
+          # from 2026-05-25 onward (originally in deploy_step_function.sh
+          # via PR #313; migrated here 2026-05-26 in the EB-target
+          # single-SoT PR — keeping the flag on the SCRIPT meant
+          # re-deploying CFN silently flipped it off). Revert by
+          # flipping to false here in the same PR that updates
+          # ``tests/test_deploy_step_function_eventbridge_input.py``.
           Input: !Sub |
             {
               "ec2_instance_id": ["${MicroInstanceId}"],
               "sns_topic_arn": "${AlertsTopic}",
+              "enable_standalone_scanner": true,
               "pipeline_role": "weekly"
             }
 
@@ -181,6 +202,8 @@ Resources:
       ScheduleExpression: 'cron(45 20 ? * FRI *)'
       State: DISABLED
       Targets:
+        # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
+        # comment for the 2026-05-26 duplicate-target incident.
         - Id: friday-shell-run
           Arn: !Ref SaturdayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
@@ -218,6 +241,10 @@ Resources:
       ScheduleExpression: 'cron(45 12 ? * MON-FRI *)'
       State: ENABLED
       Targets:
+        # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
+        # comment for the 2026-05-26 duplicate-target incident that
+        # codified this invariant. SoT for this rule is THIS FILE;
+        # the deploy scripts no longer touch EventBridge.
         - Id: weekday-pipeline
           Arn: !Ref WeekdayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
