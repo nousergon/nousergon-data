@@ -621,6 +621,127 @@ def _detect_chronic_gap_polygon_recovery(
     return summary
 
 
+def _detect_chronic_gap_constituents_drift(
+    bucket: str,
+    chronic_tickers: list[str],
+) -> dict:
+    """Drift alarm: detect when a chronic_polygon_gaps allowlist ticker has
+    dropped out of the current S&P 500/400 constituents set.
+
+    Pairs with ``_self_heal_chronic_polygon_gaps`` and serves as the GATE
+    on its inputs — non-constituent tickers are filtered out before any
+    yfinance fetch or ``backfill(ticker_filter=...)`` call so the heal
+    path never hands a non-constituent ticker to the constituents-filtered
+    backfill writer (which hard-errs per ``builders/backfill.py``).
+
+    Mirrors :func:`_detect_chronic_gap_polygon_recovery` on the inverse
+    axis. The polygon-recovery detector catches the "polygon now serves
+    this — remove from allowlist" direction; this detector catches the
+    "ticker no longer a constituent — remove from allowlist" direction.
+
+    Origin: 2026-05-27 flow-doctor ERROR "Ticker PSTG not found in
+    universe" — PSTG dropped from S&P 500/400 constituents between the
+    5/16 and 5/23 weekly partitions (REMOVED cohort = {BK, FLO, PSTG};
+    see config private-docs/ROADMAP.md L1772) but stayed in the
+    chronic_polygon_gaps allowlist. MorningEnrich yfinance-backfilled
+    PSTG.parquet then called ``backfill(ticker_filter='PSTG')``, which
+    hard-erred against the constituents filter. The polygon-recovery
+    drift detector was the existing axis; this is the missing inverse
+    axis.
+
+    Reads the current constituents via the shared chokepoint
+    :func:`builders._constituents_loader.load_constituents_for_run_date`
+    (no ``run_date`` argument → pointer-following ad-hoc read, which is
+    the correct read for a MorningEnrich-time check between Saturday SFs).
+
+    Emits a CloudWatch gauge
+    ``AlphaEngine/Data/chronic_gap_non_constituent_count`` for alarming.
+
+    Best-effort: a constituents read failure logs a WARN and returns
+    ``status='skipped'`` with the full chronic list as ``still_constituents``
+    so the caller falls through to the existing behavior (the original
+    hard-err at backfill is then the load-bearing surface). Never raises.
+
+    Returns
+    -------
+    dict
+        ``{"status": "ok"|"skipped", "chronic_tickers_checked": int,
+           "still_constituents": list[str], "dropped_non_constituent": list[str],
+           "weekly_date": str|None, "errors": list[dict]}``
+    """
+    summary: dict = {
+        "status": "ok",
+        "chronic_tickers_checked": len(chronic_tickers),
+        "still_constituents": list(chronic_tickers),
+        "dropped_non_constituent": [],
+        "weekly_date": None,
+        "errors": [],
+    }
+    if not chronic_tickers:
+        return summary
+
+    try:
+        from builders._constituents_loader import load_constituents_for_run_date
+        s3 = boto3.client("s3")
+        constituents_set, weekly_date = load_constituents_for_run_date(s3, bucket)
+        summary["weekly_date"] = weekly_date
+    except Exception as exc:
+        logger.warning(
+            "chronic-gap constituents-drift check: could not load current "
+            "constituents — drift gate skipped this cycle, all %d chronic "
+            "ticker(s) will proceed to self-heal. %s",
+            len(chronic_tickers), exc,
+        )
+        summary["status"] = "skipped"
+        summary["errors"].append({"reason": str(exc)})
+        return summary
+
+    still: list[str] = []
+    dropped: list[str] = []
+    for ticker in chronic_tickers:
+        if ticker in constituents_set:
+            still.append(ticker)
+        else:
+            dropped.append(ticker)
+
+    summary["still_constituents"] = still
+    summary["dropped_non_constituent"] = dropped
+
+    if dropped:
+        logger.warning(
+            "chronic-gap constituents drift detected: %d chronic_polygon_gaps "
+            "ticker(s) no longer in current constituents (%s, weekly=%s): %s. "
+            "These will be SKIPPED by self-heal — prune from "
+            "alpha-engine-config/data/config.yaml chronic_polygon_gaps.tickers "
+            "to silence this WARN.",
+            len(dropped), bucket, weekly_date, dropped,
+        )
+    else:
+        logger.info(
+            "chronic-gap constituents drift: %d of %d chronic tickers still "
+            "in current constituents (weekly=%s) — allowlist coherent.",
+            len(still), len(chronic_tickers), weekly_date,
+        )
+
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "chronic_gap_non_constituent_count",
+                "Value": float(len(dropped)),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "chronic_gap_non_constituent_count metric emit failed: %s — "
+            "drift alarm cadence may degrade until next cycle.", exc,
+        )
+
+    return summary
+
+
 def _self_heal_chronic_polygon_gaps(
     bucket: str,
     target_date: str,
@@ -1030,6 +1151,29 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         except Exception as e:
             logger.warning("Chronic-gap drift detection failed (non-blocking): %s", e)
             results["collectors"]["chronic_gap_drift_detection"] = {
+                "status": "skipped",
+                "error": str(e),
+            }
+
+        # Drift GATE: filter out chronic tickers that have dropped out of
+        # the current constituents set. The heal path ends in
+        # ``backfill(ticker_filter=...)``, which hard-errs against the
+        # constituents filter for non-constituents (2026-05-27 PSTG
+        # flow-doctor alert origin). Filtering here closes the loop so a
+        # config that lags a constituents change becomes a WARN + skip
+        # instead of a hard ERROR. Best-effort — a read failure falls
+        # through with the original list and the existing backfill-side
+        # error remains the load-bearing surface.
+        try:
+            cdrift_result = _detect_chronic_gap_constituents_drift(
+                bucket=bucket,
+                chronic_tickers=chronic_tickers,
+            )
+            results["collectors"]["chronic_gap_constituents_drift"] = cdrift_result
+            chronic_tickers = cdrift_result["still_constituents"]
+        except Exception as e:
+            logger.warning("Chronic-gap constituents drift check failed (non-blocking): %s", e)
+            results["collectors"]["chronic_gap_constituents_drift"] = {
                 "status": "skipped",
                 "error": str(e),
             }
