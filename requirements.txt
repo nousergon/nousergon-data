@@ -23,5 +23,10 @@ arcticdb>=6.11
 # ``collectors/nlp/event_extraction.py``'s news-article event-extraction
 # LLM calls into the cost-telemetry stream (highest-volume previously-
 # untracked site at ~100–300 Haiku calls/wk during RAGIngestion).
+# v0.38.0 adds the ``locks`` submodule
+# (``universe_writer_lock`` S3-conditional-PUT primitive) consumed by
+# ``builders/daily_append.py`` for the producer-side single-writer
+# invariant (ROADMAP L286). Gated default-OFF via
+# ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.33.0
+alpha-engine-lib[arcticdb,flow_doctor,rag] @ git+https://github.com/cipher813/alpha-engine-lib@v0.38.0
