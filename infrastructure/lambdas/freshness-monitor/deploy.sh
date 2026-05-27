@@ -63,7 +63,7 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler syntax + run unit tests --------------------------
+# ----- 0a. Syntax-check handler (no imports — works on bare python) --------
 
 python3 -c "
 import ast
@@ -72,12 +72,7 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
-
-# ----- 0b. Validate registry locally before upload --------------------------
+# ----- 0b. Verify ae-config clone present (registry validation runs later) -
 
 if [[ ! -f "${REGISTRY_LOCAL}" ]]; then
   echo "❌ Registry not found at ${REGISTRY_LOCAL}"
@@ -91,20 +86,41 @@ if [[ ! -f "${REGISTRY_VALIDATOR}" ]]; then
   exit 1
 fi
 
-echo "Validating registry locally before upload..."
-python3 "${REGISTRY_VALIDATOR}" --registry "${REGISTRY_LOCAL}"
-
-# ----- 1. Package: pip install deps + zip handler ---------------------------
+# ----- 1. Package: pip install runtime deps into $PKG ----------------------
 
 PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
-echo "Installing deps into ${PKG} (pip install -t)..."
+echo "Installing runtime deps into ${PKG} (pip install -t)..."
 python3 -m pip install \
   --quiet \
   --target "${PKG}" \
   --upgrade \
   -r "${SCRIPT_DIR}/requirements.txt"
+
+# ----- 1a. Validate registry locally before upload --------------------------
+# Runs AFTER step 1's pip install — the validator imports yaml which isn't
+# guaranteed in the caller's bare python. PYTHONPATH=$PKG resolves it.
+
+echo "Validating registry locally before upload..."
+PYTHONPATH="${PKG}" python3 "${REGISTRY_VALIDATOR}" --registry "${REGISTRY_LOCAL}"
+
+# ----- 1b. Preflight handler unit tests with runtime deps available --------
+# Runs AFTER step 1's pip install so the test's `import index` succeeds
+# (index imports yaml + boto3 + alpha_engine_lib.{alerts,artifact_freshness}
+# — none of which are guaranteed in the caller's bare python). pytest +
+# its deps install into $TEST_DEPS (separate from $PKG) so they don't
+# get bundled into the Lambda zip.
+
+if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  echo "Installing pytest into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
+  echo "Running handler unit tests (PYTHONPATH=${PKG}:${TEST_DEPS})..."
+  PYTHONPATH="${PKG}:${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+fi
+
+# ----- 1c. Copy handler + zip Lambda package -------------------------------
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 ZIP="${PKG}/function.zip"
