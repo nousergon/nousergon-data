@@ -561,6 +561,36 @@ def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
     return records
 
 
+_LOCK_ENV_VAR = "ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED"
+
+
+def _writer_lock_enabled(dry_run: bool) -> bool:
+    """True if the producer-side writer lock should fire for this call.
+
+    Default-OFF rollout: ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED`` must
+    be explicitly set to a truthy value. ``dry_run`` always bypasses the
+    lock because dry-run paths do not write to ArcticDB — locking them
+    would block legitimate concurrent dry-runs (e.g. operator inspection
+    while the Saturday SF is running).
+    """
+    if dry_run:
+        return False
+    return os.environ.get(_LOCK_ENV_VAR, "").lower() in ("1", "true", "yes")
+
+
+def _build_writer_id() -> str:
+    """Compose a process-identifying writer_id for the lock body.
+
+    Pattern: ``daily_append-{user}-pid{pid}``. The user and pid let the
+    operator recognize the holder when inspecting the lock object
+    (``aws s3 cp s3://alpha-engine-research/locks/universe-writer.lock -``)
+    or reading a ``LockHeldByAnotherWriterError`` from a failed
+    acquisition.
+    """
+    user = os.environ.get("USER", "unknown")
+    return f"daily_append-{user}-pid{os.getpid()}"
+
+
 def daily_append(
     date_str: str | None = None,
     bucket: str = DEFAULT_BUCKET,
@@ -576,6 +606,23 @@ def daily_append(
     2. Append today's OHLCV row
     3. Compute features for the combined series
     4. Extract the last row (today) and append to ArcticDB
+
+    **Producer-side write-coordination lock.** When
+    ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED=true`` is in the
+    environment, this function acquires the
+    :func:`alpha_engine_lib.locks.universe_writer_lock` at the top of
+    the call and releases it on exit. The lock closes the
+    manual-invocation half of the single-writer-per-resource invariant
+    (forensic / backfill / dev shells running ``python -m
+    builders.daily_append`` that bypass the SF entirely). The SF-entry
+    half lives in the L274 MutualExclusionGuard (DynamoDB-side).
+    Default-OFF for safe rollout — flip the env var to ``true`` after
+    one clean weekday + Saturday cycle. ``dry_run=True`` always bypasses
+    the lock (read-only path, no race surface).
+
+    On lock contention, :exc:`alpha_engine_lib.locks.LockHeldByAnotherWriterError`
+    propagates to the caller — fail-loud per
+    ``~/Development/CLAUDE.md``'s no-silent-fails rule.
 
     Parameters
     ----------
@@ -615,6 +662,42 @@ def daily_append(
         the expected set.
 
     Returns summary dict.
+    """
+    if _writer_lock_enabled(dry_run):
+        from alpha_engine_lib.locks import universe_writer_lock
+
+        with universe_writer_lock(writer_id=_build_writer_id()):
+            return _daily_append_impl(
+                date_str=date_str,
+                bucket=bucket,
+                dry_run=dry_run,
+                skip_if_exists=skip_if_exists,
+                expected_tickers=expected_tickers,
+            )
+    return _daily_append_impl(
+        date_str=date_str,
+        bucket=bucket,
+        dry_run=dry_run,
+        skip_if_exists=skip_if_exists,
+        expected_tickers=expected_tickers,
+    )
+
+
+def _daily_append_impl(
+    date_str: str | None = None,
+    bucket: str = DEFAULT_BUCKET,
+    dry_run: bool = False,
+    skip_if_exists: bool = False,
+    expected_tickers: list[str] | None = None,
+) -> dict:
+    """Inner implementation of :func:`daily_append`.
+
+    Single-writer-lock semantics are provided by the outer
+    :func:`daily_append` wrapper; this function performs the actual
+    OHLCV + features write to ArcticDB. Callers should invoke
+    :func:`daily_append`, not this. Exists separately so the lock
+    wrap is a tiny diff and the existing 800-line body stays
+    structurally unchanged.
     """
     s3 = boto3.client("s3")
     date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
