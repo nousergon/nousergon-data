@@ -372,7 +372,23 @@ class TestStrictSuperset:
     """shell_run absent/false ⇒ byte-identical to the pre-spine Saturday run."""
 
     def test_initialize_input_routes_to_shell_run_gate(self, states):
-        assert states["InitializeInput"]["Next"] == "CheckShellRun"
+        # 2026-05-27: L274 SF MutualExclusionGuard inserted a CheckMutexRole
+        # Choice between InitializeInput and CheckShellRun. The strict-superset
+        # property holds because CheckMutexRole.Default → CheckShellRun (the
+        # bypass path that runs for any input without a cadence pipeline_role
+        # in {daily, weekly, eod, shell-run}), and AcquireMutex.Next →
+        # CheckShellRun (the cadence-role acquire path lands at the same
+        # downstream state). See tests/test_sf_mutex_wiring.py for the full
+        # mutex-chain contract.
+        assert states["InitializeInput"]["Next"] == "CheckMutexRole"
+        assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
+            "Mutex bypass path must route to CheckShellRun so the shell-run "
+            "chain remains a strict superset for non-cadence inputs"
+        )
+        assert states["AcquireMutex"]["Next"] == "CheckShellRun", (
+            "Mutex acquire path must also land at CheckShellRun so the "
+            "shell-run chain runs after a successful cadence acquire"
+        )
 
     def test_initialize_input_merge_expr_unchanged(self, states):
         # The run_date / sns_topic_arn defaults-under-input merge must be
@@ -871,12 +887,18 @@ class TestHappyPathTraversal:
         assert "WeeklySubstrateHealthCheck" in order
 
     def test_shell_run_absent_is_pre_keystone_path(self, sf, states):
+        # 2026-05-27: L274 mutex chain inserted CheckMutexRole between
+        # InitializeInput and CheckShellRun. With no pipeline_role on the
+        # input (the trace's default), CheckMutexRole.Default routes to
+        # CheckShellRun — same downstream chain as pre-mutex, with one
+        # extra Choice in the visited order.
         order, skipped = self._trace_main(sf, states, shell_run=False)
         assert "ApplyShellRunDefaults" not in order
         assert "NotifyShellRunComplete" not in order
         assert not skipped, "nothing skipped when shell_run absent"
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
             "MorningEnrich",

@@ -68,15 +68,25 @@ class TestChainOrdering:
     CheckSkipDataPhase1 → DataPhase1 (existing downstream unchanged)."""
 
     def test_initialize_input_routes_to_morning_enrich_skipgate(self, states):
-        # Post Friday-PM shell-run spine (feat/sf-friday-shell-run):
-        # InitializeInput now hands off to the CheckShellRun gate, whose
-        # Default is the pre-spine target CheckSkipMorningEnrich. The real
-        # Saturday run (no shell_run input) therefore still reaches the
-        # MorningEnrich skip-gate first — MorningEnrich still precedes
-        # DataPhase1. Strict superset: shell_run absent ⇒ unchanged.
-        assert states["InitializeInput"]["Next"] == "CheckShellRun", (
-            "InitializeInput must hand off to the shell-run gate, whose "
-            "Default preserves the pre-spine MorningEnrich skip-gate path."
+        # 2026-05-27: L274 SF MutualExclusionGuard inserted CheckMutexRole
+        # between InitializeInput and CheckShellRun. The strict-superset
+        # property still holds: CheckMutexRole.Default → CheckShellRun,
+        # whose Default is the pre-spine target CheckSkipMorningEnrich. The
+        # real Saturday run (no shell_run + with pipeline_role='weekly' that
+        # acquires the mutex; or any non-cadence role that bypasses) still
+        # reaches the MorningEnrich skip-gate first — MorningEnrich still
+        # precedes DataPhase1.
+        assert states["InitializeInput"]["Next"] == "CheckMutexRole", (
+            "InitializeInput now hands off to the L274 mutex gate; see "
+            "tests/test_sf_mutex_wiring.py for the mutex-chain contract"
+        )
+        assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
+            "Mutex bypass must route to CheckShellRun so the pre-mutex "
+            "downstream chain is byte-identical for operator/missing-role inputs"
+        )
+        assert states["AcquireMutex"]["Next"] == "CheckShellRun", (
+            "Mutex acquire path must also land at CheckShellRun so cadence "
+            "runs reach the same downstream chain after grabbing the mutex"
         )
         assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich", (
             "CheckShellRun.Default must be CheckSkipMorningEnrich so the "

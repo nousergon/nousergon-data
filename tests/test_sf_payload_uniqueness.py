@@ -399,6 +399,14 @@ class TestEODSFTopLevelFieldsClosed:
             "substrate_check_poll",
             "substrate_check_result",
             "trading_instance_id",
+            # L274 SF MutualExclusionGuard (2026-05-27) — CheckMutexRole
+            # reads $.pipeline_role; AcquireMutex emits $.mutex_result on
+            # success, $.mutex_conflict on ConditionalCheckFailed Catch,
+            # and $.mutex_error on the fail-open States.ALL Catch.
+            "mutex_conflict",
+            "mutex_error",
+            "mutex_result",
+            "pipeline_role",
         }
     )
 

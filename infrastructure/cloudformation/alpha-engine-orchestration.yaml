@@ -73,6 +73,46 @@ Resources:
       Protocol: email
       Endpoint: !Ref AlertEmail
 
+  # --------------------------------------------------------------------------
+  # DynamoDB — Step Function Execution Mutex (L274 SF MutualExclusionGuard)
+  # --------------------------------------------------------------------------
+  # Single-writer-per-cadence-cell invariant for the three Alpha Engine SFs.
+  # Closes the architectural hole that the L286a/b producer-side
+  # `universe_writer_lock` covers for manual `daily_append` invocations —
+  # that lock guards the data writer; this table guards the SF entry point.
+  # Together they cover both halves of "exactly one cron-fired execution of
+  # each SF per minute bucket."
+  #
+  # Trigger of record: the 2026-05-26 duplicate-EventBridge-target incident
+  # (PR #322), where two parallel SF executions raced 321 unique-symbol
+  # ArcticDB E_NON_INCREASING_INDEX_VERSION errors in MorningEnrich and
+  # hard-failed the weekday pipeline. The PR #322 CFN-target-uniqueness
+  # CI gate catches the SPECIFIC duplicate-target shape; this mutex catches
+  # the broader class (operator double-paste, EventBridge internal retry-on-
+  # throttle, cross-region replay coincidence, any future shape the CI
+  # chokepoint misses).
+  #
+  # Schema: mutex_key (S) PK only — no TTL attribute and no auto-release.
+  # The mutex_key encodes `{state-machine-name}#{pipeline_role}#{minute-bucket}`,
+  # so a successfully-acquired key is naturally single-use: no future
+  # execution can land in the same minute-bucket of a past UTC date. Item
+  # accumulation is ~12 items/week × cadence runs ≈ <1000/yr; PAY_PER_REQUEST
+  # storage cost is negligible (sub-cent annual). Periodic sweeper deferred —
+  # operationally meaningful staleness is a non-issue.
+  ExecutionMutexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: alpha-engine-sf-execution-mutex
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: mutex_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: mutex_key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
   # NOTE: AlertsTopic also has a SECOND subscriber — a Lambda that mirrors
   # every alert to s3://alpha-engine-research/changelog/incidents/ for the
   # system-wide event-mining changelog. That Lambda + its IAM role + its
@@ -596,3 +636,7 @@ Outputs:
   WeekdayPipelineArn:
     Value: !Ref WeekdayPipeline
     Description: Weekday pipeline state machine ARN
+
+  ExecutionMutexTableName:
+    Value: !Ref ExecutionMutexTable
+    Description: DynamoDB table name for SF execution mutex (L274)

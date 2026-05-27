@@ -9,7 +9,67 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "CheckMutexRole"
+    },
+    "CheckMutexRole": {
+      "Type": "Choice",
+      "Comment": "L274 SF MutualExclusionGuard — gate at SF entry point. Allowlist cadence-roles (daily / weekly / eod / shell-run) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations — that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell. Trigger of record: 2026-05-26 duplicate-EventBridge-target incident (PR #322 closed the SPECIFIC dup-target shape via CI; this mutex closes the broader class).",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.pipeline_role", "IsPresent": true},
+            {
+              "Or": [
+                {"Variable": "$.pipeline_role", "StringEquals": "daily"},
+                {"Variable": "$.pipeline_role", "StringEquals": "weekly"},
+                {"Variable": "$.pipeline_role", "StringEquals": "eod"},
+                {"Variable": "$.pipeline_role", "StringEquals": "shell-run"}
+              ]
+            }
+          ],
+          "Next": "AcquireMutex"
+        }
+      ],
+      "Default": "CheckShellRun"
+    },
+    "AcquireMutex": {
+      "Type": "Task",
+      "Comment": "L274 — DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException → MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Item": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}:{}', $$.StateMachine.Name, $.pipeline_role, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
+          },
+          "execution_arn": {"S.$": "$$.Execution.Id"},
+          "started_at": {"S.$": "$$.Execution.StartTime"},
+          "state_machine": {"S.$": "$$.StateMachine.Name"},
+          "pipeline_role": {"S.$": "$.pipeline_role"}
+        },
+        "ConditionExpression": "attribute_not_exists(mutex_key)"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert.",
+          "Next": "MutexConflict",
+          "ResultPath": "$.mutex_conflict"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review.",
+          "Next": "CheckShellRun",
+          "ResultPath": "$.mutex_error"
+        }
+      ],
+      "ResultPath": "$.mutex_result",
       "Next": "CheckShellRun"
+    },
+    "MutexConflict": {
+      "Type": "Fail",
+      "Error": "MutexConflict",
+      "Cause": "L274: another SF execution with the same state-machine + pipeline_role + start-minute already holds the mutex. Most likely cause: duplicate EventBridge target fan-out (PR #322 closes the specific CFN-vs-deploy-script shape; this Fail catches the broader class). Forensic: check execution history for the prior holder's executionArn via DynamoDB GetItem on the mutex_key in $.mutex_conflict."
     },
     "CheckShellRun": {
       "Type": "Choice",
