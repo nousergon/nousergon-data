@@ -1,0 +1,5 @@
+# Pinned to alpha-engine-lib v0.40.0 (the artifact_freshness substrate
+# was introduced here). Bumping this is a substrate-change PR — not
+# something to do absent-mindedly during a code-only refresh.
+alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.40.0
+pyyaml>=6.0
