@@ -37,6 +37,7 @@ import pandas as pd
 
 import hashlib
 
+from features.cross_sectional import apply_factor_zscores
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.registry import upload_registry
 from features.writer import write_feature_snapshot
@@ -630,6 +631,13 @@ def compute_and_write(
 
     # ── 3. Write to S3 ───────────────────────────────────────────────────────
     features_df = pd.DataFrame(store_rows)
+
+    # C.1 (optimizer-sota-upgrades-260526.md §C.1): append cross-sectional
+    # factor-loading z-scores AFTER per-ticker compute, BEFORE write. These
+    # are the columns of the factor-loading matrix B that workstream C.3
+    # (alpha-engine executor) consumes to build Σ = B·F·Bᵀ + D. Winsorized
+    # at ±3σ then standardized (Barra USE4 / AQR convention).
+    features_df = apply_factor_zscores(features_df)
 
     if dry_run:
         log.info(

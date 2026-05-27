@@ -116,6 +116,20 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("payout_ratio", "fundamental", "TTM dividends / net income (0-2 clipped); Stewardship pillar input — retention rate = 1 - payout drives reinvestment", source="fmp", refresh="quarterly"),
     FeatureEntry("dividend_yield", "fundamental", "Indicated annual dividend yield (decimal, 0-0.2 clipped); Stewardship pillar input", source="fmp", refresh="quarterly"),
     FeatureEntry("capex_growth_5y", "fundamental", "5-year CAPEX growth (decimal); Stewardship pillar input — reinvestment intensity proxy", source="fmp", refresh="quarterly"),
+
+    # ── Factor loadings (8) — C.1 of optimizer-sota-upgrades-260526 ──────────
+    # Cross-sectional ±3σ-winsorized z-scores of canonical Barra-style factors.
+    # Columns of the factor-loading matrix B for the executor's Σ = B·F·Bᵀ + D
+    # risk decomposition (workstream C.3). Computed POST-assembly in
+    # features/compute.py via features.cross_sectional.apply_factor_zscores.
+    FeatureEntry("momentum_20d_zscore", "factor_loading", "Cross-sectional z-score of momentum_20d (winsorized ±3σ). Barra MOMENTUM (short-horizon) loading.", source="derived", refresh="daily"),
+    FeatureEntry("return_60d_zscore", "factor_loading", "Cross-sectional z-score of return_60d (winsorized ±3σ). Barra MOMENTUM (medium-horizon) loading.", source="derived", refresh="daily"),
+    FeatureEntry("beta_60d_zscore", "factor_loading", "Cross-sectional z-score of beta_60d (winsorized ±3σ). Barra BETA loading (market sensitivity).", source="derived", refresh="daily"),
+    FeatureEntry("idio_vol_60d_zscore", "factor_loading", "Cross-sectional z-score of idio_vol_60d (winsorized ±3σ). Barra RESVOL loading (residual / idiosyncratic risk).", source="derived", refresh="daily"),
+    FeatureEntry("realized_vol_63d_zscore", "factor_loading", "Cross-sectional z-score of realized_vol_63d (winsorized ±3σ). Barra VOLATILITY loading (total realized risk).", source="derived", refresh="daily"),
+    FeatureEntry("dist_from_52w_high_zscore", "factor_loading", "Cross-sectional z-score of dist_from_52w_high (winsorized ±3σ). Proximity-to-high / reversal-risk loading.", source="derived", refresh="daily"),
+    FeatureEntry("pe_ratio_zscore", "factor_loading", "Cross-sectional z-score of pe_ratio (winsorized ±3σ). Barra VALUE loading (proxy via 1/PE direction).", source="derived", refresh="daily"),
+    FeatureEntry("roe_zscore", "factor_loading", "Cross-sectional z-score of roe (winsorized ±3σ). Barra QUALITY / profitability loading.", source="derived", refresh="daily"),
 ]
 
 # Quick lookup by name
