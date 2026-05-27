@@ -20,6 +20,18 @@
 # both — acceptable since partial Saturday failures typically require a
 # full-pipeline rerun anyway.
 #
+# **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 2).**
+# Communication with the spot is now via `aws ssm send-command`
+# (IAM-authenticated, CloudTrail-audited) wrapped at the lib chokepoint
+# `python -m alpha_engine_lib.ssm_dispatcher run`. No port-22 inbound on
+# the spot SG; no ssh / scp / ssh-keyscan. The private config.yaml is
+# staged to a temporary S3 prefix the dispatcher controls and pulled
+# down by the spot via its existing `alpha-engine-executor-profile` IAM
+# role's `s3:GetObject` grant. Mirrors alpha-engine-predictor #168 +
+# alpha-engine-lib v0.35.0 `ssm_dispatcher` (PR 1 of the 5-PR arc); this
+# is PR 2. Closes the (i) alive-SSH-path finding from the 2026-05-24
+# audit.
+#
 # Usage:
 #   ./infrastructure/spot_data_weekly.sh                   # phase1 + rag
 #   ./infrastructure/spot_data_weekly.sh --smoke-only      # quick validation, then terminate
@@ -45,9 +57,12 @@
 #
 # Prerequisites on the launching host (ae-dashboard when invoked by the
 # Saturday Step Function):
-#   - AWS CLI with perms to RunInstances / TerminateInstances / DescribeInstances
-#   - SSH key at ~/.ssh/alpha-engine-key.pem
+#   - AWS CLI with perms to RunInstances / TerminateInstances /
+#     DescribeInstances / SendCommand / GetCommandInvocation /
+#     ssm:SendCommand on the spot's SSM document
 #   - alpha-engine-data checked out at the script's parent dir
+#   - alpha-engine-lib installed in ae-dashboard's .venv (LIB_PYTHON
+#     points at it) — provides both `ec2_spot` and `ssm_dispatcher` CLIs
 #
 # Secrets resolve from SSM at Python startup via
 # alpha_engine_lib.secrets.get_secret(); the spot's IAM profile
@@ -56,7 +71,7 @@
 
 set -euo pipefail
 
-# SSM RunCommand does not set HOME; default it for the SSH key lookup below.
+# SSM RunCommand does not set HOME; default it for the config-file lookup below.
 export HOME="${HOME:-/home/ec2-user}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,8 +97,14 @@ AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # plus pip install + preflight. If the workload legitimately needs longer,
 # bump this — don't silently rely on the orphan reaper.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# Key-pair name kept ONLY for compatibility with
+# alpha_engine_lib.ec2_spot's --key-name flag — the spot still launches
+# with this key associated, but NOTHING in this script SSH's into the
+# instance. Communication is via SSM; the key remains as a manual
+# break-glass option (operator can `ssh -i ~/.ssh/...pem` only if the
+# security group's port-22 inbound rule is temporarily re-opened, which
+# it should NOT be in steady state — see ROADMAP L342 PR 5).
 KEY_NAME="alpha-engine-key"
-KEY_FILE="$HOME/.ssh/alpha-engine-key.pem"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # All 6 default-VPC subnets across us-east-1{a,b,c,d,e,f}. The lib CLI
 # (alpha_engine_lib.ec2_spot) rotates across this list on capacity
@@ -159,16 +180,27 @@ echo "  Branch        : $BRANCH"
 echo "  Run mode      : $RUN_MODE"
 echo "  Preflight-only: $PREFLIGHT_ONLY  (1 = boot + preflight + exit 0, NO fetch/write)"
 echo "  S3 bucket     : $S3_BUCKET"
+echo "  Transport     : SSM via lib chokepoint (python -m alpha_engine_lib.ssm_dispatcher)"
 echo ""
 
 # ── Preflight ───────────────────────────────────────────────────────────────
-if [ ! -f "$KEY_FILE" ]; then
-    echo "ERROR: SSH key not found at $KEY_FILE"
-    exit 1
-fi
 # Note: alpha-engine-lib was flipped public 2026-05-03; spot installs it
 # directly from git+https with no auth required. Earlier versions of this
 # script fetched a PAT from /alpha-engine/lib-token via SSM — no longer needed.
+
+# Locate the private alpha-engine-config/data/config.yaml on the dispatcher
+# so we can stage it to S3 for the spot. weekly_collector.py's load_config()
+# searches /home/ec2-user/alpha-engine-config/data/config.yaml first; the
+# dispatcher (ae-dashboard) clones the private config repo daily via
+# boot-pull.sh.
+CONFIG_SRC="/home/ec2-user/alpha-engine-config/data/config.yaml"
+if [ ! -f "$CONFIG_SRC" ]; then
+    CONFIG_SRC="$HOME/Development/alpha-engine-config/data/config.yaml"
+fi
+if [ ! -f "$CONFIG_SRC" ]; then
+    echo "ERROR: dispatcher config not found at /home/ec2-user/alpha-engine-config/data/config.yaml or $HOME/Development/alpha-engine-config/data/config.yaml — is alpha-engine-config cloned + pulled?"
+    exit 1
+fi
 
 # ── Launch spot ──────────────────────────────────────────────────────────────
 # Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
@@ -200,144 +232,163 @@ fi
 
 echo "  Instance ID: $INSTANCE_ID"
 
-# Always terminate, even on error.
+RUN_ID="$(date +%Y%m%dT%H%M%SZ)-${INSTANCE_ID}"
+S3_STAGING_PREFIX="tmp/spot_data_weekly/${RUN_ID}"
+S3_STAGING="s3://${S3_BUCKET}/${S3_STAGING_PREFIX}"
+
+# Cleanup — always terminate the instance + remove the S3 staging prefix.
+# (S3 lifecycle on tmp/ is the belt-and-suspenders if the trap never fires.)
 cleanup() {
     echo ""
     echo "==> Terminating spot instance $INSTANCE_ID..."
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-    echo "  Instance terminated."
+    aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
+    echo "  Instance terminated; S3 staging cleaned."
 }
 trap cleanup EXIT
 
 echo "==> Waiting for instance to enter running state..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
 
-PUBLIC_IP=$(aws ec2 describe-instances \
-    --instance-ids "$INSTANCE_ID" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' \
-    --output text \
-    --region "$AWS_REGION")
+# Stage alpha-engine-config/data/config.yaml to S3 (spot pulls via its
+# IAM role's existing s3:GetObject grant). Replaces the pre-2026-05-27
+# SCP path — no ssh key, no port-22 inbound, no scp.
+echo "==> Staging alpha-engine-config/data/config.yaml → ${S3_STAGING}/config.yaml"
+aws s3 cp "$CONFIG_SRC" "${S3_STAGING}/config.yaml" --region "$AWS_REGION" --quiet
 
-if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-    echo "ERROR: Instance has no public IP. Check subnet/VPC configuration."
-    exit 1
-fi
-
-echo "  Public IP: $PUBLIC_IP"
-
-# ── Wait for SSH ─────────────────────────────────────────────────────────────
-echo "==> Waiting for SSH to become available..."
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
-
-for i in $(seq 1 30); do
-    if ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "echo ok" 2>/dev/null; then
-        echo "  SSH ready."
+# ── Wait for the SSM agent to register ────────────────────────────────────────
+# Replaces the old SSH-readiness poll. AL2023 ships the SSM agent; with the
+# instance profile's AmazonSSMManagedInstanceCore (in alpha-engine-executor-profile)
+# it registers within ~1 min.
+echo "==> Waiting for SSM agent to come Online..."
+for i in $(seq 1 36); do  # 36 × 5s = 180s budget
+    ping=$(aws ssm describe-instance-information \
+        --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+        --query 'InstanceInformationList[0].PingStatus' \
+        --output text --region "$AWS_REGION" 2>/dev/null || true)
+    if [ "$ping" = "Online" ]; then
+        echo "  SSM agent Online."
         break
     fi
-    if [ "$i" -eq 30 ]; then
-        echo "ERROR: SSH not available after 150s"
+    if [ "$i" -eq 36 ]; then
+        echo "ERROR: SSM agent not Online after 180s (instance $INSTANCE_ID)"
         exit 1
     fi
     sleep 5
 done
 
-run_remote() {
-    ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "$@"
+# ── SSM dispatch primitive (lib chokepoint) ──────────────────────────────────
+# run_ssm "<description>" [timeout_seconds] <<HEREDOC ... HEREDOC
+#
+# Thin wrapper around `python -m alpha_engine_lib.ssm_dispatcher run` (lib
+# v0.35.0+). The lib base64-wraps the script body (read from stdin via the
+# `--script-stdin` flag) for AWS-RunShellScript transport, polls
+# get-command-invocation, streams StandardOutputContent delta to this
+# process's stdout, and propagates the inner script's exit status (0 on
+# Success; 1 on Failed/TimedOut/Cancelled). Full stdout/stderr beyond
+# SSM's 24KB inline cap is written to the --output-bucket /
+# --output-key-prefix for post-mortem.
+#
+# Stdin-fed by design: the spot script bodies contain shell metachars
+# (apostrophes in comments, `$(...)` inside `aws ssm get-parameter
+# --query 'Parameter.Value'` invocations, etc.) which break the
+# `"$(cat <<HEREDOC ... HEREDOC)"` command-substitution pattern that
+# alpha-engine-predictor's pre-lift run_ssm helper used. Reading from
+# stdin keeps the body verbatim — the dispatcher's bash parser doesn't
+# scan it for quote/paren balance. Callers pipe a heredoc directly:
+#
+#     run_ssm "bootstrap" 600 <<BOOTSTRAP
+#     set -eo pipefail
+#     ...
+#     BOOTSTRAP
+#
+# The `InvocationDoesNotExist` registration race (2026-05-23 SF event 16
+# substrate weakness) is handled inside the lib — first ~60s after
+# SendCommand maps to "Pending" status; later occurrences are terminal
+# failure.
+run_ssm() {
+    local description="$1" timeout_s="${2:-3600}"
+    "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
+        --instance-id "$INSTANCE_ID" \
+        --description "data-weekly: $description" \
+        --timeout "$timeout_s" \
+        --output-bucket "$S3_BUCKET" \
+        --output-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
+        --region "$AWS_REGION" \
+        --script-stdin
 }
 
-# ── Spot-side watchdog ──────────────────────────────────────────────────────
-# Dispatcher-side `trap cleanup EXIT` (line ~140) only fires when THIS bash
-# script exits cleanly. If the dispatcher SSM command is cancelled, the
-# dispatcher EC2 is stopped mid-run, or the shell gets SIGKILLed, the trap
-# never runs and the spot orphans until manually terminated — hit 3 times
-# in April 2026 (~$20 orphan each). This installs a transient systemd
-# timer on the spot that fires shutdown -h now after MAX_RUNTIME_SECONDS
-# regardless of dispatcher state. AL2023's InstanceInitiatedShutdown for
-# spots defaults to terminate, so shutdown = instance goes away.
-echo "==> Installing spot-side watchdog (${MAX_RUNTIME_SECONDS}s = $((MAX_RUNTIME_SECONDS / 60)) min)..."
-run_remote "sudo systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now"
+# Each run_ssm step is a fresh SSM shell with a minimal env. The
+# .env-deprecation arc deleted the sourced .env, so AWS_REGION /
+# AWS_DEFAULT_REGION (which boto3 + alpha_engine_lib.preflight.check_env_vars
+# require) are no longer set unless each step's export line sets them.
+# Same #247 regression as sibling spot scripts. System is single-region
+# us-east-1 (matches this file's own ${AWS_REGION:-us-east-1} defaults).
+# Origin: 2026-05-16 Saturday SF DataPhase1 preflight failure.
+#
+# PYTHON_BIN is set per-block via `command -v python3.12 || command -v
+# python3` so downstream bash scripts (rag/pipelines/run_weekly_ingestion.sh)
+# inherit the interpreter that bootstrap installed. AL2023 spots install
+# python3.12 but have no bare `python` symlink — the RAG script's
+# `python -m ...` fails without this. Origin: 2026-04-17 Saturday SF
+# failure in RAG step-0 preflight.
+read -r -d '' ENV_SOURCE <<'ENV_EOF' || true
+export HOME=/home/ec2-user
+export XDG_CACHE_HOME=/tmp
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=us-east-1
+command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+export PYTHON_BIN
+ENV_EOF
 
-# ── Bootstrap spot: python + git ─────────────────────────────────────────────
-echo "==> Bootstrapping spot environment..."
-run_remote bash -s <<'BOOTSTRAP'
-set -euo pipefail
-sudo dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-    sudo dnf install -y -q python3 python3-pip python3-devel git gcc
-if command -v python3.12 &>/dev/null; then
-    echo "Using: $(python3.12 --version)"
-else
-    echo "Using: $(python3 --version)"
-fi
-mkdir -p ~/.ssh
-ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+# ── Bootstrap spot: watchdog + python + git + clone + config ────────────────
+# Single SSM call covering: spot-side hard-timeout watchdog,
+# python3.12/git install, repo clone, and config.yaml fetch from the
+# dispatcher's S3 staging prefix. Watchdog rationale: dispatcher-side
+# `trap cleanup EXIT` only fires when THIS script exits cleanly. If the
+# dispatcher SSM command is cancelled, the dispatcher EC2 is stopped
+# mid-run, or the shell gets SIGKILLed, the trap never runs and the spot
+# orphans until manually terminated. Hit 3 times in April 2026 (~$20
+# orphan each). systemd-run shuts the box down after MAX_RUNTIME_SECONDS
+# regardless of dispatcher state. AL2023's
+# InstanceInitiatedShutdownBehavior for spots defaults to terminate, so
+# shutdown = instance goes away.
+echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
+run_ssm "bootstrap" 600 <<BOOTSTRAP
+set -eo pipefail
+${ENV_SOURCE}
+
+# Spot-side hard-timeout watchdog (see bootstrap-step rationale above).
+systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog \
+    --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now
+
+dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+    dnf install -y -q python3 python3-pip python3-devel git gcc
+echo "Using: \$(\$PYTHON_BIN --version)"
+
+git clone --depth 1 --branch ${BRANCH} https://github.com/cipher813/alpha-engine-data.git /home/ec2-user/alpha-engine-data
+
+mkdir -p /home/ec2-user/alpha-engine-config/data
+aws s3 cp ${S3_STAGING}/config.yaml /home/ec2-user/alpha-engine-config/data/config.yaml --region ${AWS_REGION} --quiet
+echo "Bootstrap complete: repo cloned, config.yaml fetched from ${S3_STAGING}/config.yaml."
 BOOTSTRAP
 
-# ── Clone alpha-engine-data on spot ──────────────────────────────────────────
-echo "==> Cloning alpha-engine-data (branch: $BRANCH)..."
-# HTTPS clone with PAT — matches the lib-install pattern below.
-run_remote "git clone --depth 1 --branch $BRANCH https://github.com/cipher813/alpha-engine-data.git /home/ec2-user/alpha-engine-data"
-
-# ── Upload alpha-engine-config/data/config.yaml ─────────────────────────────
-# weekly_collector.py's load_config() searches /home/ec2-user/alpha-engine-config/data/config.yaml
-# first. Private config repo — SCP from the dispatcher's clone (pulled daily by
-# ae-dashboard's boot-pull) rather than cloning it on the spot (which would
-# require broader git-auth setup; the spot only needs read access to public repos).
-CONFIG_SRC="/home/ec2-user/alpha-engine-config/data/config.yaml"
-if [ ! -f "$CONFIG_SRC" ]; then
-    CONFIG_SRC="$HOME/Development/alpha-engine-config/data/config.yaml"
-fi
-if [ ! -f "$CONFIG_SRC" ]; then
-    echo "ERROR: dispatcher config not found at /home/ec2-user/alpha-engine-config/data/config.yaml or $HOME/Development/alpha-engine-config/data/config.yaml — is alpha-engine-config cloned + pulled?"
-    exit 1
-fi
-echo "==> Uploading alpha-engine-config/data/config.yaml to spot..."
-run_remote "mkdir -p /home/ec2-user/alpha-engine-config/data"
-scp $SSH_OPTS -i "$KEY_FILE" \
-    "$CONFIG_SRC" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-config/data/config.yaml
-
-# ── Install python deps ──────────────────────────────────────────────────────
-# The spot pulls its own alpha-engine-lib PAT from SSM (same pattern as
-# ae-trading's boot-pull.sh). Dispatcher never handles the secret. The
-# spot's IAM profile (alpha-engine-executor-profile) grants ssm:GetParameter
-# on /alpha-engine/*. Token is scoped to a local shell var, never exported
-# or logged.
+# ── Install python deps ─────────────────────────────────────────────────────
 echo "==> Installing Python dependencies..."
-run_remote bash -s <<'DEPS'
-set -euo pipefail
+run_ssm "deps" 900 <<DEPS
+set -eo pipefail
+${ENV_SOURCE}
 cd /home/ec2-user/alpha-engine-data
 
-if command -v python3.12 &>/dev/null; then
-    PIP="python3.12 -m pip"
-else
-    PIP="python3 -m pip"
-fi
-
-$PIP install --upgrade pip -q
-$PIP install -q -r requirements.txt
+PIP="\$PYTHON_BIN -m pip"
+\$PIP install --upgrade pip -q
+\$PIP install -q -r requirements.txt
 
 # numpy<2 pin to match other spot workloads (pyarrow compiled against 1.x).
-$PIP install -q 'numpy<2'
+\$PIP install -q 'numpy<2'
 
 echo "Dependencies installed."
 DEPS
-
-REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
-# Export PYTHON_BIN so downstream bash scripts (e.g.
-# rag/pipelines/run_weekly_ingestion.sh) inherit the interpreter we
-# bootstrapped. AL2023 spots install python3.12 but have no bare `python`
-# symlink — the RAG script's `python -m ...` fails without this. Origin:
-# 2026-04-17 Saturday Step Function failure in RAG step-0 preflight.
-#
-# AWS_REGION/AWS_DEFAULT_REGION: the spot shell no longer sources a .env
-# (PR 9f / #241 removed `.env` sourcing in favor of runtime get_secret()
-# SSM lookups), but AWS_REGION is a plain env var — not a secret — that
-# alpha_engine_lib.preflight.check_env_vars hard-requires, and boto3 needs
-# a default region with no .env present. Re-export it explicitly from the
-# dispatcher-side $AWS_REGION (set above with us-east-1 fallback). Origin:
-# 2026-05-16 Saturday SF DataPhase1 failure — weekly_collector --morning-enrich
-# aborted at preflight with "required env vars missing: ['AWS_REGION']".
-ENV_SOURCE="export XDG_CACHE_HOME=/tmp; export PYTHON_BIN=$REMOTE_PYTHON; export AWS_REGION=$AWS_REGION; export AWS_DEFAULT_REGION=$AWS_REGION;"
 
 # ── Smoke-only: imports + --phase 1 --dry-run ────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then
@@ -345,23 +396,23 @@ if [ "$RUN_MODE" = "smoke-only" ]; then
     echo "═══════════════════════════════════════════════════════════════"
     echo "  SMOKE TEST"
     echo "═══════════════════════════════════════════════════════════════"
-    run_remote bash -s <<SMOKE
-set -euo pipefail
-cd /home/ec2-user/alpha-engine-data
+    run_ssm "smoke" 1800 <<SMOKE
+set -eo pipefail
 ${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
 
 echo "==> Smoke: python import weekly_collector"
-$REMOTE_PYTHON -c "import weekly_collector; print('import OK')"
+\$PYTHON_BIN -c "import weekly_collector; print('import OK')"
 
 echo ""
 echo "==> Smoke: python import builders.prune_delisted_tickers"
-$REMOTE_PYTHON -c "from builders import prune_delisted_tickers; print('import OK')"
+\$PYTHON_BIN -c "from builders import prune_delisted_tickers; print('import OK')"
 
 echo ""
 echo "==> Smoke: weekly_collector.py --phase 1 --dry-run"
 # Show full output (was tail -30 — truncated error tracebacks from early
 # collectors so their failure mode was invisible during debugging).
-$REMOTE_PYTHON weekly_collector.py --phase 1 --dry-run 2>&1
+\$PYTHON_BIN weekly_collector.py --phase 1 --dry-run 2>&1
 SMOKE
 
     echo "==> Smoke complete — instance will be terminated."
@@ -386,10 +437,10 @@ if [ "$RUN_MODE" = "rag-smoke-only" ]; then
     echo "═══════════════════════════════════════════════════════════════"
     echo "  RAG SMOKE TEST"
     echo "═══════════════════════════════════════════════════════════════"
-    run_remote bash -s <<RAG_SMOKE
-set -euo pipefail
-cd /home/ec2-user/alpha-engine-data
+    run_ssm "rag-smoke" 1800 <<RAG_SMOKE
+set -eo pipefail
 ${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
 
 echo "==> RAG smoke: fetching secrets from SSM"
 for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
@@ -447,10 +498,10 @@ if [ "$RUN_MODE" = "rag-only" ]; then
         # (ingest_sec_filings) — proof that no ingest_*/embedding/Postgres
         # write code path is reachable. Heartbeat is deliberately NOT
         # emitted (a preflight is not a completed ingestion).
-        run_remote bash -s <<RAG_ONLY_PREFLIGHT
-set -euo pipefail
-cd /home/ec2-user/alpha-engine-data
+        run_ssm "rag-only-preflight" 900 <<RAG_ONLY_PREFLIGHT
+set -eo pipefail
 ${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
 
 echo "──────────────────────────────────────────────────────────────"
 echo "Fetching RAG secrets from SSM at \$(date)"
@@ -488,10 +539,29 @@ RAG_ONLY_PREFLIGHT
     echo "═══════════════════════════════════════════════════════════════"
     echo "  RAG-ONLY RUN (skipping DataPhase1)"
     echo "═══════════════════════════════════════════════════════════════"
-    run_remote bash -s <<RAG_ONLY
-set -euo pipefail
-cd /home/ec2-user/alpha-engine-data
+    run_ssm "rag-only" 3600 <<RAG_ONLY
+set -eo pipefail
 ${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
+
+# ── Spot-side log capture ────────────────────────────────────────────
+# SSM get-command-invocation caps StandardOutputContent at 24KB; the lib
+# CLI's --output-bucket captures the full inline-cap stdout in
+# ${S3_STAGING}/ssm-output/. For an additional belt-and-suspenders
+# per-mode log we ALSO tee into /tmp/rag-ingestion.log + upload to S3
+# on ANY exit path. Origin: 2026-05-03 SF failure where the
+# postflight error message was past the SSM truncation cutoff and the
+# spot was already gone by the time triage started.
+LOG_FILE=/tmp/rag-ingestion.log
+exec > >(tee -a "\$LOG_FILE") 2>&1
+upload_log() {
+    local exit_code=\$?
+    local s3_key="health/rag_ingestion_log/\$(date +%Y-%m-%d)/\$(date +%Y%m%dT%H%M%SZ -u)-exit\${exit_code}.log"
+    aws s3 cp "\$LOG_FILE" "s3://${S3_BUCKET}/\$s3_key" --region "\${AWS_REGION:-us-east-1}" 2>/dev/null \\
+        && echo "[log-upload] s3://${S3_BUCKET}/\$s3_key" \\
+        || echo "[log-upload] WARNING: failed to upload \$LOG_FILE to S3"
+}
+trap upload_log EXIT
 
 echo "──────────────────────────────────────────────────────────────"
 echo "Fetching RAG secrets from SSM at \$(date)"
@@ -569,7 +639,7 @@ esac
 # ── Data-path preflight-only (Friday shell-run dry path) ────────────────────
 # Reuses the DO_MORNING_ENRICH / DO_PHASE1 gates above to decide WHICH
 # weekly_collector preflight to run, then runs ONLY the preflight via the
-# new `weekly_collector.py ... --preflight-only` flag. That flag executes
+# `weekly_collector.py ... --preflight-only` flag. That flag executes
 # DataPreflight(mode).run() (env/secret get_secret resolution, S3 HEAD,
 # polygon/FRED auth-reachability probes, ArcticDB connect + libraries-present
 # read) then sys.exit(0) BEFORE run_weekly() — run_weekly() is the sole
@@ -597,16 +667,16 @@ if [ "$PREFLIGHT_ONLY" = "1" ]; then
     echo "  PREFLIGHT-ONLY: $HEADER_LABEL"
     echo "  (boot + preflight + exit 0 — NO collector fetch, NO write)"
     echo "═══════════════════════════════════════════════════════════════"
-    run_remote bash -s <<PREFLIGHT_WORKLOADS
-set -euo pipefail
-cd /home/ec2-user/alpha-engine-data
+    run_ssm "preflight-workloads" 900 <<PREFLIGHT_WORKLOADS
+set -eo pipefail
 ${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
 
 if [ "${DO_MORNING_ENRICH}" = "1" ]; then
     echo "──────────────────────────────────────────────────────────────"
     echo "weekly_collector.py --morning-enrich --preflight-only at \$(date)"
     echo "──────────────────────────────────────────────────────────────"
-    if ! $REMOTE_PYTHON weekly_collector.py --morning-enrich --preflight-only 2>&1; then
+    if ! \$PYTHON_BIN weekly_collector.py --morning-enrich --preflight-only 2>&1; then
         echo "ERROR: morning-enrich preflight failed (bootstrap-class breakage caught ~12h before Saturday)." >&2
         exit 1
     fi
@@ -617,7 +687,7 @@ if [ "${DO_PHASE1}" = "1" ]; then
     echo "──────────────────────────────────────────────────────────────"
     echo "weekly_collector.py --phase 1 --preflight-only at \$(date)"
     echo "──────────────────────────────────────────────────────────────"
-    if ! $REMOTE_PYTHON weekly_collector.py --phase 1 --preflight-only 2>&1; then
+    if ! \$PYTHON_BIN weekly_collector.py --phase 1 --preflight-only 2>&1; then
         echo "ERROR: phase1 preflight failed (bootstrap-class breakage caught ~12h before Saturday)." >&2
         exit 1
     fi
@@ -639,17 +709,19 @@ echo "════════════════════════�
 echo "  $HEADER_LABEL"
 echo "═══════════════════════════════════════════════════════════════"
 
-run_remote bash -s <<WORKLOADS
-set -euo pipefail
-cd /home/ec2-user/alpha-engine-data
+run_ssm "workloads" "$MAX_RUNTIME_SECONDS" <<WORKLOADS
+set -eo pipefail
 ${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
 
 # ── Spot-side log capture ────────────────────────────────────────────
-# SSM RunCommand truncates StandardOutputContent at 24KB and the spot
-# terminates before the dispatcher can scp logs back, so post-mortem
-# debugging requires the full log to land somewhere durable. Tee
-# everything below into /tmp/<mode-label>.log + upload to S3 on ANY exit
-# path (success, hard-fail, signal). Origin: 2026-05-03 SF failure where
+# SSM get-command-invocation caps StandardOutputContent at 24KB and the
+# spot terminates before the dispatcher can fetch logs another way; the
+# lib CLI's --output-bucket captures the full inline-cap stdout in
+# ${S3_STAGING}/ssm-output/. This block ALSO tees into a per-mode log
+# file and uploads to S3 on any exit path (success, hard-fail, signal)
+# for back-compat with the pre-2026-05-27 health/<mode>_log/ key layout
+# that downstream dashboards read. Origin: 2026-05-03 SF failure where
 # the postflight error message was past the SSM truncation cutoff and
 # the spot was already gone by the time triage started. The S3 key uses
 # the per-mode label (preflight-task-split 2026-05-16) so a
@@ -691,7 +763,7 @@ if [ "${DO_MORNING_ENRICH}" = "1" ]; then
 echo "──────────────────────────────────────────────────────────────"
 echo "Starting weekly_collector.py --morning-enrich (Friday polygon-T+1 fill) at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
-if ! $REMOTE_PYTHON weekly_collector.py --morning-enrich 2>&1; then
+if ! \$PYTHON_BIN weekly_collector.py --morning-enrich 2>&1; then
     echo "ERROR: weekly_collector.py --morning-enrich failed — Friday's polygon-authoritative daily_closes not collected. Aborting so downstream consumers don't read stale data." >&2
     exit 1
 fi
@@ -707,7 +779,7 @@ echo ""
 echo "──────────────────────────────────────────────────────────────"
 echo "Starting weekly_collector.py --phase 1 at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
-if ! $REMOTE_PYTHON weekly_collector.py --phase 1 2>&1; then
+if ! \$PYTHON_BIN weekly_collector.py --phase 1 2>&1; then
     echo "ERROR: weekly_collector.py --phase 1 failed." >&2
     exit 1
 fi
@@ -724,7 +796,7 @@ echo "────────────────────────�
 # — closes the loop on legit delistings so the threshold doesn't keep
 # getting bumped or symbols manually deleted. Constituents.json was
 # just refreshed by Phase 1 above, so this read is fresh.
-if ! $REMOTE_PYTHON -m builders.prune_delisted_tickers --apply 2>&1; then
+if ! \$PYTHON_BIN -m builders.prune_delisted_tickers --apply 2>&1; then
     echo "ERROR: prune_delisted_tickers failed." >&2
     exit 1
 fi

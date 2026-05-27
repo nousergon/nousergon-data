@@ -134,7 +134,25 @@ class TestSpotScriptPreflightOnly:
         the real WORKLOADS heredoc.
         """
         i_block = spot_text.rindex('if [ "$PREFLIGHT_ONLY" = "1" ]; then')
-        i_workloads = spot_text.index("run_remote bash -s <<WORKLOADS")
+        # The workloads heredoc opener was `run_remote bash -s <<WORKLOADS`
+        # pre-2026-05-27 (SSH transport); post-migration it is
+        # `run_ssm "workloads" "$MAX_RUNTIME_SECONDS" <<WORKLOADS` (SSM via
+        # alpha_engine_lib.ssm_dispatcher). Match either shape so the same
+        # invariant test survives the transport flip.
+        i_workloads = next(
+            (
+                spot_text.index(needle)
+                for needle in (
+                    'run_ssm "workloads"',
+                    "run_remote bash -s <<WORKLOADS",
+                )
+                if needle in spot_text
+            ),
+            -1,
+        )
+        assert i_workloads >= 0, (
+            "neither run_ssm nor run_remote workloads opener found in spot_data_weekly.sh"
+        )
         block = spot_text[i_block:i_workloads]
         assert "weekly_collector.py --morning-enrich --preflight-only" in block
         assert "weekly_collector.py --phase 1 --preflight-only" in block
@@ -156,7 +174,25 @@ class TestSpotScriptPreflightOnly:
         """The data-path preflight-only block must `exit 0` before the
         real WORKLOADS heredoc so the work path is unreachable."""
         i_block = spot_text.index('if [ "$PREFLIGHT_ONLY" = "1" ]; then')
-        i_workloads = spot_text.index("run_remote bash -s <<WORKLOADS")
+        # The workloads heredoc opener was `run_remote bash -s <<WORKLOADS`
+        # pre-2026-05-27 (SSH transport); post-migration it is
+        # `run_ssm "workloads" "$MAX_RUNTIME_SECONDS" <<WORKLOADS` (SSM via
+        # alpha_engine_lib.ssm_dispatcher). Match either shape so the same
+        # invariant test survives the transport flip.
+        i_workloads = next(
+            (
+                spot_text.index(needle)
+                for needle in (
+                    'run_ssm "workloads"',
+                    "run_remote bash -s <<WORKLOADS",
+                )
+                if needle in spot_text
+            ),
+            -1,
+        )
+        assert i_workloads >= 0, (
+            "neither run_ssm nor run_remote workloads opener found in spot_data_weekly.sh"
+        )
         assert i_block < i_workloads, (
             "the PREFLIGHT_ONLY data block must precede the WORKLOADS heredoc"
         )
