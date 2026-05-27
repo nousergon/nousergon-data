@@ -41,6 +41,20 @@
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
+    },
+    {
+      "Sid": "DedupMarkerListBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "_alerts/_dedup",
+            "_alerts/_dedup/*"
+          ]
+        }
+      }
     }
   ]
 }
