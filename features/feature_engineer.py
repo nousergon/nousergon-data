@@ -159,6 +159,19 @@ FEATURES = [
     "vol_of_vol_30d",
     "max_drawdown_60d",
     "realized_vol_63d",
+    # C.1 (optimizer-sota-upgrades-260526.md §C.1) — factor-loading z-scores
+    # for the executor's Σ = B·F·Bᵀ + D risk decomposition (C.3). Computed
+    # POST-assembly in features/compute.py via features.cross_sectional.
+    # apply_factor_zscores, not in per-ticker compute_features. Winsorized
+    # at ±3σ then standardized (Barra USE4 / AQR convention).
+    "momentum_20d_zscore",
+    "return_60d_zscore",
+    "beta_60d_zscore",
+    "idio_vol_60d_zscore",
+    "realized_vol_63d_zscore",
+    "dist_from_52w_high_zscore",
+    "pe_ratio_zscore",
+    "roe_zscore",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer

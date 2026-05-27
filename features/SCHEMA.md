@@ -165,6 +165,29 @@ parity.
 | `dividend_yield` | decimal pct (bare-named convention) | indicated annual dividend yield | predictor |
 | `capex_growth_5y` | decimal pct (bare-named convention) | 5y CAPEX growth | predictor |
 
+### Factor loadings (cross-sectional, daily refresh)
+
+Columns of the factor-loading matrix **B** consumed by the executor's
+structural risk decomposition Σ = B·F·Bᵀ + D (workstream C.3 of
+`alpha-engine-docs/private/optimizer-sota-upgrades-260526.md`). Each
+column is a cross-sectional ±3σ-winsorized z-score of the named source
+column, computed POST-assembly in `features/compute.py` via
+`features.cross_sectional.apply_factor_zscores`. Winsorization +
+re-standardization follow the Barra USE4 / AQR convention so a single
+outlier ticker cannot dominate the downstream factor-return regression
+(C.2, alpha-engine-predictor).
+
+| Field | Units | Compute | Consumers |
+|---|---|---|---|
+| `momentum_20d_zscore` | z-score (`_zscore` suffix) | Cross-sectional z of `momentum_20d`, ±3σ winsorized | executor (Barra MOMENTUM short-horizon, C.3) |
+| `return_60d_zscore` | z-score | Cross-sectional z of `return_60d`, ±3σ winsorized | executor (Barra MOMENTUM medium-horizon, C.3) |
+| `beta_60d_zscore` | z-score | Cross-sectional z of `beta_60d`, ±3σ winsorized | executor (Barra BETA loading — market sensitivity, C.3) |
+| `idio_vol_60d_zscore` | z-score | Cross-sectional z of `idio_vol_60d`, ±3σ winsorized | executor (Barra RESVOL — idiosyncratic risk, C.3) |
+| `realized_vol_63d_zscore` | z-score | Cross-sectional z of `realized_vol_63d`, ±3σ winsorized | executor (Barra VOLATILITY — total realized risk, C.3) |
+| `dist_from_52w_high_zscore` | z-score | Cross-sectional z of `dist_from_52w_high`, ±3σ winsorized | executor (proximity-to-high / reversal-risk loading, C.3) |
+| `pe_ratio_zscore` | z-score | Cross-sectional z of `pe_ratio`, ±3σ winsorized | executor (Barra VALUE proxy via 1/PE direction, C.3) |
+| `roe_zscore` | z-score | Cross-sectional z of `roe`, ±3σ winsorized | executor (Barra QUALITY — profitability loading, C.3) |
+
 ---
 
 ## 4. PR checklist for new features
@@ -192,3 +215,4 @@ Before opening a PR that adds a column to `compute_features`:
 |---|---|
 | 2026-05-25 | L1995 Phase 1 standalone scanner Lambda surfaces `scanner_tickers=[]`; audit reveals `avg_volume_20d` units mismatch with Research scanner consumer; Option E selected as SOTA fix. |
 | 2026-05-25 | This SCHEMA.md + additive `avg_volume_20d_raw` + naming-convention rule shipped as the institutional substrate (alpha-engine-data Phase 1). |
+| 2026-05-26 | C.1 of optimizer-sota-upgrades-260526 — 8 factor-loading `*_zscore` columns added (cross-sectional ±3σ-winsorized z-scores) as substrate for the executor's Σ = B·F·Bᵀ + D risk decomposition. |
