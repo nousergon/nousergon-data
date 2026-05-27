@@ -485,8 +485,62 @@ def backfill(
 
     if ticker_filter:
         if ticker_filter not in universe_tickers:
-            log.error("Ticker %s not found in universe (no data or in skip list)", ticker_filter)
-            return {"status": "error", "error": f"ticker_not_found: {ticker_filter}"}
+            # Split the three reasons so operators / CW alarms can distinguish
+            # transient data absence from configuration drift. The single
+            # "no data or in skip list" string previously here masked the
+            # 2026-05-27 PSTG case (ticker dropped from constituents but
+            # still in chronic_polygon_gaps allowlist) by collapsing it into
+            # a "no data" framing.
+            if (
+                ticker_filter in _SKIP_TICKERS
+                and ticker_filter not in _UNIVERSE_EXTRA
+            ):
+                log.error(
+                    "Ticker %s is in _SKIP_TICKERS and not promoted via "
+                    "_UNIVERSE_EXTRA — not eligible for universe write.",
+                    ticker_filter,
+                )
+                return {
+                    "status": "error",
+                    "error": f"ticker_in_skip_list: {ticker_filter}",
+                }
+            if _is_sector_etf(ticker_filter):
+                log.error(
+                    "Ticker %s is a sector ETF (prefix in _SECTOR_ETF_PREFIXES) "
+                    "— not eligible for universe write.",
+                    ticker_filter,
+                )
+                return {
+                    "status": "error",
+                    "error": f"ticker_is_sector_etf: {ticker_filter}",
+                }
+            if (
+                price_data.get(ticker_filter) is None
+                or ticker_filter not in price_data
+            ):
+                log.error(
+                    "Ticker %s has no parquet rows in the price_cache read "
+                    "prefix chain — backfill cannot proceed.",
+                    ticker_filter,
+                )
+                return {
+                    "status": "error",
+                    "error": f"ticker_no_data: {ticker_filter}",
+                }
+            # Last reason: not in current constituents (the 2026-05-27 PSTG
+            # case). All other gates passed, parquet was read, ticker just
+            # isn't a constituent — usually means the caller's allowlist /
+            # config has drifted past a recent S&P remove.
+            log.error(
+                "Ticker %s has price_cache data but is not in current "
+                "constituents (run_date=%s) — drop the upstream allowlist "
+                "entry (e.g. chronic_polygon_gaps) and retry.",
+                ticker_filter, run_date,
+            )
+            return {
+                "status": "error",
+                "error": f"ticker_not_in_constituents: {ticker_filter}",
+            }
         universe_tickers = [ticker_filter]
         n_short_history_in_scope = (
             1 if len(price_data[ticker_filter]) < MIN_ROWS_FOR_FEATURES else 0
