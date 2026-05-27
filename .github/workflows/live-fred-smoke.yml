@@ -1,0 +1,45 @@
+name: Live FRED Smoke
+
+# Catches FRED REST API payload-shape regressions that the mocked
+# unit-test suite cannot see. Modeled on morning-signal's live-api-smoke
+# pattern shipped 2026-05-26 for the same class of bug.
+#
+# Triggers ONLY on PRs touching files that affect the FRED payload
+# shape or the consumers that parse its response.
+#
+# Cost: one observations call (free tier) per triggered run.
+#
+# Secret gate: requires repo secret FRED_API_KEY. Forks without the
+# secret get a clean skip rather than a failing CI status.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "collectors/fred_history.py"
+      - "collectors/daily_closes.py"
+      - "tests/live_smoke/fred_smoke.py"
+      - ".github/workflows/live-fred-smoke.yml"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Dispatch live-FRED smoke
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python tests/live_smoke/fred_smoke.py

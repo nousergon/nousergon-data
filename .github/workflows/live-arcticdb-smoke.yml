@@ -1,0 +1,62 @@
+name: Live ArcticDB Smoke
+
+# Catches ArcticDB schema-drift regressions that the mocked unit-test
+# suite cannot see. Modeled on morning-signal's live-api-smoke pattern
+# shipped 2026-05-26 for the same class of bug.
+#
+# Triggers ONLY on PRs touching files that affect the ArcticDB read/
+# write surface or the canonical universe-library schema.
+#
+# Cost: one tail-row S3 read per triggered run (~$0.0001).
+#
+# Auth gate: assumes the existing github-actions-lambda-deploy OIDC
+# role. That role grants S3 read on alpha-engine-research/arcticdb/*
+# (verified via `aws iam get-role-policy` 2026-05-27). Forks without
+# the OIDC trust get a clean skip rather than a failing CI status —
+# the script exits 0 when no AWS creds are in the env.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "store/arctic_store.py"
+      - "builders/daily_append.py"
+      - "builders/backfill.py"
+      - "builders/_price_cache_writeboth.py"
+      - "tests/live_smoke/arcticdb_smoke.py"
+      - ".github/workflows/live-arcticdb-smoke.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        # Fork PRs without the configured OIDC trust will fail this step
+        # silently (continue-on-error) so downstream skip-on-no-creds
+        # logic in arcticdb_smoke.py takes the clean-skip path.
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Dispatch live-ArcticDB smoke
+        run: python tests/live_smoke/arcticdb_smoke.py
