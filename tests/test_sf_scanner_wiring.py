@@ -1,24 +1,25 @@
 """Pins the Scanner Lambda wiring in the Saturday Step Functions JSON.
 
-ROADMAP L1995 Phase 2 — gated default-off via `enable_standalone_scanner`
-flag. The companion alpha-engine-research PR #235 adds the
-`alpha-engine-research-scanner:live` Lambda (Phase 1); this PR inserts
-the SF state that invokes it when the operator flips the flag (Phase 3
-soak), so RAGIngestion (Phase 4) can later read the new
-`candidates.json` artifact.
+ROADMAP L1995 Phase 2 — Scanner runs UNCONDITIONALLY on every Saturday
+SF firing (parallel-observe mode, non-blocking Catch). The prior
+``CheckEnableStandaloneScanner`` Choice gate was removed 2026-05-28 per
+``feedback_observe_mode_unconditional_gates_govern_cutover`` — observe-
+mode producer code must never be flag-gated, since silent absence-of-
+artifact is itself the failure mode the soak is meant to detect. The
+Phase 4/5 consumer-cutover flag (Research / RAG reading
+``candidates.json`` load-bearingly) belongs at the consumer side, not
+the producer side.
 
 Pin the chain between DataPhase1 and CheckSkipRAGIngestion:
 
-    DataPhase1 (skip path)    ──┐
-                                ├──→ CheckEnableStandaloneScanner ──→ Scanner ──→ CheckSkipRAGIngestion
-    CheckDataPhase1Status.Success┘                              └──(default)──→ CheckSkipRAGIngestion
+    DataPhase1 (skip path)        ──┐
+                                    ├──→ Scanner ──→ CheckSkipRAGIngestion
+    CheckDataPhase1Status.Success ──┘    │
+                                         └─(Catch)──→ CheckSkipRAGIngestion
 
-When the flag is false/absent (Phase 2 default), the path through
-CheckEnableStandaloneScanner is byte-identical to the pre-Phase-2 chain
-— Choice.Default goes directly to CheckSkipRAGIngestion, no Lambda
-invocation occurs. When the flag is true, the Lambda runs in
-parallel-observe mode and Catch ensures failure does NOT halt the
-pipeline.
+Scanner failure must NOT halt the pipeline (Research Lambda's internal
+scanner still produces the load-bearing universe today; the standalone
+artifact is parallel-observe and consumer-less until Phase 4).
 """
 
 from __future__ import annotations
@@ -55,15 +56,22 @@ def states(sf) -> dict:
 
 
 class TestStatesPresent:
-    def test_scanner_states_exist(self, states):
-        assert "CheckEnableStandaloneScanner" in states
+    def test_scanner_state_exists(self, states):
         assert "Scanner" in states
 
     def test_scanner_is_a_task(self, states):
         assert states["Scanner"]["Type"] == "Task"
 
-    def test_check_enable_is_a_choice(self, states):
-        assert states["CheckEnableStandaloneScanner"]["Type"] == "Choice"
+    def test_no_enable_scanner_choice_gate(self, states):
+        # The Choice gate was removed 2026-05-28 — observe-mode must not
+        # be flag-gated. Re-introducing it silently disables observation
+        # any time the enable_standalone_scanner input is absent or false.
+        assert "CheckEnableStandaloneScanner" not in states, (
+            "CheckEnableStandaloneScanner Choice gate must not exist. "
+            "Per feedback_observe_mode_unconditional_gates_govern_cutover, "
+            "Scanner runs unconditionally — gates belong at the consumer "
+            "side (Phase 4/5), not the producer side."
+        )
 
 
 # ── Lambda target + payload ───────────────────────────────────────────────
@@ -123,70 +131,34 @@ class TestFailureIsolation:
         )
 
 
-# ── Gate semantics (default-off) ──────────────────────────────────────────
-
-
-class TestGateDefaultOff:
-    def test_default_path_is_check_skip_rag(self, states):
-        # Phase 2 ships gated default-off: when the flag is absent or
-        # false the chain is byte-identical to pre-Phase-2.
-        assert (
-            states["CheckEnableStandaloneScanner"]["Default"]
-            == "CheckSkipRAGIngestion"
-        )
-
-    def test_flag_true_routes_to_scanner(self, states):
-        gate = states["CheckEnableStandaloneScanner"]
-        choices = gate["Choices"]
-        assert len(choices) == 1
-        choice = choices[0]
-        assert choice["Next"] == "Scanner"
-        # Conjunction pins the variable + bool semantics (IsPresent AND
-        # BooleanEquals true).
-        variables = [c["Variable"] for c in choice["And"]]
-        assert all(v == "$.enable_standalone_scanner" for v in variables)
-        assert any(c.get("BooleanEquals") is True for c in choice["And"])
-
-
-# ── Wiring: edges into and out of the new states ──────────────────────────
+# ── Wiring: edges into and out of Scanner ─────────────────────────────────
 
 
 class TestEdges:
-    def test_data_phase1_skip_path_routes_to_scanner_gate(self, states):
+    def test_data_phase1_skip_path_routes_to_scanner(self, states):
         # CheckSkipDataPhase1's skip branch (operator passes
-        # skip_data_phase1=true) previously went to CheckSkipRAGIngestion
-        # directly. Phase 2 re-routes it through the new gate so the
-        # Phase-2-enabled path is honored even on a phase1-skip rerun.
+        # skip_data_phase1=true) routes through Scanner unconditionally,
+        # matching the success path. Anyone re-introducing a gate here
+        # silently disables observation on phase1-skip reruns.
         skip = states["CheckSkipDataPhase1"]
         skip_choices = skip["Choices"]
         assert any(
-            c["Next"] == "CheckEnableStandaloneScanner"
-            for c in skip_choices
-        )
+            c["Next"] == "Scanner" for c in skip_choices
+        ), "CheckSkipDataPhase1 skip branch must route directly to Scanner."
 
-    def test_data_phase1_success_path_routes_to_scanner_gate(self, states):
-        # CheckDataPhase1Status.Success previously went to
-        # CheckSkipRAGIngestion directly; Phase 2 re-routes through the
-        # new gate.
+    def test_data_phase1_success_path_routes_to_scanner(self, states):
         status = states["CheckDataPhase1Status"]
         success = next(
             c for c in status["Choices"]
             if c.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "CheckEnableStandaloneScanner"
+        assert success["Next"] == "Scanner", (
+            "CheckDataPhase1Status Success branch must route directly "
+            "to Scanner — no intermediate gate."
+        )
 
     def test_scanner_success_routes_to_check_skip_rag(self, states):
         assert states["Scanner"]["Next"] == "CheckSkipRAGIngestion"
-
-    def test_default_path_byte_identical_to_pre_phase_2(self, states):
-        # The end of this chain MUST equal what the pre-Phase-2 chain
-        # had — CheckSkipRAGIngestion. Anyone changing the gate's
-        # Default without updating this assertion is silently breaking
-        # the observe-only Phase 2 contract.
-        assert (
-            states["CheckEnableStandaloneScanner"]["Default"]
-            == "CheckSkipRAGIngestion"
-        )
 
 
 # ── Result paths (state-merge contract) ───────────────────────────────────

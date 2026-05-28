@@ -185,21 +185,10 @@ Resources:
           # Ad-hoc operator launches MUST set their own pipeline_role
           # (smoke / recovery / backfill / operator-replay) per the
           # taxonomy in pipeline-reporting-revamp-260524.md §6.
-          #
-          # enable_standalone_scanner=true activates the L1995 Phase 2
-          # Scanner SF state (alpha-engine-research-scanner Lambda
-          # writes candidates.json in parallel-observe mode). Set true
-          # from 2026-05-25 onward (originally in deploy_step_function.sh
-          # via PR #313; migrated here 2026-05-26 in the EB-target
-          # single-SoT PR — keeping the flag on the SCRIPT meant
-          # re-deploying CFN silently flipped it off). Revert by
-          # flipping to false here in the same PR that updates
-          # ``tests/test_deploy_step_function_eventbridge_input.py``.
           Input: !Sub |
             {
               "ec2_instance_id": ["${MicroInstanceId}"],
               "sns_topic_arn": "${AlertsTopic}",
-              "enable_standalone_scanner": true,
               "pipeline_role": "weekly"
             }
 
