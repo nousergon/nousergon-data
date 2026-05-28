@@ -31,6 +31,7 @@ FUNCTION_NAME="alpha-engine-freshness-monitor"
 ROLE_NAME="alpha-engine-freshness-monitor-role"
 POLICY_NAME="alpha-engine-freshness-monitor-policy"
 RULE_NAME="alpha-engine-freshness-monitor-cron"
+HISTORICAL_RULE_NAME="alpha-engine-freshness-monitor-historical-cron"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -199,6 +200,33 @@ if $BOOTSTRAP; then
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${RULE_ARN}" \
+    --region "${REGION}" 2>/dev/null || true
+
+  # Historical-mode cron: daily at 04:00 UTC, off-peak. Fires the same
+  # Lambda with event={"mode": "historical"} so it probes the last N
+  # cycles of each artifact and writes _freshness_monitor/history.json
+  # (page 26 reads this for per-row history expanders + gap counts).
+  # Lookback defaults: 12 saturday + 30 weekday/eod cycles.
+  echo "  Creating EventBridge historical cron: ${HISTORICAL_RULE_NAME}"
+  run aws events put-rule \
+    --name "${HISTORICAL_RULE_NAME}" \
+    --schedule-expression "cron(0 4 * * ? *)" \
+    --description "Daily 04:00 UTC historical-cycle probe (mode=historical)" \
+    --region "${REGION}" \
+    --query 'RuleArn' --output text
+
+  run aws events put-targets \
+    --rule "${HISTORICAL_RULE_NAME}" \
+    --targets "Id=1,Arn=${FN_ARN},Input={\"mode\":\"historical\"}" \
+    --region "${REGION}"
+
+  HIST_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${HISTORICAL_RULE_NAME}"
+  run aws lambda add-permission \
+    --function-name "${FUNCTION_NAME}" \
+    --statement-id "eventbridge-${HISTORICAL_RULE_NAME}" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "${HIST_RULE_ARN}" \
     --region "${REGION}" 2>/dev/null || true
 fi
 
