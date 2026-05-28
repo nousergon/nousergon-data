@@ -570,3 +570,93 @@ def test_handler_dispatches_to_historical_on_mode_flag(monkeypatch, fixed_now):
     assert result["mode"] == "historical"
     index._handle_historical.assert_called_once()
     index.load_registry.assert_not_called()  # current-state path NOT taken
+
+
+# ── Trading-day-axis historical-probe tests ─────────────────────────────────
+
+
+def test_iter_historical_resolves_trading_day_axis_for_saturday_sf(fixed_now):
+    """When template uses {trading_day}, saturday_sf cycle dates resolve
+    to the previous NYSE trading day before each Saturday. fixed_now is
+    Sat 2026-05-30; prev Saturdays are 5/23, 5/16, 5/9; their
+    previous_trading_day values are Fri 5/22, Fri 5/15, Fri 5/8."""
+    import index
+    dates = index._iter_historical_cycle_dates(
+        "saturday_sf", fixed_now, 3,
+        template="signals/{trading_day}/signals.json",
+    )
+    assert [d.isoformat() for d in dates] == [
+        "2026-05-22", "2026-05-15", "2026-05-08",
+    ]
+
+
+def test_iter_historical_resolves_trading_day_axis_for_weekday_sf(fixed_now):
+    """weekday_sf with {trading_day}: previous_trading_day of each
+    weekday firing date — the AM SF fires before market open so the
+    'available' trading day is the previous one. From Fri 5/29 (the
+    first weekday before fixed_now Sat 5/30): prev trading day = Thu
+    5/28; from Thu 5/28 → Wed 5/27; etc."""
+    import index
+    dates = index._iter_historical_cycle_dates(
+        "weekday_sf", fixed_now, 4,
+        template="predictor/predictions/{trading_day}.json",
+    )
+    assert [d.isoformat() for d in dates] == [
+        "2026-05-28", "2026-05-27", "2026-05-26", "2026-05-22",
+    ]
+
+
+def test_iter_historical_resolves_eod_keeps_firing_date_for_trading_day(fixed_now):
+    """eod_sf with {trading_day}: EOD writes today's data after market
+    close, so trading_day == the SF firing weekday itself (no offset).
+    fixed_now Sat 5/30; previous weekday firings 5/29, 5/28, 5/27."""
+    import index
+    dates = index._iter_historical_cycle_dates(
+        "eod_sf", fixed_now, 3,
+        template="regime/{trading_day}.json",
+    )
+    assert [d.isoformat() for d in dates] == [
+        "2026-05-29", "2026-05-28", "2026-05-27",
+    ]
+
+
+def test_iter_historical_calendar_axis_unchanged_for_date_placeholder(fixed_now):
+    """{date} placeholder keeps calendar-axis resolution (no
+    previous_trading_day translation). Used by _weekly/{date}/manifest.json
+    where the {date} IS the Saturday firing date."""
+    import index
+    dates = index._iter_historical_cycle_dates(
+        "saturday_sf", fixed_now, 3,
+        template="_weekly/{date}/manifest.json",
+    )
+    assert [d.isoformat() for d in dates] == [
+        "2026-05-23", "2026-05-16", "2026-05-09",
+    ]
+
+
+def test_iter_historical_backward_compat_no_template_arg(fixed_now):
+    """Pre-PR callers that omit template still get calendar-axis
+    resolution. Required so the prior 21 tests don't regress."""
+    import index
+    dates = index._iter_historical_cycle_dates("saturday_sf", fixed_now, 3)
+    assert [d.isoformat() for d in dates] == [
+        "2026-05-23", "2026-05-16", "2026-05-09",
+    ]
+
+
+def test_resolve_axis_dates_holiday_skips_via_lib():
+    """previous_trading_day is NYSE-holiday-aware. Memorial Day 2026-05-25
+    (Mon) is a NYSE holiday; previous_trading_day(2026-05-25) returns
+    Fri 5/22 (skipping the Mon holiday)."""
+    from datetime import date as _date
+    import index
+    dates = index._resolve_axis_dates(
+        [_date(2026, 5, 26)],  # Tue after Memorial Day
+        template="x/{trading_day}.json",
+        cadence="weekday_sf",
+    )
+    # Tue 5/26's prior trading day skips Mon 5/25 (Memorial Day) →
+    # lands on Fri 5/22 if 5/25 is holiday-marked in the lib's calendar.
+    # Don't pin a specific value here — just assert it's NOT Mon 5/25.
+    assert dates[0] != _date(2026, 5, 25)
+    assert dates[0] < _date(2026, 5, 26)

@@ -60,6 +60,7 @@ from alpha_engine_lib.artifact_freshness import (
     check_freshness,
     resolve_dedup_key,
 )
+from alpha_engine_lib.trading_calendar import previous_trading_day
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -347,25 +348,19 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
 # can route via alpha_engine_lib.dates.
 
 
-def _iter_historical_cycle_dates(cadence: str, now: datetime, count: int) -> list[date]:
-    """Return the N most recent cycle dates for the given cadence,
-    newest-first. Calendar-naive (NYSE holidays are not skipped).
-
-    For ``saturday_sf``: previous ``count`` Saturdays strictly before
-    ``now.date()``. Today's Saturday is excluded if ``now`` is before
-    the typical 09:00 UTC cron — the caller is expected to invoke
-    historical mode after the current-state probe has had time to
-    cover the current cycle.
-
-    For ``weekday_sf`` / ``eod_sf``: previous ``count`` Mon-Fri days
-    strictly before ``now.date()``.
+def _iter_sf_firing_dates(cadence: str, now: datetime, count: int) -> list[date]:
+    """Return the N most recent SF firing dates (calendar) for the given
+    cadence, newest-first. The SF cron's actual firing dates — Saturdays
+    for saturday_sf, Mon-Fri for weekday_sf / eod_sf. Calendar-naive
+    (NYSE holidays NOT skipped at this layer — observable false-positives
+    for holiday-skipped firings surface as ❌ absent cells, which the
+    operator interprets in context).
     """
     if count <= 0:
         return []
     today = now.date()
     dates: list[date] = []
     if cadence == "saturday_sf":
-        # Walk back day-by-day, collecting Saturdays.
         d = today - timedelta(days=1)
         while len(dates) < count:
             if d.weekday() == 5:  # Saturday
@@ -377,8 +372,59 @@ def _iter_historical_cycle_dates(cadence: str, now: datetime, count: int) -> lis
             if d.weekday() < 5:  # Mon-Fri
                 dates.append(d)
             d -= timedelta(days=1)
-    # Other cadences: skip (continuous covered by current-state probe).
     return dates
+
+
+def _resolve_axis_dates(
+    firing_dates: list[date], template: str, cadence: str,
+) -> list[date]:
+    """Translate SF firing dates to the date axis the s3_key_template
+    actually uses. Two axes are supported:
+
+      - ``{date}`` — calendar date (the SF firing date itself). Used by
+        artifacts whose key reflects the SF firing identity, e.g.
+        ``_weekly/{date}/manifest.json`` (the data manifest IS the
+        Saturday firing receipt).
+      - ``{trading_day}`` — NYSE trading day. Used by artifacts whose
+        key reflects the trading-day the data refers to, NOT the SF
+        firing date. Cadence-specific resolution:
+          * saturday_sf: previous_trading_day(saturday) → typically Fri
+            (the trading day whose close drove this Saturday's research).
+          * weekday_sf: previous_trading_day(weekday) → the prior trading
+            day's close (the AM SF fires before market open).
+          * eod_sf: weekday itself → today's close (the EOD SF fires
+            after market close, so today IS the trading_day).
+
+    Per the system-wide ``now_dual()`` convention
+    (``trading_day = last_closed_trading_day(now)``); see
+    alpha-engine-docs/private/DATE_CONVENTIONS.md.
+
+    Calendar-naive at the SF-firing layer above, but trading_day
+    resolution uses ``alpha_engine_lib.trading_calendar.previous_trading_day``
+    which IS NYSE-holiday-aware. So holiday-skipped firings still
+    surface as cleanly-absent cells, but their resolved trading_day
+    skips the holiday correctly.
+    """
+    if "{trading_day}" in template:
+        if cadence == "eod_sf":
+            return list(firing_dates)
+        return [previous_trading_day(d) for d in firing_dates]
+    return list(firing_dates)
+
+
+def _iter_historical_cycle_dates(
+    cadence: str, now: datetime, count: int, template: str = "",
+) -> list[date]:
+    """Return the N most recent cycle dates resolved to the axis the
+    template uses. See ``_iter_sf_firing_dates`` +
+    ``_resolve_axis_dates`` for the two-stage derivation.
+
+    Backward compat: callers that omit ``template`` get calendar-axis
+    resolution (the pre-2026-05-28 behavior). The historical-mode
+    handler always passes the template.
+    """
+    firing_dates = _iter_sf_firing_dates(cadence, now, count)
+    return _resolve_axis_dates(firing_dates, template, cadence)
 
 
 def _format_historical_key(template: str, target_date: date) -> str:
@@ -498,7 +544,9 @@ def _handle_historical(
     total_cycles_probed = 0
     for spec in specs:
         count = lookback.get(spec.cadence, 0)
-        cycle_dates = _iter_historical_cycle_dates(spec.cadence, now, count)
+        cycle_dates = _iter_historical_cycle_dates(
+            spec.cadence, now, count, template=spec.s3_key_template,
+        )
         cycles, is_latest_pointer = _probe_historical(s3_client, spec, cycle_dates)
         if not cycles and "{cycle_label}" in spec.s3_key_template:
             skipped_unsupported += 1
