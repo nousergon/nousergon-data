@@ -210,32 +210,24 @@ class TestOrchestrationCFNPipelineRoles:
         ), 'WeekdayTrigger Input must carry pipeline_role="daily".'
 
 
-class TestSaturdayCFNTargetActivatesScanner:
-    """ROADMAP L1995 Phase 3 — ``enable_standalone_scanner: true`` is
-    what activates the Scanner SF state (Phase 2) in parallel-observe
-    mode. Originally lived in ``deploy_step_function.sh``'s INPUT_JSON
-    (PR #313); migrated to CFN here on 2026-05-26 as part of the
-    EB-target single-SoT consolidation. Keeping the flag on the
-    SCRIPT meant that re-deploying CFN would silently revert Phase 3
-    by overwriting the live target with a CFN-form input that lacks
-    the flag — a footgun the SoT consolidation removes.
-
-    Revert by flipping to ``false`` in the CFN template in the same
-    PR that updates this test.
+class TestSaturdayCFNTargetHasNoScannerGateFlag:
+    """The ``CheckEnableStandaloneScanner`` SF Choice gate was removed
+    2026-05-28 — Scanner runs unconditionally per
+    ``feedback_observe_mode_unconditional_gates_govern_cutover``. The
+    EB target Input MUST NOT carry ``enable_standalone_scanner``: the
+    flag is dead substrate, and re-introducing it primes a future
+    re-add of the Choice gate (the test that pinned its presence is
+    what kept the gate alive). The Phase 4/5 consumer-cutover flag
+    (Research / RAG reading ``candidates.json``) belongs at the
+    consumer side, not on the producer-side EB target.
     """
 
-    def test_enable_standalone_scanner_present_and_true(self, orchestration_text):
+    def test_no_enable_standalone_scanner_in_input(self, orchestration_text):
         block = _trigger_block(orchestration_text, "SaturdayTrigger")
-        assert "enable_standalone_scanner" in block, (
-            "SaturdayTrigger Input dropped enable_standalone_scanner. "
-            "This silently reverts ROADMAP L1995 Phase 3 (Scanner SF "
-            "state runs default-off). If the revert is intentional, "
-            "update both this test and the CFN template in the same PR."
-        )
-        assert re.search(
-            r'"enable_standalone_scanner"\s*:\s*true',
-            block,
-        ), (
-            "enable_standalone_scanner is present but not set to true. "
-            "Phase 3 requires the flag value to be true."
+        assert "enable_standalone_scanner" not in block, (
+            "SaturdayTrigger Input must NOT carry enable_standalone_scanner. "
+            "Scanner runs unconditionally as of 2026-05-28; the flag is "
+            "dead substrate. Re-introducing it primes a re-add of the "
+            "removed Choice gate. See "
+            "feedback_observe_mode_unconditional_gates_govern_cutover."
         )
