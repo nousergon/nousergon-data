@@ -69,6 +69,41 @@ class TestSignalsContract:
         with pytest.raises(ValidationError):
             validate(instance=bad_signals, schema=schema)
 
+    def test_market_regime_enum_is_3class(self):
+        # 3-class Ang-Bekaert taxonomy (v0.42.0 / 2026-05-28).
+        # Legacy 4-class "caution" retired per
+        # caution-regime-retirement-260528.md.
+        schema = _load_schema("signals.schema.json")
+        regime_field = schema["properties"]["market_regime"]
+        assert regime_field["enum"] == ["bull", "neutral", "bear"]
+
+    def test_market_regime_caution_rejected(self):
+        schema = _load_schema("signals.schema.json")
+        bad_signals = {
+            "date": "2026-04-03",
+            "run_time": "00:30:00",
+            "market_regime": "caution",
+            "sector_ratings": {},
+            "universe": [],
+            "buy_candidates": [],
+        }
+        with pytest.raises(ValidationError):
+            validate(instance=bad_signals, schema=schema)
+
+    def test_each_3class_regime_accepted(self):
+        schema = _load_schema("signals.schema.json")
+        for regime in ("bull", "neutral", "bear"):
+            signals = {
+                "date": "2026-04-03",
+                "run_time": "00:30:00",
+                "market_regime": regime,
+                "sector_ratings": {},
+                "universe": [],
+                "buy_candidates": [],
+            }
+            # Should not raise
+            validate(instance=signals, schema=schema)
+
 
 class TestPredictionsContract:
     def test_valid_predictions_pass(self):
