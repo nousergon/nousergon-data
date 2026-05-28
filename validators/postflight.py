@@ -119,19 +119,12 @@ class DataPostflight:
 
     def _open_arctic_libs(self) -> "tuple[Any, Any]":
         if self._universe_lib is None or self._macro_lib is None:
-            import arcticdb as adb
-            uri = (
-                f"s3s://s3.{self.region}.amazonaws.com:{self.bucket}"
-                "?path_prefix=arcticdb&aws_auth=true"
-            )
+            from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
             try:
-                arctic = adb.Arctic(uri)
-                self._universe_lib = arctic.get_library("universe")
-                self._macro_lib = arctic.get_library("macro")
+                self._universe_lib = open_universe_lib(self.bucket, region=self.region)
+                self._macro_lib = open_macro_lib(self.bucket, region=self.region)
             except Exception as exc:
-                raise PostflightError(
-                    f"ArcticDB unreachable at {uri}: {exc}"
-                ) from exc
+                raise PostflightError(str(exc)) from exc
         return self._universe_lib, self._macro_lib
 
     # ── Checks ───────────────────────────────────────────────────────────────

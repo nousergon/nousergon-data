@@ -172,11 +172,8 @@ def check_arctic_connectivity(ctx: PreflightContext) -> CheckResult:
     t0 = time.time()
     try:
         import arcticdb as adb
-        uri = (
-            f"s3s://s3.us-east-1.amazonaws.com:{ctx.bucket}"
-            "?path_prefix=arcticdb&aws_auth=true"
-        )
-        arctic = adb.Arctic(uri)
+        from alpha_engine_lib.arcticdb import open_arctic
+        arctic = open_arctic(ctx.bucket, region="us-east-1")
         libs = set(arctic.list_libraries())
         if "universe" not in libs or "macro" not in libs:
             return CheckResult(
