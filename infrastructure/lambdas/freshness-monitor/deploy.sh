@@ -215,10 +215,26 @@ if $BOOTSTRAP; then
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
+  # JSON Input (`{"mode":"historical"}`) doesn't fit the put-targets
+  # shorthand form (Id=,Arn=,Input= chokes on the embedded quotes +
+  # comma). Write a temp JSON file + pass via file:// to dodge the
+  # shell-quoting trap. Caught live 2026-05-28 when --bootstrap re-run
+  # tripped argparse on the shorthand.
+  HIST_TARGET_JSON=$(mktemp)
+  cat > "${HIST_TARGET_JSON}" <<EOF
+[
+  {
+    "Id": "1",
+    "Arn": "${FN_ARN}",
+    "Input": "{\"mode\":\"historical\"}"
+  }
+]
+EOF
   run aws events put-targets \
     --rule "${HISTORICAL_RULE_NAME}" \
-    --targets "Id=1,Arn=${FN_ARN},Input={\"mode\":\"historical\"}" \
+    --targets "file://${HIST_TARGET_JSON}" \
     --region "${REGION}"
+  rm -f "${HIST_TARGET_JSON}"
 
   HIST_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${HISTORICAL_RULE_NAME}"
   run aws lambda add-permission \
