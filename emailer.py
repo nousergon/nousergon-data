@@ -1,84 +1,28 @@
 """
 emailer.py — Completion email for data pipeline steps.
 
-Gmail SMTP primary, SES fallback. Same pattern as predictor/research.
+Builds subject/body/HTML and delegates the SMTP+SES dispatch to
+``alpha_engine_lib.email_sender.send_email`` (the L4356 chokepoint).
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import smtplib
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-from alpha_engine_lib.secrets import get_secret
+from alpha_engine_lib.email_sender import send_email
 
 log = logging.getLogger(__name__)
 
 
 def send_step_email(step_name: str, results: dict, date_str: str) -> bool:
     """Send a completion email for a pipeline step. Never raises."""
-    sender = (get_secret("EMAIL_SENDER", required=False, default="") or "").strip()
-    recipients = [
-        r.strip()
-        for r in (get_secret("EMAIL_RECIPIENTS", required=False, default="") or "").split(",")
-        if r.strip()
-    ]
-
-    if not sender or not recipients:
-        log.info("Step email skipped — EMAIL_SENDER/EMAIL_RECIPIENTS not set")
-        return False
-
     try:
         subject, html_body, plain_body = _build_email(step_name, results, date_str)
     except Exception as exc:
         log.warning("Failed to build step email: %s", exc)
         return False
-
-    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").strip()
-
-    if app_password:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"] = sender
-            msg["To"] = ", ".join(recipients)
-            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-            msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-            with smtplib.SMTP("smtp.gmail.com", 587) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender, app_password.replace(" ", ""))
-                server.sendmail(sender, recipients, msg.as_string())
-            log.info("Step email sent via Gmail SMTP: '%s'", subject)
-            return True
-        except Exception as exc:
-            log.warning("Gmail SMTP failed (%s) — trying SES fallback", exc)
-
-    try:
-        import boto3
-        ses = boto3.client("ses", region_name=os.environ.get("AWS_REGION", "us-east-1"))
-        ses.send_email(
-            Source=sender,
-            Destination={"ToAddresses": recipients},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {
-                    "Text": {"Data": plain_body, "Charset": "UTF-8"},
-                    "Html": {"Data": html_body, "Charset": "UTF-8"},
-                },
-            },
-        )
-        log.info("Step email sent via SES: '%s'", subject)
-        return True
-    except Exception as exc:
-        log.warning("SES email failed: %s", exc)
-
-    return False
+    return send_email(subject, plain_body, html=html_body)
 
 
 def _build_email(step_name: str, results: dict, date_str: str) -> tuple[str, str, str]:
