@@ -476,3 +476,97 @@ def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now)
     assert index._maybe_alert(spec, result, fixed_now) is True
     publish_mock.assert_called_once()
     assert publish_mock.call_args.kwargs["severity"] == "critical"
+
+
+# ── Historical-mode tests ────────────────────────────────────────────────────
+
+
+def test_iter_historical_cycle_dates_saturday_returns_previous_saturdays(fixed_now):
+    """Saturday cadence walks back day-by-day collecting Saturdays only.
+    Verified anchor: 2026-05-28 is a Thursday; previous Saturdays are
+    2026-05-23, 2026-05-16, 2026-05-09, etc."""
+    import index
+    dates = index._iter_historical_cycle_dates("saturday_sf", fixed_now, 3)
+    assert [d.isoformat() for d in dates] == ["2026-05-23", "2026-05-16", "2026-05-09"]
+
+
+def test_iter_historical_cycle_dates_weekday_returns_previous_mon_fri(fixed_now):
+    """weekday_sf walks back collecting Mon-Fri only. fixed_now is Sat
+    2026-05-30; previous Mon-Fri sequence is Fri 5/29, Thu 5/28, Wed
+    5/27, Tue 5/26, Mon 5/25."""
+    import index
+    dates = index._iter_historical_cycle_dates("weekday_sf", fixed_now, 5)
+    assert [d.isoformat() for d in dates] == [
+        "2026-05-29", "2026-05-28", "2026-05-27", "2026-05-26", "2026-05-25",
+    ]
+
+
+def test_iter_historical_cycle_dates_eod_matches_weekday(fixed_now):
+    """eod_sf shares the weekday cadence — confirmed by callers in
+    ARTIFACT_REGISTRY.yaml (regime_state_dated, predictor_drift_detection)."""
+    import index
+    sat_dates = index._iter_historical_cycle_dates("weekday_sf", fixed_now, 4)
+    eod_dates = index._iter_historical_cycle_dates("eod_sf", fixed_now, 4)
+    assert sat_dates == eod_dates
+
+
+def test_iter_historical_cycle_dates_continuous_returns_empty(fixed_now):
+    """continuous cadence is intentionally skipped — current-state probe
+    covers it at 15min granularity."""
+    import index
+    assert index._iter_historical_cycle_dates("continuous", fixed_now, 100) == []
+
+
+def test_iter_historical_cycle_dates_zero_count_returns_empty(fixed_now):
+    """count=0 short-circuits — early return prevents infinite loop on a
+    cadence string whose weekday filter never matches."""
+    import index
+    assert index._iter_historical_cycle_dates("saturday_sf", fixed_now, 0) == []
+
+
+def test_format_historical_key_substitutes_date_placeholder():
+    import index
+    assert index._format_historical_key(
+        "candidates/{date}/candidates.json", date(2026, 5, 23),
+    ) == "candidates/2026-05-23/candidates.json"
+
+
+def test_format_historical_key_substitutes_trading_day_placeholder():
+    """{trading_day} renders the same ISO date as {date} — the lib's
+    placeholder set treats them as synonyms for historical-probe purposes."""
+    import index
+    assert index._format_historical_key(
+        "predictor/predictions/{trading_day}.json", date(2026, 5, 27),
+    ) == "predictor/predictions/2026-05-27.json"
+
+
+def test_format_historical_key_passes_through_latest_pointer():
+    """Latest-pointer templates have no placeholder — format is a no-op."""
+    import index
+    assert index._format_historical_key(
+        "factors/profiles/latest.json", date(2026, 5, 24),
+    ) == "factors/profiles/latest.json"
+
+
+def test_handler_dispatches_to_historical_on_mode_flag(monkeypatch, fixed_now):
+    """event={'mode': 'historical'} routes to _handle_historical without
+    touching the current-state path."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(
+        index, "_handle_historical",
+        mock.Mock(return_value={"mode": "historical", "n_artifacts": 0,
+                                "n_cycles_probed": 0, "skipped_unsupported": 0,
+                                "duration_seconds": 0.0}),
+    )
+    monkeypatch.setattr(index, "load_registry", mock.Mock())  # would fail otherwise
+    monkeypatch.setattr(
+        index, "datetime", mock.Mock(
+            now=mock.Mock(return_value=fixed_now),
+        ),
+    )
+    result = index.handler({"mode": "historical"}, None)
+    assert result["mode"] == "historical"
+    index._handle_historical.assert_called_once()
+    index.load_registry.assert_not_called()  # current-state path NOT taken
