@@ -40,6 +40,17 @@
         "arn:aws:s3:::alpha-engine-research/_freshness_monitor/*",
         "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
       ]
+    },
+    {
+      "Sid": "CloudWatchCycleCompletionMetric",
+      "Effect": "Allow",
+      "Action": ["cloudwatch:PutMetricData"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine/Substrate"
+        }
+      }
     }
   ]
 }
