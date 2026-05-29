@@ -905,43 +905,23 @@ class TestHappyPathTraversal:
         ]
 
 
-class TestFridayEventBridgeRule:
-    """The Friday rule must be shipped DISABLED, target the SAME Saturday
-    SF, and pass shell_run=true (additive observability, not a backstop)."""
+class TestFridayCronRuleRetired:
+    """The fixed-time Friday cron rule (alpha-engine-friday-shell-run) was
+    RETIRED 2026-05-29 (ROADMAP L4055), superseded by the event-driven
+    alpha-engine-eod-success-friday-shell-trigger Lambda (#282). These guard
+    against its re-introduction — the cron's three failure modes (no-fire on
+    Friday EOD failure, late-rerun blindness, StopTradingInstance race) are
+    exactly what the event-driven path eliminates. The shell_run SF gate it
+    used to feed is unchanged and still covered by the rest of this file."""
 
     @pytest.fixture(scope="class")
     def cfn_text(self) -> str:
         return _CFN_PATH.read_text()
 
-    def test_rule_block_present(self, cfn_text):
-        assert "FridayShellRunTrigger:" in cfn_text
-        assert "Name: alpha-engine-friday-shell-run" in cfn_text
-
-    def test_rule_shipped_disabled(self, cfn_text):
-        block = cfn_text.split("FridayShellRunTrigger:", 1)[1].split(
-            "WeekdayTrigger:", 1
-        )[0]
-        assert "State: DISABLED" in block, (
-            "Friday shell-run rule MUST ship DISABLED — zero-risk merge; "
-            "Brian enables it deliberately (fail-loud / no-backstop design)."
+    def test_cron_rule_resource_removed(self, cfn_text):
+        assert "FridayShellRunTrigger:" not in cfn_text, (
+            "The Friday cron rule was retired (L4055) — the event-driven "
+            "Lambda is the sole shell-run trigger. Do not re-add the CFN rule."
         )
-        assert "State: ENABLED" not in block
-
-    def test_rule_targets_same_saturday_sf_with_shell_run(self, cfn_text):
-        block = cfn_text.split("FridayShellRunTrigger:", 1)[1].split(
-            "WeekdayTrigger:", 1
-        )[0]
-        assert "!Ref SaturdayPipeline" in block, (
-            "must reuse the existing Saturday SF — NOT a parallel SF"
-        )
-        assert "!Ref EventBridgeSfnRoleArn" in block  # same StartExecution grant
-        assert '"shell_run": true' in block
-
-    def test_friday_schedule_after_eod_before_saturday(self, cfn_text):
-        block = cfn_text.split("FridayShellRunTrigger:", 1)[1].split(
-            "WeekdayTrigger:", 1
-        )[0]
-        # 20:45 UTC Fri = 1:45 PM PT (PDT) — after Friday EOD SF (~1:25 PT),
-        # ~12h before the real Sat 09:00 UTC firing. (Retimed from 21:30 UTC
-        # per operator request 2026-05-18.)
-        assert "cron(45 20 ? * FRI *)" in block
+        assert "Name: alpha-engine-friday-shell-run" not in cfn_text
+        assert "cron(45 20 ? * FRI *)" not in cfn_text

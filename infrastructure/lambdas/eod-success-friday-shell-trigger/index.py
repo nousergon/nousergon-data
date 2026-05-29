@@ -91,6 +91,14 @@ def _build_shell_run_input() -> str:
             "ec2_instance_id": [TRADING_EC2_INSTANCE_ID],
             "sns_topic_arn": SNS_TOPIC_ARN,
             "shell_run": True,
+            # pipeline_role="shell-run" (Option-D taxonomy): tags this
+            # execution so the dashboard page-25 / Slack / CLI role filters
+            # distinguish the Friday-PM dry-pass from the canonical weekly
+            # run. The retired cron rule (alpha-engine-friday-shell-run,
+            # ROADMAP L4055) carried this tag; restored here so the
+            # event-driven path is a faithful replacement, not a surface
+            # regression. shell_run=true stays the load-bearing input.
+            "pipeline_role": "shell-run",
         }
     )
 

@@ -9,10 +9,10 @@
 # rollover) and, if trading_day.weekday()==4 (Friday), invokes the Saturday
 # Step Function with `shell_run: true`.
 #
-# Replaces the prior fixed-time cron rule `alpha-engine-friday-shell-run`
-# (cron(45 20 ? * FRI *) = 13:45 PT Friday). Disable the cron AFTER this
-# Lambda's first successful Friday event-driven invocation:
-#   aws events disable-rule --name alpha-engine-friday-shell-run --region us-east-1
+# Replaced the prior fixed-time cron rule `alpha-engine-friday-shell-run`
+# (cron(45 20 ? * FRI *) = 13:45 PT Friday), which ran DISABLED from the
+# 2026-05-21 cutover and was RETIRED from CloudFormation 2026-05-29 (ROADMAP
+# L4055) after the event-driven path confirmed across two Fridays (5/22 + 5/29).
 #
 # Managed outside CloudFormation — same rationale as sf-telegram-notifier +
 # spot-orphan-reaper + changelog-cloudwatch-mirror (keeps the
