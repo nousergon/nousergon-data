@@ -660,3 +660,132 @@ def test_resolve_axis_dates_holiday_skips_via_lib():
     # Don't pin a specific value here — just assert it's NOT Mon 5/25.
     assert dates[0] != _date(2026, 5, 25)
     assert dates[0] < _date(2026, 5, 26)
+
+
+# ── Per-cycle completion rollup (L249 consumer) ─────────────────────────────
+
+
+def _run_handler(monkeypatch, fake_s3, fixed_now, *, registry_body):
+    """Invoke the handler in OBSERVE mode with boto3 routed to fake_s3
+    (which also serves boto3.client('cloudwatch') — put_metric_data lands
+    on the same recording mock)."""
+    monkeypatch.delenv("MNEMON_FRESHNESS_MONITOR_ENABLED", raising=False)
+    fake_s3._registry_body = registry_body
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    return index.handler({}, None)
+
+
+def _cycle_verdict_payload(fake_s3) -> dict:
+    body = next(
+        b for (_, k, b) in fake_s3._put_calls
+        if k == "_freshness_monitor/cycle_verdict.json"
+    )
+    return json.loads(body)
+
+
+def test_handler_emits_cycle_verdict_per_cadence(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """The registry walk is mixed-cadence; the rollup must produce ONE
+    verdict per (cadence, label), never a single conflated verdict. With
+    the fixture: saturday_sf critical (probe_missing) 404s → incomplete;
+    continuous critical (probe_heartbeat) 404s → incomplete. probe_fresh is
+    WARNING → excluded from the required set."""
+    # probe_fresh fresh; the two criticals 404 by default.
+    fake_s3._head_returns["path/2026-05-30/fresh.json"] = {
+        "LastModified": datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc),
+    }
+    result = _run_handler(monkeypatch, fake_s3, fixed_now, registry_body=yaml_registry_body)
+
+    payload = _cycle_verdict_payload(fake_s3)
+    by_cadence = {v["cadence"]: v for v in payload["verdicts"]}
+    assert set(by_cadence) == {"saturday_sf", "continuous"}
+
+    sat = by_cadence["saturday_sf"]
+    assert sat["state"] == "incomplete"
+    assert sat["n_required"] == 1          # only probe_missing (critical); probe_fresh excluded
+    assert sat["missing"] == ["probe_missing"]
+
+    cont = by_cadence["continuous"]
+    assert cont["state"] == "incomplete"
+    assert cont["missing"] == ["probe_heartbeat"]
+
+    assert result["cycle_verdicts"] == {
+        "saturday_sf": "incomplete",
+        "continuous": "incomplete",
+    }
+
+
+def test_handler_cycle_complete_when_criticals_fresh(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """All critical artifacts present+valid → every cadence complete."""
+    # Saturday cycle tick is 09:00 UTC, so 12:00 is fresh.
+    sat_lm = {"LastModified": datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc)}
+    fake_s3._head_returns["path/2026-05-30/fresh.json"] = sat_lm
+    fake_s3._head_returns["path/2026-05-30/missing.json"] = sat_lm
+    # Continuous cycle tick is the current 15-min bucket (== now, 18:00), so the
+    # heartbeat must be modified at/after now to count fresh.
+    fake_s3._head_returns["_freshness_monitor/heartbeat.json"] = {
+        "LastModified": datetime(2026, 5, 30, 18, 0, tzinfo=timezone.utc),
+    }
+
+    result = _run_handler(monkeypatch, fake_s3, fixed_now, registry_body=yaml_registry_body)
+    assert result["cycle_verdicts"] == {
+        "saturday_sf": "complete",
+        "continuous": "complete",
+    }
+
+
+def test_handler_emits_cycle_completion_cw_metric(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """One ArtifactFreshnessCycleComplete datapoint per cadence, dimensioned
+    by Cadence only, in the AlphaEngine/Substrate namespace."""
+    fake_s3._head_returns["path/2026-05-30/fresh.json"] = {
+        "LastModified": datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc),
+    }
+    _run_handler(monkeypatch, fake_s3, fixed_now, registry_body=yaml_registry_body)
+
+    assert fake_s3.put_metric_data.called
+    _, kwargs = fake_s3.put_metric_data.call_args
+    assert kwargs["Namespace"] == "AlphaEngine/Substrate"
+    md = kwargs["MetricData"]
+    assert {m["MetricName"] for m in md} == {"ArtifactFreshnessCycleComplete"}
+    dims = {m["Dimensions"][0]["Value"] for m in md}
+    assert dims == {"saturday_sf", "continuous"}
+    # Both cadences incomplete here → all values 0.0.
+    assert all(m["Value"] == 0.0 for m in md)
+
+
+def test_handler_cycle_rollup_failure_is_non_fatal(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """A failure in the cycle-rollup block must NOT sink the monitor — the
+    primary check_results + heartbeat are still written and the handler
+    returns with cycle_verdicts={}."""
+    fake_s3._registry_body = yaml_registry_body
+    monkeypatch.delenv("MNEMON_FRESHNESS_MONITOR_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    # Force the rollup to blow up.
+    def _boom(*a, **kw):
+        raise RuntimeError("rollup exploded")
+    monkeypatch.setattr(index, "_serialize_cycle_verdicts", _boom)
+
+    result = index.handler({}, None)
+
+    assert result["cycle_verdicts"] == {}
+    put_keys = [k for (_, k, _) in fake_s3._put_calls]
+    assert "_freshness_monitor/heartbeat.json" in put_keys
+    assert "_freshness_monitor/check_results.json" in put_keys
+    assert "_freshness_monitor/cycle_verdict.json" not in put_keys
