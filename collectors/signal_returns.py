@@ -408,14 +408,17 @@ def _backfill_score_context(
 
 
 def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
-    """Backfill 5d/10d/30d returns in score_performance by JOINing universe_returns."""
+    """Backfill 5d/10d/21d/30d returns in score_performance by JOINing
+    universe_returns, plus the canonical 21d log-domain market-relative
+    alpha (log_alpha_21d) — the same target the predictor trains on.
+    """
     try:
         conn = sqlite3.connect(db_path)
         _ensure_score_performance_schema(conn)
 
         updated = 0
-        for horizon in ("5d", "10d", "30d"):
-            bdays = {"5d": 5, "10d": 10, "30d": 30}[horizon]
+        for horizon in ("5d", "10d", "21d", "30d"):
+            bdays = {"5d": 5, "10d": 10, "21d": 21, "30d": 30}[horizon]
 
             # Find score_performance rows missing this horizon's return
             pending = pd.read_sql_query(
@@ -459,8 +462,54 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
                     )
                 updated += 1
 
+        # Backfill canonical 21d log-domain market-relative alpha
+        # (log_alpha_21d) — the same target the predictor trains on
+        # (actual_log_alpha). Separate block from the arithmetic loop
+        # because it sources the LOG columns, not the arithmetic ones:
+        #   log_alpha = log_return_21d - log_spy_return_21d
+        # Mirrors _backfill_predictor_returns (lines ~629-631) so the
+        # judge outcome-IC correlates against an identically-defined
+        # alpha. No clipping / sector-neutralization — raw log diff, per
+        # the canonical-alpha framework (cutover 2026-05-09).
+        ur_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()
+        }
+        if {"log_return_21d", "log_spy_return_21d"} <= ur_cols:
+            pending_alpha = pd.read_sql_query(
+                "SELECT symbol, score_date FROM score_performance WHERE log_alpha_21d IS NULL",
+                conn,
+            )
+            for _, row in pending_alpha.iterrows():
+                ticker = row["symbol"]
+                score_date = row["score_date"]
+                ur = conn.execute(
+                    "SELECT log_return_21d, log_spy_return_21d "
+                    "FROM universe_returns WHERE ticker = ? AND eval_date = ?",
+                    (ticker, score_date),
+                ).fetchone()
+                if ur is None or ur[0] is None:
+                    continue
+                log_alpha = ur[0] - (ur[1] if ur[1] is not None else 0.0)
+                if not dry_run:
+                    conn.execute(
+                        "UPDATE score_performance SET log_alpha_21d=? "
+                        "WHERE symbol=? AND score_date=? AND log_alpha_21d IS NULL",
+                        (round(log_alpha, 6), ticker, score_date),
+                    )
+                updated += 1
+        else:
+            # Carve-out per ~/Development/CLAUDE.md no-silent-fails: (a) failure
+            # mode = legacy universe_returns lacking 21d log columns (pre-#197);
+            # (b) primary deliverable (5/10/21/30d arithmetic returns above)
+            # survives; (c) recording surface = this WARN. Post-#197 DBs always
+            # have these, so a sustained WARN means a migration regressed.
+            logger.warning(
+                "score_performance: universe_returns lacks log_return_21d/"
+                "log_spy_return_21d — skipping canonical log_alpha_21d backfill"
+            )
+
         # Repair: fix beat_spy columns where return exists but beat_spy is NULL
-        for horizon in ("5d", "10d", "30d"):
+        for horizon in ("5d", "10d", "21d", "30d"):
             repaired = conn.execute(
                 f"UPDATE score_performance SET beat_spy_{horizon} = CASE WHEN return_{horizon} > spy_{horizon}_return THEN 1 ELSE 0 END WHERE return_{horizon} IS NOT NULL AND spy_{horizon}_return IS NOT NULL AND beat_spy_{horizon} IS NULL",
             ).rowcount
@@ -712,6 +761,15 @@ def _ensure_score_performance_schema(conn) -> None:
         ("beat_spy_5d", "INTEGER"), ("eval_date_5d", "TEXT"),
         ("price_10d", "REAL"), ("return_10d", "REAL"), ("spy_10d_return", "REAL"),
         ("beat_spy_10d", "INTEGER"), ("eval_date_10d", "TEXT"),
+        # Canonical 21d horizon (alpha-engine-research migration #18,
+        # 2026-05-29). Arithmetic parity columns + the canonical
+        # log-domain market-relative alpha (log_alpha_21d) the predictor
+        # trains on (actual_log_alpha). Sourced from universe_returns'
+        # return_21d / log_return_21d columns (alpha-engine-data #197).
+        # Powers the judge outcome-IC validation (ROADMAP L480 re-scope).
+        ("price_21d", "REAL"), ("return_21d", "REAL"), ("spy_21d_return", "REAL"),
+        ("beat_spy_21d", "INTEGER"), ("eval_date_21d", "TEXT"),
+        ("log_alpha_21d", "REAL"),
         ("price_30d", "REAL"), ("return_30d", "REAL"), ("spy_30d_return", "REAL"),
         ("beat_spy_30d", "INTEGER"), ("eval_date_30d", "TEXT"),
         # Calibrator-v1 context (alpha-engine-research migration #12)

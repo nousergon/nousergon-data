@@ -651,3 +651,144 @@ class TestEnsureScorePerformanceSchemaIncludesStance:
             _ensure_score_performance_schema(conn)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(score_performance)").fetchall()}
         assert "stance" in cols
+
+
+# ── Canonical 21d returns + log-alpha backfill (ROADMAP L480, 2026-05-29) ──
+#
+# The judge outcome-IC validation correlates judge quality scores against
+# realized canonical 21d log-domain market-relative alpha. These tests pin
+# that _backfill_score_returns now populates the 21d arithmetic parity
+# columns AND log_alpha_21d (= log_return_21d - log_spy_return_21d, the
+# same definition the predictor's actual_log_alpha uses).
+
+
+from collectors.signal_returns import _backfill_score_returns
+
+
+def _make_21d_db(
+    path,
+    *,
+    ticker="AAPL",
+    score_date="2026-05-01",
+    entry_price=100.0,
+    include_log_cols=True,
+    log_21d=0.0488,
+    log_spy_21d=0.00995,
+):
+    """score_performance with one seeded row + a universe_returns carrying
+    the full horizon column set (only 21d populated)."""
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE score_performance ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, "
+            "score_date TEXT NOT NULL, score REAL, price_on_date REAL, "
+            "UNIQUE(symbol, score_date))"
+        )
+        conn.execute(
+            "INSERT INTO score_performance (symbol, score_date, score, price_on_date) "
+            "VALUES (?, ?, ?, ?)",
+            (ticker, score_date, 78.0, entry_price),
+        )
+        log_cols = (
+            ", log_return_21d REAL, log_spy_return_21d REAL"
+            if include_log_cols else ""
+        )
+        conn.execute(
+            "CREATE TABLE universe_returns ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, "
+            "eval_date TEXT NOT NULL, "
+            "return_5d REAL, spy_return_5d REAL, beat_spy_5d INTEGER, "
+            "return_10d REAL, spy_return_10d REAL, beat_spy_10d INTEGER, "
+            "return_21d REAL, spy_return_21d REAL, beat_spy_21d INTEGER, "
+            "return_30d REAL, spy_return_30d REAL, beat_spy_30d INTEGER"
+            f"{log_cols}, UNIQUE(ticker, eval_date))"
+        )
+        if include_log_cols:
+            conn.execute(
+                "INSERT INTO universe_returns "
+                "(ticker, eval_date, return_21d, spy_return_21d, beat_spy_21d, "
+                "log_return_21d, log_spy_return_21d) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ticker, score_date, 0.05, 0.01, 1, log_21d, log_spy_21d),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO universe_returns "
+                "(ticker, eval_date, return_21d, spy_return_21d, beat_spy_21d) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ticker, score_date, 0.05, 0.01, 1),
+            )
+        conn.commit()
+
+
+class TestBackfillScoreReturns21d:
+    def test_populates_21d_arithmetic_and_canonical_log_alpha(self, tmp_path):
+        db = str(tmp_path / "research.db")
+        _make_21d_db(db, log_21d=0.0488, log_spy_21d=0.00995)
+
+        out = _backfill_score_returns(db, dry_run=False)
+        assert out["status"] == "ok"
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT price_21d, return_21d, spy_21d_return, beat_spy_21d, "
+                "log_alpha_21d FROM score_performance WHERE symbol='AAPL'"
+            ).fetchone()
+        price_21d, return_21d, spy_21d_return, beat_spy_21d, log_alpha_21d = row
+        assert price_21d == pytest.approx(105.0)         # 100 * (1 + 0.05)
+        assert return_21d == pytest.approx(5.0)          # stored as percent
+        assert spy_21d_return == pytest.approx(1.0)
+        assert beat_spy_21d == 1
+        # Canonical: log_alpha = log_return_21d - log_spy_return_21d
+        assert log_alpha_21d == pytest.approx(0.0488 - 0.00995, abs=1e-6)
+
+    def test_missing_log_columns_warns_but_arithmetic_survives(self, tmp_path, caplog):
+        import logging
+
+        db = str(tmp_path / "research.db")
+        _make_21d_db(db, include_log_cols=False)
+
+        with caplog.at_level(logging.WARNING, logger="collectors.signal_returns"):
+            out = _backfill_score_returns(db, dry_run=False)
+        assert out["status"] == "ok"
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT return_21d, log_alpha_21d FROM score_performance WHERE symbol='AAPL'"
+            ).fetchone()
+        # Primary deliverable (arithmetic 21d) survives; canonical alpha NULL.
+        assert row[0] == pytest.approx(5.0)
+        assert row[1] is None
+        assert any(
+            "log_alpha_21d" in r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), "no-silent-fails: missing log columns must emit a WARN"
+
+    def test_dry_run_does_not_write_21d(self, tmp_path):
+        db = str(tmp_path / "research.db")
+        _make_21d_db(db)
+
+        _backfill_score_returns(db, dry_run=True)
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT return_21d, log_alpha_21d FROM score_performance WHERE symbol='AAPL'"
+            ).fetchone()
+        assert row == (None, None)
+
+    def test_rerun_is_noop_once_populated(self, tmp_path):
+        db = str(tmp_path / "research.db")
+        _make_21d_db(db)
+        _backfill_score_returns(db, dry_run=False)
+        out = _backfill_score_returns(db, dry_run=False)
+        # Second pass finds nothing NULL → 0 further writes.
+        assert out["rows_written"] == 0
+
+    def test_schema_ensure_adds_21d_columns(self, tmp_db):
+        with sqlite3.connect(tmp_db) as conn:
+            _ensure_score_performance_schema(conn)
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(score_performance)"
+            ).fetchall()}
+        for col in ("price_21d", "return_21d", "spy_21d_return",
+                    "beat_spy_21d", "eval_date_21d", "log_alpha_21d"):
+            assert col in cols, f"missing {col}"
