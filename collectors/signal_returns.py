@@ -542,6 +542,11 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
             return {"status": "ok", "rows_written": 0, "note": "no prediction files in S3"}
 
         conn = sqlite3.connect(db_path)
+        # Ensure horizon-agnostic + barrier_win_prob columns exist BEFORE the
+        # seed INSERT (Step 3) — the backfill (Step 4) also calls this but runs
+        # later, so the INSERT below would reference a missing column on first
+        # run without this. Idempotent: Step 4's call becomes a no-op.
+        _ensure_predictor_outcomes_schema(conn)
         existing = {
             (r[0], r[1]) for r in
             conn.execute("SELECT symbol, prediction_date FROM predictor_outcomes").fetchall()
@@ -559,8 +564,8 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
                         continue
                     if not dry_run:
                         conn.execute(
-                            "INSERT INTO predictor_outcomes (symbol, prediction_date, predicted_direction, prediction_confidence, p_up, p_flat, p_down, score_modifier_applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            (ticker, pred_date, p.get("predicted_direction"), p.get("prediction_confidence"), p.get("p_up"), p.get("p_flat"), p.get("p_down"), 0.0),
+                            "INSERT INTO predictor_outcomes (symbol, prediction_date, predicted_direction, prediction_confidence, p_up, p_flat, p_down, score_modifier_applied, barrier_win_prob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (ticker, pred_date, p.get("predicted_direction"), p.get("prediction_confidence"), p.get("p_up"), p.get("p_flat"), p.get("p_down"), 0.0, p.get("barrier_win_prob")),
                         )
                     existing.add((ticker, pred_date))
                     inserted += 1
@@ -804,6 +809,12 @@ def _ensure_predictor_outcomes_schema(conn) -> None:
         ("actual_log_alpha", "REAL"),
         ("horizon_days", "INTEGER"),
         ("correct", "INTEGER"),
+        # Observe-only López-de-Prado meta-label: P(upper/profit barrier touched
+        # before lower/stop barrier), emitted by alpha-engine-predictor #211 into
+        # predictions.json. Nullable — null when the meta-label classifier isn't
+        # loaded/fitted for a cycle. Recording it here unblocks the backtester's
+        # barrier_sizing_optimizer IC gate (was returning barrier_win_prob_column_absent).
+        ("barrier_win_prob", "REAL"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE predictor_outcomes ADD COLUMN {col} {col_type}")
