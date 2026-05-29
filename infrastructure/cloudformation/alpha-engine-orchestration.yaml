@@ -192,63 +192,18 @@ Resources:
               "pipeline_role": "weekly"
             }
 
-  # Friday-PM "shell run" — automated full-fidelity dry preflight of the
-  # Saturday SF (ROADMAP "Scheduled Friday-PM shell run", P1; spine in
-  # step_function.json's CheckShellRun/ApplyShellRunDefaults gate). Fires the
-  # SAME alpha-engine-saturday-pipeline SF (NOT a parallel SF) with
-  # shell_run=true, which the InitializeInput→CheckShellRun gate fans into
-  # every skip_* flag so the whole workload no-ops while the SF/health
-  # bootstrap chain is still exercised ~11.5 h before the real Sat 02:00 PT
-  # firing — surfacing a Saturday-fatal break inside an operator-awake
-  # Friday-evening fix window.
-  #
-  # SHIPPED DISABLED (State: DISABLED) — zero-risk to merge. This is
-  # additive observability, NOT a backstop (the system's "fail loud,
-  # no backstop" design decision stands). Brian enables it deliberately:
-  #   aws events enable-rule --name alpha-engine-friday-shell-run --region us-east-1
-  # (and, if the spine's per-module dry paths are still scoped follow-ons,
-  # the shell run is a pure-skip no-op pass until those land — still a
-  # valid SF/IAM/EventBridge/health-check bootstrap smoke test).
-  #
-  # Cron: 20:45 UTC Fri = 1:45 PM PT (PDT, the dominant season) /
-  # 12:45 PM PT (PST). Chosen AFTER the Friday EOD SF (~1:25 PT) so the
-  # shell run never collides with PostMarketData / EODReconcile /
-  # StopTradingInstance on the trading instance, and ~12 h BEFORE the
-  # real Saturday 09:00 UTC firing — a red shell-run report Friday
-  # evening leaves a full operator fix window before the real run
-  # consumes its weekly research/training/backtest cycle. shell_run mode
-  # makes nothing fetch, so the Saturday "polygon T+1 must have settled"
-  # timing constraint is moot here (no API calls in a shell run).
-  FridayShellRunTrigger:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: alpha-engine-friday-shell-run
-      Description: >-
-        Friday 20:45 UTC (1:45 PM PT PDT / 12:45 PM PT PST) — DISABLED by default —
-        fires the Saturday SF with shell_run=true (full dry preflight, no API
-        calls / no S3-config-email-SNS writes) ~12h before the real Sat run.
-        Enable via: aws events enable-rule --name alpha-engine-friday-shell-run
-      ScheduleExpression: 'cron(45 20 ? * FRI *)'
-      State: DISABLED
-      Targets:
-        # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
-        # comment for the 2026-05-26 duplicate-target incident.
-        - Id: friday-shell-run
-          Arn: !Ref SaturdayPipeline
-          RoleArn: !Ref EventBridgeSfnRoleArn
-          # pipeline_role="shell-run" (Option-D 2026-05-25): tags this
-          # execution so page 25's role filter distinguishes Friday-PM
-          # dry-pass from the canonical Saturday weekly run. shell_run=true
-          # remains the load-bearing input field consumed by
-          # InitializeInput/CheckShellRun; pipeline_role is the surface
-          # contract that dashboard / Slack / CLI consumers filter on.
-          Input: !Sub |
-            {
-              "ec2_instance_id": ["${MicroInstanceId}"],
-              "sns_topic_arn": "${AlertsTopic}",
-              "shell_run": true,
-              "pipeline_role": "shell-run"
-            }
+  # Friday-PM "shell run" cron rule (alpha-engine-friday-shell-run) RETIRED
+  # 2026-05-29 (ROADMAP L4055): superseded by the event-driven
+  # alpha-engine-eod-success-friday-shell-trigger Lambda
+  # (infrastructure/lambdas/eod-success-friday-shell-trigger/, shipped #282),
+  # which fires the Saturday SF in shell_run mode on the Friday EOD-SF
+  # SUCCEEDED transition (trading_day-bound, not wall-clock) — eliminating the
+  # cron's three failure modes (no-fire on Friday EOD failure, late-rerun
+  # blindness, StopTradingInstance race). The cron ran DISABLED from the 5/21
+  # event-driven cutover; the event-driven path confirmed across two Fridays
+  # (5/22 + 5/29) before this deletion. The shell_run SF gate
+  # (InitializeInput→CheckShellRun/ApplyShellRunDefaults) is UNCHANGED — the
+  # Lambda still supplies {"shell_run": true, "pipeline_role": "shell-run"}.
 
   WeekdayTrigger:
     Type: AWS::Events::Rule

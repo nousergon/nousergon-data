@@ -58,9 +58,11 @@ _DEPLOY_SCRIPTS = (
 # top-level name marker. Pairing each rule with its known successor
 # lets us slice the block deterministically without a YAML parser
 # (CFN's ``!Sub`` / ``!Ref`` tags require a custom loader).
+# FridayShellRunTrigger retired 2026-05-29 (ROADMAP L4055) — superseded by the
+# event-driven alpha-engine-eod-success-friday-shell-trigger Lambda. SaturdayTrigger
+# now flows directly into WeekdayTrigger.
 _TRIGGER_SUCCESSORS = {
-    "SaturdayTrigger": "FridayShellRunTrigger",
-    "FridayShellRunTrigger": "WeekdayTrigger",
+    "SaturdayTrigger": "WeekdayTrigger",
     "WeekdayTrigger": "ResearchAlerts",
 }
 
@@ -190,17 +192,6 @@ class TestOrchestrationCFNPipelineRoles:
             r'"pipeline_role"\s*:\s*"weekly"',
             block,
         ), 'SaturdayTrigger Input must carry pipeline_role="weekly".'
-
-    def test_friday_shell_run_trigger_has_shell_run_role(self, orchestration_text):
-        block = _trigger_block(orchestration_text, "FridayShellRunTrigger")
-        assert re.search(
-            r'"pipeline_role"\s*:\s*"shell-run"',
-            block,
-        ), (
-            'FridayShellRunTrigger Input must carry '
-            'pipeline_role="shell-run" — distinguishes the dry-pass '
-            "from the canonical weekly run on page 25."
-        )
 
     def test_weekday_trigger_has_daily_role(self, orchestration_text):
         block = _trigger_block(orchestration_text, "WeekdayTrigger")
