@@ -20,8 +20,8 @@
     },
     "market_regime": {
       "type": "string",
-      "enum": ["bull", "neutral", "caution", "bear"],
-      "description": "Current market regime assessment"
+      "enum": ["bull", "neutral", "bear"],
+      "description": "Current market regime assessment. 3-class Ang-Bekaert taxonomy (v0.42.0 / 2026-05-28). Legacy 4-class 'caution' retired per caution-regime-retirement-260528.md — its driving signals (VIX, HY OAS, SPY 30d return) are weighted continuously into regime_intensity_z (predictor META_FEATURE 13) rather than discretized into a 4th category. Portfolio-protective hysteresis is a separate axis on the predictor drawdown leg (risk_on/caution/risk_off). Historical signals.json artifacts with 'caution' in market_regime are grandfathered — consumers tolerant of legacy enum on read."
     },
     "sector_ratings": {
       "type": "object",
