@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -58,6 +59,8 @@ from alpha_engine_lib.artifact_freshness import (
     ArtifactSpec,
     CheckResult,
     check_freshness,
+    cycle_completion,
+    resolve_current_cycle,
     resolve_dedup_key,
 )
 from alpha_engine_lib.trading_calendar import previous_trading_day
@@ -75,6 +78,12 @@ REGISTRY_KEY = os.environ.get(
 HEARTBEAT_KEY = "_freshness_monitor/heartbeat.json"
 CHECK_RESULTS_KEY = "_freshness_monitor/check_results.json"
 HISTORY_KEY = "_freshness_monitor/history.json"
+CYCLE_VERDICT_KEY = "_freshness_monitor/cycle_verdict.json"
+
+# CloudWatch namespace for the per-cycle completion rollup metric. Shares
+# the substrate-health namespace so cycle-completion + substrate-row health
+# graph together. Dimensioned by Cadence only (low-cardinality, alarm-able).
+CW_NAMESPACE = "AlphaEngine/Substrate"
 
 # Historical-mode lookback depth per cadence. Tunable via event payload
 # (event["lookback"] = {"saturday_sf": 12, ...}). Defaults sized for ~3
@@ -254,6 +263,78 @@ def _put_json(s3_client: Any, bucket: str, key: str, payload: dict) -> None:
         Body=body,
         ContentType="application/json",
     )
+
+
+# ── Per-cycle completion rollup (L249 consumer) ─────────────────────────────
+
+
+def _serialize_cycle_verdicts(
+    pairs: list[tuple[ArtifactSpec, CheckResult]], now: datetime
+) -> dict[str, Any]:
+    """Roll the per-artifact probe results up into one completion verdict
+    per execution cycle, via :func:`cycle_completion`.
+
+    The registry walk covers EVERY cadence in a single 15-min pass, so the
+    grouping by ``(cadence, cycle_label)`` is mandatory — a single rollup
+    over the mixed-cadence ``pairs`` would conflate the Saturday, weekday,
+    EOD and continuous cycles into one meaningless verdict. ``weekday_sf``
+    and ``eod_sf`` share a date-shaped label, so the cadence is part of the
+    group key to keep them distinct.
+
+    ``cycle_completion`` itself filters to ``severity="critical"`` rows; a
+    group whose cadence has no critical artifacts rolls up vacuously
+    complete (``n_required=0``).
+    """
+    groups: dict[tuple[str, str], list[tuple[ArtifactSpec, CheckResult]]] = (
+        defaultdict(list)
+    )
+    for spec, result in pairs:
+        _, label = resolve_current_cycle(spec, now)
+        groups[(spec.cadence, label)].append((spec, result))
+
+    verdicts = []
+    for (cadence, label), grp in sorted(groups.items()):
+        v = cycle_completion(grp, cycle_label=label)
+        verdicts.append(
+            {
+                "cadence": cadence,
+                "cycle_label": label,
+                "state": v.state,
+                "complete": v.complete,
+                "n_required": v.n_required,
+                "n_satisfied": v.n_satisfied,
+                "missing": v.missing,
+                "stale": v.stale,
+                "probe_failed": v.probe_failed,
+                "grace_period": v.grace_period,
+                "reason": v.reason,
+            }
+        )
+    return {"run_at": now.isoformat(), "verdicts": verdicts}
+
+
+def _emit_cycle_metrics(cw_client: Any, verdict_payload: dict[str, Any]) -> None:
+    """Emit one ``ArtifactFreshnessCycleComplete`` datapoint per cadence
+    (1.0 complete / 0.0 not), in :data:`CW_NAMESPACE`.
+
+    Dimensioned by ``Cadence`` ONLY — a stable, low-cardinality set
+    (``{saturday_sf, weekday_sf, eod_sf, continuous}``) that a CW alarm can
+    bind to. The per-cycle ``cycle_label`` is recorded in the S3 artifact,
+    NOT a metric dimension: a label is high-cardinality (a new value every
+    week/day) and would make the metric both unalarmable and costly.
+    """
+    metric_data = [
+        {
+            "MetricName": "ArtifactFreshnessCycleComplete",
+            "Dimensions": [{"Name": "Cadence", "Value": v["cadence"]}],
+            "Value": 1.0 if v["complete"] else 0.0,
+            "Unit": "Count",
+        }
+        for v in verdict_payload["verdicts"]
+    ]
+    if metric_data:
+        # Cadence set is ≤4 → one call, well under CW's 1000-metric cap.
+        cw_client.put_metric_data(Namespace=CW_NAMESPACE, MetricData=metric_data)
 
 
 # ── Alerting (gated on ALERTS_ENABLED) ──────────────────────────────────────
@@ -653,6 +734,29 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     _put_json(s3, REGISTRY_BUCKET, CHECK_RESULTS_KEY, check_results)
     _put_json(s3, REGISTRY_BUCKET, HEARTBEAT_KEY, heartbeat)
 
+    # ── Per-cycle completion rollup (L249 consumer) ─────────────────────
+    # Secondary observability hung off the primary probe pass. The artifact
+    # write comes first (S3 PutObject is already granted); the CW emit is
+    # last (it needs the cloudwatch:PutMetricData grant added in iam-policy.json,
+    # which only takes effect on the next deploy). The whole block is wrapped
+    # so a failure here can NEVER take down the monitor's primary deliverables
+    # (check_results + heartbeat + alerts), already persisted above.
+    #   (a) swallowed failure: cycle-verdict compute / S3 write / CW put error.
+    #   (c) recording surface: the WARN log below (CW Logs) + the staleness of
+    #       cycle_verdict.json (itself a monitorable artifact).
+    # Per CLAUDE.md no-silent-fails secondary-observability carve-out.
+    cycle_verdicts: dict[str, str] = {}
+    try:
+        verdict_payload = _serialize_cycle_verdicts(pairs, now)
+        _put_json(s3, REGISTRY_BUCKET, CYCLE_VERDICT_KEY, verdict_payload)
+        _emit_cycle_metrics(boto3.client("cloudwatch"), verdict_payload)
+        cycle_verdicts = {
+            v["cadence"]: v["state"] for v in verdict_payload["verdicts"]
+        }
+        logger.info("cycle verdicts: %s", cycle_verdicts)
+    except Exception as exc:  # noqa: BLE001 — secondary observability, must not sink the monitor
+        logger.warning("cycle-completion rollup failed (non-fatal): %s", exc)
+
     logger.info(
         "freshness-monitor complete: %s checked, %s alerted, %s per-spec exceptions, "
         "duration=%.2fs",
@@ -667,4 +771,5 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "alerted": alerted,
         "per_spec_exceptions": per_spec_exceptions,
         "duration_seconds": heartbeat["duration_seconds"],
+        "cycle_verdicts": cycle_verdicts,
     }
