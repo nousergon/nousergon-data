@@ -618,13 +618,14 @@
             },
             "Research": {
               "Type": "Task",
-              "Comment": "Research Lambda \u2014 generates signals.json",
+              "Comment": "Research Lambda \u2014 generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass \u2014 ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-runner:live",
                 "Payload": {
                   "weekly_run": true,
                   "force": true,
+                  "skip_dry_run_gate": true,
                   "dry_run_llm.$": "$.research_dry"
                 }
               },

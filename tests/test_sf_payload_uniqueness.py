@@ -74,7 +74,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
-    "Research": frozenset({"dry_run_llm.$", "force", "weekly_run"}),
+    "Research": frozenset({"dry_run_llm.$", "force", "weekly_run", "skip_dry_run_gate"}),
     "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass"}
