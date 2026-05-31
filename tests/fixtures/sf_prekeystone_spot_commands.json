@@ -1,73 +1,91 @@
 {
-  "Backtester": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-backtester",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "export RUN_DATE='2026-05-18'",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator"
-  ],
-  "DataPhase1": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-data",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only"
-  ],
-  "DriftDetection": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-data",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug drift-detection --log /var/log/drift-detection.log -- bash infrastructure/spot_drift_detection.sh"
-  ],
-  "Evaluator": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-backtester",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "export RUN_DATE='2026-05-18'",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity"
-  ],
-  "MorningEnrich": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-data",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only"
-  ],
-  "Parity": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-backtester",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "export RUN_DATE='2026-05-18'",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator"
-  ],
-  "PredictorTraining": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-    "sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
-    "cd /home/ec2-user/alpha-engine-predictor",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only"
-  ],
-  "RAGIngestion": [
-    "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "cd /home/ec2-user/alpha-engine-data",
-    "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only"
-  ]
+ "Backtester": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-backtester",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "export RUN_DATE='2026-05-18'",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator"
+ ],
+ "DataPhase1": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-data",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only"
+ ],
+ "DriftDetection": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-data",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug drift-detection --log /var/log/drift-detection.log -- bash infrastructure/spot_drift_detection.sh"
+ ],
+ "Evaluator": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-backtester",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "export RUN_DATE='2026-05-18'",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity"
+ ],
+ "MorningEnrich": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-data",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only"
+ ],
+ "Parity": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-backtester",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "export RUN_DATE='2026-05-18'",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator"
+ ],
+ "PortfolioOptimizerBacktest": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-backtester",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "export RUN_DATE='2026-05-18'",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator"
+ ],
+ "PredictorBacktest": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-backtester",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "export RUN_DATE='2026-05-18'",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator"
+ ],
+ "PredictorTraining": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+  "sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
+  "cd /home/ec2-user/alpha-engine-predictor",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only"
+ ],
+ "RAGIngestion": [
+  "set -eo pipefail",
+  "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+  "cd /home/ec2-user/alpha-engine-data",
+  "export HOME=/home/ec2-user",
+  "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+  "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only"
+ ]
 }

@@ -20,12 +20,30 @@ This is SF-wiring-only: spot_backtest.sh's --skip-stages already supports
 backtest/parity/evaluator independently (validated stage vocabulary
 _KNOWN_STAGES="backtest parity evaluator") — no backtester-repo change.
 
+L4472 phase-split (2026-05-31, ROADMAP L4472): the single `Backtester`
+state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/
+gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution
+timeout on a fresh date (L4470). The backtest stage is now decomposed by
+--mode into THREE sequential SF states, each with its own SSM timeout +
+independent redrive:
+  Backtester               --mode=param-sweep --no-pit-parity   (simulate+sweep)
+  PredictorBacktest        --mode=predictor-backtest            (predictor+Phase4, pit_parity HERE)
+  PortfolioOptimizerBacktest --mode=portfolio-optimizer-backtest --no-pit-parity
+The happy path is now:
+  CheckSkipBacktester → Backtester → PredictorBacktest →
+  PortfolioOptimizerBacktest → CheckSkipParity → Parity →
+  CheckSkipEvaluator → Evaluator.
+skip_backtester still skips the whole backtest-family (routes past
+CheckSkipParity to CheckSkipEvaluator). pit_parity fires exactly once
+(default-ON in PredictorBacktest; the other two pass --no-pit-parity).
+
 This test catches regressions like:
 - Someone reverts Backtester's SSM command back to --skip-stages=evaluator
-  (re-bundles parity into the 121-min backtest task).
+  (re-bundles parity into the backtest task) or drops --mode=param-sweep
+  (re-bundles the heavy post-sweep phases back into one SSM command).
 - Someone wires Parity BEFORE Backtester, or drops the Parity state.
-- Someone reroutes CheckBacktesterStatus(success) past CheckSkipParity
-  straight to CheckSkipEvaluator (silently drops parity).
+- Someone reroutes the backtest-family chain so a phase is skipped or
+  re-ordered (e.g. predictor before sim).
 - Someone drops the HandleFailure Catch on the new states.
 - The old single combined-Backtester semantics (--skip-stages=evaluator)
   reappears anywhere.
@@ -116,16 +134,21 @@ class TestChainOrdering:
     def test_backtester_wait_routes_to_status_check(self, states):
         assert states["WaitForBacktester"]["Next"] == "CheckBacktesterStatus"
 
-    def test_backtester_success_routes_to_parity_skipgate(self, states):
+    def test_backtester_success_routes_to_predictor_backtest(self, states):
+        """L4472: Backtester (simulate-only) success hands off to the new
+        PredictorBacktest state, not directly to CheckSkipParity — the
+        predictor+Phase4 block now runs in its own SF state so its runtime
+        no longer sums into the simulate SSM command."""
         success = [
             c["Next"]
             for c in states["CheckBacktesterStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["CheckSkipParity"], (
-            "Backtester (backtest stage) success must hand off to "
-            "CheckSkipParity — Parity runs AFTER a completed backtest, and "
-            "must never re-run the 121-min backtest on its own failure."
+        assert success == ["PredictorBacktest"], (
+            "Backtester (simulate-only) success must hand off to "
+            "PredictorBacktest — the L4472 phase-split runs predictor+Phase4 "
+            "in its own state so a fresh simulate never carries the post-sweep "
+            "stack into one SSM execution timeout."
         )
 
     def test_backtester_status_loops_and_default(self, states):
@@ -257,12 +280,15 @@ class TestSsmCommandShape:
         from tests.sf_command_utils import extract_commands
         return extract_commands(states[name])
 
-    def test_backtester_invokes_backtest_stage_only(self, states):
+    def test_backtester_invokes_simulation_stage_only(self, states):
+        """L4472: Backtester runs ONLY the simulation pipeline via
+        --mode=param-sweep, with --no-pit-parity (pit_parity belongs to
+        PredictorBacktest). It must still skip the parity+evaluator stages."""
         joined = " ".join(self._commands(states, "Backtester"))
-        assert "spot_backtest.sh --skip-stages=parity,evaluator" in joined, (
-            "Backtester must run ONLY the backtest stage post-split — "
-            "--skip-stages=evaluator re-bundles parity into the 121-min "
-            "backtest task."
+        assert "spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator" in joined, (
+            "Backtester must run --mode=param-sweep (simulation only) with "
+            "--no-pit-parity post-L4472-split — dropping --mode re-bundles the "
+            "heavy predictor/optimizer phases back into one SSM command."
         )
         assert "--skip-stages=evaluator" not in joined
         assert "--skip-stages=backtest,evaluator" not in joined
@@ -382,3 +408,114 @@ class TestResultPathIsolation:
     def test_wait_reads_parity_command_id(self, states):
         cmd_id = states["WaitForParity"]["Parameters"]["CommandId.$"]
         assert "parity_result" in cmd_id
+
+
+class TestL4472PhaseSplit:
+    """Pins the L4472 three-way split of the backtest stage: Backtester
+    (simulate) → PredictorBacktest (predictor+Phase4) →
+    PortfolioOptimizerBacktest (optimizer/cov/gamma) → CheckSkipParity.
+    Each heavy block is its own SF state so no single SSM command carries
+    the SUMMED 60-100 min runtime that blew the timeout on a fresh date."""
+
+    def _commands(self, states, name):
+        from tests.sf_command_utils import extract_commands
+        return extract_commands(states[name])
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "PredictorBacktest",
+            "WaitForPredictorBacktest",
+            "CheckPredictorBacktestStatus",
+            "PredictorBacktestWait",
+            "ExtractPredictorBacktestError",
+            "PortfolioOptimizerBacktest",
+            "WaitForPortfolioOptimizerBacktest",
+            "CheckPortfolioOptimizerBacktestStatus",
+            "PortfolioOptimizerBacktestWait",
+            "ExtractPortfolioOptimizerBacktestError",
+        ],
+    )
+    def test_new_state_exists(self, states, name):
+        assert name in states, f"{name} missing — L4472 split incomplete"
+
+    def test_chain_backtester_predictor_optimizer_parity(self, states):
+        """Backtester → PredictorBacktest → PortfolioOptimizerBacktest →
+        CheckSkipParity, each via its status gate's Success edge."""
+        def success(check):
+            return [
+                c["Next"] for c in states[check]["Choices"]
+                if c.get("StringEquals") == "Success"
+            ]
+        assert success("CheckBacktesterStatus") == ["PredictorBacktest"]
+        assert success("CheckPredictorBacktestStatus") == ["PortfolioOptimizerBacktest"]
+        assert success("CheckPortfolioOptimizerBacktestStatus") == ["CheckSkipParity"]
+
+    def test_predictor_backtest_invokes_predictor_mode(self, states):
+        joined = " ".join(self._commands(states, "PredictorBacktest"))
+        assert "spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator" in joined
+        # pit_parity runs HERE (no --no-pit-parity on this state)
+        assert "--no-pit-parity" not in joined
+
+    def test_optimizer_invokes_optimizer_mode_no_pit(self, states):
+        joined = " ".join(self._commands(states, "PortfolioOptimizerBacktest"))
+        assert "spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
+
+    def test_pit_parity_runs_exactly_once(self, sf):
+        """--no-pit-parity must appear on Backtester + PortfolioOptimizer but
+        NOT PredictorBacktest, so the observational pit_parity pass fires
+        exactly once across the three split states."""
+        blob = json.dumps(sf)
+        # PredictorBacktest is the only backtest-family state without --no-pit-parity
+        from tests.sf_command_utils import extract_commands
+        states = sf["States"]
+        def has_no_pit(name):
+            return "--no-pit-parity" in " ".join(extract_commands(states[name]))
+        assert has_no_pit("Backtester")
+        assert has_no_pit("PortfolioOptimizerBacktest")
+        assert not has_no_pit("PredictorBacktest")
+
+    @pytest.mark.parametrize(
+        "name",
+        ["PredictorBacktest", "PortfolioOptimizerBacktest"],
+    )
+    def test_new_task_catches_handle_failure(self, states, name):
+        catches = states[name]["Catch"]
+        assert any(
+            c["ErrorEquals"] == ["States.ALL"]
+            and c["Next"] == "HandleFailure"
+            and c["ResultPath"] == "$.error"
+            for c in catches
+        )
+
+    def test_new_states_distinct_result_paths(self, states):
+        paths = {
+            states["Backtester"]["ResultPath"],
+            states["PredictorBacktest"]["ResultPath"],
+            states["PortfolioOptimizerBacktest"]["ResultPath"],
+        }
+        assert len(paths) == 3, f"result paths collide: {paths}"
+        assert states["PredictorBacktest"]["ResultPath"] == "$.predictor_backtest_result"
+        assert states["PortfolioOptimizerBacktest"]["ResultPath"] == "$.portfolio_optimizer_result"
+
+    @pytest.mark.parametrize(
+        "check,wait",
+        [
+            ("CheckPredictorBacktestStatus", "PredictorBacktestWait"),
+            ("CheckPortfolioOptimizerBacktestStatus", "PortfolioOptimizerBacktestWait"),
+        ],
+    )
+    def test_new_status_gates_loop_and_error_default(self, states, check, wait):
+        nexts = {c["StringEquals"]: c["Next"] for c in states[check]["Choices"]}
+        assert nexts["InProgress"] == wait
+        assert nexts["Pending"] == wait
+        assert states[check]["Default"].startswith("Extract")
+
+    def test_new_states_timeout_matches_backtester(self, states):
+        """Each split state gets its own full SSM execution timeout — the
+        point of the split is that none carries the summed runtime."""
+        bt_to = states["Backtester"]["TimeoutSeconds"]
+        bt_exec = states["Backtester"]["Parameters"]["Parameters"]["executionTimeout"]
+        for name in ("PredictorBacktest", "PortfolioOptimizerBacktest"):
+            assert states[name]["TimeoutSeconds"] == bt_to
+            assert states[name]["Parameters"]["Parameters"]["executionTimeout"] == bt_exec

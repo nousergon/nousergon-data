@@ -108,18 +108,28 @@ class TestBacktesterTransition:
         #
         # Post-2026-05-16 preflight-task-split P1: the parity stage was
         # split out of the combined Backtester state into its own Parity
-        # quartet. Backtester (now the backtest stage only) success now
-        # routes to CheckSkipParity; CheckSkipEvaluator is reached
-        # transitively via the Parity quartet (CheckSkipParity → Parity →
-        # WaitForParity → CheckParityStatus(Success) → CheckSkipEvaluator)
-        # or the skip_parity short-circuit (CheckSkipParity →
-        # CheckSkipEvaluator). Either way the eval-judge chain stays
-        # reachable — pinned here by walking the forward path.
+        # quartet, reached via CheckSkipParity.
+        #
+        # Post-2026-05-31 L4472 phase-split: the backtest stage is further
+        # decomposed by --mode into Backtester (simulate) → PredictorBacktest
+        # → PortfolioOptimizerBacktest → CheckSkipParity. CheckSkipEvaluator
+        # (the eval-judge gate) stays reachable transitively through the whole
+        # chain; pinned here by walking each status gate's Success edge.
         bt = states["CheckBacktesterStatus"]
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "CheckSkipParity"
+        assert success_choice["Next"] == "PredictorBacktest"
+
+        def _success(check):
+            return next(
+                c for c in states[check]["Choices"]
+                if c.get("StringEquals") == "Success"
+            )["Next"]
+
+        # Walk the L4472 split chain to the parity skip-gate.
+        assert _success("CheckPredictorBacktestStatus") == "PortfolioOptimizerBacktest"
+        assert _success("CheckPortfolioOptimizerBacktestStatus") == "CheckSkipParity"
 
         # skip_parity short-circuit reaches the Evaluator gate directly.
         skip_parity = states["CheckSkipParity"]
