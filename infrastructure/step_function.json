@@ -1593,7 +1593,7 @@
     },
     "Backtester": {
       "Type": "Task",
-      "Comment": "Backtest (10y simulate + param sweep, ~121 min) on spot instance, after predictor training. The parity stage was split into a separate Parity SF state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest and parity are independent preflight-bearing actions, so a parity failure must never re-run the ~121-min backtest. Post-2026-05-07 the evaluator stage was already its own state (plan: alpha-engine-docs/private/evaluator-split-260507.md). spot_backtest.sh is invoked with --skip-stages=parity,evaluator so this state runs ONLY the backtest stage; the Parity state runs --skip-stages=backtest,evaluator and the Evaluator state runs --skip-stages=backtest,parity, all against the same backtest/{date}/ S3 prefix. State name kept as Backtester (lower-churn vs renaming to Backtest \u2014 preserves DriftDetection's Next/Catch edges and all inbound wiring). If this state fails, Parity is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn \u2014 preserves DriftDetection's Next/Catch edges + skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -1602,7 +1602,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -1668,7 +1668,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipParity"
+          "Next": "PredictorBacktest"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -1687,6 +1687,200 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+    "PredictorBacktest": {
+      "Type": "Task",
+      "Comment": "Predictor-backtest + Phase 4a/b/c stage on a fresh spot SSM command, after the simulation-only Backtester state. L4472 phase-split (2026-05-31): runs spot_backtest.sh --mode=predictor-backtest, which executes the predictor_pipeline (GBM inference + 10y ArcticDB read + predictor param sweep) and Phase 4a/b/c — the block that, bundled with simulate + the optimizer sweeps in the old single Backtester state, summed past the SSM execution timeout on a fresh date (L4470). pit_parity runs HERE (default ON; Backtester + PortfolioOptimizerBacktest pass --no-pit-parity) so the observational walk-forward parity fires exactly once. Reads the backtest/{date}/ artifacts the Backtester state just wrote and writes its own predictor_sweep_df.parquet + predictor_stats.json to the same prefix. Per the L4472 executor-apply fix (backtester backtest.py::_run_predictor_pipeline gated on mode==all), this --mode=predictor-backtest run does NOT write the from_executor_optimizer.json recommendation artifact — the Backtester (param-sweep) state is its sole writer, so the assembler sees sim-based executor params (monolithic semantics preserved). If this state fails, PortfolioOptimizerBacktest is NOT entered (anti-auto-promote-garbage).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "executionTimeout": [
+            "7200"
+          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator{}',$.preflight_args))"
+        },
+        "TimeoutSeconds": 7200
+      },
+      "TimeoutSeconds": 7260,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 180,
+          "BackoffRate": 2.0,
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture."
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.predictor_backtest_result",
+      "Next": "WaitForPredictorBacktest"
+    },
+    "WaitForPredictorBacktest": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until predictor-backtest complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.predictor_backtest_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.predictor_backtest_poll",
+      "Next": "CheckPredictorBacktestStatus"
+    },
+    "CheckPredictorBacktestStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.predictor_backtest_poll.Status",
+          "StringEquals": "Success",
+          "Next": "PortfolioOptimizerBacktest"
+        },
+        {
+          "Variable": "$.predictor_backtest_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "PredictorBacktestWait"
+        },
+        {
+          "Variable": "$.predictor_backtest_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "PredictorBacktestWait"
+        }
+      ],
+      "Default": "ExtractPredictorBacktestError"
+    },
+    "PredictorBacktestWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "WaitForPredictorBacktest"
+    },
+    "PortfolioOptimizerBacktest": {
+      "Type": "Task",
+      "Comment": "Portfolio-optimizer block (portfolio_optimizer_gate + cov_estimator_sweep + gamma_sweep) on a fresh spot SSM command, after PredictorBacktest. L4472 phase-split (2026-05-31): runs spot_backtest.sh --mode=portfolio-optimizer-backtest. Each of these three phases re-runs the predictor pipeline (GBM inference + 10y ArcticDB read) internally; bundled with simulate + predictor-backtest in the old single state their summed runtime blew the SSM execution timeout on a fresh date (L4470). --no-pit-parity (pit_parity already ran in PredictorBacktest). Reads/writes the same backtest/{date}/ prefix. On Success routes to CheckSkipParity so the downstream Parity -> Evaluator chain is unchanged. If this state fails, Parity is NOT entered (anti-auto-promote-garbage).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "executionTimeout": [
+            "7200"
+          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
+        },
+        "TimeoutSeconds": 7200
+      },
+      "TimeoutSeconds": 7260,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 180,
+          "BackoffRate": 2.0,
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture."
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.portfolio_optimizer_result",
+      "Next": "WaitForPortfolioOptimizerBacktest"
+    },
+    "WaitForPortfolioOptimizerBacktest": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until portfolio-optimizer block complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.portfolio_optimizer_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.portfolio_optimizer_poll",
+      "Next": "CheckPortfolioOptimizerBacktestStatus"
+    },
+    "CheckPortfolioOptimizerBacktestStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.portfolio_optimizer_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipParity"
+        },
+        {
+          "Variable": "$.portfolio_optimizer_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "PortfolioOptimizerBacktestWait"
+        },
+        {
+          "Variable": "$.portfolio_optimizer_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "PortfolioOptimizerBacktestWait"
+        }
+      ],
+      "Default": "ExtractPortfolioOptimizerBacktestError"
+    },
+    "PortfolioOptimizerBacktestWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "WaitForPortfolioOptimizerBacktest"
     },
     "CheckSkipParity": {
       "Type": "Choice",
@@ -2155,6 +2349,28 @@
         "phase": "Parity",
         "source": "CheckParityStatus.Default",
         "poll.$": "$.parity_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "ExtractPredictorBacktestError": {
+      "Type": "Pass",
+      "Comment": "Normalize PredictorBacktest SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckPredictorBacktestStatus.Default does not populate $.error, only Task Catch blocks do. Added by the L4472 phase-split.",
+      "Parameters": {
+        "phase": "PredictorBacktest",
+        "source": "CheckPredictorBacktestStatus.Default",
+        "poll.$": "$.predictor_backtest_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "ExtractPortfolioOptimizerBacktestError": {
+      "Type": "Pass",
+      "Comment": "Normalize PortfolioOptimizerBacktest SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckPortfolioOptimizerBacktestStatus.Default does not populate $.error, only Task Catch blocks do. Added by the L4472 phase-split.",
+      "Parameters": {
+        "phase": "PortfolioOptimizerBacktest",
+        "source": "CheckPortfolioOptimizerBacktestStatus.Default",
+        "poll.$": "$.portfolio_optimizer_poll"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"

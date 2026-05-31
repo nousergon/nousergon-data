@@ -130,8 +130,16 @@ _SPOT_STATES = {
         "/var/log/predictor-training.log",
     ),
     "Backtester": (
-        "bash infrastructure/spot_backtest.sh --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator",
         "/var/log/backtester.log",
+    ),
+    "PredictorBacktest": (
+        "bash infrastructure/spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator",
+        "/var/log/predictor-backtest.log",
+    ),
+    "PortfolioOptimizerBacktest": (
+        "bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "/var/log/portfolio-optimizer.log",
     ),
     "Parity": (
         "bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator",
@@ -865,6 +873,8 @@ class TestHappyPathTraversal:
             "RAGIngestion",
             "DriftDetection",
             "Backtester",
+            "PredictorBacktest",
+            "PortfolioOptimizerBacktest",
             "Parity",
             "Evaluator",
             "RegimeSubstrate",
