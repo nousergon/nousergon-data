@@ -137,8 +137,11 @@ def test_polygon_only_propagates_polygon_forbidden():
     yf_spy.assert_not_called()
 
 
-def test_polygon_only_does_not_call_yfinance():
-    """polygon_only must never call yfinance — even when polygon coverage is partial."""
+def test_polygon_only_does_not_call_yfinance_for_equities():
+    """polygon_only must never call yfinance for the EQUITY universe — even when
+    polygon coverage is partial. (The FRED-index macro tickers have their own
+    loud yfinance backstop, exercised by
+    ``test_polygon_only_calls_yfinance_backstop_for_missing_macro``.)"""
     s3 = _no_existing_parquet_s3()
 
     mock_pg_client = MagicMock()
@@ -207,8 +210,69 @@ def test_polygon_only_writes_vwap_from_polygon():
 # ── overwrite + discrepancy logging ─────────────────────────────────────────
 
 
+def test_polygon_only_calls_yfinance_backstop_for_missing_macro():
+    """When FRED fails to supply a macro index ticker (the 2026-06-01 TNX 429),
+    polygon_only must fall through to yfinance for that ticker ONLY — never for
+    equities."""
+    s3 = _no_existing_parquet_s3()
+    mock_pg_client = MagicMock()
+    mock_pg_client.get_grouped_daily.return_value = {
+        "AAPL": {"open": 100, "high": 105, "low": 99, "close": 103, "volume": 1_000_000, "vwap": 102.5},
+    }
+
+    with patch("collectors.daily_closes.boto3.client", return_value=s3), \
+         patch("polygon_client.polygon_client", return_value=mock_pg_client), \
+         patch("collectors.daily_closes._fetch_fred_closes", return_value=0), \
+         patch("collectors.daily_closes._fetch_yfinance_closes", return_value=0) as yf_spy:
+        daily_closes.collect(
+            bucket="b", tickers=["AAPL", "^TNX"], run_date="2026-04-23",
+            source="polygon_only", dry_run=True,
+        )
+
+    yf_spy.assert_called_once()
+    backstop_tickers = yf_spy.call_args.args[0]
+    assert backstop_tickers == ["^TNX"], "only the macro ticker may hit the yfinance backstop"
+    assert "AAPL" not in backstop_tickers, "equities must never reach the yfinance backstop"
+
+
+def test_polygon_only_retains_prior_macro_cell_on_live_gap():
+    """2026-06-01 regression: a macro ticker the live pass cannot refresh (polygon
+    never serves it, FRED 429, yfinance down) must RETAIN its prior parquet value
+    rather than being blanked by the overwrite."""
+    s3 = _existing_parquet_s3(
+        {"AAPL": 103.0, "TNX": 4.5},
+        last_modified=datetime(2026, 4, 22, 21, 0, 0, tzinfo=timezone.utc),  # post-close
+    )
+    mock_pg_client = MagicMock()
+    mock_pg_client.get_grouped_daily.return_value = {  # polygon serves AAPL only
+        "AAPL": {"open": 100, "high": 105, "low": 99, "close": 103.5, "volume": 1_000_000, "vwap": 102.5},
+    }
+
+    captured = {}
+    s3.put_object.side_effect = lambda **kw: captured.update(kw) or {}
+
+    with patch("collectors.daily_closes.boto3.client", return_value=s3), \
+         patch("polygon_client.polygon_client", return_value=mock_pg_client), \
+         patch("collectors.daily_closes._fetch_fred_closes", return_value=0), \
+         patch("collectors.daily_closes._fetch_yfinance_closes", return_value=0):
+        result = daily_closes.collect(
+            bucket="b", tickers=["AAPL", "^TNX"], run_date="2026-04-22",
+            source="polygon_only",
+        )
+
+    assert result["status"] == "ok"
+    import io
+    df = pd.read_parquet(io.BytesIO(captured["Body"]), engine="pyarrow")
+    assert "TNX" in df.index, "TNX must be retained, not blanked by the overwrite"
+    assert df.loc["TNX", "Close"] == 4.5
+    assert df.loc["AAPL", "Close"] == 103.5, "AAPL still overwritten with fresh polygon close"
+
+
 def test_polygon_only_always_overwrites_existing_parquet():
-    """polygon_only must NEVER skip on existing parquet — overwrite is the design."""
+    """polygon_only must NEVER skip on existing parquet — it re-fetches and
+    overwrites every ticker the live pass *can* refresh (no skip-on-exists).
+    Tickers the live pass cannot refresh are retained, not dropped — see
+    ``test_polygon_only_retains_prior_macro_cell_on_live_gap``."""
     s3 = _existing_parquet_s3(
         {"AAPL": 103.0, "MSFT": 206.0},
         last_modified=datetime(2026, 4, 22, 21, 0, 0, tzinfo=timezone.utc),  # post-close
