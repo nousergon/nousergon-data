@@ -31,8 +31,17 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from tests.test_daily_append_skip_if_exists import _patch_targets
+
+
+@pytest.fixture(autouse=True)
+def _disable_factor_momentum_daily(monkeypatch):
+    # L4484: isolate the chunk-count assertions from the daily factor-momentum
+    # second pass (its extra read_batch/update_batch calls would inflate the
+    # per-chunk call counts pinned here). The pass has its own tests.
+    monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
 
 
 def test_universe_pass_chunks_read_batch_calls(monkeypatch):

@@ -44,6 +44,15 @@ _DAILY_APPEND = Path(__file__).parent.parent / "builders" / "daily_append.py"
 _WEEKLY_COLLECTOR = Path(__file__).parent.parent / "weekly_collector.py"
 
 
+@pytest.fixture(autouse=True)
+def _disable_factor_momentum_daily(monkeypatch):
+    # L4484: isolate these tests from the daily factor-momentum second pass —
+    # its extra read_batch/update_batch calls would perturb the skip/call-count
+    # assertions here. The pass has its own tests (test_factor_momentum.py +
+    # test_daily_append_factor_momentum.py).
+    monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
+
+
 def _stub_closes(tickers: list[str]) -> dict:
     """Minimal daily_closes shape: per-ticker {Open,High,Low,Close,Volume,VWAP}."""
     return {
