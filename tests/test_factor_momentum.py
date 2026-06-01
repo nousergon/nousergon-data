@@ -19,6 +19,7 @@ from features.factor_momentum import (
     compute_factor_momentum_feature,
     compute_factor_momentum_series,
     materialize_factor_momentum,
+    update_factor_momentum_latest,
 )
 
 
@@ -206,5 +207,109 @@ class TestMaterializeSecondPass:
     def test_empty_universe_returns_empty_status(self):
         lib = _MockLib({})
         result = materialize_factor_momentum(lib, [], loading_cols=["f1"])
+        assert result["status"] == "empty"
+        assert result["tickers_written"] == 0
+
+
+class _BatchResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class _BatchLib:
+    """Mock supporting the read_batch(ReadRequest)/update_batch(UpdatePayload)
+    surface update_factor_momentum_latest uses, with date_range + columns
+    slicing. Missing symbols return a result whose ``.data`` is None
+    (DataError-like)."""
+
+    def __init__(self, frames: dict):
+        self._store = {t: df.copy() for t, df in frames.items()}
+
+    def read_batch(self, reqs):
+        out = []
+        for req in reqs:
+            sym = req.symbol
+            if sym not in self._store:
+                out.append(_BatchResult(None))
+                continue
+            df = self._store[sym]
+            dr = getattr(req, "date_range", None)
+            if dr is not None:
+                lo, hi = dr
+                if lo is not None:
+                    df = df.loc[df.index >= lo]
+                if hi is not None:
+                    df = df.loc[df.index <= hi]
+            cols = getattr(req, "columns", None)
+            if cols:
+                df = df[[c for c in cols if c in df.columns]]
+            out.append(_BatchResult(df.copy()))
+        return out
+
+    def update_batch(self, payloads):
+        for p in payloads:
+            cur = self._store.get(p.symbol)
+            if cur is None:
+                self._store[p.symbol] = p.data.copy()
+                continue
+            cur = cur.copy()
+            for idx in p.data.index:
+                for c in p.data.columns:
+                    cur.loc[idx, c] = p.data.loc[idx, c]
+            self._store[p.symbol] = cur
+
+
+def _panel_to_full_frames(panel: pd.DataFrame) -> dict:
+    """Per-ticker date-indexed frames with Close + the f1 loading."""
+    frames = {}
+    for t, grp in panel.groupby("ticker", sort=False):
+        g = grp.sort_values("date").set_index("date")
+        frames[t] = pd.DataFrame({"Close": g["close"].astype(float), "f1": g["f1"].astype(float)})
+    return frames
+
+
+class TestUpdateLatestDaily:
+    def test_writes_latest_value_consistent_with_pure_fn(self):
+        panel, tickers, loading = _persistent_factor_panel(seed=11)
+        frames = _panel_to_full_frames(panel)
+        lib = _BatchLib(frames)
+        as_of = max(df.index.max() for df in frames.values())
+
+        result = update_factor_momentum_latest(lib, tickers, as_of, loading_cols=["f1"])
+        assert result["status"] == "ok"
+        assert result["tickers_written"] == len(tickers)
+
+        hi = max(loading, key=loading.get)
+        lo = min(loading, key=loading.get)
+        v_hi = lib._store[hi].loc[as_of, "factor_momentum_ratio"]
+        v_lo = lib._store[lo].loc[as_of, "factor_momentum_ratio"]
+        assert np.isfinite(v_hi) and v_hi > 0
+        assert v_hi > v_lo
+        # Only the latest row is updated — earlier rows have no fm column.
+        assert "factor_momentum_ratio" not in frames[hi].columns
+
+    def test_write_false_computes_but_does_not_write(self):
+        panel, tickers, _ = _persistent_factor_panel(seed=12)
+        lib = _BatchLib(_panel_to_full_frames(panel))
+        as_of = max(df.index.max() for df in lib._store.values())
+        result = update_factor_momentum_latest(lib, tickers, as_of, loading_cols=["f1"], write=False)
+        assert result["status"] == "ok"
+        assert result["tickers_written"] == 0
+        assert result["n_computed"] == len(tickers)
+        for t in tickers:
+            assert "factor_momentum_ratio" not in lib._store[t].columns
+
+    def test_missing_symbols_counted_read_fail_not_fatal(self):
+        panel, tickers, _ = _persistent_factor_panel(seed=13)
+        lib = _BatchLib(_panel_to_full_frames(panel))
+        as_of = max(df.index.max() for df in lib._store.values())
+        result = update_factor_momentum_latest(lib, tickers + ["GHOST"], as_of, loading_cols=["f1"])
+        assert result["status"] == "ok"
+        assert result["read_fail"] == 1
+        assert result["tickers_written"] == len(tickers)
+
+    def test_empty_store_returns_empty_status(self):
+        lib = _BatchLib({})
+        result = update_factor_momentum_latest(lib, ["A", "B"], pd.Timestamp("2020-06-01"), loading_cols=["f1"])
         assert result["status"] == "empty"
         assert result["tickers_written"] == 0

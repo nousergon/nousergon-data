@@ -35,6 +35,7 @@ from features.feature_engineer import (
     MIN_ROWS_FOR_FEATURES,
     compute_features,
 )
+from features.factor_momentum import update_factor_momentum_latest
 from features.compute import (
     DEFAULT_BUCKET,
     _SKIP_TICKERS,
@@ -1263,6 +1264,23 @@ def _daily_append_impl(
                 # passthrough behaviour.
                 today_row[PROVENANCE_COL] = new_row.iloc[0][PROVENANCE_COL]
 
+                # ── L4484: align today_row to the stored schema ──────────────
+                # The universe lib is STATIC-schema, so update_batch's descriptor
+                # must match the stored symbol's column SET. A FEATURES column
+                # the stored series carries but ``compute_features`` does NOT emit
+                # — ``factor_momentum_ratio``, a cross-sectional SECOND-PASS
+                # column written by features.factor_momentum over the full panel
+                # (it cannot be produced per-ticker here) — would otherwise be
+                # absent from today_row, tripping StreamDescriptorMismatch on the
+                # first daily_append after a backfill that added it. Add any such
+                # column as NaN so the descriptor matches; its real go-forward
+                # value is filled by the factor-momentum second pass after the
+                # write loop. Generalizes _align_schema_for_update (single-row
+                # path) to the batch path. Per [[feedback_no_silent_fails]].
+                for _stored_col in hist.columns:
+                    if _stored_col in FEATURES and _stored_col not in today_row.columns:
+                        today_row[_stored_col] = np.nan
+
                 # Column order is enforced by ``to_arctic_canonical`` at
                 # the queue site below — no per-site reorder required.
 
@@ -1514,6 +1532,24 @@ def _daily_append_impl(
                 f"ArcticDB daily_append error rate {err_rate:.1%} exceeds 5% threshold "
                 f"(n_ok={n_ok} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
             )
+
+        # ── L4484: factor-momentum daily go-forward second pass ──────────────
+        # factor_momentum_ratio is a cross-sectional-time-series feature that
+        # can't be produced per-ticker in the loop above (it ranks the WHOLE
+        # cross-section + builds factor-return portfolios). Now that today's
+        # OHLCV+loadings rows are written, recompute the latest date's value
+        # over a slim trailing panel and update it in place. Best-effort +
+        # OBSERVE: the function never raises; gate off via the env var if it
+        # ever misbehaves. Skipped on dry_run (no writes happened).
+        if os.environ.get("FACTOR_MOMENTUM_DAILY_ENABLED", "true").lower() != "false":
+            try:
+                fm_result = update_factor_momentum_latest(
+                    universe_lib, stock_tickers, today_ts,
+                    canonical_fn=to_arctic_canonical,
+                )
+                log.info("Factor-momentum daily update: %s", json.dumps(fm_result, default=str))
+            except Exception as exc:  # belt-and-suspenders — never fail the daily pipeline
+                log.warning("Factor-momentum daily update FAILED (OBSERVE, non-fatal): %s", exc)
 
         # Producer-side post-write validation. Catches the partial-write
         # class (2026-04-21 ASGN/MOH) that the per-ticker error-rate gate
