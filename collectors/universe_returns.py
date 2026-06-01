@@ -2,11 +2,13 @@
 collectors/universe_returns.py — Full-population forward-return tracking.
 
 Uses polygon.io grouped-daily endpoint to fetch OHLCV for the entire US market
-in a single API call per date. Computes 5d/10d/21d/30d forward returns for every
-ticker, SPY benchmark returns, and sector ETF returns for sector-relative
+in a single API call per date. Computes 5d/10d/21d/30d/60d/90d forward returns for
+every ticker, SPY benchmark returns, and sector ETF returns for sector-relative
 analysis. 21d arithmetic + log-domain columns added 2026-05-09 to align the
 measurement substrate with the predictor's canonical 21d log-domain training
-target (see docs/private/predictor-21d-migration-260509.md).
+target (see docs/private/predictor-21d-migration-260509.md). 60d/90d (return +
+SPY-relative + beat + log-domain) added 2026-06-01 (W3.1, L4469) for the
+predictor horizon study + backtester 60/90d signal-quality.
 
 This is the denominator for all lift calculations in the backtester evaluation
 framework: scanner filter lift, sector team lift, CIO lift, predictor lift,
@@ -66,12 +68,22 @@ CREATE TABLE IF NOT EXISTS universe_returns (
     spy_return_10d REAL,
     spy_return_21d REAL,
     spy_return_30d REAL,
+    return_60d REAL,
+    return_90d REAL,
+    spy_return_60d REAL,
+    spy_return_90d REAL,
     beat_spy_5d INTEGER,
     beat_spy_10d INTEGER,
     beat_spy_21d INTEGER,
     beat_spy_30d INTEGER,
+    beat_spy_60d INTEGER,
+    beat_spy_90d INTEGER,
     log_return_21d REAL,
     log_spy_return_21d REAL,
+    log_return_60d REAL,
+    log_return_90d REAL,
+    log_spy_return_60d REAL,
+    log_spy_return_90d REAL,
     sector_etf TEXT,
     sector_etf_return_5d REAL,
     beat_sector_5d INTEGER,
@@ -85,6 +97,20 @@ _NEW_COLUMNS_21D = [
     ("beat_spy_21d", "INTEGER"),
     ("log_return_21d", "REAL"),
     ("log_spy_return_21d", "REAL"),
+]
+
+# W3.1 (L4469): 60d/90d horizon columns (return + SPY-relative + beat + log).
+_NEW_COLUMNS_60_90D = [
+    ("return_60d", "REAL"),
+    ("return_90d", "REAL"),
+    ("spy_return_60d", "REAL"),
+    ("spy_return_90d", "REAL"),
+    ("beat_spy_60d", "INTEGER"),
+    ("beat_spy_90d", "INTEGER"),
+    ("log_return_60d", "REAL"),
+    ("log_return_90d", "REAL"),
+    ("log_spy_return_60d", "REAL"),
+    ("log_spy_return_90d", "REAL"),
 ]
 
 
@@ -284,6 +310,11 @@ def _ensure_table(db_path: str) -> None:
         for col, col_type in _NEW_COLUMNS_21D:
             if col not in cols:
                 conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
+        # W3.1 (L4469): 60d/90d horizon columns — additive migration for the
+        # predictor horizon study + backtester 60/90d signal quality.
+        for col, col_type in _NEW_COLUMNS_60_90D:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
         conn.commit()
     finally:
         conn.close()
@@ -347,14 +378,23 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
                     "spy_return_5d, spy_return_10d, spy_return_21d, spy_return_30d, "
                     "beat_spy_5d, beat_spy_10d, beat_spy_21d, beat_spy_30d, "
                     "log_return_21d, log_spy_return_21d, "
+                    "return_60d, return_90d, spy_return_60d, spy_return_90d, "
+                    "beat_spy_60d, beat_spy_90d, "
+                    "log_return_60d, log_return_90d, log_spy_return_60d, log_spy_return_90d, "
                     "sector_etf, sector_etf_return_5d, beat_sector_5d) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row["ticker"], row["eval_date"], row["sector"], row["close_price"],
                         row["return_5d"], row["return_10d"], row["return_21d"], row["return_30d"],
                         row["spy_return_5d"], row["spy_return_10d"], row["spy_return_21d"], row["spy_return_30d"],
                         row["beat_spy_5d"], row["beat_spy_10d"], row["beat_spy_21d"], row["beat_spy_30d"],
                         row["log_return_21d"], row["log_spy_return_21d"],
+                        row.get("return_60d"), row.get("return_90d"),
+                        row.get("spy_return_60d"), row.get("spy_return_90d"),
+                        row.get("beat_spy_60d"), row.get("beat_spy_90d"),
+                        row.get("log_return_60d"), row.get("log_return_90d"),
+                        row.get("log_spy_return_60d"), row.get("log_spy_return_90d"),
                         row["sector_etf"], row["sector_etf_return_5d"], row["beat_sector_5d"],
                     ),
                 )
@@ -380,6 +420,8 @@ def _build_rows_for_date(
     fwd_10d = _add_trading_days(eval_dt, 10)
     fwd_21d = _add_trading_days(eval_dt, 21)
     fwd_30d = _add_trading_days(eval_dt, 30)
+    fwd_60d = _add_trading_days(eval_dt, 60)
+    fwd_90d = _add_trading_days(eval_dt, 90)
 
     # Check that forward dates are in the past (returns can be computed)
     today = date.today()
@@ -390,6 +432,8 @@ def _build_rows_for_date(
     has_10d = fwd_10d < today
     has_21d = fwd_21d < today
     has_30d = fwd_30d < today
+    has_60d = fwd_60d < today
+    has_90d = fwd_90d < today
 
     # Fetch grouped-daily prices for eval_date and forward dates
     prices_t0 = polygon_client.get_grouped_daily(eval_date)
@@ -397,6 +441,8 @@ def _build_rows_for_date(
     prices_10d = polygon_client.get_grouped_daily(str(fwd_10d)) if has_10d else {}
     prices_21d = polygon_client.get_grouped_daily(str(fwd_21d)) if has_21d else {}
     prices_30d = polygon_client.get_grouped_daily(str(fwd_30d)) if has_30d else {}
+    prices_60d = polygon_client.get_grouped_daily(str(fwd_60d)) if has_60d else {}
+    prices_90d = polygon_client.get_grouped_daily(str(fwd_90d)) if has_90d else {}
 
     if not prices_t0:
         logger.warning("No prices for eval_date %s — may be a non-trading day", eval_date)
@@ -412,12 +458,18 @@ def _build_rows_for_date(
     spy_10d = prices_10d.get("SPY", {}).get("close") if has_10d else None
     spy_21d = prices_21d.get("SPY", {}).get("close") if has_21d else None
     spy_30d = prices_30d.get("SPY", {}).get("close") if has_30d else None
+    spy_60d = prices_60d.get("SPY", {}).get("close") if has_60d else None
+    spy_90d = prices_90d.get("SPY", {}).get("close") if has_90d else None
 
     spy_ret_5d = _pct_return(spy_t0, spy_5d)
     spy_ret_10d = _pct_return(spy_t0, spy_10d) if has_10d else None
     spy_ret_21d = _pct_return(spy_t0, spy_21d) if has_21d else None
     spy_ret_30d = _pct_return(spy_t0, spy_30d) if has_30d else None
+    spy_ret_60d = _pct_return(spy_t0, spy_60d) if has_60d else None
+    spy_ret_90d = _pct_return(spy_t0, spy_90d) if has_90d else None
     log_spy_ret_21d = _log_return(spy_t0, spy_21d) if has_21d else None
+    log_spy_ret_60d = _log_return(spy_t0, spy_60d) if has_60d else None
+    log_spy_ret_90d = _log_return(spy_t0, spy_90d) if has_90d else None
 
     # Sector ETF returns
     sector_etf_returns_5d: dict[str, float | None] = {}
@@ -440,12 +492,18 @@ def _build_rows_for_date(
         close_10d = prices_10d.get(ticker, {}).get("close") if has_10d else None
         close_21d = prices_21d.get(ticker, {}).get("close") if has_21d else None
         close_30d = prices_30d.get(ticker, {}).get("close") if has_30d else None
+        close_60d = prices_60d.get(ticker, {}).get("close") if has_60d else None
+        close_90d = prices_90d.get(ticker, {}).get("close") if has_90d else None
 
         ret_5d = _pct_return(close_t0, close_5d)
         ret_10d = _pct_return(close_t0, close_10d) if has_10d else None
         ret_21d = _pct_return(close_t0, close_21d) if has_21d else None
         ret_30d = _pct_return(close_t0, close_30d) if has_30d else None
+        ret_60d = _pct_return(close_t0, close_60d) if has_60d else None
+        ret_90d = _pct_return(close_t0, close_90d) if has_90d else None
         log_ret_21d = _log_return(close_t0, close_21d) if has_21d else None
+        log_ret_60d = _log_return(close_t0, close_60d) if has_60d else None
+        log_ret_90d = _log_return(close_t0, close_90d) if has_90d else None
 
         # Sector classification
         sector_etf = sector_map.get(ticker) if sector_map else None
@@ -469,8 +527,18 @@ def _build_rows_for_date(
             "beat_spy_10d": int(ret_10d > spy_ret_10d) if ret_10d is not None and spy_ret_10d is not None else None,
             "beat_spy_21d": int(ret_21d > spy_ret_21d) if ret_21d is not None and spy_ret_21d is not None else None,
             "beat_spy_30d": int(ret_30d > spy_ret_30d) if ret_30d is not None and spy_ret_30d is not None else None,
+            "return_60d": round(ret_60d, 4) if ret_60d is not None else None,
+            "return_90d": round(ret_90d, 4) if ret_90d is not None else None,
+            "spy_return_60d": round(spy_ret_60d, 4) if spy_ret_60d is not None else None,
+            "spy_return_90d": round(spy_ret_90d, 4) if spy_ret_90d is not None else None,
+            "beat_spy_60d": int(ret_60d > spy_ret_60d) if ret_60d is not None and spy_ret_60d is not None else None,
+            "beat_spy_90d": int(ret_90d > spy_ret_90d) if ret_90d is not None and spy_ret_90d is not None else None,
             "log_return_21d": round(log_ret_21d, 6) if log_ret_21d is not None else None,
             "log_spy_return_21d": round(log_spy_ret_21d, 6) if log_spy_ret_21d is not None else None,
+            "log_return_60d": round(log_ret_60d, 6) if log_ret_60d is not None else None,
+            "log_return_90d": round(log_ret_90d, 6) if log_ret_90d is not None else None,
+            "log_spy_return_60d": round(log_spy_ret_60d, 6) if log_spy_ret_60d is not None else None,
+            "log_spy_return_90d": round(log_spy_ret_90d, 6) if log_spy_ret_90d is not None else None,
             "sector_etf": sector_etf,
             "sector_etf_return_5d": round(etf_ret_5d, 4) if etf_ret_5d is not None else None,
             "beat_sector_5d": int(ret_5d > etf_ret_5d) if ret_5d is not None and etf_ret_5d is not None else None,
