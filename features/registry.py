@@ -106,6 +106,12 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("residual_momentum_ratio", "technical", "Vol-scaled cumulative residual (idiosyncratic) log-return over the 12-1 skip-month window: ∑resid_ret[t-252,t-21] / (σ_resid·√231) — an information ratio (Blitz/Hanauer residual momentum)", source="yfinance", refresh="daily"),
     FeatureEntry("mom_12_1_pct", "technical", "12-1 skip-month raw price momentum: close.shift(21)/close.shift(252) - 1 (classic momentum factor, skips the recent-month reversal)", source="yfinance", refresh="daily"),
     FeatureEntry("sector_mom_pct", "technical", "The ticker's sector-ETF own 12-1 skip-month momentum (GKX industry momentum — absolute, distinct from sector_vs_spy_* relative features)", source="yfinance", refresh="daily"),
+    # W2.3 (L4469) — factor momentum (Gupta-Kelly "Factor Momentum Everywhere").
+    # Cross-sectional-time-series projection: Σ_f zscore(loading_{i,f,t}) ×
+    # factor_momentum_{f,t}. NOT produced by per-ticker compute_features —
+    # materialized in a second pass over the universe lib (factor_momentum.
+    # materialize_factor_momentum). Mirrors the post-assembly *_zscore loadings.
+    FeatureEntry("factor_momentum_ratio", "technical", "Factor-momentum tilt (Gupta-Kelly): per date, dot the ticker's cross-sectionally z-scored factor loadings with each factor's trailing 12-1 long-short return momentum — Σ_f zscore(loading) × factor_mom. Dimensionless projection; backward-only (loadings at t × factor momentum through t-skip)", source="derived", refresh="daily"),
 
     # ── Fundamental (13) — quarterly financials ───────────────────────────────
     FeatureEntry("pe_ratio", "fundamental", "Trailing P/E ratio, normalized (PE / 30)", source="fmp", refresh="quarterly"),
