@@ -112,6 +112,9 @@ parity.
 | `idio_vol_60d` | annualized vol (decimal) | `std(residual_returns).rolling(60) * sqrt(252)` after beta removal | predictor |
 | `vol_of_vol_30d` | stdev of vol | `realized_vol_20d.rolling(30).std()` | predictor |
 | `max_drawdown_60d` | non-positive decimal pct (bare-named convention) | min of `(close / rolling_max_60 - 1)` over 60d | predictor |
+| `residual_momentum_ratio` | information ratio (dimensionless) | `sum(residual_returns)[t-252,t-21] / (std(residual_returns).rolling(20) * sqrt(231))` — reuses the beta-residualized log-return (same series as idio_vol_60d) | predictor (W2 residual-momentum L1, observe-gated) |
+| `mom_12_1_pct` | decimal return | `close.shift(21) / close.shift(252) - 1` (12-1 skip-month momentum) | predictor (W2) |
+| `sector_mom_pct` | decimal return | sector-ETF `close.shift(21) / close.shift(252) - 1` (absolute industry momentum) | predictor (W2) |
 
 ### Macro (one row per date — `per_ticker=False`)
 
