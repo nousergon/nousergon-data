@@ -44,6 +44,10 @@ def _series(n=400, seed=99, drift=0.0, vol=0.008, start="2018-01-01", base=300.0
     return pd.Series(close, index=pd.date_range(start, periods=n, freq="B"))
 
 
+def _closes_from_returns_local(r, n, start="2018-01-01", base=100.0):
+    return pd.Series(base * np.exp(np.cumsum(r)), index=pd.date_range(start, periods=n, freq="B"))
+
+
 class TestSchema:
     def test_w2_columns_in_features_list(self):
         for name in _W2_COLS:
@@ -62,16 +66,27 @@ class TestResidualMomentumRatio:
         # Pre-warmup (window 252 + skip 21) is NaN.
         assert pd.isna(out["residual_momentum_ratio"].iloc[100])
 
-    def test_pure_beta_stock_has_near_zero_residual_momentum(self):
-        # Stock == SPY exactly → residual return ≈ 0 → residual momentum ≈ 0,
-        # even though the market trends. (Distinguishes residual from raw.)
-        spy = _series(n=400, drift=0.0008)  # market trends up
-        df = pd.DataFrame({
-            "Open": spy, "High": spy * 1.001, "Low": spy * 0.999,
-            "Close": spy, "Volume": np.full(400, 5e6, dtype=float),
-        }, index=spy.index)
-        out = compute_features(df, spy_series=spy)
-        assert abs(out["residual_momentum_ratio"].iloc[-1]) < 0.05
+    def test_residual_momentum_negative_when_idio_drifts_down(self):
+        # Mirror of the idio-up case: market trends UP, the idiosyncratic
+        # component trends DOWN (beta=1) → residual momentum is NEGATIVE even
+        # though raw price momentum is positive. Strong drifts dominate noise,
+        # so this is robust across pandas/numpy versions (unlike a pure-beta
+        # 0/0 information ratio, which is jitter-dominated and ill-posed).
+        rng = np.random.default_rng(21)
+        n = 500
+        r_bench = 0.001 + rng.normal(0, 0.001, n)    # market drifts up
+        idio = -0.0008 + rng.normal(0, 0.001, n)     # stock-specific drift down
+        close = _closes_from_returns_local(r_bench + idio, n)  # beta_true = 1
+        bench = _closes_from_returns_local(r_bench, n)
+        out = compute_features(
+            pd.DataFrame({
+                "Open": close, "High": close * 1.001, "Low": close * 0.999,
+                "Close": close, "Volume": np.full(n, 5e6, dtype=float),
+            }, index=close.index),
+            spy_series=bench,
+        )
+        assert out["residual_momentum_ratio"].iloc[-1] < 0   # residual momentum down
+        assert out["mom_12_1_pct"].iloc[-1] > 0              # raw price momentum up
 
     def test_nan_when_spy_missing(self):
         out = compute_features(_ohlcv(), spy_series=None)
