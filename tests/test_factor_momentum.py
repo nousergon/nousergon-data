@@ -18,6 +18,7 @@ from features.factor_momentum import (
     compute_daily_factor_returns,
     compute_factor_momentum_feature,
     compute_factor_momentum_series,
+    materialize_factor_momentum,
 )
 
 
@@ -111,3 +112,99 @@ class TestRobustness:
         out = compute_factor_momentum_feature(panel, ["f1"], window=252, skip=21)
         assert len(out) == len(panel)
         assert out.isna().all()
+
+
+class _MockLib:
+    """Minimal in-memory stand-in for an ArcticDB Library — supports the
+    ``read(sym).data`` / ``write(sym, df)`` surface materialize_factor_momentum
+    uses, storing per-ticker frames keyed by symbol."""
+
+    class _Item:
+        def __init__(self, data):
+            self.data = data
+
+    def __init__(self, frames: dict):
+        self._store = dict(frames)
+
+    def read(self, sym):
+        return self._Item(self._store[sym].copy())
+
+    def write(self, sym, df):
+        self._store[sym] = df.copy()
+
+    def list_symbols(self):
+        return list(self._store)
+
+
+def _panel_to_universe_frames(panel: pd.DataFrame) -> dict:
+    """Reshape the long persistent-factor panel into per-ticker date-indexed
+    frames with a ``Close`` column + the ``f1`` loading (mirrors the universe
+    library's per-symbol storage)."""
+    frames = {}
+    for t, grp in panel.groupby("ticker", sort=False):
+        g = grp.sort_values("date").set_index("date")
+        frames[t] = pd.DataFrame({"Close": g["close"].astype(float), "f1": g["f1"].astype(float)})
+    return frames
+
+
+class TestMaterializeSecondPass:
+    def test_writes_factor_momentum_column_consistent_with_pure_fn(self):
+        panel, tickers, loading = _persistent_factor_panel(seed=7)
+        lib = _MockLib(_panel_to_universe_frames(panel))
+
+        result = materialize_factor_momentum(lib, tickers, loading_cols=["f1"])
+        assert result["status"] == "ok"
+        assert result["tickers_written"] == len(tickers)
+
+        # Every ticker's stored frame now carries the column.
+        for t in tickers:
+            df = lib.read(t).data
+            assert "factor_momentum_ratio" in df.columns
+
+        # High-loading name's latest value is positive and exceeds the low one —
+        # same property the pure-function test asserts, now end-to-end.
+        hi = max(loading, key=loading.get)
+        lo = min(loading, key=loading.get)
+        s_hi = lib.read(hi).data["factor_momentum_ratio"].iloc[-1]
+        s_lo = lib.read(lo).data["factor_momentum_ratio"].iloc[-1]
+        assert np.isfinite(s_hi) and s_hi > 0
+        assert s_hi > s_lo
+
+    def test_write_false_computes_but_does_not_mutate_store(self):
+        panel, tickers, _ = _persistent_factor_panel(seed=8)
+        lib = _MockLib(_panel_to_universe_frames(panel))
+        result = materialize_factor_momentum(lib, tickers, loading_cols=["f1"], write=False)
+        assert result["status"] == "ok"
+        assert result["tickers_written"] == 0
+        for t in tickers:
+            assert "factor_momentum_ratio" not in lib.read(t).data.columns
+
+    def test_canonical_fn_applied_on_write(self):
+        panel, tickers, _ = _persistent_factor_panel(seed=9)
+        lib = _MockLib(_panel_to_universe_frames(panel))
+        seen = {}
+
+        def _canon(df):
+            seen["called"] = True
+            return df
+
+        materialize_factor_momentum(lib, tickers, loading_cols=["f1"], canonical_fn=_canon)
+        assert seen.get("called") is True
+
+    def test_unreadable_tickers_are_skipped_loudly_not_fatal(self):
+        panel, tickers, _ = _persistent_factor_panel(seed=10)
+        frames = _panel_to_universe_frames(panel)
+        lib = _MockLib(frames)
+        # A ticker named in the list but absent from the store → read raises.
+        result = materialize_factor_momentum(
+            lib, tickers + ["MISSING"], loading_cols=["f1"],
+        )
+        assert result["status"] == "ok"
+        assert result["read_fail"] == 1
+        assert result["tickers_written"] == len(tickers)
+
+    def test_empty_universe_returns_empty_status(self):
+        lib = _MockLib({})
+        result = materialize_factor_momentum(lib, [], loading_cols=["f1"])
+        assert result["status"] == "empty"
+        assert result["tickers_written"] == 0

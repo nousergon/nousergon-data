@@ -170,6 +170,14 @@ FEATURES = [
     "residual_momentum_ratio",
     "mom_12_1_pct",
     "sector_mom_pct",
+    # W2.3 (L4469) — factor momentum ("Factor Momentum Everywhere", Gupta-Kelly).
+    # A cross-sectional-time-series projection, so (like the C.1 z-scores below)
+    # it is NOT produced by per-ticker compute_features — it is materialized in a
+    # SECOND PASS over the universe library by features.factor_momentum.
+    # materialize_factor_momentum, called at the end of builders/backfill.py
+    # (full 10y) and the daily go-forward path. Predictor-consumed (W2.3);
+    # observe-only.
+    "factor_momentum_ratio",
     # C.1 (optimizer-sota-upgrades-260526.md §C.1) — factor-loading z-scores
     # for the executor's Σ = B·F·Bᵀ + D risk decomposition (C.3). Computed
     # POST-assembly in features/compute.py via features.cross_sectional.

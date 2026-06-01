@@ -28,8 +28,12 @@ sectional-time-series construction needs the whole panel, not a per-ticker slice
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 # The factor-loading columns this signal tilts across. These are the raw
 # per-ticker loadings the feature store already computes; the cross-sectional
@@ -163,3 +167,122 @@ def compute_factor_momentum_feature(
     ssum = np.where(finite, prod, 0.0).sum(axis=1)
     signal = np.where(count > 0, ssum / np.maximum(count, 1), np.nan)
     return pd.Series(signal, index=panel.index, name="factor_momentum_ratio")
+
+
+def materialize_factor_momentum(
+    universe_lib,
+    tickers,
+    *,
+    loading_cols: list[str] | None = None,
+    window: int = 252,
+    skip: int = 21,
+    quantile: float = 0.3,
+    min_names: int = 20,
+    write: bool = True,
+    canonical_fn=None,
+) -> dict:
+    """Second-pass library builder: materialize ``factor_momentum_ratio`` over
+    the FULL universe-library history (W2.3, L4469).
+
+    Factor momentum is a cross-sectional-time-series construction — date t's
+    value needs EVERY ticker's (close + loadings) history at once (to rank the
+    cross-section and build factor-return portfolios). The streaming per-ticker
+    writes in ``builders/backfill.py`` / ``builders/daily_append.py`` never hold
+    the whole panel in memory, so this runs as a SEPARATE pass AFTER those
+    writes:
+
+      * Pass 1 — read back the slim ``(close + loadings)`` panel per ticker
+        (the full feature frame is ~630 MB universe-wide; the slim slice is a
+        fraction of that), assemble the long panel, and call
+        ``compute_factor_momentum_feature`` once over the whole thing.
+      * Pass 2 — read-modify-write ``factor_momentum_ratio`` into each ticker's
+        stored frame (one frame in memory at a time). ``canonical_fn`` (pass
+        ``store.arctic_store.to_arctic_canonical``) re-projects to the
+        OHLCV+source+FEATURES column contract so the new column lands in its
+        canonical position; ``factor_momentum_ratio`` must be in ``FEATURES`` or
+        the canonical projection would drop it.
+
+    Tickers that fail to read/write are skipped with a WARN (the signal is
+    OBSERVE-mode and best-effort); an all-NaN ``factor_momentum_ratio`` count is
+    logged LOUD so a silently-empty materialization can't pass for success.
+    Returns a summary dict.
+    """
+    cols = list(loading_cols) if loading_cols is not None else list(DEFAULT_FACTOR_LOADINGS)
+
+    # ── Pass 1: assemble the slim long panel (close + loadings) ──────────────
+    frames: list[pd.DataFrame] = []
+    read_fail = 0
+    for t in tickers:
+        try:
+            df = universe_lib.read(t).data
+        except Exception as exc:
+            log.warning("factor-momentum: read failed for %s (skipped): %s", t, exc)
+            read_fail += 1
+            continue
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        sub = pd.DataFrame({"close": df["Close"].astype(float)})
+        for c in cols:
+            if c in df.columns:
+                sub[c] = df[c].astype(float)
+        sub["ticker"] = t
+        sub["date"] = df.index
+        frames.append(sub.reset_index(drop=True))
+
+    if not frames:
+        log.warning(
+            "factor-momentum: no readable tickers (read_fail=%d) — nothing materialized",
+            read_fail,
+        )
+        return {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
+
+    panel = pd.concat(frames, ignore_index=True)
+    fm = compute_factor_momentum_feature(
+        panel, loading_cols=cols, window=window, skip=skip,
+        quantile=quantile, min_names=min_names,
+    )
+    panel["factor_momentum_ratio"] = fm.to_numpy()
+
+    # ── Pass 2: read-modify-write the column per ticker ──────────────────────
+    n_written = 0
+    n_all_nan = 0
+    write_fail = 0
+    n_tickers = panel["ticker"].nunique()
+    for t, grp in panel.groupby("ticker", sort=False):
+        col = grp.set_index("date")["factor_momentum_ratio"].astype(float)
+        if not np.isfinite(col.to_numpy()).any():
+            n_all_nan += 1
+        if not write:
+            continue
+        try:
+            df = universe_lib.read(t).data
+            df["factor_momentum_ratio"] = col.reindex(df.index).astype("float32")
+            out = canonical_fn(df) if canonical_fn is not None else df
+            universe_lib.write(t, out)
+            n_written += 1
+        except Exception as exc:
+            log.warning("factor-momentum: write failed for %s (skipped): %s", t, exc)
+            write_fail += 1
+
+    if n_all_nan:
+        # LOUD per [[feedback_no_silent_fails]]: an all-NaN signal is the
+        # short-history / no-finite-loadings tail, not a failure — but a HIGH
+        # count would mean the panel/loadings were wrong, so surface it.
+        log.warning(
+            "factor-momentum: %d/%d tickers have an all-NaN factor_momentum_ratio "
+            "(short history or no finite loadings → neutral downstream, NOT a "
+            "silent zero).",
+            n_all_nan, n_tickers,
+        )
+    log.info(
+        "factor-momentum materialized: %d written, %d all-NaN, %d read-fail, "
+        "%d write-fail (of %d panel tickers)",
+        n_written, n_all_nan, read_fail, write_fail, n_tickers,
+    )
+    return {
+        "status": "ok",
+        "tickers_written": n_written,
+        "tickers_all_nan": n_all_nan,
+        "read_fail": read_fail,
+        "write_fail": write_fail,
+    }

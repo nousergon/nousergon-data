@@ -115,6 +115,7 @@ parity.
 | `residual_momentum_ratio` | information ratio (dimensionless) | `sum(residual_returns)[t-252,t-21] / (std(residual_returns).rolling(20) * sqrt(231))` — reuses the beta-residualized log-return (same series as idio_vol_60d) | predictor (W2 residual-momentum L1, observe-gated) |
 | `mom_12_1_pct` | decimal return | `close.shift(21) / close.shift(252) - 1` (12-1 skip-month momentum) | predictor (W2) |
 | `sector_mom_pct` | decimal return | sector-ETF `close.shift(21) / close.shift(252) - 1` (absolute industry momentum) | predictor (W2) |
+| `factor_momentum_ratio` | dimensionless projection | `Σ_f zscore(loading_{i,f,t}) × factor_momentum_{f,t}` (Gupta-Kelly factor momentum) — **second-pass** column materialized over the full universe panel by `factor_momentum.materialize_factor_momentum` (not per-ticker `compute_features`); backward-only | predictor (W2.3, observe) |
 
 ### Macro (one row per date — `per_ticker=False`)
 

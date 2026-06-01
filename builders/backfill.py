@@ -36,6 +36,7 @@ from features.feature_engineer import (
     MIN_ROWS_FOR_FEATURES,
     compute_features,
 )
+from features.factor_momentum import materialize_factor_momentum
 from features.compute import (
     DEFAULT_BUCKET,
     SOURCE_CATEGORIES,
@@ -733,6 +734,25 @@ def backfill(
                     sector_df = pd.DataFrame({"Close": macro[key]}, index=macro[key].index)
                     sector_df.index.name = "date"
                     macro_lib.write(key, to_arctic_safe(sector_df))
+
+    # ── 5b. Factor-momentum second pass (W2.3, L4469) ────────────────────────
+    # ``factor_momentum_ratio`` is a cross-sectional-time-series feature: date
+    # t's value ranks the WHOLE cross-section and builds factor-return
+    # portfolios, so it can't be produced inside the per-ticker compute_features
+    # loop above. Run it as a second pass over the just-written universe lib,
+    # reading back the slim (close + loadings) panel and writing the column
+    # back per ticker (canonical projection keeps it in its FEATURES position).
+    # Full-universe only — a ``--ticker X`` patch can't reconstruct the
+    # cross-section, so the column is left to the next full backfill / the
+    # daily go-forward path. Runs BEFORE the snapshot so the snapshot is
+    # complete.
+    if not dry_run and ticker_filter is None:
+        fm_result = materialize_factor_momentum(
+            universe_lib,
+            universe_tickers,
+            canonical_fn=to_arctic_canonical,
+        )
+        log.info("Factor-momentum second pass: %s", json.dumps(fm_result, default=str))
 
     # ── 6. Snapshot ──────────────────────────────────────────────────────────
     if not dry_run:
