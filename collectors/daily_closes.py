@@ -105,6 +105,75 @@ _FRED_INDEX_MAP = {
 }
 
 
+def _coalesce_by_source_priority(
+    new_records: list[dict],
+    existing_rows: list[dict],
+    run_date: str,
+) -> tuple[list[dict], dict]:
+    """Merge this-run records with the prior parquet by source priority.
+
+    Institutional source-of-record waterfall (see ``_SOURCE_PRIORITY``). For
+    each ticker, keep the row from the highest-priority source across {prior
+    parquet, this run}:
+
+    * **retain-on-empty** — a ticker the live pass could not refresh this run
+      (absent from ``new_records``) keeps its prior row instead of being
+      dropped. A populated cell can never regress to absent. This is the bug
+      that halted the 2026-06-01 weekday pipeline: a transient FRED 429 on
+      ``TNX`` let a wholesale overwrite blank a value the prior parquet held.
+    * **restatement wins** — a ticker present from the SAME-or-higher priority
+      source this run overwrites the prior value (ties resolve to the fresh
+      row), so polygon's corporate-action-adjusted close still lands.
+    * **no source-downgrade** — a strictly lower-priority fresh value (e.g. a
+      yfinance backstop) cannot clobber a higher-priority existing value (e.g.
+      a prior polygon close + true VWAP), preventing the 2026-04-17
+      ``VWAP=None`` contamination class.
+
+    A row whose ``Close`` is null/NaN is treated as missing (priority below any
+    real value) so it neither wins a merge nor gets written as an empty cell.
+
+    Returns ``(merged_records, stats)`` — stats counts retained / overwritten /
+    new_only / downgrade_blocked tickers for loud observability.
+    """
+    def _prio(row: dict | None) -> int:
+        if row is None:
+            return -1
+        close = row.get("Close")
+        if close is None or pd.isna(close):
+            return 0
+        return _SOURCE_PRIORITY.get(row.get("source"), _UNKNOWN_SOURCE_PRIORITY)
+
+    new_by_ticker = {r["ticker"]: r for r in new_records}
+    existing_by_ticker = {r["ticker"]: r for r in existing_rows}
+
+    merged: dict[str, dict] = {}
+    stats = {"overwritten": 0, "retained": 0, "new_only": 0, "downgrade_blocked": 0}
+
+    for ticker in set(new_by_ticker) | set(existing_by_ticker):
+        new_row = new_by_ticker.get(ticker)
+        old_row = existing_by_ticker.get(ticker)
+        new_p, old_p = _prio(new_row), _prio(old_row)
+
+        # Nothing usable from either side — drop (don't write a null cell).
+        if max(new_p, old_p) <= 0:
+            continue
+
+        if old_row is None:
+            merged[ticker] = new_row
+            stats["new_only"] += 1
+        elif new_p < 0:  # ticker absent from this run → retain prior
+            merged[ticker] = old_row
+            stats["retained"] += 1
+        elif new_p >= old_p:  # equal-or-higher source wins (tie → restatement)
+            merged[ticker] = new_row
+            stats["overwritten"] += 1
+        else:  # fresh value is strictly lower-quality — keep the better existing
+            merged[ticker] = old_row
+            stats["downgrade_blocked"] += 1
+
+    return list(merged.values()), stats
+
+
 def _is_post_close_write(last_modified: datetime, run_date: str) -> bool:
     """Return True if ``last_modified`` is at or after the NYSE close for ``run_date``.
 
@@ -121,6 +190,21 @@ _YFINANCE_MIN_COVERAGE = 0.95   # below this, yfinance_only mode hard-fails
 _POLYGON_MIN_COVERAGE = 0.95    # below this, polygon_only mode hard-fails
 _DISCREPANCY_WARN_PCT = 0.01    # |polygon_close - yfinance_close| / yfinance_close
 _DISCREPANCY_ERROR_PCT = 0.05
+
+# Source-of-record priority for the coalescing merge (institutional waterfall).
+# A cell is replaced only by an equal-or-higher-priority source; a lower-priority
+# or *missing* value never clobbers a higher-quality existing value. This is the
+# structural form of Brian's 2026-05-10 decision ("a cell is only updated if the
+# data exists in [the authoritative source], else the prior datapoint is
+# retained") — generalized so data can never regress to a less-informative value.
+# polygon (adjusted close + true VWAP) and fred (sole source for its index
+# series) are co-primary over DISJOINT ticker domains (equities vs ^indices), so
+# they never compete for the same cell; yfinance is the backstop tier.
+_SOURCE_PRIORITY = {"polygon": 3, "fred": 3, "yfinance": 1}
+# Prior parquet rows written before the `source` column existed: treat as
+# backstop-tier so a fresh polygon/fred value wins but a missing fresh value
+# still retains them (never blanked).
+_UNKNOWN_SOURCE_PRIORITY = 1
 
 # Share-class symbol convention bridge (Yahoo/our-universe dash → polygon dot).
 #
@@ -310,6 +394,10 @@ def collect(
     # Skip-on-exists short-circuit (yfinance_only + auto only) returns inside
     # the live branch since dry_run by definition isn't going to write.
     existing_close_for_discrepancy: dict[str, float] | None = None
+    # Full prior-parquet rows (with ``source``), used by the polygon_only
+    # source-priority coalesce so a transient live-fetch gap retains the prior
+    # value instead of blanking it. Empty unless an existing parquet is read.
+    existing_rows_for_merge: list[dict] = []
     # When skip_if_canonical=True, ``canonical_existing_rows`` carries
     # the records dicts for tickers in the existing parquet that already
     # have an authoritative source (yfinance / polygon) and a non-null
@@ -333,9 +421,13 @@ def collect(
     if head is not None:
         last_modified = head["LastModified"]
         if source == "polygon_only":
-            # Read existing rows so we can log Close-discrepancy after the
-            # polygon overwrite. Failures here are non-fatal — discrepancy
-            # logging is observability, not a write blocker.
+            # Read existing rows for (a) Close-discrepancy logging and (b) the
+            # source-priority coalesce merge before write — so a cell the live
+            # pass can't refresh this run is RETAINED, never blanked. Failures
+            # here are non-fatal for discrepancy logging, but losing the prior
+            # rows means we fall back to the legacy destructive overwrite, so
+            # warn loudly. The coverage gate still runs on the FRESH fetch, so
+            # a real polygon outage is not masked by retained rows.
             try:
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 existing_df = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
@@ -344,15 +436,19 @@ def collect(
                     for t in existing_df.index
                     if pd.notna(existing_df.loc[t, "Close"])
                 }
+                for t in existing_df.index:
+                    row = {"ticker": str(t)}
+                    row.update(existing_df.loc[t].to_dict())
+                    existing_rows_for_merge.append(row)
                 logger.info(
                     "polygon_only: found existing parquet (last_modified=%s, %d tickers) — "
-                    "will overwrite and log Close discrepancies",
+                    "will coalesce (retain-on-empty, priority-ranked) and log Close discrepancies",
                     last_modified.isoformat(), len(existing_close_for_discrepancy),
                 )
             except Exception as exc:
                 logger.warning(
-                    "polygon_only: failed to read existing parquet for discrepancy logging "
-                    "(%s) — proceeding with overwrite without discrepancy comparison",
+                    "polygon_only: failed to read existing parquet for coalesce/discrepancy "
+                    "(%s) — proceeding with destructive overwrite (no retain-on-empty this run)",
                     exc,
                 )
         elif skip_if_canonical:
@@ -438,10 +534,16 @@ def collect(
     if fred_missing:
         fred_count = _fetch_fred_closes(fred_missing, run_date, records)
 
-    # ── Step 3: yfinance — only in auto + yfinance_only modes ────────────────
-    # polygon_only refuses yfinance fallback per feedback_no_silent_fails: a
-    # silent yfinance fill would hide polygon outages and re-introduce the
-    # 2026-04-17 → 2026-04-23 VWAP=None contamination.
+    # ── Step 3: yfinance ─────────────────────────────────────────────────────
+    # polygon_only refuses yfinance fallback for the EQUITY universe per
+    # feedback_no_silent_fails: a silent yfinance fill would hide a polygon
+    # outage and re-introduce the 2026-04-17 → 2026-04-23 VWAP=None
+    # contamination. That refusal is equity-specific — it does NOT apply to the
+    # FRED-index macro tickers (^TNX/^VIX/^IRX/^VIX3M), which polygon never
+    # serves and which carry no VWAP. For those, FRED → yfinance is the
+    # legitimate primary chain, so a FRED 429 (the 2026-06-01 TNX failure)
+    # falls through to yfinance LOUDLY rather than leaving a critical macro key
+    # absent. Equities still refuse yfinance in polygon_only.
     captured_tickers = {r["ticker"] for r in records}
     missing = [t for t in tickers if t.lstrip("^") not in captured_tickers]
     # When skip_if_canonical=True (yfinance_only / auto window mode), drop
@@ -457,8 +559,21 @@ def collect(
             run_date, before, len(missing), before - len(missing),
         )
     yfinance_count = 0
-    if missing and source != "polygon_only":
-        yfinance_count = _fetch_yfinance_closes(missing, run_date, records)
+    if missing:
+        if source == "polygon_only":
+            # Equity universe stays refused; macro FRED-index tickers get the
+            # loud yfinance backstop.
+            macro_missing = [t for t in missing if t.lstrip("^") in _FRED_INDEX_MAP]
+            if macro_missing:
+                logger.warning(
+                    "polygon_only: FRED did not supply macro ticker(s) %s for %s — "
+                    "falling back to yfinance (loud backstop; FRED likely rate-limited). "
+                    "Equity universe still refuses yfinance per feedback_no_silent_fails.",
+                    macro_missing, run_date,
+                )
+                yfinance_count = _fetch_yfinance_closes(macro_missing, run_date, records)
+        else:
+            yfinance_count = _fetch_yfinance_closes(missing, run_date, records)
 
     # Merge preserved canonical rows from the existing parquet into the
     # records list. These are tickers we deliberately skipped fetching
@@ -505,6 +620,33 @@ def collect(
     if not records:
         logger.warning("No closes captured for %s (source=%s)", run_date, source)
         return {"status": "error", "error": "no data fetched", "tickers_captured": 0, "source": source}
+
+    # ── Source-priority coalesce (polygon_only) ──────────────────────────────
+    # Merge the fresh fetch with the prior parquet so a cell the live pass could
+    # not refresh this run RETAINS its prior value instead of being blanked,
+    # while polygon restatements still win and a lower-tier fresh value can't
+    # downgrade a higher-tier existing cell. Runs AFTER the coverage gate, so a
+    # genuine polygon outage still hard-fails on the FRESH fetch before any
+    # retained rows could mask it. (yfinance_only / auto preserve prior state
+    # via ``canonical_existing_rows`` above, so the coalesce is polygon_only.)
+    if source == "polygon_only" and existing_rows_for_merge:
+        records, merge_stats = _coalesce_by_source_priority(
+            records, existing_rows_for_merge, run_date,
+        )
+        if merge_stats["retained"] or merge_stats["downgrade_blocked"]:
+            logger.warning(
+                "polygon_only coalesce for %s: retained %d prior cell(s) the live pass "
+                "could not refresh, blocked %d source-downgrade(s); overwrote %d, new %d "
+                "(total %d).",
+                run_date, merge_stats["retained"], merge_stats["downgrade_blocked"],
+                merge_stats["overwritten"], merge_stats["new_only"], len(records),
+            )
+        else:
+            logger.info(
+                "polygon_only coalesce for %s: overwrote %d, new %d, total %d "
+                "(no retain/downgrade events).",
+                run_date, merge_stats["overwritten"], merge_stats["new_only"], len(records),
+            )
 
     closes_df = pd.DataFrame(records).set_index("ticker")
     logger.info(
