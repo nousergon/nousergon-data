@@ -57,6 +57,11 @@ FEATURE_CFG: dict = {
     "beta_window": 60,
     "vol_of_vol_window": 30,
     "max_drawdown_window": 60,
+    # W2 residual-momentum windows (L4469). 12-1 skip-month convention:
+    # cumulative residual return over [t-window, t-skip], vol-scaled.
+    "resid_mom_window": 252,
+    "resid_mom_skip": 21,
+    "resid_mom_vol_window": 20,
 }
 
 _FC = FEATURE_CFG
@@ -159,6 +164,12 @@ FEATURES = [
     "vol_of_vol_30d",
     "max_drawdown_60d",
     "realized_vol_63d",
+    # W2 (L4469) — residual/idiosyncratic momentum + 12-1 skip-month + sector
+    # momentum. Predictor-consumed; observe-gated in the predictor's L2 until
+    # the standalone leak-free read validates the signal.
+    "residual_momentum_ratio",
+    "mom_12_1_pct",
+    "sector_mom_pct",
     # C.1 (optimizer-sota-upgrades-260526.md §C.1) — factor-loading z-scores
     # for the executor's Σ = B·F·Bᵀ + D risk decomposition (C.3). Computed
     # POST-assembly in features/compute.py via features.cross_sectional.
@@ -573,6 +584,51 @@ def compute_features(
         ).astype(float)
     else:
         df["idio_vol_60d"] = float("nan")
+
+    # ── W2 (L4469): residual / idiosyncratic momentum ─────────────────────────
+    # Revives the dead raw-momentum L1 with the strongest single finding in the
+    # canon (Blitz/Hanauer residual momentum — ~½ vol, ~2× risk-adjusted, wins
+    # horse races). REUSES the ``residual_returns`` series computed above for
+    # idio_vol_60d — the SAME beta-residualized log-return, NO recompute. All
+    # windows are backward-only / point-in-time; front-of-history rows stay NaN
+    # until warm-up (consumers neutralize, as with momentum_5d/return_120d).
+    _rm_win = _FC["resid_mom_window"]
+    _rm_skip = _FC["resid_mom_skip"]
+    _rm_vol_w = _FC["resid_mom_vol_window"]
+    _rm_cum = max(_rm_win - _rm_skip, 1)
+    if spy_series is not None:
+        # residual_momentum_ratio: vol-scaled cumulative residual log-return over
+        # [t-window, t-skip] (12-1 skip-month) → an information-ratio (∑resid /
+        # (σ_resid·√window)). Dimensionless → ``_ratio``.
+        _cum_resid = residual_returns.rolling(
+            window=_rm_cum, min_periods=_rm_cum,
+        ).sum().shift(_rm_skip)
+        _resid_dvol = residual_returns.rolling(
+            window=_rm_vol_w, min_periods=_rm_vol_w,
+        ).std()
+        df["residual_momentum_ratio"] = (
+            _cum_resid / (_resid_dvol * np.sqrt(_rm_cum)).replace(0, float("nan"))
+        ).replace([np.inf, -np.inf], float("nan")).astype(float)
+    else:
+        df["residual_momentum_ratio"] = float("nan")
+
+    # mom_12_1_pct: raw 12-1 skip-month price momentum (the classic momentum
+    # factor — the store only has 5/20/60/120d, none skip the recent month).
+    # Decimal return → ``_pct``.
+    df["mom_12_1_pct"] = (
+        (close.shift(_rm_skip) / close.shift(_rm_win)) - 1.0
+    ).replace([np.inf, -np.inf], float("nan")).astype(float)
+
+    # sector_mom_pct: the ticker's sector-ETF own 12-1 skip-month momentum
+    # (GKX industry momentum — absolute, distinct from the existing
+    # sector_vs_spy_* RELATIVE features). Decimal return → ``_pct``.
+    if sector_etf_series is not None:
+        _sec_for_mom = sector_etf_series.reindex(df.index, method="ffill").astype(float)
+        df["sector_mom_pct"] = (
+            (_sec_for_mom.shift(_rm_skip) / _sec_for_mom.shift(_rm_win)) - 1.0
+        ).replace([np.inf, -np.inf], float("nan")).astype(float)
+    else:
+        df["sector_mom_pct"] = float("nan")
 
     # vol_of_vol_30d: 30d rolling stdev of realized_vol_20d. Captures the
     # stability of the vol regime — a stock whose realized vol oscillates

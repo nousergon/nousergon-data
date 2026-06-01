@@ -100,6 +100,12 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("idio_vol_60d", "technical", "60d residual vol after removing beta exposure; std × sqrt(252) (idiosyncratic risk)", source="yfinance", refresh="daily"),
     FeatureEntry("vol_of_vol_30d", "technical", "30d rolling stdev of realized_vol_20d (stability of vol regime)", source="yfinance", refresh="daily"),
     FeatureEntry("max_drawdown_60d", "technical", "Worst peak-to-trough drawdown within trailing 60d window (non-positive decimal pct)", source="yfinance", refresh="daily"),
+    # W2 (L4469) — residual/idiosyncratic momentum family. residual_momentum_ratio
+    # reuses the beta-residualized log-return series (same as idio_vol_60d), NO
+    # beta recompute. Predictor-consumed; observe-gated in the L2 until validated.
+    FeatureEntry("residual_momentum_ratio", "technical", "Vol-scaled cumulative residual (idiosyncratic) log-return over the 12-1 skip-month window: ∑resid_ret[t-252,t-21] / (σ_resid·√231) — an information ratio (Blitz/Hanauer residual momentum)", source="yfinance", refresh="daily"),
+    FeatureEntry("mom_12_1_pct", "technical", "12-1 skip-month raw price momentum: close.shift(21)/close.shift(252) - 1 (classic momentum factor, skips the recent-month reversal)", source="yfinance", refresh="daily"),
+    FeatureEntry("sector_mom_pct", "technical", "The ticker's sector-ETF own 12-1 skip-month momentum (GKX industry momentum — absolute, distinct from sector_vs_spy_* relative features)", source="yfinance", refresh="daily"),
 
     # ── Fundamental (13) — quarterly financials ───────────────────────────────
     FeatureEntry("pe_ratio", "fundamental", "Trailing P/E ratio, normalized (PE / 30)", source="fmp", refresh="quarterly"),
