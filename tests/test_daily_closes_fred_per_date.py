@@ -36,6 +36,7 @@ from collectors import daily_closes
 def _fred_response(observations: list[dict]) -> MagicMock:
     """Build a mock ``requests.get`` response with the given observations."""
     resp = MagicMock()
+    resp.status_code = 200  # L4480: _fred_get_with_retry inspects status_code
     resp.raise_for_status.return_value = None
     resp.json.return_value = {"observations": observations}
     return resp

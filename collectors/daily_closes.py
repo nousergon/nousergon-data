@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import io
 import logging
+import random
 import re
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -71,6 +72,67 @@ _YFINANCE_BATCH_DELAY = 2  # seconds between batches
 
 _FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 _FRED_TIMEOUT = 15
+# L4480: bounded retry with exponential backoff + full jitter for FRED.
+# The windowed reconciliation fires ~N×(window) FRED calls in a tight burst;
+# without spacing FRED returns 429 storms (the 2026-06-01 TNX failure). #354
+# made us resilient to a missed value; this stops the storm at the source.
+# Honors a server `Retry-After` when present, else exponential backoff + jitter.
+_FRED_MAX_ATTEMPTS = 3
+_FRED_BACKOFF_BASE = 1.0   # seconds; wait ≈ base * 2**attempt + U(0, base)
+_FRED_BACKOFF_CAP = 30.0   # seconds; never wait longer than this between tries
+
+
+def _fred_get_with_retry(params: dict) -> requests.Response:
+    """GET a FRED observation with bounded backoff + jitter on transient errors.
+
+    Retries on 429 / 5xx / timeout / connection error (the recoverable class);
+    a 4xx other than 429 (e.g. a malformed series_id) raises immediately — no
+    point retrying a deterministic client error. Raises the last exception (or
+    an HTTPError via ``raise_for_status``) after ``_FRED_MAX_ATTEMPTS``.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_FRED_MAX_ATTEMPTS):
+        try:
+            resp = requests.get(_FRED_BASE, params=params, timeout=_FRED_TIMEOUT)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        wait = float(retry_after)
+                    except ValueError:
+                        wait = _FRED_BACKOFF_BASE * (2 ** attempt)
+                else:
+                    wait = _FRED_BACKOFF_BASE * (2 ** attempt)
+                wait = min(wait + random.uniform(0, _FRED_BACKOFF_BASE), _FRED_BACKOFF_CAP)
+                if attempt < _FRED_MAX_ATTEMPTS - 1:
+                    logger.warning(
+                        "FRED %s — backing off %.1fs (attempt %d/%d)",
+                        resp.status_code, wait, attempt + 1, _FRED_MAX_ATTEMPTS,
+                    )
+                    time.sleep(wait)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < _FRED_MAX_ATTEMPTS - 1:
+                wait = min(
+                    _FRED_BACKOFF_BASE * (2 ** attempt)
+                    + random.uniform(0, _FRED_BACKOFF_BASE),
+                    _FRED_BACKOFF_CAP,
+                )
+                logger.warning(
+                    "FRED transient %s — backing off %.1fs (attempt %d/%d)",
+                    type(exc).__name__, wait, attempt + 1, _FRED_MAX_ATTEMPTS,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    # All attempts were 429/5xx that fell through the loop — surface the last.
+    resp.raise_for_status()
+    return resp
 
 # Map our ArcticDB ticker key (after stripping ^) to FRED series id.
 # Both yfinance (^VIX, ^TNX, ...) and FRED (VIXCLS, DGS10, ...) publish
@@ -516,9 +578,39 @@ def collect(
     # ── Step 1: polygon.io grouped-daily ─────────────────────────────────────
     # Skipped in yfinance_only mode (free tier returns 403 same-day; deferring
     # to the morning polygon_only enrichment is the canonical path).
+    #
+    # L4482: a TRANSIENT polygon NETWORK failure (read-timeout / connection
+    # error / rate-limit-exhausted) must NOT abort the whole date — the
+    # FRED-index macro tickers (^TNX/^VIX/^IRX/^VIX3M) and their yfinance
+    # backstop NEVER come from polygon, yet a raise here skips Steps 2 & 3 and
+    # leaves the critical macro keys unfilled (the exact gap that failed
+    # recovery re-run #1 on 2026-06-01 despite #354 — a polygon read-timeout).
+    # So in polygon_only mode we catch ONLY the transient network class, log
+    # loudly, and fall through to FRED + the macro backstop. A REAL polygon
+    # outage is still surfaced: zero equity records → the equity coverage gate
+    # below hard-fails, so the catch cannot mask an equity-data failure.
+    # NARROW BY DESIGN: `PolygonForbiddenError` (structural 403) and
+    # `_fetch_polygon_closes`'s deliberate "0 tickers" empty-data RuntimeError
+    # still propagate with their own clear messages — only network transients
+    # are downgraded to "continue to the macro backstop".
+    from polygon_client import PolygonRateLimitError
     polygon_count = 0
     if source != "yfinance_only":
-        polygon_count = _fetch_polygon_closes(tickers, run_date, records, source=source)
+        try:
+            polygon_count = _fetch_polygon_closes(
+                tickers, run_date, records, source=source
+            )
+        except (requests.Timeout, requests.ConnectionError,
+                PolygonRateLimitError) as exc:
+            if source != "polygon_only":
+                raise  # auto mode already owns its fallback inside the fetch
+            logger.warning(
+                "L4482: polygon grouped-daily failed transiently for %s (%s: %s) "
+                "— proceeding to FRED (Step 2) + macro yfinance backstop (Step 3) "
+                "so the FRED-index macro keys still fill. A real equity outage is "
+                "caught by the coverage gate (0 equity records → hard-fail).",
+                run_date, type(exc).__name__, exc,
+            )
 
     # ── Step 2: FRED for the 4 indices polygon never serves ──────────────────
     # VIX/VIX3M/TNX/IRX are not on polygon free tier (and won't be on paid either
@@ -990,10 +1082,23 @@ def _log_close_discrepancies(
     consolidated tape coverage variance. Larger drifts (>1% WARN, >5% ERROR)
     typically indicate corporate-action timing differences or one-source data
     quality issues worth a human eyeball.
+
+    L4486: the >5% ERROR band is for genuine cross-source EQUITY drift (polygon
+    overwriting a different-source equity close — a data-quality flag). The
+    FRED-index macro tickers (^TNX/^VIX/^IRX/^VIX3M, …) are a different class:
+    the windowed reconciliation predictably RESTATES them toward the
+    authoritative FRED value — healing a cell clobbered by a transient 429 (the
+    5/14 VIX case) or correcting a stale T-1 edge cell (the reconciliation runs
+    before FRED publishes the prior session's value). Those self-heals jump >5%
+    on volatile-VIX days but are DESIRABLE, not anomalies, so they log at WARN
+    (`fred_restatement`) and are excluded from the flow-doctor ERROR filter. The
+    recording surface stays (per feedback_no_silent_fails) — just at the right
+    severity. Pattern observed twice (2026-05-12, 2026-06-02).
     """
     n_compared = 0
     n_warn = 0
     n_error = 0
+    n_restatement = 0
     biggest: tuple[str, float] = ("", 0.0)
     for ticker in new_df.index:
         prior = prior_close.get(str(ticker))
@@ -1001,8 +1106,18 @@ def _log_close_discrepancies(
         if prior is None or pd.isna(new_close) or prior == 0:
             continue
         n_compared += 1
+        is_fred_index = str(ticker).lstrip("^") in _FRED_INDEX_MAP
         pct_diff = abs(float(new_close) - prior) / prior
-        if pct_diff > _DISCREPANCY_ERROR_PCT:
+        if pct_diff > _DISCREPANCY_ERROR_PCT and is_fred_index:
+            # FRED-index restatement toward the authoritative value — expected
+            # self-heal, NOT an equity data-quality anomaly. WARN, not ERROR.
+            logger.warning(
+                "fred_restatement %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet) — "
+                "windowed reconciliation healed toward authoritative FRED (expected)",
+                ticker, run_date, prior, float(new_close), pct_diff * 100,
+            )
+            n_restatement += 1
+        elif pct_diff > _DISCREPANCY_ERROR_PCT:
             logger.error(
                 "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet) — "
                 "investigate before downstream consumers re-read",
@@ -1019,8 +1134,9 @@ def _log_close_discrepancies(
             biggest = (str(ticker), pct_diff)
     logger.info(
         "polygon_only discrepancy summary for %s: compared=%d warn(>1%%)=%d error(>5%%)=%d "
-        "biggest=%s@%.2f%%",
-        run_date, n_compared, n_warn, n_error, biggest[0] or "n/a", biggest[1] * 100,
+        "fred_restatement(>5%%)=%d biggest=%s@%.2f%%",
+        run_date, n_compared, n_warn, n_error, n_restatement,
+        biggest[0] or "n/a", biggest[1] * 100,
     )
 
 
@@ -1069,8 +1185,7 @@ def _fetch_fred_closes(
                 "sort_order": "desc",
                 "limit": 5,
             }
-            resp = requests.get(_FRED_BASE, params=params, timeout=_FRED_TIMEOUT)
-            resp.raise_for_status()
+            resp = _fred_get_with_retry(params)  # L4480: backoff + jitter
             obs = resp.json().get("observations", [])
             latest = next((o for o in obs if o.get("value", ".") != "."), None)
             if latest is None:
