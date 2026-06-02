@@ -239,6 +239,8 @@
           "commands": [
             "set -eo pipefail",
             "export FLOW_DOCTOR_ENABLED=1",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",

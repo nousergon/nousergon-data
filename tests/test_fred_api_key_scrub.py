@@ -92,6 +92,9 @@ def test_fetch_fred_closes_scrubs_api_key_on_http_error(
     monkeypatch.setenv("FRED_API_KEY", "live-test-key-1234567890")
 
     class _ExplodingResponse:
+        status_code = 200  # L4480: _fred_get_with_retry reads status_code first
+        headers: dict = {}
+
         def raise_for_status(self):
             err_msg = (
                 "500 Server Error: Internal Server Error for url: "
