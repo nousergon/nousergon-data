@@ -43,3 +43,6 @@ Thumbs.db
 .gitleaks.toml
 
 .gitleaksbaseline.json
+
+# Claude Code local agent worktrees + state (never commit)
+.claude/worktrees/
