@@ -89,8 +89,14 @@ def collect(
     if not dry_run:
         results["context_coverage_drift"] = _emit_context_coverage_metric(db_path)
 
-    # Step 3: Seed predictor_outcomes
+    # Step 3: Seed predictor_outcomes (live / champion)
     results["seed_predictor_outcomes"] = _seed_predictor_outcomes(
+        s3, bucket, db_path, dry_run,
+    )
+
+    # Step 3b: Seed challenger (shadow) predictor_outcomes — champion/challenger
+    # Phase 2 (L4469). No-op until the Phase-1 shadow runner writes shadow files.
+    results["seed_shadow_predictor_outcomes"] = _seed_shadow_predictor_outcomes(
         s3, bucket, db_path, dry_run,
     )
 
@@ -542,11 +548,17 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
             return {"status": "ok", "rows_written": 0, "note": "no prediction files in S3"}
 
         conn = sqlite3.connect(db_path)
-        # Ensure horizon-agnostic + barrier_win_prob columns exist BEFORE the
-        # seed INSERT (Step 3) — the backfill (Step 4) also calls this but runs
-        # later, so the INSERT below would reference a missing column on first
-        # run without this. Idempotent: Step 4's call becomes a no-op.
+        # Ensure horizon-agnostic + barrier_win_prob + model_version columns
+        # exist BEFORE the seed INSERT (Step 3) — the backfill (Step 4) also
+        # calls this but runs later, so the INSERT below would reference a
+        # missing column on first run without this. Idempotent: Step 4's call
+        # becomes a no-op.
         _ensure_predictor_outcomes_schema(conn)
+        # Live (champion) dedup is on (symbol, prediction_date): there is exactly
+        # ONE live prediction per symbol/day, so version is not part of the live
+        # key (legacy rows with NULL model_version still dedup correctly, and a
+        # re-seed never duplicates). Shadow rows are deduped separately on
+        # (symbol, date, version_id) in _seed_shadow_predictor_outcomes.
         existing = {
             (r[0], r[1]) for r in
             conn.execute("SELECT symbol, prediction_date FROM predictor_outcomes").fetchall()
@@ -558,14 +570,15 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 data = json.loads(obj["Body"].read())
                 pred_date = data.get("date") or key.split("/")[-1].replace(".json", "")
+                model_version = data.get("model_version")
                 for p in data.get("predictions", []):
                     ticker = p.get("ticker")
                     if not ticker or (ticker, pred_date) in existing:
                         continue
                     if not dry_run:
                         conn.execute(
-                            "INSERT INTO predictor_outcomes (symbol, prediction_date, predicted_direction, prediction_confidence, p_up, p_flat, p_down, score_modifier_applied, barrier_win_prob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (ticker, pred_date, p.get("predicted_direction"), p.get("prediction_confidence"), p.get("p_up"), p.get("p_flat"), p.get("p_down"), 0.0, p.get("barrier_win_prob")),
+                            "INSERT INTO predictor_outcomes (symbol, prediction_date, predicted_direction, prediction_confidence, p_up, p_flat, p_down, score_modifier_applied, barrier_win_prob, model_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (ticker, pred_date, p.get("predicted_direction"), p.get("prediction_confidence"), p.get("p_up"), p.get("p_flat"), p.get("p_down"), 0.0, p.get("barrier_win_prob"), model_version),
                         )
                     existing.add((ticker, pred_date))
                     inserted += 1
@@ -585,7 +598,177 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
         return {"status": "error", "error": str(e), "rows_written": 0}
 
 
+# ── Step 3b: Seed challenger (shadow) outcomes ────────────────────────────────
+
+
+def _ensure_shadow_outcomes_schema(conn) -> None:
+    """Create the challenger-outcomes table if absent (champion/challenger
+    Phase 2, L4469).
+
+    Deliberately a SEPARATE table from ``predictor_outcomes`` rather than
+    multi-version rows in it: the live table is ``UNIQUE(symbol,
+    prediction_date)`` and every existing consumer (drift gate, last-week
+    scorecard, backtester) assumes exactly one row per (symbol, date). Injecting
+    challenger rows there would violate the constraint AND silently inflate
+    those consumers' counts. This table holds the observe-only shadow
+    predictions keyed by ``UNIQUE(symbol, prediction_date, model_version)``;
+    the backfill resolves its realized canonical alpha exactly like the live
+    table so per-version rank IC can be scored against the champion.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictor_outcomes_shadow (
+            id                      INTEGER PRIMARY KEY,
+            symbol                  TEXT NOT NULL,
+            prediction_date         TEXT NOT NULL,
+            model_version           TEXT NOT NULL,
+            predicted_direction     TEXT,
+            prediction_confidence   REAL,
+            p_up                    REAL,
+            p_flat                  REAL,
+            p_down                  REAL,
+            barrier_win_prob        REAL,
+            actual_log_alpha        REAL,
+            horizon_days            INTEGER,
+            correct                 INTEGER,
+            UNIQUE(symbol, prediction_date, model_version)
+        )
+        """
+    )
+    conn.commit()
+
+
+def _seed_shadow_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> dict:
+    """Seed predictor_outcomes_shadow from predictions_shadow/{version_id}/*.json.
+
+    Champion/challenger Phase 2 (L4469): the Phase-1 shadow runner writes each
+    registered challenger's predictions to predictor/predictions_shadow/
+    {version_id}/{date}.json (trade-on-none). Seed them into the dedicated
+    shadow table, tagged with model_version=version_id, so the Step-4 backfill
+    resolves each challenger's realized canonical alpha. Dedup on
+    (symbol, date, version_id). Best-effort: a bad shadow file is logged +
+    skipped. No-op until the shadow runner produces files.
+    """
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        keys = []
+        for page in paginator.paginate(Bucket=bucket, Prefix="predictor/predictions_shadow/"):
+            for obj in page.get("Contents", []):
+                k = obj["Key"]
+                if k.endswith(".json") and "latest" not in k:
+                    keys.append(k)
+
+        if not keys:
+            return {"status": "ok", "rows_written": 0, "note": "no shadow prediction files"}
+
+        conn = sqlite3.connect(db_path)
+        _ensure_shadow_outcomes_schema(conn)
+        existing = {
+            (r[0], r[1], r[2]) for r in
+            conn.execute(
+                "SELECT symbol, prediction_date, model_version FROM predictor_outcomes_shadow"
+            ).fetchall()
+        }
+
+        inserted = 0
+        for key in keys:
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                data = json.loads(obj["Body"].read())
+                pred_date = data.get("date") or key.split("/")[-1].replace(".json", "")
+                # version_id from the payload; fall back to the path segment
+                # predictions_shadow/{version_id}/{date}.json.
+                version_id = data.get("version_id") or key.split("/")[-2]
+                for p in data.get("predictions", []):
+                    ticker = p.get("ticker")
+                    if not ticker or (ticker, pred_date, version_id) in existing:
+                        continue
+                    if not dry_run:
+                        conn.execute(
+                            "INSERT INTO predictor_outcomes_shadow (symbol, prediction_date, model_version, predicted_direction, prediction_confidence, p_up, p_flat, p_down, barrier_win_prob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (ticker, pred_date, version_id, p.get("predicted_direction"), p.get("prediction_confidence"), p.get("p_up"), p.get("p_flat"), p.get("p_down"), p.get("barrier_win_prob")),
+                        )
+                    existing.add((ticker, pred_date, version_id))
+                    inserted += 1
+            except (ClientError, json.JSONDecodeError, KeyError, IndexError) as e:
+                logger.info("Skipping shadow prediction file %s: %s", key, e)
+
+        if not dry_run:
+            conn.commit()
+        conn.close()
+
+        if inserted:
+            logger.info(
+                "Seeded %d challenger (shadow) outcome rows from %d S3 files",
+                inserted, len(keys),
+            )
+        return {"status": "ok", "rows_written": inserted}
+
+    except Exception as e:
+        logger.error("seed_shadow_predictor_outcomes failed: %s", e)
+        return {"status": "error", "error": str(e), "rows_written": 0}
+
+
 # ── Step 4: Backfill predictor_outcomes ───────────────────────────────────────
+
+
+def _resolve_pending_for_table(
+    conn, table: str, h: int, log_col: str, log_spy_col: str, dry_run: bool,
+) -> tuple[int, dict]:
+    """Resolve never-resolved (actual_log_alpha IS NULL) rows of ``table`` at
+    horizon ``h`` via the universe_returns JOIN. Updates each row BY ID with its
+    own ``correct`` (per its predicted_direction); the realized alpha is shared
+    across versions for a (ticker, date) but written per-row. Returns
+    ``(resolved, non_binary_skipped)``. ``table`` is a fixed internal literal,
+    never user input. Shared by the live (predictor_outcomes) and challenger
+    (predictor_outcomes_shadow) backfills — L4469 Phase 2.
+    """
+    pending = pd.read_sql_query(
+        f"SELECT id, symbol, prediction_date, predicted_direction "
+        f"FROM {table} WHERE actual_log_alpha IS NULL",
+        conn,
+    )
+    resolved = 0
+    non_binary_skipped: dict[str, int] = {}
+    if pending.empty:
+        return resolved, non_binary_skipped
+
+    for _, row in pending.iterrows():
+        ticker = row["symbol"]
+        pred_date = row["prediction_date"]
+        ur = conn.execute(
+            f"SELECT {log_col}, {log_spy_col} "
+            f"FROM universe_returns WHERE ticker = ? AND eval_date = ?",
+            (ticker, pred_date),
+        ).fetchone()
+        if ur is None or ur[0] is None:
+            continue  # no row, or forward window not yet closed — retry next run
+
+        log_stock = ur[0]
+        log_spy = ur[1] if ur[1] is not None else 0.0
+        log_alpha = log_stock - log_spy
+
+        direction = row["predicted_direction"]
+        if direction == "UP":
+            correct = 1 if log_alpha > 0 else 0
+        elif direction == "DOWN":
+            correct = 1 if log_alpha < 0 else 0
+        else:
+            # Non-binary (legacy FLAT / unexpected) — WARN-counted, left NULL so
+            # a later SELECT still surfaces it (fail-loud carve-out, see the
+            # caller's warning). If this grows, the binary contract regressed.
+            key = str(direction) if direction is not None else "NULL"
+            non_binary_skipped[key] = non_binary_skipped.get(key, 0) + 1
+            continue
+
+        if not dry_run:
+            conn.execute(
+                f"UPDATE {table} SET "
+                f"actual_log_alpha=?, horizon_days=?, correct=? WHERE id=?",
+                (round(log_alpha, 6), h, correct, int(row["id"])),
+            )
+        resolved += 1
+    return resolved, non_binary_skipped
 
 
 def _backfill_predictor_returns(
@@ -646,74 +829,21 @@ def _backfill_predictor_returns(
                 "rows_written": 0,
             }
 
-        # Pending rows: never-resolved (new column NULL). Includes rows that
-        # had the legacy 5d-only path populate actual_5d_return — they get
-        # re-resolved at the new horizon, the legacy column gets refreshed
-        # with whatever forward_days indicates so backtester COALESCE
-        # consumers see consistent values.
-        pending = pd.read_sql_query(
-            "SELECT id, symbol, prediction_date, predicted_direction "
-            "FROM predictor_outcomes WHERE actual_log_alpha IS NULL",
-            conn,
-        )
-        if pending.empty:
-            conn.close()
-            return {"status": "ok", "rows_written": 0}
-
+        # Resolve BOTH the live champion table and the challenger shadow table
+        # (champion/challenger Phase 2, L4469) at this horizon — same realized
+        # universe_returns JOIN, each row updated by id with its own `correct`.
+        # No early-return on an empty live table: the shadow table may still
+        # have pending rows (and vice versa).
+        _ensure_shadow_outcomes_schema(conn)
         resolved = 0
         non_binary_skipped: dict[str, int] = {}
-        for _, row in pending.iterrows():
-            ticker = row["symbol"]
-            pred_date = row["prediction_date"]
-
-            ur = conn.execute(
-                f"SELECT {log_col}, {log_spy_col} "
-                f"FROM universe_returns WHERE ticker = ? AND eval_date = ?",
-                (ticker, pred_date),
-            ).fetchone()
-
-            if ur is None or ur[0] is None:
-                # Either no universe_returns row for this (ticker, date), or
-                # the forward window has not yet closed (log_return_Nd
-                # NULL — gated by the universe_returns collector). Leave
-                # the predictor_outcomes row unresolved; it will be picked
-                # up on the next collector run.
-                continue
-
-            log_stock = ur[0]
-            log_spy = ur[1] if ur[1] is not None else 0.0
-            log_alpha = log_stock - log_spy
-
-            direction = row["predicted_direction"]
-            if direction == "UP":
-                correct = 1 if log_alpha > 0 else 0
-            elif direction == "DOWN":
-                correct = 1 if log_alpha < 0 else 0
-            else:
-                # Per ~/Development/CLAUDE.md fail-loud-and-fast rule: a silent
-                # skip in a backfill loop is forbidden by default. Carve-out
-                # here is "finite legacy set" — the predictor has emitted
-                # binary UP/DOWN only since alpha-engine-predictor #143
-                # collapsed the 3-class FLAT scaffolding at calibrator level.
-                # Carve-out conditions: (a) failure mode = non-binary direction
-                # value (legacy FLAT or unexpected new label); (c) recording
-                # surface = WARN log + grouped counter below + the rows stay
-                # NULL-resolved so a future SELECT on `actual_log_alpha IS NULL`
-                # still surfaces them. If the counter starts growing, the
-                # predictor has regressed past the binary contract and needs
-                # a new branch added here.
-                key = str(direction) if direction is not None else "NULL"
-                non_binary_skipped[key] = non_binary_skipped.get(key, 0) + 1
-                continue
-
-            if not dry_run:
-                conn.execute(
-                    "UPDATE predictor_outcomes SET "
-                    "actual_log_alpha=?, horizon_days=?, correct=? "
-                    "WHERE symbol=? AND prediction_date=?",
-                    (round(log_alpha, 6), h, correct, ticker, pred_date),
-                )
-            resolved += 1
+        for _table in ("predictor_outcomes", "predictor_outcomes_shadow"):
+            _r, _nb = _resolve_pending_for_table(
+                conn, _table, h, log_col, log_spy_col, dry_run,
+            )
+            resolved += _r
+            for _k, _v in _nb.items():
+                non_binary_skipped[_k] = non_binary_skipped.get(_k, 0) + _v
 
         if not dry_run:
             conn.commit()
@@ -721,7 +851,7 @@ def _backfill_predictor_returns(
 
         if resolved:
             logger.info(
-                "Backfilled %d predictor_outcomes at horizon=%dd "
+                "Backfilled %d predictor_outcomes(+shadow) rows at horizon=%dd "
                 "(log-domain canonical) via universe_returns JOIN",
                 resolved, h,
             )
@@ -815,6 +945,14 @@ def _ensure_predictor_outcomes_schema(conn) -> None:
         # loaded/fitted for a cycle. Recording it here unblocks the backtester's
         # barrier_sizing_optimizer IC gate (was returning barrier_win_prob_column_absent).
         ("barrier_win_prob", "REAL"),
+        # Champion/challenger Phase 2 (L4469): which model version produced this
+        # prediction row. Live (champion) rows carry predictions.json's
+        # model_version; shadow (challenger) rows carry the registry version_id
+        # (predictions_shadow/{version_id}/). Legacy rows stay NULL — the live
+        # seed dedups on (symbol, prediction_date) so NULL never causes a
+        # re-insert, and per-version rank IC simply excludes the unlabelled
+        # legacy tail. Enables scoring each version on realized alpha.
+        ("model_version", "TEXT"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE predictor_outcomes ADD COLUMN {col} {col_type}")
