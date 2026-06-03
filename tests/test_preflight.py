@@ -77,11 +77,26 @@ class TestPolygonReachable:
                 pf._check_polygon_reachable()
 
     def test_network_error(self):
+        # L4494: a sustained ConnectionError now retries _REACHABILITY_MAX_ATTEMPTS
+        # times (backoff sleep patched out) before failing loud as "unreachable".
         pf = self._setup()
-        with patch("requests.get") as mock_get:
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
             mock_get.side_effect = requests.ConnectionError("DNS failure")
-            with pytest.raises(RuntimeError, match="unreachable"):
+            with pytest.raises(RuntimeError, match="unreachable after 3 attempts"):
                 pf._check_polygon_reachable()
+        assert mock_get.call_count == 3
+
+    def test_transient_then_success_recovers(self):
+        # L4494: a single transient blip must NOT abort — it retries and the
+        # next attempt's 200 passes the probe.
+        pf = self._setup()
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
+            mock_get.side_effect = [
+                requests.ReadTimeout("read timed out"),
+                MagicMock(status_code=200, text='{"results": []}'),
+            ]
+            pf._check_polygon_reachable()
+        assert mock_get.call_count == 2
 
 
 # ── FRED reachability ────────────────────────────────────────────────────────
@@ -120,11 +135,13 @@ class TestFredReachable:
                 pf._check_fred_reachable()
 
     def test_network_error(self):
+        # L4494: sustained Timeout retries then fails loud as "unreachable".
         pf = self._setup()
-        with patch("requests.get") as mock_get:
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
             mock_get.side_effect = requests.Timeout("timed out")
-            with pytest.raises(RuntimeError, match="unreachable"):
+            with pytest.raises(RuntimeError, match="unreachable after 3 attempts"):
                 pf._check_fred_reachable()
+        assert mock_get.call_count == 3
 
 
 # ── S3 writeable sentinel ────────────────────────────────────────────────────

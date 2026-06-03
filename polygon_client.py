@@ -21,6 +21,8 @@ Usage:
 from __future__ import annotations
 
 import logging
+import random
+import re
 import time
 from collections import deque
 from datetime import date, datetime, timedelta
@@ -34,6 +36,31 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.polygon.io"
 _MAX_BARS_PER_REQUEST = 50_000  # polygon limit param max
+
+# L4495 (security): polygon authenticates via the ``apiKey`` querystring
+# (set on the session in ``__init__``), so ``requests.HTTPError`` /
+# ``RequestException`` ``str()`` representations — which embed the full
+# effective request URL — leak the live key into logs and operator
+# transcripts (confirmed 2026-06-03 from a grouped-daily 500 WARNING).
+# Mask ``apiKey=...`` AND ``api_key=...`` before any polygon error string
+# is raised or logged. Sibling of ``daily_closes._scrub_api_key``.
+_POLYGON_API_KEY_RE = re.compile(r"(?:apiKey|api_key)=[^&\s]+")
+
+
+def _scrub_api_key(msg: object) -> str:
+    """Mask the polygon ``apiKey=...`` (or ``api_key=...``) querystring."""
+    return _POLYGON_API_KEY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
+
+
+# L4496: polygon 5xx + transient network errors on the grouped-daily TARGET
+# fetch were NOT in the retry class — a single transient server error (500/
+# 502/503) raised ``HTTPError`` via ``raise_for_status`` and hard-failed the
+# whole daily_closes run (4 reruns on 2026-06-03 AM). Bounded exponential
+# backoff + full jitter; honors a server ``Retry-After`` when present; fails
+# loud after the cap so a sustained outage still surfaces.
+_POLYGON_MAX_ATTEMPTS = 4
+_POLYGON_BACKOFF_BASE = 1.0   # seconds; wait ≈ base * 2**attempt + U(0, base)
+_POLYGON_BACKOFF_CAP = 30.0   # seconds; never wait longer than this between tries
 
 
 class PolygonRateLimitError(Exception):
@@ -89,11 +116,33 @@ class PolygonClient:
         self._call_times.append(time.monotonic())
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        """Make a rate-limited GET request. Handles 429 with retry."""
+        """Make a rate-limited GET request.
+
+        Retries the recoverable class — 429 rate-limit, 5xx server error
+        (L4496), and transient network errors (Timeout/ConnectionError) —
+        with bounded exponential backoff + full jitter, then fails loud.
+        403 (free-tier "before end of day" / bad key) raises immediately as
+        ``PolygonForbiddenError`` — never silently swallowed (the prior
+        behavior masked the 2026-04-17→23 VWAP outage). All error strings are
+        scrubbed of the ``apiKey`` querystring before raising (L4495).
+        """
         self._wait_for_slot()
         url = f"{_BASE_URL}{path}"
-        for attempt in range(3):
-            resp = self._session.get(url, params=params or {}, timeout=30)
+        for attempt in range(_POLYGON_MAX_ATTEMPTS):
+            last = attempt == _POLYGON_MAX_ATTEMPTS - 1
+            try:
+                resp = self._session.get(url, params=params or {}, timeout=30)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                # L4496: a transient network blip on the target fetch must not
+                # hard-fail the whole run on the first try — retry, then raise.
+                if last:
+                    raise requests.ConnectionError(
+                        _scrub_api_key(f"polygon transient error on {path} "
+                                       f"after {_POLYGON_MAX_ATTEMPTS} attempts: {exc}")
+                    ) from None
+                self._backoff(attempt, f"polygon transient {type(exc).__name__} on {path}")
+                continue
+
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 15))
                 logger.warning("Rate limited (429), waiting %ds", retry_after)
@@ -113,11 +162,47 @@ class PolygonClient:
                 except (ValueError, KeyError):
                     msg = resp.text[:200] or "Not authorized"
                 raise PolygonForbiddenError(
-                    f"Polygon 403 on {path}: {msg}"
+                    _scrub_api_key(f"Polygon 403 on {path}: {msg}")
                 )
-            resp.raise_for_status()
+            if resp.status_code >= 500 and not last:
+                # L4496: transient polygon server error — back off + retry
+                # before the target-date hard-fail; a sustained 5xx still
+                # raises (scrubbed) once the attempts are exhausted.
+                retry_after = resp.headers.get("Retry-After")
+                self._backoff(
+                    attempt, f"polygon {resp.status_code} on {path}",
+                    retry_after=retry_after,
+                )
+                continue
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:
+                # L4495: the HTTPError str embeds the effective URL incl.
+                # ``apiKey`` — re-raise with a scrubbed message.
+                raise requests.HTTPError(_scrub_api_key(exc), response=resp) from None
             return resp.json()
-        raise PolygonRateLimitError("Rate limited after 3 retries")
+        raise PolygonRateLimitError(
+            f"Rate limited after {_POLYGON_MAX_ATTEMPTS} retries"
+        )
+
+    def _backoff(self, attempt: int, reason: str, retry_after: str | None = None) -> None:
+        """Sleep ``base * 2**attempt + U(0, base)`` (capped), honoring a
+        server ``Retry-After`` header when present. Shared by the 5xx and
+        transient-network retry paths in :meth:`_get`."""
+        wait = None
+        if retry_after is not None:
+            try:
+                wait = float(retry_after)
+            except (TypeError, ValueError):
+                wait = None
+        if wait is None:
+            wait = _POLYGON_BACKOFF_BASE * (2 ** attempt)
+        wait = min(wait + random.uniform(0, _POLYGON_BACKOFF_BASE), _POLYGON_BACKOFF_CAP)
+        logger.warning(
+            "%s — backing off %.1fs (attempt %d/%d)",
+            reason, wait, attempt + 1, _POLYGON_MAX_ATTEMPTS,
+        )
+        time.sleep(wait)
 
     # -- Core endpoints ------------------------------------------------------
 

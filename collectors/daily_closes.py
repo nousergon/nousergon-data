@@ -52,18 +52,24 @@ from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
-_FRED_API_KEY_RE = re.compile(r"api_key=[^&\s]+")
+# Matches BOTH FRED's ``api_key=`` (snake) and polygon's ``apiKey=`` (camel)
+# querystring fragments. L4495: polygon error strings embed ``apiKey=<live>``
+# (confirmed 2026-06-03 from a grouped-daily 500 WARNING) and the original
+# FRED-only pattern let the polygon key through.
+_API_KEY_RE = re.compile(r"(?:api_key|apiKey)=[^&\s]+")
+# Back-compat alias — referenced by name in some tests.
+_FRED_API_KEY_RE = _API_KEY_RE
 
 
 def _scrub_api_key(msg: object) -> str:
-    """Mask the FRED ``api_key=...`` querystring fragment in any error string.
+    """Mask the ``api_key=...`` / ``apiKey=...`` querystring in any string.
 
-    ``requests.exceptions.HTTPError`` embeds the full request URL — including
-    the ``api_key`` querystring — in its ``str()`` representation. Logging
-    that to CloudWatch leaks the credential. Always pass FRED-fetch
-    exceptions through this scrubber before logging.
+    ``requests.exceptions.HTTPError`` (FRED and polygon) embeds the full
+    request URL — including the key querystring — in its ``str()``
+    representation. Logging that to CloudWatch leaks the credential. Always
+    pass FRED/polygon-fetch exceptions through this scrubber before logging.
     """
-    return _FRED_API_KEY_RE.sub("api_key=***", str(msg))
+    return _API_KEY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
 
 _NYSE_TZ = ZoneInfo("America/New_York")
 
@@ -347,6 +353,7 @@ def collect(
     source: str = "auto",
     window_days: int = 1,
     skip_if_canonical: bool = False,
+    fred_window_cache: dict[str, list[tuple[str, float]]] | None = None,
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -624,7 +631,12 @@ def collect(
     ]
     fred_count = 0
     if fred_missing:
-        fred_count = _fetch_fred_closes(fred_missing, run_date, records)
+        # L4492: in window mode the caller prefetches the whole window's FRED
+        # series in one ranged call each and passes the cache down; per-date
+        # emit then reads from it (no per-date FRED I/O). None → legacy path.
+        fred_count = _fetch_fred_closes(
+            fred_missing, run_date, records, window_cache=fred_window_cache,
+        )
 
     # ── Step 3: yfinance ─────────────────────────────────────────────────────
     # polygon_only refuses yfinance fallback for the EQUITY universe per
@@ -826,6 +838,22 @@ def _collect_window(
     return-shape section for the schema.
     """
     window_dates = _previous_business_days(run_date, n=window_days)
+    # ── L4492: prefetch FRED once per series over the whole window ──────────
+    # Each per-date ``collect`` below previously re-fetched all FRED index
+    # series for its date (window_days × len(series) calls → 429 storm + the
+    # 2026-06-03 30-min timeout). Fetch each series once over the window range
+    # (padded a few calendar days so the oldest date's on-or-before lookup
+    # resolves) and hand the cache to every per-date call. Only prefetch when
+    # the universe actually contains FRED-index tickers — keeps non-macro
+    # window callers (and tests) on a zero-FRED-I/O path.
+    fred_tickers = [t for t in tickers if t.lstrip("^") in _FRED_INDEX_MAP]
+    fred_window_cache: dict[str, list[tuple[str, float]]] | None = None
+    if fred_tickers:
+        _oldest = window_dates[-1]  # _previous_business_days returns newest-first
+        _start = (
+            datetime.strptime(_oldest, "%Y-%m-%d") - timedelta(days=10)
+        ).strftime("%Y-%m-%d")
+        fred_window_cache = _fetch_fred_window(fred_tickers, _start, window_dates[0])
     # The newest date in the window is the TARGET date — the one
     # downstream (predictor inference / eod_reconcile) actually reads.
     # The older dates are best-effort *historical backfill*: a per-date
@@ -874,6 +902,7 @@ def _collect_window(
                 source=source,
                 window_days=1,
                 skip_if_canonical=skip_if_canonical,
+                fred_window_cache=fred_window_cache,  # L4492: 1 ranged call/series
             )
         except Exception as exc:
             # Record + continue. Fatality is target-driven (decided
@@ -882,11 +911,11 @@ def _collect_window(
             logger.warning(
                 "[daily_closes window] date=%s source=%s failed: %s — "
                 "recording and continuing window",
-                d, source, exc,
+                d, source, _scrub_api_key(exc),  # L4495: exc may carry polygon apiKey
             )
             aggregate["per_date"][d] = {
                 "status": "error",
-                "error": str(exc),
+                "error": _scrub_api_key(exc),  # L4495: never persist the key to S3 logs
                 "source": source,
             }
             continue
@@ -962,7 +991,10 @@ def _fetch_polygon_closes(
     except Exception as e:
         if source == "polygon_only":
             raise
-        logger.warning("Polygon grouped-daily failed in auto mode: %s — falling back", e)
+        logger.warning(
+            "Polygon grouped-daily failed in auto mode: %s — falling back",
+            _scrub_api_key(e),  # L4495: exc may carry polygon apiKey
+        )
         return 0
 
     if not grouped:
@@ -1050,7 +1082,7 @@ def _fetch_polygon_closes_per_ticker(
         except Exception as exc:
             logger.warning(
                 "Polygon per-ticker fallback failed for %s @ %s: %s",
-                store_ticker, run_date, exc,
+                store_ticker, run_date, _scrub_api_key(exc),  # L4495
             )
             continue
         if not bar:
@@ -1140,10 +1172,121 @@ def _log_close_discrepancies(
     )
 
 
+def _fred_record(store_ticker: str, date_str: str, close: float) -> dict:
+    """Build a FRED daily-close record (OHLC all = close; no volume/VWAP).
+
+    VWAP only meaningful from polygon grouped-daily (volume-weighted across
+    trades). FRED single-value closes give us no distribution to VWAP, so
+    None rather than passing Close off as VWAP.
+    """
+    return {
+        "ticker": store_ticker,
+        "date": date_str,
+        "Open": round(close, 4),
+        "High": round(close, 4),
+        "Low": round(close, 4),
+        "Close": round(close, 4),
+        "Adj_Close": round(close, 4),
+        "Volume": 0,
+        "VWAP": None,
+        "source": "fred",
+    }
+
+
+def _fred_value_on_or_before(
+    series: list[tuple[str, float]], date_str: str,
+) -> float | None:
+    """Value of the most-recent observation dated on-or-before ``date_str``.
+
+    ``series`` is ascending-sorted ``(date, value)``. Mirrors the per-date
+    API semantics (``observation_end=date_str``, newest non-missing) against
+    the prefetched window cache (L4492) — a future-dated value is never
+    returned, matching the legacy path's defensive ``obs_date > date_str``
+    guard.
+    """
+    candidate: float | None = None
+    for d, v in series:
+        if d <= date_str:
+            candidate = v
+        else:
+            break
+    return candidate
+
+
+def _fetch_fred_window(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, list[tuple[str, float]]]:
+    """Fetch each FRED index series ONCE over ``[start_date, end_date]`` (L4492).
+
+    The windowed-reconciliation loop previously hit FRED once PER DATE per
+    series (``window_days × len(series)`` calls — 56 at window=14), firing a
+    self-inflicted 429 storm and burning most of MorningEnrich's runtime (the
+    2026-06-03 30-min SSM timeout). The FRED ``observations`` endpoint takes
+    ``observation_start``/``observation_end``, so the whole window's values
+    for a series come back in ONE ranged call; the per-date emit then indexes
+    this cache via :func:`_fred_value_on_or_before` (no further I/O). This
+    *supersedes* L4480's backoff-on-429 (which only tolerated the storm
+    slowly) by removing the storm at the source.
+
+    Returns ``{store_ticker: [(obs_date, value), ...]}`` ascending by date,
+    non-missing only. A series whose fetch fails is simply absent — the
+    per-date caller skips it and the loud yfinance macro backstop fills the
+    gap (same degradation as a per-date FRED miss). ``start_date`` should be
+    padded a few calendar days before the oldest window date so the oldest
+    date's on-or-before lookup can resolve to a prior observation (FRED daily
+    series skip weekends/holidays).
+    """
+    api_key = get_secret("FRED_API_KEY", required=False, default="")
+    if not api_key:
+        logger.warning(
+            "FRED_API_KEY not set — skipping FRED window prefetch for %d tickers",
+            len(tickers),
+        )
+        return {}
+
+    cache: dict[str, list[tuple[str, float]]] = {}
+    for ticker in tickers:
+        store_ticker = ticker.lstrip("^")
+        series_id = _FRED_INDEX_MAP.get(store_ticker)
+        if not series_id:
+            continue
+        try:
+            params = {
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "observation_start": start_date,
+                "observation_end": end_date,
+                "sort_order": "asc",
+            }
+            resp = _fred_get_with_retry(params)  # L4480: backoff + jitter
+            obs = resp.json().get("observations", [])
+            series = [
+                (o["date"], float(o["value"]))
+                for o in obs
+                if o.get("value", ".") != "." and o.get("date")
+            ]
+            cache[store_ticker] = series
+            logger.info(
+                "FRED window %s → %s: %d obs over [%s, %s] (1 ranged call)",
+                store_ticker, series_id, len(series), start_date, end_date,
+            )
+        except Exception as e:
+            logger.warning(
+                "FRED window fetch failed for %s (%s): %s — per-date emit will "
+                "skip it (yfinance macro backstop fills the gap)",
+                store_ticker, series_id, _scrub_api_key(e),
+            )
+    return cache
+
+
 def _fetch_fred_closes(
     tickers: list[str],
     date_str: str,
     records: list[dict],
+    window_cache: dict[str, list[tuple[str, float]]] | None = None,
 ) -> int:
     """Fetch FRED close on-or-before ``date_str`` for index tickers.
 
@@ -1164,7 +1307,38 @@ def _fetch_fred_closes(
     returns the most-recent-on-or-before-today observation (typically T-1),
     so the legacy "today's parquet carries yesterday's FRED value" semantic
     is preserved for the current-day case.
+
+    ``window_cache`` (L4492): when provided (window mode), the per-date value
+    is read from the prefetched ranged-call cache (:func:`_fetch_fred_window`)
+    instead of hitting FRED — so the windowed-reconciliation loop makes
+    ``len(series)`` ranged calls total, not ``window_days × len(series)``
+    per-date calls. ``None`` (the default; single-date callers) preserves the
+    legacy per-date API path.
     """
+    if window_cache is not None:
+        count = 0
+        for ticker in tickers:
+            store_ticker = ticker.lstrip("^")
+            series = window_cache.get(store_ticker)
+            if not series:
+                # Series absent (not a FRED index, or its window fetch failed)
+                # — skip; the yfinance macro backstop handles the gap loudly.
+                continue
+            close = _fred_value_on_or_before(series, date_str)
+            if close is None:
+                logger.warning(
+                    "FRED %s: no cached observation on or before %s",
+                    store_ticker, date_str,
+                )
+                continue
+            records.append(_fred_record(store_ticker, date_str, close))
+            count += 1
+        logger.info(
+            "FRED window-cache: %d/%d index tickers captured for %s",
+            count, len(tickers), date_str,
+        )
+        return count
+
     api_key = get_secret("FRED_API_KEY", required=False, default="")
     if not api_key:
         logger.warning("FRED_API_KEY not set — skipping FRED fallback for %d tickers", len(tickers))
@@ -1205,21 +1379,7 @@ def _fetch_fred_closes(
                 )
                 continue
             close = float(latest["value"])
-            records.append({
-                "ticker": store_ticker,
-                "date": date_str,
-                "Open": round(close, 4),
-                "High": round(close, 4),
-                "Low": round(close, 4),
-                "Close": round(close, 4),
-                "Adj_Close": round(close, 4),
-                "Volume": 0,
-                # VWAP only meaningful from polygon grouped-daily (volume-weighted
-                # across trades). FRED single-value closes give us no distribution
-                # to VWAP, so None rather than passing Close off as VWAP.
-                "VWAP": None,
-                "source": "fred",
-            })
+            records.append(_fred_record(store_ticker, date_str, close))
             count += 1
         except Exception as e:
             logger.warning(
