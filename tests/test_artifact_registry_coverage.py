@@ -73,7 +73,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/daily_closes_fred_repair.py": 1,
     "collectors/fred_history.py": 1,
     "collectors/fundamentals.py": 1,
-    "collectors/macro.py": 1,
+    "collectors/macro.py": 2,  # weekly/<date>/macro.json + macro_history.parquet
     "collectors/prices.py": 1,
     "collectors/short_interest.py": 1,
     "collectors/signal_returns.py": 1,

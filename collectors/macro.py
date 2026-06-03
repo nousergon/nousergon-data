@@ -12,6 +12,7 @@ Writes macro.json to S3 with:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import time
@@ -43,6 +44,34 @@ _FRED_SERIES = {
     "initial_claims": "ICSA",
     "hy_credit_spread_oas": "BAMLH0A0HYM2",
 }
+
+# ── Historical macro time series ──────────────────────────────────────────────
+# A standalone, dashboard-facing artifact (NOT the per-ticker feature store):
+# full FRED observation history per series, refreshed weekly and OVERWRITTEN each
+# run (FRED returns the entire series, so the artifact is idempotent + self-
+# healing — no week-by-week accumulation). Consumed by robodashboard's Macro page
+# via market_data/macro_history.parquet. See ARTIFACT_REGISTRY.yaml.
+_MACRO_HISTORY_KEY = "macro_history.parquet"
+_MACRO_HISTORY_START = "2000-01-01"  # ~25y of history is plenty for a dashboard
+
+# series_id → (label, units, frequency). Mirrors _FRED_SERIES plus the native
+# 10Y-2Y spread series and the raw CPI index (CPI YoY is derived below).
+_FRED_HISTORY_SERIES = {
+    "FEDFUNDS": ("Fed Funds Rate", "percent", "monthly"),
+    "DGS2": ("2Y Treasury", "percent", "daily"),
+    "DGS10": ("10Y Treasury", "percent", "daily"),
+    "T10Y2Y": ("Yield Curve Slope (10Y-2Y)", "percent", "daily"),
+    "VIXCLS": ("VIX", "index", "daily"),
+    "UNRATE": ("Unemployment Rate", "percent", "monthly"),
+    "UMCSENT": ("Consumer Sentiment", "index", "monthly"),
+    "ICSA": ("Initial Jobless Claims", "count", "weekly"),
+    "BAMLH0A0HYM2": ("High-Yield Credit Spread (OAS)", "percent", "daily"),
+    "CPIAUCSL": ("CPI (Index)", "index", "monthly"),
+}
+
+# Derived series (computed from a raw series above), appended to the artifact so
+# the dashboard consumes them directly rather than re-deriving.
+_CPI_YOY = ("CPI_YOY", "Inflation (CPI YoY)", "percent", "monthly")
 
 
 def _load_breadth_prices(bucket: str) -> Optional[dict]:
@@ -129,7 +158,19 @@ def collect(
     )
     logger.info("Wrote macro.json to s3://%s/%s", bucket, key)
 
-    return {"status": "ok", "fields": len(macro)}
+    # Historical macro time series — a SECONDARY, dashboard-only artifact hung off
+    # the primary macro.json write. Guarded so a FRED-history failure (the swallowed
+    # mode) cannot mask the macro.json success that the trading pipeline depends on
+    # (why primary survives); the failure is recorded in the WARN log + the returned
+    # ``macro_history`` status field (the recording surfaces). Not raised here.
+    history_status: dict = {"status": "skipped_empty", "rows": 0}
+    try:
+        history_status = write_macro_history(bucket=bucket, s3_prefix=s3_prefix, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001 - secondary artifact; never fail macro.json
+        logger.warning("macro_history write failed (macro.json unaffected): %s", e)
+        history_status = {"status": "error", "error": str(e)}
+
+    return {"status": "ok", "fields": len(macro), "macro_history": history_status}
 
 
 def _fetch_fred() -> dict:
@@ -209,6 +250,128 @@ def _fred_cpi_yoy(api_key: str) -> Optional[float]:
     except Exception as e:
         logger.warning("CPI YoY computation failed: %s", e)
         return None
+
+
+def _fred_history(series_id: str, api_key: str, start: str = _MACRO_HISTORY_START) -> list[tuple[str, float]]:
+    """Fetch the full observation history for a FRED series (with retry).
+
+    Returns ``[(date, value), ...]`` ascending by date, missing values ('.')
+    dropped. Returns ``[]`` on persistent failure (the caller omits the series
+    rather than writing partial/None rows).
+    """
+    for attempt in range(1, 3):
+        try:
+            params = {
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "observation_start": start,
+                "sort_order": "asc",
+            }
+            resp = requests.get(_FRED_BASE, params=params, timeout=_FRED_TIMEOUT)
+            resp.raise_for_status()
+            obs = resp.json().get("observations", [])
+            out: list[tuple[str, float]] = []
+            for o in obs:
+                val = o.get("value", ".")
+                if val != ".":
+                    out.append((o["date"], float(val)))
+            return out
+        except requests.exceptions.RequestException as e:
+            if attempt < 2:
+                logger.warning("FRED history %s attempt %d failed: %s — retrying", series_id, attempt, e)
+                time.sleep(3)
+            else:
+                logger.warning("FRED history %s failed after 2 attempts: %s", series_id, e)
+        except Exception as e:
+            logger.warning("FRED history %s failed: %s", series_id, e)
+            return []
+    return []
+
+
+def _cpi_yoy_rows(cpi_obs: list[tuple[str, float]]) -> list[tuple[str, float]]:
+    """Derive CPI YoY% from the raw monthly CPI index history.
+
+    For each month with an observation 12 entries prior, YoY = (v / v_12mo − 1) * 100.
+    ``cpi_obs`` must be ascending by date (as ``_fred_history`` returns).
+    """
+    rows: list[tuple[str, float]] = []
+    for i in range(12, len(cpi_obs)):
+        prior = cpi_obs[i - 12][1]
+        if prior:
+            rows.append((cpi_obs[i][0], round((cpi_obs[i][1] / prior - 1) * 100, 2)))
+    return rows
+
+
+def build_macro_history(api_key: str | None = None) -> pd.DataFrame:
+    """Build the long-format macro history DataFrame.
+
+    Columns: ``date, series_id, label, value, units, frequency``. One row per
+    (series, date). Includes the raw FRED series in ``_FRED_HISTORY_SERIES`` plus
+    the derived CPI YoY series. Returns an empty frame (correct columns) when no
+    FRED key is configured, so callers can skip the write cleanly.
+    """
+    cols = ["date", "series_id", "label", "value", "units", "frequency"]
+    if api_key is None:
+        api_key = get_secret("FRED_API_KEY", required=False, default="")
+    if not api_key:
+        logger.warning("FRED_API_KEY not set — skipping macro history")
+        return pd.DataFrame(columns=cols)
+
+    records: list[dict] = []
+    cpi_obs: list[tuple[str, float]] = []
+    for series_id, (label, units, frequency) in _FRED_HISTORY_SERIES.items():
+        obs = _fred_history(series_id, api_key)
+        if series_id == "CPIAUCSL":
+            cpi_obs = obs
+        for date, value in obs:
+            records.append(
+                {"date": date, "series_id": series_id, "label": label,
+                 "value": value, "units": units, "frequency": frequency}
+            )
+
+    # Derived: CPI YoY (inflation) from the raw CPI index.
+    yoy_id, yoy_label, yoy_units, yoy_freq = _CPI_YOY
+    for date, value in _cpi_yoy_rows(cpi_obs):
+        records.append(
+            {"date": date, "series_id": yoy_id, "label": yoy_label,
+             "value": value, "units": yoy_units, "frequency": yoy_freq}
+        )
+
+    df = pd.DataFrame(records, columns=cols)
+    logger.info("Built macro history: %d rows across %d series", len(df), df["series_id"].nunique() if not df.empty else 0)
+    return df
+
+
+def write_macro_history(bucket: str, s3_prefix: str = "market_data/", dry_run: bool = False) -> dict:
+    """Build + write the macro history parquet to ``market_data/macro_history.parquet``.
+
+    OVERWRITES the single fixed key each run (idempotent — FRED returns full
+    history). Returns a status dict; raises on the S3 write failure so a hard
+    producer fault surfaces, but an empty build (no FRED key / all fetches failed)
+    is a no-op rather than writing an empty artifact over a good one.
+    """
+    df = build_macro_history()
+    if df.empty:
+        logger.warning("macro history empty — skipping write (no FRED key or all series failed)")
+        return {"status": "skipped_empty", "rows": 0}
+
+    if dry_run:
+        logger.info("[dry-run] macro_history: %d rows across %d series", len(df), df["series_id"].nunique())
+        return {"status": "ok_dry_run", "rows": len(df), "series": int(df["series_id"].nunique())}
+
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", compression="snappy", index=False)
+    buf.seek(0)
+    key = f"{s3_prefix}{_MACRO_HISTORY_KEY}"
+    boto3.client("s3").put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=buf.getvalue(),
+        ContentType="application/octet-stream",
+    )
+    logger.info("Wrote macro history to s3://%s/%s (%d rows)", bucket, key, len(df))
+    return {"status": "ok", "rows": len(df), "series": int(df["series_id"].nunique())}
 
 
 def _fetch_market_prices() -> dict:
