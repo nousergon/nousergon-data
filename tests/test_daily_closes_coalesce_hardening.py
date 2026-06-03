@@ -88,7 +88,7 @@ class TestPolygonTransientNonFatal:
     def test_polygon_timeout_still_fills_macro_via_fred(self):
         s3 = _no_existing_parquet_s3()
 
-        def _fred_side_effect(tickers, date_str, records):
+        def _fred_side_effect(tickers, date_str, records, window_cache=None):
             for t in tickers:
                 records.append({
                     "ticker": t.lstrip("^"), "date": date_str,

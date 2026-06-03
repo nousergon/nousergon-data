@@ -16,6 +16,9 @@ the single source of truth. See alpha-engine-lib README for the
 from __future__ import annotations
 
 import logging
+import random
+import re
+import time
 import uuid
 from typing import Any
 
@@ -25,6 +28,27 @@ from alpha_engine_lib.secrets import get_secret
 log = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT_SECS = 10.0
+
+# L4494: the polygon/FRED reachability probes had a hard 10s timeout and NO
+# retry, so a single transient ReadTimeout/ConnectionError aborted the whole
+# weekday pipeline at the gate (cost a rerun 2026-06-03). Wrap the probe GET in
+# bounded exponential backoff + full jitter; a sustained outage still fails
+# loud after the attempts. Mirrors the collect-side L4482 + polygon-client
+# L4496 retry idiom.
+_REACHABILITY_MAX_ATTEMPTS = 3
+_REACHABILITY_BACKOFF_BASE = 1.0   # seconds; wait ≈ base * 2**attempt + U(0, base)
+_REACHABILITY_BACKOFF_CAP = 8.0    # seconds; never wait longer than this between tries
+
+# Mask the api key querystring (FRED ``api_key=`` / polygon ``apiKey=``) before
+# a probe error string reaches a log or RuntimeError. Defensive — Timeout/
+# ConnectionError strings carry host:port not the full URL, but a broader
+# RequestException could embed the prepared URL. Sibling of
+# ``daily_closes._scrub_api_key``.
+_API_KEY_RE = re.compile(r"(?:api_key|apiKey)=[^&\s]+")
+
+
+def _scrub_api_key(msg: object) -> str:
+    return _API_KEY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
 
 # FMP /stable probe: cheapest auth-gated call that distinguishes
 # (a) valid key on /stable from (b) a key that still works on the
@@ -218,6 +242,56 @@ class DataPreflight(BasePreflight):
 
     # ── Mode-specific primitives ─────────────────────────────────────────
 
+    def _reachability_get(self, label: str, url: str, params: dict) -> Any:
+        """GET a reachability probe with bounded backoff + jitter retry.
+
+        L4494: retries the transient network class (Timeout / ConnectionError)
+        a few times before declaring the endpoint unreachable, so one blip at
+        preflight doesn't abort the whole pipeline. A non-transient
+        ``RequestException`` (bad URL, too many redirects) raises immediately —
+        no point retrying a deterministic error. After the attempts are
+        exhausted a transient failure raises ``RuntimeError(... unreachable
+        ...)`` (the message all callers/tests match on). All error strings are
+        api-key-scrubbed.
+        """
+        import requests
+
+        last_exc: Exception | None = None
+        for attempt in range(_REACHABILITY_MAX_ATTEMPTS):
+            try:
+                return requests.get(url, params=params, timeout=_HTTP_TIMEOUT_SECS)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_exc = exc
+                if attempt < _REACHABILITY_MAX_ATTEMPTS - 1:
+                    wait = min(
+                        _REACHABILITY_BACKOFF_BASE * (2 ** attempt)
+                        + random.uniform(0, _REACHABILITY_BACKOFF_BASE),
+                        _REACHABILITY_BACKOFF_CAP,
+                    )
+                    log.warning(
+                        "preflight: %s transient %s — backing off %.1fs (attempt %d/%d)",
+                        label, type(exc).__name__, wait, attempt + 1,
+                        _REACHABILITY_MAX_ATTEMPTS,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"Pre-flight: {label} unreachable after "
+                    f"{_REACHABILITY_MAX_ATTEMPTS} attempts: {_scrub_api_key(exc)} — "
+                    f"sustained network outage or egress blocked."
+                ) from exc
+            except requests.RequestException as exc:
+                # Non-transient (bad URL / too many redirects) — fail fast.
+                raise RuntimeError(
+                    f"Pre-flight: {label} unreachable: {_scrub_api_key(exc)} — "
+                    f"network outage or egress blocked."
+                ) from exc
+        # Unreachable in practice (the loop returns or raises), but keeps the
+        # type-checker happy and surfaces the last exception defensively.
+        raise RuntimeError(
+            f"Pre-flight: {label} unreachable: {_scrub_api_key(last_exc)}"
+        )
+
     def _check_fmp_stable_reachable(self) -> None:
         """Validate FMP /stable auth + endpoint availability.
 
@@ -228,19 +302,12 @@ class DataPreflight(BasePreflight):
         before anyone noticed. A /stable probe at startup fails the
         Step Function in ~1s instead.
         """
-        import requests
-
         api_key = (get_secret("FMP_API_KEY", required=False, default="") or "").strip()
-        try:
-            resp = requests.get(
-                _FMP_STABLE_PROBE_URL,
-                params={"symbol": _FMP_STABLE_PROBE_SYMBOL, "apikey": api_key},
-                timeout=_HTTP_TIMEOUT_SECS,
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Pre-flight: FMP /stable unreachable: {exc} — network outage or egress blocked."
-            ) from exc
+        resp = self._reachability_get(
+            "FMP /stable",
+            _FMP_STABLE_PROBE_URL,
+            {"symbol": _FMP_STABLE_PROBE_SYMBOL, "apikey": api_key},
+        )
 
         if resp.status_code in (401, 403):
             raise RuntimeError(
@@ -277,19 +344,10 @@ class DataPreflight(BasePreflight):
         catch rate-limit ceiling (next collector call will retry/fail
         loudly by design).
         """
-        import requests
-
         api_key = (get_secret("POLYGON_API_KEY", required=False, default="") or "").strip()
-        try:
-            resp = requests.get(
-                _POLYGON_PROBE_URL,
-                params={"apiKey": api_key},
-                timeout=_HTTP_TIMEOUT_SECS,
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Pre-flight: polygon.io unreachable: {exc} — network outage or egress blocked."
-            ) from exc
+        resp = self._reachability_get(
+            "polygon.io", _POLYGON_PROBE_URL, {"apiKey": api_key},
+        )
 
         if resp.status_code in (401, 403):
             raise RuntimeError(
@@ -310,25 +368,18 @@ class DataPreflight(BasePreflight):
 
     def _check_fred_reachable(self) -> None:
         """Validate FRED network + auth via single-observation DFF call."""
-        import requests
-
         api_key = (get_secret("FRED_API_KEY", required=False, default="") or "").strip()
-        try:
-            resp = requests.get(
-                _FRED_PROBE_URL,
-                params={
-                    "series_id": _FRED_PROBE_SERIES,
-                    "api_key": api_key,
-                    "file_type": "json",
-                    "sort_order": "desc",
-                    "limit": 1,
-                },
-                timeout=_HTTP_TIMEOUT_SECS,
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Pre-flight: FRED unreachable: {exc} — network outage or egress blocked."
-            ) from exc
+        resp = self._reachability_get(
+            "FRED",
+            _FRED_PROBE_URL,
+            {
+                "series_id": _FRED_PROBE_SERIES,
+                "api_key": api_key,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": 1,
+            },
+        )
 
         if resp.status_code == 400:
             # FRED returns 400 with body containing "api_key" on bad key
