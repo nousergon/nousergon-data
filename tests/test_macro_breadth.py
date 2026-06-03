@@ -38,6 +38,10 @@ def _stub_fetchers(monkeypatch):
         "_fetch_market_prices",
         lambda: {"sp500_close": 650.0, "sp500_30d_return": 2.0},
     )
+    # Macro history is a secondary write off collect(); stub it empty so these
+    # breadth tests stay offline and macro.json remains the single captured PUT.
+    _HISTORY_COLS = ["date", "series_id", "label", "value", "units", "frequency"]
+    monkeypatch.setattr(macro, "build_macro_history", lambda *a, **k: pd.DataFrame(columns=_HISTORY_COLS))
 
 
 def test_breadth_computed_when_price_data_supplied(monkeypatch):
