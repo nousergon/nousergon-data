@@ -101,10 +101,19 @@ echo "==> Updating Step Function definitions..."
 SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"
 
-aws stepfunctions update-state-machine --state-machine-arn "$SAT_ARN" --definition "$(cat "$SAT_STAMPED")" --query "updateDate" --output text
+# Pass the definition via file:// — NOT inline "$(cat ...)". The Saturday ASL is
+# ~131 KB and growing (one state per pipeline step); combined with the AWS
+# session-token env on the CI runner, an inline arg blows past the effective
+# ARG_MAX and the runner aborts with "aws: Argument list too long" (exit 126),
+# which silently leaves the live SF stamp behind origin/main HEAD and trips the
+# deploy-drift preflight on the next pipeline run. file:// reads from disk, so
+# the definition size is bounded only by the SF service limit (1 MB), not ARG_MAX.
+# Regression: 2026-06-04 — the Director SF state pushed the Saturday ASL over the
+# line and broke this deploy.
+aws stepfunctions update-state-machine --state-machine-arn "$SAT_ARN" --definition "file://$SAT_STAMPED" --query "updateDate" --output text
 echo "  Saturday pipeline updated."
 
-aws stepfunctions update-state-machine --state-machine-arn "$DAILY_ARN" --definition "$(cat "$DAILY_STAMPED")" --query "updateDate" --output text
+aws stepfunctions update-state-machine --state-machine-arn "$DAILY_ARN" --definition "file://$DAILY_STAMPED" --query "updateDate" --output text
 echo "  Weekday pipeline updated."
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
