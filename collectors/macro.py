@@ -451,6 +451,12 @@ def _fred_release_dates(release_id: int, api_key: str) -> list[str]:
     ``include_release_dates_with_no_data=true`` makes FRED include FUTURE
     scheduled dates (which have no data yet). Returns ``[]`` on failure; the
     caller filters to the forward horizon.
+
+    ``sort_order=desc`` returns the furthest-future scheduled dates first, so the
+    limit must exceed the count of ALL future-scheduled dates or the NEAREST ones
+    get truncated off the bottom — that silently dropped near-term weekly claims
+    (a ~7-week gap) at limit=24. 130 comfortably covers a year-plus of any
+    cadence (weekly ≈ 52/yr) while the caller still trims to the 180d horizon.
     """
     try:
         params = {
@@ -459,7 +465,7 @@ def _fred_release_dates(release_id: int, api_key: str) -> list[str]:
             "file_type": "json",
             "include_release_dates_with_no_data": "true",
             "sort_order": "desc",
-            "limit": 24,
+            "limit": 130,
         }
         resp = requests.get(_FRED_RELEASE_DATES_BASE, params=params, timeout=_FRED_TIMEOUT)
         resp.raise_for_status()
