@@ -77,14 +77,19 @@ class TestChainOrdering:
         # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
         # input) still ends at NotifyComplete — strict superset preserved.
         #
-        # The non-fatal ReportCard state (evaluator Report Card v2) now sits
-        # between the substrate poll and the notify gate; both its Next and its
-        # Catch land on CheckShellRunNotify, preserving the success edge.
+        # Two non-fatal advisory states (evaluator Report Card v2, then the
+        # Director) now sit between the substrate poll and the notify gate.
+        # ReportCard's SUCCESS edge feeds the Director (which weighs the fresh
+        # card); ReportCard's Catch skips the Director straight to notify (no
+        # card to weigh). The Director's own Next AND Catch both land on
+        # CheckShellRunNotify, so every path still preserves the success edge.
         assert (
             states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
         )
-        assert states["ReportCard"]["Next"] == "CheckShellRunNotify"
+        assert states["ReportCard"]["Next"] == "Director"
         assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
+        assert states["Director"]["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "CheckShellRunNotify" for c in states["Director"]["Catch"])
         assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
 
 

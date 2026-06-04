@@ -2287,6 +2287,41 @@
         }
       ],
       "ResultPath": "$.report_card_result",
+      "Next": "Director"
+    },
+    "Director": {
+      "Type": "Task",
+      "Comment": "Director (Layer C, Part II) — the FINAL Saturday-SF task. A single structured Opus call over the fresh Report Card v2 (evaluator/{date}/report_card.json) produces an advisory DirectorWeeklyActionPlan at director/{date}/action_plan.json + updates the carry-over ledger. Runs only after a SUCCESSFUL ReportCard (a failed ReportCard skips straight to notify — no card to weigh). FLAG-GATED: the alpha-engine-evaluator-director Lambda is a no-op (status=disabled) until DIRECTOR_ENABLED is flipped on. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory failure never breaks the run that produced the real trading artifacts.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-evaluator-director:live",
+        "Payload": {
+          "date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Advisory Director is non-fatal — continue to the terminal notify regardless.",
+          "Next": "CheckShellRunNotify",
+          "ResultPath": "$.director_error"
+        }
+      ],
+      "ResultPath": "$.director_result",
       "Next": "CheckShellRunNotify"
     },
     "CheckShellRunNotify": {
