@@ -2252,6 +2252,41 @@
         }
       ],
       "ResultPath": "$.substrate_check_poll",
+      "Next": "ReportCard"
+    },
+    "ReportCard": {
+      "Type": "Task",
+      "Comment": "Evaluator Report Card v2 (Layer B, Option B) — builds s3://alpha-engine-research/evaluator/{date}/report_card.json from the persisted per-module artifacts (the 7-tile MetricRecord substrate the Director will consume). Runs here, after the Evaluator + substrate health checks, so it reads fresh grades. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory grading failure never breaks the run that produced the real trading artifacts.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-evaluator:live",
+        "Payload": {
+          "date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Advisory grading is non-fatal — continue to the terminal notify regardless.",
+          "Next": "CheckShellRunNotify",
+          "ResultPath": "$.report_card_error"
+        }
+      ],
+      "ResultPath": "$.report_card_result",
       "Next": "CheckShellRunNotify"
     },
     "CheckShellRunNotify": {

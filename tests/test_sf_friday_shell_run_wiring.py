@@ -674,10 +674,16 @@ class TestByteIdenticalAbsentPath:
 
 class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
+        # The substrate check now flows through the non-fatal ReportCard state
+        # (evaluator Report Card v2) before the notify gate; ReportCard's success
+        # Next AND its Catch both land on CheckShellRunNotify, so the path to the
+        # notify gate is preserved whether grading succeeds or fails.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
-            == "CheckShellRunNotify"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
         )
+        report_card = states["ReportCard"]
+        assert report_card["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "CheckShellRunNotify" for c in report_card["Catch"])
 
     def test_shell_run_notify_reuses_sns_substrate(self, states):
         """NotifyShellRunComplete surfaces the user-facing 'Saturday

@@ -76,10 +76,15 @@ class TestChainOrdering:
         # dry-pass gets a shell-run-tagged email. The gate's Default is the
         # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
         # input) still ends at NotifyComplete — strict superset preserved.
+        #
+        # The non-fatal ReportCard state (evaluator Report Card v2) now sits
+        # between the substrate poll and the notify gate; both its Next and its
+        # Catch land on CheckShellRunNotify, preserving the success edge.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
-            == "CheckShellRunNotify"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
         )
+        assert states["ReportCard"]["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
         assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
 
 
