@@ -103,6 +103,9 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days"}
     ),
     "AggregateCosts": frozenset({"date.$", "dry_run_llm.$"}),
+    # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
+    # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
+    "ReportCard": frozenset({"date.$"}),
 }
 
 # Weekday SF — alpha-engine-predictor Lambdas
