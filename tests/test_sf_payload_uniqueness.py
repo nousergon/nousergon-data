@@ -106,6 +106,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
     # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
     "ReportCard": frozenset({"date.$"}),
+    # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
+    # advisory task; reads the fresh report card, writes director/{date}/
+    # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
+    "Director": frozenset({"date.$"}),
 }
 
 # Weekday SF — alpha-engine-predictor Lambdas
