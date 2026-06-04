@@ -96,6 +96,33 @@ def test_build_release_calendar_empty_without_key(monkeypatch):
     assert list(df.columns) == _CAL_COLS
 
 
+def test_fred_release_dates_requests_enough_future_dates(monkeypatch):
+    """Regression: the FRED query must request enough desc dates to reach the
+    NEAREST future ones. sort_order=desc returns furthest-future first, so a
+    small limit truncated near-term weekly claims (the ~7-week ICSA gap). Pin a
+    floor on the limit + the future-dates flag so a shrink re-surfaces visibly.
+    """
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"release_dates": [{"date": "2026-06-11"}]}
+
+    def _fake_get(url, params=None, timeout=None):
+        captured.update(params or {})
+        return _Resp()
+
+    monkeypatch.setattr(macro.requests, "get", _fake_get)
+    out = macro._fred_release_dates(10, "fake-key")
+    assert out == ["2026-06-11"]
+    assert captured["include_release_dates_with_no_data"] == "true"
+    assert captured["sort_order"] == "desc"
+    assert captured["limit"] >= 120  # must cover a year-plus of weekly cadence
+
+
 def test_write_release_calendar_puts_parquet(monkeypatch):
     df = pd.DataFrame(
         [{"date": "2026-06-11", "kind": "release", "series_id": "CPIAUCSL",
