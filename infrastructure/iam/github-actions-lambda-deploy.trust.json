@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::711398986525:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:cipher813/alpha-engine-research:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-research:pull_request",
+            "repo:cipher813/alpha-engine-predictor:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-predictor:pull_request",
+            "repo:cipher813/alpha-engine-data:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-data:pull_request",
+            "repo:cipher813/alpha-engine-dashboard:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-dashboard:pull_request",
+            "repo:cipher813/alpha-engine:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine:pull_request",
+            "repo:cipher813/alpha-engine-backtester:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-backtester:pull_request",
+            "repo:cipher813/alpha-engine-lib:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-lib:pull_request",
+            "repo:cipher813/alpha-engine-config:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-config:pull_request",
+            "repo:cipher813/alpha-engine-docs:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-docs:pull_request",
+            "repo:cipher813/mnemon:ref:refs/heads/main",
+            "repo:cipher813/mnemon:pull_request",
+            "repo:cipher813/flow-doctor:ref:refs/heads/main",
+            "repo:cipher813/flow-doctor:pull_request",
+            "repo:cipher813/robodashboard:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-evaluator:ref:refs/heads/main",
+            "repo:cipher813/alpha-engine-evaluator:pull_request"
+          ]
+        }
+      }
+    }
+  ]
+}

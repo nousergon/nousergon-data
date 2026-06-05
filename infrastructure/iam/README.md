@@ -73,11 +73,27 @@ regression class.
 
 ## Trust policies + role creation
 
-Out of scope for this directory. Trust policies + initial role creation
-are handled inline in the deploy scripts that need them
-(`infrastructure/deploy_step_function.sh` for the SF + EB-SFN roles).
-This directory only manages the **inline policy documents** on roles
-that already exist.
+Initial role creation is out of scope (handled inline in the deploy
+scripts that need them — `infrastructure/deploy_step_function.sh` for the
+SF + EB-SFN roles). `apply.sh` only manages the **inline permission
+documents** on roles that already exist.
+
+**Exception — `github-actions-lambda-deploy.trust.json` (reference copy).**
+The OIDC trust policy for the shared `github-actions-lambda-deploy` role
+(which repos may assume it from GitHub Actions) was historically manual /
+uncodified. The `*.trust.json` file is a version-tracked snapshot of that
+trust policy so additions are reviewable. `apply.sh` does NOT apply it
+(it's an assume-role-policy, not an inline policy). Apply a trust-policy
+change explicitly:
+
+```
+aws iam update-assume-role-policy --role-name github-actions-lambda-deploy --policy-document file://infrastructure/iam/github-actions-lambda-deploy.trust.json
+```
+
+When a new repo needs to auto-deploy, add its
+`repo:cipher813/<repo>:ref:refs/heads/main` (+ `:pull_request`) entry to
+the trust JSON AND add its resource ARNs to the permission JSON, then
+apply both.
 
 ## Drift detection
 
