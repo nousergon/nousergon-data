@@ -134,7 +134,7 @@ _SPOT_STATES = {
         "/var/log/backtester.log",
     ),
     "PredictorBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator",
         "/var/log/predictor-backtest.log",
     ),
     "PortfolioOptimizerBacktest": (
@@ -142,7 +142,7 @@ _SPOT_STATES = {
         "/var/log/portfolio-optimizer.log",
     ),
     "Parity": (
-        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator",
+        "bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator",
         "/var/log/parity.log",
     ),
     "Evaluator": (

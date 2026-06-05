@@ -27,15 +27,19 @@ timeout on a fresh date (L4470). The backtest stage is now decomposed by
 --mode into THREE sequential SF states, each with its own SSM timeout +
 independent redrive:
   Backtester               --mode=param-sweep --no-pit-parity   (simulate+sweep)
-  PredictorBacktest        --mode=predictor-backtest            (predictor+Phase4, pit_parity HERE)
+  PredictorBacktest        --mode=predictor-backtest --no-pit-parity  (predictor+Phase4)
   PortfolioOptimizerBacktest --mode=portfolio-optimizer-backtest --no-pit-parity
+  Parity                   --skip-stages=backtest,evaluator     (parity + pit_parity HERE, L4486)
 The happy path is now:
   CheckSkipBacktester → Backtester → PredictorBacktest →
   PortfolioOptimizerBacktest → CheckSkipParity → Parity →
   CheckSkipEvaluator → Evaluator.
 skip_backtester still skips the whole backtest-family (routes past
-CheckSkipParity to CheckSkipEvaluator). pit_parity fires exactly once
-(default-ON in PredictorBacktest; the other two pass --no-pit-parity).
+CheckSkipParity to CheckSkipEvaluator). L4486 (2026-06-05): pit_parity fires
+exactly once, RELOCATED to the standalone Parity state (fresh process, ≥8 GB
+floor) — the other three states pass --no-pit-parity. It used to run stacked in
+PredictorBacktest, OOM-guard-failing on the 8 GB box (2nd predictor_pipeline
+after the main one held ~3.5 GB).
 
 This test catches regressions like:
 - Someone reverts Backtester's SSM command back to --skip-stages=evaluator
@@ -295,7 +299,7 @@ class TestSsmCommandShape:
 
     def test_parity_invokes_parity_stage_only(self, states):
         joined = " ".join(self._commands(states, "Parity"))
-        assert "spot_backtest.sh --skip-stages=backtest,evaluator" in joined, (
+        assert "spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator" in joined, (
             "Parity must run ONLY the parity stage."
         )
         assert "--skip-stages=evaluator" not in joined
@@ -333,7 +337,7 @@ class TestSsmCommandShape:
         )
         assert "--slug parity" in work
         assert "--log /var/log/parity.log" in work
-        assert "-- bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator" in work
+        assert "-- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator" in work
         assert not any(c.startswith("trap ") for c in cmds), (
             "Inline trap must not coexist with the lib CLI — the CLI "
             "internalizes the trap."
@@ -453,27 +457,42 @@ class TestL4472PhaseSplit:
 
     def test_predictor_backtest_invokes_predictor_mode(self, states):
         joined = " ".join(self._commands(states, "PredictorBacktest"))
-        assert "spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator" in joined
-        # pit_parity runs HERE (no --no-pit-parity on this state)
-        assert "--no-pit-parity" not in joined
+        assert "spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
+        # L4486: pit_parity NO LONGER runs here (it was stacked after the main
+        # predictor_pipeline → 8 GB OOM-guard fail). Relocated to the Parity state.
+        assert "--no-pit-parity" in joined
 
     def test_optimizer_invokes_optimizer_mode_no_pit(self, states):
         joined = " ".join(self._commands(states, "PortfolioOptimizerBacktest"))
         assert "spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
 
-    def test_pit_parity_runs_exactly_once(self, sf):
-        """--no-pit-parity must appear on Backtester + PortfolioOptimizer but
-        NOT PredictorBacktest, so the observational pit_parity pass fires
-        exactly once across the three split states."""
-        blob = json.dumps(sf)
-        # PredictorBacktest is the only backtest-family state without --no-pit-parity
+    def test_pit_parity_runs_exactly_once_in_parity_state(self, sf):
+        """L4486: pit_parity fires EXACTLY ONCE, in the standalone Parity state
+        (fresh process, ≥8 GB floor via --mode=all). A state runs pit_parity iff
+        it neither passes --no-pit-parity NOR skips the `pit_parity` stage token.
+        Backtester / PredictorBacktest / PortfolioOptimizerBacktest all pass
+        --no-pit-parity; Parity does not, and its --skip-stages=backtest,evaluator
+        does not contain pit_parity."""
+        import re
         from tests.sf_command_utils import extract_commands
         states = sf["States"]
-        def has_no_pit(name):
-            return "--no-pit-parity" in " ".join(extract_commands(states[name]))
-        assert has_no_pit("Backtester")
-        assert has_no_pit("PortfolioOptimizerBacktest")
-        assert not has_no_pit("PredictorBacktest")
+
+        def runs_pit_parity(name):
+            cmd = " ".join(extract_commands(states[name]))
+            # isolate the spot_backtest.sh invocation flags
+            m = re.search(r"spot_backtest\.sh ([^']*)", cmd)
+            flags = m.group(1) if m else ""
+            if "--no-pit-parity" in flags:
+                return False
+            skip = re.search(r"--skip-stages=(\S+)", flags)
+            skipped = skip.group(1).split(",") if skip else []
+            return "pit_parity" not in skipped
+
+        family = ["Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest", "Parity"]
+        runners = [n for n in family if runs_pit_parity(n)]
+        assert runners == ["Parity"], (
+            f"pit_parity must fire exactly once, in Parity; got runners={runners}"
+        )
 
     @pytest.mark.parametrize(
         "name",
