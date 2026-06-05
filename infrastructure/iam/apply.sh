@@ -87,6 +87,13 @@ else
     exit 0
   fi
   for file in "${files[@]}"; do
+    # *.trust.json are version-tracked snapshots of assume-role (trust)
+    # policies, NOT inline permission documents — they are applied with
+    # `aws iam update-assume-role-policy`, never put-role-policy. Skip them
+    # in the bulk pass (see README "Trust policies + role creation").
+    case "$file" in
+      *.trust.json) echo "Skipping trust snapshot $file (apply with update-assume-role-policy)"; continue ;;
+    esac
     apply_one "$file"
   done
 fi

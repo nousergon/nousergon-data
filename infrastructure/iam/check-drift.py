@@ -101,7 +101,12 @@ def main() -> int:
             sys.stderr.write(f"ERROR: {role_files[0]} not found\n")
             return 2
     else:
-        role_files = sorted(SCRIPT_DIR.glob("*.json"))
+        # *.trust.json are assume-role (trust) policy snapshots, not inline
+        # permission documents — they have no `{stem}-policy` inline policy to
+        # diff, so exclude them from the drift sweep (mirrors apply.sh).
+        role_files = sorted(
+            f for f in SCRIPT_DIR.glob("*.json") if not f.name.endswith(".trust.json")
+        )
 
     if not role_files:
         print(f"No codified role files found under {SCRIPT_DIR} — nothing to check.")
