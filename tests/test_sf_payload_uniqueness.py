@@ -105,11 +105,13 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "AggregateCosts": frozenset({"date.$", "dry_run_llm.$"}),
     # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
     # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
-    "ReportCard": frozenset({"date.$"}),
+    # dry_run.$=$.research_dry → no-write on the Friday preflight (ROADMAP L4504).
+    "ReportCard": frozenset({"date.$", "dry_run.$"}),
     # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
     # advisory task; reads the fresh report card, writes director/{date}/
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
-    "Director": frozenset({"date.$"}),
+    # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
+    "Director": frozenset({"date.$", "dry_run.$"}),
 }
 
 # Weekday SF — alpha-engine-predictor Lambdas
