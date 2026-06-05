@@ -1699,7 +1699,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --skip-stages=parity,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -1913,7 +1913,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
