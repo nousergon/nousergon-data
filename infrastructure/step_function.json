@@ -2252,7 +2252,27 @@
         }
       ],
       "ResultPath": "$.substrate_check_poll",
-      "Next": "ReportCard"
+      "Next": "CheckShellRunSkipDirector"
+    },
+    "CheckShellRunSkipDirector": {
+      "Type": "Choice",
+      "Comment": "Shell-run / preflight guard for the advisory tail (ROADMAP L4504). The Friday-PM Preflight Pipeline (shell_run=true) dry-executes the Saturday SF to exercise bootstrap paths — but ReportCard + Director have NO dry path (their payload is only {date}; the Director Lambda gates solely on DIRECTOR_ENABLED). Left ungated, a Friday preflight would run ReportCard for real over backtest/{Fri-date}/* that the dry workload never wrote (→ a degenerate, mostly-N/A card) and, once DIRECTOR_ENABLED is flipped on, fire a REAL Opus Director call that merges that degenerate plan into the SHARED, non-date-scoped carry-over ledger (director/carryover_ledger.json) — polluting the state the real Saturday run reads. So on shell_run=true we hard-skip BOTH advisory states straight to the shell-run-aware notify; the preflight's purpose is bootstrap exercise and both Lambdas already have their own canaries. shell_run absent/false → Default → ReportCard, BYTE-IDENTICAL to the pre-guard real Saturday run.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.shell_run",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.shell_run",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "ReportCard"
     },
     "ReportCard": {
       "Type": "Task",

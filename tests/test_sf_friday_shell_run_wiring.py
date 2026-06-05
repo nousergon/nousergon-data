@@ -674,21 +674,50 @@ class TestByteIdenticalAbsentPath:
 
 class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
-        # The substrate check now flows through two non-fatal advisory states
-        # (evaluator Report Card v2, then the Director) before the notify gate.
-        # ReportCard's SUCCESS Next feeds the Director; its Catch skips straight
-        # to CheckShellRunNotify. The Director's own Next AND Catch both land on
-        # CheckShellRunNotify, so the path to the notify gate is preserved
-        # whether grading/advisory succeed or fail.
+        # The substrate check now flows through the shell-run guard
+        # (CheckShellRunSkipDirector, ROADMAP L4504) and then two non-fatal
+        # advisory states (evaluator Report Card v2, then the Director) before
+        # the notify gate. On a real Saturday run the guard's Default routes to
+        # ReportCard; ReportCard's SUCCESS Next feeds the Director; its Catch
+        # skips straight to CheckShellRunNotify. The Director's own Next AND
+        # Catch both land on CheckShellRunNotify, so the path to the notify gate
+        # is preserved whether grading/advisory succeed or fail.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckShellRunSkipDirector"
         )
+        assert states["CheckShellRunSkipDirector"]["Default"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "Director"
         assert all(c["Next"] == "CheckShellRunNotify" for c in report_card["Catch"])
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"
         assert all(c["Next"] == "CheckShellRunNotify" for c in director["Catch"])
+
+    def test_shell_run_skips_advisory_tail(self, states):
+        """ROADMAP L4504: on a Friday-PM Preflight Pipeline (shell_run=true) the
+        advisory tail (ReportCard + Director) MUST be hard-skipped straight to
+        the notify gate. Left ungated, the Director would run a real Opus call
+        over a degenerate preflight card and pollute the shared, non-date-scoped
+        carry-over ledger (director/carryover_ledger.json) that the real
+        Saturday run reads. The guard sits between the substrate health check
+        and ReportCard so BOTH advisory states are bypassed on the preflight.
+        """
+        gate = states["CheckShellRunSkipDirector"]
+        assert gate["Type"] == "Choice"
+        # shell_run absent/false → Default → ReportCard (byte-identical Saturday).
+        assert gate["Default"] == "ReportCard"
+        # shell_run present AND true → skip the whole advisory tail to notify.
+        choices = gate["Choices"]
+        assert len(choices) == 1
+        assert choices[0]["Next"] == "CheckShellRunNotify"
+        conds = choices[0]["And"]
+        assert {c["Variable"] for c in conds} == {"$.shell_run"}
+        assert any(c.get("IsPresent") is True for c in conds)
+        assert any(c.get("BooleanEquals") is True for c in conds)
+        # The skip target is the notify gate, NOT ReportCard/Director.
+        assert "ReportCard" not in {choices[0]["Next"]}
+        assert "Director" not in {choices[0]["Next"]}
 
     def test_shell_run_notify_reuses_sns_substrate(self, states):
         """NotifyShellRunComplete surfaces the user-facing 'Saturday
