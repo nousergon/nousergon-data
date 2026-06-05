@@ -2252,36 +2252,17 @@
         }
       ],
       "ResultPath": "$.substrate_check_poll",
-      "Next": "CheckShellRunSkipDirector"
-    },
-    "CheckShellRunSkipDirector": {
-      "Type": "Choice",
-      "Comment": "Shell-run / preflight guard for the advisory tail (ROADMAP L4504). The Friday-PM Preflight Pipeline (shell_run=true) dry-executes the Saturday SF to exercise bootstrap paths — but ReportCard + Director have NO dry path (their payload is only {date}; the Director Lambda gates solely on DIRECTOR_ENABLED). Left ungated, a Friday preflight would run ReportCard for real over backtest/{Fri-date}/* that the dry workload never wrote (→ a degenerate, mostly-N/A card) and, once DIRECTOR_ENABLED is flipped on, fire a REAL Opus Director call that merges that degenerate plan into the SHARED, non-date-scoped carry-over ledger (director/carryover_ledger.json) — polluting the state the real Saturday run reads. So on shell_run=true we hard-skip BOTH advisory states straight to the shell-run-aware notify; the preflight's purpose is bootstrap exercise and both Lambdas already have their own canaries. shell_run absent/false → Default → ReportCard, BYTE-IDENTICAL to the pre-guard real Saturday run.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.shell_run",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.shell_run",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckShellRunNotify"
-        }
-      ],
-      "Default": "ReportCard"
+      "Next": "ReportCard"
     },
     "ReportCard": {
       "Type": "Task",
-      "Comment": "Evaluator Report Card v2 (Layer B, Option B) — builds s3://alpha-engine-research/evaluator/{date}/report_card.json from the persisted per-module artifacts (the 7-tile MetricRecord substrate the Director will consume). Runs here, after the Evaluator + substrate health checks, so it reads fresh grades. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory grading failure never breaks the run that produced the real trading artifacts.",
+      "Comment": "Evaluator Report Card v2 (Layer B, Option B) — builds s3://alpha-engine-research/evaluator/{date}/report_card.json from the persisted per-module artifacts (the 7-tile MetricRecord substrate the Director will consume). Runs here, after the Evaluator + substrate health checks, so it reads fresh grades. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory grading failure never breaks the run that produced the real trading artifacts. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry (the canonical shell-run-dry signal — false on the real Saturday run, true on the Friday-PM Preflight Pipeline). On the preflight the handler still exercises the full read+compute path (container boot, lib/numpy/pandas imports, S3-read IAM/transport, the tile compute) but does NOT persist the degenerate, mostly-N/A preflight card — mirrors how the other advisory Lambdas (eval-judge / rationale-clustering / replay-concordance / counterfactual) run dry rather than skip, per the shell-run keystone's 'dry-execute, don't skip' principle.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator:live",
         "Payload": {
-          "date.$": "$.run_date"
+          "date.$": "$.run_date",
+          "dry_run.$": "$.research_dry"
         }
       },
       "TimeoutSeconds": 300,
@@ -2311,12 +2292,13 @@
     },
     "Director": {
       "Type": "Task",
-      "Comment": "Director (Layer C, Part II) — the FINAL Saturday-SF task. A single structured Opus call over the fresh Report Card v2 (evaluator/{date}/report_card.json) produces an advisory DirectorWeeklyActionPlan at director/{date}/action_plan.json + updates the carry-over ledger. Runs only after a SUCCESSFUL ReportCard (a failed ReportCard skips straight to notify — no card to weigh). FLAG-GATED: the alpha-engine-evaluator-director Lambda is a no-op (status=disabled) until DIRECTOR_ENABLED is flipped on. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory failure never breaks the run that produced the real trading artifacts.",
+      "Comment": "Director (Layer C, Part II) — the FINAL Saturday-SF task. A single structured Opus call over the fresh Report Card v2 (evaluator/{date}/report_card.json) produces an advisory DirectorWeeklyActionPlan at director/{date}/action_plan.json + updates the carry-over ledger. Runs only after a SUCCESSFUL ReportCard (a failed ReportCard skips straight to notify — no card to weigh). FLAG-GATED: the alpha-engine-evaluator-director Lambda is a no-op (status=disabled) until DIRECTOR_ENABLED is flipped on. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory failure never breaks the run that produced the real trading artifacts. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry. On the Friday-PM Preflight Pipeline (research_dry=true) the handler runs a no-Opus / no-write PROBE — it constructs the real Opus client (exercising the langchain-anthropic import + the SSM ANTHROPIC_API_KEY fetch / ReadAnthropicSecret IAM grant) and reads the carry-over ledger, then STOPS short of the paid .invoke() and writes NOTHING (no action_plan, no ledger mutation). This is load-bearing: the carry-over ledger is shared + non-date-scoped (director/carryover_ledger.json), so a preflight write would pollute the real Saturday run. A broken import / revoked key grant surfaces as a caught preflight failure ~18h before the real Saturday Director would hit it.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator-director:live",
         "Payload": {
-          "date.$": "$.run_date"
+          "date.$": "$.run_date",
+          "dry_run.$": "$.research_dry"
         }
       },
       "TimeoutSeconds": 300,

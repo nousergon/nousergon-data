@@ -77,25 +77,16 @@ class TestChainOrdering:
         # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
         # input) still ends at NotifyComplete — strict superset preserved.
         #
-        # The shell-run guard (CheckShellRunSkipDirector, ROADMAP L4504) now
-        # sits first: on a Friday-PM preflight (shell_run=true) it skips the
-        # whole advisory tail straight to CheckShellRunNotify; its Default routes
-        # the REAL Saturday run (no shell_run) to ReportCard, unchanged.
-        #
         # Two non-fatal advisory states (evaluator Report Card v2, then the
-        # Director) sit between the guard and the notify gate. ReportCard's
-        # SUCCESS edge feeds the Director (which weighs the fresh card);
-        # ReportCard's Catch skips the Director straight to notify (no card to
-        # weigh). The Director's own Next AND Catch both land on
-        # CheckShellRunNotify, so every path still preserves the success edge.
+        # Director) sit between the substrate poll and the notify gate. ReportCard's
+        # SUCCESS edge feeds the Director (which weighs the fresh card); ReportCard's
+        # Catch skips the Director straight to notify (no card to weigh). The
+        # Director's own Next AND Catch both land on CheckShellRunNotify, so every
+        # path still preserves the success edge. On the Friday preflight both states
+        # RUN (dry, via dry_run.$=$.research_dry — ROADMAP L4504), they are not
+        # skipped, so the wiring is identical on real + preflight runs.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
-            == "CheckShellRunSkipDirector"
-        )
-        assert states["CheckShellRunSkipDirector"]["Default"] == "ReportCard"
-        assert (
-            states["CheckShellRunSkipDirector"]["Choices"][0]["Next"]
-            == "CheckShellRunNotify"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
         )
         assert states["ReportCard"]["Next"] == "Director"
         assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
