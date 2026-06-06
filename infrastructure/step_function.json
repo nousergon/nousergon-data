@@ -186,6 +186,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.morning_enrich_poll",
       "Next": "CheckMorningEnrichStatus"
     },
@@ -301,6 +307,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.data_phase1_poll",
       "Next": "CheckDataPhase1Status"
     },
@@ -452,6 +464,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.rag_ingestion_poll",
       "Next": "CheckRAGIngestionStatus"
     },
