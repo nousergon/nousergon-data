@@ -26,6 +26,17 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      # Changelog mirror Lambdas live outside tests/ (pytest testpaths) and each
+      # stubs boto3 in sys.modules, so they can't share a pytest process. Run
+      # each in its own interpreter. Guards the deterministic SNS classifier
+      # (classify.py) against a mislabeling regression.
+      - name: Run changelog lambda tests
+        run: |
+          python3 infrastructure/lambdas/_shared/test_vocab.py
+          python3 infrastructure/lambdas/_shared/test_classify.py
+          python3 infrastructure/lambdas/changelog-incident-mirror/test_handler.py
+          python3 infrastructure/lambdas/changelog-cloudwatch-mirror/test_handler.py
+
       - name: Security audit
         run: |
           pip install pip-audit

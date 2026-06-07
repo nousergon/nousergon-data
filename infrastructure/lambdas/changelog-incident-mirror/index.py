@@ -45,9 +45,10 @@ from hashlib import sha1
 
 import boto3
 
-# Vendored at deploy time (deploy.sh copies _shared/vocab.py alongside
-# index.py so the import works in the Lambda runtime).
+# Vendored at deploy time (deploy.sh copies _shared/vocab.py + classify.py
+# alongside index.py so the imports work in the Lambda runtime).
 import vocab as _vocab
+from classify import classify_sns
 
 _S3 = boto3.client("s3")
 _BUCKET = os.environ["CHANGELOG_BUCKET"]
@@ -97,14 +98,22 @@ def handler(event, context):
         actor_safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in topic_name)
         event_id = f"{ts_id}_{actor_safe}_{event_hash}"
 
+        # Deterministic (no-LLM) classification of the alert. The SNS topic
+        # carries a MIX of real failures, warnings, recoveries (OK alarm-clears)
+        # and success notifications; classify_sns sorts each to its true type so
+        # the incident corpus + retro-candidate feed are not polluted by
+        # SUCCESS/OK entries. Unrecognized subjects default to incident/high
+        # (fail loud). See _shared/classify.py.
+        event_type, severity, subsystem, root_cause_category = classify_sns(subject, message)
+
         structured_entry = {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "ts_utc": ts_utc,
-            "event_type": "incident",
-            "severity": "high",
-            "subsystem": "infrastructure",
-            "root_cause_category": "infrastructure_failure",
+            "event_type": event_type,
+            "severity": severity,
+            "subsystem": subsystem,
+            "root_cause_category": root_cause_category,
             "resolution_type": None,
             "started_at": None,
             "detected_at": ts_utc,

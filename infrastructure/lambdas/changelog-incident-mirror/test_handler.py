@@ -173,5 +173,56 @@ class QuarantineTests(unittest.TestCase):
         self.assertEqual(body["validation_errors"], ["err-a", "err-b"])
 
 
+class ClassificationTests(unittest.TestCase):
+    """End-to-end: the handler applies classify_sns so SUCCESS/OK messages are
+    no longer mislabeled as high-severity incidents (the bug this fixes)."""
+
+    def setUp(self):
+        self.index, self.s3 = _import_handler()
+
+    def _emit(self, subject, message="body"):
+        ev = _sample_event()
+        ev["Records"][0]["Sns"]["Subject"] = subject
+        ev["Records"][0]["Sns"]["Message"] = message
+        self.index.handler(ev, context=None)
+        call = next(c for c in self.s3.put_object.call_args_list if "entries/" in c.kwargs["Key"])
+        return json.loads(call.kwargs["Body"].decode())
+
+    def test_success_pipeline_is_change_not_incident(self):
+        body = self._emit("Alpha Engine Saturday Pipeline — SUCCESS")
+        self.assertEqual(body["event_type"], "change")
+        self.assertEqual(body["severity"], "informational")
+        self.assertIsNone(body["root_cause_category"])
+
+    def test_alarm_ok_is_recovery(self):
+        body = self._emit('OK: "alpha-engine-research-runner-timeout" in US East')
+        self.assertEqual(body["event_type"], "recovery")
+        self.assertEqual(body["severity"], "informational")
+
+    def test_alarm_fired_is_incident(self):
+        body = self._emit('ALARM: "alpha-engine-saturday-sf-failed" in US East')
+        self.assertEqual(body["event_type"], "incident")
+        self.assertEqual(body["severity"], "high")
+        self.assertEqual(body["root_cause_category"], "infrastructure_failure")
+
+    def test_warn_is_medium_incident_with_subsystem(self):
+        body = self._emit("Alpha Engine alert [WARN] — research:score_aggregator")
+        self.assertEqual(body["event_type"], "incident")
+        self.assertEqual(body["severity"], "medium")
+        self.assertEqual(body["subsystem"], "research")
+
+    def test_non_incident_entries_pass_validation_and_land_in_entries(self):
+        # change/recovery entries must not be quarantined.
+        for subj in ("Alpha Engine Saturday Pipeline — SUCCESS",
+                     'OK: "x" in US East'):
+            self.s3.reset_mock()
+            ev = _sample_event()
+            ev["Records"][0]["Sns"]["Subject"] = subj
+            self.index.handler(ev, context=None)
+            keys = [c.kwargs["Key"] for c in self.s3.put_object.call_args_list]
+            self.assertTrue(all(k.startswith("changelog/entries/") for k in keys),
+                            f"{subj!r} should not quarantine: {keys}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
