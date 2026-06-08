@@ -1,0 +1,61 @@
+name: Flow Doctor Fix
+
+# Fires when flow-doctor (or a human) applies the `flow-doctor:fix` label to
+# an issue. During the 0.6.0rc2 soak, flow-doctor's auto_fix_pr toggle applies
+# that label automatically on each filed issue, so this generates a fix PR with
+# no human step. Cost is bounded upstream: flow-doctor.yaml caps issues at
+# max_issues_per_day: 3 (-> <=3 label events -> <=3 runs/day), the fix model is
+# Haiku, and diagnosis has a $0.50/day hard cap. Generated PRs are proposals
+# (scope-guarded + test-gated) and are NEVER auto-merged.
+
+on:
+  issues:
+    types: [labeled]
+
+# The default GITHUB_TOKEN needs write scope to open the fix PR + comment.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  generate-fix:
+    if: github.event.label.name == 'flow-doctor:fix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        # requirements.txt pins alpha-engine-lib@v0.56.0, which installs
+        # flow-doctor[diagnosis,s3]==0.6.0rc2 (the soak version + the fix CLI).
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Generate fix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m flow_doctor.fix.cli generate-fix \
+            --issue-number ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --token $GITHUB_TOKEN \
+            --config flow-doctor.yaml
+
+      - name: Comment on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: '⚠️ Flow Doctor fix generation failed. See the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.'
+            })
