@@ -455,7 +455,10 @@ class TestEODSFTopLevelFieldsClosed:
 # was split into Backtester (simulate) + PredictorBacktest +
 # PortfolioOptimizerBacktest so no single SSM command carries the summed
 # 60-100 min post-sweep runtime that blew the timeout (L4470).
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 10
+# 10 → 11 on 2026-06-08 (ROADMAP L4544): ModelZooRotation — the best-effort
+# model-zoo weekly rotation + CPCV selection, sequential after PredictorTraining
+# success in Branch B (same spot instance, off the live-trading path).
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
 
 
 def _saturday_spot_states() -> list[str]:
