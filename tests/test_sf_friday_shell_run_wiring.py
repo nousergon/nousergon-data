@@ -80,6 +80,9 @@ _CFN_PATH = (
 # targeted operator skips) — this constant + test_skip_gates_still_intact
 # enforce that none were deleted.
 _EXPECTED_SKIPS = {
+    # Added 2026-06-08 (L4517 — preventive cross-repo lib-pin drift gate,
+    # the first state after InitializeInput).
+    "skip_lib_pin_drift_check",
     "skip_morning_enrich",
     "skip_data_phase1",
     "skip_rag_ingestion",
@@ -388,7 +391,10 @@ class TestStrictSuperset:
         # CheckShellRun (the cadence-role acquire path lands at the same
         # downstream state). See tests/test_sf_mutex_wiring.py for the full
         # mutex-chain contract.
-        assert states["InitializeInput"]["Next"] == "CheckMutexRole"
+        # 2026-06-08 (L4517): the lib-pin drift gate precedes the mutex; its
+        # paths converge on CheckMutexRole (see test_sf_lib_pin_drift_wiring.py),
+        # so the mutex→CheckShellRun superset property below is unchanged.
+        assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass path must route to CheckShellRun so the shell-run "
             "chain remains a strict superset for non-cadence inputs"
@@ -947,8 +953,15 @@ class TestHappyPathTraversal:
         assert "ApplyShellRunDefaults" not in order
         assert "NotifyShellRunComplete" not in order
         assert not skipped, "nothing skipped when shell_run absent"
+        # 2026-06-08 (L4517): the lib-pin drift gate is now the first hop after
+        # InitializeInput; with no skip flag + no drift, its skip/check/gate
+        # Defaults converge on CheckMutexRole — same downstream chain, three
+        # extra states in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            "CheckSkipLibPinDriftCheck",
+            "LibPinDriftCheck",
+            "LibPinDriftGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
