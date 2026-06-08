@@ -76,9 +76,12 @@ class TestChainOrdering:
         # acquires the mutex; or any non-cadence role that bypasses) still
         # reaches the MorningEnrich skip-gate first — MorningEnrich still
         # precedes DataPhase1.
-        assert states["InitializeInput"]["Next"] == "CheckMutexRole", (
-            "InitializeInput now hands off to the L274 mutex gate; see "
-            "tests/test_sf_mutex_wiring.py for the mutex-chain contract"
+        # 2026-06-08: L4517 inserted the lib-pin drift gate as the new first
+        # state; its skip/check/gate Defaults converge on CheckMutexRole, so the
+        # downstream mutex→CheckShellRun→CheckSkipMorningEnrich chain is unchanged.
+        assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck", (
+            "InitializeInput now hands off to the L4517 lib-pin drift gate; see "
+            "tests/test_sf_lib_pin_drift_wiring.py for the gate→mutex chain"
         )
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass must route to CheckShellRun so the pre-mutex "

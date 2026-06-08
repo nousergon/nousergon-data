@@ -162,7 +162,12 @@ class TestMutexWiring:
     and the bypass path (operator/missing role)."""
 
     def test_saturday_initialize_input_routes_to_check_mutex_role(self, saturday_sf):
-        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"
+        # 2026-06-08 (L4517): the preventive lib-pin drift gate is now the first
+        # state after InitializeInput; its skip-default + gate-default converge
+        # on CheckMutexRole — the mutex still sits between entry and the
+        # former-first-state, one gate further down.
+        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
+        assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"

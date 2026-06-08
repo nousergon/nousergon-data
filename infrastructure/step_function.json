@@ -9,7 +9,68 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
-      "Next": "CheckMutexRole"
+      "Next": "CheckSkipLibPinDriftCheck"
+    },
+    "CheckSkipLibPinDriftCheck": {
+      "Type": "Choice",
+      "Comment": "Skip-gate (L4517). {\"skip_lib_pin_drift_check\": true} bypasses the preventive cross-repo lib-pin drift check — e.g. an operator rerun where pins are known-good.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_lib_pin_drift_check", "IsPresent": true},
+            {"Variable": "$.skip_lib_pin_drift_check", "BooleanEquals": true}
+          ],
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Default": "LibPinDriftCheck"
+    },
+    "LibPinDriftCheck": {
+      "Type": "Task",
+      "Comment": "Preventive cross-repo alpha-engine-lib pin-drift gate (L4517). Runs BEFORE any spot launch: asserts backtester-pin == predictor-pin (co-install parity — the only multi-repo co-install site, the 2026-05-12 silent-downgrade incident) AND every Saturday-SF repo's pin >= MIN_LIB_VERSION (v0.39.0 floor = data's lowest INTENTIONAL pin). has_drift=true halts in seconds with a named offender instead of a co-install break ~12 min into a spot. FAIL-OPEN: a GitHub-fetch/parse miss sets has_drift=false (the probe's own degraded mode), and the Catch routes any Lambda failure (incl. an unknown action before predictor PR A deploys) straight to the pipeline — so the checker NEVER false-halts the weekly run.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_lib_pin_drift"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
+          "Next": "CheckMutexRole",
+          "ResultPath": "$.libpin_drift_error"
+        }
+      ],
+      "ResultPath": "$.libpin_drift_result",
+      "Next": "LibPinDriftGate"
+    },
+    "LibPinDriftGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch.",
+      "Choices": [
+        {
+          "Variable": "$.libpin_drift_result.Payload.has_drift",
+          "BooleanEquals": true,
+          "Next": "HandleFailure"
+        }
+      ],
+      "Default": "CheckMutexRole"
     },
     "CheckMutexRole": {
       "Type": "Choice",
