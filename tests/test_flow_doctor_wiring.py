@@ -46,6 +46,11 @@ def stub_flow_doctor_env(monkeypatch):
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
+    # 0.6.0rc2 soak: flow-doctor.yaml now enables Haiku diagnosis with
+    # api_key: ${ANTHROPIC_API_KEY}. flow-doctor fails loud on an unresolved
+    # ${VAR}, so the wiring tests must seed it (mirrors the runtime, where the
+    # box resolves it from SSM /alpha-engine/ANTHROPIC_API_KEY).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stub-anthropic-key")
 
 
 @pytest.fixture

@@ -11,6 +11,12 @@ notify:
   - type: github
     repo: cipher813/alpha-engine-data
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
+    # 0.6.0rc2 soak: file an issue on failure (default) AND auto-apply the
+    # flow-doctor:fix label so the flow-doctor-fix workflow generates a fix
+    # PR with no human step. Both bounded by max_issues_per_day below.
+    auto_create_issue: true
+    auto_fix_pr: true
+    fix_label: flow-doctor:fix
   # System-wide changelog corpus — every flow-doctor report lands as a
   # schema-1.0.0 entry at s3://alpha-engine-research/changelog/entries/
   # alongside CI deploy entries + SNS-mirrored alarm entries. Closes
@@ -25,5 +31,48 @@ store:
 dedup_cooldown_minutes: 60
 rate_limits:
   max_alerts_per_day: 10
-  max_issues_per_day: 3
-  max_diagnosed_per_day: 3
+  max_issues_per_day: 3       # caps issues -> labels -> fix-PR generations
+  max_diagnosed_per_day: 3    # caps diagnosis LLM calls
+
+# Top-level GitHub config consumed by the fix CLI (flow_doctor.fix.cli).
+github:
+  token: ${FLOW_DOCTOR_GITHUB_TOKEN}
+  labels: [flow-doctor]
+
+# LLM root-cause diagnosis. Required for fix-PR generation (the fix CLI
+# reads the diagnosis metadata embedded in the issue body). Haiku for the
+# soak — cheap; the hard daily dollar cap is the cost backstop.
+diagnosis:
+  enabled: true
+  model: claude-haiku-4-5
+  api_key: ${ANTHROPIC_API_KEY}
+  max_daily_cost_usd: 0.50
+
+# Auto-fix-PR generation (runs in the flow-doctor-fix GitHub Actions
+# workflow when an issue gets the fix label). Haiku, scoped to source
+# dirs, test-gated. dry_run: false so a PR actually opens for the soak —
+# PRs are proposals (human-reviewed), never auto-merged.
+auto_fix:
+  enabled: true
+  model: claude-haiku-4-5
+  confidence_threshold: 0.90
+  dry_run: false
+  test_command: "pytest tests/ -x -q"
+  scope:
+    allow:
+      - collectors/
+      - features/
+      - validators/
+      - builders/
+      - store/
+      - contracts/
+      - data/
+      - rag/
+    deny:
+      - "*.yaml"
+      - "*.yml"
+      - .github/
+      - infrastructure/
+      - tests/
+      - scripts/
+      - lambda/
