@@ -275,13 +275,45 @@ class TestBranchBContents:
             "WaitForPredictorTraining"
         )
 
-    def test_predictor_success_routes_to_branch_complete(self, branch_b):
+    def test_predictor_success_routes_to_model_zoo_rotation(self, branch_b):
+        # L4544: champion-retrain success now flows into the best-effort model-zoo
+        # rotation before the branch completes (skip path still → BranchBComplete).
         success = [
             c["Next"]
             for c in branch_b["CheckPredictorStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["BranchBComplete"]
+        assert success == ["ModelZooRotation"]
+
+    def test_model_zoo_rotation_is_best_effort(self, branch_b):
+        """L4544: the rotation must NEVER fail Branch B — every terminal path
+        (task Catch, poll Catch, any non-success poll Status) converges to
+        BranchBComplete, since the champion already trained+promoted."""
+        zoo = branch_b["ModelZooRotation"]
+        # Task-level Catch routes failure to BranchBComplete (not BranchBFailed).
+        assert any(
+            c["Next"] == "BranchBComplete" and "States.ALL" in c["ErrorEquals"]
+            for c in zoo["Catch"]
+        )
+        assert zoo["Next"] == "WaitForModelZoo"
+        # Same shared instance as the champion retrain.
+        assert zoo["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
+        # The command invokes the rotation entrypoint, honoring shell-run preflight.
+        cmd = zoo["Parameters"]["Parameters"]["commands.$"]
+        assert "--model-zoo-weekly" in cmd
+        assert "$.preflight_args" in cmd
+        # Poll Catch is best-effort; the status Choice defaults to BranchBComplete.
+        wait = branch_b["WaitForModelZoo"]
+        assert any(
+            c["Next"] == "BranchBComplete" and "States.ALL" in c["ErrorEquals"]
+            for c in wait["Catch"]
+        )
+        check = branch_b["CheckModelZooStatus"]
+        assert check["Default"] == "BranchBComplete"
+        nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
+        assert nexts["InProgress"] == "ModelZooWait"
+        assert nexts["Pending"] == "ModelZooWait"
+        assert branch_b["ModelZooWait"]["Next"] == "WaitForModelZoo"
 
     def test_branch_b_ssm_can_resolve_instance_id(self, branch_b):
         """Branch B's SSM calls reference $.ec2_instance_id — which is

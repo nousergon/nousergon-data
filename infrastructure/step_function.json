@@ -1401,7 +1401,7 @@
                 {
                   "Variable": "$.predictor_poll.Status",
                   "StringEquals": "Success",
-                  "Next": "BranchBComplete"
+                  "Next": "ModelZooRotation"
                 },
                 {
                   "Variable": "$.predictor_poll.Status",
@@ -1452,9 +1452,104 @@
                 }
               ]
             },
+            "ModelZooRotation": {
+              "Type": "Task",
+              "Comment": "L4544: after the champion retrain SUCCEEDS, train the weekly model-zoo rotation (challenger variants) + immediate leak-free-CPCV selection on the SAME spot instance, off the live-trading path. Observe-first: writes predictor/model_zoo/leaderboard/{date}.json and only PROMOTES if MODEL_ZOO_AUTO_PROMOTE_WINNER is set. BEST-EFFORT: every failure path routes to BranchBComplete (the champion already trained+promoted; a rotation failure must NEVER fail the Saturday SF). Budget=1 challenger/week (predictor.yaml model_zoo_weekly_budget) round-robins the 3 specs; each is ~one full train, so this extends Branch B by ~one champion-train.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-model-zoo --log /var/log/predictor-model-zoo.log -- bash infrastructure/spot_train.sh --model-zoo-weekly{}',$.preflight_args))",
+                  "executionTimeout": [
+                    "5400"
+                  ]
+                },
+                "TimeoutSeconds": 5400
+              },
+              "TimeoutSeconds": 5460,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 180,
+                  "BackoffRate": 2.0,
+                  "Comment": "Single best-effort retry (e.g. spot interruption); the rotation is non-critical so we do not over-retry."
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Best-effort: a rotation failure must NEVER fail the branch. The champion already trained+promoted.",
+                  "Next": "BranchBComplete",
+                  "ResultPath": "$.model_zoo_error"
+                }
+              ],
+              "ResultPath": "$.model_zoo_result",
+              "Next": "WaitForModelZoo"
+            },
+            "WaitForModelZoo": {
+              "Type": "Task",
+              "Comment": "Poll the model-zoo rotation SSM command until complete.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.model_zoo_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Best-effort: poll failure must not fail the branch.",
+                  "Next": "BranchBComplete",
+                  "ResultPath": "$.model_zoo_error"
+                }
+              ],
+              "ResultPath": "$.model_zoo_poll",
+              "Next": "CheckModelZooStatus"
+            },
+            "CheckModelZooStatus": {
+              "Type": "Choice",
+              "Comment": "Any non-success routes to BranchBComplete — the rotation is best-effort and its failure is logged on the box (predictor-model-zoo.log); the champion is already live.",
+              "Choices": [
+                {
+                  "Variable": "$.model_zoo_poll.Status",
+                  "StringEquals": "InProgress",
+                  "Next": "ModelZooWait"
+                },
+                {
+                  "Variable": "$.model_zoo_poll.Status",
+                  "StringEquals": "Pending",
+                  "Next": "ModelZooWait"
+                }
+              ],
+              "Default": "BranchBComplete"
+            },
+            "ModelZooWait": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "WaitForModelZoo"
+            },
             "BranchBComplete": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining quartet) completed (training success OR skipped via skip_predictor_training). Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch.",
+              "Comment": "Branch B (PredictorTraining quartet) completed (training success OR skipped via skip_predictor_training; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch.",
               "Result": {
                 "branch_b_status": "OK"
               },
