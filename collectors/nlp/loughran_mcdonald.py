@@ -48,12 +48,66 @@ from collectors.nlp.protocols import SentimentScore
 logger = logging.getLogger(__name__)
 
 
+class LmDictUnavailable(RuntimeError):
+    """The Loughran-McDonald master dictionary could not be made present
+    (missing locally AND the S3 fallback fetch failed). Producers should
+    treat this as a HARD failure rather than silently scoring all-zero
+    sentiment — see ``ensure_lm_master_dict`` + [[feedback_no_silent_fails]]."""
+
+
 # ── Lexicon I/O ────────────────────────────────────────────────────────
 
 
 _DEFAULT_LM_PATH = (
     Path(__file__).parent / "data" / "lm_master_dict.csv"
 )
+
+# Durable fallback source for the dict (the upstream Notre Dame Google-Drive
+# URL rotates and 404s — see L4575). We mirror the canonical CSV into our own
+# private S3 so any news-producing host can self-heal a missing local copy.
+_S3_DICT_BUCKET = "alpha-engine-research"
+_S3_DICT_KEY = "reference/nlp/lm_master_dict.csv"
+
+
+def ensure_lm_master_dict(
+    path: Path | None = None,
+    *,
+    s3_client=None,
+    bucket: str = _S3_DICT_BUCKET,
+    key: str = _S3_DICT_KEY,
+) -> Path:
+    """Ensure the LM master dict exists locally, fetching from S3 if missing.
+
+    Returns the resolved path on success. Raises :class:`LmDictUnavailable`
+    when the dict is absent locally AND the S3 fallback fetch fails — the
+    caller (a producer) must then fail loud rather than score all-zero
+    sentiment. Self-heals any host (trading box, Saturday spot) that never
+    ran the install script.
+    """
+    path = path or _DEFAULT_LM_PATH
+    if path.exists() and path.stat().st_size > 0:
+        return path
+    try:
+        if s3_client is None:
+            import boto3
+
+            s3_client = boto3.client("s3")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        s3_client.download_file(bucket, key, str(path))
+    except Exception as e:  # noqa: BLE001 — re-raise as the named hard failure
+        raise LmDictUnavailable(
+            f"LM master dict missing at {path} and S3 fallback fetch "
+            f"failed (s3://{bucket}/{key}): {e}"
+        ) from e
+    if not (path.exists() and path.stat().st_size > 0):
+        raise LmDictUnavailable(
+            f"LM master dict still absent/empty after S3 fetch to {path}"
+        )
+    logger.info(
+        "[loughran_mcdonald] fetched master dict from s3://%s/%s → %s",
+        bucket, key, path,
+    )
+    return path
 
 
 def load_lm_master_dict(

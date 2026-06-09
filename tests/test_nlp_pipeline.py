@@ -27,9 +27,11 @@ from collectors.nlp.rule_based_event_extraction import (
     RuleBasedEventExtractor,
 )
 from collectors.nlp.loughran_mcdonald import (
+    LmDictUnavailable,
     LoughranMcDonaldScorer,
     _tokenize,
     _truthy,
+    ensure_lm_master_dict,
     load_lm_master_dict,
 )
 from collectors.nlp.pipeline import NewsNLPPipeline, NewsNLPOutput
@@ -277,6 +279,43 @@ class TestLoadLmMasterDict:
         out = load_lm_master_dict(csv)
         assert "good" in out
         assert "" not in out
+
+
+class TestEnsureLmMasterDict:
+    """ensure_lm_master_dict self-heals a missing dict from S3, else fails loud
+    (L4575 — no silent all-zero sentiment)."""
+
+    def test_present_returns_path_without_fetch(self, tmp_path: Path):
+        p = tmp_path / "lm.csv"
+        p.write_text("Word,Negative,Positive\ngood,0,2009\n")
+        s3 = MagicMock()
+        assert ensure_lm_master_dict(p, s3_client=s3) == p
+        s3.download_file.assert_not_called()
+
+    def test_missing_fetches_from_s3(self, tmp_path: Path):
+        p = tmp_path / "nested" / "lm.csv"
+        s3 = MagicMock()
+
+        def _dl(bucket, key, dest):  # emulate a successful S3 download
+            Path(dest).write_text("Word,Negative,Positive\ngood,0,2009\n")
+
+        s3.download_file.side_effect = _dl
+        out = ensure_lm_master_dict(p, s3_client=s3)
+        assert out == p and p.exists()
+        s3.download_file.assert_called_once()
+
+    def test_missing_and_s3_fails_raises(self, tmp_path: Path):
+        p = tmp_path / "lm.csv"
+        s3 = MagicMock()
+        s3.download_file.side_effect = RuntimeError("no such key")
+        with pytest.raises(LmDictUnavailable):
+            ensure_lm_master_dict(p, s3_client=s3)
+
+    def test_empty_after_fetch_raises(self, tmp_path: Path):
+        p = tmp_path / "lm.csv"
+        s3 = MagicMock()  # download_file is a no-op → file never created
+        with pytest.raises(LmDictUnavailable):
+            ensure_lm_master_dict(p, s3_client=s3)
 
 
 # ── Anthropic event extractor ──────────────────────────────────────────

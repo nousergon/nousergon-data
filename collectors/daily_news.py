@@ -41,6 +41,11 @@ from datetime import date as Date
 from datetime import datetime, timezone
 from typing import Any
 
+from collectors.nlp.loughran_mcdonald import (
+    LmDictUnavailable,
+    ensure_lm_master_dict,
+)
+
 logger = logging.getLogger(__name__)
 
 DAILY_PREFIX = "data/news_aggregates_daily"
@@ -157,6 +162,25 @@ def collect(
     if not universe:
         logger.warning("[daily_news] empty universe — skipping news pull")
         return {"status": "skipped", "reason": "empty_universe", "tickers": 0}
+
+    # ── Ensure the LM sentiment dict is present (self-heal from S3) ──────────
+    # A missing dict makes the scorer silently return all-zero sentiment; rather
+    # than write that degraded artifact, fail loud here (L4575 /
+    # [[feedback_no_silent_fails]]). Checked BEFORE the ~17-min news pull so a
+    # dict outage fails fast. ensure_lm_master_dict self-heals any host that
+    # never ran the install script by fetching the canonical CSV from S3.
+    try:
+        ensure_lm_master_dict(s3_client=s3_client)
+    except LmDictUnavailable as e:
+        logger.error(
+            "[daily_news] %s — refusing to write an all-zero-sentiment artifact",
+            e,
+        )
+        return {
+            "status": "error",
+            "reason": "lm_dict_unavailable",
+            "tickers": len(universe),
+        }
 
     # ── Fetch (concurrent multi-source fan-in; deterministic) ────────────────
     # AsyncNewsAggregator.fetch is a coroutine — drive it from this sync entry
