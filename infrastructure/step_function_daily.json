@@ -796,7 +796,7 @@
 
     "RunDailyNews": {
       "Type": "Task",
-      "Comment": "Secondary daily news pull for the held + tracked universe (robodashboard holdings ∪ AE signals universe). Writes data/news_aggregates_daily/ for the robodashboard morning brief + AE consumers. Runs AFTER RunDaemon so it never delays the trading path. FAIL-SOFT: news must never fail the weekday SF — the Catch here, the WaitForDailyNews Catch, and the CheckDailyNewsStatus Default all route to PipelineComplete. ~50-70-ticker pull, concurrent fan-in via AsyncNewsAggregator (sources overlap), Polygon-bound at 5 req/min ≈ 12-14 min; executionTimeout 1800s gives headroom over that floor (bumped from 1200s 2026-06-09 — the sync aggregator summed sources sequentially and TimedOut every weekday, silently producing nothing; ROADMAP L4567).",
+      "Comment": "Secondary daily news pull for the held + tracked universe (robodashboard holdings ∪ AE signals universe). Writes data/news_aggregates_daily/ for the robodashboard morning brief + AE consumers. Runs AFTER RunDaemon so it never delays the trading path. FAIL-SOFT: news must never fail the weekday SF — the Catch here, the WaitForDailyNews Catch, and the CheckDailyNewsStatus Default all route to PipelineComplete. ~50-70-ticker pull, concurrent fan-in via AsyncNewsAggregator (sources overlap), Polygon-bound at 5 req/min ≈ 12-14 min; executionTimeout 1800s gives headroom over that floor (bumped from 1200s 2026-06-09 — the sync aggregator summed sources sequentially and TimedOut every weekday, silently producing nothing; ROADMAP L4573).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",

@@ -29,7 +29,7 @@ Run this as its own decoupled weekday SSM step (``python -m collectors.daily_new
 not inside ``_run_daily``; the ``RunDailyNews`` SF step's ``executionTimeout`` is
 sized with headroom over that floor. (Before 2026-06-09 this used the *sync*
 aggregator, which summed the sources sequentially and ``TimedOut`` every weekday
-at the 1200s ceiling, silently producing nothing — see ROADMAP L4567.)
+at the 1200s ceiling, silently producing nothing — see ROADMAP L4573.)
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def _build_aggregator():
 
     Uses :class:`AsyncNewsAggregator` (concurrent fan-in + per-vendor rate
     limits + tenacity retry) so the three sources overlap instead of summing
-    sequentially — the fix for the 1200s SSM timeout (ROADMAP L4567). Isolated
+    sequentially — the fix for the 1200s SSM timeout (ROADMAP L4573). Isolated
     as a seam so the daily orchestrator can be unit-tested without the adapter
     constructors or the SEC company-name fetch touching the network.
     """
@@ -161,7 +161,7 @@ def collect(
     # ── Fetch (concurrent multi-source fan-in; deterministic) ────────────────
     # AsyncNewsAggregator.fetch is a coroutine — drive it from this sync entry
     # point with anyio.run so the three vendors overlap (≈ Polygon-bound wall
-    # time) instead of summing sequentially past the SSM timeout (L4567).
+    # time) instead of summing sequentially past the SSM timeout (L4573).
     import functools
 
     import anyio
