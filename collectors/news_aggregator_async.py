@@ -159,6 +159,15 @@ class AsyncNewsAggregator:
     def source_names(self) -> tuple[str, ...]:
         return tuple(s.name for s in self._sources)
 
+    def trust_weight(self, source_name: str) -> float:
+        """Per-source trust weight — delegates to the wrapped sync aggregator.
+
+        Makes this class a drop-in for ``aggregate_and_write(aggregator=...)``
+        (which looks up per-source trust weights when building the aggregates
+        DataFrame). Same weights, same 0.5 fallback + warning as the sync path.
+        """
+        return self._sync_aggregator.trust_weight(source_name)
+
     def _semaphore_for(self, vendor: str) -> anyio.Semaphore:
         if vendor not in self._semaphores:
             limit = self._concurrency.get(vendor, 2)

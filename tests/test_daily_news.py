@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from collectors import daily_news
 
@@ -55,9 +55,25 @@ def test_collect_skips_on_empty_universe():
 
 
 def _fake_aggregator():
+    # AsyncNewsAggregator.fetch is a coroutine — collect() drives it via
+    # anyio.run, so the fetch seam must be awaitable.
     agg = MagicMock()
-    agg.fetch.return_value = []
+    agg.fetch = AsyncMock(return_value=[])
     return agg
+
+
+def test_build_aggregator_is_async_concurrent_fanin():
+    """The producer must use the concurrent AsyncNewsAggregator (3 sources
+    overlapping), not the sequential sync aggregator — the L4567 timeout fix.
+    """
+    from collectors.news_aggregator_async import AsyncNewsAggregator
+
+    with patch(
+        "rag.pipelines.run_news_pipeline._load_ticker_name_map", return_value={}
+    ):
+        agg = daily_news._build_aggregator()
+    assert isinstance(agg, AsyncNewsAggregator)
+    assert set(agg.source_names) == {"polygon", "gdelt", "yahoo_rss"}
 
 
 @patch("collectors.daily_news._build_nlp_pipeline")
