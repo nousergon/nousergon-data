@@ -796,7 +796,7 @@
 
     "RunDailyNews": {
       "Type": "Task",
-      "Comment": "Secondary daily news pull for the held + tracked universe (robodashboard holdings ∪ AE signals universe). Writes data/news_aggregates_daily/ for the robodashboard morning brief + AE consumers. Runs AFTER RunDaemon so it never delays the trading path. FAIL-SOFT: news must never fail the weekday SF — the Catch here, the WaitForDailyNews Catch, and the CheckDailyNewsStatus Default all route to PipelineComplete. ~50-70-ticker per-ticker Polygon pull at 5 req/min ≈ 12 min; executionTimeout 1200s absorbs it well under the SSM ceiling.",
+      "Comment": "Secondary daily news pull for the held + tracked universe (robodashboard holdings ∪ AE signals universe). Writes data/news_aggregates_daily/ for the robodashboard morning brief + AE consumers. Runs AFTER RunDaemon so it never delays the trading path. FAIL-SOFT: news must never fail the weekday SF — the Catch here, the WaitForDailyNews Catch, and the CheckDailyNewsStatus Default all route to PipelineComplete. ~50-70-ticker pull, concurrent fan-in via AsyncNewsAggregator (sources overlap), Polygon-bound at 5 req/min ≈ 12-14 min; executionTimeout 1800s gives headroom over that floor (bumped from 1200s 2026-06-09 — the sync aggregator summed sources sequentially and TimedOut every weekday, silently producing nothing; ROADMAP L4567).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -813,10 +813,10 @@
             "trap 'aws s3 cp /var/log/daily-news.log \"s3://alpha-engine-research/_ssm_logs/daily-news/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python -m collectors.daily_news 2>&1 | tee -a /var/log/daily-news.log"
           ],
-          "executionTimeout": ["1200"]
+          "executionTimeout": ["1800"]
         }
       },
-      "TimeoutSeconds": 1260,
+      "TimeoutSeconds": 1860,
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],

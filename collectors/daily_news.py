@@ -1,6 +1,6 @@
 """Daily news producer — weekday news pull for the held + tracked universe.
 
-Mirrors the Saturday ``run_news_pipeline`` chain (``NewsAggregator`` →
+Mirrors the Saturday ``run_news_pipeline`` chain (news aggregator →
 ``NewsNLPPipeline`` → ``aggregate_and_write``) but on a WEEKDAY cadence over a
 small, high-value universe:
 
@@ -21,11 +21,15 @@ robodashboard's brief (the held names) and AE's own tracked set — and Polygon'
 free tier is 5 req/min, so a per-ticker pull over 900 names is infeasible in any
 morning window. The full universe stays on the weekly Saturday cadence.
 
-NOTE on scheduling: a per-ticker pull over ~50-70 names at 5 req/min is ~10-14
-min. That is too long to bolt onto the latency-sensitive daily SSM step (the
-1200s ceiling — see ``weekly_collector.py`` daily-append comment). Run this as
-its own decoupled weekday step / invocation (``python -m collectors.daily_news``),
-not inside ``_run_daily``.
+NOTE on scheduling: a per-ticker pull over ~50-70 names is bounded by Polygon's
+free-tier 5 req/min (~12-14 min). We fan the three sources in CONCURRENTLY via
+:class:`AsyncNewsAggregator` (per-vendor rate limits + tenacity retry), so wall
+time ≈ the Polygon-bound ~12-14 min rather than the SUM of the three sources.
+Run this as its own decoupled weekday SSM step (``python -m collectors.daily_news``),
+not inside ``_run_daily``; the ``RunDailyNews`` SF step's ``executionTimeout`` is
+sized with headroom over that floor. (Before 2026-06-09 this used the *sync*
+aggregator, which summed the sources sequentially and ``TimedOut`` every weekday
+at the 1200s ceiling, silently producing nothing — see ROADMAP L4567.)
 """
 
 from __future__ import annotations
@@ -88,18 +92,21 @@ def assemble_universe(bucket: str, s3_client: Any) -> list[str]:
 
 
 def _build_aggregator():
-    """Construct the default multi-source aggregator (mirrors run_news_pipeline).
+    """Construct the default multi-source ASYNC aggregator.
 
-    Isolated as a seam so the daily orchestrator can be unit-tested without the
-    adapter constructors or the SEC company-name fetch touching the network.
+    Uses :class:`AsyncNewsAggregator` (concurrent fan-in + per-vendor rate
+    limits + tenacity retry) so the three sources overlap instead of summing
+    sequentially — the fix for the 1200s SSM timeout (ROADMAP L4567). Isolated
+    as a seam so the daily orchestrator can be unit-tested without the adapter
+    constructors or the SEC company-name fetch touching the network.
     """
-    from collectors.news_aggregator import NewsAggregator
+    from collectors.news_aggregator_async import AsyncNewsAggregator
     from collectors.news_sources.gdelt import GdeltNewsAdapter
     from collectors.news_sources.polygon import PolygonNewsAdapter
     from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
     from rag.pipelines.run_news_pipeline import _load_ticker_name_map
 
-    return NewsAggregator(
+    return AsyncNewsAggregator(
         sources=[
             PolygonNewsAdapter(),
             GdeltNewsAdapter(ticker_name_map=_load_ticker_name_map()),
@@ -151,9 +158,16 @@ def collect(
         logger.warning("[daily_news] empty universe — skipping news pull")
         return {"status": "skipped", "reason": "empty_universe", "tickers": 0}
 
-    # ── Fetch (mirrors run_news_pipeline; deterministic multi-source) ────────
+    # ── Fetch (concurrent multi-source fan-in; deterministic) ────────────────
+    # AsyncNewsAggregator.fetch is a coroutine — drive it from this sync entry
+    # point with anyio.run so the three vendors overlap (≈ Polygon-bound wall
+    # time) instead of summing sequentially past the SSM timeout (L4567).
+    import functools
+
+    import anyio
+
     aggregator = _build_aggregator()
-    articles = aggregator.fetch(universe, hours=hours)
+    articles = anyio.run(functools.partial(aggregator.fetch, universe, hours=hours))
     logger.info(
         "[daily_news] fetched %d aggregated articles for %d tickers",
         len(articles),
