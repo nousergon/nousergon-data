@@ -64,7 +64,7 @@ _load_dotenv()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -1802,4 +1802,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Capture an uncaught crash via flow-doctor before re-raising
+    # (no-ops when flow-doctor is inactive).
+    with guard_entrypoint():
+        main()

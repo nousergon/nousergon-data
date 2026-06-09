@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 from alpha_engine_lib.preflight import BasePreflight
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
@@ -78,4 +78,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Capture an uncaught crash via flow-doctor before re-raising
+    # (no-ops when flow-doctor is inactive).
+    with guard_entrypoint():
+        sys.exit(main())

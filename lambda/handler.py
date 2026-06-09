@@ -26,7 +26,7 @@ import traceback
 # where Dockerfile COPYs flow-doctor.yaml) takes precedence; falls back
 # to two-dirs-up from this file for local dev (lambda/handler.py →
 # repo root). Mirrors alpha-engine-research/lambda/handler.py.
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -44,6 +44,7 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 
+@monitor_handler
 def handler(event, context):
     """
     AWS Lambda handler for Phase 2 alternative data collection.
