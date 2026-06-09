@@ -31,13 +31,16 @@ from pathlib import Path
 
 
 # Update this URL when Bill McDonald rotates the dict version. As of
-# 2026-05-13 the latest stable release is the 2022 Master Dictionary.
-# The redirect-friendly URL pattern is preferred over the direct
-# Dropbox link which has changed multiple times.
+# 2026-06-09 the latest stable release is the 1993-2025 Master Dictionary
+# (updated March 2026). NOTE: this upstream Google-Drive id rotates and has
+# 404'd before (L4575) — production hosts self-heal from our own S3 mirror
+# (s3://alpha-engine-research/reference/nlp/lm_master_dict.csv) via
+# collectors.nlp.loughran_mcdonald.ensure_lm_master_dict, NOT this script.
+# This script is the operator path for (re)seeding that S3 mirror.
 LM_DICT_URL = (
     "https://drive.google.com/uc?export=download&id="
-    "17CmUZM9hGUdGUkXKZpaSPMUNVxlgnVfP"
-    # ^ 2022 Master Dictionary; if this 404s, fetch the latest URL from
+    "1iq2RUf8qGFEAk1g8wQntP3habOnR3fXF"
+    # ^ 1993-2025 Master Dictionary; if this 404s, fetch the latest URL from
     #   https://sraf.nd.edu/loughranmcdonald-master-dictionary/
 )
 

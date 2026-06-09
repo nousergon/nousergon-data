@@ -76,9 +76,10 @@ def test_build_aggregator_is_async_concurrent_fanin():
     assert set(agg.source_names) == {"polygon", "gdelt", "yahoo_rss"}
 
 
+@patch("collectors.daily_news.ensure_lm_master_dict")
 @patch("collectors.daily_news._build_nlp_pipeline")
 @patch("collectors.daily_news._build_aggregator")
-def test_collect_dry_run_does_not_write(mock_agg, mock_nlp):
+def test_collect_dry_run_does_not_write(mock_agg, mock_nlp, mock_ensure):
     mock_agg.return_value = _fake_aggregator()
     s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
     out = daily_news.collect("b", s3_client=s3, dry_run=True)
@@ -86,10 +87,11 @@ def test_collect_dry_run_does_not_write(mock_agg, mock_nlp):
     assert out["tickers"] == 2
 
 
+@patch("collectors.daily_news.ensure_lm_master_dict")
 @patch("data.derived.news_aggregates.aggregate_and_write")
 @patch("collectors.daily_news._build_nlp_pipeline")
 @patch("collectors.daily_news._build_aggregator")
-def test_collect_writes_to_daily_prefix(mock_agg, mock_nlp, mock_write):
+def test_collect_writes_to_daily_prefix(mock_agg, mock_nlp, mock_write, mock_ensure):
     mock_agg.return_value = _fake_aggregator()
     fake_df = MagicMock()
     fake_df.__len__ = lambda self: 7
@@ -102,3 +104,26 @@ def test_collect_writes_to_daily_prefix(mock_agg, mock_nlp, mock_write):
     # Wrote to the DAILY prefix, NOT the Saturday data/news_aggregates prefix.
     assert mock_write.call_args.kwargs["prefix"] == daily_news.DAILY_PREFIX
     assert out["rows"] == 7
+
+
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+@patch("collectors.daily_news.ensure_lm_master_dict")
+def test_collect_fails_loud_when_lm_dict_unavailable(
+    mock_ensure, mock_agg, mock_nlp, mock_write
+):
+    """A missing LM dict must NOT write an all-zero-sentiment artifact — the
+    producer returns an error status and never reaches the writer (L4575)."""
+    from collectors.nlp.loughran_mcdonald import LmDictUnavailable
+
+    mock_ensure.side_effect = LmDictUnavailable("missing + S3 fetch failed")
+    mock_agg.return_value = _fake_aggregator()
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "error"
+    assert out["reason"] == "lm_dict_unavailable"
+    mock_write.assert_not_called()  # no degraded artifact written
+    mock_agg.assert_not_called()  # failed fast, before the ~17-min news pull
