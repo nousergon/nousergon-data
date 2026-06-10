@@ -247,6 +247,7 @@
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/morning-enrich.log",
             "python weekly_collector.py --morning-enrich 2>&1 | tee -a /var/log/morning-enrich.log"
           ],
           "executionTimeout": ["1800"]
@@ -816,6 +817,7 @@
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/daily-news.log \"s3://alpha-engine-research/_ssm_logs/daily-news/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/daily-news.log",
             "python -m collectors.daily_news 2>&1 | tee -a /var/log/daily-news.log"
           ],
           "executionTimeout": ["1800"]
