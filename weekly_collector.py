@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,6 +66,7 @@ _load_dotenv()
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
 from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from alpha_engine_lib.phase_registry import PhaseRegistry
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -115,6 +117,104 @@ def _load_chronic_polygon_gaps(config: dict) -> list[str]:
     return sorted(tickers.keys())
 
 
+class _CollectorError(RuntimeError):
+    """Raised inside a phase block when a collector returns ``status=error`` so the
+    phase writes an ``error`` marker (→ a recovery RE-RUNS it) instead of a lying
+    ``ok`` marker. Caught at the call site to preserve best-effort-continue."""
+
+    def __init__(self, name: str, detail) -> None:
+        super().__init__(f"{name}: {detail}")
+        self.detail = detail
+
+
+def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "PhaseRegistry | None":
+    """Construct a per-date :class:`PhaseRegistry` for marker-based skip/resume +
+    watchdog (L4528 — data is the 2nd consumer of the lib phase framework, after
+    the backtester), or ``None`` in dry-run.
+
+    Dry-run returns None so a validation pass never writes markers — a dry-run
+    marker would claim ``ok`` while writing no artifact, poisoning a later real
+    run's auto-skip decision. ``--only <collector>`` and ``--force`` force every
+    phase to RUN (the operator explicitly asked for that work) while still writing
+    markers. Per-phase hard caps come from the optional ``full_run_hard_caps_seconds``
+    config block (absent → watchdog off, no behavior change).
+    """
+    if args.dry_run:
+        return None
+    _csv = lambda s: [p.strip() for p in (s or "").split(",") if p.strip()]
+    return PhaseRegistry(
+        date=date,
+        bucket=config["bucket"],
+        marker_prefix="data",
+        skip_phases=_csv(getattr(args, "skip_phases", "")),
+        force=bool(getattr(args, "force", False)) or (getattr(args, "only", None) is not None),
+        force_phases=_csv(getattr(args, "force_phases", "")),
+        hard_caps=config.get("full_run_hard_caps_seconds") or {},
+    )
+
+
+def _phase_collect(
+    reg: "PhaseRegistry | None",
+    name: str,
+    run_fn,
+    *,
+    artifact_key: str | None = None,
+    supports_auto_skip: bool = True,
+) -> dict:
+    """Run a collector under the phase registry (markers + L4524 artifact-validated
+    auto-skip + watchdog), preserving the module's best-effort-continue posture.
+
+    - ``reg is None`` (dry-run): run ``run_fn`` directly, no markers.
+    - auto-skip (prior ``ok`` marker AND its recorded artifact still on S3): return an
+      ``ok`` cache-hit dict WITHOUT recomputing. Recorded as ``ok`` — not ``skipped`` —
+      because the module's status aggregator fails the run on any non-``ok`` collector,
+      and a resumed phase is a success, not a failure.
+    - success: ``record_artifact(artifact_key)`` so the next run's L4524 checkpoint can
+      verify the output still exists (a marker whose artifact vanished re-runs).
+    - collector error / raise: write an ``error`` marker (via ``_CollectorError``) and
+      return an error dict so the loop continues AND main()'s aggregation still exits 1.
+
+    ``supports_auto_skip=False`` (multi-file / shared-DB / ArcticDB producers with no
+    single stable S3 key) → markers + watchdog only, the phase always runs.
+    """
+    if reg is None:
+        try:
+            return run_fn()
+        except Exception as e:  # best-effort: record + continue (mirrors prior try/except)
+            logger.error("%s failed: %s", name, e)
+            return {"status": "error", "error": str(e)}
+    try:
+        with reg.phase(name, supports_auto_skip=supports_auto_skip) as ctx:
+            if ctx.skipped:
+                logger.info(
+                    "%s: auto-skip (%s) — output already on S3 this date", name, ctx.skip_reason
+                )
+                return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
+            result = run_fn() or {}
+            if result.get("status") == "error":
+                raise _CollectorError(name, result.get("error"))
+            if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
+                ctx.record_artifact(artifact_key)
+            return result
+    except _CollectorError as ce:
+        return {"status": "error", "error": ce.detail}
+    except Exception as e:
+        logger.error("%s phase failed: %s", name, e)
+        return {"status": "error", "error": str(e)}
+
+
+def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
+    """Marker-only phase wrapper (watchdog + START/END marker, no auto-skip) for
+    steps whose body manages its own hard-fail/best-effort posture inline —
+    MorningEnrich's preflight/append/self-heal. Returns the registry's phase
+    context manager, or :func:`contextlib.nullcontext` in dry-run (reg is None).
+    The yielded value is unused by these call sites (no ``ctx.skipped`` / no
+    ``record_artifact``)."""
+    if reg is None:
+        return nullcontext()
+    return reg.phase(name, supports_auto_skip=False, **log_ctx)
+
+
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     """Run collectors based on mode selection."""
     if getattr(args, "morning_enrich", False):
@@ -144,6 +244,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
     run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     dry_run = args.dry_run
     only = args.only
+    reg = _build_registry(config, args, run_date)
 
     results: dict = {
         "phase": 1,
@@ -164,21 +265,17 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         logger.info("COLLECTING: constituents")
         logger.info("=" * 60)
-        try:
-            const_result = constituents.collect(
-                bucket=bucket,
-                s3_prefix=market_prefix,
-                run_date=run_date,
-                dry_run=dry_run,
-            )
-            results["collectors"]["constituents"] = const_result
-
-            # Use the tickers returned by collect() directly — saves the S3
-            # round-trip we previously needed to re-read what we just wrote.
-            tickers = const_result.get("tickers", [])
-        except Exception as e:
-            logger.error("Constituents collection failed: %s", e)
-            results["collectors"]["constituents"] = {"status": "error", "error": str(e)}
+        const_result = _phase_collect(
+            reg, "constituents",
+            lambda: constituents.collect(
+                bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
+            ),
+            artifact_key=f"{market_prefix}weekly/{run_date}/constituents.json",
+        )
+        results["collectors"]["constituents"] = const_result
+        # Use the tickers returned by collect() directly (empty on auto-skip →
+        # the load_from_s3 fallback below repopulates from the cached artifact).
+        tickers = const_result.get("tickers", [])
 
     # If we didn't collect constituents, load from S3
     if not tickers and only not in ("constituents",):
@@ -199,8 +296,12 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             logger.warning("No tickers available — skipping price cache refresh")
             results["collectors"]["prices"] = {"status": "skipped", "reason": "no tickers"}
         else:
-            try:
-                price_result = prices.collect(
+            # supports_auto_skip=False: prices writes per-ticker parquet (no single
+            # stable S3 key to validate), so markers + watchdog only — the phase
+            # always runs.
+            results["collectors"]["prices"] = _phase_collect(
+                reg, "prices",
+                lambda: prices.collect(
                     bucket=bucket,
                     tickers=tickers,
                     s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
@@ -208,11 +309,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     staleness_threshold_days=price_cfg.get("staleness_threshold_days", 3),
                     batch_size=price_cfg.get("refresh_batch_size", 50),
                     dry_run=dry_run,
-                )
-                results["collectors"]["prices"] = price_result
-            except Exception as e:
-                logger.error("Price cache refresh failed: %s", e)
-                results["collectors"]["prices"] = {"status": "error", "error": str(e)}
+                ),
+                supports_auto_skip=False,
+            )
 
     # ── 3. Slim cache — REMOVED (Wave-4) ─────────────────────────────────────
     # predictor/price_cache_slim/ deleted: every consumer (data macro-breadth
@@ -224,17 +323,13 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         logger.info("COLLECTING: macro data")
         logger.info("=" * 60)
-        try:
-            macro_result = macro.collect(
-                bucket=bucket,
-                s3_prefix=market_prefix,
-                run_date=run_date,
-                dry_run=dry_run,
-            )
-            results["collectors"]["macro"] = macro_result
-        except Exception as e:
-            logger.error("Macro collection failed: %s", e)
-            results["collectors"]["macro"] = {"status": "error", "error": str(e)}
+        results["collectors"]["macro"] = _phase_collect(
+            reg, "macro",
+            lambda: macro.collect(
+                bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
+            ),
+            artifact_key=f"{market_prefix}weekly/{run_date}/macro.json",
+        )
 
     # ── 4b. Short interest ───────────────────────────────────────────────────
     # Per-ticker yfinance Ticker.info scrape for the full S&P 500+400 universe.
@@ -259,19 +354,18 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 "status": "skipped", "reason": "no tickers",
             }
         else:
-            try:
-                si_result = short_interest.collect(
+            results["collectors"]["short_interest"] = _phase_collect(
+                reg, "short_interest",
+                lambda: short_interest.collect(
                     bucket=bucket,
                     tickers=tickers,
                     s3_prefix=market_prefix,
                     run_date=run_date,
                     inter_request_delay=si_cfg.get("inter_request_delay", 0.4),
                     dry_run=dry_run,
-                )
-                results["collectors"]["short_interest"] = si_result
-            except Exception as e:
-                logger.error("Short interest collection failed: %s", e)
-                results["collectors"]["short_interest"] = {"status": "error", "error": str(e)}
+                ),
+                artifact_key=f"{market_prefix}weekly/{run_date}/short_interest.json",
+            )
     elif only in (None, "short_interest") and not si_enabled:
         logger.info("short_interest collector disabled via config — skipping")
         results["collectors"]["short_interest"] = {"status": "ok", "skipped": "disabled_in_config"}
@@ -297,8 +391,11 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 db_path = None
 
         if db_path:
-            try:
-                ur_result = universe_returns.collect(
+            # supports_auto_skip=False: writes the shared mutable research.db (no
+            # dated artifact to validate) → markers + watchdog only.
+            results["collectors"]["universe_returns"] = _phase_collect(
+                reg, "universe_returns",
+                lambda: universe_returns.collect(
                     bucket=bucket,
                     db_path=db_path,
                     signals_prefix=ur_cfg.get("signals_prefix", "signals"),
@@ -306,11 +403,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                         "sector_map_key", "predictor/price_cache/sector_map.json"
                     ),
                     dry_run=dry_run,
-                )
-                results["collectors"]["universe_returns"] = ur_result
-            except Exception as e:
-                logger.error("Universe returns collection failed: %s", e)
-                results["collectors"]["universe_returns"] = {"status": "error", "error": str(e)}
+                ),
+                supports_auto_skip=False,
+            )
 
     # ── 5b. Signal returns (score_performance + predictor_outcomes) ────────────
     if only in (None, "signal_returns"):
@@ -320,19 +415,19 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         # Reuse the same db_path from universe_returns (already pulled from S3)
         sr_db_path = db_path
         if sr_db_path:
-            try:
-                sr_cfg = config.get("signal_returns") or {}
-                sr_result = signal_returns.collect(
+            sr_cfg = config.get("signal_returns") or {}
+            # supports_auto_skip=False: also writes the shared research.db.
+            results["collectors"]["signal_returns"] = _phase_collect(
+                reg, "signal_returns",
+                lambda: signal_returns.collect(
                     bucket=bucket,
                     db_path=sr_db_path,
                     signals_prefix=ur_cfg.get("signals_prefix", "signals"),
                     dry_run=dry_run,
                     forward_days=int(sr_cfg.get("forward_days", 21)),
-                )
-                results["collectors"]["signal_returns"] = sr_result
-            except Exception as e:
-                logger.error("Signal returns collection failed: %s", e)
-                results["collectors"]["signal_returns"] = {"status": "error", "error": str(e)}
+                ),
+                supports_auto_skip=False,
+            )
         else:
             results["collectors"]["signal_returns"] = {"status": "skipped", "reason": "no research.db"}
 
@@ -345,47 +440,39 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             logger.warning("No tickers available — skipping fundamentals")
             results["collectors"]["fundamentals"] = {"status": "skipped", "reason": "no tickers"}
         else:
-            try:
-                fund_result = fundamentals.collect(
-                    bucket=bucket,
-                    tickers=tickers,
-                    run_date=run_date,
-                    dry_run=dry_run,
-                )
-                results["collectors"]["fundamentals"] = fund_result
-            except Exception as e:
-                logger.error("Fundamentals collection failed: %s", e)
-                results["collectors"]["fundamentals"] = {"status": "error", "error": str(e)}
+            results["collectors"]["fundamentals"] = _phase_collect(
+                reg, "fundamentals",
+                lambda: fundamentals.collect(
+                    bucket=bucket, tickers=tickers, run_date=run_date, dry_run=dry_run,
+                ),
+                artifact_key=f"archive/fundamentals/{run_date}.json",
+            )
 
     # ── 7. Feature store compute ───────────────────────────────────────────
     if only in (None, "features"):
         logger.info("=" * 60)
         logger.info("COMPUTING: feature store snapshot")
         logger.info("=" * 60)
-        try:
-            from features.compute import compute_and_write
-            fs_result = compute_and_write(
-                date_str=run_date,
-                bucket=bucket,
-                dry_run=dry_run,
-            )
-            results["collectors"]["features"] = fs_result
-        except Exception as e:
-            logger.error("Feature store compute failed: %s", e)
-            results["collectors"]["features"] = {"status": "error", "error": str(e)}
+        from features.compute import compute_and_write
+        results["collectors"]["features"] = _phase_collect(
+            reg, "features",
+            lambda: compute_and_write(date_str=run_date, bucket=bucket, dry_run=dry_run),
+            artifact_key=f"features/{run_date}/schema_version.json",
+        )
 
     # ── 8. ArcticDB universe rebuild ─────────────────────────────────────────
     if only in (None, "arcticdb"):
         logger.info("=" * 60)
         logger.info("REBUILDING: ArcticDB universe (full backfill)")
         logger.info("=" * 60)
-        try:
-            from builders.backfill import backfill
-            arctic_result = backfill(bucket=bucket, dry_run=dry_run, run_date=run_date)
-            results["collectors"]["arcticdb"] = arctic_result
-        except Exception as e:
-            logger.error("ArcticDB backfill failed: %s", e)
-            results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+        from builders.backfill import backfill
+        # supports_auto_skip=False: writes ArcticDB (no S3 key); backfill is
+        # idempotent and cheap to repeat → markers + watchdog only.
+        results["collectors"]["arcticdb"] = _phase_collect(
+            reg, "arcticdb",
+            lambda: backfill(bucket=bucket, dry_run=dry_run, run_date=run_date),
+            supports_auto_skip=False,
+        )
 
     # ── Finalize ─────────────────────────────────────────────────────────────
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -399,6 +486,7 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
     run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     dry_run = args.dry_run
+    reg = _build_registry(config, args, run_date)
 
     results: dict = {
         "phase": 2,
@@ -410,17 +498,13 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     logger.info("COLLECTING: alternative data (Phase 2)")
     logger.info("=" * 60)
-    try:
-        alt_result = alternative.collect(
-            bucket=bucket,
-            s3_prefix=market_prefix,
-            run_date=run_date,
-            dry_run=dry_run,
-        )
-        results["collectors"]["alternative"] = alt_result
-    except Exception as e:
-        logger.error("Alternative data collection failed: %s", e)
-        results["collectors"]["alternative"] = {"status": "error", "error": str(e)}
+    results["collectors"]["alternative"] = _phase_collect(
+        reg, "alternative",
+        lambda: alternative.collect(
+            bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
+        ),
+        artifact_key=f"{market_prefix}weekly/{run_date}/alternative/manifest.json",
+    )
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     _finalize(results, bucket, market_prefix, run_date, dry_run, None)
@@ -951,6 +1035,9 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             }
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
+    # Registry date = target_date (the prior trading day MorningEnrich enriches),
+    # so markers land under data/{target_date}/.phases/. None in dry-run.
+    reg = _build_registry(config, args, target_date)
 
     results: dict = {
         "mode": "morning_enrich",
@@ -981,12 +1068,13 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         logger.info("REFRESHING: constituents (pre-MorningEnrich)")
         logger.info("=" * 60)
         try:
-            cons_result = constituents.collect(
-                bucket=bucket,
-                s3_prefix=market_prefix,
-                run_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                dry_run=False,
-            )
+            with _maybe_phase(reg, "morning_constituents"):
+                cons_result = constituents.collect(
+                    bucket=bucket,
+                    s3_prefix=market_prefix,
+                    run_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    dry_run=False,
+                )
             results["collectors"]["constituents_preflight"] = cons_result
             tickers = cons_result.get("tickers", [])
             logger.info(
@@ -1011,12 +1099,13 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             # "stale enough to drop". The post-Phase-1 prune still runs
             # later with the conservative 14d default for any newcomers
             # the SF picked up between MorningEnrich and Phase 1.
-            prune_result = prune_delisted_tickers(
-                bucket=bucket,
-                absent_days=5,
-                apply=True,
-                constituents_override=set(tickers),
-            )
+            with _maybe_phase(reg, "morning_prune"):
+                prune_result = prune_delisted_tickers(
+                    bucket=bucket,
+                    absent_days=5,
+                    apply=True,
+                    constituents_override=set(tickers),
+                )
             results["collectors"]["prune_preflight"] = prune_result
             logger.info(
                 "Pre-MorningEnrich prune: pruned %d stragglers (skipped_recent=%d)",
@@ -1084,16 +1173,17 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     window_days = int(daily_cfg.get("window_days", 1))
     skip_if_canonical = bool(daily_cfg.get("skip_if_canonical", False))
     try:
-        dc_result = daily_closes.collect(
-            bucket=bucket,
-            tickers=tickers,
-            run_date=target_date,
-            s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
-            dry_run=dry_run,
-            source="polygon_only",
-            window_days=window_days,
-            skip_if_canonical=skip_if_canonical,
-        )
+        with _maybe_phase(reg, "morning_daily_closes"):
+            dc_result = daily_closes.collect(
+                bucket=bucket,
+                tickers=tickers,
+                run_date=target_date,
+                s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
+                dry_run=dry_run,
+                source="polygon_only",
+                window_days=window_days,
+                skip_if_canonical=skip_if_canonical,
+            )
         results["collectors"]["daily_closes"] = dc_result
     except Exception as e:
         logger.exception("Morning polygon enrichment failed for %s", target_date)
@@ -1110,12 +1200,13 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     try:
         from builders.daily_append import daily_append
-        arctic_result = daily_append(
-            date_str=target_date,
-            bucket=bucket,
-            dry_run=dry_run,
-            expected_tickers=tickers,
-        )
+        with _maybe_phase(reg, "morning_arcticdb"):
+            arctic_result = daily_append(
+                date_str=target_date,
+                bucket=bucket,
+                dry_run=dry_run,
+                expected_tickers=tickers,
+            )
         results["collectors"]["arcticdb"] = arctic_result
     except Exception as e:
         logger.exception("ArcticDB daily_append (morning enrich) failed for %s", target_date)
@@ -1185,12 +1276,13 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         )
         logger.info("=" * 60)
         try:
-            heal_result = _self_heal_chronic_polygon_gaps(
-                bucket=bucket,
-                target_date=target_date,
-                chronic_tickers=chronic_tickers,
-                dry_run=dry_run,
-            )
+            with _maybe_phase(reg, "morning_self_heal"):
+                heal_result = _self_heal_chronic_polygon_gaps(
+                    bucket=bucket,
+                    target_date=target_date,
+                    chronic_tickers=chronic_tickers,
+                    dry_run=dry_run,
+                )
             # Always "ok" by design — chronic-gap self-heal is best-effort.
             # Postflight is the load-bearing gate; if a chronic ticker is
             # still stale after this step, postflight raises. Marking it
@@ -1289,6 +1381,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
+    reg = _build_registry(config, args, run_date)
 
     results: dict = {
         "mode": "daily",
@@ -1346,26 +1439,26 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     # entirely so the batch cost stays near zero in steady state.
     window_days = int(daily_cfg.get("window_days", 1))
     skip_if_canonical = bool(daily_cfg.get("skip_if_canonical", False))
-    try:
-        # EOD pass uses yfinance_only — polygon free-tier 403's same-day, and
-        # silently substituting yfinance was the 2026-04-17 → 2026-04-23 VWAP
-        # outage. Morning polygon_only enrichment (separate SF step) fills VWAP
-        # the next morning by overwriting these rows with polygon's authoritative
-        # OHLCV+VWAP. See module docstring on collectors/daily_closes.py.
-        dc_result = daily_closes.collect(
+    _dc_prefix = daily_cfg.get("s3_prefix", "staging/daily_closes/")
+    # EOD pass uses yfinance_only — polygon free-tier 403's same-day, and
+    # silently substituting yfinance was the 2026-04-17 → 2026-04-23 VWAP
+    # outage. Morning polygon_only enrichment (separate SF step) fills VWAP
+    # the next morning by overwriting these rows with polygon's authoritative
+    # OHLCV+VWAP. See module docstring on collectors/daily_closes.py.
+    results["collectors"]["daily_closes"] = _phase_collect(
+        reg, "daily_closes",
+        lambda: daily_closes.collect(
             bucket=bucket,
             tickers=tickers,
             run_date=run_date,
-            s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
+            s3_prefix=_dc_prefix,
             dry_run=dry_run,
             source="yfinance_only",
             window_days=window_days,
             skip_if_canonical=skip_if_canonical,
-        )
-        results["collectors"]["daily_closes"] = dc_result
-    except Exception as e:
-        logger.error("Daily closes collection failed: %s", e)
-        results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
+        ),
+        artifact_key=f"{_dc_prefix}{run_date}.parquet",
+    )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
     # executor gate at alpha-engine/executor/main.py reads this key to decide
@@ -1395,17 +1488,12 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     logger.info("COMPUTING: feature store snapshot")
     logger.info("=" * 60)
-    try:
-        from features.compute import compute_and_write
-        fs_result = compute_and_write(
-            date_str=run_date,
-            bucket=bucket,
-            dry_run=dry_run,
-        )
-        results["collectors"]["features"] = fs_result
-    except Exception as e:
-        logger.exception("Feature store compute failed")
-        results["collectors"]["features"] = {"status": "error", "error": str(e)}
+    from features.compute import compute_and_write
+    results["collectors"]["features"] = _phase_collect(
+        reg, "features",
+        lambda: compute_and_write(date_str=run_date, bucket=bucket, dry_run=dry_run),
+        artifact_key=f"features/{run_date}/schema_version.json",
+    )
 
     # ── ArcticDB daily append ────────────────────────────────────────────────
     # EOD post-market path: yfinance closes are immutable once written, so
@@ -1418,19 +1506,20 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     logger.info("APPENDING: ArcticDB universe (daily)")
     logger.info("=" * 60)
-    try:
-        from builders.daily_append import daily_append
-        arctic_result = daily_append(
+    from builders.daily_append import daily_append
+    # supports_auto_skip=False: ArcticDB write (no S3 key) + already cheap on
+    # re-run via skip_if_exists=True → markers + watchdog only.
+    results["collectors"]["arcticdb"] = _phase_collect(
+        reg, "arcticdb",
+        lambda: daily_append(
             date_str=run_date,
             bucket=bucket,
             dry_run=dry_run,
             skip_if_exists=True,
             expected_tickers=tickers,
-        )
-        results["collectors"]["arcticdb"] = arctic_result
-    except Exception as e:
-        logger.exception("ArcticDB daily append failed")
-        results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+        ),
+        supports_auto_skip=False,
+    )
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -1722,6 +1811,21 @@ def _parse_args() -> argparse.Namespace:
         "--only",
         choices=["constituents", "prices", "macro", "short_interest", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
+    )
+    # Phase-registry recovery controls (L4528 — markers under data/{date}/.phases/).
+    # A recovery re-run of the same date auto-skips collectors whose marker is ok
+    # AND whose declared S3 artifact still exists (L4524). These flags override that:
+    parser.add_argument(
+        "--skip-phases", dest="skip_phases", default="",
+        help="CSV of phase names to force-SKIP this run (e.g. 'prices,features').",
+    )
+    parser.add_argument(
+        "--force-phases", dest="force_phases", default="",
+        help="CSV of phase names to force-RERUN even if a valid marker exists.",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force-rerun ALL phases (ignore every completion marker).",
     )
     parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
