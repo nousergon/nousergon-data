@@ -41,6 +41,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # flow-doctor's load_config strictly resolves EVERY ${VAR} in
+          # flow-doctor.yaml at load time, including the email-notify block —
+          # which the fix CLI never uses (it comments via the --token arg and
+          # reads diagnosis.api_key/ANTHROPIC_API_KEY). On EC2 those vars come
+          # from the box env; in CI they're absent, so the run died with
+          # "ConfigError: Unresolved environment variable(s): EMAIL_SENDER".
+          # Empty values satisfy resolution (os.environ.get -> "" != None).
+          # BRIDGE: remove once flow-doctor rc3 (fix CLI loads config with
+          # allow_unresolved) propagates via the alpha-engine-lib re-pin.
+          FLOW_DOCTOR_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EMAIL_SENDER: ""
+          EMAIL_RECIPIENTS: ""
+          GMAIL_APP_PASSWORD: ""
         run: |
           python -m flow_doctor.fix.cli generate-fix \
             --issue-number ${{ github.event.issue.number }} \
