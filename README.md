@@ -65,4 +65,4 @@ This repo is **public**. `config.yaml` is gitignored locally; real values (S3 bu
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial licenses available — contact brian@nousergon.ai.
