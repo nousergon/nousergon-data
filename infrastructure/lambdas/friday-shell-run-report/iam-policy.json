@@ -1,0 +1,33 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-friday-shell-run-report:*"
+    },
+    {
+      "Sid": "ReadSaturdayExecutionHistory",
+      "Effect": "Allow",
+      "Action": ["states:GetExecutionHistory"],
+      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:*"
+    },
+    {
+      "Sid": "WriteShellRunReport",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/friday-shell-run/*"
+    },
+    {
+      "Sid": "PublishSummary",
+      "Effect": "Allow",
+      "Action": ["sns:Publish"],
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    }
+  ]
+}

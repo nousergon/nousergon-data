@@ -1,0 +1,5 @@
+# Only alpha_engine_lib.trading_calendar.last_closed_trading_day is used (the
+# trading_day fallback when an execution name lacks the friday-shell-{date}
+# prefix). Pinned to match the sibling eod-success-friday-shell-trigger Lambda
+# so the two Friday-shell-run Lambdas share one lib-date substrate.
+alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.20.0
