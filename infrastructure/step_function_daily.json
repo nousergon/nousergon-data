@@ -223,7 +223,7 @@
               "StringMatches": "*TRADING DAY*"
             }
           ],
-          "Next": "MorningEnrich"
+          "Next": "CheckSkipMorningEnrich"
         }
       ],
       "Default": "TradingDayCheckFailed"
@@ -302,7 +302,7 @@
         {
           "Variable": "$.morning_enrich_poll.Status",
           "StringEquals": "Success",
-          "Next": "ChronicGapSelfHeal"
+          "Next": "CheckSkipChronicGapHeal"
         },
         {
           "Variable": "$.morning_enrich_poll.Status",
@@ -358,7 +358,7 @@
             "States.ALL"
           ],
           "Comment": "Fail-soft — a chronic-gap heal failure (incl. the SSM-timeout SIGKILL it used to cause) must never block predictions. Proceed to PredictorInference.",
-          "Next": "PredictorInference",
+          "Next": "CheckSkipPredictorInference",
           "ResultPath": "$.chronic_gap_error"
         }
       ],
@@ -390,7 +390,7 @@
             "States.ALL"
           ],
           "Comment": "Fail-soft — a poll failure proceeds to PredictorInference, no heal that day.",
-          "Next": "PredictorInference",
+          "Next": "CheckSkipPredictorInference",
           "ResultPath": "$.chronic_gap_error"
         }
       ],
@@ -413,7 +413,7 @@
           "Next": "ChronicGapWait"
         }
       ],
-      "Default": "PredictorInference"
+      "Default": "CheckSkipPredictorInference"
     },
 
     "ChronicGapWait": {
@@ -438,7 +438,7 @@
         "Message.$": "States.Format('Trading day check failed (SSM error, not a holiday detection). Pipeline proceeding as trading day. State: {}', States.JsonToString($))"
       },
       "ResultPath": "$.trading_day_error_notify",
-      "Next": "MorningEnrich"
+      "Next": "CheckSkipMorningEnrich"
     },
 
     "StopExecutorOnHoliday": {
@@ -757,12 +757,12 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Predictor health check is non-blocking — continue to morning planner. Executor's own upstream-health gate catches real data-freshness problems before placing orders.",
-          "Next": "RunMorningPlanner",
+          "Next": "CheckSkipMorningPlanner",
           "ResultPath": "$.predictor_health_error"
         }
       ],
       "ResultPath": "$.predictor_health_result",
-      "Next": "RunMorningPlanner"
+      "Next": "CheckSkipMorningPlanner"
     },
 
     "RunMorningPlanner": {
@@ -843,7 +843,7 @@
         {
           "Variable": "$.planner_poll.Status",
           "StringEquals": "Success",
-          "Next": "RunDaemon"
+          "Next": "CheckSkipRunDaemon"
         },
         {
           "Variable": "$.planner_poll.Status",
@@ -894,7 +894,7 @@
         }
       ],
       "ResultPath": "$.daemon_result",
-      "Next": "RunDailyNews"
+      "Next": "CheckSkipRunDailyNews"
     },
 
     "RunDailyNews": {
@@ -986,6 +986,96 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDailyNews"
+    },
+
+    "CheckSkipMorningEnrich": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_enrich\": true} routes past MorningEnrich to the next gate (CheckSkipChronicGapHeal); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the weekday pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work. The 2026-06-11 chronic-gap rerun had to re-run the already-completed MorningEnrich daily_append (~20 min) because this gate did not exist. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_morning_enrich", "IsPresent": true},
+            {"Variable": "$.skip_morning_enrich", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipChronicGapHeal"
+        }
+      ],
+      "Default": "MorningEnrich"
+    },
+
+    "CheckSkipChronicGapHeal": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_chronic_gap_heal\": true} routes past ChronicGapSelfHeal to the next gate (CheckSkipPredictorInference); missing flag = run as normal. The heal is already best-effort/fail-soft, so skipping it on a rerun is always safe. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_chronic_gap_heal", "IsPresent": true},
+            {"Variable": "$.skip_chronic_gap_heal", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipPredictorInference"
+        }
+      ],
+      "Default": "ChronicGapSelfHeal"
+    },
+
+    "CheckSkipPredictorInference": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_predictor_inference\": true} routes past PredictorInference (and its coverage/health sub-chain) to the next gate (CheckSkipMorningPlanner); missing flag = run as normal. Skip only when predictions/{date}.json already exists from a prior run. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_predictor_inference", "IsPresent": true},
+            {"Variable": "$.skip_predictor_inference", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipMorningPlanner"
+        }
+      ],
+      "Default": "PredictorInference"
+    },
+
+    "CheckSkipMorningPlanner": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_planner\": true} routes past RunMorningPlanner to the next gate (CheckSkipRunDaemon); missing flag = run as normal. The planner writes the order book but places no orders, so re-running it is normally safe; skip is for reruns where the book is already current. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_morning_planner", "IsPresent": true},
+            {"Variable": "$.skip_morning_planner", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipRunDaemon"
+        }
+      ],
+      "Default": "RunMorningPlanner"
+    },
+
+    "CheckSkipRunDaemon": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) to the next gate (CheckSkipRunDailyNews); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_run_daemon", "IsPresent": true},
+            {"Variable": "$.skip_run_daemon", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipRunDailyNews"
+        }
+      ],
+      "Default": "RunDaemon"
+    },
+
+    "CheckSkipRunDailyNews": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daily_news\": true} routes past RunDailyNews directly to PipelineComplete; missing flag = run as normal. Daily news is already fail-soft. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_run_daily_news", "IsPresent": true},
+            {"Variable": "$.skip_run_daily_news", "BooleanEquals": true}
+          ],
+          "Next": "PipelineComplete"
+        }
+      ],
+      "Default": "RunDailyNews"
     },
 
     "PipelineComplete": {
