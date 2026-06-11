@@ -1736,6 +1736,21 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: metron_market_data.collect(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.CLOSES_PREFIX}{run_date}.json",
     )
+    # Per-symbol close-history + per-currency FX-history for Metron's NAV reconstruction +
+    # as-of-date realized/dividend FX. Per-symbol keys (no single stable artifact) →
+    # markers + watchdog only, no auto-skip.
+    results["collectors"]["metron_market_data_history"] = _phase_collect(
+        reg, "metron_market_data_history",
+        lambda: metron_market_data.collect_history(bucket=bucket, dry_run=dry_run),
+        supports_auto_skip=False,
+    )
+    # GICS sectors + SPY weights + earnings dates — Metron's last external fetches, now
+    # on the spine so Metron reads ALL market/reference data from `data`.
+    results["collectors"]["metron_reference_data"] = _phase_collect(
+        reg, "metron_reference_data",
+        lambda: metron_market_data.collect_reference(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.SECTORS_PREFIX}latest.json",
+    )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
     # executor gate at alpha-engine/executor/main.py reads this key to decide

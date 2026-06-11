@@ -41,9 +41,36 @@ DEFAULT_BUCKET = "alpha-engine-research"
 HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
 CLOSES_PREFIX = "market_data/eod_closes/"
 FX_PREFIX = "market_data/fx/"
+# History artifacts (per-symbol / per-currency) — power Metron's Performance NAV
+# reconstruction (close series) + as-of-date realized/dividend FX conversion.
+CLOSE_HISTORY_PREFIX = "market_data/close_history/"
+FX_HISTORY_PREFIX = "market_data/fx_history/"
+# Reference data — GICS sector per held symbol + SPY's sector weights (Brinson
+# attribution), and each held symbol's next earnings date (Calendar page). Moves
+# Metron's last yfinance fetches to the spine so Metron reads ALL external data here.
+SECTORS_PREFIX = "market_data/sectors/"
+EARNINGS_PREFIX = "market_data/earnings/"
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
+CLOSE_HISTORY_SCHEMA_VERSION = 1
+FX_HISTORY_SCHEMA_VERSION = 1
+SECTORS_SCHEMA_VERSION = 1
+EARNINGS_SCHEMA_VERSION = 1
 BASE_CURRENCY = "USD"
+DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
+BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
+
+# yfinance ``funds_data.sector_weightings`` snake_case keys → canonical GICS label
+# (the Title-Case labels ``Ticker.info['sector']`` returns). Stable GICS reference;
+# mirrored from metron portfolio_analytics/sectors.
+_FUNDS_SECTOR_KEY = {
+    "technology": "Technology", "financial_services": "Financial Services",
+    "healthcare": "Healthcare", "consumer_cyclical": "Consumer Cyclical",
+    "consumer_defensive": "Consumer Defensive", "energy": "Energy",
+    "industrials": "Industrials", "basic_materials": "Basic Materials",
+    "utilities": "Utilities", "realestate": "Real Estate",
+    "communication_services": "Communication Services",
+}
 
 _YFINANCE_BATCH_SIZE = 100
 _YFINANCE_BATCH_DELAY = 2  # seconds between batches (rate-limit courtesy)
@@ -53,6 +80,14 @@ _YFINANCE_BATCH_DELAY = 2  # seconds between batches (rate-limit courtesy)
 CloseSource = Callable[[list[str]], dict[str, tuple[float, str]]]
 # An FX source maps currencies → {currency: rate} (base per 1 unit of currency).
 FxSource = Callable[[list[str]], dict[str, float]]
+# History sources map symbols/currencies → {key: [(date_iso, value), …]} ascending.
+CloseHistorySource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
+FxHistorySource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
+# Reference sources: sectors maps yf_symbols → {yf_symbol: gics}; benchmark weights is a
+# 0-arg → {sector: weight}; earnings maps yf_symbols → {yf_symbol: date_iso}.
+SectorSource = Callable[[list[str]], dict[str, str]]
+BenchmarkWeightsSource = Callable[[], dict[str, float]]
+EarningsSource = Callable[[list[str]], dict[str, str]]
 
 
 # ── Universe read ───────────────────────────────────────────────────────────
@@ -162,6 +197,113 @@ def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, 
     return out
 
 
+def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY) -> dict[str, list[tuple[str, float]]]:
+    """Daily close series per symbol via yfinance over ``period`` →
+    ``{key: [(bar_date, close), …]}`` ascending. ``is_fx`` maps a currency to the
+    ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted."""
+    try:
+        import pandas as pd
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        logger.warning("[metron_market_data] yfinance/pandas unavailable for history")
+        return {}
+
+    targets = {f"{c}{base}=X": c for c in symbols if c and c != base} if is_fx else {s: s for s in symbols if s}
+    if not targets:
+        return {}
+    out: dict[str, list[tuple[str, float]]] = {}
+    keys = list(targets)
+    batches = [keys[i:i + _YFINANCE_BATCH_SIZE] for i in range(0, len(keys), _YFINANCE_BATCH_SIZE)]
+    for i, batch in enumerate(batches):
+        if i > 0:
+            time.sleep(_YFINANCE_BATCH_DELAY)
+        try:
+            raw = yf.download(tickers=batch[0] if len(batch) == 1 else batch, period=period,
+                              interval="1d", auto_adjust=False, progress=False, group_by="ticker", threads=True)
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+            for key in batch:
+                try:
+                    df = (raw[key] if is_multi else raw).copy()
+                    df.index = pd.to_datetime(df.index)
+                    df = df.dropna(subset=["Close"])
+                    if df.empty:
+                        continue
+                    out[targets[key]] = [(d.date().isoformat(), round(float(c), 6)) for d, c in df["Close"].items()]
+                except Exception as e:
+                    logger.warning("[metron_market_data] history extract failed for %s: %s", key, e)
+        except Exception as e:
+            logger.warning("[metron_market_data] yfinance history batch failed: %s", e)
+    logger.info("[metron_market_data] history: %d/%d series captured", len(out), len(targets))
+    return out
+
+
+def _yfinance_close_history(yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
+    return _yf_history(yf_symbols, period, is_fx=False)
+
+
+def _yfinance_fx_history(currencies: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
+    return _yf_history(currencies, period, is_fx=True)
+
+
+def _yfinance_sectors(yf_symbols: list[str]) -> dict[str, str]:
+    """Canonical GICS sector per held symbol via ``yf.Ticker(sym).info['sector']``.
+    Fail-soft: an unclassifiable symbol is omitted (Metron shows a coverage gap)."""
+    try:
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    out: dict[str, str] = {}
+    for sym in yf_symbols:
+        try:
+            sector = (yf.Ticker(sym).info or {}).get("sector")
+            if sector:
+                out[sym] = str(sector)
+        except Exception as e:
+            logger.warning("[metron_market_data] sector fetch failed for %s: %s", sym, e)
+    logger.info("[metron_market_data] sectors: %d/%d classified", len(out), len(yf_symbols))
+    return out
+
+
+def _yfinance_spy_weights() -> dict[str, float]:
+    """SPY's live GICS sector weights (canonical label → fraction) via
+    ``funds_data.sector_weightings`` (snake_case → canonical). ``{}`` on failure."""
+    try:
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    try:
+        raw = yf.Ticker(BENCHMARK).funds_data.sector_weightings or {}
+    except Exception as e:
+        logger.warning("[metron_market_data] SPY sector weights fetch failed: %s", e)
+        return {}
+    return {_FUNDS_SECTOR_KEY[k]: float(v) for k, v in raw.items() if k in _FUNDS_SECTOR_KEY}
+
+
+def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
+    """Next (earliest upcoming) earnings date per held symbol via yfinance →
+    ``{yf_symbol: date_iso}``. Fail-soft: no resolvable date → omitted."""
+    try:
+        import pandas as pd
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    out: dict[str, str] = {}
+    for sym in yf_symbols:
+        try:
+            df = yf.Ticker(sym).get_earnings_dates(limit=8)
+            if df is None or df.empty:
+                continue
+            idx = pd.to_datetime(df.index)
+            today = pd.Timestamp.utcnow().tz_localize(None)
+            future = sorted(d for d in idx.tz_localize(None) if d >= today)
+            if future:
+                out[sym] = future[0].date().isoformat()
+        except Exception as e:
+            logger.warning("[metron_market_data] earnings fetch failed for %s: %s", sym, e)
+    logger.info("[metron_market_data] earnings: %d/%d dated", len(out), len(yf_symbols))
+    return out
+
+
 # ── S3 write (the single put-object site for this file) ──────────────────────
 
 
@@ -246,16 +388,110 @@ def collect(
     }
 
 
+def collect_history(
+    *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
+    period: str = DEFAULT_HISTORY_PERIOD,
+    close_history_source: CloseHistorySource | None = None,
+    fx_history_source: FxHistorySource | None = None,
+) -> dict:
+    """Write per-symbol close-history + per-currency FX-history artifacts for Metron's
+    held universe (Performance NAV reconstruction + as-of-date realized/dividend FX):
+
+        market_data/close_history/{yf_symbol}.json  {schema_version, yf_symbol, currency, closes: [[date, close], …]}
+        market_data/fx_history/{CCY}.json           {schema_version, currency, base, rates: [[date, rate], …]}
+
+    Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, currencies = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
+    closes = (close_history_source or _yfinance_close_history)(sorted(ccy_by_yf))
+    fx = (fx_history_source or _yfinance_fx_history)(currencies)
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))
+        return {"status": "ok_dry_run", "close_series": len(closes), "fx_series": len(fx)}
+    try:
+        for yf_sym, series in sorted(closes.items()):
+            _write_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json", {
+                "schema_version": CLOSE_HISTORY_SCHEMA_VERSION, "yf_symbol": yf_sym,
+                "currency": ccy_by_yf.get(yf_sym, "USD"), "closes": [list(p) for p in series]})
+        for ccy, series in sorted(fx.items()):
+            _write_json(s3_client, bucket, f"{FX_HISTORY_PREFIX}{ccy}.json", {
+                "schema_version": FX_HISTORY_SCHEMA_VERSION, "currency": ccy,
+                "base": BASE_CURRENCY, "rates": [list(p) for p in series]})
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] history write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote %d close-history + %d fx-history series", len(closes), len(fx))
+    return {"status": "ok", "close_series": len(closes), "fx_series": len(fx)}
+
+
+def collect_reference(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, sector_source: SectorSource | None = None,
+    benchmark_source: BenchmarkWeightsSource | None = None, earnings_source: EarningsSource | None = None,
+) -> dict:
+    """Write the GICS-sectors + earnings reference artifacts for Metron's held universe —
+    moving Metron's last external (yfinance) fetches to the spine:
+
+        market_data/sectors/latest.json   {schema_version, as_of, sectors: {yf_symbol: gics}, spy_sector_weights: {sector: weight}}
+        market_data/earnings/latest.json   {schema_version, as_of, earnings: {yf_symbol: date_iso}}
+
+    Keyed by yf_symbol (consistent with the closes artifact). Injectable sources/S3."""
+    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    sectors = (sector_source or _yfinance_sectors)(yf_symbols)
+    spy_weights = (benchmark_source or _yfinance_spy_weights)()
+    earnings = (earnings_source or _yfinance_earnings)(yf_symbols)
+    sectors_artifact = {"schema_version": SECTORS_SCHEMA_VERSION, "as_of": run_date,
+                        "sectors": dict(sorted(sectors.items())), "spy_sector_weights": dict(sorted(spy_weights.items()))}
+    earnings_artifact = {"schema_version": EARNINGS_SCHEMA_VERSION, "as_of": run_date,
+                         "earnings": dict(sorted(earnings.items()))}
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN reference: %d sectors, %d spy-weights, %d earnings",
+                    len(sectors), len(spy_weights), len(earnings))
+        return {"status": "ok_dry_run", "sectors": len(sectors), "earnings": len(earnings)}
+    try:
+        _write_json(s3_client, bucket, f"{SECTORS_PREFIX}latest.json", sectors_artifact)
+        _write_json(s3_client, bucket, f"{EARNINGS_PREFIX}latest.json", earnings_artifact)
+    except Exception as e:  # fail loud
+        logger.error("[metron_market_data] reference write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote %d sectors + %d spy-weights + %d earnings",
+                len(sectors), len(spy_weights), len(earnings))
+    return {"status": "ok", "sectors": len(sectors), "spy_weights": len(spy_weights), "earnings": len(earnings)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m collectors.metron_market_data", description=__doc__)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--date", default=None, help="run date YYYY-MM-DD (default: today UTC)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--history", action="store_true", help="also write close/FX history artifacts")
+    parser.add_argument("--reference", action="store_true", help="also write sectors/earnings artifacts")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     result = collect(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
-    logger.info("[metron_market_data] done: %s", result)
-    return 0 if result.get("status") in ("ok", "ok_dry_run", "skipped") else 1
+    logger.info("[metron_market_data] latest done: %s", result)
+    ok = result.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.history:
+        hist = collect_history(bucket=args.bucket, dry_run=args.dry_run)
+        logger.info("[metron_market_data] history done: %s", hist)
+        ok = ok and hist.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.reference:
+        ref = collect_reference(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] reference done: %s", ref)
+        ok = ok and ref.get("status") in ("ok", "ok_dry_run", "skipped")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
