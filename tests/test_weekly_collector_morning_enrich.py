@@ -692,3 +692,79 @@ def test_morning_enrich_dry_run_skips_preflight_writes():
 
     fake_constituents.collect.assert_not_called()
     assert prune_called == []
+
+
+# ── chronic-gap heal split (2026-06-11) ─────────────────────────────────────
+
+
+def test_chronic_gap_heal_routes_via_run_weekly():
+    """run_weekly must dispatch --chronic-gap-heal to _run_chronic_gap_heal."""
+    args = SimpleNamespace(
+        morning_enrich=False, chronic_gap_heal=True, daily=False,
+    )
+    with patch("weekly_collector._run_chronic_gap_heal",
+               return_value={"status": "ok", "mode": "chronic_gap_heal"}) as heal:
+        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+    heal.assert_called_once()
+    assert out["mode"] == "chronic_gap_heal"
+
+
+def test_morning_enrich_skip_chronic_heal_does_not_run_inline_heal():
+    """--skip-chronic-heal (the weekday SF path) suppresses the inline heal —
+    the separate ChronicGapSelfHeal SF state runs it instead."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(
+        date="2026-04-22", dry_run=True, morning_enrich=True,
+        skip_chronic_heal=True,
+    )
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok_dry_run", "polygon": 1, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 1,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}), \
+         patch("weekly_collector._run_chronic_gap_heal") as heal:
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    heal.assert_not_called()
+    assert result["status"] == "ok"
+
+
+def test_morning_enrich_runs_inline_heal_without_skip_flag():
+    """Without --skip-chronic-heal (the Saturday SF path), the inline heal
+    still runs before DataPhase1's postflight."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(
+        date="2026-04-22", dry_run=True, morning_enrich=True,
+        skip_chronic_heal=False,
+    )
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok_dry_run", "polygon": 1, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 1,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}), \
+         patch("weekly_collector._run_chronic_gap_heal",
+               return_value={"status": "ok", "collectors": {}}) as heal:
+        weekly_collector._run_morning_enrich(config, args)
+
+    heal.assert_called_once()
+
+
+def test_run_chronic_gap_heal_never_raises_on_load_failure():
+    """The standalone heal must return status=ok (best-effort) even when an
+    inner call raises — it must exit 0 so the SF state is non-fatal."""
+    config = {"bucket": "test-bucket"}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+    with patch("weekly_collector._load_chronic_polygon_gaps",
+               side_effect=RuntimeError("boom")):
+        out = weekly_collector._run_chronic_gap_heal(config, args)
+    assert out["status"] == "ok"
+    assert out["mode"] == "chronic_gap_heal"
+    assert out["collectors"]["chronic_gap_heal_wrapper"]["status"] == "error"
