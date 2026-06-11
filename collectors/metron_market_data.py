@@ -50,12 +50,19 @@ FX_HISTORY_PREFIX = "market_data/fx_history/"
 # Metron's last yfinance fetches to the spine so Metron reads ALL external data here.
 SECTORS_PREFIX = "market_data/sectors/"
 EARNINGS_PREFIX = "market_data/earnings/"
+# Macro indicators for Metron's Macro page (FRED observation series) — Metron's last
+# direct external fetch. The data macro.json artifact is latest-values-only / weekly /
+# missing T10YIE+T10Y2Y, so this publishes the exact series Metron needs as history.
+MACRO_PREFIX = "market_data/macro/"
+# FRED series ids Metron's Macro page renders (mirrors metron INDICATORS).
+METRON_MACRO_SERIES = ["FEDFUNDS", "UNRATE", "T10YIE", "DGS10", "DGS2", "T10Y2Y", "VIXCLS"]
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
 FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 1
 EARNINGS_SCHEMA_VERSION = 1
+MACRO_SCHEMA_VERSION = 1
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -88,6 +95,8 @@ FxHistorySource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 SectorSource = Callable[[list[str]], dict[str, str]]
 BenchmarkWeightsSource = Callable[[], dict[str, float]]
 EarningsSource = Callable[[list[str]], dict[str, str]]
+# A macro source maps FRED series ids → {series_id: [(date_iso, value), …]} ascending.
+MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 
 
 # ── Universe read ───────────────────────────────────────────────────────────
@@ -304,6 +313,46 @@ def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
     return out
 
 
+def _fred_series_history(series_ids: list[str], api_key: str, *, lookback_years: int = 2) -> dict[str, list[tuple[str, float]]]:
+    """~``lookback_years`` of daily/monthly observations per FRED series id →
+    ``{series_id: [(date, value), …]}`` ascending. stdlib urllib; fail-soft per series."""
+    if not api_key:
+        logger.warning("[metron_market_data] FRED_API_KEY unset — skipping macro")
+        return {}
+    import urllib.parse
+    import urllib.request
+    from datetime import date as _date
+    today = datetime.now(timezone.utc).date()
+    try:
+        start = today.replace(year=today.year - lookback_years).isoformat()
+    except ValueError:  # Feb 29
+        start = today.replace(year=today.year - lookback_years, day=28).isoformat()
+    out: dict[str, list[tuple[str, float]]] = {}
+    for sid in series_ids:
+        params = urllib.parse.urlencode({"series_id": sid, "api_key": api_key, "file_type": "json",
+                                         "sort_order": "asc", "observation_start": start})
+        try:
+            with urllib.request.urlopen(f"https://api.stlouisfed.org/fred/series/observations?{params}", timeout=15) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception as e:
+            logger.warning("[metron_market_data] FRED fetch failed for %s: %s", sid, e)
+            continue
+        obs: list[tuple[str, float]] = []
+        for row in payload.get("observations", []):
+            raw = row.get("value")
+            if raw in (None, "", "."):  # FRED's missing-value marker
+                continue
+            try:
+                _date.fromisoformat(row["date"])
+                obs.append((row["date"], float(raw)))
+            except (ValueError, KeyError):
+                continue
+        if obs:
+            out[sid] = obs
+    logger.info("[metron_market_data] macro: %d/%d series fetched", len(out), len(series_ids))
+    return out
+
+
 # ── S3 write (the single put-object site for this file) ──────────────────────
 
 
@@ -471,6 +520,44 @@ def collect_reference(
     return {"status": "ok", "sectors": len(sectors), "spy_weights": len(spy_weights), "earnings": len(earnings)}
 
 
+def collect_macro(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, api_key: str | None = None, macro_source: MacroSource | None = None,
+) -> dict:
+    """Write the macro-indicator artifact for Metron's Macro page — Metron's LAST direct
+    external fetch (FRED) moved to the spine:
+
+        market_data/macro/latest.json   {schema_version, as_of, series: {series_id: [[date, value], …]}}
+
+    Fetches the 7 FRED series Metron renders as ~2y observation history. Injectable
+    source/S3 for tests; FRED key from ``alpha_engine_lib.secrets`` when not injected."""
+    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    if macro_source is None:
+        if api_key is None:
+            from alpha_engine_lib.secrets import get_secret
+            api_key = get_secret("FRED_API_KEY", required=False, default="")
+        series = _fred_series_history(METRON_MACRO_SERIES, api_key)
+    else:
+        series = macro_source(METRON_MACRO_SERIES)
+    if not series:
+        return {"status": "skipped", "reason": "no macro series (FRED key unset or fetch failed)"}
+    artifact = {"schema_version": MACRO_SCHEMA_VERSION, "as_of": run_date,
+                "series": {sid: [list(p) for p in obs] for sid, obs in sorted(series.items())}}
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN macro: %d series (not written)", len(series))
+        return {"status": "ok_dry_run", "series": len(series)}
+    try:
+        _write_json(s3_client, bucket, f"{MACRO_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud
+        logger.error("[metron_market_data] macro write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote %d macro series", len(series))
+    return {"status": "ok", "series": len(series)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m collectors.metron_market_data", description=__doc__)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
@@ -478,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--history", action="store_true", help="also write close/FX history artifacts")
     parser.add_argument("--reference", action="store_true", help="also write sectors/earnings artifacts")
+    parser.add_argument("--macro", action="store_true", help="also write the macro-indicators artifact")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     result = collect(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
@@ -491,6 +579,10 @@ def main(argv: list[str] | None = None) -> int:
         ref = collect_reference(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
         logger.info("[metron_market_data] reference done: %s", ref)
         ok = ok and ref.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.macro:
+        mac = collect_macro(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] macro done: %s", mac)
+        ok = ok and mac.get("status") in ("ok", "ok_dry_run", "skipped")
     return 0 if ok else 1
 
 

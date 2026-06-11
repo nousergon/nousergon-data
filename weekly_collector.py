@@ -1751,6 +1751,13 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: metron_market_data.collect_reference(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.SECTORS_PREFIX}latest.json",
     )
+    # Macro indicators (FRED observation series) for Metron's Macro page — Metron's last
+    # direct external fetch, now on the spine.
+    results["collectors"]["metron_macro_data"] = _phase_collect(
+        reg, "metron_macro_data",
+        lambda: metron_market_data.collect_macro(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.MACRO_PREFIX}latest.json",
+    )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
     # executor gate at alpha-engine/executor/main.py reads this key to decide
