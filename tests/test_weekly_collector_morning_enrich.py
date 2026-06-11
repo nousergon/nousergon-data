@@ -829,3 +829,42 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
          patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
         bad = weekly_collector._run_morning_arctic_append(config, args)
     assert bad["status"] == "failed"
+
+
+# ── chronic-gap heal hard timeout (L4605) ───────────────────────────────────
+
+
+def test_chronic_gap_heal_hard_timeout_is_best_effort_skip(monkeypatch):
+    """A hung self-heal hits the in-process hard timeout and is recorded as a
+    best-effort skip (overall status stays ok) — it must never propagate or
+    fail the pipeline (the Saturday-inline SIGKILL fix, L4605)."""
+    import time as _time
+
+    config = {"bucket": "b", "chronic_polygon_gaps": {"tickers": {"BRK-B": "x"}}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    monkeypatch.setattr(weekly_collector, "_CHRONIC_HEAL_HARD_TIMEOUT_S", 1)
+    monkeypatch.setattr(weekly_collector, "_load_chronic_polygon_gaps", lambda c: ["BRK-B"])
+    monkeypatch.setattr(weekly_collector, "_detect_chronic_gap_polygon_recovery",
+                        lambda **k: {"status": "ok"})
+    monkeypatch.setattr(weekly_collector, "_detect_chronic_gap_constituents_drift",
+                        lambda **k: {"still_constituents": ["BRK-B"]})
+
+    def _hang(**k):
+        _time.sleep(5)  # interrupted by SIGALRM at 1s
+        return {"healed": [], "skipped_already_fresh": [], "errors": []}
+    monkeypatch.setattr(weekly_collector, "_self_heal_chronic_polygon_gaps", _hang)
+
+    out = weekly_collector._run_chronic_gap_heal(config, args)
+
+    assert out["status"] == "ok", "heal is best-effort — a timeout must not fail it"
+    assert out["collectors"]["chronic_gap_self_heal"]["status"] == "skipped"
+    assert "hard timeout" in out["collectors"]["chronic_gap_self_heal"]["error"]
+
+
+def test_hard_timeout_clean_exit_does_not_fire():
+    """The watchdog is a no-op when the block completes under budget."""
+    ran = []
+    with weekly_collector._hard_timeout(5, "x"):
+        ran.append(True)
+    assert ran == [True]
