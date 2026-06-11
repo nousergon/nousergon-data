@@ -21,7 +21,7 @@
           "Next": "AcquireMutex"
         }
       ],
-      "Default": "PostMarketData"
+      "Default": "CheckSkipPostMarketData"
     },
     "AcquireMutex": {
       "Type": "Task",
@@ -50,12 +50,12 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block the EOD reconcile + instance-stop path. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable (reconcile + stop trading EC2) survives a mutex-side failure. The error is captured in $.mutex_error for forensic review.",
-          "Next": "PostMarketData",
+          "Next": "CheckSkipPostMarketData",
           "ResultPath": "$.mutex_error"
         }
       ],
       "ResultPath": "$.mutex_result",
-      "Next": "PostMarketData"
+      "Next": "CheckSkipPostMarketData"
     },
     "MutexConflict": {
       "Type": "Fail",
@@ -134,7 +134,7 @@
       "Type": "Choice",
       "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
       "Choices": [
-        { "Variable": "$.postmarket_poll.Status", "StringEquals": "Success", "Next": "CaptureSnapshot" },
+        { "Variable": "$.postmarket_poll.Status", "StringEquals": "Success", "Next": "CheckSkipCaptureSnapshot" },
         { "Variable": "$.postmarket_poll.Status", "StringEquals": "InProgress", "Next": "PostMarketWait" },
         { "Variable": "$.postmarket_poll.Status", "StringEquals": "Pending", "Next": "PostMarketWait" },
         { "Variable": "$.postmarket_poll.Status", "StringEquals": "Delayed", "Next": "PostMarketWait" }
@@ -232,7 +232,7 @@
       "Type": "Choice",
       "Comment": "Default routes to HandleFailure so any unexpected SSM status is surfaced, not silently swallowed.",
       "Choices": [
-        { "Variable": "$.snapshot_poll.Status", "StringEquals": "Success", "Next": "EODReconcile" },
+        { "Variable": "$.snapshot_poll.Status", "StringEquals": "Success", "Next": "CheckSkipEODReconcile" },
         { "Variable": "$.snapshot_poll.Status", "StringEquals": "InProgress", "Next": "SnapshotWait" },
         { "Variable": "$.snapshot_poll.Status", "StringEquals": "Pending", "Next": "SnapshotWait" },
         { "Variable": "$.snapshot_poll.Status", "StringEquals": "Delayed", "Next": "SnapshotWait" }
@@ -329,7 +329,7 @@
       "Type": "Choice",
       "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
       "Choices": [
-        { "Variable": "$.eod_poll.Status", "StringEquals": "Success", "Next": "DailySubstrateHealthCheck" },
+        { "Variable": "$.eod_poll.Status", "StringEquals": "Success", "Next": "CheckSkipDailySubstrateHealthCheck" },
         { "Variable": "$.eod_poll.Status", "StringEquals": "InProgress", "Next": "EODWait" },
         { "Variable": "$.eod_poll.Status", "StringEquals": "Pending", "Next": "EODWait" },
         { "Variable": "$.eod_poll.Status", "StringEquals": "Delayed", "Next": "EODWait" }
@@ -416,6 +416,62 @@
       ],
       "ResultPath": "$.substrate_check_poll",
       "Next": "StopTradingInstance"
+    },
+    "CheckSkipPostMarketData": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_post_market_data\": true} routes past PostMarketData to the next gate (CheckSkipCaptureSnapshot); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the EOD pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work (e.g. an EODReconcile failure rerun should not re-run PostMarketData + CaptureSnapshot). Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_post_market_data", "IsPresent": true},
+            {"Variable": "$.skip_post_market_data", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipCaptureSnapshot"
+        }
+      ],
+      "Default": "PostMarketData"
+    },
+    "CheckSkipCaptureSnapshot": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_capture_snapshot\": true} routes past CaptureSnapshot to the next gate (CheckSkipEODReconcile); missing flag = run as normal. Skip only when the snapshot trades/snapshots/{run_date}.json already exists from a prior run. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_capture_snapshot", "IsPresent": true},
+            {"Variable": "$.skip_capture_snapshot", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipEODReconcile"
+        }
+      ],
+      "Default": "CaptureSnapshot"
+    },
+    "CheckSkipEODReconcile": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_eod_reconcile", "IsPresent": true},
+            {"Variable": "$.skip_eod_reconcile", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipDailySubstrateHealthCheck"
+        }
+      ],
+      "Default": "EODReconcile"
+    },
+    "CheckSkipDailySubstrateHealthCheck": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_daily_substrate_health_check\": true} routes past DailySubstrateHealthCheck directly to StopTradingInstance (the always-run cost-guard cleanup); missing flag = run as normal. The substrate check is already non-blocking. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_daily_substrate_health_check", "IsPresent": true},
+            {"Variable": "$.skip_daily_substrate_health_check", "BooleanEquals": true}
+          ],
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Default": "DailySubstrateHealthCheck"
     },
     "StopTradingInstance": {
       "Type": "Task",

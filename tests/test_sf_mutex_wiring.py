@@ -77,7 +77,11 @@ CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run"}
 FORMER_FIRST_STATE_BY_SF = {
     "saturday": ("step_function.json", "CheckShellRun"),
     "weekday": ("step_function_daily.json", "DeployDriftCheck"),
-    "eod": ("step_function_eod.json", "PostMarketData"),
+    # L4607: the EOD SF's first post-mutex state is now the per-task rerun
+    # gate CheckSkipPostMarketData (whose Default runs PostMarketData), not
+    # PostMarketData directly. The mutex still routes to the pipeline's first
+    # work state — that state is just the skip-gate now.
+    "eod": ("step_function_eod.json", "CheckSkipPostMarketData"),
 }
 
 

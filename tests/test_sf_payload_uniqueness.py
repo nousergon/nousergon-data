@@ -418,6 +418,13 @@ class TestEODSFTopLevelFieldsClosed:
             "mutex_error",
             "mutex_result",
             "pipeline_role",
+            # L4607 per-task rerun gates — each CheckSkip<State> reads an
+            # optional boolean skip flag from the execution input so an
+            # operator recovery rerun can resume at the first incomplete task.
+            "skip_post_market_data",
+            "skip_capture_snapshot",
+            "skip_eod_reconcile",
+            "skip_daily_substrate_health_check",
         }
     )
 
