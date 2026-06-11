@@ -63,22 +63,26 @@ class TestChainOrdering:
     """CheckMorningEnrichStatus(Success) → ChronicGapSelfHeal →
     WaitForChronicGap → CheckChronicGapStatus(terminal) → PredictorInference."""
 
-    def test_morning_enrich_success_routes_to_heal(self, states):
-        # Since L4606 the heal sits behind the CheckSkipChronicGapHeal rerun
-        # gate, whose Default runs the heal. MorningEnrich success → that gate
-        # → (no skip flag) ChronicGapSelfHeal. The heal still runs AFTER a
-        # completed (load-bearing) MorningEnrich.
+    def test_heal_runs_after_morning_enrich_and_append(self, states):
+        # Since L4608 the load-bearing daily_append (CheckSkipMorningArcticAppend
+        # → MorningArcticAppend) sits between MorningEnrich and the heal. The
+        # heal still runs (behind its skip-gate) AFTER both, before predictions.
         success = [
             c["Next"]
             for c in states["CheckMorningEnrichStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["CheckSkipChronicGapHeal"], (
-            "MorningEnrich success must hand off to the chronic-gap skip-gate"
+        assert success == ["CheckSkipMorningArcticAppend"], (
+            "MorningEnrich success must hand off to the arctic-append gate"
         )
-        assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL, (
-            "the skip-gate's Default must run ChronicGapSelfHeal"
-        )
+        # Append success → the chronic-gap skip-gate → (no flag) the heal.
+        append_success = [
+            c["Next"]
+            for c in states["CheckMorningArcticAppendStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        ]
+        assert append_success == ["CheckSkipChronicGapHeal"]
+        assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL
 
     def test_heal_routes_to_poll(self, states):
         assert states[_HEAL]["Next"] == _POLL

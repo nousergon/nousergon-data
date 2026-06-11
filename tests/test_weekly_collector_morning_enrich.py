@@ -770,6 +770,67 @@ def test_run_chronic_gap_heal_never_raises_on_load_failure():
     assert out["collectors"]["chronic_gap_heal_wrapper"]["status"] == "error"
 
 
+# ── arctic-append split (L4608) ─────────────────────────────────────────────
+
+
+def test_arctic_append_routes_via_run_weekly():
+    """run_weekly must dispatch --morning-arctic-append to _run_morning_arctic_append."""
+    args = SimpleNamespace(
+        morning_enrich=False, morning_arctic_append=True, chronic_gap_heal=False, daily=False,
+    )
+    with patch("weekly_collector._run_morning_arctic_append",
+               return_value={"status": "ok", "mode": "morning_arctic_append"}) as ap:
+        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+    ap.assert_called_once()
+    assert out["mode"] == "morning_arctic_append"
+
+
+def test_morning_enrich_skip_arctic_append_does_not_append():
+    """--skip-arctic-append (weekday SF) suppresses the inline daily_append —
+    the separate MorningArcticAppend SF state runs it instead."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(
+        date="2026-04-22", dry_run=True, morning_enrich=True,
+        skip_chronic_heal=True, skip_arctic_append=True,
+    )
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+    append_calls = []
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok_dry_run", "polygon": 1, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 1, "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: append_calls.append(k) or {"status": "ok"}):
+        result = weekly_collector._run_morning_enrich(config, args)
+    assert append_calls == [], "daily_append must not run when --skip-arctic-append"
+    assert "arcticdb" not in result["collectors"]
+
+
+def test_arctic_append_runs_daily_append_and_is_load_bearing():
+    """_run_morning_arctic_append runs daily_append for the target date and
+    returns failed (load-bearing) when the append errors."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=False)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    # happy path
+    calls = []
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: calls.append(k) or {"status": "ok"}):
+        ok = weekly_collector._run_morning_arctic_append(config, args)
+    assert ok["status"] == "ok" and ok["mode"] == "morning_arctic_append"
+    assert calls and calls[0]["date_str"] == "2026-04-22"
+
+    # load-bearing: append raises → failed
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
+        bad = weekly_collector._run_morning_arctic_append(config, args)
+    assert bad["status"] == "failed"
+
+
 # ── chronic-gap heal hard timeout (L4605) ───────────────────────────────────
 
 

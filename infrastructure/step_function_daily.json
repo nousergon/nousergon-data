@@ -248,7 +248,7 @@
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/morning-enrich.log",
-            "python weekly_collector.py --morning-enrich --skip-chronic-heal 2>&1 | tee -a /var/log/morning-enrich.log"
+            "python weekly_collector.py --morning-enrich --skip-chronic-heal --skip-arctic-append 2>&1 | tee -a /var/log/morning-enrich.log"
           ],
           "executionTimeout": ["1800"]
         },
@@ -302,7 +302,7 @@
         {
           "Variable": "$.morning_enrich_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipChronicGapHeal"
+          "Next": "CheckSkipMorningArcticAppend"
         },
         {
           "Variable": "$.morning_enrich_poll.Status",
@@ -990,17 +990,127 @@
 
     "CheckSkipMorningEnrich": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_enrich\": true} routes past MorningEnrich to the next gate (CheckSkipChronicGapHeal); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the weekday pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work. The 2026-06-11 chronic-gap rerun had to re-run the already-completed MorningEnrich daily_append (~20 min) because this gate did not exist. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_enrich\": true} routes past MorningEnrich (fetch: constituents + prune + polygon daily_closes) to the next gate (CheckSkipMorningArcticAppend); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the weekday pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_morning_enrich", "IsPresent": true},
             {"Variable": "$.skip_morning_enrich", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipChronicGapHeal"
+          "Next": "CheckSkipMorningArcticAppend"
         }
       ],
       "Default": "MorningEnrich"
+    },
+
+    "CheckSkipMorningArcticAppend": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4608). Input {\"skip_morning_arctic_append\": true} routes past MorningArcticAppend to the next gate (CheckSkipChronicGapHeal); missing flag = run as normal. The slow ArcticDB daily_append was split out of MorningEnrich 2026-06-11 — it ran ~20-38 min and a same-morning rerun exceeded MorningEnrich's 1800s SSM timeout and SIGKILLed it. As its own state it gets a longer timeout decoupled from the fast fetch, and a recovery rerun can skip whichever half already completed. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_morning_arctic_append", "IsPresent": true},
+            {"Variable": "$.skip_morning_arctic_append", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipChronicGapHeal"
+        }
+      ],
+      "Default": "MorningArcticAppend"
+    },
+
+    "MorningArcticAppend": {
+      "Type": "Task",
+      "Comment": "LOAD-BEARING: ArcticDB universe daily_append for the prior trading day — writes the polygon-corrected OHLCV row + recomputed features that predictor inference reads next. Split out of MorningEnrich (L4608, 2026-06-11): the append is the slow part (~20-38 min on the t3.small) and on 2026-06-11 a same-morning rerun's append exceeded MorningEnrich's 1800s executionTimeout and SIGKILLed the whole command. Own longer timeout (2400s) decoupled from the fast fetch; reads the constituents MorningEnrich just refreshed to S3. Failure → HandleFailure (predictor must not run on a stale ArcticDB).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "export FLOW_DOCTOR_ENABLED=1",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-data",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/morning-arctic-append.log \"s3://alpha-engine-research/_ssm_logs/morning-arctic-append/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/morning-arctic-append.log",
+            "python weekly_collector.py --morning-arctic-append 2>&1 | tee -a /var/log/morning-arctic-append.log"
+          ],
+          "executionTimeout": ["2400"]
+        },
+        "TimeoutSeconds": 2400
+      },
+      "TimeoutSeconds": 2460,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.arctic_append_result",
+      "Next": "WaitForMorningArcticAppend"
+    },
+
+    "WaitForMorningArcticAppend": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.arctic_append_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.arctic_append_poll",
+      "Next": "CheckMorningArcticAppendStatus"
+    },
+
+    "CheckMorningArcticAppendStatus": {
+      "Type": "Choice",
+      "Comment": "LOAD-BEARING like CheckMorningEnrichStatus: only Success proceeds (to the chronic-gap heal gate, then PredictorInference); any other terminal SSM status → HandleFailure (predictor must not run on a stale ArcticDB universe). Only InProgress/Pending keep polling.",
+      "Choices": [
+        {
+          "Variable": "$.arctic_append_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipChronicGapHeal"
+        },
+        {
+          "Variable": "$.arctic_append_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "MorningArcticAppendWait"
+        },
+        {
+          "Variable": "$.arctic_append_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "MorningArcticAppendWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "MorningArcticAppendWait": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "WaitForMorningArcticAppend"
     },
 
     "CheckSkipChronicGapHeal": {
