@@ -220,6 +220,9 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     if getattr(args, "morning_enrich", False):
         return _run_morning_enrich(config, args)
 
+    if getattr(args, "morning_arctic_append", False):
+        return _run_morning_arctic_append(config, args)
+
     if getattr(args, "chronic_gap_heal", False):
         return _run_chronic_gap_heal(config, args)
 
@@ -1204,22 +1207,34 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     # ── Re-append to ArcticDB so the polygon-overwritten row replaces the
     # yfinance row written at EOD. universe_lib.update() is idempotent for
     # same-date overwrites (see daily_append.py:232-242 for the design intent).
-    logger.info("=" * 60)
-    logger.info("APPENDING: ArcticDB universe (morning enrich, %s)", target_date)
-    logger.info("=" * 60)
-    try:
-        from builders.daily_append import daily_append
-        with _maybe_phase(reg, "morning_arcticdb"):
-            arctic_result = daily_append(
-                date_str=target_date,
-                bucket=bucket,
-                dry_run=dry_run,
-                expected_tickers=tickers,
-            )
-        results["collectors"]["arcticdb"] = arctic_result
-    except Exception as e:
-        logger.exception("ArcticDB daily_append (morning enrich) failed for %s", target_date)
-        results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+    #
+    # daily_append is the SLOW part of MorningEnrich (~20-38 min on the
+    # t3.small). 2026-06-11: a same-morning rerun's append exceeded the 1800s
+    # SSM executionTimeout and SIGKILLed MorningEnrich (L4608). ``--skip-arctic-append``
+    # decouples it on the WEEKDAY pipeline, where it runs as its OWN skip-gated,
+    # load-bearing SF state (``MorningArcticAppend``, via ``_run_morning_arctic_append``)
+    # with a longer timeout AFTER the fast fetch — so (a) the append's duration
+    # can no longer time out the fetch, and (b) a recovery rerun can skip the
+    # completed fetch and re-run only the append (or vice-versa). The SATURDAY
+    # pipeline still runs it INLINE here (no skip flag): the append must precede
+    # DataPhase1's postflight, same rationale as the inline chronic-gap heal.
+    if not getattr(args, "skip_arctic_append", False):
+        logger.info("=" * 60)
+        logger.info("APPENDING: ArcticDB universe (morning enrich, %s)", target_date)
+        logger.info("=" * 60)
+        try:
+            from builders.daily_append import daily_append
+            with _maybe_phase(reg, "morning_arcticdb"):
+                arctic_result = daily_append(
+                    date_str=target_date,
+                    bucket=bucket,
+                    dry_run=dry_run,
+                    expected_tickers=tickers,
+                )
+            results["collectors"]["arcticdb"] = arctic_result
+        except Exception as e:
+            logger.exception("ArcticDB daily_append (morning enrich) failed for %s", target_date)
+            results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
 
     # ── Chronic-polygon-gap self-heal ────────────────────────────────────────
     # The chronic-gap drift-detection + yfinance self-heal logic lives in
@@ -1312,6 +1327,103 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         ", ".join(f"{k}={v.get('status', '?')}" for k, v in results["collectors"].items()),
         duration,
     )
+    return results
+
+
+def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
+    """Standalone ArcticDB universe append for the prior trading day (L4608).
+
+    Split out of :func:`_run_morning_enrich` (2026-06-11) into its own weekday-SF
+    state (``MorningArcticAppend``). MorningEnrich now does only the fast fetch
+    (constituents refresh + prune + polygon daily_closes overwrite, via
+    ``--skip-arctic-append``); this runs the SLOW ``daily_append`` that writes
+    the polygon-corrected row + recomputed features into the ArcticDB universe
+    library.
+
+    Why split: ``daily_append`` ran ~20-38 min on the t3.small and on 2026-06-11
+    a same-morning rerun exceeded MorningEnrich's 1800s SSM ``executionTimeout``
+    and SIGKILLed it. As its own state the append gets a longer timeout decoupled
+    from the fetch, and a recovery rerun can skip whichever half already
+    completed (``skip_morning_enrich`` / ``skip_morning_arctic_append``) instead
+    of re-paying both.
+
+    LOAD-BEARING: predictor inference reads the ArcticDB universe right after
+    this, so an append failure returns ``status="failed"`` → ``main()`` exits 1
+    → the SF's ``CheckMorningArcticAppendStatus`` routes to HandleFailure. Reads
+    the constituents MorningEnrich just refreshed to S3 (so the expected-ticker
+    scope matches the post-prune universe).
+    """
+    bucket = config["bucket"]
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Same PT-aware target-date resolution as MorningEnrich, so the append
+    # targets the prior trading day MorningEnrich just fetched.
+    if args.date is None:
+        from zoneinfo import ZoneInfo
+        target_date = _previous_trading_day(
+            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
+        )
+    else:
+        target_date = args.date
+
+    dry_run = args.dry_run
+    results: dict = {
+        "mode": "morning_arctic_append",
+        "date": target_date,
+        "started_at": started_at,
+        "collectors": {},
+    }
+
+    # Load the constituents MorningEnrich just refreshed to S3 (post-prune
+    # universe scope for daily_append's expected-ticker check). S3 → Wikipedia
+    # fallback, mirroring _run_daily.
+    tickers: list[str] = []
+    market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
+    try:
+        existing = constituents.load_from_s3(bucket, market_prefix)
+        if existing:
+            tickers = existing.get("tickers", [])
+            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+    except Exception as exc:
+        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
+    if not tickers:
+        try:
+            tickers, _, _, _, _ = constituents._fetch_constituents()
+            logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
+        except Exception as exc:
+            logger.error("Wikipedia constituents fallback failed: %s", exc)
+
+    if not tickers:
+        logger.error("No tickers available for ArcticDB append")
+        results["status"] = "failed"
+        results["completed_at"] = datetime.now(timezone.utc).isoformat()
+        return results
+
+    logger.info("=" * 60)
+    logger.info("APPENDING: ArcticDB universe (arctic-append state, %s)", target_date)
+    logger.info("=" * 60)
+    reg = _build_registry(config, args, target_date)
+    try:
+        from builders.daily_append import daily_append
+        with _maybe_phase(reg, "morning_arcticdb"):
+            arctic_result = daily_append(
+                date_str=target_date,
+                bucket=bucket,
+                dry_run=dry_run,
+                expected_tickers=tickers,
+            )
+        results["collectors"]["arcticdb"] = arctic_result
+        # daily_append returns its own status; surface it as the load-bearing
+        # verdict so a write failure halts the pipeline (predictor reads next).
+        _status = arctic_result.get("status", "unknown")
+        results["status"] = "ok" if _status in ("ok", "ok_dry_run") else "failed"
+    except Exception as e:
+        logger.exception("ArcticDB daily_append (arctic-append state) failed for %s", target_date)
+        results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+        results["status"] = "failed"
+
+    results["completed_at"] = datetime.now(timezone.utc).isoformat()
+    logger.info("ArcticDB append %s for %s", results["status"].upper(), target_date)
     return results
 
 
@@ -1900,6 +2012,19 @@ def _parse_args() -> argparse.Namespace:
              "(the weekday SF runs it as a separate fail-soft ChronicGapSelfHeal "
              "state instead). The Saturday SF omits this flag so the heal still "
              "runs inline before DataPhase1's postflight.",
+    )
+    parser.add_argument(
+        "--skip-arctic-append", dest="skip_arctic_append", action="store_true",
+        help="With --morning-enrich: skip the inline ArcticDB daily_append "
+             "(the weekday SF runs it as a separate load-bearing MorningArcticAppend "
+             "state with a longer timeout). The Saturday SF omits this flag so the "
+             "append still runs inline before DataPhase1's postflight.",
+    )
+    parser.add_argument(
+        "--morning-arctic-append", dest="morning_arctic_append", action="store_true",
+        help="Standalone ArcticDB universe append for the prior trading day "
+             "(the slow daily_append split out of --morning-enrich, L4608). "
+             "Load-bearing: exits 1 on append failure. --date overrides target day.",
     )
     parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,

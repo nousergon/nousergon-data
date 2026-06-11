@@ -31,7 +31,8 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 
 # (gate, task, skip_flag, next_gate) in pipeline order.
 _CHAIN = [
-    ("CheckSkipMorningEnrich", "MorningEnrich", "skip_morning_enrich", "CheckSkipChronicGapHeal"),
+    ("CheckSkipMorningEnrich", "MorningEnrich", "skip_morning_enrich", "CheckSkipMorningArcticAppend"),
+    ("CheckSkipMorningArcticAppend", "MorningArcticAppend", "skip_morning_arctic_append", "CheckSkipChronicGapHeal"),
     ("CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "skip_chronic_gap_heal", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
@@ -85,10 +86,31 @@ class TestEntryEdgesRouteThroughGates:
     def test_trading_day_check_failed_enters_morning_enrich_gate(self, states):
         assert states["TradingDayCheckFailed"]["Next"] == "CheckSkipMorningEnrich"
 
-    def test_morning_enrich_success_enters_heal_gate(self, states):
+    def test_morning_enrich_success_enters_append_gate(self, states):
+        # L4608: the slow daily_append is now its own load-bearing state behind
+        # CheckSkipMorningArcticAppend, after the fast MorningEnrich fetch.
         success = [c["Next"] for c in states["CheckMorningEnrichStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
+        assert success == ["CheckSkipMorningArcticAppend"]
+
+    def test_arctic_append_success_enters_heal_gate(self, states):
+        success = [c["Next"] for c in states["CheckMorningArcticAppendStatus"]["Choices"]
+                   if c.get("StringEquals") == "Success"]
         assert success == ["CheckSkipChronicGapHeal"]
+
+    def test_arctic_append_is_load_bearing(self, states):
+        # Unlike the fail-soft heal, daily_append must halt the pipeline on
+        # failure — predictor reads the ArcticDB universe right after.
+        assert states["CheckMorningArcticAppendStatus"]["Default"] == "HandleFailure"
+        assert states["MorningArcticAppend"]["Catch"][0]["Next"] == "HandleFailure"
+        assert states["WaitForMorningArcticAppend"]["Catch"][0]["Next"] == "HandleFailure"
+        # Its SSM command runs the standalone append entrypoint, with a longer
+        # timeout than MorningEnrich's 1800s.
+        from tests.sf_command_utils import extract_commands
+        cmds = "\n".join(extract_commands(states["MorningArcticAppend"]))
+        assert "weekly_collector.py --morning-arctic-append" in cmds
+        et = states["MorningArcticAppend"]["Parameters"]["Parameters"]["executionTimeout"]
+        assert int(et[0] if isinstance(et, list) else et) > 1800
 
     def test_chronic_gap_terminal_enters_predictor_gate(self, states):
         # CheckChronicGapStatus Default + both heal Catches.
@@ -146,9 +168,20 @@ class TestPaths:
             assert task not in order, f"{task} ran despite its skip flag"
         assert order == ["PipelineComplete"]
 
-    def test_skip_morning_enrich_only_resumes_at_heal(self, states):
-        """The exact 6/11 case: MorningEnrich already done → skip it, run the rest."""
+    def test_skip_fetch_only_resumes_at_append(self, states):
+        """MorningEnrich fetch already done → skip it, run the append onward."""
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags={"skip_morning_enrich"})
         assert "MorningEnrich" not in order
+        assert order[0] == "MorningArcticAppend"
+        assert "PredictorInference" in order and order[-1] == "PipelineComplete"
+
+    def test_skip_fetch_and_append_resumes_at_heal(self, states):
+        """The exact 6/11 recovery case: fetch + append both done → skip both,
+        resume at the heal → predictions."""
+        order = self._walk(
+            states, "CheckSkipMorningEnrich",
+            skip_flags={"skip_morning_enrich", "skip_morning_arctic_append"},
+        )
+        assert "MorningEnrich" not in order and "MorningArcticAppend" not in order
         assert order[0] == "ChronicGapSelfHeal"
         assert "PredictorInference" in order and order[-1] == "PipelineComplete"
