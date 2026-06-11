@@ -140,6 +140,29 @@ class TestHistory:
         assert mmd.collect_history(bucket="b", s3_client=s3b, close_history_source=lambda s: {}, fx_history_source=lambda c: {})["status"] == "skipped"
 
 
+class TestMacro:
+    def test_writes_macro_series_artifact(self):
+        s3 = _universe_s3(_UNIVERSE)  # macro doesn't read the universe; reuse the fake S3
+        macro_src = lambda ids: {"FEDFUNDS": [("2026-05-01", 5.33), ("2026-06-01", 5.33)],
+                                 "VIXCLS": [("2026-06-10", 14.2), ("2026-06-11", 13.8)]}
+        result = mmd.collect_macro(bucket="b", run_date="2026-06-11", s3_client=s3, macro_source=macro_src)
+        assert result["status"] == "ok" and result["series"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/macro/latest.json"}
+        art = puts["market_data/macro/latest.json"]
+        assert art["schema_version"] == mmd.MACRO_SCHEMA_VERSION
+        assert art["series"]["FEDFUNDS"] == [["2026-05-01", 5.33], ["2026-06-01", 5.33]]
+        assert art["series"]["VIXCLS"][-1] == ["2026-06-11", 13.8]
+
+    def test_macro_dry_run_and_no_series(self):
+        s3 = _universe_s3(_UNIVERSE)
+        r = mmd.collect_macro(bucket="b", run_date="2026-06-11", dry_run=True, s3_client=s3,
+                              macro_source=lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)]})
+        assert r["status"] == "ok_dry_run"
+        s3.put_object.assert_not_called()
+        assert mmd.collect_macro(bucket="b", s3_client=s3, macro_source=lambda ids: {})["status"] == "skipped"
+
+
 class TestReference:
     def test_writes_sectors_and_earnings_keyed_by_yf_symbol(self):
         s3 = _universe_s3(_UNIVERSE)
