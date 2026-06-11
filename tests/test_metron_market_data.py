@@ -114,3 +114,55 @@ def test_load_universe_parses_holdings_and_currencies():
     holdings, currencies = mmd.load_metron_universe("b", s3)
     assert {h["yf_symbol"] for h in holdings} == {"AAPL", "1299.HK"}
     assert currencies == ["HKD"]
+
+
+class TestHistory:
+    def test_writes_per_symbol_close_history_and_per_currency_fx_history(self):
+        s3 = _universe_s3(_UNIVERSE)
+        close_hist = lambda syms: {"AAPL": [("2026-06-10", 200.0), ("2026-06-11", 201.5)], "1299.HK": [("2026-06-11", 64.2)]}
+        fx_hist = lambda ccys: {"HKD": [("2026-06-10", 0.128), ("2026-06-11", 0.1282)]}
+        result = mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=fx_hist)
+        assert result["status"] == "ok" and result["close_series"] == 2 and result["fx_series"] == 1
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/close_history/AAPL.json", "market_data/close_history/1299.HK.json",
+                             "market_data/fx_history/HKD.json"}
+        aapl = puts["market_data/close_history/AAPL.json"]
+        assert aapl["yf_symbol"] == "AAPL" and aapl["currency"] == "USD"
+        assert aapl["closes"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
+        assert puts["market_data/fx_history/HKD.json"]["rates"][-1] == ["2026-06-11", 0.1282]
+
+    def test_history_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        r = mmd.collect_history(bucket="b", dry_run=True, s3_client=s3, close_history_source=lambda s: {"AAPL": [("2026-06-11", 201.5)]}, fx_history_source=lambda c: {})
+        assert r["status"] == "ok_dry_run"
+        s3.put_object.assert_not_called()
+        s3b = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_history(bucket="b", s3_client=s3b, close_history_source=lambda s: {}, fx_history_source=lambda c: {})["status"] == "skipped"
+
+
+class TestReference:
+    def test_writes_sectors_and_earnings_keyed_by_yf_symbol(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_reference(
+            bucket="b", run_date="2026-06-11", s3_client=s3,
+            sector_source=lambda syms: {"AAPL": "Technology", "1299.HK": "Financial Services"},
+            benchmark_source=lambda: {"Technology": 0.30, "Financial Services": 0.13},
+            earnings_source=lambda syms: {"AAPL": "2026-07-30"},
+        )
+        assert result["status"] == "ok" and result["sectors"] == 2 and result["earnings"] == 1
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/sectors/latest.json", "market_data/earnings/latest.json"}
+        sec = puts["market_data/sectors/latest.json"]
+        assert sec["schema_version"] == mmd.SECTORS_SCHEMA_VERSION
+        assert sec["sectors"] == {"1299.HK": "Financial Services", "AAPL": "Technology"}
+        assert sec["spy_sector_weights"]["Technology"] == 0.30
+        assert puts["market_data/earnings/latest.json"]["earnings"] == {"AAPL": "2026-07-30"}
+
+    def test_reference_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        r = mmd.collect_reference(bucket="b", run_date="2026-06-11", dry_run=True, s3_client=s3,
+                                  sector_source=lambda s: {"AAPL": "Technology"}, benchmark_source=lambda: {}, earnings_source=lambda s: {})
+        assert r["status"] == "ok_dry_run"
+        s3.put_object.assert_not_called()
+        s3b = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_reference(bucket="b", s3_client=s3b, sector_source=lambda s: {}, benchmark_source=lambda: {}, earnings_source=lambda s: {})["status"] == "skipped"
