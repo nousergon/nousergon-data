@@ -132,7 +132,7 @@ case "$STACK_STATUS" in
     ROLLBACK_COMPLETE | ROLLBACK_FAILED | UPDATE_ROLLBACK_FAILED | CREATE_FAILED | DELETE_FAILED)
         echo "  ERROR: stack $STACK_NAME is in terminal state $STACK_STATUS — CloudFormation refuses to update."
         echo "         Remediation (one-time): run the import change-set flow to adopt pre-existing resources."
-        echo "         See infrastructure/cloudformation/resources-to-import.json + the README section"
+        echo "         See nous-ergon-ops/alpha-engine-data/infrastructure/cloudformation/resources-to-import.json (private ops repo) + the README section"
         echo "         'Recovering from ROLLBACK_COMPLETE' for the exact aws commands."
         exit 1
         ;;
