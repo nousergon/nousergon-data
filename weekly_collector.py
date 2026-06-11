@@ -220,6 +220,9 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     if getattr(args, "morning_enrich", False):
         return _run_morning_enrich(config, args)
 
+    if getattr(args, "chronic_gap_heal", False):
+        return _run_chronic_gap_heal(config, args)
+
     if args.daily:
         return _run_daily(config, args)
 
@@ -916,6 +919,12 @@ def _self_heal_chronic_polygon_gaps(
                 end=end_excl.strftime("%Y-%m-%d"),
                 progress=False,
                 auto_adjust=True,
+                # Bound the network call so a hung yfinance fetch can't stall
+                # the heal indefinitely. The 2026-06-11 incident was an
+                # unbounded yf.download here; the SF state isolation is the
+                # primary fix, this is defence-in-depth so a single ticker's
+                # stall is capped rather than eating the whole state timeout.
+                timeout=30,
             )
             if isinstance(yf_df.columns, _pd.MultiIndex):
                 yf_df.columns = yf_df.columns.get_level_values(0)
@@ -1213,98 +1222,29 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
 
     # ── Chronic-polygon-gap self-heal ────────────────────────────────────────
-    # Yfinance-backfills any ArcticDB universe row gap for the chronic-gap
-    # tickers (BF-B/BRK-B/MOG-A/PSTG by default — see config). Polygon does
-    # not reliably serve these, so the polygon_only daily_append above leaves
-    # them at whatever the prior EOD yfinance pass landed; on days when EOD
-    # also dropped them, the row gap compounds and postflight catches them
-    # as stale. This step closes that loop without weakening polygon_only's
-    # "no silent fails" stance for the other ~900 tickers.
+    # The chronic-gap drift-detection + yfinance self-heal logic lives in
+    # ``_run_chronic_gap_heal`` (shared). It heals BF-B/BRK-B/MOG-A/PSTG row
+    # gaps (polygon doesn't reliably serve them) before downstream consumers
+    # read ArcticDB.
     #
-    # Best-effort: a yfinance hiccup on one chronic ticker logs + records in
-    # the result but does not halt the morning enrich. Postflight remains
-    # the load-bearing gate on freshness — if a chronic ticker is still
-    # stale after this step, postflight surfaces it.
-    chronic_tickers = _load_chronic_polygon_gaps(config)
-    if chronic_tickers:
-        # Drift alarm: detect polygon recovery for chronic tickers (BEFORE
-        # self-heal so the signal is a clean read of what polygon shipped
-        # today, not contaminated by our yfinance backfill). Best-effort,
-        # observability only — never raises.
-        try:
-            drift_result = _detect_chronic_gap_polygon_recovery(
-                bucket=bucket,
-                target_date=target_date,
-                chronic_tickers=chronic_tickers,
-                daily_closes_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
-            )
-            results["collectors"]["chronic_gap_drift_detection"] = drift_result
-        except Exception as e:
-            logger.warning("Chronic-gap drift detection failed (non-blocking): %s", e)
-            results["collectors"]["chronic_gap_drift_detection"] = {
-                "status": "skipped",
-                "error": str(e),
-            }
-
-        # Drift GATE: filter out chronic tickers that have dropped out of
-        # the current constituents set. The heal path ends in
-        # ``backfill(ticker_filter=...)``, which hard-errs against the
-        # constituents filter for non-constituents (2026-05-27 PSTG
-        # flow-doctor alert origin). Filtering here closes the loop so a
-        # config that lags a constituents change becomes a WARN + skip
-        # instead of a hard ERROR. Best-effort — a read failure falls
-        # through with the original list and the existing backfill-side
-        # error remains the load-bearing surface.
-        try:
-            cdrift_result = _detect_chronic_gap_constituents_drift(
-                bucket=bucket,
-                chronic_tickers=chronic_tickers,
-            )
-            results["collectors"]["chronic_gap_constituents_drift"] = cdrift_result
-            chronic_tickers = cdrift_result["still_constituents"]
-        except Exception as e:
-            logger.warning("Chronic-gap constituents drift check failed (non-blocking): %s", e)
-            results["collectors"]["chronic_gap_constituents_drift"] = {
-                "status": "skipped",
-                "error": str(e),
-            }
-
-        logger.info("=" * 60)
-        logger.info(
-            "SELF-HEAL: chronic polygon coverage gaps (%d ticker(s): %s)",
-            len(chronic_tickers), ", ".join(chronic_tickers),
-        )
-        logger.info("=" * 60)
-        try:
-            with _maybe_phase(reg, "morning_self_heal"):
-                heal_result = _self_heal_chronic_polygon_gaps(
-                    bucket=bucket,
-                    target_date=target_date,
-                    chronic_tickers=chronic_tickers,
-                    dry_run=dry_run,
-                )
-            # Always "ok" by design — chronic-gap self-heal is best-effort.
-            # Postflight is the load-bearing gate; if a chronic ticker is
-            # still stale after this step, postflight raises. Marking it
-            # "partial" on per-ticker yfinance failures would halt
-            # MorningEnrich on a transient yfinance hiccup, which would
-            # block the entire weekly pipeline for ~5 ms of yfinance flake.
-            results["collectors"]["chronic_gap_self_heal"] = {
-                "status": "ok",
-                **heal_result,
-            }
-            logger.info(
-                "chronic-gap self-heal: %d healed, %d already-fresh, %d errors",
-                len(heal_result["healed"]),
-                len(heal_result["skipped_already_fresh"]),
-                len(heal_result["errors"]),
-            )
-        except Exception as e:
-            logger.exception("Chronic-gap self-heal step failed for %s", target_date)
-            results["collectors"]["chronic_gap_self_heal"] = {
-                "status": "error",
-                "error": str(e),
-            }
+    # ``--skip-chronic-heal`` decouples it from MorningEnrich on the WEEKDAY
+    # pipeline, where it runs as its own fail-soft SF state (``ChronicGapSelfHeal``)
+    # AFTER MorningEnrich. Origin: 2026-06-11 — an unbounded ``yf.download`` hang
+    # in the inline heal ran out MorningEnrich's SSM ``executionTimeout`` and
+    # SIGKILLed the whole command, discarding ~20 min of completed daily_append
+    # and failing the weekday pipeline. Splitting it (per the standing rule: a
+    # best-effort downstream step must never force re-running a completed
+    # upstream task) means a heal hang can no longer touch the load-bearing
+    # data write.
+    #
+    # The SATURDAY pipeline still runs the heal INLINE here (no skip flag): it
+    # must precede DataPhase1's postflight, whose freshness gate is the heal's
+    # origin (2026-05-09 stale-PSTG failure). The ``yf.download(timeout=30)``
+    # bound now caps the hang that the inline path can't otherwise isolate;
+    # splitting Saturday's heal into its own state too is a tracked follow-up.
+    if not getattr(args, "skip_chronic_heal", False):
+        heal = _run_chronic_gap_heal(config, args)
+        results["collectors"].update(heal.get("collectors", {}))
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
@@ -1372,6 +1312,149 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         ", ".join(f"{k}={v.get('status', '?')}" for k, v in results["collectors"].items()),
         duration,
     )
+    return results
+
+
+def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
+    """Best-effort chronic-polygon-gap drift detection + yfinance self-heal.
+
+    Split out of :func:`_run_morning_enrich` (2026-06-11) into its own
+    weekday-SF state (``ChronicGapSelfHeal``). Yfinance-backfills any ArcticDB
+    universe row gap for the chronic-gap tickers (BF-B/BRK-B/MOG-A/PSTG by
+    default — see config; polygon does not reliably serve them) and emits the
+    polygon-recovery + constituents-drift alarms.
+
+    Runs AFTER MorningEnrich's load-bearing daily_append, as a fail-soft SF
+    state, so an unbounded ``yf.download`` hang here (the 2026-06-11 SIGKILL
+    incident) can never run out MorningEnrich's SSM ``executionTimeout`` and
+    throw away completed daily_append work. The standing rule: a best-effort
+    downstream step must never force re-running a completed upstream task.
+
+    NEVER raises — the whole body is wrapped so that any unexpected failure
+    returns ``status="error"`` rather than propagating a non-zero exit that
+    the SF would (correctly, but pointlessly here) treat as a state failure.
+    The SF Catch makes a failed state non-fatal regardless; this is
+    defence-in-depth so the SSM command itself exits 0. Postflight remains the
+    load-bearing freshness gate — a still-stale chronic ticker surfaces there.
+    """
+    bucket = config["bucket"]
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Mirror _run_morning_enrich's PT-aware target-date resolution so the heal
+    # targets the same trading day the enrich just wrote.
+    if args.date is None:
+        from zoneinfo import ZoneInfo
+        target_date = _previous_trading_day(
+            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
+        )
+    else:
+        target_date = args.date
+
+    dry_run = args.dry_run
+    daily_cfg = config.get("daily_closes", {})
+    results: dict = {
+        "mode": "chronic_gap_heal",
+        "date": target_date,
+        "started_at": started_at,
+        "collectors": {},
+    }
+
+    try:
+        chronic_tickers = _load_chronic_polygon_gaps(config)
+        if not chronic_tickers:
+            logger.info("chronic-gap heal: no chronic_polygon_gaps configured — nothing to do.")
+            results["status"] = "ok"
+            results["completed_at"] = datetime.now(timezone.utc).isoformat()
+            return results
+
+        # Drift alarm: detect polygon recovery for chronic tickers (BEFORE
+        # self-heal so the signal is a clean read of what polygon shipped
+        # today, not contaminated by our yfinance backfill). Best-effort,
+        # observability only — never raises.
+        try:
+            drift_result = _detect_chronic_gap_polygon_recovery(
+                bucket=bucket,
+                target_date=target_date,
+                chronic_tickers=chronic_tickers,
+                daily_closes_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
+            )
+            results["collectors"]["chronic_gap_drift_detection"] = drift_result
+        except Exception as e:
+            logger.warning("Chronic-gap drift detection failed (non-blocking): %s", e)
+            results["collectors"]["chronic_gap_drift_detection"] = {
+                "status": "skipped",
+                "error": str(e),
+            }
+
+        # Drift GATE: filter out chronic tickers that have dropped out of
+        # the current constituents set. The heal path ends in
+        # ``backfill(ticker_filter=...)``, which hard-errs against the
+        # constituents filter for non-constituents (2026-05-27 PSTG
+        # flow-doctor alert origin). Filtering here closes the loop so a
+        # config that lags a constituents change becomes a WARN + skip
+        # instead of a hard ERROR. Best-effort — a read failure falls
+        # through with the original list and the existing backfill-side
+        # error remains the load-bearing surface.
+        try:
+            cdrift_result = _detect_chronic_gap_constituents_drift(
+                bucket=bucket,
+                chronic_tickers=chronic_tickers,
+            )
+            results["collectors"]["chronic_gap_constituents_drift"] = cdrift_result
+            chronic_tickers = cdrift_result["still_constituents"]
+        except Exception as e:
+            logger.warning("Chronic-gap constituents drift check failed (non-blocking): %s", e)
+            results["collectors"]["chronic_gap_constituents_drift"] = {
+                "status": "skipped",
+                "error": str(e),
+            }
+
+        logger.info("=" * 60)
+        logger.info(
+            "SELF-HEAL: chronic polygon coverage gaps (%d ticker(s): %s)",
+            len(chronic_tickers), ", ".join(chronic_tickers),
+        )
+        logger.info("=" * 60)
+        try:
+            heal_result = _self_heal_chronic_polygon_gaps(
+                bucket=bucket,
+                target_date=target_date,
+                chronic_tickers=chronic_tickers,
+                dry_run=dry_run,
+            )
+            # Always "ok" by design — chronic-gap self-heal is best-effort.
+            results["collectors"]["chronic_gap_self_heal"] = {
+                "status": "ok",
+                **heal_result,
+            }
+            logger.info(
+                "chronic-gap self-heal: %d healed, %d already-fresh, %d errors",
+                len(heal_result["healed"]),
+                len(heal_result["skipped_already_fresh"]),
+                len(heal_result["errors"]),
+            )
+        except Exception as e:
+            logger.exception("Chronic-gap self-heal step failed for %s", target_date)
+            results["collectors"]["chronic_gap_self_heal"] = {
+                "status": "error",
+                "error": str(e),
+            }
+    except Exception as e:  # defence-in-depth — this state must exit 0
+        logger.exception("Chronic-gap heal wrapper failed for %s", target_date)
+        results["collectors"]["chronic_gap_heal_wrapper"] = {
+            "status": "error",
+            "error": str(e),
+        }
+
+    results["completed_at"] = datetime.now(timezone.utc).isoformat()
+    # Best-effort step: report ok unless the whole thing fell over. Per-ticker /
+    # per-substep failures are recorded in collectors but do not flip the state
+    # to failed (the SF Catch makes it non-fatal either way).
+    results["status"] = "ok"
+    statuses = {
+        k: v.get("status", "?") for k, v in results["collectors"].items()
+    }
+    logger.info("Chronic-gap heal complete for %s: %s", target_date, statuses)
     return results
 
 
@@ -1802,6 +1885,21 @@ def _parse_args() -> argparse.Namespace:
         help="Morning polygon enrichment: overwrite the prior trading day's parquet + ArcticDB row "
              "with polygon's authoritative OHLCV+VWAP. Hard-fails on polygon failure (no yfinance "
              "fallback). --date overrides which trading day to enrich (default: previous trading day).",
+    )
+    parser.add_argument(
+        "--chronic-gap-heal", dest="chronic_gap_heal", action="store_true",
+        help="Best-effort: yfinance-backfill ArcticDB row gaps for the chronic-polygon-gap "
+             "tickers (polygon doesn't reliably serve them) + emit the polygon-recovery / "
+             "constituents-drift alarms. Split out of --morning-enrich (2026-06-11) so a "
+             "yfinance hang in this best-effort step can never SIGKILL the load-bearing "
+             "MorningEnrich. Never raises — returns a status dict. --date overrides target day.",
+    )
+    parser.add_argument(
+        "--skip-chronic-heal", dest="skip_chronic_heal", action="store_true",
+        help="With --morning-enrich: skip the inline chronic-gap self-heal "
+             "(the weekday SF runs it as a separate fail-soft ChronicGapSelfHeal "
+             "state instead). The Saturday SF omits this flag so the heal still "
+             "runs inline before DataPhase1's postflight.",
     )
     parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
