@@ -141,7 +141,7 @@ def _emit_quality_gate_metrics(
     """Emit ``AlphaEngine/Data/fundamentals_quality_*`` gauges.
 
     Best-effort: CloudWatch errors WARN but don't fail the collector — the
-    per-anomaly logger.error calls on the block path are the load-bearing
+    aggregated run-level quality-gate logger.error is the load-bearing
     Flow Doctor surface; the metric catches slow drift. Mirrors
     ``builders.daily_append._emit_quality_gate_metrics``.
     """
@@ -174,8 +174,8 @@ def _emit_quality_gate_metrics(
     except Exception as exc:
         logger.warning(
             "CloudWatch fundamentals_quality_* metric failed: %s. Not "
-            "blocking — the per-anomaly logger.error calls are the "
-            "load-bearing Flow Doctor surface.",
+            "blocking — the aggregated run-level quality-gate logger.error "
+            "is the load-bearing Flow Doctor surface.",
             exc,
         )
 
@@ -390,6 +390,7 @@ def collect(
     n_quality_blocked = 0  # records replaced with NEUTRAL (block severity)
     n_quality_warned = 0   # records kept but flagged (warn severity)
     quality_counts_by_type: dict[str, int] = {}
+    quality_blocked_details: list[str] = []  # "TICKER.type" per block
 
     for ticker in tickers:
         try:
@@ -397,9 +398,10 @@ def collect(
             # ── Write-time value-range gate ─────────────────────────────
             # Runs on the fully-shaped (clipped) per-ticker dict before it
             # is queued for the S3 snapshot. block → drop the corrupt row
-            # to NEUTRAL + logger.error so Flow Doctor surfaces it (a
-            # NaN/inf or negative margin would otherwise poison the
-            # predictor feature store). warn → keep + log + count.
+            # to NEUTRAL + count (a NaN/inf or negative margin would
+            # otherwise poison the predictor feature store); the aggregated
+            # run-level logger.error below surfaces blocks to Flow Doctor.
+            # warn → keep + log + count.
             qg = validate_feature_record(
                 data, _FUNDAMENTALS_FIELD_SPECS, ticker
             )
@@ -409,15 +411,17 @@ def collect(
             ]
             if blocking:
                 for a in blocking:
-                    # logger.error so FlowDoctorHandler picks it up —
-                    # return-dicts are invisible to it.
-                    logger.error(
+                    # WARNING per ticker; the single aggregated run-level
+                    # logger.error below is the Flow Doctor surface (one
+                    # systemic event → one alert, not one per ticker).
+                    logger.warning(
                         "Fundamentals quality gate BLOCK %s.%s: %s",
                         ticker, a["type"], a["detail"],
                     )
                     quality_counts_by_type[a["type"]] = (
                         quality_counts_by_type.get(a["type"], 0) + 1
                     )
+                    quality_blocked_details.append(f"{ticker}.{a['type']}")
                 n_quality_blocked += 1
                 # Refuse the corrupt row; NEUTRAL is the existing
                 # no-data sentinel the ok_ratio gate already accounts for.
@@ -448,7 +452,20 @@ def collect(
         "Fundamentals fetched in %.1fs: %d populated, %d errors, %d total (ok_ratio=%.1f%%)",
         elapsed, n_ok, n_err, len(results), ok_ratio * 100,
     )
-    if n_quality_blocked or n_quality_warned:
+    if n_quality_blocked:
+        # Single aggregated ERROR per run — the Flow Doctor surface for the
+        # block path (per-ticker lines above are WARNING-only; one systemic
+        # event must produce one alert, not one per ticker — see the
+        # 2026-06-11 daily_append EOD storm note).
+        detail_list = ", ".join(quality_blocked_details[:20])
+        if len(quality_blocked_details) > 20:
+            detail_list += f", … +{len(quality_blocked_details) - 20} more"
+        logger.error(
+            "Fundamentals quality gate blocked %d ticker(s) this run "
+            "(counts=%s): %s",
+            n_quality_blocked, quality_counts_by_type, detail_list,
+        )
+    elif n_quality_warned:
         logger.info(
             "Fundamentals quality gate: %d blocked, %d warned, counts=%s",
             n_quality_blocked, n_quality_warned, quality_counts_by_type,

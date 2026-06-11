@@ -11,9 +11,10 @@ downstream feature compute + predictor training.
 
 This wave wires ``validate_today_row`` into the per-symbol write_tasks
 loop with per-anomaly-type severity semantics: ``block`` definitely-bad
-rows by default (refuse the queue + log error so Flow Doctor surfaces),
-``warn`` legitimately-rare-but-possible signals (queue write + log
-warning + emit metric). Operators upgrade types to block via
+rows by default (refuse the queue + per-ticker WARNING + ONE aggregated
+run-level record for Flow Doctor), ``warn``
+legitimately-rare-but-possible signals (queue write + log warning +
+emit metric). Operators upgrade types to block via
 ``DAILY_APPEND_BLOCK_ANOMALY_TYPES``.
 
 Source-text invariants pin the wiring shape; functional cases through
@@ -78,17 +79,39 @@ def test_validate_today_row_called_before_write_queue():
     )
 
 
-def test_block_path_uses_logger_error_not_warning():
-    """Blocking anomalies must emit logger.error so the FlowDoctorHandler
-    picks them up — per feedback_collector_return_dict_invisible_to_flow_doctor,
-    only logger.error / logger.critical cross the logging boundary."""
+def test_block_path_per_ticker_logs_warning_not_error():
+    """Per-ticker block lines must log at WARNING, not ERROR — one systemic
+    event (e.g. the 2026-06-11 EOD unsettled-bar storm, 10 tickers) must not
+    fan out into one Flow Doctor alert per ticker. The aggregated run-level
+    record below is the alert surface."""
     src = _source()
-    # The block branch must use log.error
-    assert 'log.error(\n                            "Quality gate BLOCK %s.%s: %s"' in src or \
-        'log.error(\n                            "Quality gate BLOCK' in src, (
-            "Block path must call log.error so Flow Doctor surfaces the "
-            "anomaly via SNS / GitHub issue."
-        )
+    assert 'log.warning(\n                            "Quality gate BLOCK' in src, (
+        "Per-ticker block lines must be log.warning — the aggregated "
+        "run-level record is the Flow Doctor surface."
+    )
+    assert 'log.error(\n                            "Quality gate BLOCK' not in src, (
+        "Per-ticker log.error block lines reintroduce the alert storm "
+        "(one email per blocked ticker)."
+    )
+
+
+def test_aggregated_block_summary_is_flow_doctor_surface():
+    """Exactly one run-level record crosses into Flow Doctor when rows were
+    blocked — ERROR for real data-quality events, WARNING for the expected
+    EOD unsettled-bar artifact (skip_if_exists + all-intrabar_inconsistent),
+    which heals via the next MorningEnrich overwrite."""
+    src = _source()
+    assert "if n_quality_blocked:" in src
+    # The expected-EOD carve-out must key on BOTH the post-market path flag
+    # and the anomaly-type set — a settled-path (MorningEnrich) intrabar
+    # block, or any other anomaly type, must stay ERROR.
+    assert (
+        "skip_if_exists and blocked_types == {ANOMALY_INTRABAR_INCONSISTENT}"
+        in src
+    )
+    assert '"Quality gate blocked %d row(s) this run (types=%s): %s"' in src
+    # Per-ticker (ticker, type) details must be accumulated for the summary.
+    assert "quality_blocked_details.append((ticker, a[\"type\"]))" in src
 
 
 def test_block_path_skips_write_via_continue():

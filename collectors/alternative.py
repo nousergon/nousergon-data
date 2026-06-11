@@ -202,8 +202,8 @@ def _emit_quality_gate_metrics(
     except Exception as exc:
         logger.warning(
             "CloudWatch alternative_quality_* metric failed: %s. Not "
-            "blocking — the per-anomaly logger.error calls are the "
-            "load-bearing Flow Doctor surface.",
+            "blocking — the aggregated run-level quality-gate logger.error "
+            "is the load-bearing Flow Doctor surface.",
             exc,
         )
 
@@ -566,6 +566,7 @@ def collect(
     n_quality_blocked = 0
     n_quality_warned = 0
     quality_counts_by_type: dict[str, int] = {}
+    quality_blocked_details: list[str] = []  # "TICKER.source.type" per block
     # Per-source populated counts. Increment only when the source for
     # this ticker carried real (non-default) data — see _HAS_DATA_PREDICATES
     # commentary above for the silent-fail surface this protects against.
@@ -592,13 +593,18 @@ def collect(
             )
             if blocking:
                 for a in blocking:
-                    # logger.error so FlowDoctorHandler picks it up.
-                    logger.error(
+                    # WARNING per ticker; the single aggregated run-level
+                    # logger.error below is the Flow Doctor surface (one
+                    # systemic event → one alert, not one per ticker).
+                    logger.warning(
                         "Alternative quality gate BLOCK %s.%s.%s: %s",
                         ticker, a["source"], a["type"], a["detail"],
                     )
                     quality_counts_by_type[a["type"]] = (
                         quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                    quality_blocked_details.append(
+                        f"{ticker}.{a['source']}.{a['type']}"
                     )
                 n_quality_blocked += 1
                 failed += 1
@@ -641,7 +647,20 @@ def collect(
             errors.append({"ticker": ticker, "error": scrubbed})
             logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
 
-    if n_quality_blocked or n_quality_warned:
+    if n_quality_blocked:
+        # Single aggregated ERROR per run — the Flow Doctor surface for the
+        # block path (per-ticker lines above are WARNING-only; one systemic
+        # event must produce one alert, not one per ticker — see the
+        # 2026-06-11 daily_append EOD storm note).
+        detail_list = ", ".join(quality_blocked_details[:20])
+        if len(quality_blocked_details) > 20:
+            detail_list += f", … +{len(quality_blocked_details) - 20} more"
+        logger.error(
+            "Alternative quality gate blocked %d ticker(s) this run "
+            "(counts=%s): %s",
+            n_quality_blocked, quality_counts_by_type, detail_list,
+        )
+    elif n_quality_warned:
         logger.info(
             "Alternative quality gate: %d blocked, %d warned, counts=%s",
             n_quality_blocked, n_quality_warned, quality_counts_by_type,

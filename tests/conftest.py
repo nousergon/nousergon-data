@@ -15,6 +15,16 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Hard-disable flow-doctor for the whole pytest session. The lib's
+# PYTEST_CURRENT_TEST guard does not cover handler attachment at module
+# IMPORT time (several tests import weekly_collector, whose module-top
+# setup_logging runs during collection, before PYTEST_CURRENT_TEST is
+# set) — on 2026-06-11 a local test run leaked REAL alert emails + GitHub
+# issues + S3 changelog entries for synthetic fixture tickers (T0/T1/BAD).
+# Must be set before any test module import, hence module level here, not
+# a fixture.
+os.environ.setdefault("FLOW_DOCTOR_DISABLED", "1")
+
 
 @pytest.fixture(autouse=True)
 def _isolate_secrets_from_ssm(monkeypatch):
