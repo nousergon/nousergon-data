@@ -68,10 +68,16 @@ class TestChainOrdering:
             (c for c in choices if c.get("StringEquals") == "Success"), None
         )
         assert success_choice is not None, "CheckEODStatus must have a Success branch"
-        assert success_choice["Next"] == "DailySubstrateHealthCheck", (
-            "CheckEODStatus Success must hand off to the substrate check, "
-            "not skip directly to StopTradingInstance."
+        # Since L4607 the substrate check sits behind the
+        # CheckSkipDailySubstrateHealthCheck rerun gate, whose Default runs it.
+        # CheckEODStatus Success → that gate → (no skip flag) the substrate
+        # check — it still runs after EODReconcile, not skipped to stop.
+        assert success_choice["Next"] == "CheckSkipDailySubstrateHealthCheck", (
+            "CheckEODStatus Success must hand off to the substrate skip-gate."
         )
+        assert states["CheckSkipDailySubstrateHealthCheck"]["Default"] == (
+            "DailySubstrateHealthCheck"
+        ), "the skip-gate's Default must run the substrate check"
 
     def test_substrate_check_routes_to_wait_state(self, states):
         assert states["DailySubstrateHealthCheck"]["Next"] == (
