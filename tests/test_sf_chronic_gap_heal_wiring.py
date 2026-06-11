@@ -64,14 +64,20 @@ class TestChainOrdering:
     WaitForChronicGap → CheckChronicGapStatus(terminal) → PredictorInference."""
 
     def test_morning_enrich_success_routes_to_heal(self, states):
+        # Since L4606 the heal sits behind the CheckSkipChronicGapHeal rerun
+        # gate, whose Default runs the heal. MorningEnrich success → that gate
+        # → (no skip flag) ChronicGapSelfHeal. The heal still runs AFTER a
+        # completed (load-bearing) MorningEnrich.
         success = [
             c["Next"]
             for c in states["CheckMorningEnrichStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == [_HEAL], (
-            "MorningEnrich success must hand off to ChronicGapSelfHeal — the "
-            "heal runs AFTER a completed (load-bearing) MorningEnrich."
+        assert success == ["CheckSkipChronicGapHeal"], (
+            "MorningEnrich success must hand off to the chronic-gap skip-gate"
+        )
+        assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL, (
+            "the skip-gate's Default must run ChronicGapSelfHeal"
         )
 
     def test_heal_routes_to_poll(self, states):
@@ -117,27 +123,35 @@ class TestFailSoft:
     """A heal failure / hang / timeout must NEVER fail the pipeline — every
     terminal edge routes to PredictorInference, never HandleFailure."""
 
-    def test_check_default_is_predictor_inference_not_handlefailure(self, states):
-        # Inverse of CheckMorningEnrichStatus, whose Default is HandleFailure.
-        assert states[_CHECK]["Default"] == "PredictorInference", (
-            "Chronic-gap heal is best-effort: any terminal status (incl. "
-            "failure) must proceed to PredictorInference, not HandleFailure."
-        )
+    # Since L4606 the forward target is the CheckSkipPredictorInference rerun
+    # gate (whose Default runs PredictorInference) rather than PredictorInference
+    # directly — still fail-soft: it proceeds toward predictions, never to
+    # HandleFailure.
+    _FWD = "CheckSkipPredictorInference"
 
-    def test_heal_catch_routes_to_predictor_inference(self, states):
+    def test_check_default_proceeds_toward_predictions_not_handlefailure(self, states):
+        # Inverse of CheckMorningEnrichStatus, whose Default is HandleFailure.
+        assert states[_CHECK]["Default"] == self._FWD, (
+            "Chronic-gap heal is best-effort: any terminal status (incl. "
+            "failure) must proceed toward PredictorInference, not HandleFailure."
+        )
+        # And the gate it hands to must actually run PredictorInference.
+        assert states[self._FWD]["Default"] == "PredictorInference"
+
+    def test_heal_catch_proceeds_toward_predictions(self, states):
         catches = states[_HEAL].get("Catch", [])
         assert catches, f"{_HEAL} must have a fail-soft Catch"
         for c in catches:
-            assert c["Next"] == "PredictorInference", (
-                f"{_HEAL} Catch must route to PredictorInference (fail-soft), "
-                f"got {c['Next']}"
+            assert c["Next"] == self._FWD, (
+                f"{_HEAL} Catch must proceed toward PredictorInference via "
+                f"{self._FWD} (fail-soft), got {c['Next']}"
             )
 
-    def test_poll_catch_routes_to_predictor_inference(self, states):
+    def test_poll_catch_proceeds_toward_predictions(self, states):
         catches = states[_POLL].get("Catch", [])
         assert catches, f"{_POLL} must have a fail-soft Catch"
         for c in catches:
-            assert c["Next"] == "PredictorInference"
+            assert c["Next"] == self._FWD
 
     def test_no_heal_state_routes_to_handlefailure(self, states):
         """No Next/Default/Catch target across the heal quartet may be
