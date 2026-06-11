@@ -1,8 +1,12 @@
 """
 contracts/ — JSON Schema data contracts for inter-module communication.
 
-Schemas define the expected format of S3 JSON files shared between modules.
-Validation is advisory — log warnings on mismatch, never hard-fail.
+The SLOT boundary schemas (signals = Slot R, predictions = Slot M) live in
+``alpha_engine_lib.contracts`` (single source of truth since lib v0.59.x, M0 —
+config#989); this package DELEGATES to the lib for those and keeps only the
+``executor_params`` schema local (backtester→executor tuned-config boundary,
+not a slot contract). Validation here is advisory — log warnings on mismatch,
+never hard-fail.
 
 Usage:
     from contracts import validate_signals, validate_predictions
@@ -23,7 +27,15 @@ logger = logging.getLogger(__name__)
 _SCHEMA_DIR = Path(__file__).parent
 
 
+_LIB_HOSTED = {"signals", "predictions"}
+
+
 def _load_schema(name: str) -> dict:
+    if name in _LIB_HOSTED:
+        # Slot contracts: single source of truth in alpha-engine-lib.
+        from alpha_engine_lib.contracts import load_schema
+
+        return load_schema(name)
     path = _SCHEMA_DIR / f"{name}.schema.json"
     with open(path) as f:
         return json.load(f)
