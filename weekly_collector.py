@@ -76,7 +76,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest
+from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data
 from builders._price_cache_writeboth import (
     price_cache_write_prefixes as _price_cache_write_prefixes,
 )
@@ -1724,6 +1724,17 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             skip_if_canonical=skip_if_canonical,
         ),
         artifact_key=f"{_dc_prefix}{run_date}.parquet",
+    )
+
+    # Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
+    # `alpha-engine-data` is the single market-data ground truth for the NE system;
+    # Metron reads these artifacts (it makes no direct market-data API calls). Reads its
+    # own universe from s3://<bucket>/metron/holdings_universe.json (fail-soft → skipped
+    # when absent), independent of the constituent `tickers` above.
+    results["collectors"]["metron_market_data"] = _phase_collect(
+        reg, "metron_market_data",
+        lambda: metron_market_data.collect(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.CLOSES_PREFIX}{run_date}.json",
     )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
