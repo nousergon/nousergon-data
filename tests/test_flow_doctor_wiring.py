@@ -40,6 +40,10 @@ def stub_flow_doctor_env(monkeypatch):
     but breaks tests that don't intend to fire the network call. Same
     knob applies to S3Notifier's bucket head-check in 0.4.0+.
     """
+    # conftest.py hard-sets FLOW_DOCTOR_DISABLED=1 for the whole session
+    # (kill switch outranks ENABLED=1) — clear it for tests that exercise
+    # activation deliberately with fully-stubbed notifiers.
+    monkeypatch.delenv("FLOW_DOCTOR_DISABLED", raising=False)
     monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
     monkeypatch.setenv("FLOW_DOCTOR_SKIP_PREFLIGHT", "1")
     monkeypatch.setenv("EMAIL_SENDER", "test@example.com")

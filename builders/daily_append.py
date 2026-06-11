@@ -63,6 +63,7 @@ from builders._price_cache_writeboth import (
 )
 from validators.price_validator import (
     ALL_ANOMALY_TYPES,
+    ANOMALY_INTRABAR_INCONSISTENT,
     DEFAULT_BLOCK_ANOMALY_TYPES,
     validate_today_row,
 )
@@ -279,10 +280,10 @@ def _emit_quality_gate_metrics(
     """Emit ``AlphaEngine/Data/daily_append_quality_*`` gauges.
 
     Best-effort: CloudWatch errors WARN but don't fail the pipeline — the
-    per-anomaly logger.error calls above are the load-bearing Flow Doctor
-    surface; the metric catches slow drift so a chronic 1-2-ticker-per-day
-    anomaly stream surfaces before it cumulates into a regression.
-    Mirrors ``_emit_missing_from_closes_metric``.
+    aggregated run-level quality-gate record (one per run, after the chunk
+    loop) is the load-bearing Flow Doctor surface; the metric catches slow
+    drift so a chronic 1-2-ticker-per-day anomaly stream surfaces before
+    it cumulates into a regression. Mirrors ``_emit_missing_from_closes_metric``.
     """
     if not counts_by_type and n_blocked == 0 and n_warned == 0:
         return
@@ -311,8 +312,8 @@ def _emit_quality_gate_metrics(
     except Exception as exc:
         log.warning(
             "CloudWatch daily_append_quality_* metric failed: %s. "
-            "Not blocking daily_append — the per-anomaly logger.error calls "
-            "above are the load-bearing Flow Doctor surface.",
+            "Not blocking daily_append — the aggregated run-level "
+            "quality-gate record is the load-bearing Flow Doctor surface.",
             exc,
         )
 
@@ -1034,6 +1035,7 @@ def _daily_append_impl(
     n_quality_blocked = 0  # rows refused by validate_today_row (block severity)
     n_quality_warned = 0   # rows written but flagged by validate_today_row (warn)
     quality_counts_by_type: dict[str, int] = {}
+    quality_blocked_details: list[tuple[str, str]] = []  # (ticker, anomaly_type)
 
     # Read DAILY_APPEND_BLOCK_ANOMALY_TYPES once per run (raises on malformed
     # JSON / unknown types — fail fast before the chunked pass begins).
@@ -1321,27 +1323,30 @@ def _daily_append_impl(
                 # Runs after today_row is fully shaped (OHLCV + features +
                 # provenance + dtypes aligned) but before the row is queued
                 # for batch write. Two outcomes: block (skip queue + log
-                # error so Flow Doctor surfaces) or warn (queue write +
-                # log warning + count). DEFAULT_BLOCK_ANOMALY_TYPES
-                # blocks only definitely-bad rows (High<Low, Close<=0);
-                # operators can upgrade types via the
-                # DAILY_APPEND_BLOCK_ANOMALY_TYPES env var.
+                # + count) or warn (queue write + log warning + count).
+                # DEFAULT_BLOCK_ANOMALY_TYPES blocks only definitely-bad
+                # rows (High<Low, Close<=0); operators can upgrade types
+                # via the DAILY_APPEND_BLOCK_ANOMALY_TYPES env var.
+                #
+                # Per-ticker block lines log at WARNING; the load-bearing
+                # Flow Doctor surface is the single aggregated run-level
+                # record emitted after the chunk loop (one systemic event
+                # → one alert, not one per ticker — see the 2026-06-11
+                # EOD storm note there).
                 qg = validate_today_row(today_row, hist, ticker)
                 blocking_anomalies = [
                     a for a in qg["anomalies"] if a["type"] in block_anomaly_types
                 ]
                 if blocking_anomalies:
                     for a in blocking_anomalies:
-                        # logger.error so the FlowDoctorHandler picks this
-                        # up — return-dicts are invisible to it per
-                        # feedback_collector_return_dict_invisible_to_flow_doctor.
-                        log.error(
+                        log.warning(
                             "Quality gate BLOCK %s.%s: %s",
                             ticker, a["type"], a["detail"],
                         )
                         quality_counts_by_type[a["type"]] = (
                             quality_counts_by_type.get(a["type"], 0) + 1
                         )
+                        quality_blocked_details.append((ticker, a["type"]))
                     n_quality_blocked += 1
                     continue  # do not queue this row for write
                 if qg["anomalies"]:
@@ -1477,6 +1482,46 @@ def _daily_append_impl(
         del hists_by_ticker, write_tasks, update_payloads, write_payloads
         gc.collect()
 
+    # ── Aggregated quality-gate alert (one per run, not one per ticker) ──
+    # 2026-06-11: the EOD run blocked 10 tickers' unsettled bars and fanned
+    # out 10 Flow Doctor alert emails + auto-filed issues (hitting
+    # max_alerts_per_day) for ONE systemic provider-settlement event. The
+    # per-ticker BLOCK lines above stay at WARNING for log forensics; this
+    # single record is what crosses the logging boundary into Flow Doctor
+    # (only ERROR-level records do, per
+    # feedback_collector_return_dict_invisible_to_flow_doctor).
+    #
+    # EOD severity carve-out: on the post-market path (skip_if_exists=True,
+    # minutes after the close) an intrabar_inconsistent block is the
+    # EXPECTED provider artifact — the closing-auction print lands in Close
+    # before the High/Low aggregates settle (NVR/ADC/HPE/… daily, all
+    # sub-1% gaps). The heal is structural: next morning's MorningEnrich
+    # overwrites with settled polygon data, and the universe-freshness scan
+    # hard-raises at >3 trading days as backstop. So an all-intrabar EOD
+    # block set logs the summary at WARNING (recorded surface: per-ticker
+    # WARN lines + CW quality metrics + result counters — no alert). Any
+    # other anomaly type, or ANY block on the settled MorningEnrich path,
+    # is a real data-quality event → single ERROR → one alert.
+    if n_quality_blocked:
+        blocked_types = {atype for _, atype in quality_blocked_details}
+        detail_list = ", ".join(
+            f"{tkr}.{atype}" for tkr, atype in quality_blocked_details[:20]
+        )
+        if len(quality_blocked_details) > 20:
+            detail_list += f", … +{len(quality_blocked_details) - 20} more"
+        if skip_if_exists and blocked_types == {ANOMALY_INTRABAR_INCONSISTENT}:
+            log.warning(
+                "Quality gate blocked %d row(s) this run — expected EOD "
+                "unsettled-bar artifact (close-auction print ahead of "
+                "High/Low settlement); rows heal via next MorningEnrich "
+                "overwrite: %s",
+                n_quality_blocked, detail_list,
+            )
+        else:
+            log.error(
+                "Quality gate blocked %d row(s) this run (types=%s): %s",
+                n_quality_blocked, sorted(blocked_types), detail_list,
+            )
 
     t_total = time.time() - t0
 
