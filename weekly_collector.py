@@ -26,8 +26,9 @@ import argparse
 import json
 import logging
 import os
+import signal
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -829,6 +830,56 @@ def _detect_chronic_gap_constituents_drift(
     return summary
 
 
+# Hard wall-clock bound for the chronic-gap self-heal (L4605). Generous enough
+# never to false-positive a legitimately-slow all-4-stale heal (~4 tickers ×
+# (yf.download ≤30s + backfill) ≈ 6 min worst case), but finite so an INFINITE
+# network hang in yf.download / backfill is converted to a bounded best-effort
+# skip rather than running forever. On the WEEKDAY pipeline the heal is its own
+# fail-soft SF state with a 300s SSM timeout (which fires first); on the SATURDAY
+# pipeline the heal runs INLINE inside MorningEnrich (5400s SSM budget), so this
+# in-process bound is the one that actually prevents an infinite heal hang from
+# SIGKILLing the load-bearing Saturday MorningEnrich. Chosen over a separate
+# Saturday SF state because the Saturday SF launches a fresh spot instance per
+# state — a spot-per-4-ticker-heal would be wasteful (2026-06-11 decision).
+_CHRONIC_HEAL_HARD_TIMEOUT_S = 600
+
+
+class _HardTimeout(BaseException):
+    """Raised by :func:`_hard_timeout` on SIGALRM expiry. Subclasses
+    BaseException (not Exception) so the per-ticker ``except Exception`` inside
+    the self-heal loop does NOT swallow it — the alarm aborts the whole heal
+    immediately and propagates to the caller, which logs + continues
+    (best-effort). Mirrors how KeyboardInterrupt escapes broad excepts."""
+
+
+@contextmanager
+def _hard_timeout(seconds: int, label: str):
+    """SIGALRM-based hard wall-clock bound for a best-effort block.
+
+    Main-thread only (weekly_collector runs as the main thread under both
+    ``--morning-enrich`` and ``--chronic-gap-heal``). Raises :class:`_HardTimeout`
+    on expiry. No-op (yields without arming) if SIGALRM is unavailable — not the
+    main thread, or a non-POSIX platform — so callers behave identically minus
+    the bound. SIGALRM interrupts blocking syscalls (socket recv), so it bounds
+    a hung network fetch, not just CPU-bound loops.
+    """
+    def _handler(signum, frame):
+        raise _HardTimeout(f"{label} exceeded {seconds}s hard timeout")
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _handler)
+    except (ValueError, AttributeError):
+        # Not in the main thread, or SIGALRM unavailable — run unbounded.
+        yield
+        return
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _self_heal_chronic_polygon_gaps(
     bucket: str,
     target_date: str,
@@ -1416,12 +1467,20 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
         )
         logger.info("=" * 60)
         try:
-            heal_result = _self_heal_chronic_polygon_gaps(
-                bucket=bucket,
-                target_date=target_date,
-                chronic_tickers=chronic_tickers,
-                dry_run=dry_run,
-            )
+            # Hard wall-clock bound (L4605): yf.download carries timeout=30 but
+            # the heal's builders.backfill() call is an unbounded second network
+            # path. This watchdog caps the WHOLE per-ticker heal loop so an
+            # infinite hang becomes a bounded best-effort skip — the
+            # load-bearing surface stays MorningEnrich (weekday: a separate
+            # fail-soft SF state; Saturday: DataPhase1's postflight), never a
+            # SIGKILL of the inline Saturday MorningEnrich.
+            with _hard_timeout(_CHRONIC_HEAL_HARD_TIMEOUT_S, "chronic-gap self-heal"):
+                heal_result = _self_heal_chronic_polygon_gaps(
+                    bucket=bucket,
+                    target_date=target_date,
+                    chronic_tickers=chronic_tickers,
+                    dry_run=dry_run,
+                )
             # Always "ok" by design — chronic-gap self-heal is best-effort.
             results["collectors"]["chronic_gap_self_heal"] = {
                 "status": "ok",
@@ -1433,6 +1492,18 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
                 len(heal_result["skipped_already_fresh"]),
                 len(heal_result["errors"]),
             )
+        except _HardTimeout as e:
+            # Best-effort: a hung heal must not fail the pipeline. Postflight
+            # (Saturday) catches any still-stale chronic ticker as the loud gate.
+            logger.warning(
+                "Chronic-gap self-heal hit the %ds hard timeout for %s — "
+                "skipping (best-effort); postflight remains the freshness gate. %s",
+                _CHRONIC_HEAL_HARD_TIMEOUT_S, target_date, e,
+            )
+            results["collectors"]["chronic_gap_self_heal"] = {
+                "status": "skipped",
+                "error": str(e),
+            }
         except Exception as e:
             logger.exception("Chronic-gap self-heal step failed for %s", target_date)
             results["collectors"]["chronic_gap_self_heal"] = {
