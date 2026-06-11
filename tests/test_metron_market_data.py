@@ -114,3 +114,48 @@ def test_load_universe_parses_holdings_and_currencies():
     holdings, currencies = mmd.load_metron_universe("b", s3)
     assert {h["yf_symbol"] for h in holdings} == {"AAPL", "1299.HK"}
     assert currencies == ["HKD"]
+
+
+class TestHistory:
+    def test_writes_per_symbol_close_history_and_per_currency_fx_history(self):
+        s3 = _universe_s3(_UNIVERSE)
+        close_hist = lambda syms: {
+            "AAPL": [("2026-06-10", 200.0), ("2026-06-11", 201.5)],
+            "1299.HK": [("2026-06-11", 64.2)],
+        }
+        fx_hist = lambda ccys: {"HKD": [("2026-06-10", 0.128), ("2026-06-11", 0.1282)]}
+
+        result = mmd.collect_history(
+            bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=fx_hist
+        )
+
+        assert result["status"] == "ok"
+        assert result["close_series"] == 2 and result["fx_series"] == 1
+        puts = _puts(s3)
+        assert set(puts) == {
+            "market_data/close_history/AAPL.json", "market_data/close_history/1299.HK.json",
+            "market_data/fx_history/HKD.json",
+        }
+        aapl = puts["market_data/close_history/AAPL.json"]
+        assert aapl["yf_symbol"] == "AAPL" and aapl["currency"] == "USD"
+        assert aapl["closes"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
+        hkd = puts["market_data/fx_history/HKD.json"]
+        assert hkd["base"] == "USD" and hkd["rates"][-1] == ["2026-06-11", 0.1282]
+
+    def test_history_dry_run_writes_nothing(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_history(
+            bucket="b", dry_run=True, s3_client=s3,
+            close_history_source=lambda s: {"AAPL": [("2026-06-11", 201.5)]},
+            fx_history_source=lambda c: {},
+        )
+        assert result["status"] == "ok_dry_run"
+        s3.put_object.assert_not_called()
+
+    def test_history_empty_universe_skips(self):
+        s3 = _universe_s3({"holdings": [], "currencies": []})
+        result = mmd.collect_history(
+            bucket="b", s3_client=s3, close_history_source=lambda s: {}, fx_history_source=lambda c: {}
+        )
+        assert result["status"] == "skipped"
+        s3.put_object.assert_not_called()
