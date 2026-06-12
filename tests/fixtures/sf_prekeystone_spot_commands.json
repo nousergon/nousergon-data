@@ -74,7 +74,7 @@
     "set -eo pipefail",
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-    "sudo -u ec2-user cp /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
+    "sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
     "cd /home/ec2-user/alpha-engine-predictor",
     "export HOME=/home/ec2-user",
     "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
