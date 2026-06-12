@@ -1758,6 +1758,15 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: metron_market_data.collect_macro(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.MACRO_PREFIX}latest.json",
     )
+    # Tearsheet fundamentals (multiples + balance-sheet ratios) for Metron's held
+    # universe — config#1022. Daily cadence; yfinance pass-through values; the
+    # 15-min intraday family (config#1023) runs OUTSIDE this pipeline via a systemd
+    # timer on the trading box (infrastructure/systemd/metron-intraday.timer).
+    results["collectors"]["metron_fundamentals_data"] = _phase_collect(
+        reg, "metron_fundamentals_data",
+        lambda: metron_market_data.collect_fundamentals(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.FUNDAMENTALS_PREFIX}latest.json",
+    )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
     # executor gate at alpha-engine/executor/main.py reads this key to decide

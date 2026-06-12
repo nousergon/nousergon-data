@@ -8,6 +8,8 @@ Metron makes NO direct market-data API calls of its own:
 
     market_data/eod_closes/{date}.json   + market_data/eod_closes/latest.json
     market_data/fx/{date}.json           + market_data/fx/latest.json
+    market_data/fundamentals/latest.json   (daily — tearsheet multiples/ratios)
+    market_data/intraday/latest.json       (every 15 min during US RTH — Today view)
 
 Closes cover the held union — including foreign listings (``1299.HK``, ``RMS.PA``), OTC
 (``GTBIF``), and funds (``FNILX``) that the ~903-name SP1500 constituent cache refuses.
@@ -56,6 +58,25 @@ EARNINGS_PREFIX = "market_data/earnings/"
 MACRO_PREFIX = "market_data/macro/"
 # FRED series ids Metron's Macro page renders (mirrors metron INDICATORS).
 METRON_MACRO_SERIES = ["FEDFUNDS", "UNRATE", "T10YIE", "DGS10", "DGS2", "T10Y2Y", "VIXCLS"]
+# Fundamentals — per-holding valuation multiples + balance-sheet ratios for Metron's
+# tearsheets (config#1022). Values are passed through EXACTLY as yfinance Ticker.info
+# returns them (no unit conversion at the producer — no fabrication; the consumer owns
+# display semantics and pins schema_version). NOTE: the weekly Finnhub
+# collectors/fundamentals.py covers the ~903-name SYSTEM universe with a predictor
+# feature-set; this family covers Metron's HELD universe (incl. foreign/OTC/funds
+# Finnhub free tier can't price) with the wider tearsheet field set.
+FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
+# yfinance Ticker.info keys published per symbol (artifact field == info key).
+FUNDAMENTALS_INFO_KEYS = [
+    "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
+    "earningsGrowth", "revenueGrowth", "debtToEquity", "currentRatio", "quickRatio",
+    "returnOnEquity", "returnOnAssets", "grossMargins", "operatingMargins",
+    "beta", "dividendYield", "marketCap", "sector", "industry",
+]
+# Intraday — last/open/prior-close per held symbol, refreshed every 15 min during US
+# regular trading hours by a systemd timer on the trading box (config#1023). Single
+# `latest.json` key (no dated files — 26 writes/day would litter the prefix).
+INTRADAY_PREFIX = "market_data/intraday/"
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
@@ -63,6 +84,8 @@ FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 1
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 1
+FUNDAMENTALS_SCHEMA_VERSION = 1
+INTRADAY_SCHEMA_VERSION = 1
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -97,6 +120,10 @@ BenchmarkWeightsSource = Callable[[], dict[str, float]]
 EarningsSource = Callable[[list[str]], dict[str, str]]
 # A macro source maps FRED series ids → {series_id: [(date_iso, value), …]} ascending.
 MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
+# A fundamentals source maps yf_symbols → {yf_symbol: {info_key: value}}.
+FundamentalsSource = Callable[[list[str]], dict[str, dict]]
+# An intraday source maps yf_symbols → {yf_symbol: quote dict} (see _yfinance_intraday).
+IntradaySource = Callable[[list[str]], dict[str, dict]]
 
 
 # ── Universe read ───────────────────────────────────────────────────────────
@@ -310,6 +337,83 @@ def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
         except Exception as e:
             logger.warning("[metron_market_data] earnings fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] earnings: %d/%d dated", len(out), len(yf_symbols))
+    return out
+
+
+def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
+    """Tearsheet fundamentals per held symbol via ``yf.Ticker(sym).info`` →
+    ``{yf_symbol: {info_key: value}}`` over ``FUNDAMENTALS_INFO_KEYS``.
+
+    Values pass through exactly as yfinance returns them (units documented at the
+    consumer; no producer-side conversion = no fabricated units). Fail-soft per
+    symbol; a symbol with no resolvable info is omitted (coverage gap, not zeros).
+    """
+    try:
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    out: dict[str, dict] = {}
+    for sym in yf_symbols:
+        try:
+            info = yf.Ticker(sym).info or {}
+        except Exception as e:
+            logger.warning("[metron_market_data] fundamentals fetch failed for %s: %s", sym, e)
+            continue
+        fields = {k: info[k] for k in FUNDAMENTALS_INFO_KEYS if info.get(k) is not None}
+        if fields:
+            out[sym] = fields
+    logger.info("[metron_market_data] fundamentals: %d/%d symbols covered", len(out), len(yf_symbols))
+    return out
+
+
+def _yfinance_intraday(yf_symbols: list[str]) -> dict[str, dict]:
+    """Latest (~15-min delayed) quote + session context per symbol, one batched
+    2-day daily-bar download → ``{yf_symbol: quote}`` where quote =
+    ``{last, open, prev_close, session_date, prev_session_date}``.
+
+    During a symbol's session the latest daily bar's Close IS the delayed last
+    price; outside it (e.g. a HK listing during US RTH) it is that exchange's
+    last completed session — ``session_date`` lets the consumer tell which.
+    Fail-soft per symbol; a symbol with no two valid bars is omitted.
+    """
+    try:
+        import pandas as pd
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        logger.warning("[metron_market_data] yfinance/pandas unavailable for intraday")
+        return {}
+    out: dict[str, dict] = {}
+    batches = [yf_symbols[i:i + _YFINANCE_BATCH_SIZE] for i in range(0, len(yf_symbols), _YFINANCE_BATCH_SIZE)]
+    for i, batch in enumerate(batches):
+        if i > 0:
+            time.sleep(_YFINANCE_BATCH_DELAY)
+        try:
+            raw = yf.download(
+                tickers=batch[0] if len(batch) == 1 else batch,
+                period="5d", interval="1d", auto_adjust=False,
+                progress=False, group_by="ticker", threads=True,
+            )
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+            for sym in batch:
+                try:
+                    df = (raw[sym] if is_multi else raw).copy()
+                    df.index = pd.to_datetime(df.index)
+                    df = df.dropna(subset=["Close"])
+                    if len(df) < 2:
+                        continue  # need prior close + current session — no fabrication
+                    cur, prev = df.iloc[-1], df.iloc[-2]
+                    out[sym] = {
+                        "last": round(float(cur["Close"]), 4),
+                        "open": round(float(cur["Open"]), 4),
+                        "prev_close": round(float(prev["Close"]), 4),
+                        "session_date": df.index[-1].date().isoformat(),
+                        "prev_session_date": df.index[-2].date().isoformat(),
+                    }
+                except Exception as e:
+                    logger.warning("[metron_market_data] intraday extract failed for %s: %s", sym, e)
+        except Exception as e:
+            logger.warning("[metron_market_data] yfinance intraday batch failed: %s", e)
+    logger.info("[metron_market_data] intraday: %d/%d symbols quoted", len(out), len(yf_symbols))
     return out
 
 
@@ -558,6 +662,111 @@ def collect_macro(
     return {"status": "ok", "series": len(series)}
 
 
+def collect_fundamentals(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, fundamentals_source: FundamentalsSource | None = None,
+) -> dict:
+    """Write the tearsheet-fundamentals artifact for Metron's held universe
+    (config#1022 — multiples + balance-sheet ratios, consumed by metron-ops#22):
+
+        market_data/fundamentals/latest.json
+            {schema_version, as_of, source: "yfinance", fundamentals: {yf_symbol: {info_key: value}}}
+
+    Field values are yfinance ``Ticker.info`` pass-throughs over
+    ``FUNDAMENTALS_INFO_KEYS`` — the consumer owns display/unit semantics and pins
+    ``schema_version``. Daily cadence (fundamentals move quarterly; daily is plenty).
+    Injectable source/S3 for tests."""
+    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    fundamentals = (fundamentals_source or _yfinance_fundamentals)(yf_symbols)
+    artifact = {
+        "schema_version": FUNDAMENTALS_SCHEMA_VERSION, "as_of": run_date,
+        "source": "yfinance", "fundamentals": dict(sorted(fundamentals.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN fundamentals: %d symbols (not written)", len(fundamentals))
+        return {"status": "ok_dry_run", "fundamentals": len(fundamentals)}
+    try:
+        _write_json(s3_client, bucket, f"{FUNDAMENTALS_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] fundamentals write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote fundamentals for %d/%d symbols", len(fundamentals), len(yf_symbols))
+    return {"status": "ok", "universe": len(holdings), "fundamentals": len(fundamentals)}
+
+
+# US regular trading hours in UTC, with margin: 13:25 (pre-13:30 open) → 20:10
+# (post-20:00 close). EDT-based; in EST (winter) the 14:30–21:00 session shifts an
+# hour later, so the window below is widened to cover BOTH offsets — the cost is a
+# few harmless extra runs, never a missed session segment.
+_RTH_UTC_START = (13, 25)
+_RTH_UTC_END = (21, 10)
+
+
+def in_us_market_window(now: datetime | None = None) -> bool:
+    """True on a weekday inside the (DST-widened) US RTH UTC window. NYSE holidays
+    are NOT checked here — on a holiday the trading box is the scheduler and the
+    quotes are simply unchanged; the artifact's ``session_date`` keeps it honest."""
+    now = now or datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    hm = (now.hour, now.minute)
+    return _RTH_UTC_START <= hm <= _RTH_UTC_END
+
+
+def collect_intraday(
+    *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
+    intraday_source: IntradaySource | None = None, force: bool = False,
+    now: datetime | None = None,
+) -> dict:
+    """Write the intraday-quotes artifact for Metron's held universe (config#1023 —
+    the 15-minute Today-view feed, consumed by metron-ops#23):
+
+        market_data/intraday/latest.json
+            {schema_version, as_of_utc, source: "yfinance_delayed",
+             quotes: {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
+
+    ``last`` is ~15-min delayed. Runs every 15 min during US RTH via a systemd timer
+    on the trading box (infrastructure/systemd/metron-intraday.timer); outside the
+    market window it returns ``skipped`` without fetching (``force`` overrides, for
+    manual runs). Single ``latest.json`` key — consumers see staleness via
+    ``as_of_utc``. Injectable source/S3 for tests."""
+    if not force and not in_us_market_window(now):
+        return {"status": "skipped", "reason": "outside US market window"}
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
+    quotes = (intraday_source or _yfinance_intraday)(sorted(ccy_by_yf))
+    for sym, q in quotes.items():
+        q["currency"] = ccy_by_yf.get(sym, "USD")
+    artifact = {
+        "schema_version": INTRADAY_SCHEMA_VERSION,
+        "as_of_utc": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "yfinance_delayed",
+        "quotes": dict(sorted(quotes.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN intraday: %d quotes (not written)", len(quotes))
+        return {"status": "ok_dry_run", "quotes": len(quotes)}
+    try:
+        _write_json(s3_client, bucket, f"{INTRADAY_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud — the timer unit's journal + freshness scan record it
+        logger.error("[metron_market_data] intraday write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote %d intraday quotes", len(quotes))
+    return {"status": "ok", "universe": len(holdings), "quotes": len(quotes)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m collectors.metron_market_data", description=__doc__)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
@@ -566,8 +775,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--history", action="store_true", help="also write close/FX history artifacts")
     parser.add_argument("--reference", action="store_true", help="also write sectors/earnings artifacts")
     parser.add_argument("--macro", action="store_true", help="also write the macro-indicators artifact")
+    parser.add_argument("--fundamentals", action="store_true", help="also write the tearsheet-fundamentals artifact")
+    parser.add_argument("--only-intraday", action="store_true",
+                        help="write ONLY the intraday-quotes artifact (the 15-min timer entry; "
+                             "no-op outside the US market window unless --force)")
+    parser.add_argument("--force", action="store_true", help="bypass the market-window gate for --only-intraday")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if args.only_intraday:
+        intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force)
+        logger.info("[metron_market_data] intraday done: %s", intra)
+        return 0 if intra.get("status") in ("ok", "ok_dry_run", "skipped") else 1
     result = collect(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
     logger.info("[metron_market_data] latest done: %s", result)
     ok = result.get("status") in ("ok", "ok_dry_run", "skipped")
@@ -583,6 +801,10 @@ def main(argv: list[str] | None = None) -> int:
         mac = collect_macro(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
         logger.info("[metron_market_data] macro done: %s", mac)
         ok = ok and mac.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.fundamentals:
+        fund = collect_fundamentals(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] fundamentals done: %s", fund)
+        ok = ok and fund.get("status") in ("ok", "ok_dry_run", "skipped")
     return 0 if ok else 1
 
 

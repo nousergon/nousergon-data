@@ -1,0 +1,17 @@
+# Metron intraday-quotes producer (config#1023) — one shot per timer tick.
+# Writes market_data/intraday/latest.json (last / open / prior close per held
+# symbol, ~15-min delayed) for Metron's Today view. The collector itself gates
+# on the US market window, so off-hours ticks exit "skipped" without fetching.
+# Installed on the trading box by infrastructure/install-metron-intraday.sh;
+# S3 write rides the instance role (executor-role already has market_data/*).
+[Unit]
+Description=Metron intraday quotes producer (alpha-engine-data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine-data
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python -m collectors.metron_market_data --only-intraday
+TimeoutStartSec=300
