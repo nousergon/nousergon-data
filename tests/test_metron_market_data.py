@@ -9,20 +9,32 @@ the dry-run no-write path, and the fail-soft empty-universe skip.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 from collectors import metron_market_data as mmd
 
 
-def _universe_s3(universe: dict | None) -> MagicMock:
-    """A MagicMock S3 whose get_object returns ``universe`` JSON (or raises if None)."""
+def _universe_s3(universe: dict | None, heartbeat_ts: str | None = None) -> MagicMock:
+    """A MagicMock S3 whose get_object dispatches per key: the Metron universe JSON
+    (raises if None) and, when ``heartbeat_ts`` is given, a fresh UI-heartbeat object
+    (the intraday demand gate); any other key raises NoSuchKey."""
     s3 = MagicMock()
-    if universe is None:
-        s3.get_object.side_effect = Exception("NoSuchKey")
-    else:
-        body = MagicMock()
-        body.read.return_value = json.dumps(universe).encode()
-        s3.get_object.return_value = {"Body": body}
+
+    def _get(Bucket, Key):
+        def _body(obj):
+            body = MagicMock()
+            body.read.return_value = json.dumps(obj).encode()
+            return {"Body": body}
+        if Key == "metron/ui_heartbeat.json":
+            if heartbeat_ts is None:
+                raise Exception("NoSuchKey")
+            return _body({"ts": heartbeat_ts})
+        if universe is None:
+            raise Exception("NoSuchKey")
+        return _body(universe)
+
+    s3.get_object.side_effect = _get
     return s3
 
 
@@ -230,13 +242,21 @@ class TestIntraday:
                     "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
     }
 
-    def test_writes_quotes_with_currency_inside_market_window(self):
-        from datetime import datetime, timezone
+    # Friday 2026-06-12 15:00 UTC = 11:00 ET — mid-session (EDT).
+    _RTH = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)
 
-        s3 = _universe_s3(_UNIVERSE)
-        rth = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)  # Friday 15:00 UTC
+    def _s3(self, *, heartbeat_offset_s: int | None = 60, universe: dict | None = _UNIVERSE):
+        """Fake S3 with a heartbeat ``offset_s`` seconds BEFORE the test's RTH now."""
+        ts = None
+        if heartbeat_offset_s is not None:
+            ts = (self._RTH - timedelta(seconds=heartbeat_offset_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return _universe_s3(universe, heartbeat_ts=ts)
+
+    def test_writes_quotes_with_currency_when_open_and_app_active(self):
+        s3 = self._s3()
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=lambda s: dict(self._QUOTES), now=rth
+            bucket="b", s3_client=s3, intraday_source=lambda s: {k: dict(v) for k, v in self._QUOTES.items()},
+            now=self._RTH,
         )
         assert result["status"] == "ok" and result["quotes"] == 2
         puts = _puts(s3)
@@ -247,47 +267,81 @@ class TestIntraday:
         assert art["as_of_utc"] == "2026-06-12T15:00:00Z"
         # Currency joined from the universe (the consumer FX-converts the P&L legs).
         assert art["quotes"]["1299.HK"]["currency"] == "HKD"
-        assert art["quotes"]["AAPL"]["prev_close"] == 201.5
+        # Normal moves carry no suspect flag.
+        assert "suspect" not in art["quotes"]["AAPL"]
 
-    def test_skips_outside_market_window_without_fetching(self):
-        from datetime import datetime, timezone
+    def test_suspect_flag_on_extreme_move_never_dropped(self):
+        s3 = self._s3()
+        quotes = {"AAPL": {"last": 350.0, "open": 200.5, "prev_close": 201.5,
+                           "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=lambda s: quotes, now=self._RTH
+        )
+        assert result["status"] == "ok"
+        art = _puts(s3)["market_data/intraday/latest.json"]
+        q = art["quotes"]["AAPL"]
+        assert q["suspect"] is True
+        assert q["last"] == 350.0  # flagged, never clamped/dropped — no fabrication
 
-        s3 = _universe_s3(_UNIVERSE)
+    def test_skips_without_fresh_heartbeat(self):
+        """The demand gate: Metron closed (no/stale heartbeat) → zero quote fetches."""
         calls = []
         source = lambda s: calls.append(1) or {}
-        # Friday 22:00 UTC — after the (DST-widened) close window.
-        late = datetime(2026, 6, 12, 22, 0, tzinfo=timezone.utc)
-        result = mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=late)
-        assert result["status"] == "skipped" and "market window" in result["reason"]
-        assert not calls and not s3.put_object.called
-        # Saturday inside the hour window — still skipped (weekend).
-        sat = datetime(2026, 6, 13, 15, 0, tzinfo=timezone.utc)
-        assert mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=sat)["status"] == "skipped"
-        # force=True bypasses the gate (manual backfill/debug runs).
+        # No heartbeat key at all.
+        absent = self._s3(heartbeat_offset_s=None)
+        r1 = mmd.collect_intraday(bucket="b", s3_client=absent, intraday_source=source, now=self._RTH)
+        assert r1["status"] == "skipped" and "heartbeat" in r1["reason"]
+        # Stale heartbeat (older than HEARTBEAT_FRESH_SECONDS).
+        stale = self._s3(heartbeat_offset_s=mmd.HEARTBEAT_FRESH_SECONDS + 60)
+        r2 = mmd.collect_intraday(bucket="b", s3_client=stale, intraday_source=source, now=self._RTH)
+        assert r2["status"] == "skipped" and "heartbeat" in r2["reason"]
+        assert not calls and not absent.put_object.called and not stale.put_object.called
+        # force bypasses BOTH gates (manual/debug runs).
         forced = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=lambda s: dict(self._QUOTES), now=late, force=True
+            bucket="b", s3_client=self._s3(heartbeat_offset_s=None),
+            intraday_source=lambda s: {k: dict(v) for k, v in self._QUOTES.items()},
+            now=self._RTH, force=True,
         )
         assert forced["status"] == "ok"
 
-    def test_market_window_boundaries(self):
-        from datetime import datetime, timezone
+    def test_skips_outside_session_before_heartbeat_read(self):
+        calls = []
+        source = lambda s: calls.append(1) or {}
+        s3 = self._s3()
+        # Friday 22:00 UTC = 18:00 ET — after close.
+        late = datetime(2026, 6, 12, 22, 0, tzinfo=timezone.utc)
+        assert mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=late)["status"] == "skipped"
+        # Saturday mid-window-hours — weekend.
+        sat = datetime(2026, 6, 13, 15, 0, tzinfo=timezone.utc)
+        assert mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=sat)["status"] == "skipped"
+        assert not calls
 
-        mk = lambda h, m: datetime(2026, 6, 12, h, m, tzinfo=timezone.utc)  # a Friday
-        assert not mmd.in_us_market_window(mk(13, 24))   # pre-open margin edge
-        assert mmd.in_us_market_window(mk(13, 25))       # EDT open margin
-        assert mmd.in_us_market_window(mk(20, 0))        # EDT close
-        assert mmd.in_us_market_window(mk(21, 10))       # EST close margin
-        assert not mmd.in_us_market_window(mk(21, 11))
+    def test_market_window_exchange_calendar(self):
+        mk = lambda y, mo, d, h, mi: datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+        # EDT regular day (2026-06-12): session 13:30–20:00 UTC, ±5 min margin.
+        assert not mmd.in_us_market_window(mk(2026, 6, 12, 13, 24))
+        assert mmd.in_us_market_window(mk(2026, 6, 12, 13, 25))
+        assert mmd.in_us_market_window(mk(2026, 6, 12, 20, 5))
+        assert not mmd.in_us_market_window(mk(2026, 6, 12, 20, 6))
+        # EST regular day (2026-12-15): session 14:30–21:00 UTC — the old widened-UTC
+        # heuristic would have opened an hour early; the ET evaluation does not.
+        assert not mmd.in_us_market_window(mk(2026, 12, 15, 13, 30))
+        assert mmd.in_us_market_window(mk(2026, 12, 15, 14, 25))
+        assert mmd.in_us_market_window(mk(2026, 12, 15, 21, 5))
+        # NYSE holiday (Thanksgiving 2026-11-26) — closed all day.
+        assert not mmd.in_us_market_window(mk(2026, 11, 26, 15, 0))
+        # Half-day (day after Thanksgiving, EST): closes 13:00 ET = 18:00 UTC.
+        assert mmd.in_us_market_window(mk(2026, 11, 27, 17, 0))
+        assert mmd.in_us_market_window(mk(2026, 11, 27, 18, 5))
+        assert not mmd.in_us_market_window(mk(2026, 11, 27, 19, 0))  # old heuristic said open
 
     def test_intraday_dry_run_and_empty_universe(self):
-        from datetime import datetime, timezone
-
-        rth = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)
-        s3 = _universe_s3(_UNIVERSE)
+        s3 = self._s3()
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, dry_run=True, intraday_source=lambda s: dict(self._QUOTES), now=rth
+            bucket="b", s3_client=s3, dry_run=True,
+            intraday_source=lambda s: {k: dict(v) for k, v in self._QUOTES.items()}, now=self._RTH,
         )
         assert result["status"] == "ok_dry_run"
         assert not s3.put_object.called
-        empty = _universe_s3({"holdings": [], "currencies": []})
-        assert mmd.collect_intraday(bucket="b", s3_client=empty, now=rth)["status"] == "skipped"
+        empty = self._s3(universe={"holdings": [], "currencies": []})
+        assert mmd.collect_intraday(bucket="b", s3_client=empty, now=self._RTH)["status"] == "skipped"
