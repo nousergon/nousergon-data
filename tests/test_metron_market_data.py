@@ -189,3 +189,105 @@ class TestReference:
         s3.put_object.assert_not_called()
         s3b = _universe_s3({"holdings": [], "currencies": []})
         assert mmd.collect_reference(bucket="b", s3_client=s3b, sector_source=lambda s: {}, benchmark_source=lambda: {}, earnings_source=lambda s: {})["status"] == "skipped"
+
+
+class TestFundamentals:
+    def test_writes_passthrough_fundamentals_keyed_by_yf_symbol(self):
+        s3 = _universe_s3(_UNIVERSE)
+        source = lambda syms: {
+            "AAPL": {"trailingPE": 31.2, "debtToEquity": 145.0, "sector": "Technology"},
+            "1299.HK": {"trailingPE": 12.4, "dividendYield": 0.031},
+        }
+        result = mmd.collect_fundamentals(
+            bucket="b", run_date="2026-06-12", s3_client=s3, fundamentals_source=source
+        )
+        assert result["status"] == "ok" and result["fundamentals"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/fundamentals/latest.json"}
+        art = puts["market_data/fundamentals/latest.json"]
+        assert art["schema_version"] == mmd.FUNDAMENTALS_SCHEMA_VERSION
+        assert art["source"] == "yfinance"
+        # Pass-through: values land exactly as the source returned them (no unit math).
+        assert art["fundamentals"]["AAPL"]["debtToEquity"] == 145.0
+        assert art["fundamentals"]["1299.HK"]["dividendYield"] == 0.031
+
+    def test_fundamentals_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_fundamentals(
+            bucket="b", s3_client=s3, dry_run=True, fundamentals_source=lambda s: {"AAPL": {"beta": 1.2}}
+        )
+        assert result["status"] == "ok_dry_run"
+        assert not s3.put_object.called
+        empty = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_fundamentals(bucket="b", s3_client=empty)["status"] == "skipped"
+
+
+class TestIntraday:
+    _QUOTES = {
+        "AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
+                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+        "1299.HK": {"last": 64.8, "open": 64.1, "prev_close": 64.2,
+                    "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+    }
+
+    def test_writes_quotes_with_currency_inside_market_window(self):
+        from datetime import datetime, timezone
+
+        s3 = _universe_s3(_UNIVERSE)
+        rth = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)  # Friday 15:00 UTC
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=lambda s: dict(self._QUOTES), now=rth
+        )
+        assert result["status"] == "ok" and result["quotes"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/intraday/latest.json"}
+        art = puts["market_data/intraday/latest.json"]
+        assert art["schema_version"] == mmd.INTRADAY_SCHEMA_VERSION
+        assert art["source"] == "yfinance_delayed"
+        assert art["as_of_utc"] == "2026-06-12T15:00:00Z"
+        # Currency joined from the universe (the consumer FX-converts the P&L legs).
+        assert art["quotes"]["1299.HK"]["currency"] == "HKD"
+        assert art["quotes"]["AAPL"]["prev_close"] == 201.5
+
+    def test_skips_outside_market_window_without_fetching(self):
+        from datetime import datetime, timezone
+
+        s3 = _universe_s3(_UNIVERSE)
+        calls = []
+        source = lambda s: calls.append(1) or {}
+        # Friday 22:00 UTC — after the (DST-widened) close window.
+        late = datetime(2026, 6, 12, 22, 0, tzinfo=timezone.utc)
+        result = mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=late)
+        assert result["status"] == "skipped" and "market window" in result["reason"]
+        assert not calls and not s3.put_object.called
+        # Saturday inside the hour window — still skipped (weekend).
+        sat = datetime(2026, 6, 13, 15, 0, tzinfo=timezone.utc)
+        assert mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=sat)["status"] == "skipped"
+        # force=True bypasses the gate (manual backfill/debug runs).
+        forced = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=lambda s: dict(self._QUOTES), now=late, force=True
+        )
+        assert forced["status"] == "ok"
+
+    def test_market_window_boundaries(self):
+        from datetime import datetime, timezone
+
+        mk = lambda h, m: datetime(2026, 6, 12, h, m, tzinfo=timezone.utc)  # a Friday
+        assert not mmd.in_us_market_window(mk(13, 24))   # pre-open margin edge
+        assert mmd.in_us_market_window(mk(13, 25))       # EDT open margin
+        assert mmd.in_us_market_window(mk(20, 0))        # EDT close
+        assert mmd.in_us_market_window(mk(21, 10))       # EST close margin
+        assert not mmd.in_us_market_window(mk(21, 11))
+
+    def test_intraday_dry_run_and_empty_universe(self):
+        from datetime import datetime, timezone
+
+        rth = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, dry_run=True, intraday_source=lambda s: dict(self._QUOTES), now=rth
+        )
+        assert result["status"] == "ok_dry_run"
+        assert not s3.put_object.called
+        empty = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_intraday(bucket="b", s3_client=empty, now=rth)["status"] == "skipped"

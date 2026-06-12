@@ -1,0 +1,14 @@
+# Every 15 minutes while the trading box is up. The box's own lifecycle is the
+# session gate (weekday SF starts it pre-open ~12:45 UTC, EOD SF stops it after
+# close ~21:15 UTC), and the collector additionally no-ops outside the US market
+# window — so this never needs a market calendar of its own.
+[Unit]
+Description=Metron intraday quotes every 15 min (market-window gated in-process)
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+AccuracySec=30
+Persistent=false
+
+[Install]
+WantedBy=timers.target
