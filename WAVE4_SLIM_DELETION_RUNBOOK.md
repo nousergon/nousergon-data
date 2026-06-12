@@ -37,7 +37,7 @@ run by CI or any pipeline).
    the backtester PR4. Re-confirm no new consumer via the terminal guard
    `tests/test_wave4_slim_arctic_parity.py`.
 
-## Procedure (single-dev, paper-trading; bounded-reversible)
+## Procedure (paper-trading; bounded-reversible)
 
 ```
 # 1. Pre-deletion byte-equal backup (Wave-5 precedent).
@@ -68,7 +68,7 @@ aws s3 ls s3://alpha-engine-research/predictor/price_cache_slim/ \
 
 `git revert` the Wave-4 PR(s) + `aws s3 cp --recursive` the backup prefix
 back to `predictor/price_cache_slim/`. The slim writer resumes on the next
-weekly SF. Worst case from a missed divergence in this single-dev
+weekly SF. Worst case from a missed divergence in this
 paper-trading context: degraded features for ~one week until noticed — no
 capital or data-loss risk (per the CLAUDE.md severity posture).
 
