@@ -25,9 +25,12 @@ import numpy as np
 import pandas as pd
 
 
-# ── Feature engineering parameters (from predictor.sample.yaml) ──────────────
-# These replace `from config import FEATURE_CFG as _FC` in the predictor.
-FEATURE_CFG: dict = {
+# ── Feature engineering parameters ──────────────────────────────────────────
+# config#1039: the window/period choices are experiment beliefs
+# (HARNESS_EXPERIMENT_CLASSIFICATION.md §1) — the experiment package's data
+# config.yaml `feature_cfg:` section overrides them per-key; these literals
+# are the public BASELINE used when no package entry is present.
+_BASELINE_FEATURE_CFG: dict = {
     "rsi_period": 14,
     "macd_fast": 12,
     "macd_slow": 26,
@@ -63,6 +66,46 @@ FEATURE_CFG: dict = {
     "resid_mom_skip": 21,
     "resid_mom_vol_window": 20,
 }
+
+
+def _load_feature_cfg_overrides() -> dict:
+    """Per-key FEATURE_CFG overrides from the experiment package.
+
+    Search mirrors weekly_collector.load_config + the package layer:
+    experiments/$ALPHA_ENGINE_EXPERIMENT_ID/data/config.yaml first, legacy
+    alpha-engine-config/data/config.yaml next, repo-local config.yaml last.
+    A MISSING file falls through (baseline applies); a present-but-corrupt
+    file or an unknown key RAISES — a typo'd override silently reverting a
+    window to baseline would be an invisible behavior change (no-silent-
+    fails: the failure surfaces at import, caught by SF preflight/CI).
+    """
+    import os
+    from pathlib import Path
+
+    import yaml
+
+    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
+    repo_root = Path(__file__).resolve().parent.parent
+    roots = [Path.home() / "alpha-engine-config", repo_root.parent / "alpha-engine-config"]
+    candidates = [r / "experiments" / exp / "data" / "config.yaml" for r in roots]
+    candidates += [r / "data" / "config.yaml" for r in roots]
+    candidates.append(repo_root / "config.yaml")
+    for path in candidates:
+        if not path.exists():
+            continue
+        cfg = yaml.safe_load(path.read_text()) or {}
+        overrides = dict(cfg.get("feature_cfg") or {})
+        unknown = set(overrides) - set(_BASELINE_FEATURE_CFG)
+        if unknown:
+            raise KeyError(
+                f"feature_cfg override(s) {sorted(unknown)} in {path} do not "
+                f"match any baseline FEATURE_CFG key — typo or removed param."
+            )
+        return overrides
+    return {}
+
+
+FEATURE_CFG: dict = {**_BASELINE_FEATURE_CFG, **_load_feature_cfg_overrides()}
 
 _FC = FEATURE_CFG
 
