@@ -1103,6 +1103,38 @@ def _fetch_polygon_closes_per_ticker(
     return recovered
 
 
+_SPLIT_RATIO_MAX = 50  # largest forward/reverse split factor worth hinting (covers 20:1 NVDA-class splits)
+_SPLIT_RATIO_TOL = 0.005  # adjusted closes restate by the EXACT factor; 0.5% absorbs feed rounding
+
+
+def _split_ratio_hint(prior: float, new: float) -> str:
+    """Corporate-action hint when prior/new sits on a clean split ratio, else "".
+
+    A forward N-for-1 split divides the adjusted close by exactly N (a reverse
+    1-for-N multiplies by N), so a cross-source overwrite whose ratio is within
+    ``_SPLIT_RATIO_TOL`` of an integer 2..``_SPLIT_RATIO_MAX`` is far more likely
+    a split restatement than a code bug. Surfacing the ratio in the ERROR message
+    hands the strongest evidence to whoever diagnoses it — the KLAC 10:1 split
+    (2026-06-10) was auto-diagnosed as a producer decimal-shift bug because the
+    message only said "90.00% diff" (data#417-419, config#1030).
+    """
+    if prior <= 0 or new <= 0:
+        return ""
+    for big, small, template in (
+        (prior, new, "%d-for-1 forward stock split"),
+        (new, prior, "1-for-%d reverse stock split"),
+    ):
+        ratio = big / small
+        n = round(ratio)
+        if 2 <= n <= _SPLIT_RATIO_MAX and abs(ratio - n) / n <= _SPLIT_RATIO_TOL:
+            return (
+                " [ratio = %d:1 — consistent with a %s restating adjusted history "
+                "(corporate action), check the split calendar before suspecting a code bug]"
+                % (n, template % n)
+            )
+    return ""
+
+
 def _log_close_discrepancies(
     new_df: pd.DataFrame,
     prior_close: dict[str, float],
@@ -1151,9 +1183,10 @@ def _log_close_discrepancies(
             n_restatement += 1
         elif pct_diff > _DISCREPANCY_ERROR_PCT:
             logger.error(
-                "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet) — "
+                "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)%s — "
                 "investigate before downstream consumers re-read",
                 ticker, run_date, prior, float(new_close), pct_diff * 100,
+                _split_ratio_hint(prior, float(new_close)),
             )
             n_error += 1
         elif pct_diff > _DISCREPANCY_WARN_PCT:

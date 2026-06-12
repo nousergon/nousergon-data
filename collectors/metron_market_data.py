@@ -30,6 +30,8 @@ Entry point: ``python -m collectors.metron_market_data [--date YYYY-MM-DD] [--dr
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import json
 import logging
 import time
@@ -155,6 +157,70 @@ def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[
 # ── yfinance fetchers (default sources) ─────────────────────────────────────
 
 
+@contextlib.contextmanager
+def _quiet_yfinance():
+    """Demote yfinance's internal logger to CRITICAL for the duration of a fetch.
+
+    yfinance logs its own ERROR record per failing symbol — ≥5 distinctly-worded
+    messages for ONE unpriceable ticker (quoteSummary 404, "possibly delisted"
+    in two forms, "1 Failed download:", per-period repeats). Flow Doctor keys
+    dedup on message text, so each line became its own report/email — the
+    2026-06-12 PCKM storm (config#1029). Failure recording is NOT lost: each
+    fetcher aggregates per-symbol coverage into one record per run via
+    ``_log_yf_coverage`` below, which is the named recording surface.
+    """
+    yf_logger = logging.getLogger("yfinance")
+    prior_level = yf_logger.level
+    yf_logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        yf_logger.setLevel(prior_level)
+
+
+def _yf_quiet(fn):
+    """Run a yfinance fetcher under ``_quiet_yfinance`` (see rationale there)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _quiet_yfinance():
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+def _log_yf_coverage(
+    kind: str,
+    requested: list[str],
+    covered: dict | set,
+    *,
+    error_on_empty: bool = False,
+) -> None:
+    """One aggregated coverage record per artifact per run (config#1029).
+
+    Replaces yfinance's per-symbol ERROR spray (demoted by ``_quiet_yfinance``):
+    symbols with no data are reported as a SINGLE WARN naming them all. A full
+    miss on a non-empty request escalates to ERROR only where the caller says
+    the artifact is load-bearing (``error_on_empty`` — closes), so a Yahoo
+    outage surfaces once, loudly, instead of once per artifact per symbol.
+    """
+    missing = sorted(set(requested) - set(covered))
+    if not missing:
+        return
+    if error_on_empty and not covered:
+        logger.error(
+            "[metron_market_data] %s: yfinance returned NO data for any of %d requested "
+            "symbols (%s) — full-miss on a load-bearing artifact (provider outage?)",
+            kind, len(missing), ", ".join(missing),
+        )
+        return
+    logger.warning(
+        "[metron_market_data] %s: no yfinance data for %d/%d symbols: %s — "
+        "non-listed instruments (e.g. 401(k) CITs) are broker-snapshot-priced "
+        "in Metron and belong out of the published universe (config#1029)",
+        kind, len(missing), len(requested), ", ".join(missing),
+    )
+
+
+@_yf_quiet
 def _yfinance_closes(yf_symbols: list[str]) -> dict[str, tuple[float, str]]:
     """Latest daily close per yf_symbol via yfinance → ``{yf_symbol: (close, bar_date)}``.
     Foreign listings (``.HK``/``.PA``/…) resolve natively. Unpriceable symbols omitted."""
@@ -192,9 +258,11 @@ def _yfinance_closes(yf_symbols: list[str]) -> dict[str, tuple[float, str]]:
         except Exception as e:
             logger.warning("[metron_market_data] yfinance close batch failed: %s", e)
     logger.info("[metron_market_data] closes: %d/%d symbols priced", len(out), len(yf_symbols))
+    _log_yf_coverage("closes", yf_symbols, out, error_on_empty=True)
     return out
 
 
+@_yf_quiet
 def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, float]:
     """Latest FX rate per currency via yfinance ``{CCY}{BASE}=X`` → ``{CCY: rate}``
     (``base`` per 1 unit of ``CCY``). Unresolvable pairs omitted — no fabrication."""
@@ -230,9 +298,11 @@ def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, 
     except Exception as e:
         logger.warning("[metron_market_data] yfinance FX batch failed: %s", e)
     logger.info("[metron_market_data] fx: %d/%d currencies resolved", len(out), len(pairs))
+    _log_yf_coverage("fx", list(pairs.values()), out)
     return out
 
 
+@_yf_quiet
 def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY) -> dict[str, list[tuple[str, float]]]:
     """Daily close series per symbol via yfinance over ``period`` →
     ``{key: [(bar_date, close), …]}`` ascending. ``is_fx`` maps a currency to the
@@ -270,6 +340,7 @@ def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: s
         except Exception as e:
             logger.warning("[metron_market_data] yfinance history batch failed: %s", e)
     logger.info("[metron_market_data] history: %d/%d series captured", len(out), len(targets))
+    _log_yf_coverage("fx_history" if is_fx else "close_history", list(targets.values()), out)
     return out
 
 
@@ -281,6 +352,7 @@ def _yfinance_fx_history(currencies: list[str], period: str = DEFAULT_HISTORY_PE
     return _yf_history(currencies, period, is_fx=True)
 
 
+@_yf_quiet
 def _yfinance_sectors(yf_symbols: list[str]) -> dict[str, str]:
     """Canonical GICS sector per held symbol via ``yf.Ticker(sym).info['sector']``.
     Fail-soft: an unclassifiable symbol is omitted (Metron shows a coverage gap)."""
@@ -297,9 +369,11 @@ def _yfinance_sectors(yf_symbols: list[str]) -> dict[str, str]:
         except Exception as e:
             logger.warning("[metron_market_data] sector fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] sectors: %d/%d classified", len(out), len(yf_symbols))
+    _log_yf_coverage("sectors", yf_symbols, out)
     return out
 
 
+@_yf_quiet
 def _yfinance_spy_weights() -> dict[str, float]:
     """SPY's live GICS sector weights (canonical label → fraction) via
     ``funds_data.sector_weightings`` (snake_case → canonical). ``{}`` on failure."""
@@ -315,6 +389,7 @@ def _yfinance_spy_weights() -> dict[str, float]:
     return {_FUNDS_SECTOR_KEY[k]: float(v) for k, v in raw.items() if k in _FUNDS_SECTOR_KEY}
 
 
+@_yf_quiet
 def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
     """Next (earliest upcoming) earnings date per held symbol via yfinance →
     ``{yf_symbol: date_iso}``. Fail-soft: no resolvable date → omitted."""
@@ -337,9 +412,11 @@ def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
         except Exception as e:
             logger.warning("[metron_market_data] earnings fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] earnings: %d/%d dated", len(out), len(yf_symbols))
+    _log_yf_coverage("earnings", yf_symbols, out)
     return out
 
 
+@_yf_quiet
 def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
     """Tearsheet fundamentals per held symbol via ``yf.Ticker(sym).info`` →
     ``{yf_symbol: {info_key: value}}`` over ``FUNDAMENTALS_INFO_KEYS``.
@@ -363,9 +440,11 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
         if fields:
             out[sym] = fields
     logger.info("[metron_market_data] fundamentals: %d/%d symbols covered", len(out), len(yf_symbols))
+    _log_yf_coverage("fundamentals", yf_symbols, out)
     return out
 
 
+@_yf_quiet
 def _yfinance_intraday(yf_symbols: list[str]) -> dict[str, dict]:
     """Latest (~15-min delayed) quote + session context per symbol, one batched
     2-day daily-bar download → ``{yf_symbol: quote}`` where quote =
@@ -414,6 +493,7 @@ def _yfinance_intraday(yf_symbols: list[str]) -> dict[str, dict]:
         except Exception as e:
             logger.warning("[metron_market_data] yfinance intraday batch failed: %s", e)
     logger.info("[metron_market_data] intraday: %d/%d symbols quoted", len(out), len(yf_symbols))
+    _log_yf_coverage("intraday", yf_symbols, out)
     return out
 
 
