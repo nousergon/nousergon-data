@@ -29,4 +29,4 @@ arcticdb>=6.11
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-alpha-engine-lib[arcticdb,flow_doctor,rag,contracts] @ git+https://github.com/cipher813/alpha-engine-lib@v0.59.1
+alpha-engine-lib[arcticdb,flow_doctor,rag,contracts] @ git+https://github.com/cipher813/alpha-engine-lib@v0.59.4
