@@ -9,7 +9,7 @@ Metron makes NO direct market-data API calls of its own:
     market_data/eod_closes/{date}.json   + market_data/eod_closes/latest.json
     market_data/fx/{date}.json           + market_data/fx/latest.json
     market_data/fundamentals/latest.json   (daily — tearsheet multiples/ratios)
-    market_data/intraday/latest.json       (every 15 min during US RTH — Today view)
+    market_data/intraday/latest.json       (every 5 min while NYSE open AND Metron in use)
 
 Closes cover the held union — including foreign listings (``1299.HK``, ``RMS.PA``), OTC
 (``GTBIF``), and funds (``FNILX``) that the ~903-name SP1500 constituent cache refuses.
@@ -33,7 +33,7 @@ import argparse
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -701,23 +701,76 @@ def collect_fundamentals(
     return {"status": "ok", "universe": len(holdings), "fundamentals": len(fundamentals)}
 
 
-# US regular trading hours in UTC, with margin: 13:25 (pre-13:30 open) → 20:10
-# (post-20:00 close). EDT-based; in EST (winter) the 14:30–21:00 session shifts an
-# hour later, so the window below is widened to cover BOTH offsets — the cost is a
-# few harmless extra runs, never a missed session segment.
-_RTH_UTC_START = (13, 25)
-_RTH_UTC_END = (21, 10)
+# NYSE early-close days (1:00 PM ET close): day after Thanksgiving, and Christmas
+# Eve / July 3 when they fall on a weekday. Source: nyse.com/markets/hours-calendars.
+# Holidays themselves come from alpha_engine_lib.trading_calendar.NYSE_HOLIDAYS (the
+# fleet-canonical set, maintained through 2030). Lift this early-close set into
+# alpha_engine_lib.trading_calendar on second adoption per the
+# lift-invariants-after-second-recurrence rule.
+NYSE_EARLY_CLOSES: set = {
+    # 2026
+    date(2026, 11, 27),  # day after Thanksgiving
+    date(2026, 12, 24),  # Christmas Eve (Thursday)
+    # 2027
+    date(2027, 11, 26),  # day after Thanksgiving
+    date(2027, 12, 23),  # day before observed Christmas (Dec 24 = observed holiday)
+    # 2028
+    date(2028, 7, 3),    # day before Independence Day (Monday)
+    date(2028, 11, 24),  # day after Thanksgiving
+    # 2029
+    date(2029, 7, 3),    # day before Independence Day (Tuesday)
+    date(2029, 11, 23),  # day after Thanksgiving
+    date(2029, 12, 24),  # Christmas Eve (Monday)
+    # 2030
+    date(2030, 7, 3),    # day before Independence Day (Wednesday)
+    date(2030, 11, 29),  # day after Thanksgiving
+    date(2030, 12, 24),  # Christmas Eve (Tuesday)
+}
+_SESSION_MARGIN_MIN = 5  # minutes of slack either side of the official session
 
 
 def in_us_market_window(now: datetime | None = None) -> bool:
-    """True on a weekday inside the (DST-widened) US RTH UTC window. NYSE holidays
-    are NOT checked here — on a holiday the trading box is the scheduler and the
-    quotes are simply unchanged; the artifact's ``session_date`` keeps it honest."""
+    """True inside the actual NYSE session (±5 min margin), in exchange time.
+
+    Exchange-calendar gating: weekends and NYSE holidays via the fleet-canonical
+    ``alpha_engine_lib.trading_calendar.is_trading_day``; the session is 9:30 ET →
+    16:00 ET (13:00 ET on ``NYSE_EARLY_CLOSES`` half-days), evaluated in
+    America/New_York so DST is handled exactly — no widened-UTC heuristic."""
+    from zoneinfo import ZoneInfo
+
+    from alpha_engine_lib.trading_calendar import is_trading_day
+
     now = now or datetime.now(timezone.utc)
-    if now.weekday() >= 5:
+    et = now.astimezone(ZoneInfo("America/New_York"))
+    if not is_trading_day(et.date()):
         return False
-    hm = (now.hour, now.minute)
-    return _RTH_UTC_START <= hm <= _RTH_UTC_END
+    close_hm = (13, 0) if et.date() in NYSE_EARLY_CLOSES else (16, 0)
+    open_min = 9 * 60 + 30 - _SESSION_MARGIN_MIN
+    close_min = close_hm[0] * 60 + close_hm[1] + _SESSION_MARGIN_MIN
+    return open_min <= et.hour * 60 + et.minute <= close_min
+
+
+# The demand gate: Metron's web layer touches this key while the app is actively
+# being used (throttled heartbeat — see metron api/services/data_spine.py). The
+# intraday producer fetches ONLY while the heartbeat is fresh, so a closed app
+# costs zero quote fetches. Missing key = app never opened → skip.
+UI_HEARTBEAT_KEY = "metron/ui_heartbeat.json"
+HEARTBEAT_FRESH_SECONDS = 600  # 10 min — two missed 5-min ticks ends the session
+
+
+def metron_app_active(bucket: str, s3_client: Any, now: datetime | None = None) -> bool:
+    """True when Metron's UI heartbeat exists and is fresh (see ``UI_HEARTBEAT_KEY``).
+    Fail-soft on read errors → inactive (the artifact just goes stale; the consumer
+    shows staleness honestly via ``as_of_utc``)."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=UI_HEARTBEAT_KEY)
+        ts = json.loads(obj["Body"].read()).get("ts", "")
+        beat = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return (now - beat).total_seconds() <= HEARTBEAT_FRESH_SECONDS
+    except Exception as e:  # missing key, parse error, no creds — all mean "not active"
+        logger.info("[metron_market_data] no fresh UI heartbeat (%s) — app inactive", e)
+        return False
 
 
 def collect_intraday(
@@ -732,23 +785,39 @@ def collect_intraday(
             {schema_version, as_of_utc, source: "yfinance_delayed",
              quotes: {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
 
-    ``last`` is ~15-min delayed. Runs every 15 min during US RTH via a systemd timer
-    on the trading box (infrastructure/systemd/metron-intraday.timer); outside the
-    market window it returns ``skipped`` without fetching (``force`` overrides, for
-    manual runs). Single ``latest.json`` key — consumers see staleness via
-    ``as_of_utc``. Injectable source/S3 for tests."""
+    ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading
+    box (infrastructure/systemd/metron-intraday.timer), double-gated: the NYSE
+    session window (exchange calendar incl. half-days) AND the Metron UI heartbeat
+    (``metron_app_active``) — quotes are fetched only while the market is open AND
+    the app is actually being used. Outside either gate it returns ``skipped``
+    without fetching (``force`` overrides both, for manual runs). A quote moving
+    >40% vs prior close carries ``suspect: true`` (flagged, never dropped). Single
+    ``latest.json`` key — consumers see staleness via ``as_of_utc``. Injectable
+    source/S3 for tests."""
     if not force and not in_us_market_window(now):
         return {"status": "skipped", "reason": "outside US market window"}
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
+    if not force and not metron_app_active(bucket, s3_client, now):
+        return {"status": "skipped", "reason": "metron app inactive (no fresh UI heartbeat)"}
     holdings, _ = load_metron_universe(bucket, s3_client)
     if not holdings:
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
     quotes = (intraday_source or _yfinance_intraday)(sorted(ccy_by_yf))
+    n_suspect = 0
     for sym, q in quotes.items():
         q["currency"] = ccy_by_yf.get(sym, "USD")
+        # Sanity flag — a >40% jump vs prior close is almost always a bad scrape or
+        # an unadjusted corporate action, not a real move. Flag, never drop/clamp
+        # (no fabrication): the consumer renders a warning instead of a wild P&L leg.
+        prev = q.get("prev_close") or 0.0
+        if prev and abs(q.get("last", prev) / prev - 1.0) > 0.40:
+            q["suspect"] = True
+            n_suspect += 1
+    if n_suspect:
+        logger.warning("[metron_market_data] %d intraday quote(s) flagged suspect (>40%% vs prev close)", n_suspect)
     artifact = {
         "schema_version": INTRADAY_SCHEMA_VERSION,
         "as_of_utc": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -777,9 +846,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--macro", action="store_true", help="also write the macro-indicators artifact")
     parser.add_argument("--fundamentals", action="store_true", help="also write the tearsheet-fundamentals artifact")
     parser.add_argument("--only-intraday", action="store_true",
-                        help="write ONLY the intraday-quotes artifact (the 15-min timer entry; "
-                             "no-op outside the US market window unless --force)")
-    parser.add_argument("--force", action="store_true", help="bypass the market-window gate for --only-intraday")
+                        help="write ONLY the intraday-quotes artifact (the 5-min timer entry; "
+                             "no-op outside the NYSE session or without a fresh Metron UI heartbeat, unless --force)")
+    parser.add_argument("--force", action="store_true",
+                        help="bypass the market-window AND app-heartbeat gates for --only-intraday")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if args.only_intraday:

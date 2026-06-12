@@ -1,7 +1,7 @@
 # Metron intraday-quotes producer (config#1023) — one shot per timer tick.
 # Writes market_data/intraday/latest.json (last / open / prior close per held
 # symbol, ~15-min delayed) for Metron's Today view. The collector itself gates
-# on the US market window, so off-hours ticks exit "skipped" without fetching.
+# on the US market window AND the Metron UI heartbeat, so off-gate ticks exit "skipped" without fetching.
 # Installed on the trading box by infrastructure/install-metron-intraday.sh;
 # S3 write rides the instance role (executor-role already has market_data/*).
 [Unit]
