@@ -59,7 +59,15 @@ if [ "$installed" = "$pinned" ]; then
 fi
 
 echo "ensure_lib_pin: drift -- installed=$installed pinned=v$pinned -- reinstalling '$libspec'"
-pip install --quiet "$libspec"
+# --force-reinstall + --no-cache-dir: a plain `pip install` of a git-URL pin
+# treats the version as already-satisfied and SKIPS the reinstall, so the new
+# code-importing symbol (e.g. v0.58.0's `guard_entrypoint`, the 2026-06-10
+# weekday MorningEnrich crash) and any newly-declared EXTRAS
+# (`[arcticdb,flow_doctor,rag,contracts]`) never re-resolve onto the box. Forcing
+# the reinstall and bypassing the wheel cache guarantees the pinned ref's actual
+# contents land. See feedback note "pip install SKIPS a satisfied pin so extras
+# never re-resolve" (L4591).
+pip install --quiet --force-reinstall --no-cache-dir "$libspec"
 
 healed="$(python -c 'import alpha_engine_lib as _l; print(_l.__version__)' 2>/dev/null || echo none)"
 if [ "$healed" != "$pinned" ]; then

@@ -231,7 +231,7 @@
 
     "MorningEnrich": {
       "Type": "Task",
-      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract. Timeout 1800s: 2026-04-27 the prior 720s cap killed the wrapper after the universe append's actual write completed (~12 min); bumping to 30 min absorbs the daily_append tail without masking real hangs (predictor still gated on Success status).",
+      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract. Timeout raised 1800→3000s (L4552b, 2026-06-14): the 2026-06-11 weekday run timed out against the EXACT 1800s ceiling — daily_closes+intraday collection is legitimately >30 min on the t3.small, not hung (the slow ArcticDB append was already split to MorningArcticAppend / #983, so this is the remaining fetch tail). 50 min absorbs that without masking a real hang; the CheckMorningEnrichStatus poll loop now also fails fast at a bounded attempt cap. Predictor still gated on Success status.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -250,11 +250,11 @@
             "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/morning-enrich.log",
             "python weekly_collector.py --morning-enrich --skip-chronic-heal --skip-arctic-append 2>&1 | tee -a /var/log/morning-enrich.log"
           ],
-          "executionTimeout": ["1800"]
+          "executionTimeout": ["3000"]
         },
-        "TimeoutSeconds": 1800
+        "TimeoutSeconds": 3000
       },
-      "TimeoutSeconds": 1860,
+      "TimeoutSeconds": 3060,
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -263,6 +263,14 @@
         }
       ],
       "ResultPath": "$.morning_enrich_result",
+      "Next": "InitMorningEnrichPoll"
+    },
+
+    "InitMorningEnrichPoll": {
+      "Type": "Pass",
+      "Comment": "Initialize the bounded poll-iteration counter for the MorningEnrich SSM status loop (L4552b, 2026-06-14). Mirrors InitSSMPollCounter. The loop polls every ~15s; a stuck-InProgress (SSM agent stops reporting a terminal status past the command's executionTimeout — the 2026-06-11 weekday symptom in #970) would otherwise spin until the SF state TimeoutSeconds with no clear cause. The attempt cap fails fast into MorningEnrichPollTimeout with an explicit Cause instead.",
+      "Result": {"attempts": 0},
+      "ResultPath": "$.morning_enrich_poll_counter",
       "Next": "WaitForMorningEnrich"
     },
 
@@ -297,12 +305,17 @@
 
     "CheckMorningEnrichStatus": {
       "Type": "Choice",
-      "Comment": "Block predictor inference until polygon enrichment confirms the prior trading day's row is overwritten with authoritative VWAP. SSM Failed → HandleFailure (must not proceed to inference on uncorrected data per feedback_no_silent_fails). Success → ChronicGapSelfHeal (best-effort, fail-soft) → PredictorInference; the chronic-gap heal was split out of MorningEnrich 2026-06-11 so a yfinance hang in it can never SIGKILL the load-bearing enrich.",
+      "Comment": "Block predictor inference until polygon enrichment confirms the prior trading day's row is overwritten with authoritative VWAP. SSM Failed → HandleFailure (must not proceed to inference on uncorrected data per feedback_no_silent_fails). Success → ChronicGapSelfHeal (best-effort, fail-soft) → PredictorInference; the chronic-gap heal was split out of MorningEnrich 2026-06-11 so a yfinance hang in it can never SIGKILL the load-bearing enrich. The poll-iteration cap (≥210 attempts ≈ >57 min at ~15s/iter, just past the 3000s SSM executionTimeout) fails fast into MorningEnrichPollTimeout with a clear cause if the SSM command never reports a terminal status (L4552b / #970 — the 2026-06-11 stuck-InProgress shape).",
       "Choices": [
         {
           "Variable": "$.morning_enrich_poll.Status",
           "StringEquals": "Success",
           "Next": "CheckSkipMorningArcticAppend"
+        },
+        {
+          "Variable": "$.morning_enrich_poll_counter.attempts",
+          "NumericGreaterThanEquals": 210,
+          "Next": "MorningEnrichPollTimeout"
         },
         {
           "Variable": "$.morning_enrich_poll.Status",
@@ -321,7 +334,28 @@
     "MorningEnrichWait": {
       "Type": "Wait",
       "Seconds": 15,
+      "Next": "IncrementMorningEnrichPoll"
+    },
+
+    "IncrementMorningEnrichPoll": {
+      "Type": "Pass",
+      "Comment": "Increment the MorningEnrich poll-iteration counter (L4552b). Mirrors IncrementSSMPoll.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.morning_enrich_poll_counter.attempts, 1)"
+      },
+      "ResultPath": "$.morning_enrich_poll_counter",
       "Next": "WaitForMorningEnrich"
+    },
+
+    "MorningEnrichPollTimeout": {
+      "Type": "Pass",
+      "Comment": "Bounded poll-iteration cap exhausted on the MorningEnrich SSM status loop (L4552b / #970). The SSM command never reported a terminal status (Success/Failed) within the poll budget (~210 × 15s ≈ >57 min, past the 3000s executionTimeout) — i.e. it is genuinely stuck-InProgress, not slow. Stamp a clear cause into $.error then route through HandleFailure so the SNS failure alert carries it (a bare Fail would skip the alert). Distinct from a legitimately-long collection (which now has the raised 3000s ceiling). Operator action: inspect /var/log/morning-enrich.log on ae-trading + the SSM command invocation.",
+      "Result": {
+        "Error": "MorningEnrichPollTimeout",
+        "Cause": "MorningEnrich SSM command did not reach a terminal status within the bounded poll budget (~210 iterations / ~57 min). Likely a stuck SSM agent (status frozen at InProgress) rather than slow collection. See /var/log/morning-enrich.log on ae-trading."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
 
     "ChronicGapSelfHeal": {
