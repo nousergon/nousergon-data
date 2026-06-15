@@ -1,0 +1,23 @@
+[Unit]
+Description=Daily news collector (standalone) — feeds morning-signal + dashboard Daily News
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine-data
+ExecStart=/home/ec2-user/alpha-engine-data/scripts/run_daily_news_standalone.sh
+StandardOutput=journal
+StandardError=journal
+# ~20-30 min pull (Polygon 5 req/min over the ~96-ticker holdings∪signals
+# universe); 40 min cap gives headroom.
+TimeoutStartSec=2400
+# Shared-box memory guard. Measured peak RSS ~0.17 GB; cap generously.
+MemoryAccounting=yes
+MemoryHigh=500M
+MemoryMax=700M
+
+[Install]
+WantedBy=multi-user.target

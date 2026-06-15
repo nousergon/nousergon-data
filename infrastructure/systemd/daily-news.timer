@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily news collector — 04:00 PT (DST-aware), ahead of the 05:00 morning-signal run
+Requires=daily-news.service
+
+[Timer]
+Unit=daily-news.service
+# DST-aware local time. 04:00 PT leaves a comfortable margin before the
+# 05:00 PT morning-signal generation that consumes data/news_*_daily/.
+OnCalendar=*-*-* 04:00:00 America/Los_Angeles
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
