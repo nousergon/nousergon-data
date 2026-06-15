@@ -288,13 +288,20 @@ class TestBranchBContents:
     def test_model_zoo_rotation_is_best_effort(self, branch_b):
         """L4544: the rotation must NEVER fail Branch B — every terminal path
         (task Catch, poll Catch, any non-success poll Status) converges to
-        BranchBComplete, since the champion already trained+promoted."""
+        BranchBComplete, since the champion already trained+promoted.
+
+        Post-defer-email change: failures now route via the
+        PublishModelZooFailureImmediate SNS alert FIRST (so a deferred-base-email
+        + zoo-failure run is never silent), then on to BranchBComplete. The
+        invariant is unchanged: no zoo failure path ever reaches BranchBFailed."""
         zoo = branch_b["ModelZooRotation"]
-        # Task-level Catch routes failure to BranchBComplete (not BranchBFailed).
+        # Task-level Catch routes failure to the alert (then BranchBComplete),
+        # NEVER to BranchBFailed.
         assert any(
-            c["Next"] == "BranchBComplete" and "States.ALL" in c["ErrorEquals"]
+            c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
             for c in zoo["Catch"]
         )
+        assert all(c["Next"] != "BranchBFailed" for c in zoo["Catch"])
         assert zoo["Next"] == "WaitForModelZoo"
         # Same shared instance as the champion retrain.
         assert zoo["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
@@ -302,18 +309,31 @@ class TestBranchBContents:
         cmd = zoo["Parameters"]["Parameters"]["commands.$"]
         assert "--model-zoo-weekly" in cmd
         assert "$.preflight_args" in cmd
-        # Poll Catch is best-effort; the status Choice defaults to BranchBComplete.
+        # Poll Catch is best-effort; routes via the alert, never to BranchBFailed.
         wait = branch_b["WaitForModelZoo"]
         assert any(
-            c["Next"] == "BranchBComplete" and "States.ALL" in c["ErrorEquals"]
+            c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
             for c in wait["Catch"]
         )
+        assert all(c["Next"] != "BranchBFailed" for c in wait["Catch"])
         check = branch_b["CheckModelZooStatus"]
-        assert check["Default"] == "BranchBComplete"
+        # A non-terminal poll waits; Success completes cleanly; everything else
+        # (failed/cancelled/timedout) routes to the alert then BranchBComplete.
+        assert check["Default"] == "PublishModelZooFailureImmediate"
         nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
         assert nexts["InProgress"] == "ModelZooWait"
         assert nexts["Pending"] == "ModelZooWait"
+        assert nexts["Success"] == "BranchBComplete"
         assert branch_b["ModelZooWait"]["Next"] == "WaitForModelZoo"
+
+        # The alert state is itself best-effort: it publishes SNS and then
+        # converges to BranchBComplete (both the success path and its own Catch),
+        # so an SNS failure cannot fail the branch.
+        alert = branch_b["PublishModelZooFailureImmediate"]
+        assert alert["Resource"] == "arn:aws:states:::sns:publish"
+        assert alert["Next"] == "BranchBComplete"
+        assert all(c["Next"] == "BranchBComplete" for c in alert["Catch"])
+        assert "PREDICTOR_DEFER_TRAINING_EMAIL" in alert["Parameters"]["Message.$"]
 
     def test_branch_b_ssm_can_resolve_instance_id(self, branch_b):
         """Branch B's SSM calls reference $.ec2_instance_id — which is
