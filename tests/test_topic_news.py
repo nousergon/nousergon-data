@@ -50,7 +50,8 @@ class _FakeFeedparser:
         self._by_url = by_url
         self.calls: list[str] = []
 
-    def parse(self, url):
+    def parse(self, url, **kwargs):
+        # Accept feedparser's optional kwargs (e.g. agent=) like the real API.
         self.calls.append(url)
         val = self._by_url.get(url)
         if isinstance(val, Exception):

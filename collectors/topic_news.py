@@ -46,11 +46,16 @@ logger = logging.getLogger(__name__)
 # live 2026-06-15 (HTTP 200 + feedparser parse with timestamped entries).
 TOPIC_FEEDS: dict[str, list[tuple[str, str]]] = {
     "macro": [
-        # CNBC "Economy" feed.
-        ("CNBC", "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
-        # MarketWatch top stories (Dow Jones canonical RSS host).
-        ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
-        # NPR "Economy" feed.
+        # CNBC "Top News" — high-frequency business/markets/economy headlines
+        # (~29 fresh items within 24h). Chosen over CNBC "Economy" (id
+        # 20910258) and MarketWatch MarketPulse, which are LOW-FREQUENCY
+        # topical feeds whose newest items lag 3+ days — outside the 24h
+        # lookback (verified 2026-06-15). NOTE: CNBC rejects feedparser's
+        # default UA (returns 0); _BROWSER_UA below is required.
+        ("CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+        # CNBC "Finance" — markets/finance depth.
+        ("CNBC Finance", "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
+        # NPR "Business/Economy" — clean macro supplement.
         ("NPR", "https://feeds.npr.org/1006/rss.xml"),
     ],
     "tech": [
@@ -66,6 +71,12 @@ DEFAULT_PER_TOPIC_CAP = 15
 # Cap raw entries pulled per feed BEFORE filtering — bound the work even if a
 # feed is unusually large. Mirrors yahoo_rss.py's per-feed [:50] slice.
 _PER_FEED_ENTRY_CAP = 50
+
+# Some feeds (notably CNBC) reject feedparser's default User-Agent and return
+# an empty body — passing a browser-like UA is required or the feed silently
+# yields 0 entries (the CNBC-Economy feed returned nothing in production until
+# this was set). Harmless for feeds that don't care.
+_BROWSER_UA = "Mozilla/5.0 (compatible; alpha-engine-news/1.0; +https://nousergon.ai)"
 
 
 def _iso_z(dt: datetime) -> str:
@@ -134,7 +145,9 @@ def _fetch_feed(
     """Fetch + parse a single feed. Fail-soft: any error → WARN + ``[]`` so a
     dead feed never kills the topic."""
     try:
-        feed = feedparser_module.parse(url)
+        # agent= sends a browser-like UA; some feeds (CNBC) return an empty
+        # body to feedparser's default UA. feedparser accepts `agent` kwarg.
+        feed = feedparser_module.parse(url, agent=_BROWSER_UA)
     except Exception as e:  # noqa: BLE001 — network/parse failure is per-feed fail-soft
         logger.warning("[topic_news] feed fetch failed for %s (%s): %s", source, url, e)
         return []

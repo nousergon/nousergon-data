@@ -150,6 +150,30 @@ class TestPortfolioSelection:
                          portfolio_cap=4)
         assert len(d["sections"]["portfolio"]) == 4
 
+    def test_portfolio_excludes_gdelt_source(self):
+        # GDELT keyword-matches tickers → false positives; the portfolio section
+        # must use only ticker-accurate sources (Polygon/Yahoo), never GDELT.
+        df = _articles_df([
+            _aggregated(fingerprint="g", sources=("gdelt",),
+                        title="GDELT false positive", url="https://x/g"),
+            _aggregated(fingerprint="p", sources=("polygon",),
+                        title="Polygon real", url="https://x/p"),
+        ])
+        d = build_digest(articles_df=df, topics={}, digest_date=date(2026, 5, 13))
+        titles = [e["title"] for e in d["sections"]["portfolio"]]
+        assert "Polygon real" in titles
+        assert "GDELT false positive" not in titles
+        assert all(e["source"].lower() != "gdelt" for e in d["sections"]["portfolio"])
+
+    def test_portfolio_all_gdelt_yields_empty(self):
+        df = _articles_df([
+            _aggregated(fingerprint="g1", sources=("gdelt",), title="noise1", url="https://x/g1"),
+            _aggregated(fingerprint="g2", sources=("gdelt",), title="noise2", url="https://x/g2"),
+        ])
+        d = build_digest(articles_df=df, topics=_TOPICS, digest_date=date(2026, 5, 13))
+        assert d["sections"]["portfolio"] == []
+        assert len(d["sections"]["macro"]) == 1  # topics unaffected
+
     def test_empty_articles_empty_portfolio(self):
         df = _articles_df([])
         d = build_digest(articles_df=df, topics=_TOPICS, digest_date=date(2026, 5, 13))
