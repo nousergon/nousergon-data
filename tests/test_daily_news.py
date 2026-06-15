@@ -127,3 +127,59 @@ def test_collect_fails_loud_when_lm_dict_unavailable(
     assert out["reason"] == "lm_dict_unavailable"
     mock_write.assert_not_called()  # no degraded artifact written
     mock_agg.assert_not_called()  # failed fast, before the ~17-min news pull
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_collect_writes_raw_article_companion(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_ensure
+):
+    """The additive raw-article companion is written to the articles prefix
+    alongside the aggregate, surfacing its key/rows on the status dict."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock()
+    agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("data/news_aggregates_daily/run/result.parquet", agg_df)
+    art_df = MagicMock()
+    art_df.__len__ = lambda self: 12
+    mock_articles.return_value = (
+        "data/news_articles_daily/run/articles.parquet", art_df,
+    )
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "ok"
+    assert mock_articles.call_args.kwargs["prefix"] == daily_news.ARTICLES_PREFIX
+    assert out["articles_status"] == "ok"
+    assert out["articles_rows"] == 12
+    assert out["articles_key"] == "data/news_articles_daily/run/articles.parquet"
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_collect_article_companion_failure_is_fail_soft(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_ensure
+):
+    """A failure writing the raw-article companion must NOT fail the run —
+    the aggregate (primary) already landed; status stays ok with the failure
+    recorded on articles_status (per the fail-soft secondary-artifact rule)."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock()
+    agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("data/news_aggregates_daily/run/result.parquet", agg_df)
+    mock_articles.side_effect = RuntimeError("S3 hiccup")
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "ok"            # primary deliverable survived
+    assert out["rows"] == 7
+    assert out["articles_status"] == "error"  # failure recorded, not silent
+    assert out["articles_key"] is None

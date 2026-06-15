@@ -49,6 +49,7 @@ from collectors.nlp.loughran_mcdonald import (
 logger = logging.getLogger(__name__)
 
 DAILY_PREFIX = "data/news_aggregates_daily"
+ARTICLES_PREFIX = "data/news_articles_daily"
 HOLDINGS_UNIVERSE_KEY = "robodashboard/holdings_universe.json"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_BUCKET = "alpha-engine-research"
@@ -226,12 +227,59 @@ def collect(
         prefix=DAILY_PREFIX,
     )
     logger.info("[daily_news] wrote %d rows to s3://%s/%s", len(df), bucket, key)
+
+    # ── Additive raw-article companion (human-readable feed substrate) ────────
+    # The aggregate above is the PRIMARY artifact (consumers + ARTIFACT_REGISTRY
+    # gate on it). This second write preserves the underlying deduped articles
+    # (headline/url/source/excerpt/per-article sentiment) for the dashboard
+    # "Daily News" page — built from the SAME already-fetched data, so no extra
+    # API calls and no LLM spend.
+    #
+    # FAIL-SOFT, deliberately (per [[feedback_no_silent_fails]] — acceptable
+    # category: secondary artifact hung off a path whose PRIMARY deliverable
+    # already succeeded). (a) Failure mode swallowed: the raw-article parquet/
+    # sidecar write fails (S3 hiccup, schema bug). (b) Primary survives: the
+    # aggregate already landed above; consumers are unaffected. (c) Recording
+    # surface: a WARN log here AND the ``articles_status`` field on the returned
+    # status dict (which the SF/logs capture). It must never abort the weekday
+    # SF — the whole daily_news producer is already secondary/fail-soft.
+    articles_status = "ok"
+    articles_key = None
+    articles_rows = 0
+    try:
+        from data.derived.news_articles import articles_build_and_write
+
+        articles_key, articles_df = articles_build_and_write(
+            articles=articles,
+            nlp_output=nlp_output,
+            aggregate_date=agg_date,
+            aggregator=aggregator,
+            s3_client=s3_client,
+            bucket=bucket,
+            prefix=ARTICLES_PREFIX,
+        )
+        articles_rows = int(len(articles_df))
+        logger.info(
+            "[daily_news] wrote %d article rows to s3://%s/%s",
+            articles_rows, bucket, articles_key,
+        )
+    except Exception as e:  # noqa: BLE001 — fail-soft secondary artifact (see above)
+        articles_status = "error"
+        logger.warning(
+            "[daily_news] raw-article companion write FAILED (%s: %s) — "
+            "aggregate artifact already landed, continuing",
+            type(e).__name__, e,
+        )
+
     return {
         "status": "ok",
         "tickers": len(universe),
         "articles": len(articles),
         "rows": int(len(df)),
         "key": key,
+        "articles_status": articles_status,
+        "articles_key": articles_key,
+        "articles_rows": articles_rows,
     }
 
 

@@ -82,6 +82,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "data/cache.py": 1,
     "data/derived/analyst_revisions.py": 2,
     "data/derived/news_aggregates.py": 2,
+    "data/derived/news_articles.py": 2,  # raw-article parquet + latest.json sidecar
     "data/snapshotter/analyst_daily.py": 2,
     "features/compute.py": 1,
     "features/registry.py": 1,
