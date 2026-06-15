@@ -60,7 +60,7 @@ This repo is **public**. `config.yaml` is gitignored locally; real values (S3 bu
 | Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) |
 | Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) |
 | Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) |
-| Library | [`alpha-engine-lib`](https://github.com/cipher813/alpha-engine-lib) |
+| Library | [`alpha-engine-lib`](https://github.com/nousergon/nousergon-lib) |
 | Docs | [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) |
 
 ## License

@@ -497,7 +497,7 @@ dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null
     dnf install -y -q python3 python3-pip python3-devel git gcc
 echo "Using: \$(\$PYTHON_BIN --version)"
 
-git clone --depth 1 --branch ${BRANCH} https://github.com/cipher813/alpha-engine-data.git /home/ec2-user/alpha-engine-data
+git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/nousergon-data.git /home/ec2-user/alpha-engine-data
 
 mkdir -p /home/ec2-user/alpha-engine-config/data
 aws s3 cp ${S3_STAGING}/config.yaml /home/ec2-user/alpha-engine-config/data/config.yaml --region ${AWS_REGION} --quiet

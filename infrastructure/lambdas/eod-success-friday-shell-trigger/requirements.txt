@@ -1,4 +1,4 @@
 # Pinned to match sf-telegram-notifier/requirements.txt — both Lambdas share
 # the same alpha-engine-data lib substrate; keeping the pin coherent across
 # sibling Lambdas avoids divergence on lib-side date helpers.
-alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.20.0
+alpha-engine-lib @ git+https://github.com/nousergon/nousergon-lib@v0.20.0
