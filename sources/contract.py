@@ -144,5 +144,28 @@ class PriceSourceAdapter(Protocol):
 
         ``strict=True`` asks the adapter to RAISE on source failure / empty
         result (mirrors today's ``*_only`` modes) rather than degrade silently.
+        The clean, list-returning API — built on :meth:`fetch_into`.
+        """
+        ...
+
+    def fetch_into(
+        self,
+        records: list[dict],
+        tickers: list[str],
+        run_date: str,
+        *,
+        strict: bool = False,
+        window_cache: dict | None = None,
+    ) -> int:
+        """Pipeline-facing fetch: APPEND legacy record dicts to ``records`` in
+        place and return the count appended.
+
+        Mutates the passed list (not a fresh one) so partial results survive a
+        mid-fetch error exactly as the legacy ``_fetch_*`` functions do — the
+        property the orchestrator's coverage gates rely on. This is the method
+        ``collectors.daily_closes.collect`` dispatches through;
+        :meth:`fetch_ohlcv` is the clean wrapper over it. ``window_cache`` is
+        used only by sources that support windowed reconciliation (FRED); others
+        ignore it.
         """
         ...

@@ -31,11 +31,25 @@ class FredAdapter:
         # carried through unchanged.
         return ticker
 
+    def fetch_into(
+        self,
+        records: list[dict],
+        tickers: list[str],
+        run_date: str,
+        *,
+        strict: bool = False,
+        window_cache: dict | None = None,
+    ) -> int:
+        # FRED supports windowed reconciliation — forward the prefetched cache.
+        return _dc._fetch_fred_closes(
+            tickers, run_date, records, window_cache=window_cache,
+        )
+
     def fetch_ohlcv(
         self, tickers: list[str], run_date: str, *, strict: bool = False
     ) -> list[PriceBar]:
         records: list[dict] = []
-        _dc._fetch_fred_closes(tickers, run_date, records)
+        self.fetch_into(records, tickers, run_date, strict=strict)
         return [PriceBar.from_record(r) for r in records]
 
 
