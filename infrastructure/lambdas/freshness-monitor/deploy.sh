@@ -6,7 +6,7 @@
 # Phase 3 of the artifact-freshness-monitor arc (plan doc at
 # ~/Development/alpha-engine-docs/private/artifact-freshness-monitor-260527.md).
 # Loads `private-docs/ARTIFACT_REGISTRY.yaml` from the operator's local
-# clone of cipher813/alpha-engine-config and uploads it to
+# clone of nousergon/alpha-engine-config and uploads it to
 # s3://alpha-engine-research/_freshness_monitor/ARTIFACT_REGISTRY.yaml.
 # Validates the registry locally before upload — a malformed registry
 # never reaches S3.
@@ -77,7 +77,7 @@ print('index.py syntax OK')
 
 if [[ ! -f "${REGISTRY_LOCAL}" ]]; then
   echo "❌ Registry not found at ${REGISTRY_LOCAL}"
-  echo "   Clone cipher813/alpha-engine-config into ~/Development/ or set CONFIG_REPO"
+  echo "   Clone nousergon/alpha-engine-config into ~/Development/ or set CONFIG_REPO"
   exit 1
 fi
 

@@ -172,7 +172,7 @@ class TestFlowDoctorYamlSchema:
         for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
             assert key in cfg, f"missing top-level key: {key}"
         assert cfg["flow_name"] == "data-collector"
-        assert cfg["repo"] == "cipher813/alpha-engine-data"
+        assert cfg["repo"] == "nousergon/nousergon-data"
 
     def test_yaml_has_email_and_github_notify_channels(self):
         import yaml

@@ -1,5 +1,5 @@
 flow_name: data-collector
-repo: cipher813/alpha-engine-data
+repo: nousergon/nousergon-data
 owner: "@brianmcmahon"
 notify:
   - type: email
@@ -9,7 +9,7 @@ notify:
     smtp_port: 587
     smtp_password: ${GMAIL_APP_PASSWORD}
   - type: github
-    repo: cipher813/alpha-engine-data
+    repo: nousergon/nousergon-data
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
     # 0.6.0rc2 soak: file an issue on failure (default) AND auto-apply the
     # flow-doctor:fix label so the flow-doctor-fix workflow generates a fix
