@@ -31,13 +31,24 @@ class YfinanceAdapter:
         # The legacy fetch strips the caret internally; store-key passes through.
         return ticker
 
+    def fetch_into(
+        self,
+        records: list[dict],
+        tickers: list[str],
+        run_date: str,
+        *,
+        strict: bool = False,
+        window_cache: dict | None = None,
+    ) -> int:
+        # yfinance has no strict mode (it logs + returns a partial count); the
+        # ``strict`` flag is accepted for port-uniformity and ignored.
+        return _dc._fetch_yfinance_closes(tickers, run_date, records)
+
     def fetch_ohlcv(
         self, tickers: list[str], run_date: str, *, strict: bool = False
     ) -> list[PriceBar]:
-        # yfinance has no strict mode (it logs + returns a partial count); the
-        # ``strict`` flag is accepted for port-uniformity and ignored.
         records: list[dict] = []
-        _dc._fetch_yfinance_closes(tickers, run_date, records)
+        self.fetch_into(records, tickers, run_date, strict=strict)
         return [PriceBar.from_record(r) for r in records]
 
 

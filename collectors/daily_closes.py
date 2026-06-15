@@ -354,6 +354,9 @@ def collect(
     window_days: int = 1,
     skip_if_canonical: bool = False,
     fred_window_cache: dict[str, list[tuple[str, float]]] | None = None,
+    equities_source: str = "polygon",
+    index_source: str = "fred",
+    fallback_source: str = "yfinance",
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -451,6 +454,9 @@ def collect(
             source=source,
             window_days=window_days,
             skip_if_canonical=skip_if_canonical,
+            equities_source=equities_source,
+            index_source=index_source,
+            fallback_source=fallback_source,
         )
 
     s3 = boto3.client("s3")
@@ -601,11 +607,16 @@ def collect(
     # still propagate with their own clear messages — only network transients
     # are downgraded to "continue to the macro backstop".
     from polygon_client import PolygonRateLimitError
+    # Lazy import: ``sources`` adapters import ``collectors.daily_closes`` at
+    # module load, so importing it here (at call time, when this module is fully
+    # initialized) avoids a circular import. The registry makes the source per
+    # role config-/param-selectable — swapping polygon→databento is one param.
+    from sources import get_adapter
     polygon_count = 0
     if source != "yfinance_only":
         try:
-            polygon_count = _fetch_polygon_closes(
-                tickers, run_date, records, source=source
+            polygon_count = get_adapter(equities_source).fetch_into(
+                records, tickers, run_date, strict=(source == "polygon_only"),
             )
         except (requests.Timeout, requests.ConnectionError,
                 PolygonRateLimitError) as exc:
@@ -634,8 +645,8 @@ def collect(
         # L4492: in window mode the caller prefetches the whole window's FRED
         # series in one ranged call each and passes the cache down; per-date
         # emit then reads from it (no per-date FRED I/O). None → legacy path.
-        fred_count = _fetch_fred_closes(
-            fred_missing, run_date, records, window_cache=fred_window_cache,
+        fred_count = get_adapter(index_source).fetch_into(
+            records, fred_missing, run_date, window_cache=fred_window_cache,
         )
 
     # ── Step 3: yfinance ─────────────────────────────────────────────────────
@@ -675,9 +686,13 @@ def collect(
                     "Equity universe still refuses yfinance per feedback_no_silent_fails.",
                     macro_missing, run_date,
                 )
-                yfinance_count = _fetch_yfinance_closes(macro_missing, run_date, records)
+                yfinance_count = get_adapter(fallback_source).fetch_into(
+                    records, macro_missing, run_date,
+                )
         else:
-            yfinance_count = _fetch_yfinance_closes(missing, run_date, records)
+            yfinance_count = get_adapter(fallback_source).fetch_into(
+                records, missing, run_date,
+            )
 
     # Merge preserved canonical rows from the existing parquet into the
     # records list. These are tickers we deliberately skipped fetching
@@ -814,6 +829,9 @@ def _collect_window(
     source: str,
     window_days: int,
     skip_if_canonical: bool = False,
+    equities_source: str = "polygon",
+    index_source: str = "fred",
+    fallback_source: str = "yfinance",
 ) -> dict:
     """Iterate ``collect`` over a backward-looking business-day window.
 
@@ -903,6 +921,9 @@ def _collect_window(
                 window_days=1,
                 skip_if_canonical=skip_if_canonical,
                 fred_window_cache=fred_window_cache,  # L4492: 1 ranged call/series
+                equities_source=equities_source,
+                index_source=index_source,
+                fallback_source=fallback_source,
             )
         except Exception as exc:
             # Record + continue. Fatality is target-driven (decided

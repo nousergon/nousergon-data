@@ -29,15 +29,27 @@ class PolygonAdapter:
         # Dash store-key → polygon's dot form for class shares (BRK-B → BRK.B).
         return _dc._polygon_symbol(ticker.lstrip("^"))
 
+    def fetch_into(
+        self,
+        records: list[dict],
+        tickers: list[str],
+        run_date: str,
+        *,
+        strict: bool = False,
+        window_cache: dict | None = None,
+    ) -> int:
+        # ``polygon_only`` raises on 403 / empty grouped-daily; ``auto`` degrades.
+        # Mutates ``records`` in place (partial appends survive a mid-fetch raise).
+        return _dc._fetch_polygon_closes(
+            tickers, run_date, records,
+            source="polygon_only" if strict else "auto",
+        )
+
     def fetch_ohlcv(
         self, tickers: list[str], run_date: str, *, strict: bool = False
     ) -> list[PriceBar]:
         records: list[dict] = []
-        # ``polygon_only`` raises on 403 / empty grouped-daily; ``auto`` degrades.
-        _dc._fetch_polygon_closes(
-            tickers, run_date, records,
-            source="polygon_only" if strict else "auto",
-        )
+        self.fetch_into(records, tickers, run_date, strict=strict)
         return [PriceBar.from_record(r) for r in records]
 
 

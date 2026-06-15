@@ -24,9 +24,15 @@ See alpha-engine-config#1082 for the design + rollout phases.
 - An **adapter** (`sources/<vendor>.py`) owns everything provider-specific: HTTP/SDK
   calls, response parsing, symbol-quirk mapping (`map_symbol`), rate-limit and error
   handling, and a declared `SourceCapabilities`.
-- Every adapter's `fetch_ohlcv(...)` returns a list of **`PriceBar`** — the
-  API-neutral record below. That is the ONLY shape the rest of the pipeline and all
-  consumers ever see.
+- Every adapter exposes two fetch methods over the same logic: **`fetch_ohlcv(...)`**
+  returns a clean list of **`PriceBar`** (the API-neutral record below); **`fetch_into(records, ...)`**
+  is the pipeline-facing form that appends legacy record dicts to a passed list in
+  place (preserving partial-on-error + `window_cache` semantics) and returns a count.
+- **`collectors.daily_closes.collect()` dispatches its fetches through the registry**
+  via `fetch_into`, selecting the adapter per role from injectable params
+  (`equities_source` / `index_source` / `fallback_source`, defaults `polygon` / `fred`
+  / `yfinance`). Swapping polygon→**databento** is one param + the new adapter — no
+  change to `collect()`, the persisted artifacts, or any consumer.
 - The orchestration core (chain selection, source-priority coalescing, validation,
   S3 + ArcticDB writes) is provider-agnostic and unchanged.
 
