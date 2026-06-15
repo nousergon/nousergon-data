@@ -467,6 +467,12 @@ class TestEODSFTopLevelFieldsClosed:
 # 10 → 11 on 2026-06-08 (ROADMAP L4544): ModelZooRotation — the best-effort
 # model-zoo weekly rotation + CPCV selection, sequential after PredictorTraining
 # success in Branch B (same spot instance, off the live-trading path).
+# Still 11 on config#1083 (2026-06-15): ModelZooRotation was REPLACED by the
+# parallel fan-out — ResolveZooSpecs (NOT a spot; runs list-rotation-specs on the
+# box) → ModelZooTrainMap (per-spec spots, but TrainSpecDispatch lives in the Map
+# ItemProcessor, which _flatten_states does NOT descend into) → ModelZooSelect
+# (the one flat-level spot launcher that takes ModelZooRotation's slot). Net
+# flat-level spot count is unchanged at 11.
 _EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
 
 

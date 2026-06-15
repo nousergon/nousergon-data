@@ -69,6 +69,11 @@ _BRANCH_B_STATES = {
     "CheckSkipPredictorTraining", "PredictorTraining",
     "WaitForPredictorTraining", "CheckPredictorStatus", "PredictorWait",
     "ExtractPredictorError", "PublishPredictorFailureImmediate",
+    # config#1083 parallel model-zoo fan-out: ResolveZooSpecs -> Map -> Select.
+    "ResolveZooSpecs", "WaitResolveZoo", "CheckResolveZooStatus",
+    "ResolveZooWait", "ParseZooSpecs", "ModelZooTrainMap", "ModelZooSelect",
+    "WaitForModelZoo", "CheckModelZooStatus", "ModelZooWait",
+    "PublishModelZooFailureImmediate",
     "BranchBComplete", "BranchBFailed",
 }
 
@@ -100,13 +105,14 @@ def branch_b(parallel) -> dict:
 
 def _own_targets(st: dict) -> list[str]:
     """Next/Default/Catch.Next of THIS state, NOT descending into a
-    Parallel's Branches (those are validated in their own state space)."""
+    Parallel's Branches or a Map's ItemProcessor/Iterator (those are
+    validated in their own state space)."""
     out: list[str] = []
 
     def rec(o) -> None:
         if isinstance(o, dict):
             for k, v in o.items():
-                if k == "Branches":
+                if k in ("Branches", "ItemProcessor", "Iterator"):
                     continue
                 if k in ("Next", "Default") and isinstance(v, str):
                     out.append(v)
@@ -275,65 +281,117 @@ class TestBranchBContents:
             "WaitForPredictorTraining"
         )
 
-    def test_predictor_success_routes_to_model_zoo_rotation(self, branch_b):
-        # L4544: champion-retrain success now flows into the best-effort model-zoo
-        # rotation before the branch completes (skip path still → BranchBComplete).
+    def test_predictor_success_routes_to_resolve_zoo_specs(self, branch_b):
+        # config#1083: champion-retrain success now flows into the parallel
+        # model-zoo fan-out, starting with ResolveZooSpecs (skip path still →
+        # BranchBComplete).
         success = [
             c["Next"]
             for c in branch_b["CheckPredictorStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["ModelZooRotation"]
+        assert success == ["ResolveZooSpecs"]
 
-    def test_model_zoo_rotation_is_best_effort(self, branch_b):
-        """L4544: the rotation must NEVER fail Branch B — every terminal path
-        (task Catch, poll Catch, any non-success poll Status) converges to
-        BranchBComplete, since the champion already trained+promoted.
+    def test_zoo_fanout_pipeline_wiring(self, branch_b):
+        """config#1083: ResolveZooSpecs → (poll) → ParseZooSpecs → ModelZooTrainMap
+        (Map, per-spec spot) → ModelZooSelect → (poll) → BranchBComplete. Every
+        failure path is best-effort (routes via the alert, never BranchBFailed)."""
+        # ResolveZooSpecs dispatches list-rotation-specs on the box.
+        resolve = branch_b["ResolveZooSpecs"]
+        assert resolve["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
+        rcmd = resolve["Parameters"]["Parameters"]["commands.$"]
+        assert "list-rotation-specs" in rcmd
+        assert all(c["Next"] != "BranchBFailed" for c in resolve["Catch"])
+        assert resolve["Next"] == "WaitResolveZoo"
+        # Resolve poll → CheckResolveZooStatus: Success → ParseZooSpecs.
+        check_resolve = branch_b["CheckResolveZooStatus"]
+        rnexts = {c["StringEquals"]: c["Next"] for c in check_resolve["Choices"]}
+        assert rnexts["Success"] == "ParseZooSpecs"
+        assert check_resolve["Default"] == "PublishModelZooFailureImmediate"
+        # ParseZooSpecs lifts the JSON array into $.parsed_zoo.zoo_specs.
+        parse = branch_b["ParseZooSpecs"]
+        assert parse["Type"] == "Pass"
+        assert "StringToJson" in parse["Parameters"]["zoo_specs.$"]
+        assert "Catch" not in parse  # a Pass cannot carry a Catch (AWS schema)
+        assert parse["Next"] == "ModelZooTrainMap"
 
-        Post-defer-email change: failures now route via the
-        PublishModelZooFailureImmediate SNS alert FIRST (so a deferred-base-email
-        + zoo-failure run is never silent), then on to BranchBComplete. The
-        invariant is unchanged: no zoo failure path ever reaches BranchBFailed."""
-        zoo = branch_b["ModelZooRotation"]
-        # Task-level Catch routes failure to the alert (then BranchBComplete),
-        # NEVER to BranchBFailed.
+    def test_model_zoo_train_map_per_spec_isolation(self, branch_b):
+        """THE robustness property: the Map fans out one spot PER spec, and each
+        iteration self-terminates as success (recording status as data), so one
+        challenger crashing never aborts its siblings."""
+        m = branch_b["ModelZooTrainMap"]
+        assert m["Type"] == "Map"
+        assert m["ItemsPath"] == "$.parsed_zoo.zoo_specs"
+        assert isinstance(m["MaxConcurrency"], int) and m["MaxConcurrency"] >= 1
+        # Backstop tolerance so a Map-engine error never aborts survivors.
+        assert m["ToleratedFailurePercentage"] == 100
+        # Each item carries the spec id + shared SSM context.
+        assert m["ItemSelector"]["spec_id.$"] == "$$.Map.Item.Value"
+        assert m["ItemSelector"]["ec2_instance_id.$"] == "$.ec2_instance_id"
+        proc = m["ItemProcessor"]["States"]
+        # The dispatch invokes the per-spec spot mode with the item's spec id.
+        dcmd = proc["TrainSpecDispatch"]["Parameters"]["Parameters"]["commands.$"]
+        assert "--model-zoo-spec" in dcmd
+        assert "$.spec_id" in dcmd
+        assert "$.preflight_args" in dcmd
+        # PER-ITERATION ISOLATION: both terminals are End:true Pass states
+        # recording status as DATA — the iteration NEVER throws.
+        for term in ("TrainSpecOK", "TrainSpecFailed"):
+            assert proc[term]["Type"] == "Pass"
+            assert proc[term]["End"] is True
+        # A failed/cancelled/timed-out spec routes to TrainSpecFailed (data),
+        # NOT a throw — siblings proceed.
+        cts = proc["CheckTrainSpecStatus"]
+        assert cts["Default"] == "TrainSpecFailed"
+        # The dispatch + poll Catches record failure as data (TrainSpecFailed),
+        # never throwing out of the iteration.
+        assert all(c["Next"] == "TrainSpecFailed" for c in proc["TrainSpecDispatch"]["Catch"])
+        assert all(c["Next"] == "TrainSpecFailed" for c in proc["WaitTrainSpec"]["Catch"])
+        # The Map state's own Catch is a best-effort backstop, never BranchBFailed.
+        assert all(c["Next"] != "BranchBFailed" for c in m["Catch"])
+        assert m["Next"] == "ModelZooSelect"
+
+    def test_model_zoo_select_is_best_effort(self, branch_b):
+        """config#1083: ModelZooSelect runs the selection on ONE spot after the
+        Map joins; every failure path converges to BranchBComplete via the alert,
+        never BranchBFailed (the champion already trained+promoted)."""
+        sel = branch_b["ModelZooSelect"]
+        assert sel["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
+        scmd = sel["Parameters"]["Parameters"]["commands.$"]
+        assert "--model-zoo-select" in scmd
+        assert "$.preflight_args" in scmd
         assert any(
             c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
-            for c in zoo["Catch"]
+            for c in sel["Catch"]
         )
-        assert all(c["Next"] != "BranchBFailed" for c in zoo["Catch"])
-        assert zoo["Next"] == "WaitForModelZoo"
-        # Same shared instance as the champion retrain.
-        assert zoo["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
-        # The command invokes the rotation entrypoint, honoring shell-run preflight.
-        cmd = zoo["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-weekly" in cmd
-        assert "$.preflight_args" in cmd
-        # Poll Catch is best-effort; routes via the alert, never to BranchBFailed.
+        assert all(c["Next"] != "BranchBFailed" for c in sel["Catch"])
+        assert sel["Next"] == "WaitForModelZoo"
+        # Select poll Catch is best-effort; routes via the alert, never BranchBFailed.
         wait = branch_b["WaitForModelZoo"]
-        assert any(
-            c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
-            for c in wait["Catch"]
-        )
         assert all(c["Next"] != "BranchBFailed" for c in wait["Catch"])
         check = branch_b["CheckModelZooStatus"]
-        # A non-terminal poll waits; Success completes cleanly; everything else
-        # (failed/cancelled/timedout) routes to the alert then BranchBComplete.
         assert check["Default"] == "PublishModelZooFailureImmediate"
         nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
         assert nexts["InProgress"] == "ModelZooWait"
         assert nexts["Pending"] == "ModelZooWait"
         assert nexts["Success"] == "BranchBComplete"
         assert branch_b["ModelZooWait"]["Next"] == "WaitForModelZoo"
-
-        # The alert state is itself best-effort: it publishes SNS and then
-        # converges to BranchBComplete (both the success path and its own Catch),
-        # so an SNS failure cannot fail the branch.
+        # The alert state is itself best-effort.
         alert = branch_b["PublishModelZooFailureImmediate"]
         assert alert["Resource"] == "arn:aws:states:::sns:publish"
         assert alert["Next"] == "BranchBComplete"
         assert all(c["Next"] == "BranchBComplete" for c in alert["Catch"])
         assert "PREDICTOR_DEFER_TRAINING_EMAIL" in alert["Parameters"]["Message.$"]
+
+    def test_model_zoo_map_iterator_no_dangling(self, branch_b):
+        """The Map's iterator namespace is self-consistent (all Next/Default/Catch
+        targets resolve within the iterator's own States)."""
+        proc = branch_b["ModelZooTrainMap"]["ItemProcessor"]
+        names = set(proc["States"])
+        assert proc["StartAt"] in names
+        for n, st in proc["States"].items():
+            for t in _own_targets(st):
+                assert t in names, f"Map iterator dangling: {n} -> {t}"
 
     def test_branch_b_ssm_can_resolve_instance_id(self, branch_b):
         """Branch B's SSM calls reference $.ec2_instance_id — which is
