@@ -101,6 +101,17 @@ def _select_portfolio(
         if col not in df.columns:
             df[col] = default
 
+    # GDELT keyword-matches ticker symbols/fragments ("meta-analysis" → META,
+    # "MDT" → unrelated articles), polluting the portfolio section with false
+    # positives (verified 2026-06-15: 19/30 portfolio items were GDELT noise).
+    # Polygon (API-tagged) + Yahoo (per-ticker RSS) are ticker-accurate, so the
+    # portfolio digest uses only those. GDELT remains valid for the macro/tech
+    # topic sections (keyword/topic news by design) — this filter is
+    # portfolio-only.
+    df = df[df["primary_source"].astype(str).str.lower() != "gdelt"]
+    if len(df) == 0:
+        return []
+
     df["_abs_sentiment"] = df["lm_sentiment"].fillna(0.0).abs()
     df = df.sort_values(
         ["_abs_sentiment", "published_at"], ascending=[False, False]
