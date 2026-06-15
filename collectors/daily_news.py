@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 DAILY_PREFIX = "data/news_aggregates_daily"
 ARTICLES_PREFIX = "data/news_articles_daily"
+DIGEST_PREFIX = "data/news_digest_daily"
 HOLDINGS_UNIVERSE_KEY = "robodashboard/holdings_universe.json"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_BUCKET = "alpha-engine-research"
@@ -246,6 +247,7 @@ def collect(
     articles_status = "ok"
     articles_key = None
     articles_rows = 0
+    articles_df = None
     try:
         from data.derived.news_articles import articles_build_and_write
 
@@ -271,6 +273,68 @@ def collect(
             type(e).__name__, e,
         )
 
+    # ── Podcast-ready combined digest (portfolio + macro + tech) ─────────────
+    # Combines the per-ticker article records ALREADY in memory (portfolio
+    # section) with curated macro/tech RSS headlines (topic_news) into a single
+    # small JSON the daily-brief / podcast consumer reads from latest.json in
+    # one GET. Same fail-soft posture as the article companion above (per
+    # [[feedback_no_silent_fails]] — acceptable category: secondary artifact
+    # hung off a path whose PRIMARY deliverable already landed):
+    #   (a) Failure modes swallowed: topic RSS fetch is down/garbled (→ empty
+    #       macro/tech, digest still written); OR the digest build/write itself
+    #       fails (S3 hiccup, schema bug).
+    #   (b) Primary survives: the aggregate (and article companion) already
+    #       landed above; consumers of those are unaffected.
+    #   (c) Recording surface: WARN logs here AND ``digest_status`` /
+    #       ``topic_status`` on the returned status dict (SF/logs capture it).
+    # Topic-fetch failure must NEVER block the digest: we still write it with
+    # the portfolio section populated and empty macro/tech.
+    digest_status = "ok"
+    digest_key = None
+    topic_status = "ok"
+    try:
+        topics: dict = {}
+        try:
+            from collectors.topic_news import fetch_topics
+
+            topics = fetch_topics(["macro", "tech"], hours=hours)
+        except Exception as e:  # noqa: BLE001 — topic fetch is best-effort; degrade to empty
+            topic_status = "error"
+            topics = {}
+            logger.warning(
+                "[daily_news] topic-news fetch FAILED (%s: %s) — "
+                "writing digest with empty macro/tech",
+                type(e).__name__, e,
+            )
+
+        from data.derived.news_digest import build_digest, write_digest
+
+        digest = build_digest(
+            articles_df=articles_df,
+            topics=topics,
+            digest_date=agg_date,
+        )
+        digest_key = write_digest(
+            digest,
+            s3_client=s3_client,
+            bucket=bucket,
+            prefix=DIGEST_PREFIX,
+        )
+        logger.info(
+            "[daily_news] wrote digest to s3://%s/%s (portfolio=%d macro=%d tech=%d)",
+            bucket, digest_key,
+            len(digest["sections"]["portfolio"]),
+            len(digest["sections"]["macro"]),
+            len(digest["sections"]["tech"]),
+        )
+    except Exception as e:  # noqa: BLE001 — fail-soft secondary artifact (see above)
+        digest_status = "error"
+        logger.warning(
+            "[daily_news] digest build/write FAILED (%s: %s) — "
+            "aggregate + article artifacts already landed, continuing",
+            type(e).__name__, e,
+        )
+
     return {
         "status": "ok",
         "tickers": len(universe),
@@ -280,6 +344,9 @@ def collect(
         "articles_status": articles_status,
         "articles_key": articles_key,
         "articles_rows": articles_rows,
+        "digest_status": digest_status,
+        "digest_key": digest_key,
+        "topic_status": topic_status,
     }
 
 
