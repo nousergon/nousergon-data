@@ -1393,7 +1393,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m alpha_engine_lib.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -1546,8 +1546,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Best-effort: a rotation failure must NEVER fail the branch. The champion already trained+promoted.",
-                  "Next": "BranchBComplete",
+                  "Comment": "Best-effort: a rotation failure must NEVER fail the branch. The champion already trained+promoted. BUT it must NOT be SILENT: with PREDICTOR_DEFER_TRAINING_EMAIL=1 the base retrain deferred its email to the zoo digest, so a zoo failure here would otherwise produce zero email for the whole run. Route via PublishModelZooFailureImmediate (SNS alert) before converging to BranchBComplete.",
+                  "Next": "PublishModelZooFailureImmediate",
                   "ResultPath": "$.model_zoo_error"
                 }
               ],
@@ -1578,8 +1578,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Best-effort: poll failure must not fail the branch.",
-                  "Next": "BranchBComplete",
+                  "Comment": "Best-effort: poll failure must not fail the branch — but must not be SILENT either (the base retrain deferred its email to the zoo digest). Alert via PublishModelZooFailureImmediate, then converge to BranchBComplete.",
+                  "Next": "PublishModelZooFailureImmediate",
                   "ResultPath": "$.model_zoo_error"
                 }
               ],
@@ -1588,7 +1588,7 @@
             },
             "CheckModelZooStatus": {
               "Type": "Choice",
-              "Comment": "Any non-success routes to BranchBComplete — the rotation is best-effort and its failure is logged on the box (predictor-model-zoo.log); the champion is already live.",
+              "Comment": "Any non-success routes to PublishModelZooFailureImmediate (SNS alert) then BranchBComplete — the rotation is best-effort and its failure is logged on the box (predictor-model-zoo.log); the champion is already live. The alert is required because PREDICTOR_DEFER_TRAINING_EMAIL=1 deferred the base retrain's email to the zoo digest, so a silent zoo failure would otherwise mean zero email for the run.",
               "Choices": [
                 {
                   "Variable": "$.model_zoo_poll.Status",
@@ -1599,9 +1599,34 @@
                   "Variable": "$.model_zoo_poll.Status",
                   "StringEquals": "Pending",
                   "Next": "ModelZooWait"
+                },
+                {
+                  "Variable": "$.model_zoo_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "BranchBComplete"
                 }
               ],
-              "Default": "BranchBComplete"
+              "Default": "PublishModelZooFailureImmediate"
+            },
+            "PublishModelZooFailureImmediate": {
+              "Type": "Task",
+              "Comment": "Fire an SNS failure alert when the model-zoo rotation fails/times-out. REQUIRED for fallback safety: PredictorTraining now exports PREDICTOR_DEFER_TRAINING_EMAIL=1, so the base champion-arch retrain DEFERS its per-run training email to the consolidated zoo digest (sent at the end of run_rotation_and_select). If the zoo then fails, NEITHER email goes out — without this alert the run would be SILENT. Best-effort like the predictor early-signal alert: an SNS publish failure is caught and still routes to BranchBComplete (the champion already trained+promoted; the rotation is non-critical, so a zoo failure must NEVER fail the branch).",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.sns_topic_arn",
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — ModelZooRotation FAILED (zoo digest email may be missing)', $.pipeline_label)",
+                "Message.$": "States.Format('The model-zoo rotation failed or timed out. The base champion-arch retrain already trained+promoted and DEFERRED its training email to the zoo digest (PREDICTOR_DEFER_TRAINING_EMAIL=1), so the consolidated digest email may NOT have been sent for this run — review predictor-model-zoo.log on the spot and predictor/model_zoo/leaderboard/. The branch will still complete (the champion is live); the rotation is best-effort. Error: {}', States.JsonToString($.model_zoo_error))"
+              },
+              "ResultPath": null,
+              "Next": "BranchBComplete",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Comment": "Best-effort: a failed SNS publish must not prevent the branch from completing. The champion is already live.",
+                  "ResultPath": null,
+                  "Next": "BranchBComplete"
+                }
+              ]
             },
             "ModelZooWait": {
               "Type": "Wait",
