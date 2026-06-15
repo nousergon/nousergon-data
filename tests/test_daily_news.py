@@ -183,3 +183,105 @@ def test_collect_article_companion_failure_is_fail_soft(
     assert out["rows"] == 7
     assert out["articles_status"] == "error"  # failure recorded, not silent
     assert out["articles_key"] is None
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_collect_writes_combined_digest(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """collect() also produces the podcast-ready digest (portfolio + macro +
+    tech) from the already-fetched article records, in the same flow."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("data/news_aggregates_daily/run/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("data/news_articles_daily/run/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [{"title": "m"}], "tech": [{"title": "t"}]}
+    mock_build.return_value = {
+        "sections": {"portfolio": [], "macro": [{"title": "m"}], "tech": [{"title": "t"}]}
+    }
+    mock_write_digest.return_value = "data/news_digest_daily/run/digest.json"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "ok"
+    assert out["digest_status"] == "ok"
+    assert out["topic_status"] == "ok"
+    assert out["digest_key"] == "data/news_digest_daily/run/digest.json"
+    # The digest builder received the in-memory article DataFrame + topics.
+    assert mock_build.call_args.kwargs["articles_df"] is art_df
+    assert mock_build.call_args.kwargs["topics"]["macro"] == [{"title": "m"}]
+    assert mock_write_digest.call_args.kwargs["prefix"] == daily_news.DIGEST_PREFIX
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_collect_digest_topic_failure_is_fail_soft(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """A topic-RSS failure must NOT block the digest: it's still written with
+    the portfolio section populated and empty topics — recorded on
+    topic_status, never silent, never fatal."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.side_effect = RuntimeError("RSS down")
+    mock_build.return_value = {"sections": {"portfolio": [{}], "macro": [], "tech": []}}
+    mock_write_digest.return_value = "data/news_digest_daily/run/digest.json"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "ok"             # primary deliverable survived
+    assert out["topic_status"] == "error"     # topic failure recorded
+    assert out["digest_status"] == "ok"       # digest STILL written
+    # Digest was built with empty topics despite the RSS failure.
+    assert mock_build.call_args.kwargs["topics"] == {}
+    mock_write_digest.assert_called_once()
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_collect_digest_write_failure_is_fail_soft(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_ensure,
+):
+    """A failure building/writing the digest must NOT fail the run — the
+    aggregate + article artifacts already landed; recorded on digest_status."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [], "tech": []}
+    mock_build.side_effect = RuntimeError("schema bug")
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "ok"
+    assert out["digest_status"] == "error"
+    assert out["digest_key"] is None
