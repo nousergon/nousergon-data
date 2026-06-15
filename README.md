@@ -7,11 +7,11 @@
 [![ArcticDB](https://img.shields.io/badge/ArcticDB-0e1117?style=flat-square)](https://docs.arcticdb.io/)
 [![Polygon.io](https://img.shields.io/badge/Polygon.io-1a73e8?style=flat-square)](https://polygon.io/)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
-[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
+[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/nousergon/nousergon-docs#phase-trajectory)
 
 Centralized data collection, storage, and distribution. Owns the price universe (ArcticDB), macro indicators, universe returns, the engineered feature store, the RAG ingestion step, and per-ticker alternative data.
 
-> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
+> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/nousergon/nousergon-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
 
 ## What this does
 
@@ -49,19 +49,19 @@ Quality gates run automatically after each refresh: OHLC ordering, zero-price, e
 
 ## Configuration
 
-This repo is **public**. `config.yaml` is gitignored locally; real values (S3 bucket names, API keys, email recipients) live in the private [`alpha-engine-config`](https://github.com/cipher813/alpha-engine-config) repo. Architecture and approach are public; specific values are private.
+This repo is **public**. `config.yaml` is gitignored locally; real values (S3 bucket names, API keys, email recipients) live in the private [`alpha-engine-config`](https://github.com/nousergon/alpha-engine-config) repo. Architecture and approach are public; specific values are private.
 
 ## Sister repos
 
 | Module | Repo |
 |---|---|
-| Executor | [`alpha-engine`](https://github.com/cipher813/alpha-engine) |
-| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) |
-| Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) |
-| Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) |
-| Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) |
+| Executor | [`alpha-engine`](https://github.com/nousergon/crucible-executor) |
+| Research | [`alpha-engine-research`](https://github.com/nousergon/crucible-research) |
+| Predictor | [`alpha-engine-predictor`](https://github.com/nousergon/crucible-predictor) |
+| Backtester | [`alpha-engine-backtester`](https://github.com/nousergon/crucible-backtester) |
+| Dashboard | [`alpha-engine-dashboard`](https://github.com/nousergon/crucible-dashboard) |
 | Library | [`alpha-engine-lib`](https://github.com/nousergon/nousergon-lib) |
-| Docs | [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) |
+| Docs | [`alpha-engine-docs`](https://github.com/nousergon/nousergon-docs) |
 
 ## License
 
