@@ -31,7 +31,7 @@ ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${FUNCTION_NAME}"
 echo "=== Building container image for $FUNCTION_NAME ==="
 
 # alpha-engine-lib is installed inside the Dockerfile via pip from
-# git+https://github.com/cipher813/alpha-engine-lib@v0.3.0 (public repo
+# git+https://github.com/nousergon/nousergon-lib@v0.3.0 (public repo
 # since 2026-05-03). No vendor staging needed.
 
 docker build --platform linux/amd64 --provenance=false -t "$FUNCTION_NAME:latest" .

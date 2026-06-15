@@ -1,4 +1,4 @@
 # Pinned to match alpha-engine-data/requirements.txt — the main data Lambda
 # already runs on this version, so reusing it keeps the lib substrate
 # coherent across all alpha-engine-data Lambdas.
-alpha-engine-lib @ git+https://github.com/cipher813/alpha-engine-lib@v0.20.0
+alpha-engine-lib @ git+https://github.com/nousergon/nousergon-lib@v0.20.0
