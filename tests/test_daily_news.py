@@ -285,3 +285,126 @@ def test_collect_digest_write_failure_is_fail_soft(
     assert out["status"] == "ok"
     assert out["digest_status"] == "error"
     assert out["digest_key"] is None
+
+
+# ── require_digest: digest promoted to a hard requirement of the run ──────────
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_require_digest_fails_run_when_digest_write_errors(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_ensure,
+):
+    """With require_digest, a digest build/write failure fails the whole run
+    (so daily-news.service exits non-zero and morning-signal's Requires=
+    blocks the pod) — unlike the default fail-soft path."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [], "tech": []}
+    mock_build.side_effect = RuntimeError("schema bug")
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3, require_digest=True)
+
+    assert out["status"] == "error"        # run fails → main() exits 1
+    assert out["digest_status"] == "error"
+    assert out["rows"] == 7                 # aggregate still landed for the dashboard
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_require_digest_fails_run_when_digest_empty(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """An empty digest (zero items across all sections) fails the run under
+    require_digest, even though the write itself succeeded."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [], "tech": []}
+    mock_build.return_value = {"sections": {"portfolio": [], "macro": [], "tech": []}}
+    mock_write_digest.return_value = "data/news_digest_daily/run/digest.json"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3, require_digest=True)
+
+    assert out["status"] == "error"
+    assert out["digest_status"] == "ok"    # write succeeded; emptiness is the failure
+    assert out["digest_total"] == 0
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_require_digest_passes_when_digest_nonempty(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """A fresh, non-empty digest satisfies require_digest → run is ok."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [{"title": "m"}], "tech": []}
+    mock_build.return_value = {"sections": {"portfolio": [{"ticker": "AAPL"}], "macro": [{"title": "m"}], "tech": []}}
+    mock_write_digest.return_value = "data/news_digest_daily/run/digest.json"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3, require_digest=True)
+
+    assert out["status"] == "ok"
+    assert out["digest_total"] == 2
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_default_stays_fail_soft_on_empty_digest(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """Without require_digest (the SF path), an empty digest is still a soft
+    degrade — status stays ok so the weekday SF isn't regressed."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 7
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 12
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [], "tech": []}
+    mock_build.return_value = {"sections": {"portfolio": [], "macro": [], "tech": []}}
+    mock_write_digest.return_value = "data/news_digest_daily/run/digest.json"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)  # require_digest defaults False
+
+    assert out["status"] == "ok"
+    assert out["digest_total"] == 0
