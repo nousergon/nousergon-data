@@ -68,9 +68,13 @@ def test_morning_enrich_not_mapped_to_daily():
 
 
 def test_daily_mode_mapping_unchanged():
-    """The genuine --daily weekday path still maps to 'daily' (we only
-    repointed --morning-enrich)."""
+    """The genuine --daily weekday path still maps to 'daily'. The EOD split
+    (2026-06-16) also routes --daily-arctic-append through the same 'daily'
+    preflight (it reads daily_closes + the ArcticDB universe — same surface)."""
     src = _main_source()
-    assert "elif args.daily:" in src
-    after = src[src.index("elif args.daily:"):]
-    assert 'mode = "daily"' in after.split("else:")[0]
+    assert "elif args.daily" in src
+    after = src[src.index("elif args.daily"):]
+    branch = after.split("else:")[0]
+    assert 'mode = "daily"' in branch
+    # The split-out append state shares the daily preflight surface.
+    assert 'daily_arctic_append' in branch

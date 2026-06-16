@@ -224,6 +224,9 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     if getattr(args, "morning_arctic_append", False):
         return _run_morning_arctic_append(config, args)
 
+    if getattr(args, "daily_arctic_append", False):
+        return _run_daily_arctic_append(config, args)
+
     if getattr(args, "chronic_gap_heal", False):
         return _run_chronic_gap_heal(config, args)
 
@@ -1641,6 +1644,49 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
+# Macro symbols are not S&P constituents but are core daily predictor inputs
+# (vix_level, vix_term_slope, yield_10y, yield_curve_slope, sector-relative
+# features). Appending them lets builders/daily_append.py update the ArcticDB
+# macro library every weekday — pre-ArcticDB, the predictor Lambda fetched these
+# from yfinance on each run; post-migration, the write path moved here. ETFs
+# come from polygon; indices (^-prefix) fall through to FRED then yfinance in
+# daily_closes.collect. Shared by the EOD --daily collector and the split-out
+# --daily-arctic-append state so both pass daily_append the SAME expected_tickers.
+_MACRO_DAILY_TICKERS = [
+    "SPY", "GLD", "USO",
+    "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+    "XLP", "XLRE", "XLU", "XLV", "XLY",
+    "^VIX", "^VIX3M", "^TNX", "^IRX",
+]
+
+
+def _load_daily_universe_tickers(config: dict) -> list[str]:
+    """Load the daily universe (S3 constituents → Wikipedia fallback) plus the
+    macro daily tickers. Shared by :func:`_run_daily` and
+    :func:`_run_daily_arctic_append` so a split EOD run (PostMarketData computes,
+    PostMarketArcticAppend appends) feeds daily_append the identical
+    expected-ticker scope. Returns ``[]`` when no constituents are resolvable —
+    callers treat that as a hard failure."""
+    tickers: list[str] = []
+    market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
+    try:
+        existing = constituents.load_from_s3(config["bucket"], market_prefix)
+        if existing:
+            tickers = existing.get("tickers", [])
+            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+    except Exception as exc:
+        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
+    if not tickers:
+        try:
+            tickers, _, _, _, _ = constituents._fetch_constituents()
+            logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
+        except Exception as exc:
+            logger.error("Wikipedia constituents fallback failed: %s", exc)
+    if not tickers:
+        return []
+    return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
+
+
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     """Daily mode: capture today's OHLCV closes for all tracked tickers."""
     bucket = config["bucket"]
@@ -1656,42 +1702,11 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    # Load tickers: S3 constituents → Wikipedia fallback
-    tickers: list[str] = []
-    market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
-    try:
-        existing = constituents.load_from_s3(bucket, market_prefix)
-        if existing:
-            tickers = existing.get("tickers", [])
-            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
-    except Exception as exc:
-        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
-    if not tickers:
-        try:
-            tickers, _, _, _, _ = constituents._fetch_constituents()
-            logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
-        except Exception as exc:
-            logger.error("Wikipedia constituents fallback failed: %s", exc)
-
+    tickers = _load_daily_universe_tickers(config)
     if not tickers:
         logger.error("No tickers available for daily closes")
         results["status"] = "failed"
         return results
-
-    # Macro symbols are not S&P constituents but are core daily predictor inputs
-    # (vix_level, vix_term_slope, yield_10y, yield_curve_slope, sector-relative
-    # features). Appending them here lets builders/daily_append.py update the
-    # ArcticDB macro library every weekday — pre-ArcticDB, the predictor Lambda
-    # fetched these from yfinance on each run; post-migration, the write path
-    # moved here. ETFs come from polygon; indices (^-prefix) fall through to
-    # FRED then yfinance in daily_closes.collect.
-    MACRO_DAILY_TICKERS = [
-        "SPY", "GLD", "USO",
-        "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
-        "XLP", "XLRE", "XLU", "XLV", "XLY",
-        "^VIX", "^VIX3M", "^TNX", "^IRX",
-    ]
-    tickers = list(dict.fromkeys(tickers + MACRO_DAILY_TICKERS))
 
     logger.info("=" * 60)
     logger.info("COLLECTING: daily closes")
@@ -1811,23 +1826,34 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     # that timed out the 2026-05-01 EOD SF rerun at the SSM 1200s ceiling).
     # MorningEnrich runs (_run_morning_enrich, polygon source) leave the
     # default False so polygon's true VWAP overwrites yfinance's NaN.
-    logger.info("=" * 60)
-    logger.info("APPENDING: ArcticDB universe (daily)")
-    logger.info("=" * 60)
-    from builders.daily_append import daily_append
-    # supports_auto_skip=False: ArcticDB write (no S3 key) + already cheap on
-    # re-run via skip_if_exists=True → markers + watchdog only.
-    results["collectors"]["arcticdb"] = _phase_collect(
-        reg, "arcticdb",
-        lambda: daily_append(
-            date_str=run_date,
-            bucket=bucket,
-            dry_run=dry_run,
-            skip_if_exists=True,
-            expected_tickers=tickers,
-        ),
-        supports_auto_skip=False,
-    )
+    #
+    # --skip-arctic-append: the EOD SF runs the slow daily_append as its own
+    # load-bearing PostMarketArcticAppend state (longer timeout decoupled from
+    # the feature compute), exactly mirroring the weekday MorningEnrich +
+    # MorningArcticAppend split (L4608). Without the flag (the Saturday DataPhase
+    # path) the append still runs inline here. 2026-06-16: the monolithic
+    # --daily run exceeded PostMarketData's 1200s SSM ceiling mid-append → SIGKILL.
+    if getattr(args, "skip_arctic_append", False):
+        logger.info("Skipping inline ArcticDB append (--skip-arctic-append; "
+                    "runs as the EOD SF PostMarketArcticAppend state)")
+    else:
+        logger.info("=" * 60)
+        logger.info("APPENDING: ArcticDB universe (daily)")
+        logger.info("=" * 60)
+        from builders.daily_append import daily_append
+        # supports_auto_skip=False: ArcticDB write (no S3 key) + already cheap on
+        # re-run via skip_if_exists=True → markers + watchdog only.
+        results["collectors"]["arcticdb"] = _phase_collect(
+            reg, "arcticdb",
+            lambda: daily_append(
+                date_str=run_date,
+                bucket=bucket,
+                dry_run=dry_run,
+                skip_if_exists=True,
+                expected_tickers=tickers,
+            ),
+            supports_auto_skip=False,
+        )
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -1853,6 +1879,77 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
                 ", ".join(f"{k}={v.get('status', '?')}" for k, v in results["collectors"].items()),
                 duration)
 
+    return results
+
+
+def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
+    """Standalone ArcticDB universe append for the EOD post-market path.
+
+    The daily/EOD twin of :func:`_run_morning_arctic_append`. Split out of
+    :func:`_run_daily` (2026-06-16) into its own EOD-SF state
+    (``PostMarketArcticAppend``): the monolithic ``--daily`` run does
+    daily_closes + metron collectors + feature-store compute + the SLOW
+    ``daily_append`` in one shot, and on 2026-06-16 it exceeded PostMarketData's
+    1200s SSM ``executionTimeout`` mid-append → SIGKILL → the whole EOD pipeline
+    failed (no reconcile, no EOD email). As its own state the append gets a
+    longer timeout decoupled from the feature compute, exactly mirroring the
+    weekday MorningEnrich + MorningArcticAppend split (L4608).
+
+    LOAD-BEARING: EOD reconcile + predictor inference read the ArcticDB universe
+    after this, so an append failure returns ``status="failed"`` → ``main()``
+    exits 1 → the SF's ``CheckPostMarketArcticAppendStatus`` routes to
+    HandleFailure.
+
+    Targets the same date as :func:`_run_daily` (today's UTC date, or ``--date``)
+    and passes ``skip_if_exists=True`` so an operator rerun short-circuits
+    tickers whose row already landed — identical semantics to the inline block
+    it replaces (the Saturday DataPhase path still appends inline via
+    ``--daily`` without ``--skip-arctic-append``). PostMarketData writes today's
+    daily_closes parquet that this append reads, so this state runs after it.
+    """
+    bucket = config["bucket"]
+    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dry_run = args.dry_run
+    results: dict = {
+        "mode": "daily_arctic_append",
+        "date": run_date,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "collectors": {},
+    }
+
+    tickers = _load_daily_universe_tickers(config)
+    if not tickers:
+        logger.error("No tickers available for ArcticDB append")
+        results["status"] = "failed"
+        results["completed_at"] = datetime.now(timezone.utc).isoformat()
+        return results
+
+    logger.info("=" * 60)
+    logger.info("APPENDING: ArcticDB universe (daily-arctic-append state, %s)", run_date)
+    logger.info("=" * 60)
+    reg = _build_registry(config, args, run_date)
+    try:
+        from builders.daily_append import daily_append
+        with _maybe_phase(reg, "arcticdb"):
+            arctic_result = daily_append(
+                date_str=run_date,
+                bucket=bucket,
+                dry_run=dry_run,
+                skip_if_exists=True,
+                expected_tickers=tickers,
+            )
+        results["collectors"]["arcticdb"] = arctic_result
+        # daily_append returns its own status; surface it as the load-bearing
+        # verdict so a write failure halts the pipeline (reconcile reads next).
+        _status = arctic_result.get("status", "unknown")
+        results["status"] = "ok" if _status in ("ok", "ok_dry_run") else "failed"
+    except Exception as e:
+        logger.exception("ArcticDB daily_append (daily-arctic-append state) failed for %s", run_date)
+        results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+        results["status"] = "failed"
+
+    results["completed_at"] = datetime.now(timezone.utc).isoformat()
+    logger.info("ArcticDB append %s for %s", results["status"].upper(), run_date)
     return results
 
 
@@ -2140,6 +2237,14 @@ def _parse_args() -> argparse.Namespace:
              "Load-bearing: exits 1 on append failure. --date overrides target day.",
     )
     parser.add_argument(
+        "--daily-arctic-append", dest="daily_arctic_append", action="store_true",
+        help="Standalone ArcticDB universe append for the EOD post-market path "
+             "(the slow daily_append split out of --daily, 2026-06-16). The EOD SF "
+             "runs --daily --skip-arctic-append (compute) then this state with a "
+             "longer timeout. Load-bearing: exits 1 on append failure. Targets "
+             "today's UTC date (or --date); skip_if_exists short-circuits reruns.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
@@ -2190,7 +2295,9 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily:
+    elif args.daily or getattr(args, "daily_arctic_append", False):
+        # --daily-arctic-append reads the daily_closes PostMarketData wrote +
+        # the ArcticDB universe libraries — same preflight surface as --daily.
         mode = "daily"
     else:
         mode = f"phase{args.phase or 1}"

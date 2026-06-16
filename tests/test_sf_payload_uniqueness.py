@@ -403,6 +403,11 @@ class TestEODSFTopLevelFieldsClosed:
             "force_stop_result",
             "postmarket_poll",
             "postmarket_result",
+            # PostMarketArcticAppend (2026-06-16) — slow daily_append split out
+            # of PostMarketData into its own state (mirrors MorningArcticAppend
+            # L4608); emits its own send/poll ResultPaths.
+            "postmarket_arctic_poll",
+            "postmarket_arctic_result",
             "snapshot_poll",
             "snapshot_result",
             "stop_result",
@@ -422,6 +427,7 @@ class TestEODSFTopLevelFieldsClosed:
             # optional boolean skip flag from the execution input so an
             # operator recovery rerun can resume at the first incomplete task.
             "skip_post_market_data",
+            "skip_post_market_arctic_append",
             "skip_capture_snapshot",
             "skip_eod_reconcile",
             "skip_daily_substrate_health_check",
