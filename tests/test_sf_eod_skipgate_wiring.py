@@ -22,8 +22,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 
 # (gate, task, skip_flag, next_after_skip) in pipeline order.
+# PostMarketArcticAppend was split out of PostMarketData 2026-06-16 (the slow
+# daily_append, mirroring the weekday MorningArcticAppend split L4608) — it gets
+# its own skip-gate so a recovery rerun can skip whichever half already completed.
 _CHAIN = [
-    ("CheckSkipPostMarketData", "PostMarketData", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
+    ("CheckSkipPostMarketData", "PostMarketData", "skip_post_market_data", "CheckSkipPostMarketArcticAppend"),
+    ("CheckSkipPostMarketArcticAppend", "PostMarketArcticAppend", "skip_post_market_arctic_append", "CheckSkipCaptureSnapshot"),
     ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "CheckSkipEODReconcile"),
     ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckSkipDailySubstrateHealthCheck"),
     ("CheckSkipDailySubstrateHealthCheck", "DailySubstrateHealthCheck", "skip_daily_substrate_health_check", "StopTradingInstance"),
@@ -56,8 +60,13 @@ class TestEntryEdgesRouteThroughGates:
                     if "States.ALL" in c["ErrorEquals"]]
         assert failopen == ["CheckSkipPostMarketData"]
 
-    def test_post_market_success_enters_snapshot_gate(self, states):
+    def test_post_market_success_enters_arctic_append_gate(self, states):
         succ = [c["Next"] for c in states["CheckPostMarketStatus"]["Choices"]
+                if c.get("StringEquals") == "Success"]
+        assert succ == ["CheckSkipPostMarketArcticAppend"]
+
+    def test_arctic_append_success_enters_snapshot_gate(self, states):
+        succ = [c["Next"] for c in states["CheckPostMarketArcticAppendStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
         assert succ == ["CheckSkipCaptureSnapshot"]
 
@@ -107,8 +116,15 @@ class TestPaths:
         # Cost-guard cleanup must ALWAYS run.
         assert order == ["StopTradingInstance"]
 
-    def test_skip_post_market_resumes_at_snapshot(self, states):
+    def test_skip_post_market_resumes_at_arctic_append(self, states):
         order = self._walk(states, skip_flags={"skip_post_market_data"})
         assert "PostMarketData" not in order
+        assert order[0] == "PostMarketArcticAppend"
+        assert order[-1] == "StopTradingInstance"
+
+    def test_skip_post_market_and_arctic_append_resumes_at_snapshot(self, states):
+        order = self._walk(states, skip_flags={"skip_post_market_data", "skip_post_market_arctic_append"})
+        assert "PostMarketData" not in order
+        assert "PostMarketArcticAppend" not in order
         assert order[0] == "CaptureSnapshot"
         assert order[-1] == "StopTradingInstance"

@@ -64,7 +64,7 @@
     },
     "PostMarketData": {
       "Type": "Task",
-      "Comment": "Capture today's closing prices via yfinance + append to ArcticDB (runs on ae-trading). Hard-fails on non-zero exit via pipefail so tee does not mask python failures.",
+      "Comment": "Capture today's closing prices via yfinance + compute the feature-store snapshot (runs on ae-trading). The slow ArcticDB daily_append is split out into the separate PostMarketArcticAppend state (2026-06-16) — mirrors the weekday MorningEnrich + MorningArcticAppend split (L4608) — because the monolithic --daily run exceeded the 1200s SSM executionTimeout mid-append on 2026-06-16 → SIGKILL → whole EOD pipeline failed. Hard-fails on non-zero exit via pipefail so tee does not mask python failures.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -76,13 +76,13 @@
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/postmarket-data.log \"s3://alpha-engine-research/_ssm_logs/postmarket-data/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python weekly_collector.py --daily 2>&1 | tee /var/log/postmarket-data.log"
+            "python weekly_collector.py --daily --skip-arctic-append 2>&1 | tee /var/log/postmarket-data.log"
           ],
-          "executionTimeout": ["1200"]
+          "executionTimeout": ["1800"]
         },
-        "TimeoutSeconds": 1200
+        "TimeoutSeconds": 1800
       },
-      "TimeoutSeconds": 1260,
+      "TimeoutSeconds": 1860,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
@@ -134,7 +134,7 @@
       "Type": "Choice",
       "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
       "Choices": [
-        { "Variable": "$.postmarket_poll.Status", "StringEquals": "Success", "Next": "CheckSkipCaptureSnapshot" },
+        { "Variable": "$.postmarket_poll.Status", "StringEquals": "Success", "Next": "CheckSkipPostMarketArcticAppend" },
         { "Variable": "$.postmarket_poll.Status", "StringEquals": "InProgress", "Next": "PostMarketWait" },
         { "Variable": "$.postmarket_poll.Status", "StringEquals": "Pending", "Next": "PostMarketWait" },
         { "Variable": "$.postmarket_poll.Status", "StringEquals": "Delayed", "Next": "PostMarketWait" }
@@ -159,6 +159,110 @@
       "Type": "Wait",
       "Seconds": 15,
       "Next": "WaitForPostMarketData"
+    },
+    "CheckSkipPostMarketArcticAppend": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate. Input {\"skip_post_market_arctic_append\": true} routes past PostMarketArcticAppend to the next gate (CheckSkipCaptureSnapshot); missing flag = run as normal. The slow ArcticDB daily_append was split out of PostMarketData 2026-06-16 (mirrors the weekday MorningArcticAppend split, L4608) — as its own state it gets a longer timeout decoupled from the feature compute, and a recovery rerun can skip whichever half already completed. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_post_market_arctic_append", "IsPresent": true},
+            {"Variable": "$.skip_post_market_arctic_append", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipCaptureSnapshot"
+        }
+      ],
+      "Default": "PostMarketArcticAppend"
+    },
+    "PostMarketArcticAppend": {
+      "Type": "Task",
+      "Comment": "LOAD-BEARING: ArcticDB universe daily_append for today's post-market closes — writes the OHLCV row + recomputed features that EOD reconcile + predictor inference read next. Split out of PostMarketData 2026-06-16: the append is the slow part and the monolithic --daily run exceeded PostMarketData's 1200s executionTimeout mid-append → SIGKILL → whole EOD pipeline failed (no reconcile, no EOD email). Own longer timeout (2400s) decoupled from the feature compute; reads the daily_closes PostMarketData just wrote. Failure → HandleFailure. Hard-fails on non-zero exit via pipefail so tee does not mask python failures.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -o pipefail",
+            "cd /home/ec2-user/alpha-engine-data",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "trap 'aws s3 cp /var/log/postmarket-arctic-append.log \"s3://alpha-engine-research/_ssm_logs/postmarket-arctic-append/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
+            "python weekly_collector.py --daily-arctic-append 2>&1 | tee /var/log/postmarket-arctic-append.log"
+          ],
+          "executionTimeout": ["2400"]
+        },
+        "TimeoutSeconds": 2400
+      },
+      "TimeoutSeconds": 2460,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Hard-fail: EOD reconcile + predictor read the ArcticDB universe next. Don't paper over an append failure.",
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.postmarket_arctic_result",
+      "Next": "WaitForPostMarketArcticAppend"
+    },
+    "WaitForPostMarketArcticAppend": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.postmarket_arctic_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.postmarket_arctic_poll",
+      "Next": "CheckPostMarketArcticAppendStatus"
+    },
+    "CheckPostMarketArcticAppendStatus": {
+      "Type": "Choice",
+      "Comment": "LOAD-BEARING like CheckPostMarketStatus: only Success proceeds (to CaptureSnapshot); any other terminal SSM status → HandleFailure (reconcile must not run on a stale ArcticDB universe). Only InProgress/Pending/Delayed keep polling.",
+      "Choices": [
+        { "Variable": "$.postmarket_arctic_poll.Status", "StringEquals": "Success", "Next": "CheckSkipCaptureSnapshot" },
+        { "Variable": "$.postmarket_arctic_poll.Status", "StringEquals": "InProgress", "Next": "PostMarketArcticAppendWait" },
+        { "Variable": "$.postmarket_arctic_poll.Status", "StringEquals": "Pending", "Next": "PostMarketArcticAppendWait" },
+        { "Variable": "$.postmarket_arctic_poll.Status", "StringEquals": "Delayed", "Next": "PostMarketArcticAppendWait" }
+      ],
+      "Default": "PostMarketArcticAppendStatusError"
+    },
+    "PostMarketArcticAppendStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Parameters": {
+        "source": "post_market_arctic_append_status",
+        "status.$": "$.postmarket_arctic_poll.Status",
+        "status_details.$": "$.postmarket_arctic_poll.StatusDetails",
+        "response_code.$": "$.postmarket_arctic_poll.ResponseCode",
+        "command_id.$": "$.postmarket_arctic_poll.CommandId",
+        "instance_id.$": "$.postmarket_arctic_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "PostMarketArcticAppendWait": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "WaitForPostMarketArcticAppend"
     },
     "CaptureSnapshot": {
       "Type": "Task",
@@ -419,14 +523,14 @@
     },
     "CheckSkipPostMarketData": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607). Input {\"skip_post_market_data\": true} routes past PostMarketData to the next gate (CheckSkipCaptureSnapshot); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the EOD pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work (e.g. an EODReconcile failure rerun should not re-run PostMarketData + CaptureSnapshot). Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_post_market_data\": true} routes past PostMarketData to the next gate (CheckSkipPostMarketArcticAppend); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the EOD pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work (e.g. an EODReconcile failure rerun should not re-run PostMarketData + CaptureSnapshot). Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_post_market_data", "IsPresent": true},
             {"Variable": "$.skip_post_market_data", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipCaptureSnapshot"
+          "Next": "CheckSkipPostMarketArcticAppend"
         }
       ],
       "Default": "PostMarketData"

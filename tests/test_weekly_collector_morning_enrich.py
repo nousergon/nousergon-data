@@ -831,6 +831,75 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
     assert bad["status"] == "failed"
 
 
+# ── EOD daily_append split: PostMarketData + PostMarketArcticAppend (2026-06-16) ──
+
+
+def test_daily_arctic_append_routes_via_run_weekly():
+    """run_weekly must dispatch --daily-arctic-append to _run_daily_arctic_append."""
+    args = SimpleNamespace(
+        morning_enrich=False, morning_arctic_append=False,
+        daily_arctic_append=True, chronic_gap_heal=False, daily=False,
+    )
+    with patch("weekly_collector._run_daily_arctic_append",
+               return_value={"status": "ok", "mode": "daily_arctic_append"}) as ap:
+        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+    ap.assert_called_once()
+    assert out["mode"] == "daily_arctic_append"
+
+
+def test_daily_skip_arctic_append_does_not_append():
+    """--daily --skip-arctic-append (EOD PostMarketData) suppresses the inline
+    daily_append — the separate PostMarketArcticAppend SF state runs it instead."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(
+        date="2026-06-16", dry_run=True, morning_enrich=False,
+        daily=True, only=None, skip_arctic_append=True,
+    )
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+    append_calls = []
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok_dry_run", "polygon": 0, "fred": 4,
+                             "yfinance": 1, "tickers_captured": 5, "source": "yfinance_only"}), \
+         patch("features.compute.compute_and_write", return_value={"status": "ok"}), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: append_calls.append(k) or {"status": "ok"}):
+        result = weekly_collector._run_daily(config, args)
+    assert append_calls == [], "daily_append must not run inline when --skip-arctic-append"
+    assert "arcticdb" not in result["collectors"]
+
+
+def test_daily_arctic_append_runs_daily_append_with_skip_if_exists_and_is_load_bearing():
+    """_run_daily_arctic_append runs daily_append for today's date with
+    skip_if_exists=True (cheap reruns) and returns failed (load-bearing) on error."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=False)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    calls = []
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: calls.append(k) or {"status": "ok"}):
+        ok = weekly_collector._run_daily_arctic_append(config, args)
+    assert ok["status"] == "ok" and ok["mode"] == "daily_arctic_append"
+    assert calls and calls[0]["date_str"] == "2026-06-16"
+    assert calls[0]["skip_if_exists"] is True, (
+        "EOD append must keep skip_if_exists=True so an operator rerun "
+        "short-circuits tickers whose row already landed (matches the inline "
+        "block it was split out of)."
+    )
+    # macro daily tickers must be in the expected_tickers scope (same as _run_daily)
+    assert "SPY" in calls[0]["expected_tickers"]
+
+    # load-bearing: append raises → failed
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
+        bad = weekly_collector._run_daily_arctic_append(config, args)
+    assert bad["status"] == "failed"
+
+
 # ── chronic-gap heal hard timeout (L4605) ───────────────────────────────────
 
 
