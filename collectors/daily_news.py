@@ -140,14 +140,24 @@ def collect(
     run_date: str | None = None,
     hours: int = DEFAULT_LOOKBACK_HOURS,
     dry_run: bool = False,
+    require_digest: bool = False,
     s3_client: Any = None,
 ) -> dict:
     """Pull daily news for the held + tracked universe and write the daily
     aggregates parquet (``data/news_aggregates_daily/``).
 
-    Returns a status dict. This is a SECONDARY artifact — callers should treat
-    a non-``ok`` status as a soft degrade (no news that day), never a hard
-    failure of any primary pipeline.
+    Returns a status dict. The aggregate is the PRIMARY artifact; the
+    raw-article companion and the podcast-ready digest are SECONDARY and
+    fail-soft by default — callers (e.g. the weekday SF) treat a non-``ok``
+    status as a soft degrade, never a hard failure of any primary pipeline.
+
+    ``require_digest`` PROMOTES the digest to a hard requirement of THIS run:
+    when set, a digest that failed to build/write or that is empty makes
+    ``collect`` return an ``error`` status (so ``main`` exits non-zero). The
+    standalone box runner passes this so ``daily-news.service`` fails — and
+    the ``Requires=`` coupling blocks the morning-signal pod — rather than
+    letting a soft-failed/empty digest feed a degraded episode. The SF path
+    leaves it ``False``, preserving the digest's fail-soft posture there.
     """
     if s3_client is None:
         import boto3
@@ -291,6 +301,7 @@ def collect(
     # the portfolio section populated and empty macro/tech.
     digest_status = "ok"
     digest_key = None
+    digest_total = 0
     topic_status = "ok"
     try:
         topics: dict = {}
@@ -314,6 +325,10 @@ def collect(
             topics=topics,
             digest_date=agg_date,
         )
+        _sections = digest.get("sections", {})
+        digest_total = sum(
+            len(_sections.get(s, [])) for s in ("portfolio", "macro", "tech")
+        )
         digest_key = write_digest(
             digest,
             s3_client=s3_client,
@@ -323,9 +338,9 @@ def collect(
         logger.info(
             "[daily_news] wrote digest to s3://%s/%s (portfolio=%d macro=%d tech=%d)",
             bucket, digest_key,
-            len(digest["sections"]["portfolio"]),
-            len(digest["sections"]["macro"]),
-            len(digest["sections"]["tech"]),
+            len(_sections.get("portfolio", [])),
+            len(_sections.get("macro", [])),
+            len(_sections.get("tech", [])),
         )
     except Exception as e:  # noqa: BLE001 — fail-soft secondary artifact (see above)
         digest_status = "error"
@@ -335,8 +350,26 @@ def collect(
             type(e).__name__, e,
         )
 
+    # By default the digest is secondary/fail-soft → overall status stays
+    # "ok" as long as the PRIMARY aggregate landed. With ``require_digest``
+    # the digest is a hard requirement of this run: a failed-to-write or
+    # empty digest fails the whole run (→ main() exit 1 → daily-news.service
+    # fails → morning-signal's Requires= blocks the pod). The aggregate +
+    # article artifacts already wrote to S3 above, so the dashboard's Daily
+    # News page is unaffected by this exit code.
+    status = "ok"
+    if require_digest and (digest_status != "ok" or digest_total == 0):
+        status = "error"
+        logger.error(
+            "[daily_news] require_digest set but digest is unusable "
+            "(digest_status=%s, items=%d) — failing the run so the "
+            "morning-signal consumer blocks rather than narrating a "
+            "soft-failed/empty digest",
+            digest_status, digest_total,
+        )
+
     return {
-        "status": "ok",
+        "status": status,
         "tickers": len(universe),
         "articles": len(articles),
         "rows": int(len(df)),
@@ -346,6 +379,7 @@ def collect(
         "articles_rows": articles_rows,
         "digest_status": digest_status,
         "digest_key": digest_key,
+        "digest_total": digest_total,
         "topic_status": topic_status,
     }
 
@@ -388,9 +422,24 @@ def main() -> int:
         action="store_true",
         help="Fetch + NLP but don't write the parquet.",
     )
+    parser.add_argument(
+        "--require-digest",
+        action="store_true",
+        help=(
+            "Treat the podcast digest as a hard requirement: exit non-zero "
+            "if it failed to build/write or is empty. Used by the standalone "
+            "box runner so daily-news.service fails (and morning-signal's "
+            "Requires= blocks the pod) rather than feeding a soft-failed "
+            "digest. Leave unset in the weekday SF (digest stays fail-soft)."
+        ),
+    )
     args = parser.parse_args()
     result = collect(
-        args.bucket, run_date=args.date, hours=args.hours, dry_run=args.dry_run
+        args.bucket,
+        run_date=args.date,
+        hours=args.hours,
+        dry_run=args.dry_run,
+        require_digest=args.require_digest,
     )
     logger.info("[daily_news] complete: %s", result)
     return 0 if result.get("status", "").startswith("ok") or result["status"] == "skipped" else 1

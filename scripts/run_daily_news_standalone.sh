@@ -41,7 +41,14 @@ set -a
 source /home/ec2-user/.alpha-engine.env 2>/dev/null || true
 set +a
 
-.venv/bin/python -m collectors.daily_news >> "$LOG" 2>&1
+# --require-digest: this box runner feeds the morning-signal podcast, whose
+# consumer treats the digest as a hard prerequisite. Exit non-zero if the
+# digest failed/empty so this service fails and morning-signal's Requires=
+# blocks the pod, rather than letting a soft-failed digest feed a degraded
+# episode. (The weekday SF invokes daily_news WITHOUT this flag — digest stays
+# fail-soft there.) The aggregate + article artifacts the dashboard reads
+# already wrote before the digest step, so they're unaffected by this exit.
+.venv/bin/python -m collectors.daily_news --require-digest >> "$LOG" 2>&1
 rc=$?
 echo "=== daily-news standalone exit rc=$rc $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
 exit $rc
