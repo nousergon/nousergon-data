@@ -196,9 +196,12 @@ BOOTSTRAP
 # drift_detector lives in alpha-engine-data/monitoring/ but imports from
 # alpha-engine-predictor via PYTHONPATH. Both must be present.
 echo "==> Cloning alpha-engine-data + alpha-engine-predictor (branch: $BRANCH)..."
-for REPO in alpha-engine-data alpha-engine-predictor; do
-    run_remote "git clone --depth 1 --branch $BRANCH https://github.com/cipher813/$REPO.git /home/ec2-user/$REPO"
-done
+# Repos renamed + moved to the nousergon org 2026-06-15; local checkout dirs
+# stay alpha-engine-* (dir-name ≠ repo-name split). Clone the new slugs
+# explicitly rather than depending on GitHub's chained rename/transfer 301
+# redirect from the old cipher813 paths.
+run_remote "git clone --depth 1 --branch $BRANCH https://github.com/nousergon/nousergon-data.git /home/ec2-user/alpha-engine-data"
+run_remote "git clone --depth 1 --branch $BRANCH https://github.com/nousergon/crucible-predictor.git /home/ec2-user/alpha-engine-predictor"
 
 # ── Install dependencies ─────────────────────────────────────────────────────
 # alpha-engine-lib is public; pip installs it from git+https with no auth.
