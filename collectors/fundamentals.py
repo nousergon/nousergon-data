@@ -243,6 +243,12 @@ NEUTRAL = {
     "payout_ratio": 0.0,
     "dividend_yield": 0.0,
     "capex_growth_5y": 0.0,
+    # SIZE pillar substrate (config#1142) — raw market cap (absolute units).
+    # Surfaced from the already-fetched ``marketCapitalization`` metric;
+    # the feature engineer takes log() and the cross-sectional pass emits
+    # the Barra SIZE loading (size_zscore). 0.0 here -> size NaN downstream
+    # (log guard), so a missing-cap ticker is excluded rather than mis-sized.
+    "market_cap_raw": 0.0,
 }
 
 
@@ -302,6 +308,16 @@ def _fetch_single_ticker(ticker: str) -> dict:
     else:
         fcf_yield_raw = 0.0
 
+    # SIZE pillar substrate (config#1142): persist the already-fetched raw
+    # market cap, UN-clipped / UN-normalized (it is the ``_raw`` column).
+    # ``marketCapitalization`` is surfaced as Finnhub reports it (the same
+    # source the fcf_yield ratio above already consumes). Non-positive /
+    # missing -> 0.0; the feature engineer's log() guard maps 0.0 -> NaN so
+    # a capless ticker is EXCLUDED from the SIZE cross-section, never mis-
+    # sized. The SIZE loading is scale-invariant (a constant log shift is
+    # removed by cross-sectional z-scoring), so the native unit is fine.
+    market_cap_raw = market_cap if (market_cap and market_cap > 0) else 0.0
+
     # ── Growth pillar substrate (Phase 3a of attractiveness-pillars-260520) ──
     # 3-year CAGR signals from Finnhub. Smoother than TTM YoY for
     # composite ranking (base-effect noise + single-quarter anomalies
@@ -347,6 +363,11 @@ def _fetch_single_ticker(ticker: str) -> dict:
         "payout_ratio": _clip(payout_ratio_raw, 0.0, 2.0),
         "dividend_yield": _clip(dividend_yield_raw, 0.0, 0.20),
         "capex_growth_5y": _clip(capex_growth_5y_raw, -1.0, 2.0),
+        # SIZE pillar substrate (config#1142): raw market cap in USD,
+        # deliberately UN-clipped/UN-normalized (it's a _raw column). The
+        # SIZE loading's log + cross-sectional z-score downstream tames the
+        # scale; clipping here would corrupt the absolute units.
+        "market_cap_raw": market_cap_raw,
     }
 
 

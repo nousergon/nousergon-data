@@ -40,6 +40,9 @@ log = logging.getLogger(__name__)
 #   • dist-from-52w-high — proximity-to-high / reversal-risk factor
 #   • value (1/PE proxy) — Barra's VALUE family
 #   • quality (ROE) — Barra's QUALITY / profitability factor
+#   • size (log market cap) — Barra's SIZE factor (config#1142) — completes
+#     the institutional Barra set; uses a log pre-transform (see
+#     FACTOR_LOADING_TRANSFORMS) because SIZE is canonically z(log(mktcap)).
 FACTOR_LOADING_SOURCES: dict[str, str] = {
     "momentum_20d":         "momentum_20d_zscore",
     "return_60d":           "return_60d_zscore",
@@ -49,6 +52,32 @@ FACTOR_LOADING_SOURCES: dict[str, str] = {
     "dist_from_52w_high":   "dist_from_52w_high_zscore",
     "pe_ratio":             "pe_ratio_zscore",
     "roe":                  "roe_zscore",
+    "market_cap_raw":       "size_zscore",
+}
+
+
+def _log_positive(series: pd.Series) -> pd.Series:
+    """np.log with a non-positive guard: x <= 0 (or non-finite) -> NaN.
+
+    Barra SIZE = z-score of log(market cap). Raw market cap is fat-right-
+    tailed, so the z-score is taken on the log scale. A 0.0 / negative /
+    missing market cap (the collector's NEUTRAL default for a capless or
+    uncovered ticker) maps to NaN here, which the cross-sectional z-score
+    excludes — the ticker is dropped from the SIZE cross-section rather than
+    being assigned a spurious extreme-small loading. Fail-soft, additive.
+    """
+    arr = series.astype(float)
+    return pd.Series(
+        np.where(arr > 0.0, np.log(arr.where(arr > 0.0)), np.nan),
+        index=series.index,
+    )
+
+
+# Optional per-source PRE-TRANSFORM applied before winsorize+z-score.
+# Default (source absent here) is identity. SIZE is the first user: it
+# z-scores log(market_cap_raw), not raw market cap.
+FACTOR_LOADING_TRANSFORMS: dict[str, "callable"] = {
+    "market_cap_raw": _log_positive,
 }
 
 _WINSORIZE_SIGMA = 3.0
@@ -138,5 +167,9 @@ def apply_factor_zscores(
             )
             out[dst] = np.nan
             continue
-        out[dst] = _winsorize_and_zscore(out[src].astype(float))
+        col = out[src].astype(float)
+        transform = FACTOR_LOADING_TRANSFORMS.get(src)
+        if transform is not None:
+            col = transform(col)
+        out[dst] = _winsorize_and_zscore(col)
     return out
