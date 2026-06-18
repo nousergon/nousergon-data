@@ -49,6 +49,16 @@ FX_PREFIX = "market_data/fx/"
 # reconstruction (close series) + as-of-date realized/dividend FX conversion.
 CLOSE_HISTORY_PREFIX = "market_data/close_history/"
 FX_HISTORY_PREFIX = "market_data/fx_history/"
+# Factor/sector ETFs whose close-history Metron's RISK (factor model) + ATTRIBUTION
+# (Brinson sector) need. These are NOT in any held universe, so unless their history is
+# published here the spine has no close_history for them and risk/attribution can NEVER
+# compute — metron-ops#43: the daily refresh logged `risk=False, attribution=False` with
+# `NoSuchKey` reading market_data/close_history/{XLP,XLV,...}.json. Mirrors metron
+# api/services/risk.py (SPY + STYLE_ETF) + portfolio_analytics.sectors.SECTOR_ETF; all USD.
+RISK_FACTOR_ETFS = [
+    "SPY", "MTUM", "QUAL", "USMV", "VLUE", "SIZE",  # market + iShares MSCI USA style factors
+    "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY",  # GICS sector SPDRs
+]
 # Reference data — GICS sector per held symbol + SPY's sector weights (Brinson
 # attribution), and each held symbol's next earnings date (Calendar page). Moves
 # Metron's last yfinance fetches to the spine so Metron reads ALL external data here.
@@ -649,7 +659,11 @@ def collect_history(
     if not holdings:
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
-    closes = (close_history_source or _yfinance_close_history)(sorted(ccy_by_yf))
+    # Held symbols + the factor/sector ETFs Metron's risk/attribution need (USD,
+    # independent of holdings) — without these the spine can't serve their close_history
+    # and risk/attribution stay blank (metron-ops#43).
+    hist_symbols = sorted(set(ccy_by_yf) | set(RISK_FACTOR_ETFS))
+    closes = (close_history_source or _yfinance_close_history)(hist_symbols)
     fx = (fx_history_source or _yfinance_fx_history)(currencies)
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))

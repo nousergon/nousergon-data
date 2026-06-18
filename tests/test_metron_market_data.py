@@ -143,6 +143,25 @@ class TestHistory:
         assert aapl["closes"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
         assert puts["market_data/fx_history/HKD.json"]["rates"][-1] == ["2026-06-11", 0.1282]
 
+    def test_publishes_factor_etf_history_for_risk_attribution(self):
+        # The factor/sector ETFs (SPY/MTUM/.../XLK) must be requested + published even
+        # though they're not held, or Metron's risk/attribution can't backfill (metron-ops#43).
+        s3 = _universe_s3(_UNIVERSE)
+        requested: list[str] = []
+
+        def close_hist(syms):
+            requested.extend(syms)
+            return {s: [("2026-06-11", 100.0)] for s in syms}
+
+        result = mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=lambda c: {})
+        assert set(mmd.RISK_FACTOR_ETFS) <= set(requested)  # all factor ETFs requested
+        assert "AAPL" in requested  # held symbols still included
+        puts = _puts(s3)
+        for etf in ("SPY", "XLK", "MTUM"):
+            key = f"market_data/close_history/{etf}.json"
+            assert key in puts and puts[key]["currency"] == "USD"
+        assert result["close_series"] == len(set(["AAPL", "1299.HK", *mmd.RISK_FACTOR_ETFS]))
+
     def test_history_dry_run_and_empty_universe(self):
         s3 = _universe_s3(_UNIVERSE)
         r = mmd.collect_history(bucket="b", dry_run=True, s3_client=s3, close_history_source=lambda s: {"AAPL": [("2026-06-11", 201.5)]}, fx_history_source=lambda c: {})
