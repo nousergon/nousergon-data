@@ -77,8 +77,16 @@ FUNDAMENTALS_INFO_KEYS = [
 ]
 # Intraday — last/open/prior-close per held symbol, refreshed every 15 min during US
 # regular trading hours by a systemd timer on the trading box (config#1023). Single
-# `latest.json` key (no dated files — 26 writes/day would litter the prefix).
+# `latest.json` key (no dated files — 26 writes/day would litter the prefix). The same
+# artifact also carries the major-index proxies (see INDEX_PROXY_SYMBOLS).
 INTRADAY_PREFIX = "market_data/intraday/"
+# Major US-index ETF proxies for Metron's Overview "markets" strip — refreshed in the
+# same intraday run (market context, fetched independent of the held universe). The
+# index VALUES (^GSPC / ^IXIC / ^RUT) carry a separate index license; the tradeable ETF
+# prices are ordinary equity trades, so the ETF is published as the index proxy and
+# Metron maps each symbol to the index it tracks. Quotes land under the artifact's
+# `indices` key (same per-symbol shape as held `quotes`).
+INDEX_PROXY_SYMBOLS = ["SPY", "QQQ", "IWM"]
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
@@ -87,7 +95,7 @@ SECTORS_SCHEMA_VERSION = 1
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 1
 FUNDAMENTALS_SCHEMA_VERSION = 1
-INTRADAY_SCHEMA_VERSION = 1
+INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -853,25 +861,43 @@ def metron_app_active(bucket: str, s3_client: Any, now: datetime | None = None) 
         return False
 
 
+def _flag_suspect_quotes(quotes: dict[str, dict]) -> int:
+    """Flag (never drop) any quote moving >40% vs prior close — almost always a bad
+    scrape or an unadjusted corporate action, not a real move. Marks ``suspect: true``
+    in place (no fabrication: the consumer renders a warning, not a wild P&L leg) and
+    returns the count flagged."""
+    n_suspect = 0
+    for q in quotes.values():
+        prev = q.get("prev_close") or 0.0
+        if prev and abs(q.get("last", prev) / prev - 1.0) > 0.40:
+            q["suspect"] = True
+            n_suspect += 1
+    return n_suspect
+
+
 def collect_intraday(
     *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
     intraday_source: IntradaySource | None = None, force: bool = False,
     now: datetime | None = None,
 ) -> dict:
-    """Write the intraday-quotes artifact for Metron's held universe (config#1023 —
-    the 15-minute Today-view feed, consumed by metron-ops#23):
+    """Write the intraday-quotes artifact for Metron's held universe + the major-index
+    proxies (config#1023 — the 15-minute Today-view feed + the Overview markets strip,
+    consumed by metron-ops#23):
 
         market_data/intraday/latest.json
             {schema_version, as_of_utc, source: "yfinance_delayed",
-             quotes: {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
+             quotes:  {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
+             indices: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
 
     ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading
     box (infrastructure/systemd/metron-intraday.timer), double-gated: the NYSE
     session window (exchange calendar incl. half-days) AND the Metron UI heartbeat
     (``metron_app_active``) — quotes are fetched only while the market is open AND
     the app is actually being used. Outside either gate it returns ``skipped``
-    without fetching (``force`` overrides both, for manual runs). A quote moving
-    >40% vs prior close carries ``suspect: true`` (flagged, never dropped). Single
+    without fetching (``force`` overrides both, for manual runs). The major-index ETF
+    proxies (``INDEX_PROXY_SYMBOLS``) are market context — fetched every run regardless
+    of the held universe, so a brand-new account still gets the markets strip. A quote
+    moving >40% vs prior close carries ``suspect: true`` (flagged, never dropped). Single
     ``latest.json`` key — consumers see staleness via ``as_of_utc``. Injectable
     source/S3 for tests."""
     if not force and not in_us_market_window(now):
@@ -881,21 +907,21 @@ def collect_intraday(
         s3_client = boto3.client("s3")
     if not force and not metron_app_active(bucket, s3_client, now):
         return {"status": "skipped", "reason": "metron app inactive (no fresh UI heartbeat)"}
+    fetch = intraday_source or _yfinance_intraday
+
+    # Held-universe quotes (may be empty — a brand-new account still gets the index strip).
     holdings, _ = load_metron_universe(bucket, s3_client)
-    if not holdings:
-        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
-    quotes = (intraday_source or _yfinance_intraday)(sorted(ccy_by_yf))
-    n_suspect = 0
+    quotes = fetch(sorted(ccy_by_yf)) if ccy_by_yf else {}
     for sym, q in quotes.items():
         q["currency"] = ccy_by_yf.get(sym, "USD")
-        # Sanity flag — a >40% jump vs prior close is almost always a bad scrape or
-        # an unadjusted corporate action, not a real move. Flag, never drop/clamp
-        # (no fabrication): the consumer renders a warning instead of a wild P&L leg.
-        prev = q.get("prev_close") or 0.0
-        if prev and abs(q.get("last", prev) / prev - 1.0) > 0.40:
-            q["suspect"] = True
-            n_suspect += 1
+
+    # Major-index ETF proxies — market context, always fetched (independent of holdings).
+    indices = fetch(list(INDEX_PROXY_SYMBOLS))
+    for q in indices.values():
+        q["currency"] = BASE_CURRENCY
+
+    n_suspect = _flag_suspect_quotes(quotes) + _flag_suspect_quotes(indices)
     if n_suspect:
         logger.warning("[metron_market_data] %d intraday quote(s) flagged suspect (>40%% vs prev close)", n_suspect)
     artifact = {
@@ -903,17 +929,19 @@ def collect_intraday(
         "as_of_utc": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": "yfinance_delayed",
         "quotes": dict(sorted(quotes.items())),
+        "indices": dict(sorted(indices.items())),
     }
     if dry_run:
-        logger.info("[metron_market_data] DRY-RUN intraday: %d quotes (not written)", len(quotes))
-        return {"status": "ok_dry_run", "quotes": len(quotes)}
+        logger.info("[metron_market_data] DRY-RUN intraday: %d quotes, %d indices (not written)",
+                    len(quotes), len(indices))
+        return {"status": "ok_dry_run", "quotes": len(quotes), "indices": len(indices)}
     try:
         _write_json(s3_client, bucket, f"{INTRADAY_PREFIX}latest.json", artifact)
     except Exception as e:  # fail loud — the timer unit's journal + freshness scan record it
         logger.error("[metron_market_data] intraday write failed: %s", e)
         return {"status": "error", "error": str(e)}
-    logger.info("[metron_market_data] wrote %d intraday quotes", len(quotes))
-    return {"status": "ok", "universe": len(holdings), "quotes": len(quotes)}
+    logger.info("[metron_market_data] wrote %d intraday quotes + %d indices", len(quotes), len(indices))
+    return {"status": "ok", "universe": len(holdings), "quotes": len(quotes), "indices": len(indices)}
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -241,6 +241,23 @@ class TestIntraday:
         "1299.HK": {"last": 64.8, "open": 64.1, "prev_close": 64.2,
                     "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
     }
+    _INDEX_QUOTES = {
+        "SPY": {"last": 605.2, "open": 603.0, "prev_close": 602.4,
+                "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+        "QQQ": {"last": 540.1, "open": 538.5, "prev_close": 537.0,
+                "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+        "IWM": {"last": 215.3, "open": 216.0, "prev_close": 216.5,
+                "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+    }
+
+    @staticmethod
+    def _stub(*maps):
+        """An input-aware intraday source: returns only the requested symbols it knows
+        (mirrors the real fetcher, which is called separately for held + index symbols)."""
+        merged: dict[str, dict] = {}
+        for m in maps:
+            merged.update(m)
+        return lambda syms: {s: dict(merged[s]) for s in syms if s in merged}
 
     # Friday 2026-06-12 15:00 UTC = 11:00 ET — mid-session (EDT).
     _RTH = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)
@@ -255,27 +272,42 @@ class TestIntraday:
     def test_writes_quotes_with_currency_when_open_and_app_active(self):
         s3 = self._s3()
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=lambda s: {k: dict(v) for k, v in self._QUOTES.items()},
+            bucket="b", s3_client=s3, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
             now=self._RTH,
         )
-        assert result["status"] == "ok" and result["quotes"] == 2
+        assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 3
         puts = _puts(s3)
         assert set(puts) == {"market_data/intraday/latest.json"}
         art = puts["market_data/intraday/latest.json"]
-        assert art["schema_version"] == mmd.INTRADAY_SCHEMA_VERSION
+        assert art["schema_version"] == mmd.INTRADAY_SCHEMA_VERSION == 2
         assert art["source"] == "yfinance_delayed"
         assert art["as_of_utc"] == "2026-06-12T15:00:00Z"
         # Currency joined from the universe (the consumer FX-converts the P&L legs).
         assert art["quotes"]["1299.HK"]["currency"] == "HKD"
         # Normal moves carry no suspect flag.
         assert "suspect" not in art["quotes"]["AAPL"]
+        # Index proxies land under `indices` (USD), same per-symbol shape as quotes.
+        assert set(art["indices"]) == set(mmd.INDEX_PROXY_SYMBOLS)
+        assert art["indices"]["SPY"]["currency"] == "USD"
+        assert art["indices"]["SPY"]["last"] == 605.2 and art["indices"]["SPY"]["prev_close"] == 602.4
+
+    def test_index_proxies_fetched_even_with_empty_universe(self):
+        """The markets strip is market context — published even when nothing is held."""
+        empty = self._s3(universe={"holdings": [], "currencies": []})
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=empty, intraday_source=self._stub(self._INDEX_QUOTES), now=self._RTH,
+        )
+        assert result["status"] == "ok" and result["quotes"] == 0 and result["indices"] == 3
+        art = _puts(empty)["market_data/intraday/latest.json"]
+        assert art["quotes"] == {}
+        assert set(art["indices"]) == set(mmd.INDEX_PROXY_SYMBOLS)
 
     def test_suspect_flag_on_extreme_move_never_dropped(self):
         s3 = self._s3()
         quotes = {"AAPL": {"last": 350.0, "open": 200.5, "prev_close": 201.5,
                            "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=lambda s: quotes, now=self._RTH
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
         )
         assert result["status"] == "ok"
         art = _puts(s3)["market_data/intraday/latest.json"]
@@ -299,7 +331,7 @@ class TestIntraday:
         # force bypasses BOTH gates (manual/debug runs).
         forced = mmd.collect_intraday(
             bucket="b", s3_client=self._s3(heartbeat_offset_s=None),
-            intraday_source=lambda s: {k: dict(v) for k, v in self._QUOTES.items()},
+            intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
             now=self._RTH, force=True,
         )
         assert forced["status"] == "ok"
@@ -335,13 +367,11 @@ class TestIntraday:
         assert mmd.in_us_market_window(mk(2026, 11, 27, 18, 5))
         assert not mmd.in_us_market_window(mk(2026, 11, 27, 19, 0))  # old heuristic said open
 
-    def test_intraday_dry_run_and_empty_universe(self):
+    def test_intraday_dry_run_writes_nothing(self):
         s3 = self._s3()
         result = mmd.collect_intraday(
             bucket="b", s3_client=s3, dry_run=True,
-            intraday_source=lambda s: {k: dict(v) for k, v in self._QUOTES.items()}, now=self._RTH,
+            intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES), now=self._RTH,
         )
-        assert result["status"] == "ok_dry_run"
+        assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 3
         assert not s3.put_object.called
-        empty = self._s3(universe={"holdings": [], "currencies": []})
-        assert mmd.collect_intraday(bucket="b", s3_client=empty, now=self._RTH)["status"] == "skipped"
