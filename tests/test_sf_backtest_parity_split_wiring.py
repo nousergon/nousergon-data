@@ -230,6 +230,8 @@ class TestChainOrdering:
                 name is None
                 or name.startswith("Extract")
                 or name.endswith("Wait")
+                or name.endswith("RetryGate")
+                or name.endswith("Reissue")
                 or name in ("HandleFailure", "FailExecution")
             )
 

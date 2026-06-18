@@ -200,11 +200,24 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "States.TaskFailed"
+            "States.TaskFailed",
+            "States.Timeout"
           ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -275,12 +288,33 @@
           "Next": "MorningEnrichWait"
         }
       ],
-      "Default": "ExtractMorningEnrichError"
+      "Default": "MorningEnrichRetryGate"
     },
     "MorningEnrichWait": {
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForMorningEnrich"
+    },
+    "MorningEnrichRetryGate": {
+      "Type": "Choice",
+      "Comment": "SOTA bounded auto-retry (config#1059): re-issue MorningEnrich ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.morning_enrich_attempts", "IsPresent": true },
+            { "Variable": "$.morning_enrich_attempts", "NumericGreaterThanEquals": 1 }
+          ],
+          "Next": "ExtractMorningEnrichError"
+        }
+      ],
+      "Default": "MorningEnrichReissue"
+    },
+    "MorningEnrichReissue": {
+      "Type": "Pass",
+      "Comment": "Mark one re-issue consumed (morning_enrich_attempts=1) and loop back to MorningEnrich.",
+      "Result": 1,
+      "ResultPath": "$.morning_enrich_attempts",
+      "Next": "MorningEnrich"
     },
     "CheckSkipDataPhase1": {
       "Type": "Choice",
@@ -321,11 +355,24 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "States.TaskFailed"
+            "States.TaskFailed",
+            "States.Timeout"
           ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -396,12 +443,33 @@
           "Next": "DataPhase1Wait"
         }
       ],
-      "Default": "ExtractDataPhase1Error"
+      "Default": "DataPhase1RetryGate"
     },
     "DataPhase1Wait": {
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDataPhase1"
+    },
+    "DataPhase1RetryGate": {
+      "Type": "Choice",
+      "Comment": "SOTA bounded auto-retry (config#1059): a polled non-Success SSM status on this idempotent batch step is retriable, not terminal. Re-issue DataPhase1 ONCE on the same always-on instance ($.ec2_instance_id) before giving up — re-running is safe (the data job overwrites the same run_date S3 keys). Absent counter => first failure => re-issue; counter present (=1) => second failure => give up to ExtractDataPhase1Error. Keeps the scheduled execution alive through a transient blip so it succeeds first-pass (moves unattended_first_pass_rate).",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.data_phase1_attempts", "IsPresent": true },
+            { "Variable": "$.data_phase1_attempts", "NumericGreaterThanEquals": 1 }
+          ],
+          "Next": "ExtractDataPhase1Error"
+        }
+      ],
+      "Default": "DataPhase1Reissue"
+    },
+    "DataPhase1Reissue": {
+      "Type": "Pass",
+      "Comment": "Mark one re-issue consumed (data_phase1_attempts=1) and loop back to DataPhase1 for an idempotent re-run.",
+      "Result": 1,
+      "ResultPath": "$.data_phase1_attempts",
+      "Next": "DataPhase1"
     },
     "Scanner": {
       "Type": "Task",
@@ -478,11 +546,24 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "States.TaskFailed"
+            "States.TaskFailed",
+            "States.Timeout"
           ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -553,12 +634,33 @@
           "Next": "RAGIngestionWait"
         }
       ],
-      "Default": "ExtractRAGIngestionError"
+      "Default": "RAGIngestionRetryGate"
     },
     "RAGIngestionWait": {
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForRAGIngestion"
+    },
+    "RAGIngestionRetryGate": {
+      "Type": "Choice",
+      "Comment": "SOTA bounded auto-retry (config#1059): re-issue RAGIngestion ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.rag_ingestion_attempts", "IsPresent": true },
+            { "Variable": "$.rag_ingestion_attempts", "NumericGreaterThanEquals": 1 }
+          ],
+          "Next": "ExtractRAGIngestionError"
+        }
+      ],
+      "Default": "RAGIngestionReissue"
+    },
+    "RAGIngestionReissue": {
+      "Type": "Pass",
+      "Comment": "Mark one re-issue consumed (rag_ingestion_attempts=1) and loop back to RAGIngestion.",
+      "Result": 1,
+      "ResultPath": "$.rag_ingestion_attempts",
+      "Next": "RAGIngestion"
     },
     "CheckSkipRegimeSubstrate": {
       "Type": "Choice",

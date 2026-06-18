@@ -56,6 +56,8 @@ class TestQuartetPresence:
             "CheckMorningEnrichStatus",
             "MorningEnrichWait",
             "ExtractMorningEnrichError",
+            "MorningEnrichRetryGate",
+            "MorningEnrichReissue",
         ],
     )
     def test_state_exists(self, states, name):
@@ -136,11 +138,34 @@ class TestChainOrdering:
         assert nexts["Pending"] == "MorningEnrichWait"
         assert states["MorningEnrichWait"]["Next"] == "WaitForMorningEnrich"
 
-    def test_status_default_extracts_error(self, states):
+    def test_status_default_routes_through_bounded_retry_to_error(self, states):
+        """A non-Success poll status now routes through the bounded
+        auto-retry gate (config#1059) before terminating at the error
+        path: one idempotent re-issue, then ExtractMorningEnrichError on
+        give-up. Keeps the scheduled run alive through a transient blip
+        so it succeeds first-pass (moves unattended_first_pass_rate)."""
         assert (
             states["CheckMorningEnrichStatus"]["Default"]
-            == "ExtractMorningEnrichError"
+            == "MorningEnrichRetryGate"
         )
+        gate = states["MorningEnrichRetryGate"]
+        # Give-up path: counter already consumed -> terminate at error.
+        give_up = [
+            c["Next"] for c in gate["Choices"]
+            if c["Next"] == "ExtractMorningEnrichError"
+        ]
+        assert give_up == ["ExtractMorningEnrichError"], (
+            "bounded-retry gate must still terminate at "
+            "ExtractMorningEnrichError once the re-issue budget is spent"
+        )
+        # First-failure path: re-issue once, looping back to the step.
+        assert gate["Default"] == "MorningEnrichReissue"
+        reissue = states["MorningEnrichReissue"]
+        assert reissue["Next"] == "MorningEnrich", (
+            "re-issue must loop back to the MorningEnrich step for an "
+            "idempotent re-run"
+        )
+        assert reissue["ResultPath"] == "$.morning_enrich_attempts"
 
     def test_morning_enrich_is_reachable_before_data_phase1(self, sf, states):
         """Walk the HAPPY path from StartAt (skip-gates take Default = run
