@@ -168,6 +168,7 @@ parity.
 | `payout_ratio` | 0–2 clipped ratio | TTM dividends / net income | predictor |
 | `dividend_yield` | decimal pct (bare-named convention) | indicated annual dividend yield | predictor |
 | `capex_growth_5y` | decimal pct (bare-named convention) | 5y CAPEX growth | predictor |
+| `market_cap_raw` | raw market cap, absolute units (`_raw` suffix) | Finnhub `marketCapitalization`, un-clipped / un-normalized; base input to the Barra SIZE loading `size_zscore` (scale-invariant) | predictor; research (Barra SIZE loading source for score-neutralization, config#1142); executor risk-model (potential consumer) |
 
 ### Factor loadings (cross-sectional, daily refresh)
 
@@ -191,6 +192,7 @@ outlier ticker cannot dominate the downstream factor-return regression
 | `dist_from_52w_high_zscore` | z-score | Cross-sectional z of `dist_from_52w_high`, ±3σ winsorized | executor (proximity-to-high / reversal-risk loading, C.3) |
 | `pe_ratio_zscore` | z-score | Cross-sectional z of `pe_ratio`, ±3σ winsorized | executor (Barra VALUE proxy via 1/PE direction, C.3) |
 | `roe_zscore` | z-score | Cross-sectional z of `roe`, ±3σ winsorized | executor (Barra QUALITY — profitability loading, C.3) |
+| `size_zscore` | z-score | Cross-sectional z of `log(market_cap_raw)`, ±3σ winsorized (log pre-transform; non-positive cap → NaN, excluded) | research (Barra SIZE loading for momentum+beta+size score-neutralization, config#1142); executor risk-model (Barra SIZE — potential C.3 consumer) |
 
 ---
 

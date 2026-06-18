@@ -128,8 +128,13 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("payout_ratio", "fundamental", "TTM dividends / net income (0-2 clipped); Stewardship pillar input — retention rate = 1 - payout drives reinvestment", source="fmp", refresh="quarterly"),
     FeatureEntry("dividend_yield", "fundamental", "Indicated annual dividend yield (decimal, 0-0.2 clipped); Stewardship pillar input", source="fmp", refresh="quarterly"),
     FeatureEntry("capex_growth_5y", "fundamental", "5-year CAPEX growth (decimal); Stewardship pillar input — reinvestment intensity proxy", source="fmp", refresh="quarterly"),
+    # SIZE pillar substrate (config#1142) — raw market cap, absolute units
+    # (the _raw suffix encodes absolute / un-normalized units). Surfaced from
+    # Finnhub's already-fetched marketCapitalization; UN-clipped/UN-normalized.
+    # Base input to the Barra SIZE loading (size_zscore); scale-invariant.
+    FeatureEntry("market_cap_raw", "fundamental", "Raw market capitalization (absolute units, un-normalized) surfaced from Finnhub marketCapitalization. Base input to the Barra SIZE factor loading (size_zscore).", source="finnhub", refresh="quarterly"),
 
-    # ── Factor loadings (8) — C.1 of optimizer-sota-upgrades-260526 ──────────
+    # ── Factor loadings (9) — C.1 of optimizer-sota-upgrades-260526 ──────────
     # Cross-sectional ±3σ-winsorized z-scores of canonical Barra-style factors.
     # Columns of the factor-loading matrix B for the executor's Σ = B·F·Bᵀ + D
     # risk decomposition (workstream C.3). Computed POST-assembly in
@@ -142,6 +147,7 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("dist_from_52w_high_zscore", "factor_loading", "Cross-sectional z-score of dist_from_52w_high (winsorized ±3σ). Proximity-to-high / reversal-risk loading.", source="derived", refresh="daily"),
     FeatureEntry("pe_ratio_zscore", "factor_loading", "Cross-sectional z-score of pe_ratio (winsorized ±3σ). Barra VALUE loading (proxy via 1/PE direction).", source="derived", refresh="daily"),
     FeatureEntry("roe_zscore", "factor_loading", "Cross-sectional z-score of roe (winsorized ±3σ). Barra QUALITY / profitability loading.", source="derived", refresh="daily"),
+    FeatureEntry("size_zscore", "factor_loading", "Cross-sectional z-score of log(market_cap_raw) (winsorized ±3σ). Barra SIZE loading (config#1142) — completes the institutional Barra factor set.", source="derived", refresh="daily"),
 ]
 
 # Quick lookup by name

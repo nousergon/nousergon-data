@@ -181,6 +181,11 @@ FEATURES = [
     "payout_ratio",
     "dividend_yield",
     "capex_growth_5y",
+    # SIZE pillar substrate (config#1142) — raw market cap in USD. The base
+    # input to the Barra SIZE loading (size_zscore below); itself a feature
+    # column so it lands in the cross-sectional panel apply_factor_zscores
+    # reads. Persisted from Finnhub's already-fetched marketCapitalization.
+    "market_cap_raw",
     # v3.1 additions — longer-horizon + overnight/intraday decomposition +
     # reversal-native signals. Predictor ROADMAP P2: collapse FLAT +
     # test whether 5d is reversal or momentum regime. 2026-04-15: neutral
@@ -234,6 +239,11 @@ FEATURES = [
     "dist_from_52w_high_zscore",
     "pe_ratio_zscore",
     "roe_zscore",
+    # SIZE (config#1142) — completes the institutional Barra factor set.
+    # Cross-sectional ±3σ-winsorized z-score of log(market_cap_raw),
+    # emitted by apply_factor_zscores (log pre-transform registered in
+    # cross_sectional.FACTOR_LOADING_TRANSFORMS). Barra SIZE loading.
+    "size_zscore",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer
@@ -795,6 +805,8 @@ def compute_features(
         df["payout_ratio"] = _safe_float(fundamental_data.get("payout_ratio"), 0.0)
         df["dividend_yield"] = _safe_float(fundamental_data.get("dividend_yield"), 0.0)
         df["capex_growth_5y"] = _safe_float(fundamental_data.get("capex_growth_5y"), 0.0)
+        # SIZE pillar substrate (config#1142) — raw market cap in USD.
+        df["market_cap_raw"] = _safe_float(fundamental_data.get("market_cap_raw"), 0.0)
     else:
         df["pe_ratio"] = 0.0
         df["pb_ratio"] = 0.0
@@ -809,6 +821,8 @@ def compute_features(
         df["payout_ratio"] = 0.0
         df["dividend_yield"] = 0.0
         df["capex_growth_5y"] = 0.0
+        # SIZE pillar substrate (config#1142) — 0.0 -> log() guard -> size NaN.
+        df["market_cap_raw"] = 0.0
 
     # Rows with NaN features are NOT dropped — see module docstring. A
     # feature whose rolling-window warmup exceeds the available history

@@ -93,7 +93,7 @@ class TestWinsorizeAndZscore:
 
 class TestApplyFactorZscores:
     def _baseline_panel(self):
-        """Synthetic cross-sectional panel with 50 tickers and all 8
+        """Synthetic cross-sectional panel with 50 tickers and all 9
         source columns populated. Each column has a distinct scale to
         verify standardization handles heterogeneous units."""
         rng = np.random.default_rng(7)
@@ -107,6 +107,10 @@ class TestApplyFactorZscores:
             "dist_from_52w_high":  rng.uniform(-0.30, 0.0, 50),
             "pe_ratio":            rng.lognormal(3.0, 0.3, 50),
             "roe":                 rng.normal(0.12, 0.08, 50),
+            # SIZE (config#1142): raw market cap in USD, fat-right-tailed
+            # (lognormal — realistic $1B–$2T cross-section). The size_zscore
+            # loading log-transforms this before z-scoring.
+            "market_cap_raw":      rng.lognormal(24.0, 1.5, 50),
         })
 
     def test_emits_all_eight_factor_loading_columns(self):
@@ -172,14 +176,16 @@ class TestApplyFactorZscores:
         # Default emit not invoked
         assert "momentum_20d_zscore" not in out.columns
 
-    def test_default_source_map_matches_eight_canonical_factors(self):
-        """The default factor set is the v1 canonical Barra-style loading
-        matrix. Adding a 9th factor here also requires CATALOG + SCHEMA.md
-        updates — keep this test as the chokepoint."""
-        assert len(FACTOR_LOADING_SOURCES) == 8
+    def test_default_source_map_matches_canonical_barra_factors(self):
+        """The default factor set is the canonical institutional Barra-style
+        loading matrix. SIZE (config#1142) completes the set at 9 factors.
+        Adding a 10th factor here also requires CATALOG + SCHEMA.md updates —
+        keep this test as the chokepoint."""
+        assert len(FACTOR_LOADING_SOURCES) == 9
         expected_sources = {
             "momentum_20d", "return_60d", "beta_60d", "idio_vol_60d",
             "realized_vol_63d", "dist_from_52w_high", "pe_ratio", "roe",
+            "market_cap_raw",
         }
         assert set(FACTOR_LOADING_SOURCES.keys()) == expected_sources
 
@@ -215,6 +221,72 @@ class TestApplyFactorZscores:
                 f"Column {dst} has z-score outside ±4.5σ after winsorization: "
                 f"max={float(z.abs().max()):.4f}"
             )
+
+
+class TestSizeLoading:
+    """SIZE Barra loading (config#1142) — z-score of log(market_cap_raw).
+
+    The SIZE factor is unique in the set: it applies a log PRE-transform
+    before winsorize+z-score (raw market cap is fat-right-tailed; Barra
+    SIZE is canonically z(log(mktcap))). These tests pin (a) the log is
+    actually applied, (b) non-positive caps are excluded (fail-soft), and
+    (c) the emitted loading is a finite, centered z-score on real data.
+    """
+
+    def _cap_panel(self, n: int = 60):
+        rng = np.random.default_rng(11)
+        # Realistic market caps spanning small ($300M) to mega ($2T).
+        caps = rng.lognormal(mean=24.0, sigma=1.8, size=n)
+        return pd.DataFrame({
+            "ticker": [f"T{i:02d}" for i in range(n)],
+            "market_cap_raw": caps,
+        })
+
+    def test_size_zscore_emitted(self):
+        out = apply_factor_zscores(self._cap_panel())
+        assert "size_zscore" in out.columns
+
+    def test_size_zscore_is_finite_centered_unit_std(self):
+        out = apply_factor_zscores(self._cap_panel())
+        z = out["size_zscore"].dropna()
+        assert len(z) > 0
+        assert np.isfinite(z).all(), "size_zscore must be finite on positive caps"
+        assert abs(float(z.mean())) < 0.05
+        assert abs(float(z.std(ddof=0)) - 1.0) < 0.1
+
+    def test_size_uses_log_transform_not_raw(self):
+        """The loading must z-score LOG(mktcap), not raw mktcap. Proof: a
+        mega-cap outlier (10× the next-largest) on the RAW scale would, after
+        winsorization, sit at the clip bound; on the LOG scale it is far
+        closer to the bulk. So z(log) and z(raw) differ materially — the
+        emitted column must match z(log)."""
+        from features.cross_sectional import _log_positive, _winsorize_and_zscore
+        df = self._cap_panel()
+        out = apply_factor_zscores(df)
+        expected = _winsorize_and_zscore(_log_positive(df["market_cap_raw"]))
+        pd.testing.assert_series_equal(
+            out["size_zscore"], expected, check_names=False,
+        )
+        # And it must NOT equal the raw (no-transform) z-score.
+        raw_z = _winsorize_and_zscore(df["market_cap_raw"].astype(float))
+        assert not np.allclose(
+            out["size_zscore"].to_numpy(), raw_z.to_numpy(), equal_nan=True,
+        ), "size_zscore appears to skip the log pre-transform"
+
+    def test_non_positive_cap_excluded_not_raised(self):
+        """A 0.0 / negative market cap (collector NEUTRAL default for a
+        capless ticker) must map to NaN (excluded), never raise, never
+        produce -inf from log(0)."""
+        df = self._cap_panel(n=40)
+        df.loc[0, "market_cap_raw"] = 0.0        # NEUTRAL default
+        df.loc[1, "market_cap_raw"] = -5.0       # pathological negative
+        out = apply_factor_zscores(df)
+        z = out["size_zscore"]
+        assert pd.isna(z.iloc[0]), "zero cap must -> NaN (excluded)"
+        assert pd.isna(z.iloc[1]), "negative cap must -> NaN (excluded)"
+        # The rest are finite and the column never contains ±inf.
+        assert np.isfinite(z.iloc[2:]).all()
+        assert not np.isinf(z.to_numpy()).any()
 
 
 class TestFactorLoadingsRegisteredInSchema:
