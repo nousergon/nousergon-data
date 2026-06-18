@@ -74,6 +74,8 @@
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/postmarket-data.log \"s3://alpha-engine-research/_ssm_logs/postmarket-data/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python weekly_collector.py --daily --skip-arctic-append 2>&1 | tee /var/log/postmarket-data.log"
@@ -186,6 +188,8 @@
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/postmarket-arctic-append.log \"s3://alpha-engine-research/_ssm_logs/postmarket-arctic-append/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python weekly_collector.py --daily-arctic-append 2>&1 | tee /var/log/postmarket-arctic-append.log"
@@ -276,6 +280,8 @@
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/snapshot.log \"s3://alpha-engine-research/_ssm_logs/snapshot/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/snapshot_capturer.py 2>&1 | tee /var/log/snapshot.log"
@@ -374,6 +380,8 @@
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/eod.log \"s3://alpha-engine-research/_ssm_logs/eod/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/eod_reconcile.py 2>&1 | tee /var/log/eod.log"
