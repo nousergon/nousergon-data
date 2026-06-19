@@ -193,6 +193,34 @@ class TestMacro:
         s3.put_object.assert_not_called()
         assert mmd.collect_macro(bucket="b", s3_client=s3, macro_source=lambda ids: {})["status"] == "skipped"
 
+    def test_macro_publishes_next_release_and_events(self):
+        # v2 (metron-ops#49): next_release per series + the macro event calendar, via an
+        # injected release_source (no FRED network in tests).
+        s3 = _universe_s3(_UNIVERSE)
+        macro_src = lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)], "UNRATE": [("2026-05-01", 4.1)]}
+        rel_src = lambda ids, run_date: (
+            {"FEDFUNDS": "2026-07-29", "UNRATE": "2026-07-02"},
+            [{"date": "2026-07-02", "kind": "release", "series_id": "UNRATE", "label": "Employment Situation"},
+             {"date": "2026-07-29", "kind": "fomc", "series_id": "FOMC", "label": "FOMC Meeting"}],
+        )
+        result = mmd.collect_macro(
+            bucket="b", run_date="2026-06-11", s3_client=s3, macro_source=macro_src, release_source=rel_src
+        )
+        assert result["status"] == "ok" and result["next_release"] == 2 and result["release_events"] == 2
+        art = _puts(s3)["market_data/macro/latest.json"]
+        assert art["schema_version"] == 2
+        assert art["next_release"] == {"FEDFUNDS": "2026-07-29", "UNRATE": "2026-07-02"}
+        assert art["release_events"][0]["kind"] == "release" and art["release_events"][1]["kind"] == "fomc"
+
+    def test_macro_without_release_source_defaults_empty(self):
+        # Injected macro_source but no release_source + no api_key → release fields empty,
+        # series artifact still written (best-effort calendar never blocks the primary data).
+        s3 = _universe_s3(_UNIVERSE)
+        mmd.collect_macro(bucket="b", run_date="2026-06-11", s3_client=s3,
+                          macro_source=lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)]})
+        art = _puts(s3)["market_data/macro/latest.json"]
+        assert art["next_release"] == {} and art["release_events"] == []
+
 
 class TestReference:
     def test_writes_sectors_and_earnings_keyed_by_yf_symbol(self):

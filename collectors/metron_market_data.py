@@ -103,7 +103,7 @@ CLOSE_HISTORY_SCHEMA_VERSION = 1
 FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 1
 EARNINGS_SCHEMA_VERSION = 1
-MACRO_SCHEMA_VERSION = 1
+MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
 FUNDAMENTALS_SCHEMA_VERSION = 1
 INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
 BASE_CURRENCY = "USD"
@@ -697,14 +697,21 @@ def collect_reference(
 def collect_macro(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None, api_key: str | None = None, macro_source: MacroSource | None = None,
+    release_source: Callable[[list[str], str], tuple[dict, list]] | None = None,
 ) -> dict:
     """Write the macro-indicator artifact for Metron's Macro page — Metron's LAST direct
     external fetch (FRED) moved to the spine:
 
-        market_data/macro/latest.json   {schema_version, as_of, series: {series_id: [[date, value], …]}}
+        market_data/macro/latest.json
+            {schema_version, as_of, series: {series_id: [[date, value], …]},
+             next_release: {series_id: "YYYY-MM-DD"},
+             release_events: [{date, kind, series_id, label}, …]}
 
-    Fetches the 7 FRED series Metron renders as ~2y observation history. Injectable
-    source/S3 for tests; FRED key from ``alpha_engine_lib.secrets`` when not injected."""
+    Fetches the 7 FRED series Metron renders as ~2y observation history, plus (v2) each
+    series' next scheduled release date and the forward macro event calendar (FOMC +
+    curated CPI/employment/claims releases) for the Macro "Next expected" column + the
+    Calendar page (metron-ops#49/#13). Injectable source(s)/S3 for tests; FRED key from
+    ``alpha_engine_lib.secrets`` when not injected."""
     run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if s3_client is None:
         import boto3
@@ -718,8 +725,22 @@ def collect_macro(
         series = macro_source(METRON_MACRO_SERIES)
     if not series:
         return {"status": "skipped", "reason": "no macro series (FRED key unset or fetch failed)"}
+    # v2: next-release dates + the macro event calendar. Best-effort — a FRED hiccup leaves
+    # them empty (the consumer degrades to "next-release not wired") and never costs the
+    # series artifact, which is the primary deliverable.
+    next_release: dict[str, str] = {}
+    release_events: list[dict] = []
+    if release_source is not None:
+        next_release, release_events = release_source(METRON_MACRO_SERIES, run_date)
+    elif api_key:
+        try:
+            next_release, release_events = _fred_macro_releases(METRON_MACRO_SERIES, api_key, run_date)
+        except Exception as e:  # noqa: BLE001 - secondary calendar data; never fail the series artifact
+            logger.warning("[metron_market_data] macro release info failed (non-fatal): %s", e)
     artifact = {"schema_version": MACRO_SCHEMA_VERSION, "as_of": run_date,
-                "series": {sid: [list(p) for p in obs] for sid, obs in sorted(series.items())}}
+                "series": {sid: [list(p) for p in obs] for sid, obs in sorted(series.items())},
+                "next_release": dict(sorted(next_release.items())),
+                "release_events": release_events}
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN macro: %d series (not written)", len(series))
         return {"status": "ok_dry_run", "series": len(series)}
@@ -728,8 +749,45 @@ def collect_macro(
     except Exception as e:  # fail loud
         logger.error("[metron_market_data] macro write failed: %s", e)
         return {"status": "error", "error": str(e)}
-    logger.info("[metron_market_data] wrote %d macro series", len(series))
-    return {"status": "ok", "series": len(series)}
+    logger.info("[metron_market_data] wrote %d macro series, %d next-release, %d events",
+                len(series), len(next_release), len(release_events))
+    return {"status": "ok", "series": len(series),
+            "next_release": len(next_release), "release_events": len(release_events)}
+
+
+def _fred_macro_releases(series_ids: list[str], api_key: str, run_date: str) -> tuple[dict, list]:
+    """``(next_release, release_events)`` for the Macro page — the next scheduled release
+    date per series (the "Next expected" column) + the forward macro event calendar (FOMC +
+    curated CPI/employment/claims releases for the Calendar page). Reuses the FRED
+    release-schedule helpers in ``collectors.macro``. Per-series failures are omitted (the
+    helpers already fail-soft); the whole call is best-effort at the caller."""
+    from datetime import date as _date
+
+    from collectors.macro import _fred_release_dates, _fred_release_id, build_release_calendar
+
+    next_release: dict[str, str] = {}
+    for sid in series_ids:
+        rel = _fred_release_id(sid, api_key)
+        if rel is None:
+            continue
+        future = sorted(d for d in _fred_release_dates(rel[0], api_key) if d >= run_date)
+        if future:
+            next_release[sid] = future[0]  # earliest scheduled date on/after run_date
+
+    try:
+        today = _date.fromisoformat(run_date)
+    except ValueError:
+        today = datetime.now(timezone.utc).date()
+    df = build_release_calendar(api_key, today)
+    events = (
+        []
+        if df.empty
+        else [
+            {"date": r["date"], "kind": r["kind"], "series_id": r["series_id"], "label": r["label"]}
+            for r in df.to_dict("records")
+        ]
+    )
+    return next_release, events
 
 
 def collect_fundamentals(
