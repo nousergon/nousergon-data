@@ -85,13 +85,22 @@ logger = logging.getLogger(__name__)
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    """Load config.yaml from config repo or local fallback."""
-    # Search config repo first, then local
-    search_paths = [
-        Path.home() / "alpha-engine-config" / "data" / "config.yaml",
-        Path(__file__).parent.parent / "alpha-engine-config" / "data" / "config.yaml",
-        Path(path),
+    """Load config.yaml, experiment-package first (config#1042).
+
+    Search order mirrors features/feature_engineer.py::_load_feature_cfg_overrides:
+    experiments/$ALPHA_ENGINE_EXPERIMENT_ID/data/config.yaml (default experiment
+    ``reference``) first, then the legacy top-level alpha-engine-config/data/config.yaml,
+    then the repo-local fallback (``path``). The experiment-package layer was already
+    live in feature_engineer; this closes the gap that file's docstring references.
+    """
+    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
+    roots = [
+        Path.home() / "alpha-engine-config",
+        Path(__file__).parent.parent / "alpha-engine-config",
     ]
+    search_paths = [r / "experiments" / exp / "data" / "config.yaml" for r in roots]
+    search_paths += [r / "data" / "config.yaml" for r in roots]
+    search_paths.append(Path(path))
     for p in search_paths:
         if p.exists():
             with open(p) as f:
