@@ -30,13 +30,13 @@ Entry point: ``python -m collectors.metron_market_data [--date YYYY-MM-DD] [--dr
 from __future__ import annotations
 
 import argparse
-import contextlib
-import functools
 import json
 import logging
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
+
+from collectors.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
 
 logger = logging.getLogger(__name__)
 
@@ -173,36 +173,23 @@ def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[
 
 
 # ── yfinance fetchers (default sources) ─────────────────────────────────────
+#
+# The yfinance log-noise chokepoint (quiet_yfinance / yf_quiet / log_yf_coverage)
+# lives in collectors/yfinance_quiet.py — an in-repo single source of truth since
+# the same bug class recurred through collectors/prices.py (2026-06-19, config#1029
+# follow-up). The underscored names below are kept as thin backward-compat aliases
+# so existing call sites + tests read unchanged.
 
+_quiet_yfinance = quiet_yfinance
+_yf_quiet = yf_quiet
 
-@contextlib.contextmanager
-def _quiet_yfinance():
-    """Demote yfinance's internal logger to CRITICAL for the duration of a fetch.
-
-    yfinance logs its own ERROR record per failing symbol — ≥5 distinctly-worded
-    messages for ONE unpriceable ticker (quoteSummary 404, "possibly delisted"
-    in two forms, "1 Failed download:", per-period repeats). Flow Doctor keys
-    dedup on message text, so each line became its own report/email — the
-    2026-06-12 PCKM storm (config#1029). Failure recording is NOT lost: each
-    fetcher aggregates per-symbol coverage into one record per run via
-    ``_log_yf_coverage`` below, which is the named recording surface.
-    """
-    yf_logger = logging.getLogger("yfinance")
-    prior_level = yf_logger.level
-    yf_logger.setLevel(logging.CRITICAL)
-    try:
-        yield
-    finally:
-        yf_logger.setLevel(prior_level)
-
-
-def _yf_quiet(fn):
-    """Run a yfinance fetcher under ``_quiet_yfinance`` (see rationale there)."""
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _quiet_yfinance():
-            return fn(*args, **kwargs)
-    return wrapper
+# Metron-specific coverage context: many holdings are non-listed instruments
+# (e.g. 401(k) CITs) yfinance can never price — they're broker-snapshot-priced
+# and belong out of the published universe (config#1029).
+_METRON_COVERAGE_NOTE = (
+    "non-listed instruments (e.g. 401(k) CITs) are broker-snapshot-priced in "
+    "Metron and belong out of the published universe (config#1029)"
+)
 
 
 def _log_yf_coverage(
@@ -212,29 +199,10 @@ def _log_yf_coverage(
     *,
     error_on_empty: bool = False,
 ) -> None:
-    """One aggregated coverage record per artifact per run (config#1029).
-
-    Replaces yfinance's per-symbol ERROR spray (demoted by ``_quiet_yfinance``):
-    symbols with no data are reported as a SINGLE WARN naming them all. A full
-    miss on a non-empty request escalates to ERROR only where the caller says
-    the artifact is load-bearing (``error_on_empty`` — closes), so a Yahoo
-    outage surfaces once, loudly, instead of once per artifact per symbol.
-    """
-    missing = sorted(set(requested) - set(covered))
-    if not missing:
-        return
-    if error_on_empty and not covered:
-        logger.error(
-            "[metron_market_data] %s: yfinance returned NO data for any of %d requested "
-            "symbols (%s) — full-miss on a load-bearing artifact (provider outage?)",
-            kind, len(missing), ", ".join(missing),
-        )
-        return
-    logger.warning(
-        "[metron_market_data] %s: no yfinance data for %d/%d symbols: %s — "
-        "non-listed instruments (e.g. 401(k) CITs) are broker-snapshot-priced "
-        "in Metron and belong out of the published universe (config#1029)",
-        kind, len(missing), len(requested), ", ".join(missing),
+    """Metron wrapper over :func:`yfinance_quiet.log_yf_coverage` (config#1029)."""
+    log_yf_coverage(
+        logger, kind, requested, covered,
+        error_on_empty=error_on_empty, note=_METRON_COVERAGE_NOTE,
     )
 
 
