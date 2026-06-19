@@ -29,6 +29,7 @@ import pandas as pd
 import yfinance as yf
 
 from builders._price_cache_writeboth import price_cache_write_prefixes
+from collectors.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ def _find_stale_fast(
     return stale
 
 
+@yf_quiet
 def _refresh_stale(
     s3,
     bucket: str,
@@ -166,7 +168,15 @@ def _refresh_stale(
     fetch_period: str,
     batch_size: int,
 ) -> tuple[int, list[str]]:
-    """Batch-fetch stale tickers from yfinance and upload to S3."""
+    """Batch-fetch stale tickers from yfinance and upload to S3.
+
+    Runs under ``yf_quiet`` (collectors/yfinance_quiet.py): yfinance's
+    per-symbol "possibly delisted" ERROR spray is demoted so one transient/
+    unpriceable ticker can't storm Flow Doctor with a report per worded
+    variant (the 2026-06-19 PCAR recurrence of the config#1029 PCKM storm).
+    The replacement recording surface is the aggregated ``log_yf_coverage``
+    record emitted before returning.
+    """
     import time
 
     logger.info("Refreshing %d stale tickers (period=%s) ...", len(stale), fetch_period)
@@ -242,4 +252,18 @@ def _refresh_stale(
             )
 
     logger.info("Price cache refresh complete: %d / %d tickers updated", refreshed, len(stale))
+
+    # Single aggregated record per run — the named recording surface that
+    # replaces yfinance's suppressed per-symbol ERROR spray. error_on_empty:
+    # the 10y price cache is load-bearing (GBM training reads it), so a total
+    # miss escalates to one loud ERROR (provider outage); a partial miss is one
+    # WARN naming the unpriceable tickers (transient/rate-limit this run, or
+    # persistent delisting/rename candidates for universe pruning).
+    covered = set(stale) - set(failed_tickers)
+    log_yf_coverage(
+        logger, "price_cache_refresh", stale, covered, error_on_empty=True,
+        note="stale tickers with no yfinance data this run — transient/rate-limit "
+             "misses retry next refresh; persistent misses are delisting/rename "
+             "candidates for universe pruning",
+    )
     return refreshed, failed_tickers
