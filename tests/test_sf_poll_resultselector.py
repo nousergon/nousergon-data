@@ -1,92 +1,104 @@
-"""Guards the ResultSelector that keeps SSM stdout out of SF state.
+"""Guards the ResultSelector that keeps SSM stdout out of Saturday-SF state.
 
-2026-06-06 — the Saturday SF FAILED with
-``States.DataLimitExceeded``-class error: ``ResearchPredictorParallel
-returned a result with a size exceeding the maximum number of bytes``
-(256 KB). Root cause: the three ``WaitFor{DataPhase1,RAGIngestion,
-MorningEnrich}`` getCommandInvocation tasks stored their *entire*
-invocation result — including the ~24 KB ``StandardOutputContent`` SSM
-run-log — at ``$.data_phase1_poll`` / ``$.rag_ingestion_poll`` /
-``$.morning_enrich_poll``. Those ~80 KB of stdout rode in state through
-the whole pipeline and were then tripled by ``ResearchPredictorParallel``
-(``ResultPath: $.parallel_result`` keeps the original input AND appends
-the 2-branch array, each branch passing the full input through) → ~240 KB
-→ over the 256 KB limit → hard ExecutionFailed.
+2026-06-06 — the Saturday SF FAILED with ``States.DataLimitExceeded``:
+``ResearchPredictorParallel returned a result with a size exceeding the
+maximum number of bytes`` (256 KB). Root cause: the
+``WaitFor{DataPhase1,RAGIngestion,MorningEnrich}`` getCommandInvocation tasks
+stored their *entire* invocation result — including the ~24 KB
+``StandardOutputContent`` SSM run-log — in state; ``ResearchPredictorParallel``
+tripled it past 256 KB. Fix: those 3 got a ``ResultSelector`` dropping stdout.
 
-Fix: each WaitFor* task carries a ResultSelector that keeps only the
-small fields the Choice/error path needs (Status, ResponseCode,
-StatusDetails, StandardErrorContent) and drops StandardOutputContent.
-Full SSM stdout is already shipped to S3 (_ssm_logs/), so nothing is
-lost for diagnosis.
+2026-06-19 — **the same class recurred at ``WaitForEvaluator``**: the
+2026-06-06 fix (and the prior version of THIS test) covered only the 3 states
+in that incident's path, leaving the later Saturday poll states still dumping
+full stdout. The evaluator's large stdout blew the 256 KB limit and killed the
+run before ReportCard/Director/NotifyComplete.
 
-This test forbids a future edit from dropping the ResultSelector or
-re-admitting StandardOutputContent into state.
+This test now closes the class for the **Saturday SF**: it discovers EVERY
+``aws-sdk:ssm:getCommandInvocation`` poll state and requires each to carry a
+``ResultSelector`` that keeps ``Status`` and drops ``StandardOutputContent`` —
+UNLESS a downstream state legitimately reads ``$.<poll>.StandardOutputContent``
+(e.g. ``WaitResolveZoo``, whose stdout carries the resolved zoo spec list). Full
+SSM stdout is shipped to S3 (``_ssm_logs/``), so nothing is lost for diagnosis.
+
+Weekday + EOD SF poll states have different downstream field needs (EOD reads
+``.CommandId``/``.InstanceId``; the trading-day check reads stdout) and are
+tracked + fixed separately — see the follow-up issue referenced in the PR.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
+import pytest
+
 _SF = Path(__file__).resolve().parent.parent / "infrastructure" / "step_function.json"
-
-_WAIT_STATES = {
-    "WaitForDataPhase1": "$.data_phase1_poll",
-    "WaitForRAGIngestion": "$.rag_ingestion_poll",
-    "WaitForMorningEnrich": "$.morning_enrich_poll",
-}
-
-# The Choice state reads .Status; the Extract*Error path serializes the
-# poll object. These must survive the ResultSelector.
-_REQUIRED_SELECTED = {"Status.$"}
+_SF_TEXT = _SF.read_text()
 
 
-def _all_states() -> dict:
-    d = json.loads(_SF.read_text())
-    out = {}
+def _walk_states(states: dict):
+    for name, st in states.items():
+        if not isinstance(st, dict):
+            continue
+        yield name, st
+        for sub in ("ItemProcessor", "Iterator"):
+            inner = st.get(sub)
+            if isinstance(inner, dict) and isinstance(inner.get("States"), dict):
+                yield from _walk_states(inner["States"])
+        for b in st.get("Branches", []) or []:
+            if isinstance(b, dict) and isinstance(b.get("States"), dict):
+                yield from _walk_states(b["States"])
 
-    def walk(states):
-        for name, st in states.items():
-            out[name] = st
-            if "States" in st:
-                walk(st["States"])
-            for b in st.get("Branches", []):
-                walk(b["States"])
 
-    walk(d["States"])
+def _poll_states():
+    sf = json.loads(_SF_TEXT)
+    out = []
+    for name, st in _walk_states(sf.get("States", {})):
+        if "aws-sdk:ssm:getCommandInvocation" in str(st.get("Resource", "")):
+            out.append((name, st))
     return out
 
 
-def test_wait_states_have_resultselector_dropping_stdout():
-    states = _all_states()
-    for name, expected_rp in _WAIT_STATES.items():
-        st = states.get(name)
-        assert st is not None, f"{name} missing from step_function.json"
-        assert st.get("ResultPath") == expected_rp, (
-            f"{name} ResultPath changed from {expected_rp!r}"
-        )
-        rs = st.get("ResultSelector")
-        assert rs is not None, (
-            f"{name} has no ResultSelector — its full getCommandInvocation "
-            f"result (incl. ~24 KB StandardOutputContent) will ride in state "
-            f"and re-trip the 256 KB ResearchPredictorParallel limit."
-        )
-        assert "StandardOutputContent.$" not in rs and "StandardOutputContent" not in rs, (
-            f"{name} ResultSelector re-admits StandardOutputContent — that is "
-            f"the 24 KB bloat that caused the 2026-06-06 SF failure."
-        )
-        for key in _REQUIRED_SELECTED:
-            assert key in rs, (
-                f"{name} ResultSelector dropped {key!r}, which Check*Status "
-                f"reads as the poll Status."
-            )
+def _stdout_read_downstream(result_path: str) -> bool:
+    """Does any state read ``$.<poll>.StandardOutputContent``? Then stdout must
+    be kept in that poll's ResultSelector (it's a real data dependency)."""
+    if not result_path:
+        return False
+    # The read may be a bare field or wrapped in a States.StringToJson(...) /
+    # States.Format(...) intrinsic, so match the path fragment, not a quoted key.
+    return f"{result_path}.StandardOutputContent" in _SF_TEXT
 
 
-def test_choice_states_still_read_poll_status():
-    """The Choice states must reference $.<poll>.Status, which the
-    ResultSelector preserves."""
-    text = _SF.read_text()
-    for poll in _WAIT_STATES.values():
-        assert f'"{poll}.Status"' in text, (
-            f"Choice no longer reads {poll}.Status — wiring drift."
+def test_found_poll_states() -> None:
+    # Vacuous-pass guard: the Saturday SF has many SSM poll states.
+    assert len(_poll_states()) >= 10, "expected the Saturday SF SSM poll states"
+
+
+@pytest.mark.parametrize(
+    "name,st", _poll_states(), ids=[n for n, _ in _poll_states()]
+)
+def test_poll_state_trims_or_keeps_stdout_intentionally(name: str, st: dict) -> None:
+    rs = st.get("ResultSelector")
+    assert rs is not None, (
+        f"{name} is an SSM getCommandInvocation poll with NO ResultSelector — its "
+        f"full result (incl. ~24 KB StandardOutputContent) rides in state and can "
+        f"re-trip the 256 KB limit (2026-06-06 ResearchPredictorParallel; "
+        f"2026-06-19 WaitForEvaluator)."
+    )
+    assert any(k.startswith("Status") for k in rs), (
+        f"{name} ResultSelector dropped Status, which Check*Status reads."
+    )
+    keeps_stdout = any("StandardOutputContent" in k for k in rs)
+    needs_stdout = _stdout_read_downstream(st.get("ResultPath", ""))
+    if needs_stdout:
+        assert keeps_stdout, (
+            f"{name}: a downstream state reads {st.get('ResultPath')}."
+            f"StandardOutputContent, so the ResultSelector MUST keep it."
+        )
+    else:
+        assert not keeps_stdout, (
+            f"{name} keeps StandardOutputContent but nothing reads it — that is "
+            f"the unbounded field behind both 256 KB failures. Drop it."
         )

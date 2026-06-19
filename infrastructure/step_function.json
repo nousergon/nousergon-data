@@ -1555,6 +1555,12 @@
                   "ResultPath": "$.error"
                 }
               ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
               "ResultPath": "$.predictor_poll",
               "Next": "CheckPredictorStatus"
             },
@@ -1684,6 +1690,13 @@
                   "ResultPath": "$.model_zoo_error"
                 }
               ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent",
+                "StandardOutputContent.$": "$.StandardOutputContent"
+              },
               "ResultPath": "$.resolve_zoo_poll",
               "Next": "CheckResolveZooStatus"
             },
@@ -1810,6 +1823,12 @@
                         "ResultPath": "$.error"
                       }
                     ],
+                    "ResultSelector": {
+                      "Status.$": "$.Status",
+                      "ResponseCode.$": "$.ResponseCode",
+                      "StatusDetails.$": "$.StatusDetails",
+                      "StandardErrorContent.$": "$.StandardErrorContent"
+                    },
                     "ResultPath": "$.train_spec_poll",
                     "Next": "CheckTrainSpecStatus"
                   },
@@ -1943,6 +1962,12 @@
                   "ResultPath": "$.model_zoo_error"
                 }
               ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
               "ResultPath": "$.model_zoo_poll",
               "Next": "CheckModelZooStatus"
             },
@@ -2218,6 +2243,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.backtester_poll",
       "Next": "CheckBacktesterStatus"
     },
@@ -2315,6 +2346,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.predictor_backtest_poll",
       "Next": "CheckPredictorBacktestStatus"
     },
@@ -2412,6 +2449,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.portfolio_optimizer_poll",
       "Next": "CheckPortfolioOptimizerBacktestStatus"
     },
@@ -2529,6 +2572,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.parity_poll",
       "Next": "CheckParityStatus"
     },
@@ -2646,6 +2695,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.evaluator_poll",
       "Next": "CheckEvaluatorStatus"
     },
@@ -2739,6 +2794,12 @@
           "ResultPath": "$.health_check_error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.health_check_poll",
       "Next": "WeeklySubstrateHealthCheck"
     },
@@ -2810,6 +2871,12 @@
           "ResultPath": "$.substrate_check_error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.substrate_check_poll",
       "Next": "ReportCard"
     },
