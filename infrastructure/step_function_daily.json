@@ -133,7 +133,7 @@
             "export ALPHA_ENGINE_DEPLOYED=1",
             "cd /home/ec2-user/alpha-engine",
             "source .venv/bin/activate",
-            "python -m alpha_engine_lib.trading_calendar"
+            "python -m nousergon_lib.trading_calendar"
           ],
           "executionTimeout": ["30"]
         },
