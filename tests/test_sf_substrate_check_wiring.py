@@ -132,7 +132,7 @@ class TestCommandShape:
 
     def test_invokes_transparency_module(self, commands):
         assert any(
-            "python -m alpha_engine_lib.transparency" in cmd for cmd in commands
+            "python -m nousergon_lib.transparency" in cmd for cmd in commands
         )
 
     def test_passes_cadence_weekly(self, commands):

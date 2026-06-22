@@ -482,7 +482,7 @@
             "source .venv/bin/activate",
             "pip install --quiet --upgrade -r requirements.txt",
             "trap 'aws s3 cp /var/log/substrate-health-check-daily.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check-daily/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python -m alpha_engine_lib.transparency --cadence daily --alert 2>&1 | tee /var/log/substrate-health-check-daily.log"
+            "python -m nousergon_lib.transparency --cadence daily --alert 2>&1 | tee /var/log/substrate-health-check-daily.log"
           ],
           "executionTimeout": ["180"]
         },
