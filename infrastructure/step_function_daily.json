@@ -176,6 +176,13 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent",
+        "StandardOutputContent.$": "$.StandardOutputContent"
+      },
       "ResultPath": "$.trading_day_poll",
       "Next": "CheckTradingDayResult"
     },
@@ -299,6 +306,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.morning_enrich_poll",
       "Next": "CheckMorningEnrichStatus"
     },
@@ -428,6 +441,12 @@
           "ResultPath": "$.chronic_gap_error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.chronic_gap_poll",
       "Next": "CheckChronicGapStatus"
     },
@@ -867,6 +886,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.planner_poll",
       "Next": "CheckMorningPlannerStatus"
     },
@@ -994,6 +1019,12 @@
           "ResultPath": "$.daily_news_error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.daily_news_poll",
       "Next": "CheckDailyNewsStatus"
     },
@@ -1114,6 +1145,12 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
       "ResultPath": "$.arctic_append_poll",
       "Next": "CheckMorningArcticAppendStatus"
     },

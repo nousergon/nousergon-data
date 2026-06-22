@@ -129,6 +129,13 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
       "ResultPath": "$.postmarket_poll",
       "Next": "CheckPostMarketStatus"
     },
@@ -235,6 +242,13 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
       "ResultPath": "$.postmarket_arctic_poll",
       "Next": "CheckPostMarketArcticAppendStatus"
     },
@@ -335,6 +349,13 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
       "ResultPath": "$.snapshot_poll",
       "Next": "CheckSnapshotStatus"
     },
@@ -434,6 +455,13 @@
           "ResultPath": "$.error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
       "ResultPath": "$.eod_poll",
       "Next": "CheckEODStatus"
     },
@@ -526,6 +554,13 @@
           "ResultPath": "$.substrate_check_error"
         }
       ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
       "ResultPath": "$.substrate_check_poll",
       "Next": "StopTradingInstance"
     },
