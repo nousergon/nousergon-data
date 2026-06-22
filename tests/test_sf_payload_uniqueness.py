@@ -360,11 +360,34 @@ class TestWeekdaySSMFlowDoctorOrdering:
 # Parameters / Choices / ResultPath / InputPath, then filtering to
 # top-level fields (single segment after `$`).
 def _eod_referenced_input_fields() -> frozenset[str]:
-    sf_text = _SF_EOD.read_text()
-    # Match `"$.foo"` or `"$.foo.bar"` — capture the FIRST segment.
+    # Walk the parsed SF and capture the FIRST segment of every string value
+    # that STARTS with ``$.`` (equivalent to the old ``"$.`` text regex, since
+    # ``"$.`` only ever opens a JSON string value) — EXCEPT inside a
+    # ``ResultSelector`` block. Within a ResultSelector ``$`` rebinds to the raw
+    # task result, so its ``"$.Status"`` / ``"$.CommandId"`` RHS values are NOT
+    # top-level SF-state fields (config#1163: the weekday/EOD poll-trim
+    # ResultSelectors introduced exactly these and must not pollute the
+    # top-level namespace registry, which would otherwise mask a real future
+    # ``$.Status`` ResultPath collision).
     import re
 
-    refs = set(re.findall(r'"\$\.([A-Za-z_][A-Za-z0-9_]*)', sf_text))
+    refs: set[str] = set()
+
+    def _walk(obj) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "ResultSelector":
+                    continue
+                _walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _walk(v)
+        elif isinstance(obj, str):
+            m = re.match(r"\$\.([A-Za-z_][A-Za-z0-9_]*)", obj)
+            if m:
+                refs.add(m.group(1))
+
+    _walk(json.loads(_SF_EOD.read_text()))
     return frozenset(refs)
 
 
