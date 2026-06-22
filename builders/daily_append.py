@@ -978,7 +978,17 @@ def _daily_append_impl(
             ticker_close = closes.get(key)
             if ticker_close and not np.isnan(ticker_close["Close"]):
                 series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
-                series = series[~series.index.duplicated(keep="last")]
+                # Re-sort after the today_ts concat: when today_ts is NOT the
+                # latest date in the stored macro series (holiday backfill —
+                # e.g. Juneteenth 2026-06-19 closed, so a Monday append carries
+                # today_ts=Thu 6/18 while ArcticDB macro already holds a later
+                # session), dedup-keep-last moves the today_ts row to the tail
+                # of an otherwise-ascending index → non-monotonic. compute_features
+                # does `macro.reindex(df.index, method="ffill")`, which raises
+                # "index must be monotonic increasing or decreasing" for EVERY
+                # ticker (shared series). Mirror the per-ticker combined/warmup
+                # frames, which already dedup AND sort. (2026-06-22 weekday-SF fail.)
+                series = series[~series.index.duplicated(keep="last")].sort_index()
             macro[key] = series
 
         # Sector ETFs — every XL* in the macro library must read cleanly.
@@ -1000,7 +1010,9 @@ def _daily_append_impl(
                 ticker_close = closes.get(sym)
                 if ticker_close and not np.isnan(ticker_close["Close"]):
                     series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
-                    series = series[~series.index.duplicated(keep="last")]
+                    # Re-sort after the today_ts concat — see the macro_keys
+                    # loop above; same non-monotonic-on-holiday-backfill hazard.
+                    series = series[~series.index.duplicated(keep="last")].sort_index()
                 macro[sym] = series
 
     t_load = time.time() - t0
