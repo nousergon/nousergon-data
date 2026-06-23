@@ -63,7 +63,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/_price_cache_writeboth.py": 1,
-    "builders/daily_append.py": 1,
+    "builders/daily_append.py": 2,  # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents, config#1150)
     "builders/migrate_universe_feature_order.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
