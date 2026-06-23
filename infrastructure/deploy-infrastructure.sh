@@ -65,7 +65,8 @@ echo ""
 echo "==> Stamping Step Function definitions with git SHA..."
 SAT_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 DAILY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED'" EXIT
+EOD_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
+trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED'" EXIT
 python3 -c "
 import json, sys
 path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -87,11 +88,22 @@ if orig.startswith('[git:'):
 d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
 json.dump(d, open(path_out, 'w'), indent=2)
 " "$SCRIPT_DIR/step_function_daily.json" "$DAILY_STAMPED" "$GIT_SHA"
+python3 -c "
+import json, sys
+path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path_in))
+orig = d.get('Comment', '')
+if orig.startswith('[git:'):
+    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
+d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
+json.dump(d, open(path_out, 'w'), indent=2)
+" "$SCRIPT_DIR/step_function_eod.json" "$EOD_STAMPED" "$GIT_SHA"
 
 echo ""
 echo "==> Uploading Step Function definitions to S3..."
 aws s3 cp "$SAT_STAMPED" "s3://$BUCKET/infrastructure/step_function.json" --quiet
 aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json" --quiet
+aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
 # ── 3. Update Step Functions directly ────────────────────────────────────────
@@ -100,6 +112,7 @@ echo "==> Updating Step Function definitions..."
 
 SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"
+EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
 
 # Pass the definition via file:// — NOT inline "$(cat ...)". The Saturday ASL is
 # ~131 KB and growing (one state per pipeline step); combined with the AWS
@@ -115,6 +128,15 @@ echo "  Saturday pipeline updated."
 
 aws stepfunctions update-state-machine --state-machine-arn "$DAILY_ARN" --definition "file://$DAILY_STAMPED" --query "updateDate" --output text
 echo "  Weekday pipeline updated."
+
+# EOD SF (alpha-engine-eod-pipeline) — folded into auto-deploy 2026-06-23 (config#1173).
+# Previously deployed only by the manual infrastructure/update_eod_pipeline_sf.sh, which
+# nothing triggered on merge, so merged EOD SF changes silently never reached the live
+# state machine (drift hit 2026-06-22 via #458's nousergon_lib migration). Same
+# stamp + S3-copy + file:// update-state-machine pattern as Saturday/weekday above, so all
+# three orchestration SFs now stay in lockstep with origin/main on every merge.
+aws stepfunctions update-state-machine --state-machine-arn "$EOD_ARN" --definition "file://$EOD_STAMPED" --query "updateDate" --output text
+echo "  EOD pipeline updated."
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""
