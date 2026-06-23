@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import io
 import json
@@ -47,6 +48,21 @@ from features.compute import (
 )
 from arcticdb.version_store.library import ReadRequest, UpdatePayload, WritePayload
 from arcticdb_ext.version_store import DataError
+# Schema-drift exception family — RAISED (not returned-as-DataError) when a
+# row's column set / dtypes / order no longer match the persisted ArcticDB
+# stream descriptor. ``StreamDescriptorMismatch`` is the canonical case
+# (2026-05-21 EOD incident); ``SchemaException`` / ``NormalizationException``
+# are its siblings under ``ArcticException`` for the same "row shape ≠ stored
+# descriptor" class. These propagate out of update()/write()/update_batch()/
+# write_batch() rather than landing in a per-symbol DataError, so before
+# config#1150 they aborted the run UNCOUNTED. We count-then-re-raise (fail-loud).
+from arcticdb.exceptions import (
+    NormalizationException,
+    SchemaException,
+    StreamDescriptorMismatch,
+)
+
+_SCHEMA_DRIFT_EXC = (StreamDescriptorMismatch, SchemaException, NormalizationException)
 
 from store.arctic_store import (
     OHLCV_COLS as _CANONICAL_OHLCV_COLS,
@@ -316,6 +332,114 @@ def _emit_quality_gate_metrics(
             "quality-gate record is the load-bearing Flow Doctor surface.",
             exc,
         )
+
+
+def _emit_schema_drift_metric(count: int) -> None:
+    """Emit ``AlphaEngine/Data/daily_append_schema_drift_count`` gauge.
+
+    ``count`` is the number of ArcticDB schema-drift write failures
+    (``StreamDescriptorMismatch`` / ``SchemaException`` /
+    ``NormalizationException``) seen on the universe + macro write paths this
+    run. Emitted on EVERY run (zero on a clean run) so the evaluator's
+    trailing-4w Sum has a continuous baseline — a missing datapoint then means
+    "producer didn't run", not "zero incidents". Best-effort: a CloudWatch
+    error WARNs but does NOT mask the schema-drift exception itself, which
+    still propagates and fails the run loud. Mirrors ``_emit_quality_gate_metrics``.
+    """
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "daily_append_schema_drift_count",
+                "Value": float(count),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        log.warning(
+            "CloudWatch daily_append_schema_drift_count metric failed: %s. "
+            "Not blocking daily_append — the count is observability hung off "
+            "the schema-drift failure path; the incident itself still raises.",
+            exc,
+        )
+
+
+def _write_schema_drift_manifest(s3, bucket: str, date_str: str, count: int) -> None:
+    """Persist the per-run schema-drift count to ``market_data/weekly/{date}/manifest.json``.
+
+    The durable, pull-based artifact companion to the CloudWatch metric —
+    written on EVERY run (including a clean run, count==0) so the artifact
+    reflects the last run's true state. Best-effort: an S3 error WARNs but
+    does NOT mask the schema-drift exception. ``schema_drift_incidents`` is
+    merged into any existing manifest so a co-located key from another writer
+    is preserved.
+    """
+    key = f"market_data/weekly/{date_str}/manifest.json"
+    manifest: dict = {}
+    try:
+        existing = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        loaded = json.loads(existing)
+        if isinstance(loaded, dict):
+            manifest = loaded
+    except Exception:
+        # No prior manifest (common) — start fresh. A malformed/absent object
+        # is not worth failing the run over; we overwrite with our keys.
+        manifest = {}
+    manifest["schema_drift_incidents"] = int(count)
+    manifest["schema_drift_writer"] = "alpha-engine-data:builders/daily_append.py"
+    manifest["schema_drift_written_at"] = datetime.now(timezone.utc).isoformat()
+    manifest.setdefault("date", date_str)
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(manifest, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        log.warning(
+            "manifest.json schema-drift write failed (s3://%s/%s): %s. "
+            "Not blocking daily_append — CloudWatch carries the same count and "
+            "the incident itself still raises.",
+            bucket, key, exc,
+        )
+
+
+@contextlib.contextmanager
+def _count_schema_drift(counter: list[int], *, on_drift=None):
+    """Count an ArcticDB schema-drift write failure, then RE-RAISE it (fail-loud).
+
+    Wrap an ArcticDB write call (update / write / update_batch / write_batch).
+    On a schema-drift exception (``_SCHEMA_DRIFT_EXC``) we increment
+    ``counter[0]``, invoke ``on_drift(counter[0])`` (the durable CloudWatch +
+    manifest emit, so the count survives the abort) if supplied, and re-raise
+    the original exception unchanged — the count is observability hung off the
+    existing failure path, NEVER a swallow. The run still fails loud. Non-schema
+    exceptions pass straight through, uncounted.
+    """
+    try:
+        yield
+    except _SCHEMA_DRIFT_EXC as exc:
+        counter[0] += 1
+        log.error(
+            "ArcticDB schema-drift write failure #%d this run: %s: %s — "
+            "counting then re-raising (fail-loud; the row shape no longer "
+            "matches the persisted stream descriptor).",
+            counter[0], type(exc).__name__, exc,
+        )
+        if on_drift is not None:
+            # Emit-on-abort so the incident lands in CloudWatch + manifest even
+            # though the run is about to fail. Best-effort: the emit itself must
+            # never mask the original schema-drift exception.
+            try:
+                on_drift(counter[0])
+            except Exception as emit_exc:  # pragma: no cover - defensive
+                log.warning(
+                    "schema-drift emit-on-abort failed: %s (original incident "
+                    "still re-raised below)", emit_exc,
+                )
+        raise
 
 
 def _scan_universe_and_emit_freshness_receipt(
@@ -751,6 +875,23 @@ def _daily_append_impl(
     # 08:39 PT manual rerun reproduced this — Step Function marked SUCCEEDED,
     # macro/SPY stayed at 4/10 for 5 days until an inference-side preflight
     # caught it.
+    # ── Schema-drift incident counter (config#1150 Batch B) ──────────────────
+    # Counts ArcticDB schema-drift write failures (StreamDescriptorMismatch /
+    # SchemaException / NormalizationException — see _SCHEMA_DRIFT_EXC) across
+    # BOTH the macro/sector and the chunked universe write paths this run.
+    # Single-element list so the inner write blocks share one mutable count.
+    # Before config#1150 these exceptions propagated UNCOUNTED — a descriptor
+    # regression was invisible to the report card until an operator noticed the
+    # failed run by hand. ``_emit_schema_drift`` writes the count to CloudWatch +
+    # manifest.json; on a clean run it fires once at the end (count 0), and on a
+    # schema-drift abort the _count_schema_drift wrapper fires it before the
+    # exception re-raises so the incident still lands.
+    n_schema_drift = [0]
+
+    def _emit_schema_drift(count: int) -> None:
+        _emit_schema_drift_metric(count)
+        _write_schema_drift_manifest(s3, bucket, date_str, count)
+
     macro_missing_from_closes: list[str] = []
     macro_updated: list[str] = []
     sector_updated: list[str] = []
@@ -775,7 +916,8 @@ def _daily_append_impl(
                     index=pd.DatetimeIndex([today_ts]),
                 )
                 new_row.index.name = "date"
-                mode = _write_row_backfill_safe(macro_lib, key, new_row)
+                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                    mode = _write_row_backfill_safe(macro_lib, key, new_row)
                 macro_updated.append(key)
                 macro_write_modes[key] = mode
             except Exception as exc:
@@ -799,7 +941,8 @@ def _daily_append_impl(
                     index=pd.DatetimeIndex([today_ts]),
                 )
                 new_row.index.name = "date"
-                mode = _write_row_backfill_safe(macro_lib, sym, new_row)
+                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                    mode = _write_row_backfill_safe(macro_lib, sym, new_row)
                 sector_updated.append(sym)
                 macro_write_modes[sym] = mode
             except Exception as exc:
@@ -1440,14 +1583,24 @@ def _daily_append_impl(
 
         if update_payloads or write_payloads:
             t_write0 = time.time()
-            update_results = (
-                universe_lib.update_batch(update_payloads, upsert=True)
-                if update_payloads else []
-            )
-            write_results = (
-                universe_lib.write_batch(write_payloads, prune_previous_versions=True)
-                if write_payloads else []
-            )
+            # A per-symbol schema mismatch comes back as a DataError in the
+            # results list (handled in _aggregate → n_err). A BATCH-LEVEL
+            # descriptor mismatch — the 2026-05-21 EOD incident, where the
+            # whole update_batch aborts before producing per-symbol results —
+            # RAISES StreamDescriptorMismatch out of the call. Count that here,
+            # emit the incident (the wrapper fires _emit_schema_drift before the
+            # exception escapes), then re-raise (fail-loud): a batch-level
+            # descriptor mismatch is a real data-integrity failure, not a
+            # per-ticker hiccup.
+            with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                update_results = (
+                    universe_lib.update_batch(update_payloads, upsert=True)
+                    if update_payloads else []
+                )
+                write_results = (
+                    universe_lib.write_batch(write_payloads, prune_previous_versions=True)
+                    if write_payloads else []
+                )
             write_wall = time.time() - t_write0
             log.info(
                 "Batch writes: %d updates + %d backfills in %.1fs",
@@ -1550,6 +1703,7 @@ def _daily_append_impl(
         "tickers_quality_warned": n_quality_warned,
         "quality_anomaly_counts": dict(quality_counts_by_type),
         "quality_block_anomaly_types": sorted(block_anomaly_types),
+        "schema_drift_incidents": n_schema_drift[0],
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
@@ -1572,6 +1726,11 @@ def _daily_append_impl(
         _emit_quality_gate_metrics(
             quality_counts_by_type, n_quality_blocked, n_quality_warned,
         )
+        # Clean-run schema-drift emit (count 0, or any non-fatal residual). On a
+        # schema-drift ABORT this line is never reached — the _count_schema_drift
+        # wrapper already emitted the incident before re-raising — so the count
+        # always lands exactly once, on both the clean and the fail-loud path.
+        _emit_schema_drift(n_schema_drift[0])
 
     # Hard-fail on high error rate. ``n_ok == 0`` alone is NOT a failure
     # signal — it correctly occurs when every ticker hit the
