@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # update_eod_pipeline_sf.sh — Apply the canonical EOD pipeline SF definition.
 #
+# NOTE (2026-06-23, config#1173): the EOD SF is now auto-deployed on every
+# merge to main by deploy-infrastructure.sh (alongside the Saturday + weekday
+# SFs), so this script is no longer required for normal merges. It is retained
+# only as a manual fallback for out-of-band EOD-SF redeploys (e.g. re-applying
+# the on-disk definition without a merge, or recovering from a failed
+# deploy-infrastructure run). Note: unlike the auto-deploy path, this script
+# applies the definition WITHOUT the [git:<sha>] Comment stamp.
+#
 # Reads the state-machine definition from
 # infrastructure/step_function_eod.json (single source of truth, same
 # pattern as deploy_step_function.sh for the Saturday SF) and applies
