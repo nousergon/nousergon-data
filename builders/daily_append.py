@@ -826,7 +826,10 @@ def _daily_append_impl(
     structurally unchanged.
     """
     s3 = boto3.client("s3")
-    date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if date_str is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        date_str = default_run_date()
     today_ts = pd.Timestamp(date_str)
     t0 = time.time()
 
@@ -1812,7 +1815,9 @@ def main():
     )
 
     result = daily_append(
-        date_str=args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        # config#1014: pass args.date through; daily_append() defaults a None
+        # date_str to the trading-day axis via dates.default_run_date().
+        date_str=args.date,
         bucket=args.bucket,
         dry_run=args.dry_run,
         skip_if_exists=args.skip_if_exists,

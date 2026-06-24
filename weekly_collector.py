@@ -80,6 +80,7 @@ from collectors import constituents, prices, macro, universe_returns, signal_ret
 from builders._price_cache_writeboth import (
     price_cache_write_prefixes as _price_cache_write_prefixes,
 )
+from dates import default_run_date  # config#1014: trading-day-axis default
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +261,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
     price_cfg = config.get("price_cache", {})
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
     ur_cfg = config.get("universe_returns", {})
-    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    run_date = args.date or default_run_date()
     dry_run = args.dry_run
     only = args.only
     reg = _build_registry(config, args, run_date)
@@ -503,7 +504,7 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     """Phase 2: alternative data for promoted tickers (after research)."""
     bucket = config["bucket"]
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
-    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    run_date = args.date or default_run_date()
     dry_run = args.dry_run
     reg = _build_registry(config, args, run_date)
 
@@ -1147,7 +1148,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                 cons_result = constituents.collect(
                     bucket=bucket,
                     s3_prefix=market_prefix,
-                    run_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    run_date=default_run_date(),  # config#1014: trading-day axis
                     dry_run=False,
                 )
             results["collectors"]["constituents_preflight"] = cons_result
@@ -1699,7 +1700,7 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     """Daily mode: capture today's OHLCV closes for all tracked tickers."""
     bucket = config["bucket"]
-    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    run_date = args.date or default_run_date()
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
     reg = _build_registry(config, args, run_date)
@@ -1917,7 +1918,7 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     daily_closes parquet that this append reads, so this state runs after it.
     """
     bucket = config["bucket"]
-    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    run_date = args.date or default_run_date()
     dry_run = args.dry_run
     results: dict = {
         "mode": "daily_arctic_append",
