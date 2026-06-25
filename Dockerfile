@@ -28,6 +28,14 @@ RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://gith
 COPY collectors/ ${LAMBDA_TASK_ROOT}/collectors/
 COPY polygon_client.py ${LAMBDA_TASK_ROOT}/
 COPY weekly_collector.py ${LAMBDA_TASK_ROOT}/
+# dates.py — repo-root chokepoint imported (``from dates import default_run_date``)
+# top-level in weekly_collector.py and lazily in collectors/* + builders/* +
+# features/compute.py (config#1014 trading-day-axis default). Added 2026-06-25
+# (#464) WITHOUT a matching COPY here, so every deploy since canary-failed with
+# ``No module named 'dates'`` and rolled back — the same latent bug class as the
+# ``validators/`` COPY below (2026-05-18) and ``polygon_client.py``. Any new
+# repo-root module imported by Lambda code MUST be COPYied here.
+COPY dates.py ${LAMBDA_TASK_ROOT}/
 COPY store/ ${LAMBDA_TASK_ROOT}/store/
 # validators/ — top-level imports in collectors/alternative.py +
 # collectors/fundamentals.py (added 2026-05-16 via PR #254 per-collector
