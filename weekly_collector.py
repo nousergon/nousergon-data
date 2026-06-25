@@ -859,6 +859,20 @@ def _detect_chronic_gap_constituents_drift(
 # state — a spot-per-4-ticker-heal would be wasteful (2026-06-11 decision).
 _CHRONIC_HEAL_HARD_TIMEOUT_S = 600
 
+# Hard bound for the prior-universe-gap self-heal that runs at the head of the
+# MorningArcticAppend state (40-min SSM budget). One interior-day backfill is a
+# full-universe mid-series ArcticDB rewrite (~20 min), so the bound leaves
+# ample headroom for the load-bearing same-day append that follows.
+_UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S = 1500
+# How many trading days back to scan for a missing universe append, and how
+# many to heal per run. Default heals only the single most-recent missing day
+# so one run stays comfortably inside the 40-min append budget; a multi-day
+# outage chips away one day per subsequent weekday run (and the executor's
+# gap-aware reconcile + freshness monitor cover the interim). Both overridable
+# via config["universe_gap_heal"].
+_UNIVERSE_GAP_HEAL_LOOKBACK_TD = 5
+_UNIVERSE_GAP_HEAL_MAX_PER_RUN = 1
+
 
 class _HardTimeout(BaseException):
     """Raised by :func:`_hard_timeout` on SIGALRM expiry. Subclasses
@@ -1394,6 +1408,187 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
+def _detect_missing_universe_days(
+    bucket: str,
+    target_date: str,
+    lookback_trading_days: int = _UNIVERSE_GAP_HEAL_LOOKBACK_TD,
+) -> list[str]:
+    """Trading days strictly before ``target_date`` absent from ArcticDB.
+
+    A skipped weekday/EOD Step Function leaves a hole in the universe: no
+    daily_append ran for that session, so neither the universe tickers nor
+    the macro keys have a row for it. The next day's EOD reconcile then reads
+    a *non-adjacent* prior close and mislabels a multi-session move as one day
+    (the 2026-06-24 halt → RGEN +14.92% on 06-25; config#1228).
+
+    Reference for "did the append run for day D": the macro/SPY index. The
+    macro keys are a fixed list written on *every* ``daily_append``, so a day
+    present for SPY is a day the universe append ran — and an interior hole in
+    SPY's index is exactly an interior universe gap. (A per-ticker constituent
+    would give false gaps on reconstitution churn; the fixed macro keys do
+    not.) ``target_date`` itself is owned by the same run's load-bearing
+    append, so it is excluded here.
+
+    Returns the missing days as ``YYYY-MM-DD`` strings, NEWEST first (the most
+    recent gap is the one closest to poisoning the next reconcile). Best-effort:
+    a reference-read failure returns ``[]`` so the heal is a no-op and the
+    load-bearing append proceeds unguarded (freshness monitor remains the
+    backstop).
+    """
+    from datetime import date as _date
+
+    import pandas as pd
+
+    from alpha_engine_lib.trading_calendar import previous_trading_day
+
+    target = _date.fromisoformat(target_date)
+    # Expected: the N trading sessions strictly before target_date.
+    expected: list[_date] = []
+    d = previous_trading_day(target)
+    for _ in range(lookback_trading_days):
+        expected.append(d)
+        d = previous_trading_day(d)
+
+    try:
+        from store.arctic_store import get_macro_lib
+
+        macro_lib = get_macro_lib(bucket)
+        # Pull a little beyond the window so an end-of-series gap (several
+        # recent days all missing) still has present anchors to compare to.
+        df = macro_lib.tail("SPY", n=lookback_trading_days + 6).data
+        present = {pd.Timestamp(ix).date() for ix in df.index}
+    except Exception as exc:  # best-effort reference read
+        logger.warning(
+            "universe-gap detect: macro/SPY index read failed (%s) — "
+            "skipping prior-gap heal; freshness monitor remains the backstop.",
+            exc,
+        )
+        return []
+
+    missing = [d for d in expected if d not in present]
+    missing.sort(reverse=True)  # newest first
+    return [d.strftime("%Y-%m-%d") for d in missing]
+
+
+def _self_heal_missing_universe_days(
+    bucket: str,
+    target_date: str,
+    config: dict,
+    dry_run: bool = False,
+    lookback_trading_days: int = _UNIVERSE_GAP_HEAL_LOOKBACK_TD,
+    max_heal_days: int = _UNIVERSE_GAP_HEAL_MAX_PER_RUN,
+) -> dict:
+    """Backfill trading days missing from the ArcticDB universe (config#1228).
+
+    For each missing day (newest first, capped at ``max_heal_days`` per run):
+      1. Resolve that day's constituents via ``load_constituents_for_run_date``
+         (run_date-direct, #468-correct — never the latest_weekly pointer),
+         plus the fixed macro keys.
+      2. Stage OHLCV from Polygon's immutable T+1 grouped-daily for that date
+         (``daily_closes.collect``; ``auto`` source so FRED/yfinance backfill
+         any Polygon gaps — completeness matters more than VWAP purity here).
+      3. Splice the day into ArcticDB via ``daily_append(date_str=day)`` — an
+         idempotent mid-series insert (re-running a partially-healed day is a
+         no-op-equivalent rewrite).
+
+    Best-effort and per-day isolated: one day's failure is recorded and the
+    loop continues. NEVER raises — returns a summary the caller logs. The
+    same-day load-bearing append is the caller's responsibility and must not
+    be blocked by a heal failure here.
+    """
+    summary: dict = {
+        "scan_window_td": lookback_trading_days,
+        "max_per_run": max_heal_days,
+        "missing_days": [],
+        "healed_days": [],
+        "deferred_days": [],
+        "errors": [],
+    }
+
+    missing = _detect_missing_universe_days(bucket, target_date, lookback_trading_days)
+    summary["missing_days"] = missing
+    if not missing:
+        logger.info("universe-gap heal: no prior trading-day gaps before %s.", target_date)
+        return summary
+
+    to_heal = missing[:max_heal_days]
+    summary["deferred_days"] = missing[max_heal_days:]
+    logger.warning(
+        "universe-gap heal: %d trading day(s) missing from ArcticDB before %s (%s); "
+        "healing %s this run%s.",
+        len(missing), target_date, missing, to_heal,
+        f", deferring {summary['deferred_days']} to subsequent runs" if summary["deferred_days"] else "",
+    )
+
+    from builders._constituents_loader import load_constituents_for_run_date
+    from builders.daily_append import daily_append
+    from collectors import daily_closes
+
+    daily_cfg = config.get("daily_closes", {})
+    s3_prefix = daily_cfg.get("s3_prefix", "staging/daily_closes/")
+    s3 = boto3.client("s3")
+
+    for day in to_heal:
+        try:
+            try:
+                tickers_set, weekly_date = load_constituents_for_run_date(
+                    s3, bucket, run_date=day
+                )
+            except Exception as direct_exc:
+                logger.warning(
+                    "universe-gap heal: direct constituents read for %s failed (%s) — "
+                    "falling back to latest_weekly pointer.",
+                    day, direct_exc,
+                )
+                tickers_set, weekly_date = load_constituents_for_run_date(
+                    s3, bucket, run_date=None
+                )
+            tickers = sorted(tickers_set)
+            # Mirror MorningEnrich's universe scope: constituents + macro keys.
+            tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
+            if not tickers:
+                summary["errors"].append({"date": day, "reason": "no constituents resolved"})
+                continue
+
+            # 1+2: stage the day's OHLCV (Polygon T+1, auto-chain fallback).
+            daily_closes.collect(
+                bucket=bucket,
+                tickers=tickers,
+                run_date=day,
+                s3_prefix=s3_prefix,
+                dry_run=dry_run,
+                source="auto",
+            )
+            # 3: idempotent mid-series splice into ArcticDB.
+            append_result = daily_append(
+                date_str=day,
+                bucket=bucket,
+                dry_run=dry_run,
+                expected_tickers=tickers,
+            )
+            status = append_result.get("status", "unknown")
+            if status in ("ok", "ok_dry_run"):
+                summary["healed_days"].append(
+                    {"date": day, "tickers": len(tickers), "weekly_date": str(weekly_date)}
+                )
+                logger.info(
+                    "universe-gap heal: backfilled %s (%d tickers, status=%s).",
+                    day, len(tickers), status,
+                )
+            else:
+                summary["errors"].append(
+                    {"date": day, "reason": f"daily_append status={status}"}
+                )
+                logger.warning(
+                    "universe-gap heal: daily_append for %s returned status=%s.", day, status
+                )
+        except Exception as exc:
+            logger.warning("universe-gap heal: failed to backfill %s (%s).", day, exc)
+            summary["errors"].append({"date": day, "reason": str(exc)})
+
+    return summary
+
+
 def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     """Standalone ArcticDB universe append for the prior trading day (L4608).
 
@@ -1437,6 +1632,41 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         "started_at": started_at,
         "collectors": {},
     }
+
+    # Prior-gap self-heal (config#1228): BEFORE today's load-bearing append,
+    # backfill any recent trading day whose universe append was skipped (a
+    # weekday/EOD SF halt), so the series stays gapless and the next EOD
+    # reconcile measures against the true previous trading day rather than a
+    # stale non-adjacent close. Runs here (40-min SSM budget on EC2) because a
+    # full-universe interior-day rewrite is far too slow for the 5-min
+    # best-effort ChronicGapSelfHeal state. Fail-soft + hard-bounded: a heal
+    # failure or hang must NEVER block or delay today's append.
+    ugh_cfg = config.get("universe_gap_heal", {})
+    try:
+        with _hard_timeout(_UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S, "universe-gap self-heal"):
+            heal_summary = _self_heal_missing_universe_days(
+                bucket=bucket,
+                target_date=target_date,
+                config=config,
+                dry_run=dry_run,
+                lookback_trading_days=int(
+                    ugh_cfg.get("lookback_trading_days", _UNIVERSE_GAP_HEAL_LOOKBACK_TD)
+                ),
+                max_heal_days=int(
+                    ugh_cfg.get("max_heal_days_per_run", _UNIVERSE_GAP_HEAL_MAX_PER_RUN)
+                ),
+            )
+        results["collectors"]["prior_gap_heal"] = {"status": "ok", **heal_summary}
+    except _HardTimeout as e:
+        logger.warning(
+            "universe-gap self-heal hit the %ds hard timeout for %s — skipping "
+            "(best-effort); today's append proceeds. %s",
+            _UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S, target_date, e,
+        )
+        results["collectors"]["prior_gap_heal"] = {"status": "skipped", "error": str(e)}
+    except Exception as e:
+        logger.exception("universe-gap self-heal failed for %s (non-blocking)", target_date)
+        results["collectors"]["prior_gap_heal"] = {"status": "error", "error": str(e)}
 
     # Load the constituents MorningEnrich just refreshed to S3 (post-prune
     # universe scope for daily_append's expected-ticker check). S3 → Wikipedia
