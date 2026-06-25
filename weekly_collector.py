@@ -1459,11 +1459,12 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     # via ``builders._constituents_loader``; this is the third in-repo reader.
     tickers: list[str] = []
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
-    # Calendar run date == the date MorningEnrich wrote constituents under
-    # (``run_date = args.date or now_utc`` in _run_morning_enrich). Mirror that
-    # expression exactly so we read the file this run produced — NOT
-    # target_date, which is the prior trading day the append ROW is keyed on.
-    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Run date == the date MorningEnrich wrote constituents under
+    # (``run_date = args.date or default_run_date()`` in _run_morning_enrich,
+    # config#1014 trading-day axis). Mirror that expression exactly so we read
+    # the file this run produced — NOT target_date, which is the prior trading
+    # day the append ROW is keyed on.
+    run_date = args.date or default_run_date()
     try:
         from builders._constituents_loader import load_constituents_for_run_date
         s3 = boto3.client("s3")
