@@ -2,9 +2,10 @@
 
 The **independent** Sat→Monday swallow safeguard for the autonomous resilience
 agent (config#1227). The agent (M2c) reports what it fixed; this sentinel does
-NOT trust that report. It reads the freshness-monitor's pre-computed
-``saturday_sf`` cycle-completion verdict — which is derived by probing S3
-directly, independent of the agent — and answers ONE question Monday pre-open:
+NOT trust that report. It reads the freshness-monitor's per-spec
+``check_results.json`` — derived by probing S3 directly, independent of the
+agent — computes the ``saturday_sf``-critical completeness itself, and answers
+ONE question Monday pre-open:
 
     Are last Saturday's critical artifacts (signals, predictor weights manifest,
     constituents, training summary, …) actually present + fresh, so it is safe to
@@ -16,15 +17,15 @@ does not touch the weekday SF; it pages Brian + writes a dashboard marker so the
 miss is caught before/at Monday open, within the Sat→Mon buffer.
 
 **Why independent matters.** A swallow can fool the agent's own report but cannot
-fool the freshness-monitor (which HEADs the artifacts in S3). Reading its verdict
+fool the freshness-monitor (which HEADs the artifacts in S3). Reading its results
 is what makes this a real safeguard rather than a second self-report. It also
-fires even when freshness-monitor *alerting* is in OBSERVE mode (the verdict is
-computed regardless of the alert gate), so the Monday GO/NO-GO is never silenced.
+fires even when freshness-monitor *alerting* is in OBSERVE mode (check_results is
+written regardless of the alert gate), so the Monday GO/NO-GO is never silenced.
 
-**Fail-loud on uncertainty.** For a safety check, ambiguity = NO-GO: a missing or
-stale ``cycle_verdict.json`` (monitor down) pages loud rather than assuming GO.
-The marker write is the primary deliverable (RAISES on failure); Telegram is
-best-effort.
+**Fail-loud on uncertainty.** For a safety check, ambiguity = NO-GO: missing or
+stale ``check_results.json`` (monitor down), or no saturday_sf-critical rows,
+pages loud rather than assuming GO. The marker write is the primary deliverable
+(RAISES on failure); Telegram is best-effort.
 """
 
 from __future__ import annotations
@@ -43,15 +44,25 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
-CYCLE_VERDICT_KEY = os.environ.get(
-    "CYCLE_VERDICT_KEY", "_freshness_monitor/cycle_verdict.json"
+# The per-spec freshness results (reliably produced every 15 min). We compute the
+# saturday_sf-critical completeness HERE rather than depending on the derived
+# `cycle_verdict.json`, which the deployed freshness-monitor does not emit
+# (2026-06-25: only check_results/heartbeat/history exist in S3). Depending on a
+# maybe-absent derived artifact would make this safety net false-alarm every
+# Monday and train the operator to ignore it.
+CHECK_RESULTS_KEY = os.environ.get(
+    "CHECK_RESULTS_KEY", "_freshness_monitor/check_results.json"
 )
 MARKER_PREFIX = os.environ.get(
     "MARKER_PREFIX", "consolidated/saturday_integrity"
 )
 TARGET_CADENCE = "saturday_sf"
-# If the freshness verdict itself is older than this, the monitor may be down →
-# treat as uncertain (NO-GO), don't trust a stale GO.
+TARGET_SEVERITY = "critical"
+# Per-spec states that count as "present + safe to trade on" (mirrors the
+# freshness substrate's cycle_completion, which filters to severity=critical).
+_OK_STATES = frozenset({"fresh", "grace_period"})
+# If check_results itself is older than this, the monitor may be down → treat as
+# uncertain (NO-GO); don't trust a stale GO.
 VERDICT_STALE_HOURS = float(os.environ.get("VERDICT_STALE_HOURS", "3"))
 
 
@@ -59,14 +70,14 @@ def _s3():
     return boto3.client("s3", region_name=REGION)
 
 
-def _read_cycle_verdict(s3) -> dict | None:
+def _read_check_results(s3) -> dict | None:
     try:
-        obj = s3.get_object(Bucket=BUCKET, Key=CYCLE_VERDICT_KEY)
+        obj = s3.get_object(Bucket=BUCKET, Key=CHECK_RESULTS_KEY)
         return json.loads(obj["Body"].read())
     except Exception as exc:  # noqa: BLE001 — absence IS a finding (NO-GO), handled by caller
         code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
         if code not in {"NoSuchKey", "404", "403"}:
-            logger.warning("could not read %s: %s", CYCLE_VERDICT_KEY, exc)
+            logger.warning("could not read %s: %s", CHECK_RESULTS_KEY, exc)
         return None
 
 
@@ -84,47 +95,49 @@ def _verdict_age_hours(doc: dict, now: datetime) -> float | None:
 
 
 def _evaluate(doc: dict | None, now: datetime) -> dict:
-    """Return a GO/NO-GO verdict dict. NO-GO on incomplete OR on any uncertainty
-    (missing verdict / stale monitor / absent saturday_sf row)."""
+    """Return a GO/NO-GO verdict by computing saturday_sf-critical completeness
+    from the freshness check_results rows. NO-GO on any incomplete artifact OR on
+    uncertainty (results missing / monitor stale / no saturday_sf-critical rows)."""
     if doc is None:
         return {
             "go": False, "uncertain": True,
-            "reason": "freshness cycle_verdict.json unavailable — cannot confirm Saturday integrity",
+            "reason": "freshness check_results.json unavailable — cannot confirm Saturday integrity",
             "missing": [], "stale": [],
         }
     age = _verdict_age_hours(doc, now)
     if age is not None and age > VERDICT_STALE_HOURS:
         return {
             "go": False, "uncertain": True,
-            "reason": f"freshness verdict is stale ({age:.1f}h old > {VERDICT_STALE_HOURS}h) — monitor may be down",
+            "reason": f"freshness check_results is stale ({age:.1f}h old > {VERDICT_STALE_HOURS}h) — monitor may be down",
             "missing": [], "stale": [],
         }
-    sat = next(
-        (v for v in doc.get("verdicts", []) if v.get("cadence") == TARGET_CADENCE),
-        None,
-    )
-    if sat is None:
+    critical = [
+        r for r in doc.get("results", [])
+        if r.get("cadence") == TARGET_CADENCE and r.get("severity") == TARGET_SEVERITY
+    ]
+    if not critical:
         return {
             "go": False, "uncertain": True,
-            "reason": f"no {TARGET_CADENCE} verdict in cycle_verdict.json",
+            "reason": f"no {TARGET_CADENCE}/{TARGET_SEVERITY} rows in check_results — registry coverage gap?",
             "missing": [], "stale": [],
         }
-    if sat.get("complete"):
+    bad = [r for r in critical if r.get("state") not in _OK_STATES]
+    if not bad:
         return {
             "go": True, "uncertain": False,
-            "reason": f"all {sat.get('n_required')} critical {TARGET_CADENCE} artifacts present",
-            "cycle_label": sat.get("cycle_label"),
+            "reason": f"all {len(critical)} critical {TARGET_CADENCE} artifacts present",
             "missing": [], "stale": [],
         }
+    missing = [r.get("artifact_id") for r in bad if r.get("state") == "missing"]
+    stale = [r.get("artifact_id") for r in bad if r.get("state") != "missing"]
     return {
         "go": False, "uncertain": False,
         "reason": (
-            f"{TARGET_CADENCE} cycle INCOMPLETE "
-            f"({sat.get('n_satisfied')}/{sat.get('n_required')} critical artifacts)"
+            f"{TARGET_CADENCE} INCOMPLETE "
+            f"({len(critical) - len(bad)}/{len(critical)} critical artifacts present)"
         ),
-        "cycle_label": sat.get("cycle_label"),
-        "missing": sat.get("missing", []),
-        "stale": sat.get("stale", []),
+        "missing": missing,
+        "stale": stale,
     }
 
 
@@ -174,7 +187,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     run_date = now.date().isoformat()
     s3 = _s3()
 
-    doc = _read_cycle_verdict(s3)
+    doc = _read_check_results(s3)
     verdict = _evaluate(doc, now)
     verdict["checked_at"] = now.isoformat()
 

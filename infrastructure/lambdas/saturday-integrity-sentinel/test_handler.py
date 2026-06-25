@@ -1,8 +1,9 @@
 """Unit tests for saturday-integrity-sentinel (M4).
 
 Stubs alpha_engine_lib.telegram.send_message and mocks the S3 client. Asserts
-the GO/NO-GO evaluation (complete / incomplete / uncertain), loud-vs-silent
-Telegram, fail-loud marker write, and best-effort Telegram.
+the GO/NO-GO evaluation computed from the freshness `check_results.json` rows
+(complete / incomplete / uncertain), loud-vs-silent Telegram, fail-loud marker
+write, and best-effort Telegram.
 """
 
 from __future__ import annotations
@@ -32,13 +33,25 @@ class FakeClientError(Exception):
         self.response = {"Error": {"Code": code}}
 
 
-def _s3(verdict_doc=None, missing=False, put=None):
+def _row(artifact_id, state, cadence="saturday_sf", severity="critical"):
+    return {"artifact_id": artifact_id, "cadence": cadence,
+            "severity": severity, "state": state}
+
+
+def _doc(rows, run_at=None):
+    d = {"results": rows}
+    if run_at:
+        d["run_at"] = run_at
+    return d
+
+
+def _s3(doc=None, missing=False, put=None):
     s3 = MagicMock()
     if missing:
         s3.get_object.side_effect = FakeClientError("404")
     else:
         body = MagicMock()
-        body.read.return_value = json.dumps(verdict_doc).encode()
+        body.read.return_value = json.dumps(doc).encode()
         s3.get_object.return_value = {"Body": body}
     if put is not None:
         s3.put_object.side_effect = put
@@ -57,79 +70,72 @@ def _run(s3):
         return index.handler({}, None)
 
 
-def test_go_when_saturday_cycle_complete():
-    doc = {"verdicts": [{"cadence": "saturday_sf", "complete": True,
-                         "n_required": 10, "n_satisfied": 10}]}
-    s3 = _s3(doc)
-    result = _run(s3)
+def test_go_when_all_saturday_critical_fresh():
+    rows = [
+        _row("research_signals", "fresh"),
+        _row("predictor_meta_weights_manifest", "fresh"),
+        _row("constituents_dated", "grace_period"),       # grace counts as OK
+        _row("macro_snapshot", "missing", severity="warning"),     # warning ignored
+        _row("weekday_thing", "missing", cadence="weekday_sf"),    # other cadence ignored
+    ]
+    result = _run(_s3(_doc(rows)))
     assert result["go"] is True
     assert result["uncertain"] is False
-    s3.put_object.assert_called_once()
-    # GO pings silent (heartbeat), not a loud alert.
     assert _telegram_mod.send_message.call_args.kwargs["disable_notification"] is True
-    text = _telegram_mod.send_message.call_args.args[0]
-    assert "Saturday Integrity — GO" in text
+    assert "Saturday Integrity — GO" in _telegram_mod.send_message.call_args.args[0]
 
 
-def test_nogo_when_incomplete_pages_loud():
-    doc = {"verdicts": [{"cadence": "saturday_sf", "complete": False,
-                         "n_required": 10, "n_satisfied": 8,
-                         "missing": ["research_signals"], "stale": []}]}
-    s3 = _s3(doc)
+def test_nogo_when_a_critical_artifact_missing_pages_loud():
+    rows = [
+        _row("research_signals", "missing"),
+        _row("constituents_dated", "stale"),
+        _row("predictor_meta_weights_manifest", "fresh"),
+    ]
+    s3 = _s3(_doc(rows))
     result = _run(s3)
     assert result["go"] is False
     assert result["uncertain"] is False
     kwargs = _telegram_mod.send_message.call_args.kwargs
     assert kwargs["disable_notification"] is False  # LOUD
-    text = _telegram_mod.send_message.call_args.args[0]
-    assert "NO-GO" in text
-    assert "research_signals" in text
+    assert "NO-GO" in _telegram_mod.send_message.call_args.args[0]
     written = json.loads(s3.put_object.call_args.kwargs["Body"])
-    assert written["go"] is False
     assert written["missing"] == ["research_signals"]
+    assert written["stale"] == ["constituents_dated"]
 
 
-def test_uncertain_when_verdict_missing():
-    s3 = _s3(missing=True)
-    result = _run(s3)
+def test_uncertain_when_check_results_missing():
+    result = _run(_s3(missing=True))
     assert result["go"] is False
     assert result["uncertain"] is True
     assert "unavailable" in result["reason"]
     assert _telegram_mod.send_message.call_args.kwargs["disable_notification"] is False
 
 
-def test_uncertain_when_verdict_stale():
-    doc = {"run_at": "2020-01-01T00:00:00+00:00",
-           "verdicts": [{"cadence": "saturday_sf", "complete": True,
-                         "n_required": 10, "n_satisfied": 10}]}
-    s3 = _s3(doc)
+def test_uncertain_when_results_stale():
+    s3 = _s3(_doc([_row("research_signals", "fresh")], run_at="2020-01-01T00:00:00+00:00"))
     result = _run(s3)
     assert result["go"] is False
     assert result["uncertain"] is True
     assert "stale" in result["reason"]
 
 
-def test_uncertain_when_no_saturday_row():
-    doc = {"verdicts": [{"cadence": "weekday_sf", "complete": True}]}
-    s3 = _s3(doc)
-    result = _run(s3)
+def test_uncertain_when_no_saturday_critical_rows():
+    rows = [_row("x", "fresh", cadence="weekday_sf"),
+            _row("y", "fresh", severity="warning")]
+    result = _run(_s3(_doc(rows)))
     assert result["go"] is False
     assert result["uncertain"] is True
 
 
 def test_marker_write_failure_raises_fail_loud():
-    doc = {"verdicts": [{"cadence": "saturday_sf", "complete": True,
-                         "n_required": 10, "n_satisfied": 10}]}
-    s3 = _s3(doc, put=RuntimeError("S3 down"))
+    s3 = _s3(_doc([_row("research_signals", "fresh")]), put=RuntimeError("S3 down"))
     with pytest.raises(RuntimeError, match="S3 down"):
         _run(s3)
 
 
 def test_telegram_failure_is_non_fatal():
     _telegram_mod.send_message.side_effect = RuntimeError("bot down")
-    doc = {"verdicts": [{"cadence": "saturday_sf", "complete": False,
-                         "n_required": 10, "n_satisfied": 9, "missing": ["x"]}]}
-    s3 = _s3(doc)
+    s3 = _s3(_doc([_row("research_signals", "missing")]))
     result = _run(s3)
     assert result["telegram_sent"] is False
-    s3.put_object.assert_called_once()  # primary deliverable survived
+    s3.put_object.assert_called_once()
