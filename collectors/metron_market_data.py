@@ -373,17 +373,6 @@ def _yfinance_classification(yf_symbols: list[str]) -> tuple[dict[str, str], dic
     return sectors, countries
 
 
-def _yfinance_sectors(yf_symbols: list[str]) -> dict[str, str]:
-    """GICS sector per held symbol (the sector half of ``_yfinance_classification``)."""
-    return _yfinance_classification(yf_symbols)[0]
-
-
-def _yfinance_countries(yf_symbols: list[str]) -> dict[str, str]:
-    """Country of domicile per held symbol (the country half of
-    ``_yfinance_classification``)."""
-    return _yfinance_classification(yf_symbols)[1]
-
-
 @_yf_quiet
 def _yfinance_spy_weights() -> dict[str, float]:
     """SPY's live GICS sector weights (canonical label → fraction) via
