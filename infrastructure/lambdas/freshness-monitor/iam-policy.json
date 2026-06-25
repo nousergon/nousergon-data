@@ -33,6 +33,12 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/*"
     },
     {
+      "Sid": "S3ListBucketProbe",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research"
+    },
+    {
       "Sid": "S3WriteMonitorArtifacts",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
