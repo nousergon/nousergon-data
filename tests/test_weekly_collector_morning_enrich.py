@@ -816,9 +816,13 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
     def _fake_loader(s3, bucket, run_date=None):
         return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
 
-    # happy path
+    # happy path. The prior-gap self-heal is a separate collaborator with its
+    # own test file (test_universe_gap_self_heal.py); no-op it here so this
+    # test isolates the same-day append behavior it asserts on.
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
     calls = []
     with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
          patch("builders._constituents_loader.load_constituents_for_run_date",
                side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append",
@@ -829,6 +833,7 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
 
     # load-bearing: append raises → failed
     with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
          patch("builders._constituents_loader.load_constituents_for_run_date",
                side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
@@ -866,7 +871,11 @@ def test_arctic_append_reads_constituents_by_run_date_not_pointer():
         return ({"AAPL", "MSFT", "NVDA"}, run_date)
 
     captured = []
+    # No-op the prior-gap self-heal (own test file) so the loader/append calls
+    # asserted below are exactly today's append, not the heal's per-day reads.
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
     with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
          patch("builders._constituents_loader.load_constituents_for_run_date",
                side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append",
