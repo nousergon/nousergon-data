@@ -238,3 +238,80 @@ def test_failed_state_none_when_state_exited_cleanly():
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
     assert result["failed_state"] is None
+
+
+# ── M2: repository_dispatch to the autonomous agent ─────────────────────────
+
+
+class _FakeResp:
+    status = 204
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_dispatch_disabled_by_default():
+    """AGENT_DISPATCH_ENABLED defaults false → no dispatch, action stays observe."""
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "disabled"}
+    assert result["action"] == "observe"
+
+
+def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    sent = {}
+
+    def fake_urlopen(req, timeout=None):
+        sent["url"] = req.full_url
+        sent["data"] = json.loads(req.data)
+        sent["auth"] = req.headers.get("Authorization")
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
+
+    assert result["agent_dispatch"] == {"dispatched": True, "status_code": 204}
+    assert result["action"] == "dispatched"
+    assert sent["url"].endswith("/repos/nousergon/alpha-engine-config/dispatches")
+    assert sent["data"]["event_type"] == "saturday-sf-failure"
+    cp = sent["data"]["client_payload"]
+    assert cp["failed_state"] == "RAGIngestion"
+    assert cp["run_date"] == "2023-11-14"
+    assert cp["watch_log_key"] == "consolidated/saturday_sf_watch/2023-11-14.json"
+    # Watch-log is written BEFORE dispatch (agent reads fresh context).
+    s3.put_object.assert_called_once()
+
+
+def test_dispatch_error_recorded_not_raised(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+
+    def boom():
+        raise RuntimeError("ssm denied")
+
+    monkeypatch.setattr(index, "_get_github_pat", boom)
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
+    assert result["agent_dispatch"]["dispatched"] is False
+    assert "ssm denied" in result["agent_dispatch"]["error"]
+    s3.put_object.assert_called_once()  # primary deliverable survived
+
+
+def test_pat_never_appears_in_result(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_SECRET_TOKEN")
+    monkeypatch.setattr(
+        index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp()
+    )
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
+    assert "ghp_SECRET_TOKEN" not in json.dumps(result)

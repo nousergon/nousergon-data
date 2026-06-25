@@ -18,8 +18,34 @@ Lambda:
    artifact location (the `sf-telegram-notifier` already pinged loud on the same
    FAILED event — this is the additive watch record, not a duplicate alert).
 
-It does **not** invoke any agent, touch any repo/IAM/SF definition, or rerun
-anything. `AGENT_DISPATCH_ENABLED` (default `false`) is the M2 seam.
+## M2 — agent dispatch (behind a flag, default OFF)
+
+When `AGENT_DISPATCH_ENABLED=true`, **after** writing the watch-log (so the
+agent reads fresh context) the Lambda also fires a GitHub `repository_dispatch`
+(`event_type=saturday-sf-failure`) to `DISPATCH_REPO`
+(`nousergon/alpha-engine-config`), passing the failure context
+(`execution_arn`, `failed_state`, `cause`, `run_date`, `watch_log_key`,
+`is_preflight`). That triggers the autonomous resilience-agent GHA workflow,
+which diagnoses → fixes → **merges** → **reruns the SF from the failed step**,
+then reports back (enriches the watch-log + dashboard + Telegram).
+
+The dispatch is **best-effort with a recording surface** (CLAUDE.md
+no-silent-fails secondary carve-out): a GitHub/SSM outage logs `WARNING` and is
+returned in `agent_dispatch.error`, but does NOT raise — the primary observe
+deliverable (watch-log) already landed. The PAT is read from SSM
+(`/alpha-engine/saturday_sf_watch/github_pat`, SecureString) at dispatch time
+and is never logged.
+
+**Activation (operator steps — keep `AGENT_DISPATCH_ENABLED=false` until done):**
+1. Mint a dedicated fine-grained PAT scoped to the Saturday-SF-path repos
+   (contents + pull-requests write) and store it:
+   `aws ssm put-parameter --name /alpha-engine/saturday_sf_watch/github_pat --type SecureString --value <PAT>`.
+2. Re-apply the dispatcher role policy so the new `AgentDispatchPAT` SSM grant
+   lands: `bash …/deploy.sh --bootstrap` (idempotent) — or `aws iam
+   put-role-policy` directly.
+3. Land the agent GHA workflow + scoped OIDC role (M2c, alpha-engine-config).
+4. Flip the flag:
+   `aws lambda update-function-configuration --function-name alpha-engine-saturday-sf-watch-dispatcher --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=true}' --query LastUpdateStatus --output text`.
 
 ## Why it's not a second notifier
 
@@ -65,10 +91,17 @@ detail.name:             execution id
 detail.startDate:        epoch ms
 ```
 
-## Next milestones (see #1227)
+## Milestones (see #1227)
 
-- **M2** — wire `repository_dispatch` (behind `AGENT_DISPATCH_ENABLED`) to the
-  agent GHA workflow; run propose-only.
-- **M3** — "Saturday SF Watch" dashboard page reading the watch-log artifact.
-- **M4** — independent artifact-integrity gate on the weekday pre-run.
-- **M5** — flip autonomous merge after the propose-only soak earns trust.
+- **M1** ✅ observe-only watch-log + Telegram receipt.
+- **M3** ✅ "Saturday SF Watch" dashboard page reading the watch-log.
+- **M2a** ✅ (this) `repository_dispatch` path behind `AGENT_DISPATCH_ENABLED`.
+- **M2c** — agent GHA workflow + charter + scoped OIDC role (with
+  `states:StartExecution` for the rerun) in alpha-engine-config; one-time
+  historical `workflow_dispatch` charter test, then flip the flag.
+- **M4** — independent artifact-integrity net on the weekday pre-run (parallel
+  swallow safeguard; non-blocking).
+
+**Posture (Brian-ratified):** ask-forgiveness — the agent merges the fix and
+reruns the SF from the failed step autonomously, then reports. The ONE
+forced-propose class is IAM (`put-role-policy` is human-gated).
