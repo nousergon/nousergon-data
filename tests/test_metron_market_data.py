@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 from unittest.mock import MagicMock
 
 from collectors import metron_market_data as mmd
@@ -223,31 +224,52 @@ class TestMacro:
 
 
 class TestReference:
-    def test_writes_sectors_and_earnings_keyed_by_yf_symbol(self):
+    def test_writes_sectors_countries_and_earnings_keyed_by_yf_symbol(self):
         s3 = _universe_s3(_UNIVERSE)
         result = mmd.collect_reference(
             bucket="b", run_date="2026-06-11", s3_client=s3,
             sector_source=lambda syms: {"AAPL": "Technology", "1299.HK": "Financial Services"},
+            country_source=lambda syms: {"AAPL": "United States", "1299.HK": "Hong Kong"},
             benchmark_source=lambda: {"Technology": 0.30, "Financial Services": 0.13},
             earnings_source=lambda syms: {"AAPL": "2026-07-30"},
         )
-        assert result["status"] == "ok" and result["sectors"] == 2 and result["earnings"] == 1
+        assert result["status"] == "ok" and result["sectors"] == 2 and result["countries"] == 2 and result["earnings"] == 1
         puts = _puts(s3)
         assert set(puts) == {"market_data/sectors/latest.json", "market_data/earnings/latest.json"}
         sec = puts["market_data/sectors/latest.json"]
         assert sec["schema_version"] == mmd.SECTORS_SCHEMA_VERSION
         assert sec["sectors"] == {"1299.HK": "Financial Services", "AAPL": "Technology"}
+        assert sec["countries"] == {"1299.HK": "Hong Kong", "AAPL": "United States"}
         assert sec["spy_sector_weights"]["Technology"] == 0.30
         assert puts["market_data/earnings/latest.json"]["earnings"] == {"AAPL": "2026-07-30"}
+
+    def test_sector_and_country_share_one_info_pass(self):
+        """When neither source is injected, the single ``.info`` pass populates both maps."""
+        s3 = _universe_s3(_UNIVERSE)
+        calls = {"n": 0}
+
+        def fake_classify(yf_symbols):
+            calls["n"] += 1
+            return ({"AAPL": "Technology"}, {"AAPL": "United States"})
+
+        with mock.patch.object(mmd, "_yfinance_classification", fake_classify), \
+             mock.patch.object(mmd, "_yfinance_spy_weights", lambda: {}), \
+             mock.patch.object(mmd, "_yfinance_earnings", lambda s: {}):
+            result = mmd.collect_reference(bucket="b", run_date="2026-06-11", s3_client=s3)
+        assert calls["n"] == 1  # one shared pass, not one per dimension
+        assert result["sectors"] == 1 and result["countries"] == 1
+        sec = _puts(s3)["market_data/sectors/latest.json"]
+        assert sec["countries"] == {"AAPL": "United States"}
 
     def test_reference_dry_run_and_empty_universe(self):
         s3 = _universe_s3(_UNIVERSE)
         r = mmd.collect_reference(bucket="b", run_date="2026-06-11", dry_run=True, s3_client=s3,
-                                  sector_source=lambda s: {"AAPL": "Technology"}, benchmark_source=lambda: {}, earnings_source=lambda s: {})
+                                  sector_source=lambda s: {"AAPL": "Technology"}, country_source=lambda s: {"AAPL": "United States"},
+                                  benchmark_source=lambda: {}, earnings_source=lambda s: {})
         assert r["status"] == "ok_dry_run"
         s3.put_object.assert_not_called()
         s3b = _universe_s3({"holdings": [], "currencies": []})
-        assert mmd.collect_reference(bucket="b", s3_client=s3b, sector_source=lambda s: {}, benchmark_source=lambda: {}, earnings_source=lambda s: {})["status"] == "skipped"
+        assert mmd.collect_reference(bucket="b", s3_client=s3b, sector_source=lambda s: {}, country_source=lambda s: {}, benchmark_source=lambda: {}, earnings_source=lambda s: {})["status"] == "skipped"
 
 
 class TestFundamentals:
