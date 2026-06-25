@@ -1,0 +1,4 @@
+# Pinned to match alpha-engine-data/requirements.txt (coherent lib substrate
+# across alpha-engine-data Lambdas; above the LibPinDriftCheck v0.39.0 floor).
+# Only the stable telegram.send_message primitive is used.
+alpha-engine-lib @ git+https://github.com/nousergon/nousergon-lib@v0.59.4
