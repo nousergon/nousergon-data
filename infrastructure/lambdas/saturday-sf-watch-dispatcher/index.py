@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.request
 from datetime import date, datetime, timezone
 
 import boto3
@@ -54,10 +55,23 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
 WATCH_PREFIX = os.environ.get("WATCH_PREFIX", "consolidated/saturday_sf_watch")
-# M2 seam — default OFF. M1 never dispatches; this is read + echoed only.
+# M2 gate — default OFF. When true, a Saturday failure also fires a
+# repository_dispatch that triggers the autonomous resilience agent (which
+# diagnoses → fixes → merges → reruns from the failed step). The watch-log is
+# written FIRST (so the agent reads fresh context), THEN the dispatch fires.
 AGENT_DISPATCH_ENABLED = (
     os.environ.get("AGENT_DISPATCH_ENABLED", "false").lower() == "true"
 )
+# repository_dispatch target — the private alpha-engine-config repo hosts the
+# agent GHA workflow (on: repository_dispatch, types: [saturday-sf-failure]).
+DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
+DISPATCH_EVENT_TYPE = os.environ.get("DISPATCH_EVENT_TYPE", "saturday-sf-failure")
+# Dedicated fine-grained PAT (SecureString) scoped to the Saturday-SF-path
+# repos. Read at dispatch time only — never logged.
+GITHUB_PAT_SSM_PARAM = os.environ.get(
+    "GITHUB_PAT_SSM_PARAM", "/alpha-engine/saturday_sf_watch/github_pat"
+)
+_DISPATCH_TIMEOUT_SEC = 15
 
 SATURDAY_SF_NAME = "alpha-engine-saturday-pipeline"
 SCHEMA_VERSION = 1
@@ -249,6 +263,61 @@ def _notify(record: dict, key: str) -> bool:
         return False
 
 
+def _get_github_pat() -> str:
+    """Read the dedicated fine-grained PAT (SecureString) from SSM. Never logged."""
+    ssm = boto3.client("ssm", region_name=REGION)
+    resp = ssm.get_parameter(Name=GITHUB_PAT_SSM_PARAM, WithDecryption=True)
+    return resp["Parameter"]["Value"]
+
+
+def _maybe_dispatch_agent(record: dict, run_date: str, key: str) -> dict:
+    """When AGENT_DISPATCH_ENABLED, fire a repository_dispatch that triggers the
+    autonomous resilience-agent GHA workflow in DISPATCH_REPO.
+
+    Best-effort with a recording surface (CLAUDE.md no-silent-fails secondary
+    carve-out): a GitHub/SSM outage logs WARN and is returned in the result, but
+    does NOT raise — the primary observe deliverable (watch-log) already landed.
+    The watch-log is written BEFORE this call so the agent reads fresh context.
+    """
+    if not AGENT_DISPATCH_ENABLED:
+        return {"dispatched": False, "reason": "disabled"}
+    try:
+        pat = _get_github_pat()
+        payload = {
+            "event_type": DISPATCH_EVENT_TYPE,
+            "client_payload": {
+                "execution_arn": record.get("execution_arn", ""),
+                "failed_state": record.get("failed_state"),
+                "cause": record.get("cause"),
+                "run_date": run_date,
+                "status": record.get("status"),
+                "watch_log_key": key,
+                "is_preflight": record.get("is_preflight", False),
+            },
+        }
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{DISPATCH_REPO}/dispatches",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {pat}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "saturday-sf-watch-dispatcher",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_DISPATCH_TIMEOUT_SEC) as resp:
+            status_code = resp.status
+        logger.info(
+            "agent repository_dispatch sent to %s (type=%s, http=%s)",
+            DISPATCH_REPO, DISPATCH_EVENT_TYPE, status_code,
+        )
+        return {"dispatched": True, "status_code": status_code}
+    except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised
+        logger.warning("agent repository_dispatch failed (non-fatal): %s", exc)
+        return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge handler — fires only on Saturday SF terminal failure
     (FAILED / TIMED_OUT / ABORTED), per the dedicated rule
@@ -271,10 +340,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     s3 = _s3_client()
     key = _write_watch_log(s3, run_date, record)  # PRIMARY — fail-loud
     telegram_sent = _notify(record, key)          # secondary — best-effort
+    # M2: fire the agent AFTER the watch-log lands (agent reads fresh context).
+    dispatch = _maybe_dispatch_agent(record, run_date, key)  # secondary
 
     logger.info(
-        "Saturday-SF Watch recorded: run_date=%s failed_state=%s key=%s telegram=%s",
-        run_date, record.get("failed_state"), key, telegram_sent,
+        "Saturday-SF Watch recorded: run_date=%s failed_state=%s key=%s telegram=%s dispatched=%s",
+        run_date, record.get("failed_state"), key, telegram_sent, dispatch.get("dispatched"),
     )
     return {
         "status": status,
@@ -284,5 +355,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "watch_log_key": key,
         "telegram_sent": telegram_sent,
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
-        "action": "observe",
+        "agent_dispatch": dispatch,
+        # "observe" until the agent enriches the event with its lane/action;
+        # when dispatch fires the agent owns the downstream action record.
+        "action": "dispatched" if dispatch.get("dispatched") else "observe",
     }
