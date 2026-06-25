@@ -36,8 +36,7 @@ _CHAIN = [
     ("CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "skip_chronic_gap_heal", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
-    ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "CheckSkipRunDailyNews"),
-    ("CheckSkipRunDailyNews", "RunDailyNews", "skip_run_daily_news", "PipelineComplete"),
+    ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "PipelineComplete"),
 ]
 
 
@@ -127,8 +126,11 @@ class TestEntryEdgesRouteThroughGates:
                    if c.get("StringEquals") == "Success"]
         assert success == ["CheckSkipRunDaemon"]
 
-    def test_daemon_enters_daily_news_gate(self, states):
-        assert states["RunDaemon"]["Next"] == "CheckSkipRunDailyNews"
+    def test_daemon_is_last_step(self, states):
+        # RunDailyNews removed (alpha-engine-config#1089): the standalone 04:00
+        # daily-news chain now produces the artifact, so the weekday SF ends at
+        # the daemon restart instead of routing into a news chain.
+        assert states["RunDaemon"]["Next"] == "PipelineComplete"
 
 
 class TestPaths:

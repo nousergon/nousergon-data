@@ -953,104 +953,7 @@
         }
       ],
       "ResultPath": "$.daemon_result",
-      "Next": "CheckSkipRunDailyNews"
-    },
-
-    "RunDailyNews": {
-      "Type": "Task",
-      "Comment": "Secondary daily news pull for the held + tracked universe (robodashboard holdings ∪ AE signals universe). Writes data/news_aggregates_daily/ for the robodashboard morning brief + AE consumers. Runs AFTER RunDaemon so it never delays the trading path. FAIL-SOFT: news must never fail the weekday SF — the Catch here, the WaitForDailyNews Catch, and the CheckDailyNewsStatus Default all route to PipelineComplete. ~50-70-ticker pull, concurrent fan-in via AsyncNewsAggregator (sources overlap), Polygon-bound at 5 req/min ≈ 12-14 min; executionTimeout 1800s gives headroom over that floor (bumped from 1200s 2026-06-09 — the sync aggregator summed sources sequentially and TimedOut every weekday, silently producing nothing; ROADMAP L4573).",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "export FLOW_DOCTOR_ENABLED=1",
-            "export ALPHA_ENGINE_DEPLOYED=1",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/daily-news.log \"s3://alpha-engine-research/_ssm_logs/daily-news/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/daily-news.log",
-            "python -m collectors.daily_news 2>&1 | tee -a /var/log/daily-news.log"
-          ],
-          "executionTimeout": ["1800"]
-        }
-      },
-      "TimeoutSeconds": 1860,
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Comment": "Daily news is secondary — a send failure must not fail the SF.",
-          "Next": "PipelineComplete",
-          "ResultPath": "$.daily_news_error"
-        }
-      ],
-      "ResultPath": "$.daily_news_result",
-      "Next": "WaitForDailyNews"
-    },
-
-    "WaitForDailyNews": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.daily_news_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Comment": "Fail-soft — a poll failure ends the SF cleanly, no news that day.",
-          "Next": "PipelineComplete",
-          "ResultPath": "$.daily_news_error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.daily_news_poll",
-      "Next": "CheckDailyNewsStatus"
-    },
-
-    "CheckDailyNewsStatus": {
-      "Type": "Choice",
-      "Comment": "Daily news is fail-soft: any terminal status (Success OR failure) ends the SF via PipelineComplete; only keep polling while InProgress/Pending.",
-      "Choices": [
-        {
-          "Variable": "$.daily_news_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "DailyNewsWait"
-        },
-        {
-          "Variable": "$.daily_news_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "DailyNewsWait"
-        }
-      ],
-      "Default": "PipelineComplete"
-    },
-
-    "DailyNewsWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForDailyNews"
+      "Next": "PipelineComplete"
     },
 
     "CheckSkipMorningEnrich": {
@@ -1231,32 +1134,17 @@
 
     "CheckSkipRunDaemon": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) to the next gate (CheckSkipRunDailyNews); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) directly to PipelineComplete; missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_run_daemon", "IsPresent": true},
             {"Variable": "$.skip_run_daemon", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipRunDailyNews"
-        }
-      ],
-      "Default": "RunDaemon"
-    },
-
-    "CheckSkipRunDailyNews": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daily_news\": true} routes past RunDailyNews directly to PipelineComplete; missing flag = run as normal. Daily news is already fail-soft. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
-        {
-          "And": [
-            {"Variable": "$.skip_run_daily_news", "IsPresent": true},
-            {"Variable": "$.skip_run_daily_news", "BooleanEquals": true}
-          ],
           "Next": "PipelineComplete"
         }
       ],
-      "Default": "RunDailyNews"
+      "Default": "RunDaemon"
     },
 
     "PipelineComplete": {
