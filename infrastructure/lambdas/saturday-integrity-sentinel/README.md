@@ -6,16 +6,22 @@ autonomous resilience agent. Spec: [nousergon/alpha-engine-config#1227](https://
 ## What it does
 
 Monday ~12:30 UTC (15 min before the weekday SF), it reads the freshness-monitor's
-pre-computed `saturday_sf` cycle-completion verdict
-(`s3://alpha-engine-research/_freshness_monitor/cycle_verdict.json`) and pages a
+per-spec `check_results.json`
+(`s3://alpha-engine-research/_freshness_monitor/check_results.json`), computes the
+`saturday_sf`-critical completeness itself, and pages a
 **GO / NO-GO**: are last Saturday's critical artifacts (signals, predictor
 weights manifest, constituents, training summary, …) actually present + fresh,
 so it's safe to trade on them today?
 
 - **GO** → silent heartbeat Telegram.
-- **NO-GO** (cycle incomplete, OR uncertain: verdict missing / monitor stale /
-  no `saturday_sf` row) → **LOUD** Telegram naming the missing/stale artifacts +
-  a marker at `consolidated/saturday_integrity/{date}.json` (dashboard surface).
+- **NO-GO** (a critical artifact missing/stale, OR uncertain: check_results
+  missing / monitor stale / no `saturday_sf`-critical rows) → **LOUD** Telegram
+  naming the missing/stale artifacts + a marker at
+  `consolidated/saturday_integrity/{date}.json` (dashboard surface).
+
+It computes completeness from the per-spec rows (the reliably-produced source)
+rather than the derived `cycle_verdict.json`, which the deployed freshness-monitor
+does not emit — depending on a maybe-absent artifact would false-alarm every Monday.
 
 ## Why it's the real safeguard
 

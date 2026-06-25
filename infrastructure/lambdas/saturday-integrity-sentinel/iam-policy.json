@@ -21,10 +21,10 @@
       ]
     },
     {
-      "Sid": "ReadFreshnessVerdict",
+      "Sid": "ReadFreshnessCheckResults",
       "Effect": "Allow",
       "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::alpha-engine-research/_freshness_monitor/cycle_verdict.json"
+      "Resource": "arn:aws:s3:::alpha-engine-research/_freshness_monitor/check_results.json"
     },
     {
       "Sid": "WriteIntegrityMarker",
