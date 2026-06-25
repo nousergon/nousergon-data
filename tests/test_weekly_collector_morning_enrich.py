@@ -812,12 +812,15 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
     returns failed (load-bearing) when the append errors."""
     config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
     args = SimpleNamespace(date="2026-04-22", dry_run=False)
-    fake_constituents = MagicMock()
-    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
 
     # happy path
     calls = []
-    with patch("weekly_collector.constituents", fake_constituents), \
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append",
                side_effect=lambda **k: calls.append(k) or {"status": "ok"}):
         ok = weekly_collector._run_morning_arctic_append(config, args)
@@ -825,10 +828,61 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
     assert calls and calls[0]["date_str"] == "2026-04-22"
 
     # load-bearing: append raises → failed
-    with patch("weekly_collector.constituents", fake_constituents), \
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
         bad = weekly_collector._run_morning_arctic_append(config, args)
     assert bad["status"] == "failed"
+
+
+def test_arctic_append_reads_constituents_by_run_date_not_pointer():
+    """REGRESSION (2026-06-25 weekday-SF halt): _run_morning_arctic_append must
+    load constituents via the run_date-DIRECT read, NOT the latest_weekly.json
+    pointer.
+
+    The pointer only advances on the weekly Saturday _write_manifest; daily
+    MorningEnrich writes the fresh dated weekly/{run_date}/constituents.json
+    but leaves the pointer stale. On an S&P-reconstitution week the pointer's
+    prior universe still lists the churn-out tickers — which are absent from
+    today's daily_closes — so daily_append's missing-from-closes guard counts
+    them as a data gap and halts the SF. Reading by run_date passes the FRESH
+    universe to expected_tickers, where the straggler-exclusion correctly
+    drops the churn-out tickers.
+    """
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    # No --date → run_date resolves to today's UTC calendar date (the date
+    # MorningEnrich wrote constituents under), and target_date to prior
+    # trading day. The two differ; the append must read by the RUN date.
+    args = SimpleNamespace(date=None, dry_run=False)
+
+    seen = {}
+
+    def _fake_loader(s3, bucket, run_date=None):
+        seen["run_date"] = run_date
+        # Fresh universe — churn-out tickers already removed.
+        return ({"AAPL", "MSFT", "NVDA"}, run_date)
+
+    captured = []
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: captured.append(k) or {"status": "ok"}):
+        out = weekly_collector._run_morning_arctic_append(config, args)
+
+    assert out["status"] == "ok"
+    # The loader was called with an explicit run_date (direct read), NOT None
+    # (which would be the stale-pointer fallback path).
+    assert seen.get("run_date") is not None, (
+        "must read constituents by run_date direct, not the latest_weekly pointer"
+    )
+    # Run date is today's UTC calendar date, distinct from the prior-trading-day
+    # target_date the append row is keyed on.
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert seen["run_date"] == today_utc
+    # The fresh universe is what flows into expected_tickers.
+    assert captured and set(captured[0]["expected_tickers"]) == {"AAPL", "MSFT", "NVDA"}
 
 
 # ── EOD daily_append split: PostMarketData + PostMarketArcticAppend (2026-06-16) ──

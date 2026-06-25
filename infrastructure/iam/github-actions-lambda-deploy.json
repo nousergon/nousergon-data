@@ -171,10 +171,7 @@
         "states:TagResource",
         "states:UntagResource"
       ],
-      "Resource": [
-        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
-      ]
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-*-pipeline"
     },
     {
       "Sid": "InfraDeployResourceCRUD",
