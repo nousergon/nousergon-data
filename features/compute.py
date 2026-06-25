@@ -713,8 +713,10 @@ def main():
         description="Compute and write feature store snapshots to S3",
     )
     parser.add_argument(
-        "--date", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        help="Target date (YYYY-MM-DD, default: today UTC)",
+        # config#1014: default resolved below on the trading-day axis (not
+        # calendar now()) so a Saturday run keys features/{Fri}/ not /{Sat}/.
+        "--date", default=None,
+        help="Target date (YYYY-MM-DD, default: last closed trading day)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -730,6 +732,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        args.date = default_run_date()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

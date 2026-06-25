@@ -552,7 +552,10 @@ def collect(
     """Read Metron's held universe → fetch EOD closes + FX → write the two artifacts
     (dated + ``latest``). Returns a status dict. ``close_source``/``fx_source`` inject
     fetchers for tests; ``s3_client`` injects a fake S3."""
-    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
@@ -664,7 +667,10 @@ def collect_reference(
         market_data/earnings/latest.json   {schema_version, as_of, earnings: {yf_symbol: date_iso}}
 
     Keyed by yf_symbol (consistent with the closes artifact). Injectable sources/S3."""
-    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
@@ -712,7 +718,10 @@ def collect_macro(
     curated CPI/employment/claims releases) for the Macro "Next expected" column + the
     Calendar page (metron-ops#49/#13). Injectable source(s)/S3 for tests; FRED key from
     ``alpha_engine_lib.secrets`` when not injected."""
-    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
@@ -804,7 +813,10 @@ def collect_fundamentals(
     ``FUNDAMENTALS_INFO_KEYS`` — the consumer owns display/unit semantics and pins
     ``schema_version``. Daily cadence (fundamentals move quarterly; daily is plenty).
     Injectable source/S3 for tests."""
-    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
