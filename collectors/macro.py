@@ -117,7 +117,9 @@ def collect(
         dict with status and any errors
     """
     if run_date is None:
-        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
 
     macro = _fetch_fred()
     market = _fetch_market_prices()

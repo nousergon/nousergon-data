@@ -442,7 +442,10 @@ def collect(
     if window_days < 1:
         raise ValueError(f"window_days must be >= 1, got {window_days}")
 
-    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
 
     if window_days > 1:
         return _collect_window(

@@ -851,9 +851,11 @@ def test_arctic_append_reads_constituents_by_run_date_not_pointer():
     drops the churn-out tickers.
     """
     config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
-    # No --date → run_date resolves to today's UTC calendar date (the date
-    # MorningEnrich wrote constituents under), and target_date to prior
-    # trading day. The two differ; the append must read by the RUN date.
+    # No --date → run_date resolves to the trading-day-axis default (config#1014:
+    # the date MorningEnrich wrote constituents under, mirroring
+    # ``run_date = args.date or default_run_date()`` in _run_morning_enrich), and
+    # target_date to the prior trading day. The two differ; the append must read
+    # by the RUN date.
     args = SimpleNamespace(date=None, dry_run=False)
 
     seen = {}
@@ -877,10 +879,15 @@ def test_arctic_append_reads_constituents_by_run_date_not_pointer():
     assert seen.get("run_date") is not None, (
         "must read constituents by run_date direct, not the latest_weekly pointer"
     )
-    # Run date is today's UTC calendar date, distinct from the prior-trading-day
-    # target_date the append row is keyed on.
-    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    assert seen["run_date"] == today_utc
+    # Run date is the trading-day-axis default (config#1014) — the same
+    # chokepoint expression _run_morning_arctic_append uses — distinct from the
+    # prior-trading-day target_date the append row is keyed on. Assert against
+    # the chokepoint directly so the test is axis-correct and not flaky across
+    # the NYSE close (a raw calendar-now string would diverge from the migrated
+    # trading_day default on weekends/pre-open).
+    import dates
+
+    assert seen["run_date"] == dates.default_run_date()
     # The fresh universe is what flows into expected_tickers.
     assert captured and set(captured[0]["expected_tickers"]) == {"AAPL", "MSFT", "NVDA"}
 

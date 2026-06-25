@@ -535,7 +535,10 @@ def collect(
     Returns:
         dict with status, tickers_processed, tickers_failed, errors
     """
-    run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
     s3 = boto3.client("s3")
 
     # Resolve ticker list

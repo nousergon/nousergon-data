@@ -99,7 +99,9 @@ def collect(
         ok_count >= MIN_OK_RATIO * ticker_count, else ``"error"``.
     """
     if run_date is None:
-        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
 
     if not tickers:
         return {
