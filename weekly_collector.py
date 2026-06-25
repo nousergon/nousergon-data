@@ -1441,13 +1441,59 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     # Load the constituents MorningEnrich just refreshed to S3 (post-prune
     # universe scope for daily_append's expected-ticker check). S3 → Wikipedia
     # fallback, mirroring _run_daily.
+    #
+    # MUST read THIS run's dated constituents directly, NOT the
+    # ``latest_weekly.json`` pointer. The pointer only advances on the weekly
+    # (Saturday) ``_write_manifest``; daily MorningEnrich writes the dated
+    # ``weekly/{run_date}/constituents.json`` but leaves the pointer alone. So
+    # a pointer-following read (``constituents.load_from_s3``) returns the
+    # PRIOR weekly universe — and on an S&P-reconstitution week that universe
+    # still lists the churn-out tickers. They are absent from today's
+    # daily_closes (collected against the fresh universe), so daily_append's
+    # missing-from-closes guard counts them as a data gap and halts the SF.
+    # (2026-06-25: pointer stuck at 2026-06-19; BLKB/BRBR/CNXC/COTY/CPB/POOL/
+    # SATS dropped in the 06-22 reconstitution → 7 > threshold 5 → halt.)
+    # The straggler-exclusion in daily_append only works when expected_tickers
+    # is the FRESH universe; reading by run_date restores that invariant.
+    # Same pointer-vs-direct-read TOCTOU defect class closed for backfill/prune
+    # via ``builders._constituents_loader``; this is the third in-repo reader.
     tickers: list[str] = []
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
+    # Calendar run date == the date MorningEnrich wrote constituents under
+    # (``run_date = args.date or now_utc`` in _run_morning_enrich). Mirror that
+    # expression exactly so we read the file this run produced — NOT
+    # target_date, which is the prior trading day the append ROW is keyed on.
+    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
-        existing = constituents.load_from_s3(bucket, market_prefix)
-        if existing:
-            tickers = existing.get("tickers", [])
-            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+        from builders._constituents_loader import load_constituents_for_run_date
+        s3 = boto3.client("s3")
+        try:
+            tickers_set, weekly_date = load_constituents_for_run_date(
+                s3, bucket, run_date=run_date
+            )
+            tickers = sorted(tickers_set)
+            logger.info(
+                "Loaded %d tickers from S3 constituents (run_date=%s direct)",
+                len(tickers), weekly_date,
+            )
+        except Exception as direct_exc:
+            # Standalone append rerun on a day MorningEnrich didn't run (no
+            # dated file). Fall back to the pointer — stale-but-present beats
+            # empty; the straggler-exclusion degrades gracefully to the prior
+            # weekly universe, same as before this fix.
+            logger.warning(
+                "Direct constituents read for run_date=%s failed (%s) — "
+                "falling back to latest_weekly.json pointer",
+                run_date, direct_exc,
+            )
+            tickers_set, weekly_date = load_constituents_for_run_date(
+                s3, bucket, run_date=None
+            )
+            tickers = sorted(tickers_set)
+            logger.info(
+                "Loaded %d tickers from S3 constituents (pointer→%s fallback)",
+                len(tickers), weekly_date,
+            )
     except Exception as exc:
         logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
