@@ -92,11 +92,13 @@ FUNDAMENTALS_INFO_KEYS = [
 INTRADAY_PREFIX = "market_data/intraday/"
 # Major US-index ETF proxies for Metron's Overview "markets" strip — refreshed in the
 # same intraday run (market context, fetched independent of the held universe). The
-# index VALUES (^GSPC / ^IXIC / ^RUT) carry a separate index license; the tradeable ETF
-# prices are ordinary equity trades, so the ETF is published as the index proxy and
-# Metron maps each symbol to the index it tracks. Quotes land under the artifact's
-# `indices` key (same per-symbol shape as held `quotes`).
-INDEX_PROXY_SYMBOLS = ["SPY", "QQQ", "IWM"]
+# index VALUES (^GSPC / ^IXIC / ^NDX / ^RUT) carry a separate index license; the tradeable
+# ETF prices are ordinary equity trades, so the ETF is published as the index proxy and
+# Metron maps each symbol to the index it tracks. ONEQ (Nasdaq Composite) and QQQ
+# (Nasdaq-100) are both carried because the broad Composite and the mega-cap-100 routinely
+# diverge intraday — the headline "Nasdaq" most readers see is the Composite. Quotes land
+# under the artifact's `indices` key (same per-symbol shape as held `quotes`).
+INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1

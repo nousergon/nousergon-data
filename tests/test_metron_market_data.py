@@ -291,6 +291,8 @@ class TestIntraday:
     _INDEX_QUOTES = {
         "SPY": {"last": 605.2, "open": 603.0, "prev_close": 602.4,
                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+        "ONEQ": {"last": 101.4, "open": 100.8, "prev_close": 100.5,
+                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
         "QQQ": {"last": 540.1, "open": 538.5, "prev_close": 537.0,
                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
         "IWM": {"last": 215.3, "open": 216.0, "prev_close": 216.5,
@@ -322,7 +324,7 @@ class TestIntraday:
             bucket="b", s3_client=s3, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
             now=self._RTH,
         )
-        assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 3
+        assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 4
         puts = _puts(s3)
         assert set(puts) == {"market_data/intraday/latest.json"}
         art = puts["market_data/intraday/latest.json"]
@@ -344,7 +346,7 @@ class TestIntraday:
         result = mmd.collect_intraday(
             bucket="b", s3_client=empty, intraday_source=self._stub(self._INDEX_QUOTES), now=self._RTH,
         )
-        assert result["status"] == "ok" and result["quotes"] == 0 and result["indices"] == 3
+        assert result["status"] == "ok" and result["quotes"] == 0 and result["indices"] == 4
         art = _puts(empty)["market_data/intraday/latest.json"]
         assert art["quotes"] == {}
         assert set(art["indices"]) == set(mmd.INDEX_PROXY_SYMBOLS)
@@ -420,5 +422,5 @@ class TestIntraday:
             bucket="b", s3_client=s3, dry_run=True,
             intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES), now=self._RTH,
         )
-        assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 3
+        assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 4
         assert not s3.put_object.called
