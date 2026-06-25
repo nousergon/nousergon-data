@@ -46,7 +46,7 @@ class TestQuietYfinance:
         # run quieted, or one bad symbol storms Flow Doctor again.
         for fn in (
             mmd._yfinance_closes, mmd._yfinance_fx, mmd._yf_history,
-            mmd._yfinance_sectors, mmd._yfinance_spy_weights,
+            mmd._yfinance_classification, mmd._yfinance_spy_weights,
             mmd._yfinance_earnings, mmd._yfinance_fundamentals,
             mmd._yfinance_intraday,
         ):

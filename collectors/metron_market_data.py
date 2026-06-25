@@ -103,7 +103,7 @@ CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
 FX_HISTORY_SCHEMA_VERSION = 1
-SECTORS_SCHEMA_VERSION = 1
+SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
 FUNDAMENTALS_SCHEMA_VERSION = 1
@@ -135,9 +135,11 @@ FxSource = Callable[[list[str]], dict[str, float]]
 # History sources map symbols/currencies → {key: [(date_iso, value), …]} ascending.
 CloseHistorySource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 FxHistorySource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
-# Reference sources: sectors maps yf_symbols → {yf_symbol: gics}; benchmark weights is a
+# Reference sources: sectors maps yf_symbols → {yf_symbol: gics}; countries maps
+# yf_symbols → {yf_symbol: country-of-domicile}; benchmark weights is a
 # 0-arg → {sector: weight}; earnings maps yf_symbols → {yf_symbol: date_iso}.
 SectorSource = Callable[[list[str]], dict[str, str]]
+CountrySource = Callable[[list[str]], dict[str, str]]
 BenchmarkWeightsSource = Callable[[], dict[str, float]]
 EarningsSource = Callable[[list[str]], dict[str, str]]
 # A macro source maps FRED series ids → {series_id: [(date_iso, value), …]} ascending.
@@ -341,24 +343,34 @@ def _yfinance_fx_history(currencies: list[str], period: str = DEFAULT_HISTORY_PE
 
 
 @_yf_quiet
-def _yfinance_sectors(yf_symbols: list[str]) -> dict[str, str]:
-    """Canonical GICS sector per held symbol via ``yf.Ticker(sym).info['sector']``.
-    Fail-soft: an unclassifiable symbol is omitted (Metron shows a coverage gap)."""
+def _yfinance_classification(yf_symbols: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Canonical GICS sector AND country-of-domicile per held symbol from a SINGLE
+    ``yf.Ticker(sym).info`` pass (``info['sector']`` + ``info['country']``) — country is
+    a zero-extra-API-cost addition to the existing sector fetch. Returns
+    ``(sectors, countries)``. Fail-soft per symbol: an unclassifiable symbol is omitted
+    from the respective map (Metron shows a coverage gap, never a guessed value)."""
     try:
         import yfinance as yf
     except ImportError:  # pragma: no cover
-        return {}
-    out: dict[str, str] = {}
+        return {}, {}
+    sectors: dict[str, str] = {}
+    countries: dict[str, str] = {}
     for sym in yf_symbols:
         try:
-            sector = (yf.Ticker(sym).info or {}).get("sector")
+            info = yf.Ticker(sym).info or {}
+            sector = info.get("sector")
             if sector:
-                out[sym] = str(sector)
+                sectors[sym] = str(sector)
+            country = info.get("country")
+            if country:
+                countries[sym] = str(country)
         except Exception as e:
-            logger.warning("[metron_market_data] sector fetch failed for %s: %s", sym, e)
-    logger.info("[metron_market_data] sectors: %d/%d classified", len(out), len(yf_symbols))
-    _log_yf_coverage("sectors", yf_symbols, out)
-    return out
+            logger.warning("[metron_market_data] classification fetch failed for %s: %s", sym, e)
+    logger.info("[metron_market_data] sectors: %d/%d classified, countries: %d/%d domiciled",
+                len(sectors), len(yf_symbols), len(countries), len(yf_symbols))
+    _log_yf_coverage("sectors", yf_symbols, sectors)
+    _log_yf_coverage("countries", yf_symbols, countries)
+    return sectors, countries
 
 
 @_yf_quiet
@@ -660,15 +672,17 @@ def collect_history(
 def collect_reference(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None, sector_source: SectorSource | None = None,
+    country_source: CountrySource | None = None,
     benchmark_source: BenchmarkWeightsSource | None = None, earnings_source: EarningsSource | None = None,
 ) -> dict:
     """Write the GICS-sectors + earnings reference artifacts for Metron's held universe —
     moving Metron's last external (yfinance) fetches to the spine:
 
-        market_data/sectors/latest.json   {schema_version, as_of, sectors: {yf_symbol: gics}, spy_sector_weights: {sector: weight}}
+        market_data/sectors/latest.json   {schema_version, as_of, sectors: {yf_symbol: gics}, countries: {yf_symbol: country}, spy_sector_weights: {sector: weight}}
         market_data/earnings/latest.json   {schema_version, as_of, earnings: {yf_symbol: date_iso}}
 
-    Keyed by yf_symbol (consistent with the closes artifact). Injectable sources/S3."""
+    Keyed by yf_symbol (consistent with the closes artifact). Injectable sources/S3.
+    Sector + country share a single ``.info`` pass when neither is injected."""
     if run_date is None:
         from dates import default_run_date  # config#1014: trading-day axis
 
@@ -680,26 +694,36 @@ def collect_reference(
     if not holdings:
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
-    sectors = (sector_source or _yfinance_sectors)(yf_symbols)
+    # Sector + country come from one ``.info`` pass; an injected source overrides its
+    # dimension (tests), and the shared fetch only runs if a real fetch is still needed.
+    fetched_sectors: dict[str, str] | None = None
+    fetched_countries: dict[str, str] | None = None
+    if sector_source is None or country_source is None:
+        fetched_sectors, fetched_countries = _yfinance_classification(yf_symbols)
+    sectors = sector_source(yf_symbols) if sector_source else (fetched_sectors or {})
+    countries = country_source(yf_symbols) if country_source else (fetched_countries or {})
     spy_weights = (benchmark_source or _yfinance_spy_weights)()
     earnings = (earnings_source or _yfinance_earnings)(yf_symbols)
     sectors_artifact = {"schema_version": SECTORS_SCHEMA_VERSION, "as_of": run_date,
-                        "sectors": dict(sorted(sectors.items())), "spy_sector_weights": dict(sorted(spy_weights.items()))}
+                        "sectors": dict(sorted(sectors.items())),
+                        "countries": dict(sorted(countries.items())),
+                        "spy_sector_weights": dict(sorted(spy_weights.items()))}
     earnings_artifact = {"schema_version": EARNINGS_SCHEMA_VERSION, "as_of": run_date,
                          "earnings": dict(sorted(earnings.items()))}
     if dry_run:
-        logger.info("[metron_market_data] DRY-RUN reference: %d sectors, %d spy-weights, %d earnings",
-                    len(sectors), len(spy_weights), len(earnings))
-        return {"status": "ok_dry_run", "sectors": len(sectors), "earnings": len(earnings)}
+        logger.info("[metron_market_data] DRY-RUN reference: %d sectors, %d countries, %d spy-weights, %d earnings",
+                    len(sectors), len(countries), len(spy_weights), len(earnings))
+        return {"status": "ok_dry_run", "sectors": len(sectors), "countries": len(countries), "earnings": len(earnings)}
     try:
         _write_json(s3_client, bucket, f"{SECTORS_PREFIX}latest.json", sectors_artifact)
         _write_json(s3_client, bucket, f"{EARNINGS_PREFIX}latest.json", earnings_artifact)
     except Exception as e:  # fail loud
         logger.error("[metron_market_data] reference write failed: %s", e)
         return {"status": "error", "error": str(e)}
-    logger.info("[metron_market_data] wrote %d sectors + %d spy-weights + %d earnings",
-                len(sectors), len(spy_weights), len(earnings))
-    return {"status": "ok", "sectors": len(sectors), "spy_weights": len(spy_weights), "earnings": len(earnings)}
+    logger.info("[metron_market_data] wrote %d sectors + %d countries + %d spy-weights + %d earnings",
+                len(sectors), len(countries), len(spy_weights), len(earnings))
+    return {"status": "ok", "sectors": len(sectors), "countries": len(countries),
+            "spy_weights": len(spy_weights), "earnings": len(earnings)}
 
 
 def collect_macro(
