@@ -1,0 +1,8 @@
+# alpha-engine-lib provides:
+#   - alpha_engine_lib.trading_calendar.{is_trading_day,last_closed_trading_day}
+#     for NYSE-holiday-aware trading-day gating
+# Pinned to match the freshness-monitor sibling watchdog Lambda; keeping the
+# pin coherent across sibling Lambdas avoids divergence on lib-side helpers.
+# (The package still imports as ``alpha_engine_lib`` at this pin — the rename
+# to ``nousergon_lib`` lands at 0.60.0; siblings have not yet crossed it.)
+alpha-engine-lib @ git+https://github.com/nousergon/nousergon-lib@v0.40.0
