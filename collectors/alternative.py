@@ -948,6 +948,27 @@ def _fmp_get(endpoint: str, params: dict | None = None) -> dict | list:
 # preserves call-site readability without duplicating throttle logic.
 from .finnhub_client import finnhub_get as _finnhub_get  # noqa: E402
 
+# yfinance ``Ticker.info`` does its own HTTP internally (curl_cffi / requests
+# under the hood), so the L4499 ``request_with_retry`` chokepoint — which owns
+# the GET + status interpretation — cannot wrap it. We instead reuse only the
+# shared ``backoff_delay`` math (full-jitter exponential backoff) around a
+# bespoke per-ticker attempt loop, exactly as the module docstring's
+# ``http_retry`` design note sanctions for consumers with their own control
+# flow. This mirrors the resilience intent of the Finnhub analyst-gap fix
+# (collectors/finnhub_client.py, #397 / #399) — a one-off Yahoo throttle or
+# 5xx must not silently null the ``target_price`` half of analyst_consensus —
+# without inventing a second retry mechanism.
+from alpha_engine_lib.http_retry import backoff_delay  # noqa: E402
+
+# Tight attempt cap (issue L4611): yfinance ``.info`` is slow and heavily
+# Yahoo-throttled, and target_price is NOT the gating field for the
+# analyst_consensus populated-ratio gate (``_has_analyst_data`` is satisfied by
+# Finnhub rating / num_analysts / earnings). So we keep this to 2 attempts with
+# a low backoff cap to bound the alt-data collection runtime within its SSM
+# budget. (The Finnhub sibling uses 3 attempts because it IS the gating source.)
+_YF_INFO_MAX_ATTEMPTS = 2
+_YF_INFO_BACKOFF_CAP = 4.0  # seconds — low cap; runtime-bounded, not gating
+
 
 # ---- 1. Analyst consensus ----
 
@@ -1019,9 +1040,35 @@ def _fetch_analyst(ticker: str) -> dict:
     # the Buy/Hold/Sell classification; yfinance's count is the analyst
     # coverage universe for the price-target aggregation). Populate
     # ``num_analysts`` from yfinance only if Finnhub did not supply one.
+    # Bounded retry on the transient class. yfinance ``.info`` is a single
+    # opaque property access (it owns its own HTTP), so — unlike the Finnhub
+    # sibling — there is no Response/status to inspect: any raise is treated as
+    # transient and retried up to ``_YF_INFO_MAX_ATTEMPTS`` with full-jitter
+    # backoff (shared ``backoff_delay`` math), then degrades loudly (WARN, never
+    # raises — a per-ticker yfinance outage must not poison the Phase 2 batch).
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
+
+        info = None
+        last_exc: Exception | None = None
+        for attempt in range(_YF_INFO_MAX_ATTEMPTS):
+            try:
+                info = yf.Ticker(ticker).info
+                break
+            except Exception as e:  # noqa: BLE001 — yfinance raises opaque types
+                last_exc = e
+                if attempt == _YF_INFO_MAX_ATTEMPTS - 1:
+                    raise
+                delay = backoff_delay(attempt, cap=_YF_INFO_BACKOFF_CAP)
+                logger.warning(
+                    "yfinance .info transient for %s — backing off %.1fs "
+                    "(attempt %d/%d): %s",
+                    ticker, delay, attempt + 1, _YF_INFO_MAX_ATTEMPTS,
+                    _scrub_url_creds(e),
+                )
+                time.sleep(delay)
+
+        info = info or {}
         target = info.get("targetMeanPrice")
         if target is not None:
             result["target_price"] = round(float(target), 2)
