@@ -158,9 +158,12 @@ if $BOOTSTRAP; then
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
-    # OBSERVE-mode default: MNEMON_FRESHNESS_MONITOR_ENABLED=false.
-    # Phase 6 cutover flips via update-function-configuration without
-    # redeploying. ≥2 weekly soak cycles before flip.
+    # ENFORCE mode: MNEMON_FRESHNESS_MONITOR_ENABLED=true.
+    # Phase 6 cutover EXECUTED 2026-06-25 after a ~1mo observe soak (the
+    # monitor correctly detected the missed 6/20 Saturday cycle the whole
+    # time but stayed muted). Code is now the source of truth for the flag —
+    # a fresh bootstrap comes up enforcing. For an already-deployed function,
+    # flip live via `aws lambda update-function-configuration` (no redeploy).
     run aws lambda create-function \
       --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 \
@@ -169,7 +172,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 120 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,MNEMON_FRESHNESS_MONITOR_ENABLED=false}' \
+      --environment 'Variables={LOG_LEVEL=INFO,MNEMON_FRESHNESS_MONITOR_ENABLED=true}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
