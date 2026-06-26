@@ -324,7 +324,7 @@ def orig_spot_cmds() -> dict:
       `'trap \\'aws s3 cp ...\\' EXIT'` inside `commands.$ States.Array`
       (ASL doesn't unescape `\\'` in arg strings — caught by the
       Friday-PM dry-pass). The baseline now reflects the lib-CLI form:
-      `python -m alpha_engine_lib.ssm_log_capture run --slug X
+      `python -m nousergon_lib.ssm_log_capture run --slug X
       --log Y -- bash <launcher>`. The keystone's byte-identicality
       proof against the new baseline still holds (the absent path runs
       the same lib-CLI invocation with `preflight_args=""`).
@@ -637,7 +637,7 @@ class TestByteIdenticalAbsentPath:
             ``{token} --preflight-only 2>&1 | tee {log}``
         to
             ``/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m
-              alpha_engine_lib.ssm_log_capture run --slug X --log Y --
+              nousergon_lib.ssm_log_capture run --slug X --log Y --
               {token} --preflight-only``
         as part of the inline-trap-to-lib-CLI lift (alpha-engine-lib PR #57).
         The lib CLI internalizes tee + S3-ship; --preflight-only still
@@ -652,7 +652,7 @@ class TestByteIdenticalAbsentPath:
         final = cmds[-1]
         expected = (
             "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
-            "-m alpha_engine_lib.ssm_log_capture run "
+            "-m nousergon_lib.ssm_log_capture run "
             f"--slug {slug} --log {log} -- "
             f"{token} --preflight-only"
         )

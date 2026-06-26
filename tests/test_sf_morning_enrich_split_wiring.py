@@ -234,7 +234,7 @@ class TestSsmCommandShape:
 
     def test_morning_enrich_log_capture_via_lib_cli(self, states):
         """The trap-and-log-ship invariant is now satisfied by the
-        alpha_engine_lib.ssm_log_capture Python CLI (lib v0.25.0), not
+        nousergon_lib.ssm_log_capture Python CLI (lib v0.25.0), not
         by an inline `trap 'aws s3 cp ...' EXIT` line. The 2026-05-22
         Friday-PM dry-pass caught the prior inline-trap form failing
         under ASL States.Array escape semantics (`\\'` not unescaped to
@@ -247,7 +247,7 @@ class TestSsmCommandShape:
         work_idx = next(
             i
             for i, c in enumerate(cmds)
-            if "alpha_engine_lib.ssm_log_capture run" in c
+            if "nousergon_lib.ssm_log_capture run" in c
         )
         work = cmds[work_idx]
         # Right slug and log path
