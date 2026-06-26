@@ -29,9 +29,12 @@ from __future__ import annotations
 
 from typing import Any
 
-# Wave 3 PR1 — legacy primary, new mirror. The cutover PR (Wave 3 PR4) flips
-# ``PRICE_CACHE_NEW_PREFIX`` to first position and removes the legacy entry
-# from ``price_cache_write_prefixes`` (one-line edit at that time).
+# Wave 3 PR4 (cutover, DONE) — ``reference/price_cache/`` is the sole write +
+# read home. ``PRICE_CACHE_LEGACY_PREFIX`` is retained only as the
+# production-default *sentinel* the prod call sites still pass (the helper
+# translates it to the reference prefix) and so the constant remains importable
+# for any historical reference; the legacy tree itself is removed live via
+# ``aws s3 rm --recursive s3://alpha-engine-research/predictor/price_cache/``.
 PRICE_CACHE_LEGACY_PREFIX = "predictor/price_cache/"
 PRICE_CACHE_NEW_PREFIX = "reference/price_cache/"
 
@@ -39,45 +42,46 @@ PRICE_CACHE_NEW_PREFIX = "reference/price_cache/"
 def price_cache_write_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[str]:
     """Return the active write prefixes for ticker parquet uploads.
 
-    During the Wave 3 write-both soak (this PR through Wave 3 PR4 cutover):
+    Wave 3 PR4 cutover (this edit) retired the write-both soak: ticker
+    parquets now write to ``reference/price_cache/`` ONLY. The legacy
+    ``predictor/price_cache/`` tree is no longer written and is removed
+    live via ``aws s3 rm --recursive`` once this lands.
 
-      * ``primary == "predictor/price_cache/"`` (the production default) →
-        ``["predictor/price_cache/", "reference/price_cache/"]`` — every
-        ticker-parquet write hits both prefixes byte-for-byte.
+      * ``primary == "predictor/price_cache/"`` (the production-default
+        sentinel that prod call sites still pass) → ``["reference/price_cache/"]``
+        — the sole surviving home.
       * ``primary`` is any other string (custom prefix from a test or a
-        config override) → ``[primary]`` — single-write fallback. Tests
-        that need to assert a single-prefix write pass an explicit custom
-        prefix; production paths use the default and get write-both.
+        config override) → ``[primary]`` — single-write, prefix honored
+        verbatim.
 
     Callers wrap their upload in::
 
         for prefix in price_cache_write_prefixes(s3_prefix):
             s3.upload_file(local_path, bucket, f"{prefix}{ticker}.parquet")
 
-    The order is deterministic (legacy first, new second) so a fail-fast
-    upload error on the legacy prefix preserves the existing pre-Wave-3
-    failure semantics — the new prefix never silently masks a legacy
-    write failure.
+    The default-sentinel argument is kept (rather than retargeting the
+    call sites) so the helper stays the single chokepoint for the prefix
+    contract — call sites pass their config-derived ``s3_prefix`` and the
+    helper owns the legacy→reference translation.
     """
     if primary == PRICE_CACHE_LEGACY_PREFIX:
-        return [PRICE_CACHE_LEGACY_PREFIX, PRICE_CACHE_NEW_PREFIX]
+        return [PRICE_CACHE_NEW_PREFIX]
     return [primary]
 
 
 def price_cache_read_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[str]:
     """Return active READ prefixes in fallback order.
 
-    Companion to :func:`price_cache_write_prefixes` — the Wave-3 reader
-    migration (PR3+) iterates this in fallback order so the new prefix
-    is consulted first and the legacy prefix is the safety net during
-    the soak window.
+    Companion to :func:`price_cache_write_prefixes`. Wave-3 PR4 cutover
+    (this edit) dropped the legacy ``predictor/price_cache/`` fallback in
+    the same change that retired write-both: with the producer writing
+    only ``reference/price_cache/`` and the legacy tree slated for
+    ``aws s3 rm``, reads resolve from ``reference/`` alone.
 
-      * ``primary == "predictor/price_cache/"`` (the production default) →
-        ``["reference/price_cache/", "predictor/price_cache/"]``: try
-        the new prefix first (post-PR4 it's the sole survivor), fall
-        back to legacy on miss for the soak period.
-      * ``primary`` is any other string → ``[primary]`` (single-read
-        fallback, mirrors the test-friendly write-side semantics).
+      * ``primary == "predictor/price_cache/"`` (the production-default
+        sentinel) → ``["reference/price_cache/"]``: the sole surviving home.
+      * ``primary`` is any other string → ``[primary]`` (single-read,
+        prefix honored verbatim — mirrors the write-side semantics).
 
     Callers wrap their reads in::
 
@@ -86,12 +90,9 @@ def price_cache_read_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[
                 return s3.get_object(Bucket=bucket, Key=f"{prefix}{name}")
             except ClientError:
                 continue
-
-    At Wave-3 PR4 cutover the legacy entry is removed here in the same
-    edit that flips the write helper — one-line change in each.
     """
     if primary == PRICE_CACHE_LEGACY_PREFIX:
-        return [PRICE_CACHE_NEW_PREFIX, PRICE_CACHE_LEGACY_PREFIX]
+        return [PRICE_CACHE_NEW_PREFIX]
     return [primary]
 
 

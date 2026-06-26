@@ -300,38 +300,32 @@ def test_load_parquet_warmup_prefers_new_prefix(monkeypatch):
     )
 
 
-def test_load_parquet_warmup_falls_back_to_legacy_on_new_prefix_miss(monkeypatch):
-    """When the new prefix is empty (e.g. the soak-window backfill hasn't
-    seeded a brand-new ticker yet) the legacy fallback is consulted; if
-    legacy has the parquet the helper returns it.
+def test_load_parquet_warmup_does_not_consult_legacy_after_cutover(monkeypatch):
+    """Wave-3 PR4 cutover: the legacy fallback is dropped. A miss on the
+    ``reference/`` prefix is the end of the chain — the helper does NOT fall
+    back to ``predictor/price_cache/`` (which is removed live via
+    ``aws s3 rm``). A new-prefix NoSuchKey degrades straight to None.
     """
-    good_df = pd.DataFrame(
-        {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [1]},
-        index=pd.DatetimeIndex(["2026-04-20"]),
-    )
     calls: list[str] = []
 
     def _stub(_s3, _bucket, key):
         calls.append(key)
-        if key.startswith("reference/"):
-            raise _fake_client_error("NoSuchKey")
-        return good_df
+        raise _fake_client_error("NoSuchKey")
 
     monkeypatch.setattr(daily_append, "load_parquet_from_s3", _stub)
 
     result = daily_append._load_parquet_warmup(MagicMock(), "b", "AAPL")
-    assert result is not None
-    assert calls == [
-        "reference/price_cache/AAPL.parquet",
-        "predictor/price_cache/AAPL.parquet",
-    ], "Fallback order must be new → legacy (read = write reversed)."
+    assert result is None
+    assert calls == ["reference/price_cache/AAPL.parquet"], (
+        "Post-cutover the read chain is reference-only — the legacy "
+        "predictor/price_cache/ prefix must NOT be consulted."
+    )
 
 
-def test_load_parquet_warmup_returns_none_when_absent_in_both_prefixes(monkeypatch):
-    """A ticker absent from BOTH prefixes is a genuine "not in price
-    cache yet" state (brand-new constituent the weekly backfill hasn't
-    picked up). Both prefix lookups must be attempted before the helper
-    degrades to None — a single-prefix NoSuchKey is no longer sufficient.
+def test_load_parquet_warmup_returns_none_when_absent_from_reference(monkeypatch):
+    """A ticker absent from ``reference/`` is a genuine "not in price cache
+    yet" state (brand-new constituent the weekly backfill hasn't picked up).
+    Post-cutover that's a single-prefix lookup — no legacy second attempt.
     """
     calls: list[str] = []
 
@@ -343,7 +337,7 @@ def test_load_parquet_warmup_returns_none_when_absent_in_both_prefixes(monkeypat
 
     result = daily_append._load_parquet_warmup(MagicMock(), "b", "NEWIPO")
     assert result is None
-    assert len(calls) == 2, (
-        "When the new prefix is missing the helper must still try legacy "
-        "before declaring the ticker absent."
+    assert calls == ["reference/price_cache/NEWIPO.parquet"], (
+        "Post-cutover only the reference prefix is consulted before "
+        "declaring the ticker absent."
     )
