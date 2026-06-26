@@ -303,6 +303,73 @@ class TestFundamentals:
         assert mmd.collect_fundamentals(bucket="b", s3_client=empty)["status"] == "skipped"
 
 
+class TestAnalyst:
+    def test_writes_consensus_keyed_by_yf_symbol(self):
+        s3 = _universe_s3(_UNIVERSE)
+        source = lambda syms: {
+            "AAPL": {"consensus_rating": "buy", "rating_score": 0.5,
+                     "mean_target": 240.0, "median_target": 238.0, "num_analysts": 38},
+            "1299.HK": {"consensus_rating": "strongBuy", "rating_score": 1.0,
+                        "mean_target": 95.0, "num_analysts": 12},
+        }
+        result = mmd.collect_analyst(
+            bucket="b", run_date="2026-06-26", s3_client=s3, analyst_source=source
+        )
+        assert result["status"] == "ok" and result["analyst"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/analyst/latest.json"}
+        art = puts["market_data/analyst/latest.json"]
+        assert art["schema_version"] == mmd.ANALYST_SCHEMA_VERSION
+        assert art["source"] == "yfinance+finnhub"
+        # Pass-through: values land exactly as the source returned them.
+        assert art["analyst"]["AAPL"]["mean_target"] == 240.0
+        assert art["analyst"]["1299.HK"]["rating_score"] == 1.0
+
+    def test_analyst_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_analyst(
+            bucket="b", s3_client=s3, dry_run=True,
+            analyst_source=lambda s: {"AAPL": {"consensus_rating": "hold"}},
+        )
+        assert result["status"] == "ok_dry_run"
+        assert not s3.put_object.called
+        empty = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_analyst(bucket="b", s3_client=empty)["status"] == "skipped"
+
+    def test_yfinance_analyst_derives_rating_score_and_omits_empty(self, monkeypatch):
+        """`_yfinance_analyst` maps the rating ladder → signed score, drops None
+        fields, and omits a symbol whose snapshot is entirely empty (coverage gap,
+        not zeros)."""
+        from types import SimpleNamespace
+
+        snaps = {
+            "AAPL": SimpleNamespace(consensus_rating="strongBuy", mean_target=240.0,
+                                    median_target=238.0, num_analysts=40),
+            "MSFT": SimpleNamespace(consensus_rating="sell", mean_target=None,
+                                    median_target=None, num_analysts=5),
+            # entirely empty → omitted
+            "NOPE": SimpleNamespace(consensus_rating=None, mean_target=None,
+                                    median_target=None, num_analysts=None),
+            # adapter returns None (fetch miss) → omitted
+            "MISS": None,
+        }
+
+        class _FakeAdapter:
+            def fetch(self, ticker):
+                return snaps.get(ticker)
+
+        monkeypatch.setattr(
+            "collectors.analyst_sources.YfinanceAnalystAdapter", lambda: _FakeAdapter()
+        )
+        # No Finnhub key → no rating backfill (secrets via the lib, not os.environ).
+        monkeypatch.setattr("alpha_engine_lib.secrets.get_secret", lambda *a, **k: "")
+        out = mmd._yfinance_analyst(["AAPL", "MSFT", "NOPE", "MISS"])
+        assert set(out) == {"AAPL", "MSFT"}  # empty + miss omitted
+        assert out["AAPL"]["rating_score"] == 1.0  # strongBuy
+        assert out["MSFT"]["rating_score"] == -0.5  # sell
+        assert "mean_target" not in out["MSFT"]  # None dropped
+
+
 class TestIntraday:
     _QUOTES = {
         "AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
