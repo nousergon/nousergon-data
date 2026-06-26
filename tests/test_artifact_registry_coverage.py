@@ -73,6 +73,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/daily_closes_fred_repair.py": 1,
     "collectors/fred_history.py": 1,
     "collectors/fundamentals.py": 1,
+    "collectors/historical_constituents.py": 1,  # market_data/historical_constituents.json — PIT S&P 500 membership (#657, G12)
     "collectors/macro.py": 3,  # weekly/<date>/macro.json + macro_history.parquet + macro_release_calendar.parquet
     "collectors/metron_market_data.py": 1,  # one _write_json site → market_data/eod_closes/* + market_data/fx/*
     "collectors/prices.py": 1,
