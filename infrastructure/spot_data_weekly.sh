@@ -23,7 +23,7 @@
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 2).**
 # Communication with the spot is now via `aws ssm send-command`
 # (IAM-authenticated, CloudTrail-audited) wrapped at the lib chokepoint
-# `python -m alpha_engine_lib.ssm_dispatcher run`. No port-22 inbound on
+# `python -m nousergon_lib.ssm_dispatcher run`. No port-22 inbound on
 # the spot SG; no ssh / scp / ssh-keyscan. The private config.yaml is
 # staged to a temporary S3 prefix the dispatcher controls and pulled
 # down by the spot via its existing `alpha-engine-executor-profile` IAM
@@ -219,7 +219,7 @@ echo "  Run mode      : $RUN_MODE"
 echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (relaunch on confirmed spot interruption)"
 echo "  Preflight-only: $PREFLIGHT_ONLY  (1 = boot + preflight + exit 0, NO fetch/write)"
 echo "  S3 bucket     : $S3_BUCKET"
-echo "  Transport     : SSM via lib chokepoint (python -m alpha_engine_lib.ssm_dispatcher)"
+echo "  Transport     : SSM via lib chokepoint (python -m nousergon_lib.ssm_dispatcher)"
 echo ""
 
 # ── Preflight ───────────────────────────────────────────────────────────────
@@ -340,7 +340,7 @@ trap on_exit EXIT
 
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
-INSTANCE_ID=$("$LIB_PYTHON" -m alpha_engine_lib.ec2_spot launch \
+INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
     --types "$INSTANCE_TYPES" \
     --subnets "$SUBNETS" \
     --image-id "$AMI_ID" \
@@ -400,7 +400,7 @@ done
 # ── SSM dispatch primitive (lib chokepoint) ──────────────────────────────────
 # run_ssm "<description>" [timeout_seconds] <<HEREDOC ... HEREDOC
 #
-# Thin wrapper around `python -m alpha_engine_lib.ssm_dispatcher run` (lib
+# Thin wrapper around `python -m nousergon_lib.ssm_dispatcher run` (lib
 # v0.35.0+). The lib base64-wraps the script body (read from stdin via the
 # `--script-stdin` flag) for AWS-RunShellScript transport, polls
 # get-command-invocation, streams StandardOutputContent delta to this
@@ -437,7 +437,7 @@ done
 # (substrate is failure-only).
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
-    "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
+    "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
         --instance-id "$INSTANCE_ID" \
         --description "data-weekly: $description" \
         --timeout "$timeout_s" \
