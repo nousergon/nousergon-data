@@ -49,6 +49,16 @@ _GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 _INTER_REQUEST_SLEEP_SECONDS = 1.0
 
 
+# GDELT periodically returns HTTP 429 under load (it has no documented hard
+# rate cap, so the 1s inter-request spacing is heuristic). Without honoring
+# Retry-After, every 429 dropped that ticker's coverage on the daily pull
+# (the fail-soft `continue` path) — config#663. On a 429 we wait the
+# server-advertised Retry-After (clamped) and retry the ticker ONCE before
+# giving up, recovering breadth without stalling the whole pull.
+_RETRY_AFTER_FALLBACK_SECONDS = 2.0
+_RETRY_AFTER_MAX_SECONDS = 30.0
+
+
 class GdeltNewsAdapter:
     """GDELT 2.0 DOC API adapter. Implements ``NewsSource``.
 
@@ -94,24 +104,70 @@ class GdeltNewsAdapter:
                 "enddatetime": end.strftime("%Y%m%d%H%M%S"),
                 "sort": "DateDesc",
             }
-            try:
-                resp = self._http.get(
-                    _GDELT_DOC_API,
-                    params=params,
-                    timeout=20,
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-            except Exception as e:
-                logger.warning(
-                    "[gdelt_news] fetch failed for %s: %s", ticker, e
-                )
+            payload = self._fetch_one(ticker, params)
+            if payload is None:
                 continue
             for item in payload.get("articles", []) or []:
                 article = _to_article(item, ticker=ticker)
                 if article is not None:
                     articles.append(article)
         return articles
+
+    def _fetch_one(self, ticker: str, params: dict) -> dict | None:
+        """Fetch one ticker's articles, honoring a 429 ``Retry-After`` with a
+        single bounded retry. Returns the parsed JSON payload, or ``None`` on
+        terminal failure (the caller skips the ticker — fail-soft)."""
+        for attempt in range(2):  # one initial + one retry-after-429
+            try:
+                resp = self._http.get(
+                    _GDELT_DOC_API,
+                    params=params,
+                    timeout=20,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[gdelt_news] fetch failed for %s: %s", ticker, e
+                )
+                return None
+
+            if getattr(resp, "status_code", None) == 429 and attempt == 0:
+                wait = _retry_after_seconds(resp)
+                logger.warning(
+                    "[gdelt_news] 429 for %s — honoring Retry-After=%.1fs "
+                    "then retrying once", ticker, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            try:
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.warning(
+                    "[gdelt_news] fetch failed for %s: %s", ticker, e
+                )
+                return None
+        return None
+
+
+def _retry_after_seconds(resp: Any) -> float:
+    """Parse a 429 response's ``Retry-After`` header into a clamped sleep.
+
+    Honors the integer-seconds form (the only form GDELT/CDN proxies emit in
+    practice). Falls back to a small fixed wait when the header is missing or
+    unparseable, and clamps to ``_RETRY_AFTER_MAX_SECONDS`` so a hostile or
+    buggy header can't stall the whole daily pull."""
+    headers = getattr(resp, "headers", None) or {}
+    raw = headers.get("Retry-After")
+    wait = _RETRY_AFTER_FALLBACK_SECONDS
+    if raw is not None:
+        try:
+            wait = float(int(str(raw).strip()))
+        except (TypeError, ValueError):
+            wait = _RETRY_AFTER_FALLBACK_SECONDS
+    if wait < 0:
+        wait = _RETRY_AFTER_FALLBACK_SECONDS
+    return min(wait, _RETRY_AFTER_MAX_SECONDS)
 
 
 def _build_query(ticker: str, company_name: str) -> str:
