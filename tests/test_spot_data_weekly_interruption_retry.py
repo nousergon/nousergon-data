@@ -4,7 +4,7 @@ infrastructure/spot_data_weekly.sh.
 Origin: 2026-05-30 Saturday SF DataPhase1 failure. The nested data spot
 (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-
 workload* with spot-request status `instance-terminated-no-capacity`.
-The lib launcher (alpha_engine_lib.ec2_spot) rotates instance_type ×
+The lib launcher (nousergon_lib.ec2_spot) rotates instance_type ×
 subnet on *acquisition* capacity errors, but nothing relaunched after a
 *mid-run* reclamation — the workload SSM command returned ResponseCode
 -1, the orchestrator exited 1, and the entire weekly pipeline failed.
@@ -67,7 +67,7 @@ class TestTrapInstalledBeforeLaunch:
         covers an all-combinations-exhausted launch (rc 64), not only a
         mid-run reclamation."""
         trap_at = text.index("trap on_exit EXIT")
-        launch_at = text.index("alpha_engine_lib.ec2_spot launch")
+        launch_at = text.index("nousergon_lib.ec2_spot launch")
         assert trap_at < launch_at, (
             "trap on_exit EXIT must be installed before the spot launch."
         )
