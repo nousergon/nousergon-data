@@ -370,6 +370,61 @@ class TestAnalyst:
         assert "mean_target" not in out["MSFT"]  # None dropped
 
 
+class TestSentiment:
+    def test_writes_sentiment_keyed_by_yf_symbol(self):
+        s3 = _universe_s3(_UNIVERSE)
+        source = lambda syms: {
+            "AAPL": {"sentiment": 0.42, "sentiment_mean": 0.30, "n_articles": 12,
+                     "event_count": 2, "event_severity_max": 0.6, "as_of": "2026-06-25"},
+            "1299.HK": {"sentiment": -0.1, "n_articles": 3, "as_of": "2026-06-24"},
+        }
+        result = mmd.collect_sentiment(
+            bucket="b", run_date="2026-06-26", s3_client=s3, sentiment_source=source
+        )
+        assert result["status"] == "ok" and result["sentiment"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/sentiment/latest.json"}
+        art = puts["market_data/sentiment/latest.json"]
+        assert art["schema_version"] == mmd.SENTIMENT_SCHEMA_VERSION
+        assert art["source"] == "news_aggregates_daily(LM)"
+        assert art["sentiment"]["AAPL"]["sentiment"] == 0.42
+        assert art["sentiment"]["AAPL"]["as_of"] == "2026-06-25"
+
+    def test_sentiment_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_sentiment(
+            bucket="b", s3_client=s3, dry_run=True,
+            sentiment_source=lambda s: {"AAPL": {"sentiment": 0.1}},
+        )
+        assert result["status"] == "ok_dry_run"
+        assert not s3.put_object.called
+        empty = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_sentiment(bucket="b", s3_client=empty)["status"] == "skipped"
+
+    def test_news_sentiment_latest_per_ticker_and_omits_uncovered(self, monkeypatch):
+        """`_news_sentiment` picks the most-recent row per ticker, maps
+        trusted_mean → `sentiment`, coerces NaN → None, and omits held symbols
+        with no news coverage."""
+        import pandas as pd
+
+        df = pd.DataFrame([
+            # AAPL: two dates → the later (06-25) row must win
+            {"ticker": "AAPL", "aggregate_date": "2026-06-24", "lm_sentiment_trusted_mean": 0.10,
+             "lm_sentiment_mean": 0.05, "n_articles": 4, "event_count": 0, "event_severity_max": 0.0},
+            {"ticker": "AAPL", "aggregate_date": "2026-06-25", "lm_sentiment_trusted_mean": 0.42,
+             "lm_sentiment_mean": 0.30, "n_articles": 12, "event_count": 2, "event_severity_max": 0.6},
+            # TSLA present in news but NOT in the held universe → filtered out
+            {"ticker": "TSLA", "aggregate_date": "2026-06-25", "lm_sentiment_trusted_mean": 0.9,
+             "lm_sentiment_mean": 0.9, "n_articles": 50, "event_count": 1, "event_severity_max": 0.2},
+        ])
+        monkeypatch.setattr("collectors.daily_news.read_daily_news", lambda *a, **k: df)
+        out = mmd._news_sentiment(["AAPL", "1299.HK"])  # 1299.HK has no news row → omitted
+        assert set(out) == {"AAPL"}
+        assert out["AAPL"]["sentiment"] == 0.42  # latest date won
+        assert out["AAPL"]["as_of"] == "2026-06-25"
+        assert out["AAPL"]["n_articles"] == 12
+
+
 class TestIntraday:
     _QUOTES = {
         "AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
