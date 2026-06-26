@@ -342,6 +342,35 @@ def _emit_cycle_metrics(cw_client: Any, verdict_payload: dict[str, Any]) -> None
         cw_client.put_metric_data(Namespace=CW_NAMESPACE, MetricData=metric_data)
 
 
+def _emit_cycle_verdict_error(stage: str) -> None:
+    """Emit one ``ArtifactFreshnessCycleVerdictError`` datapoint (Value=1.0) so a
+    swallowed cycle-verdict rollup failure has an alarmable recording surface
+    (config#1236) — not only the absence/staleness of ``cycle_verdict.json``.
+
+    Dimensioned by ``Stage`` (``serialize_or_s3_write`` / ``cw_metric_emit``) to
+    locate the failing step. Best-effort: the emit itself is trapped so this
+    error-signal path can never sink the monitor (and a missing PutMetricData
+    grant — the very thing it might be reporting — won't raise here).
+    """
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace=CW_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": "ArtifactFreshnessCycleVerdictError",
+                    "Dimensions": [{"Name": "Stage", "Value": stage}],
+                    "Value": 1.0,
+                    "Unit": "Count",
+                }
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — error-signal emit must never raise
+        logger.warning(
+            "failed to emit ArtifactFreshnessCycleVerdictError[%s] (non-fatal): %s",
+            stage, exc,
+        )
+
+
 # ── Alerting (gated on ALERTS_ENABLED) ──────────────────────────────────────
 
 
@@ -741,26 +770,46 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     # ── Per-cycle completion rollup (L249 consumer) ─────────────────────
     # Secondary observability hung off the primary probe pass. The artifact
-    # write comes first (S3 PutObject is already granted); the CW emit is
-    # last (it needs the cloudwatch:PutMetricData grant added in iam-policy.json,
-    # which only takes effect on the next deploy). The whole block is wrapped
-    # so a failure here can NEVER take down the monitor's primary deliverables
-    # (check_results + heartbeat + alerts), already persisted above.
-    #   (a) swallowed failure: cycle-verdict compute / S3 write / CW put error.
-    #   (c) recording surface: the WARN log below (CW Logs) + the staleness of
-    #       cycle_verdict.json (itself a monitorable artifact).
+    # The S3 verdict write comes first (S3 PutObject is already granted); the
+    # CW emit is independent (it needs the cloudwatch:PutMetricData grant in
+    # iam-policy.json, scoped to the AlphaEngine/Substrate namespace). Both are
+    # wrapped so a failure here can NEVER take down the monitor's primary
+    # deliverables (check_results + heartbeat + alerts), already persisted above.
+    #
+    # The two side effects are split into INDEPENDENT traps so a CW-emit failure
+    # (e.g. a PutMetricData grant regression) cannot suppress the cycle_verdict.json
+    # write — config#1236 found the deployed Lambda not emitting cycle_verdict.json
+    # and the single combined trap masked which step failed. Each trap now:
+    #   (a) records the swallowed failure with exc_info (full CW Logs traceback), and
+    #   (b) emits an ArtifactFreshnessCycleVerdictError CW datapoint dimensioned by
+    #       the failing Stage, so a silent rollup failure is alarmable rather than
+    #       only visible by the absence/staleness of cycle_verdict.json.
     # Per CLAUDE.md no-silent-fails secondary-observability carve-out.
     cycle_verdicts: dict[str, str] = {}
+    verdict_payload: dict[str, Any] | None = None
     try:
         verdict_payload = _serialize_cycle_verdicts(pairs, now)
         _put_json(s3, REGISTRY_BUCKET, CYCLE_VERDICT_KEY, verdict_payload)
-        _emit_cycle_metrics(boto3.client("cloudwatch"), verdict_payload)
         cycle_verdicts = {
             v["cadence"]: v["state"] for v in verdict_payload["verdicts"]
         }
         logger.info("cycle verdicts: %s", cycle_verdicts)
     except Exception as exc:  # noqa: BLE001 — secondary observability, must not sink the monitor
-        logger.warning("cycle-completion rollup failed (non-fatal): %s", exc)
+        logger.warning(
+            "cycle-verdict serialize/S3-write failed (non-fatal): %s", exc, exc_info=True
+        )
+        _emit_cycle_verdict_error("serialize_or_s3_write")
+
+    # CW metric emit is best-effort and independent of the S3 write above: even
+    # if it fails (grant regression), cycle_verdict.json is already persisted.
+    if verdict_payload is not None:
+        try:
+            _emit_cycle_metrics(boto3.client("cloudwatch"), verdict_payload)
+        except Exception as exc:  # noqa: BLE001 — observability emit, must not sink the monitor
+            logger.warning(
+                "cycle-completion CW metric emit failed (non-fatal): %s", exc, exc_info=True
+            )
+            _emit_cycle_verdict_error("cw_metric_emit")
 
     logger.info(
         "freshness-monitor complete: %s checked, %s alerted, %s per-spec exceptions, "

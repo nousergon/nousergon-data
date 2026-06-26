@@ -840,3 +840,73 @@ def test_handler_cycle_rollup_failure_is_non_fatal(
     assert "_freshness_monitor/heartbeat.json" in put_keys
     assert "_freshness_monitor/check_results.json" in put_keys
     assert "_freshness_monitor/cycle_verdict.json" not in put_keys
+
+
+def test_handler_cw_emit_failure_does_not_suppress_cycle_verdict_write(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """config#1236: a CloudWatch put_metric_data failure (e.g. a grant
+    regression) must NOT prevent the cycle_verdict.json S3 write — the two side
+    effects are independently trapped, so the verdict artifact still lands even
+    when the metric emit blows up."""
+    fake_s3._registry_body = yaml_registry_body
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    # The metric emit (only) explodes — S3 write already happened before it.
+    def _boom(*a, **kw):
+        raise RuntimeError("PutMetricData AccessDenied")
+    monkeypatch.setattr(index, "_emit_cycle_metrics", _boom)
+
+    result = index.handler({}, None)
+
+    # cycle_verdict.json was still written despite the CW failure.
+    put_keys = [k for (_, k, _) in fake_s3._put_calls]
+    assert "_freshness_monitor/cycle_verdict.json" in put_keys
+    # The verdict map is populated (it is built before the CW emit), so a
+    # downstream consumer of the return is unaffected by the metric failure.
+    assert result["cycle_verdicts"] != {}
+
+
+def test_handler_cycle_verdict_error_metric_on_swallowed_failure(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """config#1236: a swallowed cycle-verdict failure emits an alarmable
+    ArtifactFreshnessCycleVerdictError datapoint (dimensioned by the failing
+    Stage) so the silent block has a real recording surface — not only the
+    absence of cycle_verdict.json."""
+    fake_s3._registry_body = yaml_registry_body
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    def _boom(*a, **kw):
+        raise RuntimeError("serialize exploded")
+    monkeypatch.setattr(index, "_serialize_cycle_verdicts", _boom)
+
+    result = index.handler({}, None)
+
+    assert result["cycle_verdicts"] == {}
+    # An error-signal datapoint was emitted, dimensioned by the failing stage.
+    error_calls = [
+        kw for (_, kw) in fake_s3.put_metric_data.call_args_list
+        if any(
+            m["MetricName"] == "ArtifactFreshnessCycleVerdictError"
+            for m in kw.get("MetricData", [])
+        )
+    ]
+    assert error_calls, "expected an ArtifactFreshnessCycleVerdictError datapoint"
+    stages = {
+        m["Dimensions"][0]["Value"]
+        for kw in error_calls
+        for m in kw["MetricData"]
+        if m["MetricName"] == "ArtifactFreshnessCycleVerdictError"
+    }
+    assert "serialize_or_s3_write" in stages
