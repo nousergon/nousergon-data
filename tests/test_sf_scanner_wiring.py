@@ -135,27 +135,41 @@ class TestFailureIsolation:
 
 
 class TestEdges:
-    def test_data_phase1_skip_path_routes_to_scanner(self, states):
-        # CheckSkipDataPhase1's skip branch (operator passes
-        # skip_data_phase1=true) routes through Scanner unconditionally,
-        # matching the success path. Anyone re-introducing a gate here
-        # silently disables observation on phase1-skip reruns.
-        skip = states["CheckSkipDataPhase1"]
+    def test_data_phase1_skip_path_routes_to_parallel(self, sf):
+        # config#885: the Scanner→RAG→Regime chain was relocated INTO
+        # ResearchPredictorParallel Branch A (Scanner is now Branch A's
+        # StartAt) so PredictorTraining (Branch B) forks parallel to it
+        # right after DataPhase1. CheckSkipDataPhase1's skip branch
+        # therefore now routes to the Parallel (whose Branch A still runs
+        # Scanner unconditionally — observe-mode is NOT re-gated, just
+        # relocated). Anyone re-introducing a gate at Branch A's head
+        # would silently disable observation on phase1-skip reruns.
+        skip = sf["States"]["CheckSkipDataPhase1"]
         skip_choices = skip["Choices"]
         assert any(
-            c["Next"] == "Scanner" for c in skip_choices
-        ), "CheckSkipDataPhase1 skip branch must route directly to Scanner."
+            c["Next"] == "ResearchPredictorParallel" for c in skip_choices
+        ), (
+            "CheckSkipDataPhase1 skip branch must route to "
+            "ResearchPredictorParallel (config#885: Scanner moved into "
+            "Branch A as its StartAt)."
+        )
+        # Scanner remains the unconditional head of Branch A.
+        par = sf["States"]["ResearchPredictorParallel"]
+        assert par["Branches"][0]["StartAt"] == "Scanner"
 
-    def test_data_phase1_success_path_routes_to_scanner(self, states):
-        status = states["CheckDataPhase1Status"]
+    def test_data_phase1_success_path_routes_to_parallel(self, sf):
+        status = sf["States"]["CheckDataPhase1Status"]
         success = next(
             c for c in status["Choices"]
             if c.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "Scanner", (
-            "CheckDataPhase1Status Success branch must route directly "
-            "to Scanner — no intermediate gate."
+        assert success["Next"] == "ResearchPredictorParallel", (
+            "CheckDataPhase1Status Success branch must route to "
+            "ResearchPredictorParallel — config#885 forked the Scanner "
+            "chain into Branch A so it runs parallel to PredictorTraining."
         )
+        par = sf["States"]["ResearchPredictorParallel"]
+        assert par["Branches"][0]["StartAt"] == "Scanner"
 
     def test_scanner_success_routes_to_check_skip_rag(self, states):
         assert states["Scanner"]["Next"] == "CheckSkipRAGIngestion"

@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline \u2014 orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich \u2014 plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md \u2014 for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email \u2014 pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot \u2014 accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich — plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
   "StartAt": "InitializeInput",
   "States": {
     "InitializeInput": {
@@ -17,8 +17,14 @@
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_lib_pin_drift_check", "IsPresent": true},
-            {"Variable": "$.skip_lib_pin_drift_check", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_lib_pin_drift_check",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_lib_pin_drift_check",
+              "BooleanEquals": true
+            }
           ],
           "Next": "CheckMutexRole"
         }
@@ -78,13 +84,28 @@
       "Choices": [
         {
           "And": [
-            {"Variable": "$.pipeline_role", "IsPresent": true},
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
             {
               "Or": [
-                {"Variable": "$.pipeline_role", "StringEquals": "daily"},
-                {"Variable": "$.pipeline_role", "StringEquals": "weekly"},
-                {"Variable": "$.pipeline_role", "StringEquals": "eod"},
-                {"Variable": "$.pipeline_role", "StringEquals": "shell-run"}
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "daily"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "weekly"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "eod"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "shell-run"
+                }
               ]
             }
           ],
@@ -103,22 +124,34 @@
           "mutex_key": {
             "S.$": "States.Format('{}#{}#{}:{}', $$.StateMachine.Name, $.pipeline_role, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
           },
-          "execution_arn": {"S.$": "$$.Execution.Id"},
-          "started_at": {"S.$": "$$.Execution.StartTime"},
-          "state_machine": {"S.$": "$$.StateMachine.Name"},
-          "pipeline_role": {"S.$": "$.pipeline_role"}
+          "execution_arn": {
+            "S.$": "$$.Execution.Id"
+          },
+          "started_at": {
+            "S.$": "$$.Execution.StartTime"
+          },
+          "state_machine": {
+            "S.$": "$$.StateMachine.Name"
+          },
+          "pipeline_role": {
+            "S.$": "$.pipeline_role"
+          }
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
       },
       "Catch": [
         {
-          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
           "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert.",
           "Next": "MutexConflict",
           "ResultPath": "$.mutex_conflict"
         },
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review.",
           "Next": "CheckShellRun",
           "ResultPath": "$.mutex_error"
@@ -183,7 +216,7 @@
     },
     "MorningEnrich": {
       "Type": "Task",
-      "Comment": "Friday polygon-T+1 daily_closes fill (weekly_collector.py --morning-enrich) on a dedicated spot EC2. Split out of DataPhase1 by the preflight-task-split (2026-05-16): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run this completed ~28-min step. Mirrors the RAGIngestion split precedent \u2014 its own spot, watchdog budget, per-state health marker, and a proper UNION entry preflight (preflight.py mode 'morning_enrich': polygon + FRED secrets + reachability + S3 writeable + ArcticDB libraries present; deliberately NO ArcticDB-freshness check \u2014 morning-enrich is part of what makes it fresh). ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 28-min morning-enrich on a downstream redrive.",
+      "Comment": "Friday polygon-T+1 daily_closes fill (weekly_collector.py --morning-enrich) on a dedicated spot EC2. Split out of DataPhase1 by the preflight-task-split (2026-05-16): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run this completed ~28-min step. Mirrors the RAGIngestion split precedent — its own spot, watchdog budget, per-state health marker, and a proper UNION entry preflight (preflight.py mode 'morning_enrich': polygon + FRED secrets + reachability + S3 writeable + ArcticDB libraries present; deliberately NO ArcticDB-freshness check — morning-enrich is part of what makes it fresh). ~7 min extra bootstrap vs the prior bundled design — accepted in exchange for never re-paying the 28-min morning-enrich on a downstream redrive.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -301,8 +334,14 @@
       "Choices": [
         {
           "And": [
-            { "Variable": "$.morning_enrich_attempts", "IsPresent": true },
-            { "Variable": "$.morning_enrich_attempts", "NumericGreaterThanEquals": 1 }
+            {
+              "Variable": "$.morning_enrich_attempts",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.morning_enrich_attempts",
+              "NumericGreaterThanEquals": 1
+            }
           ],
           "Next": "ExtractMorningEnrichError"
         }
@@ -331,14 +370,14 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "Scanner"
+          "Next": "ResearchPredictorParallel"
         }
       ],
       "Default": "DataPhase1"
     },
     "DataPhase1": {
       "Type": "Task",
-      "Comment": "Weekly Phase 1 data collection + universe-prune (weekly_collector.py --phase 1 then builders.prune_delisted_tickers) on a dedicated spot EC2. MorningEnrich was split into its own preceding SF state by the preflight-task-split (2026-05-16): a failure here no longer re-runs the completed ~28-min morning-enrich. RAG ingestion lives in the separate RAGIngestion state (split 2026-05-06). Entry preflight is preflight.py mode 'phase1' (a strict superset of morning_enrich's dependency set \u2014 phase1 additionally builds the universe).",
+      "Comment": "Weekly Phase 1 data collection + universe-prune (weekly_collector.py --phase 1 then builders.prune_delisted_tickers) on a dedicated spot EC2. MorningEnrich was split into its own preceding SF state by the preflight-task-split (2026-05-16): a failure here no longer re-runs the completed ~28-min morning-enrich. RAG ingestion lives in the separate RAGIngestion state (split 2026-05-06). Entry preflight is preflight.py mode 'phase1' (a strict superset of morning_enrich's dependency set — phase1 additionally builds the universe).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -430,7 +469,7 @@
         {
           "Variable": "$.data_phase1_poll.Status",
           "StringEquals": "Success",
-          "Next": "Scanner"
+          "Next": "ResearchPredictorParallel"
         },
         {
           "Variable": "$.data_phase1_poll.Status",
@@ -456,8 +495,14 @@
       "Choices": [
         {
           "And": [
-            { "Variable": "$.data_phase1_attempts", "IsPresent": true },
-            { "Variable": "$.data_phase1_attempts", "NumericGreaterThanEquals": 1 }
+            {
+              "Variable": "$.data_phase1_attempts",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.data_phase1_attempts",
+              "NumericGreaterThanEquals": 1
+            }
           ],
           "Next": "ExtractDataPhase1Error"
         }
@@ -471,312 +516,329 @@
       "ResultPath": "$.data_phase1_attempts",
       "Next": "DataPhase1"
     },
-    "Scanner": {
-      "Type": "Task",
-      "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 — alpha-engine-research #235). Reads constituents.json + feature store, runs the same run_quant_filter as Research Lambda's internal scanner, writes the candidates.json artifact for THIS run_date. Phase 2 posture: observe-only — runs UNCONDITIONALLY on every Saturday SF firing (the prior CheckEnableStandaloneScanner Choice gate was removed 2026-05-28 per feedback_observe_mode_unconditional_gates_govern_cutover — observation must not be flag-gated; absence-of-artifact is itself the failure mode the soak is meant to detect). Failure is NON-BLOCKING (Catch routes to CheckSkipRAGIngestion). The artifact is parallel-observe only; no consumer reads it yet (Phase 4 will switch RAG to read it, Phase 5 will switch Research) — the Phase 4/5 consumer-cutover flag belongs at the consumer side. Status contract OK / ERROR — no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true. First post-fix Saturday SF (2026-05-30) lands candidates.json structurally; compare candidates.json::scanner_tickers against signals.json::universe (minus population). Zero divergence is the Phase 3 → Phase 4 transition signal.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-research-scanner:live",
-        "Payload": {
-          "run_date.$": "$.run_date",
-          "dry_run_llm.$": "$.research_dry"
-        }
-      },
-      "TimeoutSeconds": 600,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "Phase 2 observe-only contract — scanner failure must NOT halt the pipeline. Research Lambda's internal scanner still runs in parallel and provides the load-bearing scanner output downstream; this artifact is parallel-observe and consumer-less today (Phase 4 will flip RAG to read it). Routes forward to CheckSkipRAGIngestion so the pipeline continues exactly as it would on flag=false.",
-          "Next": "CheckSkipRAGIngestion",
-          "ResultPath": "$.scanner_error"
-        }
-      ],
-      "ResultPath": "$.scanner_result",
-      "Next": "CheckSkipRAGIngestion"
-    },
-    "CheckSkipRAGIngestion": {
-      "Type": "Choice",
-      "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipRegimeSubstrate. Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_rag_ingestion",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_rag_ingestion",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipRegimeSubstrate"
-        }
-      ],
-      "Default": "RAGIngestion"
-    },
-    "RAGIngestion": {
-      "Type": "Task",
-      "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$.preflight_args))",
-          "executionTimeout": [
-            "3600"
-          ]
-        },
-        "TimeoutSeconds": 3600
-      },
-      "TimeoutSeconds": 3660,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.TaskFailed",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 4,
-          "IntervalSeconds": 30,
-          "BackoffRate": 2.0,
-          "MaxDelaySeconds": 300,
-          "JitterStrategy": "FULL"
-        },
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 30,
-          "BackoffRate": 2.0,
-          "MaxDelaySeconds": 300,
-          "JitterStrategy": "FULL"
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.rag_ingestion_result",
-      "Next": "WaitForRAGIngestion"
-    },
-    "WaitForRAGIngestion": {
-      "Type": "Task",
-      "Comment": "Poll SSM command until complete",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.rag_ingestion_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.rag_ingestion_poll",
-      "Next": "CheckRAGIngestionStatus"
-    },
-    "CheckRAGIngestionStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.rag_ingestion_poll.Status",
-          "StringEquals": "Success",
-          "Next": "CheckSkipRegimeSubstrate"
-        },
-        {
-          "Variable": "$.rag_ingestion_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "RAGIngestionWait"
-        },
-        {
-          "Variable": "$.rag_ingestion_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "RAGIngestionWait"
-        }
-      ],
-      "Default": "RAGIngestionRetryGate"
-    },
-    "RAGIngestionWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForRAGIngestion"
-    },
-    "RAGIngestionRetryGate": {
-      "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059): re-issue RAGIngestion ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
-      "Choices": [
-        {
-          "And": [
-            { "Variable": "$.rag_ingestion_attempts", "IsPresent": true },
-            { "Variable": "$.rag_ingestion_attempts", "NumericGreaterThanEquals": 1 }
-          ],
-          "Next": "ExtractRAGIngestionError"
-        }
-      ],
-      "Default": "RAGIngestionReissue"
-    },
-    "RAGIngestionReissue": {
-      "Type": "Pass",
-      "Comment": "Mark one re-issue consumed (rag_ingestion_attempts=1) and loop back to RAGIngestion.",
-      "Result": 1,
-      "ResultPath": "$.rag_ingestion_attempts",
-      "Next": "RAGIngestion"
-    },
-    "CheckSkipRegimeSubstrate": {
-      "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps to CheckSkipRegimeRetrospectiveEval (which independently honors its own skip flag). Independent of skip_research \u2014 operators can skip the HMM refit while still running research (or vice versa).",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_regime_substrate",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_regime_substrate",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipRegimeRetrospectiveEval"
-        }
-      ],
-      "Default": "RegimeSubstrate"
-    },
-    "RegimeSubstrate": {
-      "Type": "Task",
-      "Comment": "Regime substrate Lambda \u2014 fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. The macro economist agent (Stage C) will consume this as a strong prior; macro agent remains the final regime authority. Observe-only at this stage \u2014 no production consumer reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipRegimeRetrospectiveEval, not HandleFailure) per the Stage A observe-only contract \u2014 a regime substrate failure during the 4-week observation period must not halt Research.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-predictor-regime-substrate:live",
-        "Payload": {
-          "action.$": "$.regime_action"
-        }
-      },
-      "TimeoutSeconds": 360,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "CheckSkipRegimeRetrospectiveEval",
-          "ResultPath": "$.regime_substrate_error"
-        }
-      ],
-      "ResultPath": "$.regime_substrate_result",
-      "Next": "CheckSkipRegimeRetrospectiveEval"
-    },
-    "CheckSkipRegimeRetrospectiveEval": {
-      "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_regime_retrospective_eval\": true} bypasses the T1 retrospective HMM smoothing eval and jumps to CheckSkipResearch. Independent of skip_regime_substrate \u2014 operator can run substrate without eval (or vice versa during ad-hoc replays).",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_regime_retrospective_eval",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_regime_retrospective_eval",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "ResearchPredictorParallel"
-        }
-      ],
-      "Default": "RegimeRetrospectiveEval"
-    },
-    "RegimeRetrospectiveEval": {
-      "Type": "Task",
-      "Comment": "Stage C.2 T1 retrospective HMM smoothing eval \u2014 pairs the macro agent's historical regime calls against the HMM forward-backward smoother's labels (8-week lag, asymmetric loss penalizing bear-misses 2\u00d7). Writes s3://alpha-engine-research/regime/retrospective/{YYMMDDHHMM}.json + latest.json sidecar carrying n_pairings + rolling 26-week agreement rate. Observe-only \u2014 feeds the dashboard's Regime page, does NOT gate anything. Failure is non-blocking (Catch routes to CheckSkipResearch) \u2014 a retrospective-eval failure must not halt Research. Returns n_pairings=0 cleanly during the cold-start window (~8 weeks after substrate Lambda starts running).",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
-        "Payload": {
-          "action.$": "$.regime_action"
-        }
-      },
-      "TimeoutSeconds": 660,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "ResearchPredictorParallel",
-          "ResultPath": "$.regime_retrospective_eval_error"
-        }
-      ],
-      "ResultPath": "$.regime_retrospective_eval_result",
-      "Next": "ResearchPredictorParallel"
-    },
     "ResearchPredictorParallel": {
       "Type": "Parallel",
-      "Comment": "Research and PredictorTraining are DATA-INDEPENDENT (no S3/db data flows between them \u2014 see CLAUDE.md Architecture). They previously ran sequentially ONLY to 'spread API load', a now-STALE rationale: predictor TRAINING (training/train_handler.py) reads ArcticDB + CPU LightGBM and makes NO Anthropic calls (the yfinance fallback was removed by predictor PR #6; train_handler yfinance docstrings are stale). Research's only heavy load is Anthropic. They do not contend on the rate-limited API, so they run in parallel here to decouple PredictorTraining from Research's variable <=75-min strict-retry runtime and shorten SF wall-clock. Branch A = the full Research-consuming chain (DataPhase2 + eval-judge chain + agent-justification triple), Branch B = the PredictorTraining quartet. PER-BRANCH ERROR ISOLATION: each branch ends in a branch-local Pass terminal (End:true) that records OK/FAILED as DATA \u2014 a branch NEVER throws, so SF Parallel's default cancel-all-siblings-on-error behaviour can never abandon or waste an in-flight (or completed+S3-promoted) sibling. The SF is failed AFTER the join by CheckBranchOutcomes if either branch recorded FAILED. The Parallel-level Catch is a defense-in-depth backstop for genuine SF-engine Parallel errors only (the branches themselves always succeed).",
+      "Comment": "Research and PredictorTraining are DATA-INDEPENDENT (no S3/db data flows between them — see CLAUDE.md Architecture). They previously ran sequentially ONLY to 'spread API load', a now-STALE rationale: predictor TRAINING (training/train_handler.py) reads ArcticDB + CPU LightGBM and makes NO Anthropic calls (the yfinance fallback was removed by predictor PR #6; train_handler yfinance docstrings are stale). Research's only heavy load is Anthropic. They do not contend on the rate-limited API, so they run in parallel here to decouple PredictorTraining from Research's variable <=75-min strict-retry runtime and shorten SF wall-clock. Branch A = the full Research-consuming chain (DataPhase2 + eval-judge chain + agent-justification triple), Branch B = the PredictorTraining quartet. PER-BRANCH ERROR ISOLATION: each branch ends in a branch-local Pass terminal (End:true) that records OK/FAILED as DATA — a branch NEVER throws, so SF Parallel's default cancel-all-siblings-on-error behaviour can never abandon or waste an in-flight (or completed+S3-promoted) sibling. The SF is failed AFTER the join by CheckBranchOutcomes if either branch recorded FAILED. The Parallel-level Catch is a defense-in-depth backstop for genuine SF-engine Parallel errors only (the branches themselves always succeed). (config#885: the Scanner→RAGIngestion→RegimeSubstrate→RegimeRetrospectiveEval chain was relocated FROM top-level INTO Branch A's head so PredictorTraining (Branch B) now forks parallel to it directly after DataPhase1 — Predictor ⊥ Scanner/RAG/Regime, all of which produce side-effect S3/ArcticDB artifacts, never SF-state JSON consumed by Branch B or any post-join state. Their in-branch error edges were rewired to the branch-fail path PublishResearchFailureImmediate→BranchAFailed.)",
       "Branches": [
         {
-          "StartAt": "CheckSkipResearch",
+          "StartAt": "Scanner",
           "States": {
+            "Scanner": {
+              "Type": "Task",
+              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 — alpha-engine-research #235). Reads constituents.json + feature store, runs the same run_quant_filter as Research Lambda's internal scanner, writes the candidates.json artifact for THIS run_date. Phase 2 posture: observe-only — runs UNCONDITIONALLY on every Saturday SF firing (the prior CheckEnableStandaloneScanner Choice gate was removed 2026-05-28 per feedback_observe_mode_unconditional_gates_govern_cutover — observation must not be flag-gated; absence-of-artifact is itself the failure mode the soak is meant to detect). Failure is NON-BLOCKING (Catch routes to CheckSkipRAGIngestion). The artifact is parallel-observe only; no consumer reads it yet (Phase 4 will switch RAG to read it, Phase 5 will switch Research) — the Phase 4/5 consumer-cutover flag belongs at the consumer side. Status contract OK / ERROR — no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true. First post-fix Saturday SF (2026-05-30) lands candidates.json structurally; compare candidates.json::scanner_tickers against signals.json::universe (minus population). Zero divergence is the Phase 3 → Phase 4 transition signal.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-scanner:live",
+                "Payload": {
+                  "run_date.$": "$.run_date",
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 600,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Phase 2 observe-only contract — scanner failure must NOT halt the pipeline. Research Lambda's internal scanner still runs in parallel and provides the load-bearing scanner output downstream; this artifact is parallel-observe and consumer-less today (Phase 4 will flip RAG to read it). Routes forward to CheckSkipRAGIngestion so the pipeline continues exactly as it would on flag=false.",
+                  "Next": "CheckSkipRAGIngestion",
+                  "ResultPath": "$.scanner_error"
+                }
+              ],
+              "ResultPath": "$.scanner_result",
+              "Next": "CheckSkipRAGIngestion"
+            },
+            "CheckSkipRAGIngestion": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipRegimeSubstrate. Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_rag_ingestion",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_rag_ingestion",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRegimeSubstrate"
+                }
+              ],
+              "Default": "RAGIngestion"
+            },
+            "RAGIngestion": {
+              "Type": "Task",
+              "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design — accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$.preflight_args))",
+                  "executionTimeout": [
+                    "3600"
+                  ]
+                },
+                "TimeoutSeconds": 3600
+              },
+              "TimeoutSeconds": 3660,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PublishResearchFailureImmediate",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "ResultPath": "$.rag_ingestion_result",
+              "Next": "WaitForRAGIngestion"
+            },
+            "WaitForRAGIngestion": {
+              "Type": "Task",
+              "Comment": "Poll SSM command until complete",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.rag_ingestion_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PublishResearchFailureImmediate",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.rag_ingestion_poll",
+              "Next": "CheckRAGIngestionStatus"
+            },
+            "CheckRAGIngestionStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.rag_ingestion_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "CheckSkipRegimeSubstrate"
+                },
+                {
+                  "Variable": "$.rag_ingestion_poll.Status",
+                  "StringEquals": "InProgress",
+                  "Next": "RAGIngestionWait"
+                },
+                {
+                  "Variable": "$.rag_ingestion_poll.Status",
+                  "StringEquals": "Pending",
+                  "Next": "RAGIngestionWait"
+                }
+              ],
+              "Default": "RAGIngestionRetryGate"
+            },
+            "RAGIngestionWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "WaitForRAGIngestion"
+            },
+            "RAGIngestionRetryGate": {
+              "Type": "Choice",
+              "Comment": "SOTA bounded auto-retry (config#1059): re-issue RAGIngestion ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rag_ingestion_attempts",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rag_ingestion_attempts",
+                      "NumericGreaterThanEquals": 1
+                    }
+                  ],
+                  "Next": "ExtractRAGIngestionError"
+                }
+              ],
+              "Default": "RAGIngestionReissue"
+            },
+            "RAGIngestionReissue": {
+              "Type": "Pass",
+              "Comment": "Mark one re-issue consumed (rag_ingestion_attempts=1) and loop back to RAGIngestion.",
+              "Result": 1,
+              "ResultPath": "$.rag_ingestion_attempts",
+              "Next": "RAGIngestion"
+            },
+            "CheckSkipRegimeSubstrate": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps to CheckSkipRegimeRetrospectiveEval (which independently honors its own skip flag). Independent of skip_research — operators can skip the HMM refit while still running research (or vice versa).",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_regime_substrate",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_regime_substrate",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRegimeRetrospectiveEval"
+                }
+              ],
+              "Default": "RegimeSubstrate"
+            },
+            "RegimeSubstrate": {
+              "Type": "Task",
+              "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. The macro economist agent (Stage C) will consume this as a strong prior; macro agent remains the final regime authority. Observe-only at this stage — no production consumer reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipRegimeRetrospectiveEval, not HandleFailure) per the Stage A observe-only contract — a regime substrate failure during the 4-week observation period must not halt Research.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-predictor-regime-substrate:live",
+                "Payload": {
+                  "action.$": "$.regime_action"
+                }
+              },
+              "TimeoutSeconds": 360,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "CheckSkipRegimeRetrospectiveEval",
+                  "ResultPath": "$.regime_substrate_error"
+                }
+              ],
+              "ResultPath": "$.regime_substrate_result",
+              "Next": "CheckSkipRegimeRetrospectiveEval"
+            },
+            "CheckSkipRegimeRetrospectiveEval": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_regime_retrospective_eval\": true} bypasses the T1 retrospective HMM smoothing eval and jumps to CheckSkipResearch. Independent of skip_regime_substrate — operator can run substrate without eval (or vice versa during ad-hoc replays).",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_regime_retrospective_eval",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_regime_retrospective_eval",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipResearch"
+                }
+              ],
+              "Default": "RegimeRetrospectiveEval"
+            },
+            "RegimeRetrospectiveEval": {
+              "Type": "Task",
+              "Comment": "Stage C.2 T1 retrospective HMM smoothing eval — pairs the macro agent's historical regime calls against the HMM forward-backward smoother's labels (8-week lag, asymmetric loss penalizing bear-misses 2×). Writes s3://alpha-engine-research/regime/retrospective/{YYMMDDHHMM}.json + latest.json sidecar carrying n_pairings + rolling 26-week agreement rate. Observe-only — feeds the dashboard's Regime page, does NOT gate anything. Failure is non-blocking (Catch routes to CheckSkipResearch) — a retrospective-eval failure must not halt Research. Returns n_pairings=0 cleanly during the cold-start window (~8 weeks after substrate Lambda starts running).",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
+                "Payload": {
+                  "action.$": "$.regime_action"
+                }
+              },
+              "TimeoutSeconds": 660,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "CheckSkipResearch",
+                  "ResultPath": "$.regime_retrospective_eval_error"
+                }
+              ],
+              "ResultPath": "$.regime_retrospective_eval_result",
+              "Next": "CheckSkipResearch"
+            },
+            "ExtractRAGIngestionError": {
+              "Type": "Pass",
+              "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error — the soft-failure path from CheckRAGIngestionStatus.Default does not populate $.error, only Task Catch blocks do.",
+              "Parameters": {
+                "phase": "RAGIngestion",
+                "source": "CheckRAGIngestionStatus.Default",
+                "poll.$": "$.rag_ingestion_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishResearchFailureImmediate"
+            },
             "CheckSkipResearch": {
               "Type": "Choice",
               "Comment": "Skip-gate. {\"skip_research\": true} bypasses the research Lambda and jumps to DataPhase2's skip-gate.",
@@ -799,7 +861,7 @@
             },
             "Research": {
               "Type": "Task",
-              "Comment": "Research Lambda \u2014 generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass \u2014 ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix.",
+              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-runner:live",
@@ -853,7 +915,7 @@
             },
             "CheckSkipDataPhase2": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_data_phase2\": true} bypasses the Phase 2 Lambda and jumps to the eval-judge skip-gate (post-2026-05-07 reorder \u2014 judge chain runs before predictor training so its results are available to evaluator's email).",
+              "Comment": "Skip-gate. {\"skip_data_phase2\": true} bypasses the Phase 2 Lambda and jumps to the eval-judge skip-gate (post-2026-05-07 reorder — judge chain runs before predictor training so its results are available to evaluator's email).",
               "Choices": [
                 {
                   "And": [
@@ -873,7 +935,7 @@
             },
             "DataPhase2": {
               "Type": "Task",
-              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) \u2014 judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email.",
+              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) — judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-data-collector:live",
@@ -908,7 +970,7 @@
             },
             "CheckSkipEvalJudge": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_eval_judge\": true} bypasses the LLM-as-judge eval step (typically used for ad-hoc reruns where eval cost is unwanted). Skipping the judge does NOT skip rationale clustering \u2014 they're independent observability paths (clustering reads decision_artifacts/, judge reads its own _eval/), so we route to CheckSkipRationaleClustering instead of bypassing both.",
+              "Comment": "Skip-gate. {\"skip_eval_judge\": true} bypasses the LLM-as-judge eval step (typically used for ad-hoc reruns where eval cost is unwanted). Skipping the judge does NOT skip rationale clustering — they're independent observability paths (clustering reads decision_artifacts/, judge reads its own _eval/), so we route to CheckSkipRationaleClustering instead of bypassing both.",
               "Choices": [
                 {
                   "And": [
@@ -928,7 +990,7 @@
             },
             "ComputeEvalCadence": {
               "Type": "Pass",
-              "Comment": "Extract day-of-month + ISO date + submit timestamp from the SF execution start time. day_of_month <= 07 \u21d2 first Saturday of the month \u21d2 force_sonnet_pass=true (monthly Sonnet sweep per ROADMAP \u00a71626). All other Saturdays run Haiku-only batch + per-artifact Sonnet escalation tail inside the Process Lambda. submit_iso is propagated to EvalJudgePoll so it can compute elapsed-time against the 6h fail-soft cap.",
+              "Comment": "Extract day-of-month + ISO date + submit timestamp from the SF execution start time. day_of_month <= 07 ⇒ first Saturday of the month ⇒ force_sonnet_pass=true (monthly Sonnet sweep per ROADMAP §1626). All other Saturdays run Haiku-only batch + per-artifact Sonnet escalation tail inside the Process Lambda. submit_iso is propagated to EvalJudgePoll so it can compute elapsed-time against the 6h fail-soft cap.",
               "Parameters": {
                 "day_of_month.$": "States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), '-'), 2)",
                 "eval_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
@@ -951,7 +1013,7 @@
             },
             "EvalJudgeSubmitFirstSaturday": {
               "Type": "Task",
-              "Comment": "Submit phase, monthly Sonnet sweep \u2014 force_sonnet_pass=true. Builds the (artifact \u00d7 judge_model) batch payload covering both Haiku and Sonnet for every mapped artifact, submits as one Anthropic Message Batches API call, and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 \u00a71642. 50% cost discount per Anthropic's batch contract; structurally bypasses the 15-min Lambda timeout class that nearly fired on the 2026-05-06 manual midweek SF run.",
+              "Comment": "Submit phase, monthly Sonnet sweep — force_sonnet_pass=true. Builds the (artifact × judge_model) batch payload covering both Haiku and Sonnet for every mapped artifact, submits as one Anthropic Message Batches API call, and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 §1642. 50% cost discount per Anthropic's batch contract; structurally bypasses the 15-min Lambda timeout class that nearly fired on the 2026-05-06 manual midweek SF run.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
@@ -978,7 +1040,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability per ROADMAP \u00a71635 \u2014 submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
+                  "Comment": "Eval is observability per ROADMAP §1635 — submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
                   "Next": "EvalRollingMean",
                   "ResultPath": "$.eval_judge_error"
                 }
@@ -1015,7 +1077,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 submit failures must NOT halt the pipeline.",
+                  "Comment": "Eval is observability — submit failures must NOT halt the pipeline.",
                   "Next": "EvalRollingMean",
                   "ResultPath": "$.eval_judge_error"
                 }
@@ -1025,7 +1087,7 @@
             },
             "EvalJudgePollChoice": {
               "Type": "Choice",
-              "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) \u2192 route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK \u2192 enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
+              "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) → route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK → enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
               "Choices": [
                 {
                   "Variable": "$.eval_judge_submit.Payload.status",
@@ -1048,7 +1110,7 @@
             },
             "EvalJudgePoll": {
               "Type": "Task",
-              "Comment": "Poll phase. Calls anthropic.messages.batches.retrieve(batch_id) and returns processing_status + request_counts + elapsed_seconds. SF Choice that follows branches on processing_status: ended \u2192 Process; in_progress \u2192 loop back to Wait; exceeded_max_wait=true \u2192 fail-soft to EvalRollingMean.",
+              "Comment": "Poll phase. Calls anthropic.messages.batches.retrieve(batch_id) and returns processing_status + request_counts + elapsed_seconds. SF Choice that follows branches on processing_status: ended → Process; in_progress → loop back to Wait; exceeded_max_wait=true → fail-soft to EvalRollingMean.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-poll:live",
@@ -1076,7 +1138,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "A poll-level failure is recoverable \u2014 Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route to EvalRollingMean so the rest of the pipeline isn't blocked.",
+                  "Comment": "A poll-level failure is recoverable — Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route to EvalRollingMean so the rest of the pipeline isn't blocked.",
                   "Next": "EvalRollingMean",
                   "ResultPath": "$.eval_judge_error"
                 }
@@ -1086,7 +1148,7 @@
             },
             "EvalJudgePollDecision": {
               "Type": "Choice",
-              "Comment": "Branch on poll status. processing_status='ended' \u2192 run Process. exceeded_max_wait=true \u2192 fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else \u2192 loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
+              "Comment": "Branch on poll status. processing_status='ended' → run Process. exceeded_max_wait=true → fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else → loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
               "Choices": [
                 {
                   "Or": [
@@ -1111,7 +1173,7 @@
             },
             "EvalJudgeProcess": {
               "Type": "Task",
-              "Comment": "Process phase. Streams the completed batch's results, parses each via the existing RubricEvalLLMOutput schema, persists per-artifact eval JSONs to decision_artifacts/_eval/{date}/, emits CW metrics under AlphaEngine/Eval, and runs the small synchronous Sonnet-escalation tail for any Haiku result that flagged a borderline dimension. Returns OK/PARTIAL/ERROR mirroring the legacy single-Lambda contract \u2014 no consumer (RationaleClustering, EvalRollingMean, dashboard) changes.",
+              "Comment": "Process phase. Streams the completed batch's results, parses each via the existing RubricEvalLLMOutput schema, persists per-artifact eval JSONs to decision_artifacts/_eval/{date}/, emits CW metrics under AlphaEngine/Eval, and runs the small synchronous Sonnet-escalation tail for any Haiku result that flagged a borderline dimension. Returns OK/PARTIAL/ERROR mirroring the legacy single-Lambda contract — no consumer (RationaleClustering, EvalRollingMean, dashboard) changes.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-process:live",
@@ -1138,7 +1200,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 Process failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
+                  "Comment": "Eval is observability — Process failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
                   "Next": "EvalRollingMean",
                   "ResultPath": "$.eval_judge_error"
                 }
@@ -1148,7 +1210,7 @@
             },
             "EvalRollingMean": {
               "Type": "Task",
-              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) \u2014 runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP \u00a71634). Runs every Saturday \u2014 even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal.",
+              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) — runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP §1634). Runs every Saturday — even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-rolling-mean:live",
@@ -1173,7 +1235,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline.",
+                  "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
                   "Next": "CheckSkipRationaleClustering",
                   "ResultPath": "$.eval_rolling_mean_error"
                 }
@@ -1203,7 +1265,7 @@
             },
             "RationaleClustering": {
               "Type": "Task",
-              "Comment": "Cross-week rationale clustering Lambda (ROADMAP P0, 2026-05-05). Reads decision_artifacts/ for the trailing 8 weeks, clusters rationales per agent_id via TF-IDF char n-grams + greedy single-linkage with digit-normalization, emits CW metric agent_rationale_template_concentration (% of rationales in top-3 clusters; >0.7 indicates template-generation), and persists per-agent analysis JSON to decision_artifacts/_analysis/{agent_id}/{YYYY-WW}.json. Runs every Saturday after EvalRollingMean \u2014 same image-share + observability framing.",
+              "Comment": "Cross-week rationale clustering Lambda (ROADMAP P0, 2026-05-05). Reads decision_artifacts/ for the trailing 8 weeks, clusters rationales per agent_id via TF-IDF char n-grams + greedy single-linkage with digit-normalization, emits CW metric agent_rationale_template_concentration (% of rationales in top-3 clusters; >0.7 indicates template-generation), and persists per-agent analysis JSON to decision_artifacts/_analysis/{agent_id}/{YYYY-WW}.json. Runs every Saturday after EvalRollingMean — same image-share + observability framing.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-rationale-clustering:live",
@@ -1229,7 +1291,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline.",
+                  "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
                   "Next": "CheckSkipReplayConcordance",
                   "ResultPath": "$.rationale_clustering_error"
                 }
@@ -1239,7 +1301,7 @@
             },
             "CheckSkipReplayConcordance": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_replay_concordance\": true} bypasses the cheap-model concordance Lambda (used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the comparison scorers in alpha-engine-backtester replay/comparison.py). Independent of skip_rationale_clustering and skip_counterfactual \u2014 the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag.",
+              "Comment": "Skip-gate. {\"skip_replay_concordance\": true} bypasses the cheap-model concordance Lambda (used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the comparison scorers in alpha-engine-backtester replay/comparison.py). Independent of skip_rationale_clustering and skip_counterfactual — the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag.",
               "Choices": [
                 {
                   "And": [
@@ -1259,7 +1321,7 @@
             },
             "ReplayConcordance": {
               "Type": "Task",
-              "Comment": "Weekly cheap-model concordance Lambda (ROADMAP P0, agent-justification gate signal #3). Replays each captured DecisionArtifact in the trailing 8-week window under the configured target model(s) via langchain_anthropic.with_structured_output against the canonical agent_schemas Pydantic contract; aggregates agreement_score per (agent_id_base, target_model); emits CW metric agent_cheap_model_concordance; persists per-target summary JSON to decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json. Default target: claude-haiku-4-5 (Sonnet\u2192Haiku concordance \u2248 \"is the larger model earning its cost?\"). Runs every Saturday after RationaleClustering.",
+              "Comment": "Weekly cheap-model concordance Lambda (ROADMAP P0, agent-justification gate signal #3). Replays each captured DecisionArtifact in the trailing 8-week window under the configured target model(s) via langchain_anthropic.with_structured_output against the canonical agent_schemas Pydantic contract; aggregates agreement_score per (agent_id_base, target_model); emits CW metric agent_cheap_model_concordance; persists per-target summary JSON to decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json. Default target: claude-haiku-4-5 (Sonnet→Haiku concordance ≈ \"is the larger model earning its cost?\"). Runs every Saturday after RationaleClustering.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-replay-concordance:live",
@@ -1290,7 +1352,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
+                  "Comment": "Eval observability layer — concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
                   "Next": "CheckSkipCounterfactual",
                   "ResultPath": "$.replay_concordance_error"
                 }
@@ -1300,7 +1362,7 @@
             },
             "CheckSkipCounterfactual": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_counterfactual\": true} bypasses the counterfactual rule fit Lambda (used for ad-hoc reruns while iterating on the per-agent feature extractors in alpha-engine-backtester replay/counterfactual.py). Independent of skip_rationale_clustering and skip_replay_concordance \u2014 the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag. Post-2026-05-07 reorder, exits to CheckSkipPredictorTraining (was SaturdayHealthCheck) \u2014 the judge chain now runs before predictor so its results are available to evaluator's email.",
+              "Comment": "Skip-gate. {\"skip_counterfactual\": true} bypasses the counterfactual rule fit Lambda (used for ad-hoc reruns while iterating on the per-agent feature extractors in alpha-engine-backtester replay/counterfactual.py). Independent of skip_rationale_clustering and skip_replay_concordance — the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag. Post-2026-05-07 reorder, exits to CheckSkipPredictorTraining (was SaturdayHealthCheck) — the judge chain now runs before predictor so its results are available to evaluator's email.",
               "Choices": [
                 {
                   "And": [
@@ -1320,7 +1382,7 @@
             },
             "Counterfactual": {
               "Type": "Task",
-              "Comment": "Weekly counterfactual rule fit Lambda (ROADMAP P0, agent-justification gate signal #2 \u2014 does the agent reduce to a 3-deep decision tree?). Trains DecisionTreeClassifier(max_depth=3) per supported agent on (input \u2192 decision) pairs from the trailing 8-week decision_artifacts/ corpus; emits CW metric agent_counterfactual_rule_fit per (judged_agent_id); persists per-agent JSON to decision_artifacts/_counterfactual/{agent_id_base}/{YYYY-WW}.json including tree_text + feature_importances. v1 covers ic_cio + macro_economist; other agents emit UNSUPPORTED markers. $0 ongoing \u2014 no LLM calls. Post-2026-05-07 reorder, runs after ReplayConcordance and exits to CheckSkipPredictorTraining (was SaturdayHealthCheck), so its persisted artifacts are available to Evaluator downstream.",
+              "Comment": "Weekly counterfactual rule fit Lambda (ROADMAP P0, agent-justification gate signal #2 — does the agent reduce to a 3-deep decision tree?). Trains DecisionTreeClassifier(max_depth=3) per supported agent on (input → decision) pairs from the trailing 8-week decision_artifacts/ corpus; emits CW metric agent_counterfactual_rule_fit per (judged_agent_id); persists per-agent JSON to decision_artifacts/_counterfactual/{agent_id_base}/{YYYY-WW}.json including tree_text + feature_importances. v1 covers ic_cio + macro_economist; other agents emit UNSUPPORTED markers. $0 ongoing — no LLM calls. Post-2026-05-07 reorder, runs after ReplayConcordance and exits to CheckSkipPredictorTraining (was SaturdayHealthCheck), so its persisted artifacts are available to Evaluator downstream.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-replay-counterfactual:live",
@@ -1348,7 +1410,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes to CheckSkipAggregateCosts so the cost-telemetry aggregation step still runs even when counterfactual fails (the JSONLs the aggregator reads were written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual independently; a counterfactual failure doesn't invalidate the upstream cost rows).",
+                  "Comment": "Eval observability layer — counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes to CheckSkipAggregateCosts so the cost-telemetry aggregation step still runs even when counterfactual fails (the JSONLs the aggregator reads were written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual independently; a counterfactual failure doesn't invalidate the upstream cost rows).",
                   "Next": "CheckSkipAggregateCosts",
                   "ResultPath": "$.counterfactual_error"
                 }
@@ -1358,7 +1420,7 @@
             },
             "CheckSkipAggregateCosts": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_aggregate_costs\": true} bypasses the daily cost-telemetry aggregation Lambda (used for ad-hoc reruns where the cost parquet for the date is already current, or when iterating on the aggregator script). Standalone invocation of the Lambda is always available via the deploy.sh aggregate_costs target. Independent of skip_rationale_clustering / skip_replay_concordance / skip_counterfactual \u2014 the four are independent observability paths.",
+              "Comment": "Skip-gate. {\"skip_aggregate_costs\": true} bypasses the daily cost-telemetry aggregation Lambda (used for ad-hoc reruns where the cost parquet for the date is already current, or when iterating on the aggregator script). Standalone invocation of the Lambda is always available via the deploy.sh aggregate_costs target. Independent of skip_rationale_clustering / skip_replay_concordance / skip_counterfactual — the four are independent observability paths.",
               "Choices": [
                 {
                   "And": [
@@ -1378,7 +1440,7 @@
             },
             "AggregateCosts": {
               "Type": "Task",
-              "Comment": "Daily cost-telemetry aggregation Lambda (ROADMAP L1146 \u2014 SF-wire scripts/aggregate_costs.py CLI). Reads decision_artifacts/_cost_raw/{run_date}/*.jsonl (written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual during the upstream chain), writes the daily parquet at decision_artifacts/_cost/{run_date}/cost.parquet, emits per-agent CW metrics under AlphaEngine/Cost. Placed at end of Branch A so all LLM-emitting upstream states have written their cost JSONL rows by the time the aggregator runs. Failure is non-blocking (Catch routes to BranchAComplete) \u2014 cost telemetry is observability, NOT a primary deliverable; aggregator failure does NOT regress the alpha pipeline. Status contract OK / SKIPPED / ERROR mirrors data #295 + L3277 audit \u2014 SKIPPED on no _cost_raw partitions for the date is a legitimate upstream no-op and treated as success.",
+              "Comment": "Daily cost-telemetry aggregation Lambda (ROADMAP L1146 — SF-wire scripts/aggregate_costs.py CLI). Reads decision_artifacts/_cost_raw/{run_date}/*.jsonl (written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual during the upstream chain), writes the daily parquet at decision_artifacts/_cost/{run_date}/cost.parquet, emits per-agent CW metrics under AlphaEngine/Cost. Placed at end of Branch A so all LLM-emitting upstream states have written their cost JSONL rows by the time the aggregator runs. Failure is non-blocking (Catch routes to BranchAComplete) — cost telemetry is observability, NOT a primary deliverable; aggregator failure does NOT regress the alpha pipeline. Status contract OK / SKIPPED / ERROR mirrors data #295 + L3277 audit — SKIPPED on no _cost_raw partitions for the date is a legitimate upstream no-op and treated as success.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-aggregate-costs:live",
@@ -1404,7 +1466,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available.",
+                  "Comment": "Cost-telemetry aggregation is observability — failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available.",
                   "Next": "BranchAComplete",
                   "ResultPath": "$.aggregate_costs_error"
                 }
@@ -1436,7 +1498,9 @@
               "Next": "BranchAFailed",
               "Catch": [
                 {
-                  "ErrorEquals": ["States.ALL"],
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
                   "Comment": "Best-effort: a failed SNS publish must not prevent the branch from terminating cleanly. The branch still routes to BranchAFailed and the SF still fails at the join.",
                   "ResultPath": null,
                   "Next": "BranchAFailed"
@@ -1445,7 +1509,7 @@
             },
             "BranchAComplete": {
               "Type": "Pass",
-              "Comment": "Branch A (Research \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual) completed. Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics).",
+              "Comment": "Branch A (Research → DataPhase2 → eval-judge chain → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) completed. Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS — it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics).",
               "Result": {
                 "branch_a_status": "OK"
               },
@@ -1454,7 +1518,7 @@
             },
             "BranchAFailed": {
               "Type": "Pass",
-              "Comment": "Branch A hard-failed (strict-Research no-partial-output failure, DataPhase2 failure, or a soft-fail status normalized by ExtractResearchError). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A.",
+              "Comment": "Branch A hard-failed (strict-Research no-partial-output failure, DataPhase2 failure, or a soft-fail status normalized by ExtractResearchError). Records branch_a_status=FAILED + the captured $.error as DATA and End:true — the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A.",
               "Parameters": {
                 "branch_a_status": "FAILED",
                 "branch_a_error.$": "$.error"
@@ -1512,7 +1576,7 @@
                   "MaxAttempts": 2,
                   "IntervalSeconds": 180,
                   "BackoffRate": 2.0,
-                  "Comment": "Retry on failure/timeout \u2014 handles spot interruption (new instance on retry)"
+                  "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
                 }
               ],
               "Catch": [
@@ -1538,9 +1602,9 @@
               "Retry": [
                 {
                   "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
                   "MaxAttempts": 10,
                   "IntervalSeconds": 30,
                   "BackoffRate": 1.5
@@ -1614,7 +1678,9 @@
               "Next": "BranchBFailed",
               "Catch": [
                 {
-                  "ErrorEquals": ["States.ALL"],
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
                   "Comment": "Best-effort: a failed SNS publish must not prevent the branch from terminating cleanly. The branch still routes to BranchBFailed and the SF still fails at the join.",
                   "ResultPath": null,
                   "Next": "BranchBFailed"
@@ -2006,7 +2072,9 @@
               "Next": "BranchBComplete",
               "Catch": [
                 {
-                  "ErrorEquals": ["States.ALL"],
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
                   "Comment": "Best-effort: a failed SNS publish must not prevent the branch from completing. The champion is already live.",
                   "ResultPath": null,
                   "Next": "BranchBComplete"
@@ -2029,7 +2097,7 @@
             },
             "BranchBFailed": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining) failed/timed-out (SSM non-Success normalized by ExtractPredictorError, or a Task Catch). Records branch_b_status=FAILED + $.error as DATA, End:true so the branch SUCCEEDS and the sibling Research branch runs to its own completion \u2014 a completed Research branch's signals.json / decision_artifacts are NOT silently discarded. The SF is failed AFTER the join by CheckBranchOutcomes. NOTE: if PredictorTraining promoted weights to S3 before failing a later poll, those weights persist; the recovery re-run skips the genuinely-completed branch.",
+              "Comment": "Branch B (PredictorTraining) failed/timed-out (SSM non-Success normalized by ExtractPredictorError, or a Task Catch). Records branch_b_status=FAILED + $.error as DATA, End:true so the branch SUCCEEDS and the sibling Research branch runs to its own completion — a completed Research branch's signals.json / decision_artifacts are NOT silently discarded. The SF is failed AFTER the join by CheckBranchOutcomes. NOTE: if PredictorTraining promoted weights to S3 before failing a later poll, those weights persist; the recovery re-run skips the genuinely-completed branch.",
               "Parameters": {
                 "branch_b_status": "FAILED",
                 "branch_b_error.$": "$.error"
@@ -2046,7 +2114,7 @@
             "States.ALL"
           ],
           "MaxAttempts": 0,
-          "Comment": "MaxAttempts:0 \u2014 branches self-terminate as success and record failure as data; there is nothing to retry at the Parallel level. Explicit no-op Retry documents intent and prevents an accidental default retry from re-running a completed PredictorTraining."
+          "Comment": "MaxAttempts:0 — branches self-terminate as success and record failure as data; there is nothing to retry at the Parallel level. Explicit no-op Retry documents intent and prevents an accidental default retry from re-running a completed PredictorTraining."
         }
       ],
       "Catch": [
@@ -2054,7 +2122,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Backstop ONLY for a genuine SF-engine Parallel error (branches never throw \u2014 they end success with status data). Routes to the shared HandleFailure, mirroring the existing per-state Catch->HandleFailure convention; does NOT introduce a new error channel.",
+          "Comment": "Backstop ONLY for a genuine SF-engine Parallel error (branches never throw — they end success with status data). Routes to the shared HandleFailure, mirroring the existing per-state Catch->HandleFailure convention; does NOT introduce a new error channel.",
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -2064,7 +2132,7 @@
     },
     "AggregateBranchOutcomes": {
       "Type": "Pass",
-      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights.",
+      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point — Backtester needs BOTH Research signal history AND PredictorTraining weights.",
       "Parameters": {
         "branch_a_status.$": "$.parallel_result[0].branch_a.branch_a_status",
         "branch_b_status.$": "$.parallel_result[1].branch_b.branch_b_status"
@@ -2074,7 +2142,7 @@
     },
     "CheckBranchOutcomes": {
       "Type": "Choice",
-      "Comment": "Fail the SF AFTER the join if EITHER branch recorded FAILED \u2014 so the OTHER branch's completed work (Research signals.json / decision_artifacts, OR PredictorTraining's already-S3-promoted weights) persists and the recovery re-run's skip-set can skip whichever branch genuinely completed. Research-fail + Predictor-done \u2192 recovery re-run with {\"skip_predictor_training\": true}. Predictor-fail + Research-done \u2192 recovery re-run with {\"skip_research\": true, ... per the live-SF-derived skip-set practice}. Only when BOTH branches are OK does the pipeline continue to DriftDetection -> Backtester -> Parity -> Evaluator.",
+      "Comment": "Fail the SF AFTER the join if EITHER branch recorded FAILED — so the OTHER branch's completed work (Research signals.json / decision_artifacts, OR PredictorTraining's already-S3-promoted weights) persists and the recovery re-run's skip-set can skip whichever branch genuinely completed. Research-fail + Predictor-done → recovery re-run with {\"skip_predictor_training\": true}. Predictor-fail + Research-done → recovery re-run with {\"skip_research\": true, ... per the live-SF-derived skip-set practice}. Only when BOTH branches are OK does the pipeline continue to DriftDetection -> Backtester -> Parity -> Evaluator.",
       "Choices": [
         {
           "Or": [
@@ -2094,7 +2162,7 @@
     },
     "ExtractParallelBranchError": {
       "Type": "Pass",
-      "Comment": "Normalize a post-join branch failure into $.error for HandleFailure's States.Format/JsonToString template. Carries both branch statuses + each branch's recorded error so the FAILED SNS alert names which branch(es) failed and which completed (drives the recovery skip-set: a completed branch is skipped on the re-run). Mirrors the existing Extract*Error \u2192 HandleFailure convention; no new error channel.",
+      "Comment": "Normalize a post-join branch failure into $.error for HandleFailure's States.Format/JsonToString template. Carries both branch statuses + each branch's recorded error so the FAILED SNS alert names which branch(es) failed and which completed (drives the recovery skip-set: a completed branch is skipped on the re-run). Mirrors the existing Extract*Error → HandleFailure convention; no new error channel.",
       "Parameters": {
         "phase": "ResearchPredictorParallel",
         "source": "CheckBranchOutcomes",
@@ -2147,7 +2215,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Drift detection is non-blocking \u2014 continue to backtester",
+          "Comment": "Drift detection is non-blocking — continue to backtester",
           "Next": "CheckSkipBacktester",
           "ResultPath": "$.drift_error"
         }
@@ -2157,7 +2225,7 @@
     },
     "CheckSkipBacktester": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses BOTH the Backtester (backtest stage) and Parity states \u2014 it routes straight to CheckSkipEvaluator, skipping the whole backtest+parity pair (the parity stage was split into its own Parity SF state by the preflight-task-split 2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md; skip_backtester retains its original whole-pair semantics for backward compat). The Evaluator state still runs and gracefully degrades on missing same-cohort artifacts (evaluate.py logs a WARNING and continues \u2014 verified against the 2026-05-07 v1 validation run, where `Simulation artifact not found in S3: backtest/2026-05-07/sweep_df.parquet \u2014 evaluator will run without it` shows up cleanly). Routes to CheckSkipEvaluator so {\"skip_evaluator\": true} composes orthogonally: (a) neither flag \u2192 backtest+parity+evaluator run, (b) skip_backtester only \u2192 Evaluator runs against any pre-existing backtest/{date}/ artifacts, (c) skip_evaluator only \u2192 backtest+parity run without grading, (d) both \u2192 all skipped. To skip ONLY parity (keep the backtest), use {\"skip_parity\": true} on the new CheckSkipParity gate. Eval-judge chain downstream is preserved in all cases via CheckSkipEvaluator \u2192 CheckSkipEvalJudge (the 2026-05-03 silent-bypass fix is still pinned \u2014 both CheckSkipEvaluator paths converge to CheckSkipEvalJudge). The legacy {\"freeze_evaluator\": true} input is not honored; freeze-evaluator is a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses BOTH the Backtester (backtest stage) and Parity states — it routes straight to CheckSkipEvaluator, skipping the whole backtest+parity pair (the parity stage was split into its own Parity SF state by the preflight-task-split 2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md; skip_backtester retains its original whole-pair semantics for backward compat). The Evaluator state still runs and gracefully degrades on missing same-cohort artifacts (evaluate.py logs a WARNING and continues — verified against the 2026-05-07 v1 validation run, where `Simulation artifact not found in S3: backtest/2026-05-07/sweep_df.parquet — evaluator will run without it` shows up cleanly). Routes to CheckSkipEvaluator so {\"skip_evaluator\": true} composes orthogonally: (a) neither flag → backtest+parity+evaluator run, (b) skip_backtester only → Evaluator runs against any pre-existing backtest/{date}/ artifacts, (c) skip_evaluator only → backtest+parity run without grading, (d) both → all skipped. To skip ONLY parity (keep the backtest), use {\"skip_parity\": true} on the new CheckSkipParity gate. Eval-judge chain downstream is preserved in all cases via CheckSkipEvaluator → CheckSkipEvalJudge (the 2026-05-03 silent-bypass fix is still pinned — both CheckSkipEvaluator paths converge to CheckSkipEvalJudge). The legacy {\"freeze_evaluator\": true} input is not honored; freeze-evaluator is a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
       "Choices": [
         {
           "And": [
@@ -2177,7 +2245,7 @@
     },
     "Backtester": {
       "Type": "Task",
-      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn \u2014 preserves DriftDetection's Next/Catch edges + skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn — preserves DriftDetection's Next/Catch edges + skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -2200,7 +2268,7 @@
           "MaxAttempts": 2,
           "IntervalSeconds": 180,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout \u2014 handles spot interruption (new instance on retry)"
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
         }
       ],
       "Catch": [
@@ -2486,7 +2554,7 @@
     },
     "CheckSkipParity": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_parity\": true} bypasses ONLY the Parity state (backtester\u2194executor parity check) and routes to CheckSkipEvaluator \u2014 the completed backtest artifacts stay intact and Evaluator still runs against them. Missing flag = run as normal. Parity was split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. To skip the whole backtest+parity pair, use {\"skip_backtester\": true} on CheckSkipBacktester instead. Mirrors the skip_backtester / skip_evaluator shape.",
+      "Comment": "Skip-gate. {\"skip_parity\": true} bypasses ONLY the Parity state (backtester↔executor parity check) and routes to CheckSkipEvaluator — the completed backtest artifacts stay intact and Evaluator still runs against them. Missing flag = run as normal. Parity was split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. To skip the whole backtest+parity pair, use {\"skip_backtester\": true} on CheckSkipBacktester instead. Mirrors the skip_backtester / skip_evaluator shape.",
       "Choices": [
         {
           "And": [
@@ -2506,7 +2574,7 @@
     },
     "Parity": {
       "Type": "Task",
-      "Comment": "Backtester\u2194executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. spot_backtest.sh is invoked with --skip-stages=backtest,evaluator so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized \u2014 same Retry/Catch/Timeout pattern). If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtester↔executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. spot_backtest.sh is invoked with --skip-stages=backtest,evaluator so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design — accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized — same Retry/Catch/Timeout pattern). If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -2529,7 +2597,7 @@
           "MaxAttempts": 2,
           "IntervalSeconds": 180,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout \u2014 handles spot interruption (new instance on retry)"
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
         }
       ],
       "Catch": [
@@ -2629,7 +2697,7 @@
     },
     "Evaluator": {
       "Type": "Task",
-      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
+      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -2652,7 +2720,7 @@
           "MaxAttempts": 2,
           "IntervalSeconds": 180,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout \u2014 handles spot interruption (new instance on retry). Mirrors Backtester retry posture for symmetry."
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture for symmetry."
         }
       ],
       "Catch": [
@@ -2732,7 +2800,7 @@
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline \u2014 non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration.",
+      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -2758,7 +2826,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Health check failure is non-blocking \u2014 continue to notify",
+          "Comment": "Health check failure is non-blocking — continue to notify",
           "Next": "NotifyComplete",
           "ResultPath": "$.health_check_error"
         }
@@ -2789,7 +2857,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Non-blocking \u2014 continue to substrate check even if freshness polling fails. SaturdayHealthCheck (artifact freshness) and WeeklySubstrateHealthCheck (row-driven inventory validation) are independent observability paths; both must run.",
+          "Comment": "Non-blocking — continue to substrate check even if freshness polling fails. SaturdayHealthCheck (artifact freshness) and WeeklySubstrateHealthCheck (row-driven inventory validation) are independent observability paths; both must run.",
           "Next": "WeeklySubstrateHealthCheck",
           "ResultPath": "$.health_check_error"
         }
@@ -2805,7 +2873,7 @@
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 \u2192 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) \u2014 agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) \u2014 same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 \u2014 DailySubstrateHealthCheck state).",
+      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -2835,7 +2903,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Substrate check failure is non-blocking \u2014 continue to notify. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure.",
+          "Comment": "Substrate check failure is non-blocking — continue to notify. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure.",
           "Next": "NotifyComplete",
           "ResultPath": "$.substrate_check_error"
         }
@@ -2866,7 +2934,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Non-blocking \u2014 continue even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
+          "Comment": "Non-blocking — continue even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
           "Next": "NotifyComplete",
           "ResultPath": "$.substrate_check_error"
         }
@@ -2954,7 +3022,7 @@
     },
     "CheckShellRunNotify": {
       "Type": "Choice",
-      "Comment": "Consolidated Friday-PM shell-run result notify. Reuses the EXISTING NotifyComplete SNS-publish substrate (same alpha-engine-alerts topic, same arn:aws:states:::sns:publish Resource) with a shell_run-tagged Subject/Message so the operator can tell a Friday dry-pass result apart from a real Saturday SUCCESS in their inbox. shell_run absent/false \u2192 NotifyComplete (BYTE-IDENTICAL to pre-spine). shell_run=true \u2192 NotifyShellRunComplete. No new SNS topic / Lambda / infra \u2014 the consolidated per-state pass/fail report (ROADMAP design point 5) is a scoped follow-on; the spine delivers a single shell-run-tagged success signal by reusing NotifyComplete's pattern.",
+      "Comment": "Consolidated Friday-PM shell-run result notify. Reuses the EXISTING NotifyComplete SNS-publish substrate (same alpha-engine-alerts topic, same arn:aws:states:::sns:publish Resource) with a shell_run-tagged Subject/Message so the operator can tell a Friday dry-pass result apart from a real Saturday SUCCESS in their inbox. shell_run absent/false → NotifyComplete (BYTE-IDENTICAL to pre-spine). shell_run=true → NotifyShellRunComplete. No new SNS topic / Lambda / infra — the consolidated per-state pass/fail report (ROADMAP design point 5) is a scoped follow-on; the spine delivers a single shell-run-tagged success signal by reusing NotifyComplete's pattern.",
       "Choices": [
         {
           "And": [
@@ -2974,11 +3042,11 @@
     },
     "NotifyShellRunComplete": {
       "Type": "Task",
-      "Comment": "Friday-PM Preflight Pipeline success notification via SNS. Mirrors NotifyComplete exactly (same topic, Resource, ResultPath, End) with a 'Saturday Preflight Pipeline' Subject so a green Friday dry-pass is distinguishable from a real Saturday SUCCESS in the operator inbox. The 'Preflight' label is the consumer-facing rename of what was internally called 'shell run' (2026-05-23 rename per Brian directive: the operational meaning is preflight validation of the Saturday SF; 'shell run' was internal mechanism-language that obscured the intent in alerts). A FAILED Preflight run still routes through HandleFailure, which now also surfaces 'Saturday Preflight Pipeline \u2014 FAILED' Subject via States.Format($.pipeline_label) \u2014 see HandleFailure's parameterized Subject.",
+      "Comment": "Friday-PM Preflight Pipeline success notification via SNS. Mirrors NotifyComplete exactly (same topic, Resource, ResultPath, End) with a 'Saturday Preflight Pipeline' Subject so a green Friday dry-pass is distinguishable from a real Saturday SUCCESS in the operator inbox. The 'Preflight' label is the consumer-facing rename of what was internally called 'shell run' (2026-05-23 rename per Brian directive: the operational meaning is preflight validation of the Saturday SF; 'shell run' was internal mechanism-language that obscured the intent in alerts). A FAILED Preflight run still routes through HandleFailure, which now also surfaces 'Saturday Preflight Pipeline — FAILED' Subject via States.Format($.pipeline_label) — see HandleFailure's parameterized Subject.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Preflight Pipeline \u2014 SUCCESS",
+        "Subject": "Alpha Engine Saturday Preflight Pipeline — SUCCESS",
         "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. Check dashboard / execution history for per-state detail."
       },
       "ResultPath": "$.notify_result",
@@ -2990,7 +3058,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS",
         "Message": "All steps completed successfully. Check dashboard for results."
       },
       "ResultPath": "$.notify_result",
@@ -2998,7 +3066,7 @@
     },
     "ExtractMorningEnrichError": {
       "Type": "Pass",
-      "Comment": "Normalize MorningEnrich SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error \u2014 the soft-failure path from CheckMorningEnrichStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Comment": "Normalize MorningEnrich SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error — the soft-failure path from CheckMorningEnrichStatus.Default does not populate $.error, only Task Catch blocks do.",
       "Parameters": {
         "phase": "MorningEnrich",
         "source": "CheckMorningEnrichStatus.Default",
@@ -3009,22 +3077,11 @@
     },
     "ExtractDataPhase1Error": {
       "Type": "Pass",
-      "Comment": "Normalize DataPhase1 SSM non-Success poll into $.error so HandleFailure's States.Format template has something to serialize (the soft-failure path from CheckDataPhase1Status.Default does not populate $.error \u2014 only Task Catch blocks do).",
+      "Comment": "Normalize DataPhase1 SSM non-Success poll into $.error so HandleFailure's States.Format template has something to serialize (the soft-failure path from CheckDataPhase1Status.Default does not populate $.error — only Task Catch blocks do).",
       "Parameters": {
         "phase": "DataPhase1",
         "source": "CheckDataPhase1Status.Default",
         "poll.$": "$.data_phase1_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "HandleFailure"
-    },
-    "ExtractRAGIngestionError": {
-      "Type": "Pass",
-      "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error \u2014 the soft-failure path from CheckRAGIngestionStatus.Default does not populate $.error, only Task Catch blocks do.",
-      "Parameters": {
-        "phase": "RAGIngestion",
-        "source": "CheckRAGIngestionStatus.Default",
-        "poll.$": "$.rag_ingestion_poll"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -3042,7 +3099,7 @@
     },
     "ExtractParityError": {
       "Type": "Pass",
-      "Comment": "Normalize Parity SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckParityStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Comment": "Normalize Parity SSM non-Success poll into $.error. Mirrors ExtractBacktesterError — the soft-failure path from CheckParityStatus.Default does not populate $.error, only Task Catch blocks do.",
       "Parameters": {
         "phase": "Parity",
         "source": "CheckParityStatus.Default",
@@ -3053,7 +3110,7 @@
     },
     "ExtractPredictorBacktestError": {
       "Type": "Pass",
-      "Comment": "Normalize PredictorBacktest SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckPredictorBacktestStatus.Default does not populate $.error, only Task Catch blocks do. Added by the L4472 phase-split.",
+      "Comment": "Normalize PredictorBacktest SSM non-Success poll into $.error. Mirrors ExtractBacktesterError — the soft-failure path from CheckPredictorBacktestStatus.Default does not populate $.error, only Task Catch blocks do. Added by the L4472 phase-split.",
       "Parameters": {
         "phase": "PredictorBacktest",
         "source": "CheckPredictorBacktestStatus.Default",
@@ -3064,7 +3121,7 @@
     },
     "ExtractPortfolioOptimizerBacktestError": {
       "Type": "Pass",
-      "Comment": "Normalize PortfolioOptimizerBacktest SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckPortfolioOptimizerBacktestStatus.Default does not populate $.error, only Task Catch blocks do. Added by the L4472 phase-split.",
+      "Comment": "Normalize PortfolioOptimizerBacktest SSM non-Success poll into $.error. Mirrors ExtractBacktesterError — the soft-failure path from CheckPortfolioOptimizerBacktestStatus.Default does not populate $.error, only Task Catch blocks do. Added by the L4472 phase-split.",
       "Parameters": {
         "phase": "PortfolioOptimizerBacktest",
         "source": "CheckPortfolioOptimizerBacktestStatus.Default",
@@ -3086,11 +3143,11 @@
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS \u2014 pipeline halts. Subject + Message are parameterized via States.Format on $.pipeline_label so a Preflight Pipeline failure surfaces 'Saturday Preflight Pipeline \u2014 FAILED' (shell_run=true \u2192 ApplyShellRunDefaults sets $.pipeline_label=' Preflight') while a real Saturday SF failure surfaces 'Saturday Pipeline \u2014 FAILED' ($.pipeline_label='' from InitializeInput defaults). 2026-05-23 rename arc: 'shell_run' is internal mechanism-language; alerts surface the user-facing 'Preflight' label.",
+      "Comment": "Failure alert via SNS — pipeline halts. Subject + Message are parameterized via States.Format on $.pipeline_label so a Preflight Pipeline failure surfaces 'Saturday Preflight Pipeline — FAILED' (shell_run=true → ApplyShellRunDefaults sets $.pipeline_label=' Preflight') while a real Saturday SF failure surfaces 'Saturday Pipeline — FAILED' ($.pipeline_label='' from InitializeInput defaults). 2026-05-23 rename arc: 'shell_run' is internal mechanism-language; alerts surface the user-facing 'Preflight' label.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline \u2014 FAILED', $.pipeline_label)",
+        "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — FAILED', $.pipeline_label)",
         "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. Use Step Functions console to redrive from failed step.', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
