@@ -1,0 +1,87 @@
+name: Deploy freshness-monitor
+
+# Auto-deploy the alpha-engine-freshness-monitor Lambda CODE on merge to main.
+#
+# Why this exists: the freshness-monitor was previously operator-deployed only
+# (its function ARN was deliberately omitted from the github-actions-lambda-
+# deploy role's enumerated grant). The 2026-06-26 open_orders active-window fix
+# shipped to the registry + lib but couldn't go live without a manual deploy.sh
+# — so a registry/lib fix sat inert. This closes that gap: any change under
+# infrastructure/lambdas/freshness-monitor/** redeploys the Lambda code.
+#
+# Separation of concerns: this deploys CODE only (deploy.sh --code-only). The
+# artifact REGISTRY is owned by alpha-engine-config and pushed to S3 by its own
+# sync-artifact-registry.yml on registry merges — so this job needs no
+# ae-config clone and never touches the registry.
+#
+# IAM: the github-actions-lambda-deploy role's LambdaUpdate grant was collapsed
+# from an enumerated function list to arn:...:function:alpha-engine-* (which now
+# covers this function and freed ~4.6KB under the 10,240-char inline-policy
+# ceiling). Apply via infrastructure/iam/apply.sh at merge.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/freshness-monitor/**'
+      - '.github/workflows/deploy-freshness-monitor.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-freshness-monitor-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy freshness-monitor Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Deploy freshness-monitor (code-only)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/freshness-monitor/deploy.sh --code-only
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-freshness-monitor \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-freshness-monitor.yml
+
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit

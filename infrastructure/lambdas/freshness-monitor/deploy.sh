@@ -11,15 +11,24 @@
 # Validates the registry locally before upload — a malformed registry
 # never reaches S3.
 #
-# Managed outside CloudFormation — same rationale as sf-telegram-notifier /
-# spot-orphan-reaper / changelog-cloudwatch-mirror (keeps the
-# github-actions-lambda-deploy OIDC role's blast radius narrow;
-# operator-deployed only). Phase 6 cutover flips
-# FRESHNESS_MONITOR_ENABLED via
+# Managed outside CloudFormation — same packaging rationale as
+# sf-telegram-notifier / spot-orphan-reaper / changelog-cloudwatch-mirror.
+# CODE auto-deploys on merge to main via
+# `.github/workflows/deploy-freshness-monitor.yml` (path-filtered to
+# `infrastructure/lambdas/freshness-monitor/**`), which runs this script
+# with `--code-only` under the github-actions-lambda-deploy OIDC role
+# (granted `lambda:UpdateFunctionCode` on `alpha-engine-*`). The artifact
+# REGISTRY is owned by alpha-engine-config and uploaded to S3 by its own
+# `sync-artifact-registry.yml` on registry merges — so `--code-only` skips
+# the registry validation + upload here (no ae-config clone needed in CI).
+# The full (non-`--code-only`) path remains the operator command for a
+# from-a-laptop deploy that also re-pushes the registry. Phase 6 cutover
+# flips FRESHNESS_MONITOR_ENABLED via
 # `aws lambda update-function-configuration` without redeploying.
 #
 # Usage:
-#   bash infrastructure/lambdas/freshness-monitor/deploy.sh             # update code + registry
+#   bash infrastructure/lambdas/freshness-monitor/deploy.sh             # update code + registry (operator; needs ae-config clone)
+#   bash infrastructure/lambdas/freshness-monitor/deploy.sh --code-only # update code ONLY (CI path; no registry, no ae-config clone)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --bootstrap # first-time create + wire EventBridge
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --smoke     # invoke once after deploy
@@ -47,11 +56,13 @@ REGISTRY_S3_KEY="_freshness_monitor/ARTIFACT_REGISTRY.yaml"
 DRY_RUN=false
 BOOTSTRAP=false
 SMOKE=false
+CODE_ONLY=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
     --smoke) SMOKE=true ;;
+    --code-only) CODE_ONLY=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
 done
@@ -74,17 +85,23 @@ print('index.py syntax OK')
 "
 
 # ----- 0b. Verify ae-config clone present (registry validation runs later) -
+# Skipped under --code-only: the registry is owned + S3-synced by
+# alpha-engine-config (sync-artifact-registry.yml), so a code-only CI
+# deploy needs no ae-config clone.
 
-if [[ ! -f "${REGISTRY_LOCAL}" ]]; then
-  echo "❌ Registry not found at ${REGISTRY_LOCAL}"
-  echo "   Clone nousergon/alpha-engine-config into ~/Development/ or set CONFIG_REPO"
-  exit 1
-fi
+if ! $CODE_ONLY; then
+  if [[ ! -f "${REGISTRY_LOCAL}" ]]; then
+    echo "❌ Registry not found at ${REGISTRY_LOCAL}"
+    echo "   Clone nousergon/alpha-engine-config into ~/Development/ or set CONFIG_REPO"
+    echo "   (or pass --code-only to deploy code without re-pushing the registry)"
+    exit 1
+  fi
 
-if [[ ! -f "${REGISTRY_VALIDATOR}" ]]; then
-  echo "❌ Validator not found at ${REGISTRY_VALIDATOR}"
-  echo "   alpha-engine-config must be at the post-PR-#344 commit (artifact-registry-bootstrap merged)"
-  exit 1
+  if [[ ! -f "${REGISTRY_VALIDATOR}" ]]; then
+    echo "❌ Validator not found at ${REGISTRY_VALIDATOR}"
+    echo "   alpha-engine-config must be at the post-PR-#344 commit (artifact-registry-bootstrap merged)"
+    exit 1
+  fi
 fi
 
 # ----- 1. Package: pip install runtime deps into $PKG ----------------------
@@ -103,9 +120,12 @@ python3 -m pip install \
 # ----- 1a. Validate registry locally before upload --------------------------
 # Runs AFTER step 1's pip install — the validator imports yaml which isn't
 # guaranteed in the caller's bare python. PYTHONPATH=$PKG resolves it.
+# Skipped under --code-only (alpha-engine-config CI validates + uploads it).
 
-echo "Validating registry locally before upload..."
-PYTHONPATH="${PKG}" python3 "${REGISTRY_VALIDATOR}" --registry "${REGISTRY_LOCAL}"
+if ! $CODE_ONLY; then
+  echo "Validating registry locally before upload..."
+  PYTHONPATH="${PKG}" python3 "${REGISTRY_VALIDATOR}" --registry "${REGISTRY_LOCAL}"
+fi
 
 # ----- 1b. Preflight handler unit tests with runtime deps available --------
 # Runs AFTER step 1's pip install so the test's `import index` succeeds
@@ -267,14 +287,20 @@ fi
 echo "✓ Code deployed."
 
 # ----- 4. Upload registry to S3 ---------------------------------------------
+# Skipped under --code-only: alpha-engine-config's sync-artifact-registry.yml
+# owns the registry → S3 upload on registry merges. Keeping it here too would
+# double-write (harmless) but requires the ae-config clone the CI path lacks.
 
-echo "Uploading registry: ${REGISTRY_LOCAL} → s3://${REGISTRY_BUCKET}/${REGISTRY_S3_KEY}"
-run aws s3 cp \
-  "${REGISTRY_LOCAL}" \
-  "s3://${REGISTRY_BUCKET}/${REGISTRY_S3_KEY}" \
-  --region "${REGION}"
-
-echo "✓ Registry uploaded."
+if ! $CODE_ONLY; then
+  echo "Uploading registry: ${REGISTRY_LOCAL} → s3://${REGISTRY_BUCKET}/${REGISTRY_S3_KEY}"
+  run aws s3 cp \
+    "${REGISTRY_LOCAL}" \
+    "s3://${REGISTRY_BUCKET}/${REGISTRY_S3_KEY}" \
+    --region "${REGION}"
+  echo "✓ Registry uploaded."
+else
+  echo "↪ --code-only: skipping registry upload (owned by alpha-engine-config sync workflow)."
+fi
 
 # ----- 5. Smoke (direct invoke) ---------------------------------------------
 
