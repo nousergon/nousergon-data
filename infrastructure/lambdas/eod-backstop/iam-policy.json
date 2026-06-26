@@ -1,0 +1,30 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-eod-backstop:*"
+    },
+    {
+      "Sid": "DescribeTradingBox",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ListAndStartEodSF",
+      "Effect": "Allow",
+      "Action": [
+        "states:ListExecutions",
+        "states:StartExecution"
+      ],
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+    }
+  ]
+}
