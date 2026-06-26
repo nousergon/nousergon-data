@@ -28,7 +28,7 @@ invocation:
      ``dedup_key=resolve_dedup_key(spec, now)`` — dedup collapses
      4×/hour retries to one alert per cycle per artifact.
   6. **OBSERVE-mode gate**: when env
-     ``MNEMON_FRESHNESS_MONITOR_ENABLED`` is anything other than
+     ``CRUCIBLE_FRESHNESS_MONITOR_ENABLED`` is anything other than
      ``"true"`` (case-insensitive), alerts are suppressed but the
      check results and heartbeat are still emitted. Phase 6 cutover
      flips the env var via ``aws lambda update-function-configuration``
@@ -100,7 +100,7 @@ _DEFAULT_LOOKBACK = {
 # other than literal "true" (case-insensitive) suppresses alerts. Check
 # results + heartbeat are emitted regardless.
 ALERTS_ENABLED = (
-    os.environ.get("MNEMON_FRESHNESS_MONITOR_ENABLED", "false").lower() == "true"
+    os.environ.get("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "false").lower() == "true"
 )
 
 # ArtifactSpec field set — used to strip extra YAML keys (e.g., the
