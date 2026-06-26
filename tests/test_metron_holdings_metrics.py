@@ -38,22 +38,25 @@ def _body(obj: dict) -> dict:
 
 # ── Fundamentals v2: P/B + P/S are published ─────────────────────────────────
 
-def test_fundamentals_schema_v2_includes_pb_and_ps():
-    assert mmd.FUNDAMENTALS_SCHEMA_VERSION == 2
-    assert "priceToBook" in mmd.FUNDAMENTALS_INFO_KEYS
-    assert "priceToSalesTrailing12Months" in mmd.FUNDAMENTALS_INFO_KEYS
+def test_fundamentals_schema_v3_includes_multiples_and_balance_sheet():
+    assert mmd.FUNDAMENTALS_SCHEMA_VERSION == 3
+    for k in ("priceToBook", "priceToSalesTrailing12Months", "totalDebt", "totalCash",
+              "ebitda", "freeCashflow"):
+        assert k in mmd.FUNDAMENTALS_INFO_KEYS
 
     s3 = MagicMock()
     s3.get_object.side_effect = lambda Bucket, Key: _body(_UNIVERSE) if Key == HU_KEY else (_ for _ in ()).throw(Exception("NoSuchKey"))
-    src = lambda syms: {s: {"trailingPE": 30.0, "priceToBook": 6.0, "priceToSalesTrailing12Months": 7.5} for s in syms}
+    src = lambda syms: {s: {"trailingPE": 30.0, "priceToBook": 6.0, "priceToSalesTrailing12Months": 7.5,
+                           "totalDebt": 1.1e11, "totalCash": 6.0e10, "ebitda": 1.3e11} for s in syms}
 
     result = mmd.collect_fundamentals(bucket="b", run_date="2026-06-26", s3_client=s3, fundamentals_source=src)
 
     assert result["status"] == "ok"
     art = _puts(s3)[f"{mmd.FUNDAMENTALS_PREFIX}latest.json"]
-    assert art["schema_version"] == 2
-    assert art["fundamentals"]["AAPL"]["priceToBook"] == 6.0
-    assert art["fundamentals"]["AAPL"]["priceToSalesTrailing12Months"] == 7.5
+    assert art["schema_version"] == 3
+    aapl = art["fundamentals"]["AAPL"]
+    assert aapl["priceToBook"] == 6.0 and aapl["priceToSalesTrailing12Months"] == 7.5
+    assert aapl["totalDebt"] == 1.1e11 and aapl["totalCash"] == 6.0e10 and aapl["ebitda"] == 1.3e11
 
 
 # ── Technicals: derived from close_history, no new fetch ──────────────────────

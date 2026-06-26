@@ -88,11 +88,15 @@ FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
 # yfinance Ticker.info keys published per symbol (artifact field == info key).
 # v2 (metron Holdings metrics): added priceToBook + priceToSalesTrailing12Months so the
 # Holdings table can show P/B and P/S alongside the existing P/E family.
+# v3 (metron Holdings balance-sheet band): added the absolute balance-sheet fields
+# (totalDebt / totalCash / ebitda / freeCashflow) the Holdings "Balance Sheet" columns
+# need — cash balance, debt balance, net debt, and net-debt/EBITDA leverage.
 FUNDAMENTALS_INFO_KEYS = [
     "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
     "priceToBook", "priceToSalesTrailing12Months",
     "earningsGrowth", "revenueGrowth", "debtToEquity", "currentRatio", "quickRatio",
     "returnOnEquity", "returnOnAssets", "grossMargins", "operatingMargins",
+    "totalDebt", "totalCash", "ebitda", "freeCashflow",
     "beta", "dividendYield", "marketCap", "sector", "industry",
 ]
 # Technicals — per-held-symbol indicators computed from the close_history this module
@@ -132,7 +136,7 @@ FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
-FUNDAMENTALS_SCHEMA_VERSION = 2  # v2: additive priceToBook + priceToSalesTrailing12Months
+FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow (balance sheet)
 INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
 TECHNICALS_SCHEMA_VERSION = 1
 VALUATION_MEDIANS_SCHEMA_VERSION = 1
