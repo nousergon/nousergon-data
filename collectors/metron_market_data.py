@@ -39,7 +39,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -514,10 +513,11 @@ def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
     fetched here. Fail-soft per symbol; a symbol with no resolvable snapshot is
     omitted (coverage gap, not zeros)."""
     from collectors.analyst_sources import YfinanceAnalystAdapter
+    from nousergon_lib.secrets import get_secret  # secrets via the lib, never os.environ
 
     yf_adapter = YfinanceAnalystAdapter()
     finnhub_adapter = None
-    if os.environ.get("FINNHUB_API_KEY"):
+    if get_secret("FINNHUB_API_KEY", required=False, default=""):
         try:
             from collectors.analyst_sources import FinnhubAnalystAdapter
             finnhub_adapter = FinnhubAnalystAdapter()
