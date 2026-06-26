@@ -1,7 +1,11 @@
 # Metron intraday-quotes producer (config#1023) — one shot per timer tick.
 # Writes market_data/intraday/latest.json (last / open / prior close per held
-# symbol, ~15-min delayed) for Metron's Today view. The collector itself gates
-# on the US market window AND the Metron UI heartbeat, so off-gate ticks exit "skipped" without fetching.
+# symbol + the major-index ETF proxies, ~15-min delayed) for Metron's Today view
+# and Overview markets strip. The collector gates on the US market window; off-session
+# ticks exit "skipped" without fetching. The UI-heartbeat demand gate is opt-in —
+# append --require-heartbeat below to stop fetching when no Metron app is open
+# (multi-tenant cost control; left OFF on this single-tenant owner build so the strip
+# stays warm and never freezes at the morning quote after the app has been idle).
 # Installed on the trading box by infrastructure/install-metron-intraday.sh;
 # S3 write rides the instance role (executor-role already has market_data/*).
 [Unit]

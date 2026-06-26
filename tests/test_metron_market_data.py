@@ -386,24 +386,54 @@ class TestIntraday:
         assert q["suspect"] is True
         assert q["last"] == 350.0  # flagged, never clamped/dropped — no fabrication
 
-    def test_skips_without_fresh_heartbeat(self):
-        """The demand gate: Metron closed (no/stale heartbeat) → zero quote fetches."""
+    def test_default_stays_warm_without_heartbeat(self):
+        """Owner build (gate OFF): in-session ticks publish even with no/stale heartbeat,
+        so the markets strip never freezes at the morning quote after the app is idle."""
+        # No heartbeat key at all → still writes (heartbeat never read).
+        absent = self._s3(heartbeat_offset_s=None)
+        r1 = mmd.collect_intraday(
+            bucket="b", s3_client=absent, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            now=self._RTH,
+        )
+        assert r1["status"] == "ok" and r1["indices"] == 4
+        assert absent.put_object.called
+        # Stale heartbeat (older than HEARTBEAT_FRESH_SECONDS) → still writes.
+        stale = self._s3(heartbeat_offset_s=mmd.HEARTBEAT_FRESH_SECONDS + 60)
+        r2 = mmd.collect_intraday(
+            bucket="b", s3_client=stale, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            now=self._RTH,
+        )
+        assert r2["status"] == "ok" and _puts(stale)["market_data/intraday/latest.json"]
+
+    def test_require_heartbeat_gate_skips_when_inactive(self):
+        """The opt-in demand gate (multi-tenant): Metron closed (no/stale heartbeat) →
+        zero quote fetches when require_heartbeat=True."""
         calls = []
         source = lambda s: calls.append(1) or {}
         # No heartbeat key at all.
         absent = self._s3(heartbeat_offset_s=None)
-        r1 = mmd.collect_intraday(bucket="b", s3_client=absent, intraday_source=source, now=self._RTH)
+        r1 = mmd.collect_intraday(
+            bucket="b", s3_client=absent, intraday_source=source, now=self._RTH, require_heartbeat=True,
+        )
         assert r1["status"] == "skipped" and "heartbeat" in r1["reason"]
         # Stale heartbeat (older than HEARTBEAT_FRESH_SECONDS).
         stale = self._s3(heartbeat_offset_s=mmd.HEARTBEAT_FRESH_SECONDS + 60)
-        r2 = mmd.collect_intraday(bucket="b", s3_client=stale, intraday_source=source, now=self._RTH)
+        r2 = mmd.collect_intraday(
+            bucket="b", s3_client=stale, intraday_source=source, now=self._RTH, require_heartbeat=True,
+        )
         assert r2["status"] == "skipped" and "heartbeat" in r2["reason"]
         assert not calls and not absent.put_object.called and not stale.put_object.called
-        # force bypasses BOTH gates (manual/debug runs).
+        # A fresh heartbeat opens the gate → writes.
+        active = mmd.collect_intraday(
+            bucket="b", s3_client=self._s3(), intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            now=self._RTH, require_heartbeat=True,
+        )
+        assert active["status"] == "ok"
+        # force bypasses BOTH gates even with the gate on (manual/debug runs).
         forced = mmd.collect_intraday(
             bucket="b", s3_client=self._s3(heartbeat_offset_s=None),
             intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
-            now=self._RTH, force=True,
+            now=self._RTH, force=True, require_heartbeat=True,
         )
         assert forced["status"] == "ok"
 
