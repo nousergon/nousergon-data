@@ -89,8 +89,11 @@ def _stub_universe_lib(ticker_to_last_date: dict[str, str | None]):
 
 
 def _stub_s3_with_pcache(parquet_dfs_by_ticker: dict[str, pd.DataFrame]):
-    """S3 stub that serves predictor/price_cache/{T}.parquet from a dict
-    of in-memory DataFrames; raises NoSuchKey for absent tickers."""
+    """S3 stub that serves reference/price_cache/{T}.parquet from a dict
+    of in-memory DataFrames; raises NoSuchKey for absent tickers.
+
+    Wave-3 PR4 cutover: the self-heal read/write chain is reference-only,
+    so the stub serves + records the ``reference/price_cache/`` prefix."""
     s3 = MagicMock()
 
     class _NoSuchKey(Exception):
@@ -102,7 +105,7 @@ def _stub_s3_with_pcache(parquet_dfs_by_ticker: dict[str, pd.DataFrame]):
 
     def _get_object(Bucket, Key):
         for ticker, df in parquet_dfs_by_ticker.items():
-            if Key == f"predictor/price_cache/{ticker}.parquet":
+            if Key == f"reference/price_cache/{ticker}.parquet":
                 buf = io.BytesIO()
                 df.to_parquet(buf, engine="pyarrow")
                 buf.seek(0)
@@ -162,7 +165,7 @@ def test_self_heal_backfills_pstg_via_yfinance_and_invokes_per_ticker_backfill()
     """The 2026-05-09 incident exact path: PSTG at 5/5 in ArcticDB,
     target=5/8, yfinance has 5/6 + 5/7 + 5/8. Self-heal must:
       - yfinance-fetch [5/6, 5/8]
-      - patch predictor/price_cache/PSTG.parquet with new rows (deduped)
+      - patch reference/price_cache/PSTG.parquet with new rows (deduped)
       - invoke builders.backfill(ticker_filter='PSTG') so the ArcticDB
         write goes through the same per-ticker compute_features path.
     """
@@ -203,9 +206,12 @@ def test_self_heal_backfills_pstg_via_yfinance_and_invokes_per_ticker_backfill()
     assert healed["new_last_date"] == "2026-05-08"
     assert len(result["errors"]) == 0
 
-    # Patched parquet got written with the fresh rows merged in
-    pcache_key = "predictor/price_cache/PSTG.parquet"
+    # Patched parquet got written with the fresh rows merged in (reference-only)
+    pcache_key = "reference/price_cache/PSTG.parquet"
     assert pcache_key in s3.written
+    assert not any(
+        k.startswith("predictor/price_cache/") for k in s3.written
+    )
     written_df = pd.read_parquet(io.BytesIO(s3.written[pcache_key]))
     assert pd.Timestamp("2026-05-08") in written_df.index
     assert pd.Timestamp("2026-05-06") in written_df.index
