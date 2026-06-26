@@ -44,11 +44,12 @@ Log-group prefix → vocab.yaml subsystem (matching order; first-match wins):
 
 Operator can refine via a follow-up `changelog-log --event-type investigation` entry whose `git_refs` reference the original event_id.
 
-## Subscription targets (11 Lambdas)
+## Subscription targets (21 Lambdas)
 
 The deploy script wires subscription filters to every alpha-engine Lambda **except** the two changelog-mirror Lambdas (recursion guard — if this Lambda errors, its log lines must not feed back into itself).
 
 ```
+# Pipeline / producer Lambdas
 alpha-engine-data-collector
 alpha-engine-ec2-lifecycle
 alpha-engine-predictor-health-check
@@ -60,6 +61,19 @@ alpha-engine-research-eval-judge
 alpha-engine-research-eval-rolling-mean
 alpha-engine-research-rationale-clustering
 alpha-engine-research-runner
+
+# Operational / infra Lambdas (capture completeness — config#1273 Phase B;
+# subsystem defaults to "infrastructure")
+alpha-engine-eod-backstop
+alpha-engine-eod-success-friday-shell-trigger
+alpha-engine-freshness-monitor
+alpha-engine-friday-shell-run-report
+alpha-engine-pipeline-watchdog
+alpha-engine-saturday-integrity-sentinel
+alpha-engine-saturday-sf-success-groom-dispatcher
+alpha-engine-saturday-sf-watch-dispatcher
+alpha-engine-sf-telegram-notifier
+alpha-engine-spot-orphan-reaper
 ```
 
 ## Recursion guard
