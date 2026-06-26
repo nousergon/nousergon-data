@@ -513,7 +513,9 @@ def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
     fetched here. Fail-soft per symbol; a symbol with no resolvable snapshot is
     omitted (coverage gap, not zeros)."""
     from collectors.analyst_sources import YfinanceAnalystAdapter
-    from nousergon_lib.secrets import get_secret  # secrets via the lib, never os.environ
+    from alpha_engine_lib.secrets import get_secret  # secrets via the lib, never os.environ
+    # (alpha_engine_lib, not nousergon_lib: this repo pins a pre-rename lib (<0.60.0)
+    # where only the alpha_engine_lib name exists — matches finnhub_client.py.)
 
     yf_adapter = YfinanceAnalystAdapter()
     finnhub_adapter = None
