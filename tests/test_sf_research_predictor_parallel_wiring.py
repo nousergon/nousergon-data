@@ -53,6 +53,15 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
 
 _BRANCH_A_STATES = {
+    # config#885: the Scanner→RAGIngestion→RegimeSubstrate→
+    # RegimeRetrospectiveEval chain was relocated FROM top level INTO
+    # Branch A's head (Scanner is Branch A's StartAt) so PredictorTraining
+    # (Branch B) forks parallel to it directly after DataPhase1.
+    "Scanner", "CheckSkipRAGIngestion", "RAGIngestion",
+    "WaitForRAGIngestion", "CheckRAGIngestionStatus", "RAGIngestionWait",
+    "RAGIngestionRetryGate", "RAGIngestionReissue", "ExtractRAGIngestionError",
+    "CheckSkipRegimeSubstrate", "RegimeSubstrate",
+    "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
     "CheckSkipResearch", "Research", "CheckResearchStatus",
     "CheckSkipDataPhase2", "DataPhase2", "CheckSkipEvalJudge",
     "ComputeEvalCadence", "CheckMonthlyCadence",
@@ -145,8 +154,14 @@ class TestParallelStatePresence:
     def test_parallel_has_exactly_two_branches(self, parallel):
         assert len(parallel["Branches"]) == 2
 
-    def test_branch_a_starts_at_check_skip_research(self, parallel):
-        assert parallel["Branches"][0]["StartAt"] == "CheckSkipResearch"
+    def test_branch_a_starts_at_scanner(self, parallel):
+        # config#885: Branch A now leads with the relocated Scanner chain
+        # (Scanner → RAG → RegimeSubstrate → RegimeRetrospectiveEval →
+        # CheckSkipResearch → ...). CheckSkipResearch is no longer the
+        # StartAt — it is the chain's continuation inside Branch A.
+        assert parallel["Branches"][0]["StartAt"] == "Scanner"
+        branch_a = parallel["Branches"][0]["States"]
+        assert "CheckSkipResearch" in branch_a
 
     def test_branch_b_starts_at_check_skip_predictor_training(self, parallel):
         assert (
@@ -619,22 +634,71 @@ class TestPostJoinAggregationAndFailure:
 
 
 class TestInboundRewireAndDownstreamUnchanged:
-    def test_regime_retrospective_eval_routes_into_parallel(self, states):
+    def test_data_phase1_forks_into_parallel(self, states):
+        """config#885: DataPhase1 now routes DIRECTLY into the Parallel
+        (both the skip path and the poll-Success path), so PredictorTraining
+        (Branch B) forks parallel to the relocated Scanner chain (Branch A
+        head). This is the whole point of the change — Predictor's ~91 min
+        overlaps Scanner+RAG+Research instead of stacking after it."""
+        assert any(
+            c["Next"] == "ResearchPredictorParallel"
+            for c in states["CheckSkipDataPhase1"]["Choices"]
+        )
+        success = next(
+            c for c in states["CheckDataPhase1Status"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        )
+        assert success["Next"] == "ResearchPredictorParallel"
+
+    def test_relocated_chain_threads_through_branch_a(self, branch_a):
+        """The relocated Scanner chain's terminal RegimeRetrospectiveEval
+        (and its skip-gate + non-blocking Catch) continue to
+        CheckSkipResearch IN-BRANCH — never the parent Parallel (invalid
+        branch→parent) nor top-level HandleFailure (cross-branch cancel)."""
+        assert branch_a["Scanner"]["Next"] == "CheckSkipRAGIngestion"
         assert (
-            states["RegimeRetrospectiveEval"]["Next"]
-            == "ResearchPredictorParallel"
+            branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
         )
         assert [
             c["Next"]
-            for c in states["RegimeRetrospectiveEval"]["Catch"]
-        ] == ["ResearchPredictorParallel"]
-
-    def test_skip_regime_retrospective_eval_routes_into_parallel(
-        self, states
-    ):
-        c = states["CheckSkipRegimeRetrospectiveEval"]
-        assert c["Choices"][0]["Next"] == "ResearchPredictorParallel"
+            for c in branch_a["RegimeRetrospectiveEval"]["Catch"]
+        ] == ["CheckSkipResearch"]
+        c = branch_a["CheckSkipRegimeRetrospectiveEval"]
+        assert c["Choices"][0]["Next"] == "CheckSkipResearch"
         assert c["Default"] == "RegimeRetrospectiveEval"
+
+    def test_relocated_chain_gone_from_top_level(self, states):
+        for n in (
+            "Scanner", "RAGIngestion", "RegimeSubstrate",
+            "RegimeRetrospectiveEval", "CheckSkipRegimeRetrospectiveEval",
+        ):
+            assert n not in states, (
+                f"{n} must live inside Branch A, not top level (config#885)."
+            )
+
+    def test_relocated_rag_error_edges_route_to_branch_fail_path(
+        self, branch_a
+    ):
+        """The relocated RAGIngestion error edges that USED to hit the
+        top-level HandleFailure must now route to the branch-fail path
+        (PublishResearchFailureImmediate → BranchAFailed), mirroring
+        ExtractResearchError — a branch state pointing at the non-branch
+        HandleFailure is an invalid ASL transition AND would re-introduce
+        cross-branch cancellation."""
+        assert [c["Next"] for c in branch_a["RAGIngestion"]["Catch"]] == [
+            "PublishResearchFailureImmediate"
+        ]
+        assert [
+            c["Next"] for c in branch_a["WaitForRAGIngestion"]["Catch"]
+        ] == ["PublishResearchFailureImmediate"]
+        assert (
+            branch_a["ExtractRAGIngestionError"]["Next"]
+            == "PublishResearchFailureImmediate"
+        )
+        assert (
+            branch_a["PublishResearchFailureImmediate"]["Next"]
+            == "BranchAFailed"
+        )
 
     def test_drift_to_backtester_chain_unchanged(self, states):
         assert (
