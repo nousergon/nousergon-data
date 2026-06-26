@@ -1242,10 +1242,15 @@ def in_us_market_window(now: datetime | None = None) -> bool:
     return open_min <= et.hour * 60 + et.minute <= close_min
 
 
-# The demand gate: Metron's web layer touches this key while the app is actively
-# being used (throttled heartbeat — see metron api/services/data_spine.py). The
-# intraday producer fetches ONLY while the heartbeat is fresh, so a closed app
-# costs zero quote fetches. Missing key = app never opened → skip.
+# The (opt-in) demand gate: Metron's web layer touches this key while the app is
+# actively being used (throttled heartbeat — see metron api/services/data_spine.py).
+# When the gate is ON (``require_heartbeat=True``, set for a multi-tenant deployment via
+# the ``--require-heartbeat`` flag) the producer fetches ONLY while the heartbeat is fresh,
+# so a closed app costs zero quote fetches. The gate is OFF by default: on the single-tenant
+# owner build the strip is 4 globally-shared ETF symbols + a small held universe — one fetch
+# serves everyone — so we keep it warm every session tick rather than inflict a multi-minute
+# cold-start (a frozen morning quote) on the owner every time the app has been idle >10 min.
+# Re-enable before multi-tenant by adding ``--require-heartbeat`` to the systemd unit.
 UI_HEARTBEAT_KEY = "metron/ui_heartbeat.json"
 HEARTBEAT_FRESH_SECONDS = 600  # 10 min — two missed 5-min ticks ends the session
 
@@ -1282,7 +1287,7 @@ def _flag_suspect_quotes(quotes: dict[str, dict]) -> int:
 def collect_intraday(
     *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
     intraday_source: IntradaySource | None = None, force: bool = False,
-    now: datetime | None = None,
+    now: datetime | None = None, require_heartbeat: bool = False,
 ) -> dict:
     """Write the intraday-quotes artifact for Metron's held universe + the major-index
     proxies (config#1023 — the 15-minute Today-view feed + the Overview markets strip,
@@ -1293,23 +1298,24 @@ def collect_intraday(
              quotes:  {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
              indices: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
 
-    ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading
-    box (infrastructure/systemd/metron-intraday.timer), double-gated: the NYSE
-    session window (exchange calendar incl. half-days) AND the Metron UI heartbeat
-    (``metron_app_active``) — quotes are fetched only while the market is open AND
-    the app is actually being used. Outside either gate it returns ``skipped``
-    without fetching (``force`` overrides both, for manual runs). The major-index ETF
-    proxies (``INDEX_PROXY_SYMBOLS``) are market context — fetched every run regardless
-    of the held universe, so a brand-new account still gets the markets strip. A quote
-    moving >40% vs prior close carries ``suspect: true`` (flagged, never dropped). Single
-    ``latest.json`` key — consumers see staleness via ``as_of_utc``. Injectable
-    source/S3 for tests."""
+    ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading box
+    (infrastructure/systemd/metron-intraday.timer), gated on the NYSE session window
+    (exchange calendar incl. half-days). When ``require_heartbeat`` (the multi-tenant
+    demand gate — OFF by default, see ``UI_HEARTBEAT_KEY``) it ALSO gates on a fresh Metron
+    UI heartbeat so a closed app costs zero fetches; OFF, it stays warm every session tick
+    so the owner never sees a frozen morning quote after the app was idle. Outside the
+    market window it returns ``skipped`` without fetching (``force`` overrides every gate,
+    for manual runs). The major-index ETF proxies (``INDEX_PROXY_SYMBOLS``) are market
+    context — fetched every run regardless of the held universe, so a brand-new account
+    still gets the markets strip. A quote moving >40% vs prior close carries
+    ``suspect: true`` (flagged, never dropped). Single ``latest.json`` key — consumers see
+    staleness via ``as_of_utc``. Injectable source/S3 for tests."""
     if not force and not in_us_market_window(now):
         return {"status": "skipped", "reason": "outside US market window"}
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    if not force and not metron_app_active(bucket, s3_client, now):
+    if require_heartbeat and not force and not metron_app_active(bucket, s3_client, now):
         return {"status": "skipped", "reason": "metron app inactive (no fresh UI heartbeat)"}
     fetch = intraday_source or _yfinance_intraday
 
@@ -1359,13 +1365,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fundamentals", action="store_true", help="also write the tearsheet-fundamentals artifact")
     parser.add_argument("--only-intraday", action="store_true",
                         help="write ONLY the intraday-quotes artifact (the 5-min timer entry; "
-                             "no-op outside the NYSE session or without a fresh Metron UI heartbeat, unless --force)")
+                             "no-op outside the NYSE session unless --force)")
+    parser.add_argument("--require-heartbeat", action="store_true",
+                        help="ALSO gate --only-intraday on a fresh Metron UI heartbeat (the "
+                             "multi-tenant demand gate — OFF by default so the single-tenant owner "
+                             "build stays warm every session tick)")
     parser.add_argument("--force", action="store_true",
                         help="bypass the market-window AND app-heartbeat gates for --only-intraday")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if args.only_intraday:
-        intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force)
+        intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force,
+                                 require_heartbeat=args.require_heartbeat)
         logger.info("[metron_market_data] intraday done: %s", intra)
         return 0 if intra.get("status") in ("ok", "ok_dry_run", "skipped") else 1
     result = collect(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
