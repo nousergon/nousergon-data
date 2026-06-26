@@ -19,6 +19,13 @@ Artifact schemas (versioned — Metron's consumer pins on ``schema_version``):
 
     closes: {schema_version, as_of, source, closes: {yf_symbol: {close, currency, bar_date}}}
     fx:     {schema_version, as_of, base: "USD", rates: {CCY: rate}}
+    technicals: {schema_version, as_of, source: "computed", technicals: {yf_symbol:
+                 {rsi_14, macd_hist, ma_50, ma_200, pct_to_ma_50, pct_to_ma_200,
+                  high_52w, low_52w, pct_in_52w_range, mom_20d, mom_60d}}}   (daily; derived
+                 from close_history — no new fetch)
+    valuation_medians: {schema_version, as_of, source: "yfinance", by_sector / by_country:
+                 {group: {trailing_pe, forward_pe, price_to_book, price_to_sales, ev_ebitda,
+                  dividend_yield, n}}}   (weekly; SP1500-broad peer benchmark for Holdings)
 
 Runs each weekday in ``weekly_collector._run_daily``. Best-effort per the module posture:
 the universe read fail-softs to an empty pull (logged), and a fetch/​write error returns
@@ -79,11 +86,30 @@ METRON_MACRO_SERIES = ["FEDFUNDS", "UNRATE", "T10YIE", "DGS10", "DGS2", "T10Y2Y"
 # Finnhub free tier can't price) with the wider tearsheet field set.
 FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
 # yfinance Ticker.info keys published per symbol (artifact field == info key).
+# v2 (metron Holdings metrics): added priceToBook + priceToSalesTrailing12Months so the
+# Holdings table can show P/B and P/S alongside the existing P/E family.
 FUNDAMENTALS_INFO_KEYS = [
     "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
+    "priceToBook", "priceToSalesTrailing12Months",
     "earningsGrowth", "revenueGrowth", "debtToEquity", "currentRatio", "quickRatio",
     "returnOnEquity", "returnOnAssets", "grossMargins", "operatingMargins",
     "beta", "dividendYield", "marketCap", "sector", "industry",
+]
+# Technicals — per-held-symbol indicators computed from the close_history this module
+# already publishes daily (zero new fetches). Slow-moving (RSI14 / 50d-200d MA / 52w
+# range / momentum) so a daily refresh off the close series is plenty.
+TECHNICALS_PREFIX = "market_data/technicals/"
+# Valuation medians — SP1500-broad sector & country median multiples, the peer benchmark
+# the Holdings "by sector → country" view bands each holding against. A small DERIVED
+# aggregate (medians + member counts, no per-ticker rows). Weekly cadence (multiples move
+# quarterly; the median of ~900 names is stable week to week).
+VALUATION_MEDIANS_PREFIX = "market_data/valuation_medians/"
+# yfinance Ticker.info keys the valuation-medians pass reads per universe symbol. Mirrors
+# the multiple subset of FUNDAMENTALS_INFO_KEYS (same source + semantics as the per-holding
+# fundamentals → the band and the row are directly comparable) plus sector/country to group.
+VALUATION_MEDIAN_KEYS = [
+    "trailingPE", "forwardPE", "priceToBook",
+    "priceToSalesTrailing12Months", "enterpriseToEbitda", "dividendYield",
 ]
 # Intraday — last/open/prior-close per held symbol, refreshed every 15 min during US
 # regular trading hours by a systemd timer on the trading box (config#1023). Single
@@ -106,8 +132,10 @@ FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
-FUNDAMENTALS_SCHEMA_VERSION = 1
+FUNDAMENTALS_SCHEMA_VERSION = 2  # v2: additive priceToBook + priceToSalesTrailing12Months
 INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
+TECHNICALS_SCHEMA_VERSION = 1
+VALUATION_MEDIANS_SCHEMA_VERSION = 1
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -148,6 +176,11 @@ MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 FundamentalsSource = Callable[[list[str]], dict[str, dict]]
 # An intraday source maps yf_symbols → {yf_symbol: quote dict} (see _yfinance_intraday).
 IntradaySource = Callable[[list[str]], dict[str, dict]]
+# A valuation source maps yf_symbols → {yf_symbol: {multiple_key|sector|country: value}}
+# (the multiples + classification the medians pass groups on; see _yfinance_valuation).
+ValuationSource = Callable[[list[str]], dict[str, dict]]
+# A medians universe source returns the broad (SP1500 ∪ held) yf_symbol list to benchmark.
+MediansUniverseSource = Callable[[], list[str]]
 
 
 # ── Universe read ───────────────────────────────────────────────────────────
@@ -551,6 +584,17 @@ def _write_json(s3_client: Any, bucket: str, key: str, obj: dict) -> None:
     )
 
 
+def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
+    """Read+parse ``s3://bucket/key`` → dict, or ``None`` on any miss (NoSuchKey, parse
+    error, no creds). Fail-soft so a derived collector (technicals reads back close_history;
+    medians reads back the universe) degrades to a coverage gap rather than aborting."""
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
+
+
 # ── Orchestration ────────────────────────────────────────────────────────────
 
 
@@ -865,6 +909,284 @@ def collect_fundamentals(
         return {"status": "error", "error": str(e)}
     logger.info("[metron_market_data] wrote fundamentals for %d/%d symbols", len(fundamentals), len(yf_symbols))
     return {"status": "ok", "universe": len(holdings), "fundamentals": len(fundamentals)}
+
+
+# ── Technicals (derived from close_history — no new fetch) ────────────────────
+
+# Minimum close observations needed before any indicator is emitted for a symbol. The
+# 200-day MA is the deepest window; below it we emit only the indicators a shorter series
+# supports (never a fabricated MA on too little data).
+_TECH_MIN_OBS = 30
+_SESSIONS_PER_YEAR = 252
+
+
+def _compute_technicals(closes: list[list]) -> dict | None:
+    """Indicators from an ascending ``[[date_iso, close], …]`` series → flat dict, or
+    ``None`` if the series is too short / unusable. Reuses the fleet-canonical Wilder RSI +
+    MACD from ``features.feature_engineer`` so the dashboard and the predictor agree on the
+    definitions (per the SOTA mirror-don't-reinvent rule). Each field is independently
+    gated on having enough history — a 120-day series gets RSI/50d-MA but null 200d-MA."""
+    import pandas as pd
+
+    from features.feature_engineer import _compute_macd, _compute_rsi
+
+    vals = [c for c in closes if isinstance(c, (list, tuple)) and len(c) == 2 and c[1] is not None]
+    if len(vals) < _TECH_MIN_OBS:
+        return None
+    s = pd.Series([float(v[1]) for v in vals], dtype="float64")
+    s = s[s > 0]
+    if len(s) < _TECH_MIN_OBS:
+        return None
+    last = float(s.iloc[-1])
+
+    def _round(x: float | None, n: int = 4) -> float | None:
+        if x is None:
+            return None
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return round(x, n) if x == x and x not in (float("inf"), float("-inf")) else None
+
+    rsi = _compute_rsi(s)
+    macd_line, signal_line = _compute_macd(s)
+    rsi_14 = _round(rsi.iloc[-1], 2) if len(rsi) else None
+    macd_hist = (
+        _round(float(macd_line.iloc[-1]) - float(signal_line.iloc[-1]))
+        if len(macd_line) and len(signal_line) else None
+    )
+    ma_50 = float(s.iloc[-50:].mean()) if len(s) >= 50 else None
+    ma_200 = float(s.iloc[-200:].mean()) if len(s) >= 200 else None
+    window_52w = s.iloc[-_SESSIONS_PER_YEAR:]
+    high_52w = float(window_52w.max())
+    low_52w = float(window_52w.min())
+    rng = high_52w - low_52w
+    out = {
+        "rsi_14": rsi_14,
+        "macd_hist": macd_hist,
+        "ma_50": _round(ma_50, 4),
+        "ma_200": _round(ma_200, 4),
+        "pct_to_ma_50": _round(last / ma_50 - 1.0) if ma_50 else None,
+        "pct_to_ma_200": _round(last / ma_200 - 1.0) if ma_200 else None,
+        "high_52w": _round(high_52w, 4),
+        "low_52w": _round(low_52w, 4),
+        "pct_in_52w_range": _round((last - low_52w) / rng) if rng > 0 else None,
+        "mom_20d": _round(last / float(s.iloc[-21]) - 1.0) if len(s) >= 21 else None,
+        "mom_60d": _round(last / float(s.iloc[-61]) - 1.0) if len(s) >= 61 else None,
+    }
+    # All-null → no usable indicator; treat as a coverage gap (no fabricated row).
+    return out if any(v is not None for v in out.values()) else None
+
+
+def collect_technicals(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None,
+) -> dict:
+    """Write per-held-symbol technical indicators for Metron's Holdings table, computed
+    from the ``close_history`` artifacts this module already publishes (read back from S3 —
+    **no new market-data fetch**):
+
+        market_data/technicals/latest.json
+            {schema_version, as_of, technicals: {yf_symbol: {rsi_14, macd_hist, ma_50,
+             ma_200, pct_to_ma_50, pct_to_ma_200, high_52w, low_52w, pct_in_52w_range,
+             mom_20d, mom_60d}}}
+
+    Daily cadence (close_history refreshes daily). Fail-soft per symbol; a symbol with no
+    close_history / too short a series is omitted (coverage gap, never zeros)."""
+    if run_date is None:
+        from dates import default_run_date
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    technicals: dict[str, dict] = {}
+    for yf_sym in yf_symbols:
+        hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
+        if not hist or not hist.get("closes"):
+            continue
+        try:
+            tech = _compute_technicals(hist["closes"])
+        except Exception as e:  # one bad series must not sink the whole artifact
+            logger.warning("[metron_market_data] technicals compute failed for %s: %s", yf_sym, e)
+            continue
+        if tech is not None:
+            technicals[yf_sym] = tech
+    artifact = {
+        "schema_version": TECHNICALS_SCHEMA_VERSION, "as_of": run_date,
+        "source": "computed", "technicals": dict(sorted(technicals.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN technicals: %d/%d symbols (not written)",
+                    len(technicals), len(yf_symbols))
+        return {"status": "ok_dry_run", "technicals": len(technicals), "universe": len(yf_symbols)}
+    try:
+        _write_json(s3_client, bucket, f"{TECHNICALS_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] technicals write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote technicals for %d/%d symbols", len(technicals), len(yf_symbols))
+    return {"status": "ok", "universe": len(yf_symbols), "technicals": len(technicals)}
+
+
+# ── Valuation medians (SP1500-broad sector & country peer benchmark) ──────────
+
+# camelCase yfinance .info key → snake_case median output field (the consumer maps these
+# 1:1 to the per-holding multiple, so band and row are directly comparable).
+_MEDIAN_OUT_NAME = {
+    "trailingPE": "trailing_pe", "forwardPE": "forward_pe", "priceToBook": "price_to_book",
+    "priceToSalesTrailing12Months": "price_to_sales", "enterpriseToEbitda": "ev_ebitda",
+    "dividendYield": "dividend_yield",
+}
+# A sector/country bucket below this many members is statistically too thin to be a
+# benchmark — it's still emitted (with its honest `n`) so the consumer can choose to
+# suppress it, never silently dropped.
+_MEDIAN_MIN_BUCKET = 3
+
+
+@_yf_quiet
+def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
+    """Per-symbol valuation multiples + GICS sector + country of domicile via
+    ``yf.Ticker(sym).info`` → ``{yf_symbol: {key: value, …, "sector": …, "country": …}}``
+    over ``VALUATION_MEDIAN_KEYS``. Same source + units as ``_yfinance_fundamentals`` so the
+    median band and the per-holding row are apples-to-apples. Fail-soft per symbol."""
+    try:
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    out: dict[str, dict] = {}
+    for i, sym in enumerate(yf_symbols):
+        if i > 0 and i % _YFINANCE_BATCH_SIZE == 0:
+            time.sleep(_YFINANCE_BATCH_DELAY)  # rate-limit courtesy on the ~900-name pass
+        try:
+            info = yf.Ticker(sym).info or {}
+        except Exception as e:
+            logger.warning("[metron_market_data] valuation fetch failed for %s: %s", sym, e)
+            continue
+        row = {k: info[k] for k in VALUATION_MEDIAN_KEYS if info.get(k) is not None}
+        sector, country = info.get("sector"), info.get("country")
+        if sector:
+            row["sector"] = sector
+        if country:
+            row["country"] = country
+        if row:
+            out[sym] = row
+    logger.info("[metron_market_data] valuation: %d/%d symbols covered", len(out), len(yf_symbols))
+    _log_yf_coverage("valuation", yf_symbols, out)
+    return out
+
+
+def _default_medians_universe(bucket: str, s3_client: Any) -> list[str]:
+    """The broad benchmark universe = SP1500 constituents ∪ Metron held symbols. SP1500
+    from the constituents artifact (the system universe the fleet already tracks); held
+    symbols add the foreign/OTC names so a foreign holding's country bucket isn't empty."""
+    symbols: set[str] = set()
+    try:
+        from collectors import constituents
+
+        art = constituents.load_from_s3(bucket)
+        for t in (art or {}).get("tickers", []) or []:
+            if str(t).strip():
+                symbols.add(str(t).strip())
+    except Exception as e:
+        logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    symbols.update(h["yf_symbol"] for h in holdings)
+    return sorted(symbols)
+
+
+def _grouped_medians(rows: list[dict], group_key: str) -> dict[str, dict]:
+    """Median of each multiple per ``group_key`` (``"sector"`` | ``"country"``) value, plus
+    the member count ``n``. A multiple's median uses only finite, > 0 samples (a negative /
+    zero P/E is meaningless, not a data point); a bucket missing a multiple omits that field
+    rather than emitting a fabricated value."""
+    import statistics
+
+    buckets: dict[str, list[dict]] = {}
+    for r in rows:
+        g = r.get(group_key)
+        if g:
+            buckets.setdefault(str(g), []).append(r)
+    out: dict[str, dict] = {}
+    for g, members in buckets.items():
+        entry: dict = {"n": len(members)}
+        for in_key, out_key in _MEDIAN_OUT_NAME.items():
+            samples = []
+            for m in members:
+                v = m.get(in_key)
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if v == v and v not in (float("inf"), float("-inf")) and v > 0:
+                    samples.append(v)
+            if samples:
+                entry[out_key] = round(statistics.median(samples), 4)
+        out[g] = entry
+    return dict(sorted(out.items()))
+
+
+def collect_valuation_medians(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, valuation_source: ValuationSource | None = None,
+    universe_source: MediansUniverseSource | None = None,
+) -> dict:
+    """Write the SP1500-broad sector & country median-multiple benchmark for Metron's
+    Holdings "by sector → country" bands (metron Holdings metrics):
+
+        market_data/valuation_medians/latest.json
+            {schema_version, as_of, source: "yfinance",
+             by_sector:  {sector:  {trailing_pe, forward_pe, price_to_book, price_to_sales,
+                                    ev_ebitda, dividend_yield, n}},
+             by_country: {country: {…same…}}}
+
+    Weekly cadence (medians of ~900 names move quarterly). A derived AGGREGATE — emits only
+    medians + member counts, never per-ticker rows. Injectable sources/S3 for tests; hard-
+    fails (no silent zero artifact) if the universe pass returns nothing usable."""
+    if run_date is None:
+        from dates import default_run_date
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    universe = (
+        universe_source() if universe_source is not None
+        else _default_medians_universe(bucket, s3_client)
+    )
+    if not universe:
+        return {"status": "skipped", "reason": "empty medians universe", "universe": 0}
+    rows_by_sym = (valuation_source or _yfinance_valuation)(universe)
+    rows = list(rows_by_sym.values())
+    if not rows:  # no-silent-fails: an empty pass is an error, not a blank artifact
+        logger.error("[metron_market_data] valuation medians: 0/%d symbols covered", len(universe))
+        return {"status": "error", "error": "valuation pass returned no usable rows",
+                "universe": len(universe)}
+    by_sector = _grouped_medians(rows, "sector")
+    by_country = _grouped_medians(rows, "country")
+    artifact = {
+        "schema_version": VALUATION_MEDIANS_SCHEMA_VERSION, "as_of": run_date,
+        "source": "yfinance", "by_sector": by_sector, "by_country": by_country,
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN valuation medians: %d sectors, %d countries "
+                    "from %d/%d symbols (not written)",
+                    len(by_sector), len(by_country), len(rows), len(universe))
+        return {"status": "ok_dry_run", "sectors": len(by_sector),
+                "countries": len(by_country), "covered": len(rows), "universe": len(universe)}
+    try:
+        _write_json(s3_client, bucket, f"{VALUATION_MEDIANS_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] valuation medians write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote valuation medians: %d sectors + %d countries "
+                "from %d/%d symbols", len(by_sector), len(by_country), len(rows), len(universe))
+    return {"status": "ok", "universe": len(universe), "covered": len(rows),
+            "sectors": len(by_sector), "countries": len(by_country)}
 
 
 # NYSE early-close days (1:00 PM ET close): day after Thanksgiving, and Christmas
