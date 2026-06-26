@@ -25,7 +25,11 @@ from collectors.news_aggregator import (
 )
 from collectors.news_sources.benzinga import BenzingaNewsAdapter
 from collectors.news_sources.bloomberg import BloombergNewsAdapter
-from collectors.news_sources.gdelt import GdeltNewsAdapter, _build_query
+from collectors.news_sources.gdelt import (
+    GdeltNewsAdapter,
+    _build_query,
+    _retry_after_seconds,
+)
 from collectors.news_sources.polygon import PolygonNewsAdapter
 from collectors.news_sources.ravenpack import RavenpackNewsAdapter
 from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
@@ -226,6 +230,103 @@ class TestGdeltNewsAdapter:
         adapter.fetch(["UNKNOWN"])
         params_used = fake_http.get.call_args.kwargs["params"]
         assert "UNKNOWN" in params_used["query"]
+
+    def test_429_honors_retry_after_then_succeeds(self, monkeypatch):
+        """A 429 with Retry-After is waited out and the ticker is retried
+        once — recovering coverage instead of dropping the ticker (config#663)."""
+        slept: list[float] = []
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep",
+            lambda s: slept.append(s),
+        )
+
+        resp_429 = MagicMock(status_code=429, headers={"Retry-After": "3"})
+        resp_ok = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"articles": [{
+                "url": "https://x.com/y",
+                "title": "recovered",
+                "seendate": "20260512T143000Z",
+            }]}),
+            raise_for_status=MagicMock(return_value=None),
+        )
+        fake_http = MagicMock()
+        fake_http.get.side_effect = [resp_429, resp_ok]
+
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={"AAPL": "Apple"},
+            http=fake_http,
+            inter_request_sleep=0.0,
+        )
+        out = adapter.fetch(["AAPL"])
+        assert len(out) == 1
+        assert out[0].title == "recovered"
+        assert fake_http.get.call_count == 2
+        # Honored the server-advertised Retry-After (3s), clamped under max.
+        assert 3.0 in slept
+
+    def test_429_twice_drops_ticker_fail_soft(self, monkeypatch):
+        """A persistent 429 (retry also 429) drops the ticker without
+        raising — only one retry, no infinite loop."""
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        resp_429 = MagicMock(status_code=429, headers={"Retry-After": "1"})
+        fake_http = MagicMock()
+        fake_http.get.side_effect = [resp_429, resp_429]
+
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={"AAPL": "Apple"},
+            http=fake_http,
+            inter_request_sleep=0.0,
+        )
+        out = adapter.fetch(["AAPL"])
+        assert out == []
+        assert fake_http.get.call_count == 2  # initial + one retry, no more
+
+    def test_429_on_one_ticker_does_not_block_others(self, monkeypatch):
+        """A 429 (then-drop) on one ticker still lets the rest of the batch
+        return — breadth degrades, pull does not fail."""
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        resp_429 = MagicMock(status_code=429, headers={})
+        resp_ok = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"articles": [{
+                "url": "https://x.com/msft",
+                "title": "msft ok",
+                "seendate": "20260512T143000Z",
+            }]}),
+            raise_for_status=MagicMock(return_value=None),
+        )
+        fake_http = MagicMock()
+        # AAPL: 429 then 429 (dropped); MSFT: ok
+        fake_http.get.side_effect = [resp_429, resp_429, resp_ok]
+
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={"AAPL": "Apple", "MSFT": "Microsoft"},
+            http=fake_http,
+            inter_request_sleep=0.0,
+        )
+        out = adapter.fetch(["AAPL", "MSFT"])
+        assert len(out) == 1
+        assert out[0].title == "msft ok"
+
+    @pytest.mark.parametrize(
+        "header,expected",
+        [
+            ({"Retry-After": "5"}, 5.0),
+            ({"Retry-After": "0"}, 0.0),
+            ({}, 2.0),                       # missing → fallback
+            ({"Retry-After": "garbage"}, 2.0),  # unparseable → fallback
+            ({"Retry-After": "-7"}, 2.0),    # negative → fallback
+            ({"Retry-After": "999"}, 30.0),  # clamped to max
+        ],
+    )
+    def test_retry_after_seconds_parsing(self, header, expected):
+        resp = MagicMock(headers=header)
+        assert _retry_after_seconds(resp) == expected
 
 
 # ── Yahoo RSS adapter ──────────────────────────────────────────────────

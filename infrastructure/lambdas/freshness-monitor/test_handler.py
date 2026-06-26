@@ -179,6 +179,32 @@ artifacts:
     assert specs[0].created_at == date(2025, 1, 1)
 
 
+def test_load_registry_threads_active_window_fields(fake_s3):
+    """Continuous active-window fields (nousergon-lib >=0.63.0) must survive
+    the _SPEC_FIELDS strip and thread through to ArtifactSpec, with
+    active_hours_utc coerced from a YAML list to a tuple."""
+    fake_s3._registry_body = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+artifacts:
+  - artifact_id: open_orders_latest
+    s3_key_template: "trades/open_orders/latest.json"
+    cadence: continuous
+    interval_minutes: 30
+    sla_minutes_after_cron: 15
+    severity: warning
+    owner_repo: alpha-engine
+    created_at: "2025-01-01"
+    active_trading_days_only: true
+    active_hours_utc: [14, 21]
+"""
+    import index
+    spec = index.load_registry(fake_s3, "buck", "key")[0]
+    assert spec.active_trading_days_only is True
+    assert spec.active_hours_utc == (14, 21)
+
+
 # ── handler — alerts disabled (OBSERVE mode) ────────────────────────────────
 
 

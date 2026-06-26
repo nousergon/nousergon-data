@@ -52,6 +52,21 @@ TARGET_FUNCTIONS=(
   "alpha-engine-research-eval-rolling-mean"
   "alpha-engine-research-rationale-clustering"
   "alpha-engine-research-runner"
+  # Operational/infra Lambdas — capture completeness (config#1273 Phase B).
+  # Their ERROR/CRITICAL/timeout logs now mirror into the changelog event-lake
+  # (subsystem inferred as "infrastructure" by default). The two changelog
+  # mirrors are deliberately EXCLUDED per the recursion guard above and get a
+  # CloudWatch Errors alarm instead (watch-the-watchers — config#1273 follow-up).
+  "alpha-engine-eod-backstop"
+  "alpha-engine-eod-success-friday-shell-trigger"
+  "alpha-engine-freshness-monitor"
+  "alpha-engine-friday-shell-run-report"
+  "alpha-engine-pipeline-watchdog"
+  "alpha-engine-saturday-integrity-sentinel"
+  "alpha-engine-saturday-sf-success-groom-dispatcher"
+  "alpha-engine-saturday-sf-watch-dispatcher"
+  "alpha-engine-sf-telegram-notifier"
+  "alpha-engine-spot-orphan-reaper"
 )
 
 DRY_RUN=false

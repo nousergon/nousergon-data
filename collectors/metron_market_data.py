@@ -19,6 +19,13 @@ Artifact schemas (versioned — Metron's consumer pins on ``schema_version``):
 
     closes: {schema_version, as_of, source, closes: {yf_symbol: {close, currency, bar_date}}}
     fx:     {schema_version, as_of, base: "USD", rates: {CCY: rate}}
+    technicals: {schema_version, as_of, source: "computed", technicals: {yf_symbol:
+                 {rsi_14, macd_hist, ma_50, ma_200, pct_to_ma_50, pct_to_ma_200,
+                  high_52w, low_52w, pct_in_52w_range, mom_20d, mom_60d}}}   (daily; derived
+                 from close_history — no new fetch)
+    valuation_medians: {schema_version, as_of, source: "yfinance", by_sector / by_country:
+                 {group: {trailing_pe, forward_pe, price_to_book, price_to_sales, ev_ebitda,
+                  dividend_yield, n}}}   (weekly; SP1500-broad peer benchmark for Holdings)
 
 Runs each weekday in ``weekly_collector._run_daily``. Best-effort per the module posture:
 the universe read fail-softs to an empty pull (logged), and a fetch/​write error returns
@@ -79,11 +86,49 @@ METRON_MACRO_SERIES = ["FEDFUNDS", "UNRATE", "T10YIE", "DGS10", "DGS2", "T10Y2Y"
 # Finnhub free tier can't price) with the wider tearsheet field set.
 FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
 # yfinance Ticker.info keys published per symbol (artifact field == info key).
+# v2 (metron Holdings metrics): added priceToBook + priceToSalesTrailing12Months so the
+# Holdings table can show P/B and P/S alongside the existing P/E family.
+# v3 (metron Holdings balance-sheet band): added the absolute balance-sheet fields
+# (totalDebt / totalCash / ebitda / freeCashflow) the Holdings "Balance Sheet" columns
+# need — cash balance, debt balance, net debt, and net-debt/EBITDA leverage.
 FUNDAMENTALS_INFO_KEYS = [
     "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
+    "priceToBook", "priceToSalesTrailing12Months",
     "earningsGrowth", "revenueGrowth", "debtToEquity", "currentRatio", "quickRatio",
     "returnOnEquity", "returnOnAssets", "grossMargins", "operatingMargins",
+    "totalDebt", "totalCash", "ebitda", "freeCashflow",
     "beta", "dividendYield", "marketCap", "sector", "industry",
+]
+# Technicals — per-held-symbol indicators computed from the close_history this module
+# already publishes daily (zero new fetches). Slow-moving (RSI14 / 50d-200d MA / 52w
+# range / momentum) so a daily refresh off the close series is plenty.
+TECHNICALS_PREFIX = "market_data/technicals/"
+# Valuation medians — SP1500-broad sector & country median multiples, the peer benchmark
+# the Holdings "by sector → country" view bands each holding against. A small DERIVED
+# aggregate (medians + member counts, no per-ticker rows). Weekly cadence (multiples move
+# quarterly; the median of ~900 names is stable week to week).
+VALUATION_MEDIANS_PREFIX = "market_data/valuation_medians/"
+# Analyst consensus — per-held-symbol consensus rating + price targets + #analysts, the
+# "consensus research" inputs to the Holdings Sentiment/Consensus band + the per-holding
+# attractiveness score (metron-ops#105). FREE sources only (yfinance recommendationKey +
+# targetMean/MedianPrice + numberOfAnalystOpinions, optionally Finnhub rating buckets via
+# the canonical analyst_sources adapters). Forward consensus EPS/revenue ESTIMATES are a
+# PAID feed (IBES/Visible Alpha) — NOT emitted here; the consumer scaffolds those columns
+# as "N/A · paid feed" and they populate when metron-ops#107 wires the paid source.
+ANALYST_PREFIX = "market_data/analyst/"
+# News sentiment — per-held-symbol latest LM (Loughran-McDonald) sentiment + event
+# rollup, the "sentiment" input to the Holdings Sentiment/Consensus band + attractiveness
+# score (metron-ops#105). A JSON PROJECTION of the held-universe latest slice of the
+# upstream `data/news_aggregates_daily/` parquet (per-(ticker,date) time series — correctly
+# parquet for its analytical role). Projecting to JSON here keeps Metron's spine readers
+# uniform (no pyarrow in the API) — right format at each layer.
+SENTIMENT_PREFIX = "market_data/sentiment/"
+# yfinance Ticker.info keys the valuation-medians pass reads per universe symbol. Mirrors
+# the multiple subset of FUNDAMENTALS_INFO_KEYS (same source + semantics as the per-holding
+# fundamentals → the band and the row are directly comparable) plus sector/country to group.
+VALUATION_MEDIAN_KEYS = [
+    "trailingPE", "forwardPE", "priceToBook",
+    "priceToSalesTrailing12Months", "enterpriseToEbitda", "dividendYield",
 ]
 # Intraday — last/open/prior-close per held symbol, refreshed every 15 min during US
 # regular trading hours by a systemd timer on the trading box (config#1023). Single
@@ -106,8 +151,12 @@ FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
-FUNDAMENTALS_SCHEMA_VERSION = 1
+FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow (balance sheet)
 INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
+TECHNICALS_SCHEMA_VERSION = 1
+VALUATION_MEDIANS_SCHEMA_VERSION = 1
+ANALYST_SCHEMA_VERSION = 1  # consensus rating + price targets + #analysts (free sources)
+SENTIMENT_SCHEMA_VERSION = 1  # LM news sentiment + event rollup (held-universe latest slice)
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -146,8 +195,17 @@ EarningsSource = Callable[[list[str]], dict[str, str]]
 MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 # A fundamentals source maps yf_symbols → {yf_symbol: {info_key: value}}.
 FundamentalsSource = Callable[[list[str]], dict[str, dict]]
+# An analyst source maps yf_symbols → {yf_symbol: {consensus_rating, mean_target, …}}.
+AnalystSource = Callable[[list[str]], dict[str, dict]]
+# A sentiment source maps yf_symbols → {yf_symbol: {sentiment, n_articles, …}}.
+SentimentSource = Callable[[list[str]], dict[str, dict]]
 # An intraday source maps yf_symbols → {yf_symbol: quote dict} (see _yfinance_intraday).
 IntradaySource = Callable[[list[str]], dict[str, dict]]
+# A valuation source maps yf_symbols → {yf_symbol: {multiple_key|sector|country: value}}
+# (the multiples + classification the medians pass groups on; see _yfinance_valuation).
+ValuationSource = Callable[[list[str]], dict[str, dict]]
+# A medians universe source returns the broad (SP1500 ∪ held) yf_symbol list to benchmark.
+MediansUniverseSource = Callable[[], list[str]]
 
 
 # ── Universe read ───────────────────────────────────────────────────────────
@@ -444,6 +502,68 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+# Consensus-rating ladder → a signed numeric score in [-1, +1] so the consumer can
+# average / band it without re-deriving the ordering. strongBuy=+1 … strongSell=-1.
+_RATING_SCORE = {
+    "strongBuy": 1.0, "buy": 0.5, "hold": 0.0, "sell": -0.5, "strongSell": -1.0,
+}
+
+
+@_yf_quiet
+def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
+    """Consensus research per held symbol via the canonical free analyst adapter(s)
+    → ``{yf_symbol: {consensus_rating, rating_score, mean_target, median_target,
+    num_analysts}}``.
+
+    FREE sources only: ``YfinanceAnalystAdapter`` (recommendationKey + target
+    mean/median + #analysts) is primary; if ``FINNHUB_API_KEY`` is set, the
+    ``FinnhubAnalystAdapter`` rating buckets backfill a missing consensus_rating
+    (Finnhub's price target is paid-tier, so targets stay from yfinance). Forward
+    consensus EPS/revenue estimates are a PAID feed and are intentionally NOT
+    fetched here. Fail-soft per symbol; a symbol with no resolvable snapshot is
+    omitted (coverage gap, not zeros)."""
+    from collectors.analyst_sources import YfinanceAnalystAdapter
+    from alpha_engine_lib.secrets import get_secret  # secrets via the lib, never os.environ
+    # (alpha_engine_lib, not nousergon_lib: this repo pins a pre-rename lib (<0.60.0)
+    # where only the alpha_engine_lib name exists — matches finnhub_client.py.)
+
+    yf_adapter = YfinanceAnalystAdapter()
+    finnhub_adapter = None
+    if get_secret("FINNHUB_API_KEY", required=False, default=""):
+        try:
+            from collectors.analyst_sources import FinnhubAnalystAdapter
+            finnhub_adapter = FinnhubAnalystAdapter()
+        except Exception as e:  # pragma: no cover - optional backfill
+            logger.warning("[metron_market_data] Finnhub analyst adapter unavailable: %s", e)
+
+    out: dict[str, dict] = {}
+    for sym in yf_symbols:
+        snap = yf_adapter.fetch(sym)
+        rating = snap.consensus_rating if snap else None
+        # Finnhub backfills ONLY a missing rating (targets stay from yfinance).
+        if rating is None and finnhub_adapter is not None:
+            fh = finnhub_adapter.fetch(sym)
+            if fh is not None and fh.consensus_rating is not None:
+                rating = fh.consensus_rating
+                if snap is None:
+                    snap = fh
+        if snap is None:
+            continue
+        fields = {
+            "consensus_rating": rating,
+            "rating_score": _RATING_SCORE.get(rating) if rating else None,
+            "mean_target": snap.mean_target,
+            "median_target": snap.median_target,
+            "num_analysts": snap.num_analysts,
+        }
+        # Omit a symbol that resolved to an empty snapshot (all None) — coverage gap.
+        if any(v is not None for v in fields.values()):
+            out[sym] = {k: v for k, v in fields.items() if v is not None}
+    logger.info("[metron_market_data] analyst: %d/%d symbols covered", len(out), len(yf_symbols))
+    _log_yf_coverage("analyst", yf_symbols, out)
+    return out
+
+
 @_yf_quiet
 def _yfinance_intraday(yf_symbols: list[str]) -> dict[str, dict]:
     """Latest (~15-min delayed) quote + session context per symbol, one batched
@@ -549,6 +669,17 @@ def _write_json(s3_client: Any, bucket: str, key: str, obj: dict) -> None:
         Body=json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8"),
         ContentType="application/json",
     )
+
+
+def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
+    """Read+parse ``s3://bucket/key`` → dict, or ``None`` on any miss (NoSuchKey, parse
+    error, no creds). Fail-soft so a derived collector (technicals reads back close_history;
+    medians reads back the universe) degrades to a coverage gap rather than aborting."""
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────
@@ -867,6 +998,421 @@ def collect_fundamentals(
     return {"status": "ok", "universe": len(holdings), "fundamentals": len(fundamentals)}
 
 
+def collect_analyst(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, analyst_source: AnalystSource | None = None,
+) -> dict:
+    """Write the consensus-research artifact for Metron's held universe
+    (metron-ops#105 — Holdings Sentiment/Consensus band + attractiveness score):
+
+        market_data/analyst/latest.json
+            {schema_version, as_of, source: "yfinance+finnhub", analyst:
+                {yf_symbol: {consensus_rating, rating_score, mean_target,
+                             median_target, num_analysts}}}
+
+    FREE sources only (see ``_yfinance_analyst``). The consumer derives
+    price-target upside vs the live price and owns display semantics; forward
+    consensus EPS/revenue ESTIMATES are a paid feed scaffolded N/A downstream.
+    Daily cadence (ratings/targets move slowly; daily is plenty). Injectable
+    source/S3 for tests. Mirrors ``collect_fundamentals``."""
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    analyst = (analyst_source or _yfinance_analyst)(yf_symbols)
+    artifact = {
+        "schema_version": ANALYST_SCHEMA_VERSION, "as_of": run_date,
+        "source": "yfinance+finnhub", "analyst": dict(sorted(analyst.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN analyst: %d symbols (not written)", len(analyst))
+        return {"status": "ok_dry_run", "analyst": len(analyst)}
+    try:
+        _write_json(s3_client, bucket, f"{ANALYST_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] analyst write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote analyst for %d/%d symbols", len(analyst), len(yf_symbols))
+    return {"status": "ok", "universe": len(holdings), "analyst": len(analyst)}
+
+
+def _news_sentiment(yf_symbols: list[str]) -> dict[str, dict]:
+    """Held-universe latest news-sentiment slice projected from the upstream
+    ``data/news_aggregates_daily/`` parquet → ``{yf_symbol: {sentiment,
+    sentiment_mean, n_articles, event_count, event_severity_max, as_of}}``.
+
+    ``sentiment`` is the source-trust-weighted LM composite
+    (``lm_sentiment_trusted_mean`` ∈ [-1, +1]) — the headline metric; the raw
+    ``lm_sentiment_mean`` is kept for audit. The news universe keys by plain
+    ticker, so matching is on ``yf_symbol`` (US names line up; foreign/fund
+    symbols with no coverage are omitted — a gap, not a zero). If the parquet
+    spans multiple dates, the most recent row per ticker wins; ``as_of`` carries
+    that row's date so the consumer can show sentiment staleness honestly."""
+    from collectors.daily_news import read_daily_news
+
+    try:
+        df = read_daily_news()
+    except Exception as e:  # fail-soft: degrade to "sentiment unavailable"
+        logger.warning("[metron_market_data] news-aggregates read failed: %s", e)
+        return {}
+    if df is None or getattr(df, "empty", True):
+        return {}
+
+    want = set(yf_symbols)
+    out: dict[str, dict] = {}
+    sub = df[df["ticker"].isin(want)]
+    for sym, rows in sub.groupby("ticker"):
+        row = rows.sort_values("aggregate_date").iloc[-1]  # most recent date wins
+        def _num(col):
+            v = row.get(col)
+            try:
+                f = float(v)
+                return round(f, 4) if f == f else None  # NaN → None
+            except (TypeError, ValueError):
+                return None
+        fields = {
+            "sentiment": _num("lm_sentiment_trusted_mean"),
+            "sentiment_mean": _num("lm_sentiment_mean"),
+            "n_articles": int(row["n_articles"]) if row.get("n_articles") is not None else None,
+            "event_count": int(row["event_count"]) if row.get("event_count") is not None else None,
+            "event_severity_max": _num("event_severity_max"),
+            "as_of": str(row["aggregate_date"])[:10] if row.get("aggregate_date") is not None else None,
+        }
+        if any(v is not None for v in (fields["sentiment"], fields["n_articles"])):
+            out[str(sym)] = {k: v for k, v in fields.items() if v is not None}
+    logger.info("[metron_market_data] sentiment: %d/%d symbols covered", len(out), len(yf_symbols))
+    return out
+
+
+def collect_sentiment(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, sentiment_source: SentimentSource | None = None,
+) -> dict:
+    """Write the news-sentiment artifact for Metron's held universe
+    (metron-ops#105 — Holdings Sentiment/Consensus band + attractiveness score):
+
+        market_data/sentiment/latest.json
+            {schema_version, as_of, source: "news_aggregates_daily(LM)", sentiment:
+                {yf_symbol: {sentiment, sentiment_mean, n_articles, event_count,
+                             event_severity_max, as_of}}}
+
+    A JSON projection of the held-universe latest slice of the upstream
+    `data/news_aggregates_daily/` parquet (see ``_news_sentiment``) — keeps
+    Metron's spine readers uniform (no pyarrow in the API). Injectable source/S3
+    for tests. Mirrors ``collect_analyst``."""
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    sentiment = (sentiment_source or _news_sentiment)(yf_symbols)
+    artifact = {
+        "schema_version": SENTIMENT_SCHEMA_VERSION, "as_of": run_date,
+        "source": "news_aggregates_daily(LM)", "sentiment": dict(sorted(sentiment.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN sentiment: %d symbols (not written)", len(sentiment))
+        return {"status": "ok_dry_run", "sentiment": len(sentiment)}
+    try:
+        _write_json(s3_client, bucket, f"{SENTIMENT_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] sentiment write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote sentiment for %d/%d symbols", len(sentiment), len(yf_symbols))
+    return {"status": "ok", "universe": len(holdings), "sentiment": len(sentiment)}
+
+
+# ── Technicals (derived from close_history — no new fetch) ────────────────────
+
+# Minimum close observations needed before any indicator is emitted for a symbol. The
+# 200-day MA is the deepest window; below it we emit only the indicators a shorter series
+# supports (never a fabricated MA on too little data).
+_TECH_MIN_OBS = 30
+_SESSIONS_PER_YEAR = 252
+
+
+def _compute_technicals(closes: list[list]) -> dict | None:
+    """Indicators from an ascending ``[[date_iso, close], …]`` series → flat dict, or
+    ``None`` if the series is too short / unusable. Reuses the fleet-canonical Wilder RSI +
+    MACD from ``features.feature_engineer`` so the dashboard and the predictor agree on the
+    definitions (per the SOTA mirror-don't-reinvent rule). Each field is independently
+    gated on having enough history — a 120-day series gets RSI/50d-MA but null 200d-MA."""
+    import pandas as pd
+
+    from features.feature_engineer import _compute_macd, _compute_rsi
+
+    vals = [c for c in closes if isinstance(c, (list, tuple)) and len(c) == 2 and c[1] is not None]
+    if len(vals) < _TECH_MIN_OBS:
+        return None
+    s = pd.Series([float(v[1]) for v in vals], dtype="float64")
+    s = s[s > 0]
+    if len(s) < _TECH_MIN_OBS:
+        return None
+    last = float(s.iloc[-1])
+
+    def _round(x: float | None, n: int = 4) -> float | None:
+        if x is None:
+            return None
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return round(x, n) if x == x and x not in (float("inf"), float("-inf")) else None
+
+    rsi = _compute_rsi(s)
+    macd_line, signal_line = _compute_macd(s)
+    rsi_14 = _round(rsi.iloc[-1], 2) if len(rsi) else None
+    macd_hist = (
+        _round(float(macd_line.iloc[-1]) - float(signal_line.iloc[-1]))
+        if len(macd_line) and len(signal_line) else None
+    )
+    ma_50 = float(s.iloc[-50:].mean()) if len(s) >= 50 else None
+    ma_200 = float(s.iloc[-200:].mean()) if len(s) >= 200 else None
+    window_52w = s.iloc[-_SESSIONS_PER_YEAR:]
+    high_52w = float(window_52w.max())
+    low_52w = float(window_52w.min())
+    rng = high_52w - low_52w
+    out = {
+        "rsi_14": rsi_14,
+        "macd_hist": macd_hist,
+        "ma_50": _round(ma_50, 4),
+        "ma_200": _round(ma_200, 4),
+        "pct_to_ma_50": _round(last / ma_50 - 1.0) if ma_50 else None,
+        "pct_to_ma_200": _round(last / ma_200 - 1.0) if ma_200 else None,
+        "high_52w": _round(high_52w, 4),
+        "low_52w": _round(low_52w, 4),
+        "pct_in_52w_range": _round((last - low_52w) / rng) if rng > 0 else None,
+        "mom_20d": _round(last / float(s.iloc[-21]) - 1.0) if len(s) >= 21 else None,
+        "mom_60d": _round(last / float(s.iloc[-61]) - 1.0) if len(s) >= 61 else None,
+    }
+    # All-null → no usable indicator; treat as a coverage gap (no fabricated row).
+    return out if any(v is not None for v in out.values()) else None
+
+
+def collect_technicals(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None,
+) -> dict:
+    """Write per-held-symbol technical indicators for Metron's Holdings table, computed
+    from the ``close_history`` artifacts this module already publishes (read back from S3 —
+    **no new market-data fetch**):
+
+        market_data/technicals/latest.json
+            {schema_version, as_of, technicals: {yf_symbol: {rsi_14, macd_hist, ma_50,
+             ma_200, pct_to_ma_50, pct_to_ma_200, high_52w, low_52w, pct_in_52w_range,
+             mom_20d, mom_60d}}}
+
+    Daily cadence (close_history refreshes daily). Fail-soft per symbol; a symbol with no
+    close_history / too short a series is omitted (coverage gap, never zeros)."""
+    if run_date is None:
+        from dates import default_run_date
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    technicals: dict[str, dict] = {}
+    for yf_sym in yf_symbols:
+        hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
+        if not hist or not hist.get("closes"):
+            continue
+        try:
+            tech = _compute_technicals(hist["closes"])
+        except Exception as e:  # one bad series must not sink the whole artifact
+            logger.warning("[metron_market_data] technicals compute failed for %s: %s", yf_sym, e)
+            continue
+        if tech is not None:
+            technicals[yf_sym] = tech
+    artifact = {
+        "schema_version": TECHNICALS_SCHEMA_VERSION, "as_of": run_date,
+        "source": "computed", "technicals": dict(sorted(technicals.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN technicals: %d/%d symbols (not written)",
+                    len(technicals), len(yf_symbols))
+        return {"status": "ok_dry_run", "technicals": len(technicals), "universe": len(yf_symbols)}
+    try:
+        _write_json(s3_client, bucket, f"{TECHNICALS_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] technicals write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote technicals for %d/%d symbols", len(technicals), len(yf_symbols))
+    return {"status": "ok", "universe": len(yf_symbols), "technicals": len(technicals)}
+
+
+# ── Valuation medians (SP1500-broad sector & country peer benchmark) ──────────
+
+# camelCase yfinance .info key → snake_case median output field (the consumer maps these
+# 1:1 to the per-holding multiple, so band and row are directly comparable).
+_MEDIAN_OUT_NAME = {
+    "trailingPE": "trailing_pe", "forwardPE": "forward_pe", "priceToBook": "price_to_book",
+    "priceToSalesTrailing12Months": "price_to_sales", "enterpriseToEbitda": "ev_ebitda",
+    "dividendYield": "dividend_yield",
+}
+# A sector/country bucket below this many members is statistically too thin to be a
+# benchmark — it's still emitted (with its honest `n`) so the consumer can choose to
+# suppress it, never silently dropped.
+_MEDIAN_MIN_BUCKET = 3
+
+
+@_yf_quiet
+def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
+    """Per-symbol valuation multiples + GICS sector + country of domicile via
+    ``yf.Ticker(sym).info`` → ``{yf_symbol: {key: value, …, "sector": …, "country": …}}``
+    over ``VALUATION_MEDIAN_KEYS``. Same source + units as ``_yfinance_fundamentals`` so the
+    median band and the per-holding row are apples-to-apples. Fail-soft per symbol."""
+    try:
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    out: dict[str, dict] = {}
+    for i, sym in enumerate(yf_symbols):
+        if i > 0 and i % _YFINANCE_BATCH_SIZE == 0:
+            time.sleep(_YFINANCE_BATCH_DELAY)  # rate-limit courtesy on the ~900-name pass
+        try:
+            info = yf.Ticker(sym).info or {}
+        except Exception as e:
+            logger.warning("[metron_market_data] valuation fetch failed for %s: %s", sym, e)
+            continue
+        row = {k: info[k] for k in VALUATION_MEDIAN_KEYS if info.get(k) is not None}
+        sector, country = info.get("sector"), info.get("country")
+        if sector:
+            row["sector"] = sector
+        if country:
+            row["country"] = country
+        if row:
+            out[sym] = row
+    logger.info("[metron_market_data] valuation: %d/%d symbols covered", len(out), len(yf_symbols))
+    _log_yf_coverage("valuation", yf_symbols, out)
+    return out
+
+
+def _default_medians_universe(bucket: str, s3_client: Any) -> list[str]:
+    """The broad benchmark universe = SP1500 constituents ∪ Metron held symbols. SP1500
+    from the constituents artifact (the system universe the fleet already tracks); held
+    symbols add the foreign/OTC names so a foreign holding's country bucket isn't empty."""
+    symbols: set[str] = set()
+    try:
+        from collectors import constituents
+
+        art = constituents.load_from_s3(bucket)
+        for t in (art or {}).get("tickers", []) or []:
+            if str(t).strip():
+                symbols.add(str(t).strip())
+    except Exception as e:
+        logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    symbols.update(h["yf_symbol"] for h in holdings)
+    return sorted(symbols)
+
+
+def _grouped_medians(rows: list[dict], group_key: str) -> dict[str, dict]:
+    """Median of each multiple per ``group_key`` (``"sector"`` | ``"country"``) value, plus
+    the member count ``n``. A multiple's median uses only finite, > 0 samples (a negative /
+    zero P/E is meaningless, not a data point); a bucket missing a multiple omits that field
+    rather than emitting a fabricated value."""
+    import statistics
+
+    buckets: dict[str, list[dict]] = {}
+    for r in rows:
+        g = r.get(group_key)
+        if g:
+            buckets.setdefault(str(g), []).append(r)
+    out: dict[str, dict] = {}
+    for g, members in buckets.items():
+        entry: dict = {"n": len(members)}
+        for in_key, out_key in _MEDIAN_OUT_NAME.items():
+            samples = []
+            for m in members:
+                v = m.get(in_key)
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if v == v and v not in (float("inf"), float("-inf")) and v > 0:
+                    samples.append(v)
+            if samples:
+                entry[out_key] = round(statistics.median(samples), 4)
+        out[g] = entry
+    return dict(sorted(out.items()))
+
+
+def collect_valuation_medians(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, valuation_source: ValuationSource | None = None,
+    universe_source: MediansUniverseSource | None = None,
+) -> dict:
+    """Write the SP1500-broad sector & country median-multiple benchmark for Metron's
+    Holdings "by sector → country" bands (metron Holdings metrics):
+
+        market_data/valuation_medians/latest.json
+            {schema_version, as_of, source: "yfinance",
+             by_sector:  {sector:  {trailing_pe, forward_pe, price_to_book, price_to_sales,
+                                    ev_ebitda, dividend_yield, n}},
+             by_country: {country: {…same…}}}
+
+    Weekly cadence (medians of ~900 names move quarterly). A derived AGGREGATE — emits only
+    medians + member counts, never per-ticker rows. Injectable sources/S3 for tests; hard-
+    fails (no silent zero artifact) if the universe pass returns nothing usable."""
+    if run_date is None:
+        from dates import default_run_date
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    universe = (
+        universe_source() if universe_source is not None
+        else _default_medians_universe(bucket, s3_client)
+    )
+    if not universe:
+        return {"status": "skipped", "reason": "empty medians universe", "universe": 0}
+    rows_by_sym = (valuation_source or _yfinance_valuation)(universe)
+    rows = list(rows_by_sym.values())
+    if not rows:  # no-silent-fails: an empty pass is an error, not a blank artifact
+        logger.error("[metron_market_data] valuation medians: 0/%d symbols covered", len(universe))
+        return {"status": "error", "error": "valuation pass returned no usable rows",
+                "universe": len(universe)}
+    by_sector = _grouped_medians(rows, "sector")
+    by_country = _grouped_medians(rows, "country")
+    artifact = {
+        "schema_version": VALUATION_MEDIANS_SCHEMA_VERSION, "as_of": run_date,
+        "source": "yfinance", "by_sector": by_sector, "by_country": by_country,
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN valuation medians: %d sectors, %d countries "
+                    "from %d/%d symbols (not written)",
+                    len(by_sector), len(by_country), len(rows), len(universe))
+        return {"status": "ok_dry_run", "sectors": len(by_sector),
+                "countries": len(by_country), "covered": len(rows), "universe": len(universe)}
+    try:
+        _write_json(s3_client, bucket, f"{VALUATION_MEDIANS_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] valuation medians write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote valuation medians: %d sectors + %d countries "
+                "from %d/%d symbols", len(by_sector), len(by_country), len(rows), len(universe))
+    return {"status": "ok", "universe": len(universe), "covered": len(rows),
+            "sectors": len(by_sector), "countries": len(by_country)}
+
+
 # NYSE early-close days (1:00 PM ET close): day after Thanksgiving, and Christmas
 # Eve / July 3 when they fall on a weekday. Source: nyse.com/markets/hours-calendars.
 # Holidays themselves come from alpha_engine_lib.trading_calendar.NYSE_HOLIDAYS (the
@@ -916,10 +1462,15 @@ def in_us_market_window(now: datetime | None = None) -> bool:
     return open_min <= et.hour * 60 + et.minute <= close_min
 
 
-# The demand gate: Metron's web layer touches this key while the app is actively
-# being used (throttled heartbeat — see metron api/services/data_spine.py). The
-# intraday producer fetches ONLY while the heartbeat is fresh, so a closed app
-# costs zero quote fetches. Missing key = app never opened → skip.
+# The (opt-in) demand gate: Metron's web layer touches this key while the app is
+# actively being used (throttled heartbeat — see metron api/services/data_spine.py).
+# When the gate is ON (``require_heartbeat=True``, set for a multi-tenant deployment via
+# the ``--require-heartbeat`` flag) the producer fetches ONLY while the heartbeat is fresh,
+# so a closed app costs zero quote fetches. The gate is OFF by default: on the single-tenant
+# owner build the strip is 4 globally-shared ETF symbols + a small held universe — one fetch
+# serves everyone — so we keep it warm every session tick rather than inflict a multi-minute
+# cold-start (a frozen morning quote) on the owner every time the app has been idle >10 min.
+# Re-enable before multi-tenant by adding ``--require-heartbeat`` to the systemd unit.
 UI_HEARTBEAT_KEY = "metron/ui_heartbeat.json"
 HEARTBEAT_FRESH_SECONDS = 600  # 10 min — two missed 5-min ticks ends the session
 
@@ -956,7 +1507,7 @@ def _flag_suspect_quotes(quotes: dict[str, dict]) -> int:
 def collect_intraday(
     *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
     intraday_source: IntradaySource | None = None, force: bool = False,
-    now: datetime | None = None,
+    now: datetime | None = None, require_heartbeat: bool = False,
 ) -> dict:
     """Write the intraday-quotes artifact for Metron's held universe + the major-index
     proxies (config#1023 — the 15-minute Today-view feed + the Overview markets strip,
@@ -967,23 +1518,24 @@ def collect_intraday(
              quotes:  {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
              indices: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
 
-    ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading
-    box (infrastructure/systemd/metron-intraday.timer), double-gated: the NYSE
-    session window (exchange calendar incl. half-days) AND the Metron UI heartbeat
-    (``metron_app_active``) — quotes are fetched only while the market is open AND
-    the app is actually being used. Outside either gate it returns ``skipped``
-    without fetching (``force`` overrides both, for manual runs). The major-index ETF
-    proxies (``INDEX_PROXY_SYMBOLS``) are market context — fetched every run regardless
-    of the held universe, so a brand-new account still gets the markets strip. A quote
-    moving >40% vs prior close carries ``suspect: true`` (flagged, never dropped). Single
-    ``latest.json`` key — consumers see staleness via ``as_of_utc``. Injectable
-    source/S3 for tests."""
+    ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading box
+    (infrastructure/systemd/metron-intraday.timer), gated on the NYSE session window
+    (exchange calendar incl. half-days). When ``require_heartbeat`` (the multi-tenant
+    demand gate — OFF by default, see ``UI_HEARTBEAT_KEY``) it ALSO gates on a fresh Metron
+    UI heartbeat so a closed app costs zero fetches; OFF, it stays warm every session tick
+    so the owner never sees a frozen morning quote after the app was idle. Outside the
+    market window it returns ``skipped`` without fetching (``force`` overrides every gate,
+    for manual runs). The major-index ETF proxies (``INDEX_PROXY_SYMBOLS``) are market
+    context — fetched every run regardless of the held universe, so a brand-new account
+    still gets the markets strip. A quote moving >40% vs prior close carries
+    ``suspect: true`` (flagged, never dropped). Single ``latest.json`` key — consumers see
+    staleness via ``as_of_utc``. Injectable source/S3 for tests."""
     if not force and not in_us_market_window(now):
         return {"status": "skipped", "reason": "outside US market window"}
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    if not force and not metron_app_active(bucket, s3_client, now):
+    if require_heartbeat and not force and not metron_app_active(bucket, s3_client, now):
         return {"status": "skipped", "reason": "metron app inactive (no fresh UI heartbeat)"}
     fetch = intraday_source or _yfinance_intraday
 
@@ -1031,15 +1583,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reference", action="store_true", help="also write sectors/earnings artifacts")
     parser.add_argument("--macro", action="store_true", help="also write the macro-indicators artifact")
     parser.add_argument("--fundamentals", action="store_true", help="also write the tearsheet-fundamentals artifact")
+    parser.add_argument("--analyst", action="store_true", help="also write the consensus-research artifact (free sources)")
+    parser.add_argument("--sentiment", action="store_true", help="also write the news-sentiment artifact (held-universe slice of news_aggregates_daily)")
     parser.add_argument("--only-intraday", action="store_true",
                         help="write ONLY the intraday-quotes artifact (the 5-min timer entry; "
-                             "no-op outside the NYSE session or without a fresh Metron UI heartbeat, unless --force)")
+                             "no-op outside the NYSE session unless --force)")
+    parser.add_argument("--require-heartbeat", action="store_true",
+                        help="ALSO gate --only-intraday on a fresh Metron UI heartbeat (the "
+                             "multi-tenant demand gate — OFF by default so the single-tenant owner "
+                             "build stays warm every session tick)")
     parser.add_argument("--force", action="store_true",
                         help="bypass the market-window AND app-heartbeat gates for --only-intraday")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if args.only_intraday:
-        intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force)
+        intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force,
+                                 require_heartbeat=args.require_heartbeat)
         logger.info("[metron_market_data] intraday done: %s", intra)
         return 0 if intra.get("status") in ("ok", "ok_dry_run", "skipped") else 1
     result = collect(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
@@ -1061,6 +1620,14 @@ def main(argv: list[str] | None = None) -> int:
         fund = collect_fundamentals(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
         logger.info("[metron_market_data] fundamentals done: %s", fund)
         ok = ok and fund.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.analyst:
+        ana = collect_analyst(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] analyst done: %s", ana)
+        ok = ok and ana.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.sentiment:
+        sent = collect_sentiment(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] sentiment done: %s", sent)
+        ok = ok and sent.get("status") in ("ok", "ok_dry_run", "skipped")
     return 0 if ok else 1
 
 
