@@ -116,6 +116,13 @@ VALUATION_MEDIANS_PREFIX = "market_data/valuation_medians/"
 # PAID feed (IBES/Visible Alpha) — NOT emitted here; the consumer scaffolds those columns
 # as "N/A · paid feed" and they populate when metron-ops#107 wires the paid source.
 ANALYST_PREFIX = "market_data/analyst/"
+# News sentiment — per-held-symbol latest LM (Loughran-McDonald) sentiment + event
+# rollup, the "sentiment" input to the Holdings Sentiment/Consensus band + attractiveness
+# score (metron-ops#105). A JSON PROJECTION of the held-universe latest slice of the
+# upstream `data/news_aggregates_daily/` parquet (per-(ticker,date) time series — correctly
+# parquet for its analytical role). Projecting to JSON here keeps Metron's spine readers
+# uniform (no pyarrow in the API) — right format at each layer.
+SENTIMENT_PREFIX = "market_data/sentiment/"
 # yfinance Ticker.info keys the valuation-medians pass reads per universe symbol. Mirrors
 # the multiple subset of FUNDAMENTALS_INFO_KEYS (same source + semantics as the per-holding
 # fundamentals → the band and the row are directly comparable) plus sector/country to group.
@@ -149,6 +156,7 @@ INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxi
 TECHNICALS_SCHEMA_VERSION = 1
 VALUATION_MEDIANS_SCHEMA_VERSION = 1
 ANALYST_SCHEMA_VERSION = 1  # consensus rating + price targets + #analysts (free sources)
+SENTIMENT_SCHEMA_VERSION = 1  # LM news sentiment + event rollup (held-universe latest slice)
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -189,6 +197,8 @@ MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 FundamentalsSource = Callable[[list[str]], dict[str, dict]]
 # An analyst source maps yf_symbols → {yf_symbol: {consensus_rating, mean_target, …}}.
 AnalystSource = Callable[[list[str]], dict[str, dict]]
+# A sentiment source maps yf_symbols → {yf_symbol: {sentiment, n_articles, …}}.
+SentimentSource = Callable[[list[str]], dict[str, dict]]
 # An intraday source maps yf_symbols → {yf_symbol: quote dict} (see _yfinance_intraday).
 IntradaySource = Callable[[list[str]], dict[str, dict]]
 # A valuation source maps yf_symbols → {yf_symbol: {multiple_key|sector|country: value}}
@@ -1033,6 +1043,98 @@ def collect_analyst(
     return {"status": "ok", "universe": len(holdings), "analyst": len(analyst)}
 
 
+def _news_sentiment(yf_symbols: list[str]) -> dict[str, dict]:
+    """Held-universe latest news-sentiment slice projected from the upstream
+    ``data/news_aggregates_daily/`` parquet → ``{yf_symbol: {sentiment,
+    sentiment_mean, n_articles, event_count, event_severity_max, as_of}}``.
+
+    ``sentiment`` is the source-trust-weighted LM composite
+    (``lm_sentiment_trusted_mean`` ∈ [-1, +1]) — the headline metric; the raw
+    ``lm_sentiment_mean`` is kept for audit. The news universe keys by plain
+    ticker, so matching is on ``yf_symbol`` (US names line up; foreign/fund
+    symbols with no coverage are omitted — a gap, not a zero). If the parquet
+    spans multiple dates, the most recent row per ticker wins; ``as_of`` carries
+    that row's date so the consumer can show sentiment staleness honestly."""
+    from collectors.daily_news import read_daily_news
+
+    try:
+        df = read_daily_news()
+    except Exception as e:  # fail-soft: degrade to "sentiment unavailable"
+        logger.warning("[metron_market_data] news-aggregates read failed: %s", e)
+        return {}
+    if df is None or getattr(df, "empty", True):
+        return {}
+
+    want = set(yf_symbols)
+    out: dict[str, dict] = {}
+    sub = df[df["ticker"].isin(want)]
+    for sym, rows in sub.groupby("ticker"):
+        row = rows.sort_values("aggregate_date").iloc[-1]  # most recent date wins
+        def _num(col):
+            v = row.get(col)
+            try:
+                f = float(v)
+                return round(f, 4) if f == f else None  # NaN → None
+            except (TypeError, ValueError):
+                return None
+        fields = {
+            "sentiment": _num("lm_sentiment_trusted_mean"),
+            "sentiment_mean": _num("lm_sentiment_mean"),
+            "n_articles": int(row["n_articles"]) if row.get("n_articles") is not None else None,
+            "event_count": int(row["event_count"]) if row.get("event_count") is not None else None,
+            "event_severity_max": _num("event_severity_max"),
+            "as_of": str(row["aggregate_date"])[:10] if row.get("aggregate_date") is not None else None,
+        }
+        if any(v is not None for v in (fields["sentiment"], fields["n_articles"])):
+            out[str(sym)] = {k: v for k, v in fields.items() if v is not None}
+    logger.info("[metron_market_data] sentiment: %d/%d symbols covered", len(out), len(yf_symbols))
+    return out
+
+
+def collect_sentiment(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, sentiment_source: SentimentSource | None = None,
+) -> dict:
+    """Write the news-sentiment artifact for Metron's held universe
+    (metron-ops#105 — Holdings Sentiment/Consensus band + attractiveness score):
+
+        market_data/sentiment/latest.json
+            {schema_version, as_of, source: "news_aggregates_daily(LM)", sentiment:
+                {yf_symbol: {sentiment, sentiment_mean, n_articles, event_count,
+                             event_severity_max, as_of}}}
+
+    A JSON projection of the held-universe latest slice of the upstream
+    `data/news_aggregates_daily/` parquet (see ``_news_sentiment``) — keeps
+    Metron's spine readers uniform (no pyarrow in the API). Injectable source/S3
+    for tests. Mirrors ``collect_analyst``."""
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    sentiment = (sentiment_source or _news_sentiment)(yf_symbols)
+    artifact = {
+        "schema_version": SENTIMENT_SCHEMA_VERSION, "as_of": run_date,
+        "source": "news_aggregates_daily(LM)", "sentiment": dict(sorted(sentiment.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN sentiment: %d symbols (not written)", len(sentiment))
+        return {"status": "ok_dry_run", "sentiment": len(sentiment)}
+    try:
+        _write_json(s3_client, bucket, f"{SENTIMENT_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] sentiment write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote sentiment for %d/%d symbols", len(sentiment), len(yf_symbols))
+    return {"status": "ok", "universe": len(holdings), "sentiment": len(sentiment)}
+
+
 # ── Technicals (derived from close_history — no new fetch) ────────────────────
 
 # Minimum close observations needed before any indicator is emitted for a symbol. The
@@ -1482,6 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--macro", action="store_true", help="also write the macro-indicators artifact")
     parser.add_argument("--fundamentals", action="store_true", help="also write the tearsheet-fundamentals artifact")
     parser.add_argument("--analyst", action="store_true", help="also write the consensus-research artifact (free sources)")
+    parser.add_argument("--sentiment", action="store_true", help="also write the news-sentiment artifact (held-universe slice of news_aggregates_daily)")
     parser.add_argument("--only-intraday", action="store_true",
                         help="write ONLY the intraday-quotes artifact (the 5-min timer entry; "
                              "no-op outside the NYSE session unless --force)")
@@ -1521,6 +1624,10 @@ def main(argv: list[str] | None = None) -> int:
         ana = collect_analyst(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
         logger.info("[metron_market_data] analyst done: %s", ana)
         ok = ok and ana.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.sentiment:
+        sent = collect_sentiment(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] sentiment done: %s", sent)
+        ok = ok and sent.get("status") in ("ok", "ok_dry_run", "skipped")
     return 0 if ok else 1
 
 
