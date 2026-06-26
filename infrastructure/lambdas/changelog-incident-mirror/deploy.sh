@@ -120,7 +120,7 @@ if [[ "${SMOKE_ARG}" == "--smoke" ]]; then
   if [ -x "$(dirname "$0")/../../../.venv/bin/python" ]; then
     _alert_python="$(dirname "$0")/../../../.venv/bin/python"
   fi
-  "$_alert_python" -m alpha_engine_lib.alerts publish \
+  "$_alert_python" -m nousergon_lib.alerts publish \
     --severity info \
     --no-telegram \
     --source alpha-engine-data/changelog-incident-mirror/deploy.sh \

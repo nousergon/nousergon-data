@@ -150,7 +150,7 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
   # alert per (Lambda, version) — lib v0.24.0 substrate (L221
   # retrofit 2026-05-22). Best-effort; trailing || true never
   # overrides the deploy's exit 1.
-  python3 -m alpha_engine_lib.alerts publish \
+  python3 -m nousergon_lib.alerts publish \
     --severity error \
     --source "alpha-engine-data/infrastructure/deploy.sh" \
     --dedup-key "canary-fail-${FUNCTION_NAME}-v${VERSION}" \

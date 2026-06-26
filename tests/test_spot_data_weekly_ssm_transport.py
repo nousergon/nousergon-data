@@ -2,7 +2,7 @@
 
 Origin: ROADMAP L342 PR 2 — the 2026-05-27 SSH/SCP→SSM migration moved
 all dispatcher→spot communication to the lib chokepoint
-``python -m alpha_engine_lib.ssm_dispatcher`` (lib v0.35.0+). Without
+``python -m nousergon_lib.ssm_dispatcher`` (lib v0.35.0+). Without
 these chokepoint tests, a future refactor could silently re-introduce
 SSH+SCP (the prior transport) and re-open the port-22 dependency the
 migration was designed to retire.
@@ -66,7 +66,7 @@ def test_no_top_level_ssh_invocation():
 
     Replaces the pre-2026-05-27 SSH dispatch (``ssh -i $KEY_FILE
     ec2-user@$PUBLIC_IP "<cmd>"``) with ``python -m
-    alpha_engine_lib.ssm_dispatcher`` (lib v0.35.0+). Any new ``ssh``
+    nousergon_lib.ssm_dispatcher`` (lib v0.35.0+). Any new ``ssh``
     invocation surfaces as an immediate red CI signal.
 
     Allow-list: none. Inside heredoc bodies (the spot-side shell
@@ -87,7 +87,7 @@ def test_no_top_level_ssh_invocation():
         f"spot_data_weekly.sh:\n"
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
         + "\n\nThe 2026-05-27 SSH→SSM migration moved all dispatch to "
-        "``python -m alpha_engine_lib.ssm_dispatcher``. Re-introducing "
+        "``python -m nousergon_lib.ssm_dispatcher``. Re-introducing "
         "ssh re-opens the port-22 dependency the migration retired. "
         "If the change is deliberate, update this test + ROADMAP L342 "
         "PR 5 (the planned port-22 SG revoke)."
@@ -139,15 +139,15 @@ def test_no_ssh_keyscan_invocation():
 
 def test_uses_lib_ssm_dispatcher_chokepoint():
     """The migration's load-bearing surface: ``python -m
-    alpha_engine_lib.ssm_dispatcher`` MUST appear in the script. Pinning
+    nousergon_lib.ssm_dispatcher`` MUST appear in the script. Pinning
     this catches a regression where a future PR replaces the lib CLI
     with an inline ``aws ssm send-command`` bash helper (the
     alpha-engine-predictor #168 pre-lift pattern that L342 explicitly
     lifts to the lib chokepoint)."""
     body = _SCRIPT.read_text()
-    assert "alpha_engine_lib.ssm_dispatcher" in body, (
+    assert "nousergon_lib.ssm_dispatcher" in body, (
         "spot_data_weekly.sh does not reference "
-        "alpha_engine_lib.ssm_dispatcher. The 2026-05-27 migration uses "
+        "nousergon_lib.ssm_dispatcher. The 2026-05-27 migration uses "
         "the lib chokepoint as the SSM dispatch path; re-introducing a "
         "raw `aws ssm send-command` bash helper would undo the lift to "
         "``alpha-engine-lib`` v0.35.0."
@@ -206,7 +206,7 @@ def test_no_inline_aws_ssm_send_command():
         f"Found {len(offenders)} non-comment ``aws ssm send-command`` "
         f"invocations in spot_data_weekly.sh:\n"
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
-        + "\n\nRoute through ``python -m alpha_engine_lib.ssm_dispatcher "
+        + "\n\nRoute through ``python -m nousergon_lib.ssm_dispatcher "
         "run`` instead — that's the chokepoint v0.35.0 lifted."
     )
 
@@ -254,7 +254,7 @@ def test_no_residual_key_file_dispatch_use():
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
         + "\n\nThe migration retired the SSH key file as a dispatch "
         "credential. KEY_NAME stays as a launch attribute for "
-        "alpha_engine_lib.ec2_spot's --key-name flag (break-glass "
+        "nousergon_lib.ec2_spot's --key-name flag (break-glass "
         "operator SSH only); KEY_FILE / SSH_OPTS should not appear "
         "anywhere."
     )
