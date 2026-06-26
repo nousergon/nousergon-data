@@ -1,5 +1,10 @@
-# Pinned to alpha-engine-lib v0.40.0 (the artifact_freshness substrate
-# was introduced here). Bumping this is a substrate-change PR — not
-# something to do absent-mindedly during a code-only refresh.
-alpha-engine-lib @ git+https://github.com/nousergon/nousergon-lib@v0.40.0
+# Pinned to nousergon-lib v0.62.0 — the artifact_freshness RECENCY
+# redesign (PR #128): freshness is judged by the most-recent instance vs a
+# cron-tick-minus-slack floor, not an exact cron-date key. This is what
+# makes the monitor robust to off-cycle runs (the 6/19 full run satisfying
+# the 6/20 cycle) and the {trading_day} anchor. Name changed alpha-engine-lib
+# -> nousergon-lib at the 0.60 rename; index.py's alpha_engine_lib imports
+# keep working via the compat shim (lib >=0.60.2). Bumping this is a
+# substrate-change PR — not a code-only refresh.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.62.0
 pyyaml>=6.0

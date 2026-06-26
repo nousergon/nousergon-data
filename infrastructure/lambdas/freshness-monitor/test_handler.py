@@ -96,9 +96,25 @@ def fake_s3():
     def _get(*, Bucket, Key):
         return {"Body": io.BytesIO(client._registry_body)}
 
+    def _paginate(*, Bucket, Prefix):
+        # Recency model (nousergon-lib >=0.62.0): date-templated probes LIST
+        # the prefix and take the newest matching object. Derive the listing
+        # from the same _head_returns table so a single per-key fixture entry
+        # feeds both the fixed-key HEAD path and the date-templated LIST path.
+        contents = [
+            {"Key": k, "LastModified": v["LastModified"]}
+            for k, v in client._head_returns.items()
+            if k.startswith(Prefix) and isinstance(v, dict) and "LastModified" in v
+        ]
+        return iter([{"Contents": contents}])
+
+    paginator = mock.Mock()
+    paginator.paginate.side_effect = _paginate
+
     client.head_object.side_effect = _head
     client.put_object.side_effect = _put
     client.get_object.side_effect = _get
+    client.get_paginator.return_value = paginator
     return client
 
 
@@ -283,6 +299,15 @@ def test_handler_probe_failed_routes_to_critical(
             raise _ClientError403()
         raise _ClientError404()
     fake_s3.head_object.side_effect = _head
+
+    # Recency model (lib >=0.62.0) LISTs the prefix for date-templated keys —
+    # make the LIST 403 for probe_fresh's prefix so the canonical probe is
+    # authoritative-failed (the monitor itself is blind → probe_failed).
+    def _paginate_403(*, Bucket, Prefix):
+        if Prefix.startswith("path/"):
+            raise _ClientError403()
+        return iter([{"Contents": []}])
+    fake_s3.get_paginator.return_value.paginate.side_effect = _paginate_403
 
     import importlib
     import index
