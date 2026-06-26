@@ -48,6 +48,14 @@ Operator can refine via a follow-up `changelog-log --event-type investigation` e
 
 The deploy script wires subscription filters to every alpha-engine Lambda **except** the two changelog-mirror Lambdas (recursion guard — if this Lambda errors, its log lines must not feed back into itself).
 
+`TARGET_FUNCTIONS` is hand-maintained, so a newly-deployed `alpha-engine-*` Lambda won't auto-subscribe. Run the read-only drift audit to catch that (config#862) — periodically, as a CI step, or a Saturday-SF substrate-health row:
+
+```
+bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --audit-targets
+```
+
+It lists live `alpha-engine-*` Lambdas, subtracts the two recursion-guard exclusions, diffs against `TARGET_FUNCTIONS`, and exits `1` if any live Lambda is missing (or any array entry no longer exists). Reconcile by editing the array, then `--wire-subs`.
+
 ```
 # Pipeline / producer Lambdas
 alpha-engine-data-collector
