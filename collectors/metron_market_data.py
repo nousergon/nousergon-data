@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -108,6 +109,14 @@ TECHNICALS_PREFIX = "market_data/technicals/"
 # aggregate (medians + member counts, no per-ticker rows). Weekly cadence (multiples move
 # quarterly; the median of ~900 names is stable week to week).
 VALUATION_MEDIANS_PREFIX = "market_data/valuation_medians/"
+# Analyst consensus — per-held-symbol consensus rating + price targets + #analysts, the
+# "consensus research" inputs to the Holdings Sentiment/Consensus band + the per-holding
+# attractiveness score (metron-ops#105). FREE sources only (yfinance recommendationKey +
+# targetMean/MedianPrice + numberOfAnalystOpinions, optionally Finnhub rating buckets via
+# the canonical analyst_sources adapters). Forward consensus EPS/revenue ESTIMATES are a
+# PAID feed (IBES/Visible Alpha) — NOT emitted here; the consumer scaffolds those columns
+# as "N/A · paid feed" and they populate when metron-ops#107 wires the paid source.
+ANALYST_PREFIX = "market_data/analyst/"
 # yfinance Ticker.info keys the valuation-medians pass reads per universe symbol. Mirrors
 # the multiple subset of FUNDAMENTALS_INFO_KEYS (same source + semantics as the per-holding
 # fundamentals → the band and the row are directly comparable) plus sector/country to group.
@@ -140,6 +149,7 @@ FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow
 INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
 TECHNICALS_SCHEMA_VERSION = 1
 VALUATION_MEDIANS_SCHEMA_VERSION = 1
+ANALYST_SCHEMA_VERSION = 1  # consensus rating + price targets + #analysts (free sources)
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
@@ -178,6 +188,8 @@ EarningsSource = Callable[[list[str]], dict[str, str]]
 MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 # A fundamentals source maps yf_symbols → {yf_symbol: {info_key: value}}.
 FundamentalsSource = Callable[[list[str]], dict[str, dict]]
+# An analyst source maps yf_symbols → {yf_symbol: {consensus_rating, mean_target, …}}.
+AnalystSource = Callable[[list[str]], dict[str, dict]]
 # An intraday source maps yf_symbols → {yf_symbol: quote dict} (see _yfinance_intraday).
 IntradaySource = Callable[[list[str]], dict[str, dict]]
 # A valuation source maps yf_symbols → {yf_symbol: {multiple_key|sector|country: value}}
@@ -478,6 +490,65 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
             out[sym] = fields
     logger.info("[metron_market_data] fundamentals: %d/%d symbols covered", len(out), len(yf_symbols))
     _log_yf_coverage("fundamentals", yf_symbols, out)
+    return out
+
+
+# Consensus-rating ladder → a signed numeric score in [-1, +1] so the consumer can
+# average / band it without re-deriving the ordering. strongBuy=+1 … strongSell=-1.
+_RATING_SCORE = {
+    "strongBuy": 1.0, "buy": 0.5, "hold": 0.0, "sell": -0.5, "strongSell": -1.0,
+}
+
+
+@_yf_quiet
+def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
+    """Consensus research per held symbol via the canonical free analyst adapter(s)
+    → ``{yf_symbol: {consensus_rating, rating_score, mean_target, median_target,
+    num_analysts}}``.
+
+    FREE sources only: ``YfinanceAnalystAdapter`` (recommendationKey + target
+    mean/median + #analysts) is primary; if ``FINNHUB_API_KEY`` is set, the
+    ``FinnhubAnalystAdapter`` rating buckets backfill a missing consensus_rating
+    (Finnhub's price target is paid-tier, so targets stay from yfinance). Forward
+    consensus EPS/revenue estimates are a PAID feed and are intentionally NOT
+    fetched here. Fail-soft per symbol; a symbol with no resolvable snapshot is
+    omitted (coverage gap, not zeros)."""
+    from collectors.analyst_sources import YfinanceAnalystAdapter
+
+    yf_adapter = YfinanceAnalystAdapter()
+    finnhub_adapter = None
+    if os.environ.get("FINNHUB_API_KEY"):
+        try:
+            from collectors.analyst_sources import FinnhubAnalystAdapter
+            finnhub_adapter = FinnhubAnalystAdapter()
+        except Exception as e:  # pragma: no cover - optional backfill
+            logger.warning("[metron_market_data] Finnhub analyst adapter unavailable: %s", e)
+
+    out: dict[str, dict] = {}
+    for sym in yf_symbols:
+        snap = yf_adapter.fetch(sym)
+        rating = snap.consensus_rating if snap else None
+        # Finnhub backfills ONLY a missing rating (targets stay from yfinance).
+        if rating is None and finnhub_adapter is not None:
+            fh = finnhub_adapter.fetch(sym)
+            if fh is not None and fh.consensus_rating is not None:
+                rating = fh.consensus_rating
+                if snap is None:
+                    snap = fh
+        if snap is None:
+            continue
+        fields = {
+            "consensus_rating": rating,
+            "rating_score": _RATING_SCORE.get(rating) if rating else None,
+            "mean_target": snap.mean_target,
+            "median_target": snap.median_target,
+            "num_analysts": snap.num_analysts,
+        }
+        # Omit a symbol that resolved to an empty snapshot (all None) — coverage gap.
+        if any(v is not None for v in fields.values()):
+            out[sym] = {k: v for k, v in fields.items() if v is not None}
+    logger.info("[metron_market_data] analyst: %d/%d symbols covered", len(out), len(yf_symbols))
+    _log_yf_coverage("analyst", yf_symbols, out)
     return out
 
 
@@ -913,6 +984,51 @@ def collect_fundamentals(
         return {"status": "error", "error": str(e)}
     logger.info("[metron_market_data] wrote fundamentals for %d/%d symbols", len(fundamentals), len(yf_symbols))
     return {"status": "ok", "universe": len(holdings), "fundamentals": len(fundamentals)}
+
+
+def collect_analyst(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None, analyst_source: AnalystSource | None = None,
+) -> dict:
+    """Write the consensus-research artifact for Metron's held universe
+    (metron-ops#105 — Holdings Sentiment/Consensus band + attractiveness score):
+
+        market_data/analyst/latest.json
+            {schema_version, as_of, source: "yfinance+finnhub", analyst:
+                {yf_symbol: {consensus_rating, rating_score, mean_target,
+                             median_target, num_analysts}}}
+
+    FREE sources only (see ``_yfinance_analyst``). The consumer derives
+    price-target upside vs the live price and owns display semantics; forward
+    consensus EPS/revenue ESTIMATES are a paid feed scaffolded N/A downstream.
+    Daily cadence (ratings/targets move slowly; daily is plenty). Injectable
+    source/S3 for tests. Mirrors ``collect_fundamentals``."""
+    if run_date is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_metron_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    analyst = (analyst_source or _yfinance_analyst)(yf_symbols)
+    artifact = {
+        "schema_version": ANALYST_SCHEMA_VERSION, "as_of": run_date,
+        "source": "yfinance+finnhub", "analyst": dict(sorted(analyst.items())),
+    }
+    if dry_run:
+        logger.info("[metron_market_data] DRY-RUN analyst: %d symbols (not written)", len(analyst))
+        return {"status": "ok_dry_run", "analyst": len(analyst)}
+    try:
+        _write_json(s3_client, bucket, f"{ANALYST_PREFIX}latest.json", artifact)
+    except Exception as e:  # fail loud to the phase registry
+        logger.error("[metron_market_data] analyst write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info("[metron_market_data] wrote analyst for %d/%d symbols", len(analyst), len(yf_symbols))
+    return {"status": "ok", "universe": len(holdings), "analyst": len(analyst)}
 
 
 # ── Technicals (derived from close_history — no new fetch) ────────────────────
@@ -1363,6 +1479,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reference", action="store_true", help="also write sectors/earnings artifacts")
     parser.add_argument("--macro", action="store_true", help="also write the macro-indicators artifact")
     parser.add_argument("--fundamentals", action="store_true", help="also write the tearsheet-fundamentals artifact")
+    parser.add_argument("--analyst", action="store_true", help="also write the consensus-research artifact (free sources)")
     parser.add_argument("--only-intraday", action="store_true",
                         help="write ONLY the intraday-quotes artifact (the 5-min timer entry; "
                              "no-op outside the NYSE session unless --force)")
@@ -1398,6 +1515,10 @@ def main(argv: list[str] | None = None) -> int:
         fund = collect_fundamentals(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
         logger.info("[metron_market_data] fundamentals done: %s", fund)
         ok = ok and fund.get("status") in ("ok", "ok_dry_run", "skipped")
+    if args.analyst:
+        ana = collect_analyst(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
+        logger.info("[metron_market_data] analyst done: %s", ana)
+        ok = ok and ana.get("status") in ("ok", "ok_dry_run", "skipped")
     return 0 if ok else 1
 
 

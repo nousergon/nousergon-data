@@ -2093,6 +2093,15 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: metron_market_data.collect_technicals(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.TECHNICALS_PREFIX}latest.json",
     )
+    # Consensus research (rating + price targets + #analysts) for Metron's Holdings
+    # Sentiment/Consensus band + per-holding attractiveness score (metron-ops#105).
+    # FREE sources only (yfinance + optional Finnhub rating buckets); forward consensus
+    # ESTIMATES are a paid feed scaffolded N/A in the consumer (metron-ops#107).
+    results["collectors"]["metron_analyst_data"] = _phase_collect(
+        reg, "metron_analyst_data",
+        lambda: metron_market_data.collect_analyst(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.ANALYST_PREFIX}latest.json",
+    )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
     # executor gate at alpha-engine/executor/main.py reads this key to decide
