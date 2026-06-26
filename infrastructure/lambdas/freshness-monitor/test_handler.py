@@ -181,9 +181,9 @@ def _patch_now(monkeypatch, fixed):
 def test_handler_observe_mode_does_not_alert(
     monkeypatch, yaml_registry_body, fake_s3, fixed_now
 ):
-    """OBSERVE mode (MNEMON_FRESHNESS_MONITOR_ENABLED unset) writes
+    """OBSERVE mode (CRUCIBLE_FRESHNESS_MONITOR_ENABLED unset) writes
     heartbeat + check_results but suppresses alerts.publish."""
-    monkeypatch.delenv("MNEMON_FRESHNESS_MONITOR_ENABLED", raising=False)
+    monkeypatch.delenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", raising=False)
     fake_s3._registry_body = yaml_registry_body
 
     # Mark probe_fresh as actually fresh (HEAD returns within cycle).
@@ -228,9 +228,9 @@ def test_handler_observe_mode_does_not_alert(
 def test_handler_alerts_enabled_fires_with_dedup_key(
     monkeypatch, yaml_registry_body, fake_s3, fixed_now
 ):
-    """Production mode (MNEMON_FRESHNESS_MONITOR_ENABLED=true) routes
+    """Production mode (CRUCIBLE_FRESHNESS_MONITOR_ENABLED=true) routes
     misses past SLA to alerts.publish with the resolved dedup key."""
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     fake_s3._registry_body = yaml_registry_body
 
     cycle_tick = datetime(2026, 5, 30, 9, 0, tzinfo=timezone.utc)
@@ -267,7 +267,7 @@ def test_handler_probe_failed_routes_to_critical(
     """probe_failed (e.g., 403) routes to critical regardless of the
     spec's severity — the monitor itself is broken; operator must know.
     Plan §3 invariant 6."""
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     fake_s3._registry_body = yaml_registry_body
 
     class _ClientError403(Exception):
@@ -312,7 +312,7 @@ def test_handler_per_spec_exception_does_not_sink_pass(
     placeholder) should result in probe_failed for that spec, not a
     handler-level raise. The other specs in the registry still get
     probed."""
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     # `{ticker}` is NOT a supported placeholder in the substrate's
     # _format_key — str.format will raise KeyError.
     fake_s3._registry_body = b"""\
@@ -360,7 +360,7 @@ def test_handler_observe_to_production_cutover_via_env_flip(
     fake_s3._registry_body = yaml_registry_body
 
     # Pass 1: OBSERVE mode.
-    monkeypatch.delenv("MNEMON_FRESHNESS_MONITOR_ENABLED", raising=False)
+    monkeypatch.delenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", raising=False)
     import importlib
     import index
     importlib.reload(index)
@@ -373,7 +373,7 @@ def test_handler_observe_to_production_cutover_via_env_flip(
     assert publish_mock.call_count == 0
 
     # Pass 2: env flipped to true, reload, re-invoke.
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     fake_s3._put_calls.clear()
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
@@ -389,7 +389,7 @@ def test_handler_observe_to_production_cutover_via_env_flip(
 
 
 def test_maybe_alert_skips_fresh_state(monkeypatch, fixed_now):
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     import importlib
     import index
     importlib.reload(index)
@@ -409,7 +409,7 @@ def test_maybe_alert_skips_fresh_state(monkeypatch, fixed_now):
 
 
 def test_maybe_alert_skips_missing_within_sla_grace(monkeypatch, fixed_now):
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     import importlib
     import index
     importlib.reload(index)
@@ -430,7 +430,7 @@ def test_maybe_alert_skips_missing_within_sla_grace(monkeypatch, fixed_now):
 
 
 def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     import importlib
     import index
     importlib.reload(index)
@@ -458,7 +458,7 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
 
 def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now):
     """probe_failed always escalates to critical regardless of spec."""
-    monkeypatch.setenv("MNEMON_FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", "true")
     import importlib
     import index
     importlib.reload(index)
@@ -669,7 +669,7 @@ def _run_handler(monkeypatch, fake_s3, fixed_now, *, registry_body):
     """Invoke the handler in OBSERVE mode with boto3 routed to fake_s3
     (which also serves boto3.client('cloudwatch') — put_metric_data lands
     on the same recording mock)."""
-    monkeypatch.delenv("MNEMON_FRESHNESS_MONITOR_ENABLED", raising=False)
+    monkeypatch.delenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", raising=False)
     fake_s3._registry_body = registry_body
     import importlib
     import index
@@ -770,7 +770,7 @@ def test_handler_cycle_rollup_failure_is_non_fatal(
     primary check_results + heartbeat are still written and the handler
     returns with cycle_verdicts={}."""
     fake_s3._registry_body = yaml_registry_body
-    monkeypatch.delenv("MNEMON_FRESHNESS_MONITOR_ENABLED", raising=False)
+    monkeypatch.delenv("CRUCIBLE_FRESHNESS_MONITOR_ENABLED", raising=False)
     import importlib
     import index
     importlib.reload(index)

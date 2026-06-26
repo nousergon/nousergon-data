@@ -15,7 +15,7 @@
 # spot-orphan-reaper / changelog-cloudwatch-mirror (keeps the
 # github-actions-lambda-deploy OIDC role's blast radius narrow;
 # operator-deployed only). Phase 6 cutover flips
-# MNEMON_FRESHNESS_MONITOR_ENABLED via
+# CRUCIBLE_FRESHNESS_MONITOR_ENABLED via
 # `aws lambda update-function-configuration` without redeploying.
 #
 # Usage:
@@ -158,7 +158,7 @@ if $BOOTSTRAP; then
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
-    # ENFORCE mode: MNEMON_FRESHNESS_MONITOR_ENABLED=true.
+    # ENFORCE mode: CRUCIBLE_FRESHNESS_MONITOR_ENABLED=true.
     # Phase 6 cutover EXECUTED 2026-06-25 after a ~1mo observe soak (the
     # monitor correctly detected the missed 6/20 Saturday cycle the whole
     # time but stayed muted). Code is now the source of truth for the flag —
@@ -172,7 +172,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 120 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,MNEMON_FRESHNESS_MONITOR_ENABLED=true}' \
+      --environment 'Variables={LOG_LEVEL=INFO,CRUCIBLE_FRESHNESS_MONITOR_ENABLED=true}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
