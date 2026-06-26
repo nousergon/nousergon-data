@@ -303,6 +303,128 @@ class TestFundamentals:
         assert mmd.collect_fundamentals(bucket="b", s3_client=empty)["status"] == "skipped"
 
 
+class TestAnalyst:
+    def test_writes_consensus_keyed_by_yf_symbol(self):
+        s3 = _universe_s3(_UNIVERSE)
+        source = lambda syms: {
+            "AAPL": {"consensus_rating": "buy", "rating_score": 0.5,
+                     "mean_target": 240.0, "median_target": 238.0, "num_analysts": 38},
+            "1299.HK": {"consensus_rating": "strongBuy", "rating_score": 1.0,
+                        "mean_target": 95.0, "num_analysts": 12},
+        }
+        result = mmd.collect_analyst(
+            bucket="b", run_date="2026-06-26", s3_client=s3, analyst_source=source
+        )
+        assert result["status"] == "ok" and result["analyst"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/analyst/latest.json"}
+        art = puts["market_data/analyst/latest.json"]
+        assert art["schema_version"] == mmd.ANALYST_SCHEMA_VERSION
+        assert art["source"] == "yfinance+finnhub"
+        # Pass-through: values land exactly as the source returned them.
+        assert art["analyst"]["AAPL"]["mean_target"] == 240.0
+        assert art["analyst"]["1299.HK"]["rating_score"] == 1.0
+
+    def test_analyst_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_analyst(
+            bucket="b", s3_client=s3, dry_run=True,
+            analyst_source=lambda s: {"AAPL": {"consensus_rating": "hold"}},
+        )
+        assert result["status"] == "ok_dry_run"
+        assert not s3.put_object.called
+        empty = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_analyst(bucket="b", s3_client=empty)["status"] == "skipped"
+
+    def test_yfinance_analyst_derives_rating_score_and_omits_empty(self, monkeypatch):
+        """`_yfinance_analyst` maps the rating ladder → signed score, drops None
+        fields, and omits a symbol whose snapshot is entirely empty (coverage gap,
+        not zeros)."""
+        from types import SimpleNamespace
+
+        snaps = {
+            "AAPL": SimpleNamespace(consensus_rating="strongBuy", mean_target=240.0,
+                                    median_target=238.0, num_analysts=40),
+            "MSFT": SimpleNamespace(consensus_rating="sell", mean_target=None,
+                                    median_target=None, num_analysts=5),
+            # entirely empty → omitted
+            "NOPE": SimpleNamespace(consensus_rating=None, mean_target=None,
+                                    median_target=None, num_analysts=None),
+            # adapter returns None (fetch miss) → omitted
+            "MISS": None,
+        }
+
+        class _FakeAdapter:
+            def fetch(self, ticker):
+                return snaps.get(ticker)
+
+        monkeypatch.setattr(
+            "collectors.analyst_sources.YfinanceAnalystAdapter", lambda: _FakeAdapter()
+        )
+        # No Finnhub key → no rating backfill (secrets via the lib, not os.environ).
+        monkeypatch.setattr("alpha_engine_lib.secrets.get_secret", lambda *a, **k: "")
+        out = mmd._yfinance_analyst(["AAPL", "MSFT", "NOPE", "MISS"])
+        assert set(out) == {"AAPL", "MSFT"}  # empty + miss omitted
+        assert out["AAPL"]["rating_score"] == 1.0  # strongBuy
+        assert out["MSFT"]["rating_score"] == -0.5  # sell
+        assert "mean_target" not in out["MSFT"]  # None dropped
+
+
+class TestSentiment:
+    def test_writes_sentiment_keyed_by_yf_symbol(self):
+        s3 = _universe_s3(_UNIVERSE)
+        source = lambda syms: {
+            "AAPL": {"sentiment": 0.42, "sentiment_mean": 0.30, "n_articles": 12,
+                     "event_count": 2, "event_severity_max": 0.6, "as_of": "2026-06-25"},
+            "1299.HK": {"sentiment": -0.1, "n_articles": 3, "as_of": "2026-06-24"},
+        }
+        result = mmd.collect_sentiment(
+            bucket="b", run_date="2026-06-26", s3_client=s3, sentiment_source=source
+        )
+        assert result["status"] == "ok" and result["sentiment"] == 2
+        puts = _puts(s3)
+        assert set(puts) == {"market_data/sentiment/latest.json"}
+        art = puts["market_data/sentiment/latest.json"]
+        assert art["schema_version"] == mmd.SENTIMENT_SCHEMA_VERSION
+        assert art["source"] == "news_aggregates_daily(LM)"
+        assert art["sentiment"]["AAPL"]["sentiment"] == 0.42
+        assert art["sentiment"]["AAPL"]["as_of"] == "2026-06-25"
+
+    def test_sentiment_dry_run_and_empty_universe(self):
+        s3 = _universe_s3(_UNIVERSE)
+        result = mmd.collect_sentiment(
+            bucket="b", s3_client=s3, dry_run=True,
+            sentiment_source=lambda s: {"AAPL": {"sentiment": 0.1}},
+        )
+        assert result["status"] == "ok_dry_run"
+        assert not s3.put_object.called
+        empty = _universe_s3({"holdings": [], "currencies": []})
+        assert mmd.collect_sentiment(bucket="b", s3_client=empty)["status"] == "skipped"
+
+    def test_news_sentiment_latest_per_ticker_and_omits_uncovered(self, monkeypatch):
+        """`_news_sentiment` picks the most-recent row per ticker, maps
+        trusted_mean → `sentiment`, coerces NaN → None, and omits held symbols
+        with no news coverage."""
+        import pandas as pd
+
+        df = pd.DataFrame([
+            # AAPL: two dates → the later (06-25) row must win
+            {"ticker": "AAPL", "aggregate_date": "2026-06-24", "lm_sentiment_trusted_mean": 0.10,
+             "lm_sentiment_mean": 0.05, "n_articles": 4, "event_count": 0, "event_severity_max": 0.0},
+            {"ticker": "AAPL", "aggregate_date": "2026-06-25", "lm_sentiment_trusted_mean": 0.42,
+             "lm_sentiment_mean": 0.30, "n_articles": 12, "event_count": 2, "event_severity_max": 0.6},
+            # TSLA present in news but NOT in the held universe → filtered out
+            {"ticker": "TSLA", "aggregate_date": "2026-06-25", "lm_sentiment_trusted_mean": 0.9,
+             "lm_sentiment_mean": 0.9, "n_articles": 50, "event_count": 1, "event_severity_max": 0.2},
+        ])
+        monkeypatch.setattr("collectors.daily_news.read_daily_news", lambda *a, **k: df)
+        out = mmd._news_sentiment(["AAPL", "1299.HK"])  # 1299.HK has no news row → omitted
+        assert set(out) == {"AAPL"}
+        assert out["AAPL"]["sentiment"] == 0.42  # latest date won
+        assert out["AAPL"]["as_of"] == "2026-06-25"
+        assert out["AAPL"]["n_articles"] == 12
+
+
 class TestIntraday:
     _QUOTES = {
         "AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
@@ -386,24 +508,54 @@ class TestIntraday:
         assert q["suspect"] is True
         assert q["last"] == 350.0  # flagged, never clamped/dropped — no fabrication
 
-    def test_skips_without_fresh_heartbeat(self):
-        """The demand gate: Metron closed (no/stale heartbeat) → zero quote fetches."""
+    def test_default_stays_warm_without_heartbeat(self):
+        """Owner build (gate OFF): in-session ticks publish even with no/stale heartbeat,
+        so the markets strip never freezes at the morning quote after the app is idle."""
+        # No heartbeat key at all → still writes (heartbeat never read).
+        absent = self._s3(heartbeat_offset_s=None)
+        r1 = mmd.collect_intraday(
+            bucket="b", s3_client=absent, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            now=self._RTH,
+        )
+        assert r1["status"] == "ok" and r1["indices"] == 4
+        assert absent.put_object.called
+        # Stale heartbeat (older than HEARTBEAT_FRESH_SECONDS) → still writes.
+        stale = self._s3(heartbeat_offset_s=mmd.HEARTBEAT_FRESH_SECONDS + 60)
+        r2 = mmd.collect_intraday(
+            bucket="b", s3_client=stale, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            now=self._RTH,
+        )
+        assert r2["status"] == "ok" and _puts(stale)["market_data/intraday/latest.json"]
+
+    def test_require_heartbeat_gate_skips_when_inactive(self):
+        """The opt-in demand gate (multi-tenant): Metron closed (no/stale heartbeat) →
+        zero quote fetches when require_heartbeat=True."""
         calls = []
         source = lambda s: calls.append(1) or {}
         # No heartbeat key at all.
         absent = self._s3(heartbeat_offset_s=None)
-        r1 = mmd.collect_intraday(bucket="b", s3_client=absent, intraday_source=source, now=self._RTH)
+        r1 = mmd.collect_intraday(
+            bucket="b", s3_client=absent, intraday_source=source, now=self._RTH, require_heartbeat=True,
+        )
         assert r1["status"] == "skipped" and "heartbeat" in r1["reason"]
         # Stale heartbeat (older than HEARTBEAT_FRESH_SECONDS).
         stale = self._s3(heartbeat_offset_s=mmd.HEARTBEAT_FRESH_SECONDS + 60)
-        r2 = mmd.collect_intraday(bucket="b", s3_client=stale, intraday_source=source, now=self._RTH)
+        r2 = mmd.collect_intraday(
+            bucket="b", s3_client=stale, intraday_source=source, now=self._RTH, require_heartbeat=True,
+        )
         assert r2["status"] == "skipped" and "heartbeat" in r2["reason"]
         assert not calls and not absent.put_object.called and not stale.put_object.called
-        # force bypasses BOTH gates (manual/debug runs).
+        # A fresh heartbeat opens the gate → writes.
+        active = mmd.collect_intraday(
+            bucket="b", s3_client=self._s3(), intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            now=self._RTH, require_heartbeat=True,
+        )
+        assert active["status"] == "ok"
+        # force bypasses BOTH gates even with the gate on (manual/debug runs).
         forced = mmd.collect_intraday(
             bucket="b", s3_client=self._s3(heartbeat_offset_s=None),
             intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
-            now=self._RTH, force=True,
+            now=self._RTH, force=True, require_heartbeat=True,
         )
         assert forced["status"] == "ok"
 

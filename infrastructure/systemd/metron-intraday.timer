@@ -1,10 +1,11 @@
 # Every 5 minutes while the trading box is up. The box's lifecycle bounds the
-# day; the collector itself double-gates each tick on the NYSE session calendar
-# (holidays + half-days via alpha_engine_lib.trading_calendar) AND the Metron UI
-# heartbeat — quotes are fetched only while the market is open and the app is
-# actually in use, so off-gate ticks cost one S3 GET and exit.
+# day; the collector gates each tick on the NYSE session calendar (holidays +
+# half-days via alpha_engine_lib.trading_calendar) so off-session ticks cost one
+# S3 GET and exit. The Metron UI-heartbeat demand gate is OPT-IN (--require-heartbeat,
+# OFF on this single-tenant owner build so the strip never freezes after the app is
+# idle) — add it to the service ExecStart before a multi-tenant deployment.
 [Unit]
-Description=Metron intraday quotes every 5 min (session + app-heartbeat gated in-process)
+Description=Metron intraday quotes every 5 min (NYSE-session gated in-process)
 
 [Timer]
 OnCalendar=*-*-* *:00/5:00

@@ -1,18 +1,17 @@
-"""Wave 3 PR1 — producer-side write-both regression suite.
+"""Wave 3 PR4 (cutover) — producer-side single-prefix regression suite.
 
 Covers:
-  * The ``price_cache_write_prefixes`` helper itself (legacy default → both,
-    custom prefix → single).
+  * The ``price_cache_write_prefixes`` / ``price_cache_read_prefixes`` helpers
+    themselves: the production-default sentinel now resolves to
+    ``reference/price_cache/`` ONLY (legacy dropped), custom prefix → single.
   * Each of the three production writers (``collectors/prices.py``,
-    ``collectors/fred_history.py``, ``weekly_collector._patch_chronic_gap_ticker``
+    ``collectors/fred_history.py``, ``weekly_collector._self_heal_chronic_polygon_gaps``
     via its module-scoped chronic-gap path) calls into the helper and ends up
-    putting ticker parquets at BOTH the legacy and new prefix, with identical
-    bodies and key shape.
+    putting ticker parquets at ONLY the new ``reference/price_cache/`` prefix.
 
-These tests pin the Wave 3 write-both contract so a future "delete the legacy
-write" refactor can't quietly skip a writer — every active prod path is
-exercised. PR4 cutover edits the helper + flips these tests to expect a
-single-prefix write.
+These tests pin the Wave 3 cutover contract: write-both is retired and the
+legacy ``predictor/price_cache/`` prefix is GONE from both the write and read
+chains. Any regression that re-introduces a legacy write/read fails here.
 """
 
 from __future__ import annotations
@@ -37,23 +36,23 @@ from builders._price_cache_writeboth import (
 # ---------------------------------------------------------------------------
 
 
-def test_default_returns_both_prefixes_legacy_first():
-    """Production default → write-both with legacy ordered first.
-
-    Order matters: legacy first so a permission/quota failure on the legacy
-    prefix preserves pre-Wave-3 fail-loud semantics — the new prefix never
-    silently masks a legacy write failure.
+def test_default_writes_reference_only_legacy_dropped():
+    """Wave-3 PR4 cutover: production default → single write to the new
+    ``reference/price_cache/`` prefix. The legacy ``predictor/price_cache/``
+    entry is GONE — write-both is retired.
     """
     out = price_cache_write_prefixes()
-    assert out == [PRICE_CACHE_LEGACY_PREFIX, PRICE_CACHE_NEW_PREFIX]
+    assert out == [PRICE_CACHE_NEW_PREFIX]
+    assert PRICE_CACHE_LEGACY_PREFIX not in out
 
 
-def test_explicit_legacy_returns_both_prefixes():
-    """Callers that pass the legacy prefix explicitly get the same result as
-    callers that use the default — protects against config-layer regressions
-    where ``s3_prefix`` is read from yaml and matches the legacy string."""
+def test_explicit_legacy_sentinel_resolves_to_reference_only():
+    """The legacy string is still the production-default sentinel the prod
+    call sites pass (config ``s3_prefix``). Post-cutover it resolves to the
+    reference prefix ONLY — never writes to the legacy tree."""
     out = price_cache_write_prefixes(PRICE_CACHE_LEGACY_PREFIX)
-    assert out == [PRICE_CACHE_LEGACY_PREFIX, PRICE_CACHE_NEW_PREFIX]
+    assert out == [PRICE_CACHE_NEW_PREFIX]
+    assert PRICE_CACHE_LEGACY_PREFIX not in out
 
 
 def test_custom_prefix_returns_single():
@@ -78,18 +77,20 @@ def test_new_prefix_is_not_legacy():
 # ---------------------------------------------------------------------------
 
 
-def test_read_helper_default_returns_new_first_legacy_second():
-    """The read order is the WRITE order REVERSED — new prefix consulted
-    first so consumers see the post-PR4 home as soon as the soak begins;
-    legacy is the fallback during the soak window only.
+def test_read_helper_default_resolves_reference_only():
+    """Wave-3 PR4 cutover: the read chain drops the legacy fallback. With the
+    producer writing only ``reference/`` and the legacy tree slated for
+    ``aws s3 rm``, reads resolve from ``reference/`` alone.
     """
     out = price_cache_read_prefixes()
-    assert out == [PRICE_CACHE_NEW_PREFIX, PRICE_CACHE_LEGACY_PREFIX]
+    assert out == [PRICE_CACHE_NEW_PREFIX]
+    assert PRICE_CACHE_LEGACY_PREFIX not in out
 
 
-def test_read_helper_explicit_legacy_returns_new_first_legacy_second():
+def test_read_helper_explicit_legacy_sentinel_resolves_reference_only():
     out = price_cache_read_prefixes(PRICE_CACHE_LEGACY_PREFIX)
-    assert out == [PRICE_CACHE_NEW_PREFIX, PRICE_CACHE_LEGACY_PREFIX]
+    assert out == [PRICE_CACHE_NEW_PREFIX]
+    assert PRICE_CACHE_LEGACY_PREFIX not in out
 
 
 def test_read_helper_custom_prefix_returns_single():
@@ -123,49 +124,29 @@ def _make_paginator(pages_by_prefix: dict[str, list[list[dict]]]):
     return s3
 
 
-def test_list_price_cache_keys_default_iterates_new_then_legacy():
-    """Aggregate listing under the production default consults the new
-    prefix first then the legacy prefix; tickers present in BOTH only
-    surface once (first-prefix-wins, deduped by basename).
+def test_list_price_cache_keys_default_lists_reference_only():
+    """Wave-3 PR4 cutover: aggregate listing under the production default
+    consults the new ``reference/`` prefix ONLY — the legacy leg is dropped
+    from the read chain, so any keys still lingering under the legacy prefix
+    (pre-``aws s3 rm``) are NOT listed.
     """
     new_keys = [{"Key": f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet"},
                 {"Key": f"{PRICE_CACHE_NEW_PREFIX}MSFT.parquet"}]
     legacy_keys = [{"Key": f"{PRICE_CACHE_LEGACY_PREFIX}AAPL.parquet"},
-                   {"Key": f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet"}]
+                   {"Key": f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet"},
+                   {"Key": f"{PRICE_CACHE_LEGACY_PREFIX}ZZZZ.parquet"}]
     s3 = _make_paginator({
         PRICE_CACHE_NEW_PREFIX: [new_keys],
         PRICE_CACHE_LEGACY_PREFIX: [legacy_keys],
     })
 
     out = list_price_cache_keys(s3, "alpha-engine-research")
-    # AAPL + MSFT each appear exactly once, both anchored on the new prefix.
+    # Only the reference-prefix keys surface; the legacy-only ZZZZ is ignored.
     assert out == [
         f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet",
         f"{PRICE_CACHE_NEW_PREFIX}MSFT.parquet",
-    ], "First-prefix-wins must dedupe by {ticker}.parquet basename."
-
-
-def test_list_price_cache_keys_falls_back_to_legacy_for_missing_basenames():
-    """When the new prefix is partially populated (soak-window backfill
-    hasn't picked up every ticker yet), legacy fills the gaps so the
-    aggregate set stays complete — the whole point of keeping the
-    legacy fallback live during the soak.
-    """
-    # Only AAPL has been mirrored to new yet; MSFT still legacy-only.
-    new_keys = [{"Key": f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet"}]
-    legacy_keys = [{"Key": f"{PRICE_CACHE_LEGACY_PREFIX}AAPL.parquet"},
-                   {"Key": f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet"}]
-    s3 = _make_paginator({
-        PRICE_CACHE_NEW_PREFIX: [new_keys],
-        PRICE_CACHE_LEGACY_PREFIX: [legacy_keys],
-    })
-
-    out = list_price_cache_keys(s3, "alpha-engine-research")
-    # AAPL from new (first-wins), MSFT from legacy (gap-fill).
-    assert out == [
-        f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet",
-        f"{PRICE_CACHE_LEGACY_PREFIX}MSFT.parquet",
     ]
+    assert not any(k.startswith(PRICE_CACHE_LEGACY_PREFIX) for k in out)
 
 
 def test_list_price_cache_keys_custom_prefix_opts_out_of_chain():
@@ -224,12 +205,10 @@ def test_prices_refresh_uploads_to_both_prefixes(monkeypatch, tmp_path):
 
     assert refreshed == 1
     assert failed == []
-    # Both prefixes hit, same ticker, same bucket
+    # Cutover: ONLY the reference prefix is hit — legacy write retired.
     keys = sorted(k for _b, k in recorded)
-    assert keys == [
-        f"{PRICE_CACHE_LEGACY_PREFIX}AAPL.parquet",
-        f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet",
-    ]
+    assert keys == [f"{PRICE_CACHE_NEW_PREFIX}AAPL.parquet"]
+    assert not any(k.startswith(PRICE_CACHE_LEGACY_PREFIX) for _b, k in recorded)
     assert all(b == "test-bucket" for b, _ in recorded)
 
 
@@ -279,11 +258,10 @@ def test_fred_backfill_uploads_to_both_prefixes(monkeypatch):
 
     assert out["status"] == "ok"
     assert out["refreshed"] == 1
+    # Cutover: ONLY the reference prefix is hit — legacy write retired.
     keys = sorted(k for _b, k in recorded)
-    assert keys == [
-        f"{PRICE_CACHE_LEGACY_PREFIX}TWO.parquet",
-        f"{PRICE_CACHE_NEW_PREFIX}TWO.parquet",
-    ]
+    assert keys == [f"{PRICE_CACHE_NEW_PREFIX}TWO.parquet"]
+    assert not any(k.startswith(PRICE_CACHE_LEGACY_PREFIX) for _b, k in recorded)
 
 
 # ---------------------------------------------------------------------------
@@ -291,11 +269,12 @@ def test_fred_backfill_uploads_to_both_prefixes(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_weekly_chronic_gap_self_heal_writes_both_prefixes(monkeypatch):
-    """``_self_heal_chronic_polygon_gaps`` reads the legacy parquet for the
-    existing-rows union, then PUTs the combined frame back. Wave 3 PR1 sends
-    the PUT to both prefixes with identical body bytes; the GET stays on
-    legacy until reader migration (PR3+)."""
+def test_weekly_chronic_gap_self_heal_writes_reference_only(monkeypatch):
+    """``_self_heal_chronic_polygon_gaps`` reads the parquet for the
+    existing-rows union via the read-prefix chain (now ``reference/`` only),
+    then PUTs the combined frame back via the write-prefix chain (also
+    ``reference/`` only). Wave 3 PR4 cutover: the PUT lands on the reference
+    prefix ONLY — the legacy write is retired."""
     import weekly_collector as wc
 
     target_date = "2026-05-12"
@@ -366,15 +345,11 @@ def test_weekly_chronic_gap_self_heal_writes_both_prefixes(monkeypatch):
     assert summary["errors"] == [], summary
     assert len(summary["healed"]) == 1, summary
 
-    # Both prefixes hit with the same ticker key, bodies identical
+    # Cutover: ONLY the reference prefix is hit — legacy write retired.
     pcache_keys = sorted(
         c["Key"] for c in put_calls if c["Key"].endswith("/PSTG.parquet")
     )
-    assert pcache_keys == [
-        f"{PRICE_CACHE_LEGACY_PREFIX}PSTG.parquet",
-        f"{PRICE_CACHE_NEW_PREFIX}PSTG.parquet",
-    ], pcache_keys
-
-    bodies = [c["Body"] for c in put_calls if c["Key"].endswith("/PSTG.parquet")]
-    assert len(bodies) == 2
-    assert bodies[0] == bodies[1]
+    assert pcache_keys == [f"{PRICE_CACHE_NEW_PREFIX}PSTG.parquet"], pcache_keys
+    assert not any(
+        c["Key"].startswith(PRICE_CACHE_LEGACY_PREFIX) for c in put_calls
+    )

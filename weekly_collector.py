@@ -78,6 +78,7 @@ setup_logging(
 
 from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data
 from builders._price_cache_writeboth import (
+    price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
 )
 from dates import default_run_date  # config#1014: trading-day-axis default
@@ -467,6 +468,22 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 ),
                 artifact_key=f"archive/fundamentals/{run_date}.json",
             )
+
+    # ── 6b. Metron valuation medians (SP1500-broad sector & country benchmark) ──
+    # Powers Metron's Holdings "by sector → country" median bands. Weekly cadence —
+    # the median of ~900 names' multiples is stable week to week. Builds its own
+    # (SP1500 ∪ held) universe, so it runs independent of `tickers`.
+    if only in (None, "metron_valuation_medians"):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: metron valuation medians (sector & country)")
+        logger.info("=" * 60)
+        results["collectors"]["metron_valuation_medians"] = _phase_collect(
+            reg, "metron_valuation_medians",
+            lambda: metron_market_data.collect_valuation_medians(
+                bucket=bucket, run_date=run_date, dry_run=dry_run,
+            ),
+            artifact_key=f"{metron_market_data.VALUATION_MEDIANS_PREFIX}latest.json",
+        )
 
     # ── 7. Feature store compute ───────────────────────────────────────────
     if only in (None, "features"):
@@ -1020,16 +1037,24 @@ def _self_heal_chronic_polygon_gaps(
             ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
             new_rows = yf_df[[c for c in ohlcv_cols if c in yf_df.columns]].copy()
 
-            # Wave 3 PR1: read from legacy (single source of truth during the
-            # write-both soak — readers haven't migrated yet); write to both
-            # legacy + new prefix on the put back (see
-            # builders/_price_cache_writeboth.py for soak contract)
-            pcache_key = f"predictor/price_cache/{ticker}.parquet"
-            try:
-                obj = s3.get_object(Bucket=bucket, Key=pcache_key)
-                existing_pcache = _pd.read_parquet(_io.BytesIO(obj["Body"].read()))
-            except s3.exceptions.NoSuchKey:
-                existing_pcache = _pd.DataFrame(columns=ohlcv_cols)
+            # Wave 3 PR4 (cutover): read via the read-prefix chain (now
+            # ``reference/price_cache/`` only) for the existing-rows union,
+            # then write back to the write-prefix chain (also ``reference/``
+            # only). Post-cutover both chains resolve to the reference home;
+            # the legacy ``predictor/price_cache/`` tree is removed live via
+            # ``aws s3 rm`` (see builders/_price_cache_writeboth.py).
+            existing_pcache = _pd.DataFrame(columns=ohlcv_cols)
+            for _read_prefix in _price_cache_read_prefixes():
+                try:
+                    obj = s3.get_object(
+                        Bucket=bucket, Key=f"{_read_prefix}{ticker}.parquet"
+                    )
+                    existing_pcache = _pd.read_parquet(
+                        _io.BytesIO(obj["Body"].read())
+                    )
+                    break
+                except s3.exceptions.NoSuchKey:
+                    continue
 
             combined_pcache = _pd.concat([existing_pcache, new_rows])
             combined_pcache = combined_pcache[
@@ -2068,6 +2093,31 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         reg, "metron_fundamentals_data",
         lambda: metron_market_data.collect_fundamentals(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.FUNDAMENTALS_PREFIX}latest.json",
+    )
+    # Technical indicators (RSI / MACD / MA / 52w range / momentum) for Metron's Holdings
+    # table, computed from the close_history written by metron_market_data_history above —
+    # no new fetch. Runs after history so it reads the freshly-written close series.
+    results["collectors"]["metron_technicals_data"] = _phase_collect(
+        reg, "metron_technicals_data",
+        lambda: metron_market_data.collect_technicals(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.TECHNICALS_PREFIX}latest.json",
+    )
+    # Consensus research (rating + price targets + #analysts) for Metron's Holdings
+    # Sentiment/Consensus band + per-holding attractiveness score (metron-ops#105).
+    # FREE sources only (yfinance + optional Finnhub rating buckets); forward consensus
+    # ESTIMATES are a paid feed scaffolded N/A in the consumer (metron-ops#107).
+    results["collectors"]["metron_analyst_data"] = _phase_collect(
+        reg, "metron_analyst_data",
+        lambda: metron_market_data.collect_analyst(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.ANALYST_PREFIX}latest.json",
+    )
+    # News sentiment (held-universe latest slice of the news_aggregates_daily parquet,
+    # projected to JSON) for the Holdings Sentiment/Consensus band + attractiveness
+    # score (metron-ops#105). Runs after RunDailyNews has written the parquet.
+    results["collectors"]["metron_sentiment_data"] = _phase_collect(
+        reg, "metron_sentiment_data",
+        lambda: metron_market_data.collect_sentiment(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.SENTIMENT_PREFIX}latest.json",
     )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
