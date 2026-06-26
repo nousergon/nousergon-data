@@ -2102,6 +2102,14 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: metron_market_data.collect_analyst(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.ANALYST_PREFIX}latest.json",
     )
+    # News sentiment (held-universe latest slice of the news_aggregates_daily parquet,
+    # projected to JSON) for the Holdings Sentiment/Consensus band + attractiveness
+    # score (metron-ops#105). Runs after RunDailyNews has written the parquet.
+    results["collectors"]["metron_sentiment_data"] = _phase_collect(
+        reg, "metron_sentiment_data",
+        lambda: metron_market_data.collect_sentiment(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        artifact_key=f"{metron_market_data.SENTIMENT_PREFIX}latest.json",
+    )
 
     # Module health stamp for daily_data — scoped to daily_closes only. The
     # executor gate at alpha-engine/executor/main.py reads this key to decide
