@@ -270,6 +270,23 @@
         "dynamodb:UpdateTimeToLive"
       ],
       "Resource": "arn:aws:dynamodb:us-east-1:711398986525:table/alpha-engine-sf-execution-mutex"
+    },
+    {
+      "Sid": "CanaryFailureAlertSnsPublish",
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Sid": "CanaryFailureAlertDedupMarker",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
     }
   ]
 }
