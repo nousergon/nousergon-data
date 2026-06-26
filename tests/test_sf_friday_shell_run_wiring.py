@@ -914,18 +914,20 @@ class TestHappyPathTraversal:
         # this main-thread trace; their dry-routing is asserted by
         # TestByteIdenticalAbsentPath +
         # test_shell_defaults_force_set_ZERO_skip_exceptions.)
+        # config#885: Scanner/RAGIngestion/RegimeSubstrate/
+        # RegimeRetrospectiveEval were ALSO relocated INTO the Parallel's
+        # Branch A (so PredictorTraining forks parallel to them after
+        # DataPhase1), so they too are off this main-thread trace now —
+        # their dry-routing is covered by the same in-branch dry assertions.
         for ran_dry in (
             "MorningEnrich",
             "DataPhase1",
-            "RAGIngestion",
             "DriftDetection",
             "Backtester",
             "PredictorBacktest",
             "PortfolioOptimizerBacktest",
             "Parity",
             "Evaluator",
-            "RegimeSubstrate",
-            "RegimeRetrospectiveEval",
         ):
             assert ran_dry in order, (
                 f"{ran_dry} was NOT visited under shell_run — the rewire "

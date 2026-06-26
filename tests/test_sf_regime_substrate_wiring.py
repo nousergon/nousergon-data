@@ -42,13 +42,31 @@ def _sf() -> dict:
     return json.loads(SF_PATH.read_text())
 
 
+def _flat_states(sf: dict) -> dict:
+    """Flattened state view: top-level states UNION every Parallel
+    branch's states. config#885 relocated the Scanner→RAGIngestion→
+    RegimeSubstrate→RegimeRetrospectiveEval chain FROM top level INTO
+    ResearchPredictorParallel's Branch A head (so PredictorTraining forks
+    parallel to it after DataPhase1), so these states now live inside a
+    Parallel branch. Mirrors the helper in test_sf_scanner_wiring.py /
+    test_sf_eval_judge_wiring.py."""
+    flat: dict = dict(sf["States"])
+    for st in sf["States"].values():
+        if st.get("Type") == "Parallel":
+            for branch in st["Branches"]:
+                flat.update(branch["States"])
+    return flat
+
+
 def test_regime_substrate_state_exists() -> None:
     sf = _sf()
-    assert "RegimeSubstrate" in sf["States"], (
+    states = _flat_states(sf)
+    assert "RegimeSubstrate" in states, (
         "Saturday SF must contain a RegimeSubstrate state — Stage A "
-        "ships the substrate Lambda invocation between RAG and Research."
+        "ships the substrate Lambda invocation between RAG and Research "
+        "(config#885: now inside ResearchPredictorParallel Branch A)."
     )
-    state = sf["States"]["RegimeSubstrate"]
+    state = states["RegimeSubstrate"]
     assert state["Type"] == "Task"
     assert state["Resource"] == "arn:aws:states:::lambda:invoke"
     assert state["Parameters"]["FunctionName"] == "alpha-engine-predictor-regime-substrate:live"
@@ -64,7 +82,8 @@ def test_regime_substrate_payload_is_produce_action() -> None:
     (verified clean no-write dry path). Pin the routing so a misguided
     debugging change can't hardcode dry on the production run."""
     sf = _sf()
-    payload = sf["States"]["RegimeSubstrate"]["Parameters"]["Payload"]
+    states = _flat_states(sf)
+    payload = states["RegimeSubstrate"]["Parameters"]["Payload"]
     assert payload.get("action.$") == "$.regime_action", (
         "RegimeSubstrate payload must route action via $.regime_action "
         f"(keystone dry-routing); got {payload!r}"
@@ -82,8 +101,9 @@ def test_check_skip_regime_substrate_routes_correctly() -> None:
     skip-gate evaluation. Honors the "each regime step has its own
     skip flag" invariant introduced with T1 wiring."""
     sf = _sf()
-    assert "CheckSkipRegimeSubstrate" in sf["States"]
-    state = sf["States"]["CheckSkipRegimeSubstrate"]
+    states = _flat_states(sf)
+    assert "CheckSkipRegimeSubstrate" in states
+    state = states["CheckSkipRegimeSubstrate"]
     assert state["Type"] == "Choice"
     assert state["Default"] == "RegimeSubstrate"
     skip_choice = state["Choices"][0]
@@ -97,14 +117,15 @@ def test_post_rag_control_flow_lands_on_regime_skip_gate() -> None:
     CheckSkipResearch directly. Catches a refactor that bypasses the
     regime state."""
     sf = _sf()
+    states = _flat_states(sf)
     # CheckSkipRAGIngestion's skip-branch
-    skip_choice = sf["States"]["CheckSkipRAGIngestion"]["Choices"][0]
+    skip_choice = states["CheckSkipRAGIngestion"]["Choices"][0]
     assert skip_choice["Next"] == "CheckSkipRegimeSubstrate", (
         "CheckSkipRAGIngestion skip path must land on CheckSkipRegimeSubstrate"
     )
     # CheckRAGIngestionStatus's success branch
     success_choice = next(
-        c for c in sf["States"]["CheckRAGIngestionStatus"]["Choices"]
+        c for c in states["CheckRAGIngestionStatus"]["Choices"]
         if c.get("StringEquals") == "Success"
     )
     assert success_choice["Next"] == "CheckSkipRegimeSubstrate", (
@@ -118,7 +139,8 @@ def test_regime_substrate_failure_is_non_blocking() -> None:
     CheckSkipRegimeRetrospectiveEval (not HandleFailure) so the T1 eval
     + Research still get a chance to run."""
     sf = _sf()
-    catches = sf["States"]["RegimeSubstrate"]["Catch"]
+    states = _flat_states(sf)
+    catches = states["RegimeSubstrate"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
     assert states_all["Next"] == "CheckSkipRegimeRetrospectiveEval", (
         "RegimeSubstrate Catch[States.ALL] must route to "
@@ -134,7 +156,8 @@ def test_regime_substrate_next_is_eval_skip_gate() -> None:
     skip flag). Substrate + eval are sibling observe-only steps,
     neither gates the other."""
     sf = _sf()
-    assert sf["States"]["RegimeSubstrate"]["Next"] == "CheckSkipRegimeRetrospectiveEval"
+    states = _flat_states(sf)
+    assert states["RegimeSubstrate"]["Next"] == "CheckSkipRegimeRetrospectiveEval"
 
 
 def test_regime_substrate_timeout_is_reasonable() -> None:
@@ -142,7 +165,8 @@ def test_regime_substrate_timeout_is_reasonable() -> None:
     TimeoutSeconds must be slightly higher to avoid premature
     timeout-due-to-SF when the Lambda is still working."""
     sf = _sf()
-    sf_timeout = sf["States"]["RegimeSubstrate"]["TimeoutSeconds"]
+    states = _flat_states(sf)
+    sf_timeout = states["RegimeSubstrate"]["TimeoutSeconds"]
     assert sf_timeout >= 300, (
         f"SF TimeoutSeconds for RegimeSubstrate must be >= Lambda timeout "
         f"(300s per setup-regime-lambda.sh); got {sf_timeout}"
@@ -156,11 +180,13 @@ def test_regime_substrate_timeout_is_reasonable() -> None:
 
 def test_regime_retrospective_eval_state_exists() -> None:
     sf = _sf()
-    assert "RegimeRetrospectiveEval" in sf["States"], (
+    states = _flat_states(sf)
+    assert "RegimeRetrospectiveEval" in states, (
         "Saturday SF must contain a RegimeRetrospectiveEval state — "
-        "Stage C.2 T1 wiring (regime-v3 §5.3.3)."
+        "Stage C.2 T1 wiring (regime-v3 §5.3.3); config#885 relocated it "
+        "into ResearchPredictorParallel Branch A."
     )
-    state = sf["States"]["RegimeRetrospectiveEval"]
+    state = states["RegimeRetrospectiveEval"]
     assert state["Type"] == "Task"
     assert state["Resource"] == "arn:aws:states:::lambda:invoke"
     assert state["Parameters"]["FunctionName"] == (
@@ -175,7 +201,8 @@ def test_regime_retrospective_eval_payload_is_produce_action() -> None:
     behaviourally identical; ApplyShellRunDefaults flips to ``"dry_run"``
     ONLY under shell_run — verified clean no-write dry path)."""
     sf = _sf()
-    payload = sf["States"]["RegimeRetrospectiveEval"]["Parameters"]["Payload"]
+    states = _flat_states(sf)
+    payload = states["RegimeRetrospectiveEval"]["Parameters"]["Payload"]
     assert payload.get("action.$") == "$.regime_action", (
         "RegimeRetrospectiveEval payload must route action via "
         f"$.regime_action (keystone dry-routing); got {payload!r}"
@@ -189,16 +216,21 @@ def test_regime_retrospective_eval_payload_is_produce_action() -> None:
 
 def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
     """{\"skip_regime_retrospective_eval\": true} bypasses to the
-    research-chain entry. Post the 2026-05-16 Research || PredictorTraining
-    SF Parallel restructure (plan
-    alpha-engine-docs/private/research-predictor-parallel-260516.md) the
-    research-chain entry is the ResearchPredictorParallel state (whose
-    Branch A StartAt is CheckSkipResearch) — NOT CheckSkipResearch
-    directly, which now lives inside the Parallel's Branch A. Independent
-    of skip_regime_substrate so each regime step has its own skip flag."""
+    research-chain entry CheckSkipResearch. config#885 relocated the
+    Scanner→RAG→RegimeSubstrate→RegimeRetrospectiveEval chain INTO
+    ResearchPredictorParallel Branch A (so PredictorTraining forks
+    parallel to it after DataPhase1). RegimeRetrospectiveEval +
+    CheckSkipRegimeRetrospectiveEval now live INSIDE Branch A, so the
+    skip path lands on the next Branch-A state CheckSkipResearch (its
+    sibling), NOT the Parallel state itself (which would be an invalid
+    branch-internal → parent transition). Independent of
+    skip_regime_substrate so each regime step has its own skip flag."""
     sf = _sf()
-    assert "CheckSkipRegimeRetrospectiveEval" in sf["States"]
-    state = sf["States"]["CheckSkipRegimeRetrospectiveEval"]
+    branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
+        "States"
+    ]
+    assert "CheckSkipRegimeRetrospectiveEval" in branch_a
+    state = branch_a["CheckSkipRegimeRetrospectiveEval"]
     assert state["Type"] == "Choice"
     assert state["Default"] == "RegimeRetrospectiveEval"
     skip_choice = state["Choices"][0]
@@ -207,42 +239,55 @@ def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
         c.get("Variable") == "$.skip_regime_retrospective_eval"
         for c in skip_vars
     )
-    assert skip_choice["Next"] == "ResearchPredictorParallel"
-    # The research-chain entry is now the Parallel; CheckSkipResearch
-    # moved INSIDE its Branch A (StartAt).
+    # config#885: the chain is INSIDE Branch A now → skip continues to the
+    # sibling Branch-A state CheckSkipResearch, never the parent Parallel.
+    assert skip_choice["Next"] == "CheckSkipResearch"
+    assert "CheckSkipResearch" in branch_a
+    # The chain is no longer at top level — it forks parallel to Branch B.
     par = sf["States"]["ResearchPredictorParallel"]
     assert par["Type"] == "Parallel"
-    assert par["Branches"][0]["StartAt"] == "CheckSkipResearch"
-    assert "CheckSkipResearch" not in sf["States"]
+    assert par["Branches"][0]["StartAt"] == "Scanner"
+    assert "CheckSkipRegimeRetrospectiveEval" not in sf["States"]
+    assert "Scanner" not in sf["States"]
 
 
 def test_regime_retrospective_eval_failure_is_non_blocking() -> None:
     """Observe-only contract: a T1 eval failure must NOT halt the
-    pipeline. The Catch[States.ALL] routes to the research-chain entry
-    (post 2026-05-16 Research || PredictorTraining restructure that is
-    ResearchPredictorParallel, not HandleFailure) — T1 is observability,
-    not gating, so a failure still lets Research (now Branch A of the
-    Parallel) run."""
+    pipeline. config#885 relocated the chain INTO Branch A, so the
+    Catch[States.ALL] now routes to the next Branch-A state
+    CheckSkipResearch (non-blocking, in-branch) — NOT
+    ResearchPredictorParallel (the parent, an invalid branch→parent
+    transition) and NOT HandleFailure (blocking, and an invalid
+    branch→top-level transition that would re-introduce SF Parallel
+    cross-branch cancellation). T1 is observability, not gating."""
     sf = _sf()
-    catches = sf["States"]["RegimeRetrospectiveEval"]["Catch"]
+    branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
+        "States"
+    ]
+    catches = branch_a["RegimeRetrospectiveEval"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "ResearchPredictorParallel", (
+    assert states_all["Next"] == "CheckSkipResearch", (
         "RegimeRetrospectiveEval Catch[States.ALL] must route to the "
-        "research-chain entry ResearchPredictorParallel (non-blocking), "
-        "not HandleFailure (blocking). T1 is observability; a failure "
-        "must not halt Research."
+        "in-branch research-chain entry CheckSkipResearch (non-blocking), "
+        "not HandleFailure (blocking) nor the parent Parallel. T1 is "
+        "observability; a failure must not halt Research."
     )
+    assert states_all["Next"] in branch_a
 
 
 def test_regime_retrospective_eval_next_is_research_chain_entry() -> None:
-    """Post the 2026-05-16 SF Parallel restructure the research-chain
-    entry is ResearchPredictorParallel (Branch A StartAt =
-    CheckSkipResearch)."""
+    """config#885: the chain lives INSIDE Branch A, so
+    RegimeRetrospectiveEval's success continuation is its sibling
+    Branch-A state CheckSkipResearch (the research-chain entry), not the
+    parent Parallel."""
     sf = _sf()
+    branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
+        "States"
+    ]
     assert (
-        sf["States"]["RegimeRetrospectiveEval"]["Next"]
-        == "ResearchPredictorParallel"
+        branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
     )
+    assert "CheckSkipResearch" in branch_a
 
 
 def test_regime_retrospective_eval_timeout_accommodates_smoother_fit() -> None:
@@ -250,7 +295,8 @@ def test_regime_retrospective_eval_timeout_accommodates_smoother_fit() -> None:
     — smoother fit + signals/ archive enumeration is heavier than substrate
     fit. SF TimeoutSeconds must be slightly above the Lambda's own timeout."""
     sf = _sf()
-    sf_timeout = sf["States"]["RegimeRetrospectiveEval"]["TimeoutSeconds"]
+    states = _flat_states(sf)
+    sf_timeout = states["RegimeRetrospectiveEval"]["TimeoutSeconds"]
     assert sf_timeout >= 600, (
         f"SF TimeoutSeconds for RegimeRetrospectiveEval must be >= Lambda "
         f"timeout (600s per setup-regime-retrospective-eval-lambda.sh); "
