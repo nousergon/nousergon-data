@@ -73,7 +73,7 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
             "export ALPHA_ENGINE_DEPLOYED=1",
             "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
@@ -194,7 +194,7 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
             "export ALPHA_ENGINE_DEPLOYED=1",
             "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
@@ -293,7 +293,7 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
             "export ALPHA_ENGINE_DEPLOYED=1",
             "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
@@ -400,7 +400,7 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
             "export ALPHA_ENGINE_DEPLOYED=1",
             "export FLOW_DOCTOR_ENABLED=1",
             "source .venv/bin/activate",
