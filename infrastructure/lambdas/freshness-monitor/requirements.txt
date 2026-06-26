@@ -1,10 +1,12 @@
-# Pinned to nousergon-lib v0.62.0 — the artifact_freshness RECENCY
-# redesign (PR #128): freshness is judged by the most-recent instance vs a
-# cron-tick-minus-slack floor, not an exact cron-date key. This is what
-# makes the monitor robust to off-cycle runs (the 6/19 full run satisfying
-# the 6/20 cycle) and the {trading_day} anchor. Name changed alpha-engine-lib
-# -> nousergon-lib at the 0.60 rename; index.py's alpha_engine_lib imports
-# keep working via the compat shim (lib >=0.60.2). Bumping this is a
-# substrate-change PR — not a code-only refresh.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.62.0
+# Pinned to nousergon-lib v0.63.0 — adds the continuous active-window gate
+# (active-window for market-hours-only producers): a continuous spec may
+# carry active_trading_days_only / active_hours_utc so a daemon that only
+# writes during the NYSE session (open_orders) is judged fresh when idle
+# off-window instead of false-alarming every interval (the 2026-06-26
+# open_orders overnight alert storm). Builds on the v0.62.0 RECENCY redesign
+# (PR #128: most-recent instance vs a cron-tick-minus-slack floor). Name
+# changed alpha-engine-lib -> nousergon-lib at the 0.60 rename; index.py's
+# alpha_engine_lib imports keep working via the compat shim (lib >=0.60.2).
+# Bumping this is a substrate-change PR — not a code-only refresh.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.63.0
 pyyaml>=6.0
