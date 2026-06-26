@@ -1,4 +1,10 @@
-"""alpha-engine-saturday-sf-watch-dispatcher — Saturday-SF Watch, M1 (OBSERVE).
+"""alpha-engine-saturday-sf-watch-dispatcher — Saturday-SF Watch.
+
+STATUS (2026-06-26): **M2 dispatch is LIVE** — `AGENT_DISPATCH_ENABLED=true` on
+the deployed Lambda, so on a Saturday-pipeline failure this dispatcher fires the
+`repository_dispatch` that triggers the autonomous resilience agent
+(diagnose→fix→merge→rerun). The historical "M1 OBSERVE-only / no dispatch code"
+framing below is retained for arc context but is NO LONGER the runtime behavior.
 
 First slice of the Saturday-SF Watch arc (spec: nousergon/alpha-engine-config#1227).
 The arc's end state is an autonomous, SOTA-steered resilience agent that, on a
@@ -215,9 +221,12 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str)
         "failed_state": failed_state,
         "cause": cause or None,
         "is_preflight": _is_preflight(describe_resp),
-        # Filled by the M2+ agent; null in OBSERVE mode.
+        # `lane` is filled by the dispatched agent (null until it classifies).
+        # `action` reflects intent at write time (the log is written just BEFORE
+        # the dispatch fires): "dispatch" when the agent is being triggered,
+        # "observe" only when AGENT_DISPATCH_ENABLED is false.
         "lane": None,
-        "action": "observe",
+        "action": "dispatch" if AGENT_DISPATCH_ENABLED else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
     }
 
@@ -244,10 +253,14 @@ def _write_watch_log(s3, run_date: str, record: dict) -> str:
 def _notify(record: dict, key: str) -> bool:
     """Distinct, SILENT Telegram record. The sf-telegram-notifier already pinged
     loud on this FAILED event; this is the additive watch receipt (which state,
-    where the artifact is, OBSERVE mode). Best-effort — never raises."""
+    where the artifact is, current dispatch mode). Best-effort — never raises.
+    The header + footer reflect the LIVE ``AGENT_DISPATCH_ENABLED`` state so the
+    receipt never claims observe-only while the agent is actually being
+    dispatched (the 2026-06-26 stale-text bug)."""
     label = "Saturday Preflight SF" if record["is_preflight"] else "Saturday SF"
+    mode = "AUTO-FIX" if AGENT_DISPATCH_ENABLED else "OBSERVE"
     lines = [
-        f"\U0001f6f0️ *Saturday-SF Watch — OBSERVE*",
+        f"\U0001f6f0️ *Saturday-SF Watch — {mode}*",
         f"{label}: {record['status']}",
     ]
     if record.get("failed_state"):
@@ -255,7 +268,11 @@ def _notify(record: dict, key: str) -> bool:
     if record.get("cause"):
         lines.append(f"Cause: {record['cause']}")
     lines.append(f"Watch log: s3://{WATCH_BUCKET}/{key}")
-    lines.append("_autonomous fix DISABLED (M1 observe-only)_")
+    lines.append(
+        "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
+        if AGENT_DISPATCH_ENABLED
+        else "_autonomous fix DISABLED (observe-only)_"
+    )
     try:
         return bool(send_message("\n".join(lines), disable_notification=True))
     except Exception as exc:  # noqa: BLE001 — secondary observability
