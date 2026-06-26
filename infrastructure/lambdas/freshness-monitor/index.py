@@ -120,6 +120,11 @@ _SPEC_FIELDS = frozenset(
         "recovery_key_template",
         "calendar_aware",
         "interval_minutes",
+        # Continuous active-window bounds (nousergon-lib >= v0.63.0) — scope a
+        # market-hours-only producer (the executor daemon's open_orders
+        # snapshot) so the 24/7 continuous floor doesn't false-alarm overnight.
+        "active_trading_days_only",
+        "active_hours_utc",
     }
 )
 
