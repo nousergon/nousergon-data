@@ -18,6 +18,16 @@
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --wire-subs   # (re)apply subscription filters only
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --dry-run     # show actions, do not apply
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --smoke       # publish a synthetic ERROR log + verify entry
+#   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --audit-targets  # diff live alpha-engine-* Lambdas vs TARGET_FUNCTIONS, exit 1 on drift
+#
+# --audit-targets (config#862): TARGET_FUNCTIONS is hand-maintained, so a
+# newly-deployed alpha-engine-* Lambda won't auto-subscribe to the error
+# mirror. This mode lists live functions (aws lambda list-functions) whose
+# name starts with "alpha-engine-", subtracts the two changelog mirrors
+# (the recursion guard exclusions, which must NOT be subscribed), and
+# diffs against TARGET_FUNCTIONS. Exits 1 if any live Lambda is missing
+# from the array (or any array entry no longer exists), so it can run as a
+# Saturday-SF substrate-health row or a periodic CI step. Read-only.
 #
 # Auth: uses active AWS CLI creds. Personal IAM user (cipher813) has
 # enough perms; this script is intentionally NOT wired into CI.
@@ -73,12 +83,14 @@ DRY_RUN=false
 BOOTSTRAP=false
 WIRE_SUBS=false
 SMOKE=false
+AUDIT_TARGETS=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
     --wire-subs) WIRE_SUBS=true ;;
     --smoke) SMOKE=true ;;
+    --audit-targets) AUDIT_TARGETS=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
 done
@@ -90,6 +102,59 @@ run() {
     "$@"
   fi
 }
+
+# ----- TARGET_FUNCTIONS drift audit (config#862) ----------------------------
+# Read-only. List live alpha-engine-* Lambdas, subtract the recursion-guard
+# exclusions (the two changelog mirrors must never subscribe to the error
+# mirror), and diff against the hand-maintained TARGET_FUNCTIONS array.
+# Exit 1 on any drift so this can gate a CI step or Saturday-SF row.
+if $AUDIT_TARGETS; then
+  echo "Auditing TARGET_FUNCTIONS drift (region=${REGION})..."
+
+  # Recursion-guard exclusions: the two changelog mirrors. A live
+  # alpha-engine-* Lambda matching one of these is EXPECTED to be absent
+  # from TARGET_FUNCTIONS and must not be flagged.
+  EXCLUDED=(
+    "${FUNCTION_NAME}"                          # this cloudwatch mirror
+    "alpha-engine-changelog-incident-mirror"    # the SNS mirror sibling
+  )
+
+  # Live alpha-engine-* function names, one per line, sorted.
+  LIVE=$(aws lambda list-functions \
+    --query "Functions[?starts_with(FunctionName, 'alpha-engine-')].FunctionName" \
+    --output text --region "${REGION}" | tr '\t' '\n' | sort -u)
+
+  # Expected = live minus the excluded mirrors.
+  EXPECTED=$(comm -23 \
+    <(printf '%s\n' "${LIVE}") \
+    <(printf '%s\n' "${EXCLUDED[@]}" | sort -u))
+
+  CONFIGURED=$(printf '%s\n' "${TARGET_FUNCTIONS[@]}" | sort -u)
+
+  # Live Lambdas not yet subscribed (in EXPECTED, not in CONFIGURED).
+  MISSING=$(comm -23 <(printf '%s\n' "${EXPECTED}") <(printf '%s\n' "${CONFIGURED}"))
+  # Configured targets that no longer exist (in CONFIGURED, not in LIVE).
+  STALE=$(comm -23 <(printf '%s\n' "${CONFIGURED}") <(printf '%s\n' "${LIVE}"))
+
+  DRIFT=0
+  if [[ -n "${MISSING}" ]]; then
+    DRIFT=1
+    echo "  ✗ Live alpha-engine-* Lambdas NOT in TARGET_FUNCTIONS (won't mirror errors):"
+    printf '      %s\n' ${MISSING}
+  fi
+  if [[ -n "${STALE}" ]]; then
+    DRIFT=1
+    echo "  ✗ TARGET_FUNCTIONS entries that no longer exist as live Lambdas:"
+    printf '      %s\n' ${STALE}
+  fi
+
+  if [[ "${DRIFT}" -eq 0 ]]; then
+    echo "  ✓ No drift — TARGET_FUNCTIONS matches live alpha-engine-* Lambdas."
+    exit 0
+  fi
+  echo "  → Reconcile by editing TARGET_FUNCTIONS, then re-run with --wire-subs."
+  exit 1
+fi
 
 # ----- 0. Validate handler ---------------------------------------------------
 
