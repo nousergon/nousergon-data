@@ -44,7 +44,7 @@ section.
 |---|---|
 | `index.py` | Lambda handler source (Python 3.12, arm64, 256 MB, 30s) |
 | `iam-policy.json` | Inline policy attached to the function's role |
-| `deploy.sh` | One-shot redeploy script (updates function code only) |
+| `deploy.sh` | Redeploy script (updates function code; `--apply-iam` re-applies the inline role policy, config#865) |
 | `README.md` | this file |
 
 The Lambda's function name, role name, SNS subscription, and Lambda
@@ -66,11 +66,17 @@ Their config:
 bash infrastructure/lambdas/changelog-incident-mirror/deploy.sh
 # or with smoke test:
 bash infrastructure/lambdas/changelog-incident-mirror/deploy.sh --smoke
+# re-apply the inline execution-role policy after an iam-policy.json change:
+bash infrastructure/lambdas/changelog-incident-mirror/deploy.sh --apply-iam
 ```
 
 The script packages `index.py` into a zip, calls
 `aws lambda update-function-code`, and waits for the update to
-settle. Auth uses your local AWS CLI creds — the personal IAM user
+settle. `--apply-iam` additionally creates the execution role if
+missing and overwrites the inline `changelog-incident-mirror-s3`
+policy from `iam-policy.json` (idempotent), bringing IAM-apply
+parity with the sibling cloudwatch-mirror's `--bootstrap` block so
+policy changes no longer need a manual `aws iam put-role-policy`. Auth uses your local AWS CLI creds — the personal IAM user
 (`cipher813`) has enough perms; the `github-actions-lambda-deploy`
 OIDC role intentionally does not.
 
