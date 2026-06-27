@@ -43,6 +43,7 @@ from features.compute import (
     _SKIP_TICKERS,
     _UNIVERSE_EXTRA,
     _apply_daily_delta,
+    audit_split_jumps,
     _is_sector_etf,
     _load_parquet_from_s3,
     _load_sector_map,
@@ -384,7 +385,29 @@ def backfill(
     # ``features/compute.py::_apply_daily_delta`` so both feature-snapshot and
     # backfill share the same freshness semantics.
     if not dry_run:
-        price_data, _split_tickers = _apply_daily_delta(s3, bucket, today_str, price_data)
+        price_data, split_tickers = _apply_daily_delta(s3, bucket, today_str, price_data)
+        if split_tickers:
+            # data#1298: these tickers had a split detected and their FULL
+            # history restated by the polygon-authoritative factor before the
+            # full-series ``lib.write`` below, so ArcticDB is rewritten on one
+            # continuous adjusted scale (train == serve), not windowed-patched.
+            log.info(
+                "Split restatement applied to %d ticker(s) before ArcticDB "
+                "rewrite (data#1298): %s",
+                len(split_tickers), sorted(split_tickers),
+            )
+
+        # Standing split-jump audit guard (data#1298): a residual >45% daily
+        # move means a split slipped past restatement. Surface it loudly so the
+        # discontinuity can't land in ArcticDB silently.
+        residual = audit_split_jumps(price_data)
+        if residual:
+            log.error(
+                "Split-jump audit: %d ticker(s) STILL carry an un-restated "
+                ">45%% daily move after delta+restate (data#1298) — investigate "
+                "/ re-restate before downstream training: %s",
+                len(residual), {t: residual[t] for t in sorted(residual)[:20]},
+            )
 
     macro = _extract_macro_series(price_data)
     sector_map = _load_sector_map(s3, bucket)

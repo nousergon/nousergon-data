@@ -301,18 +301,107 @@ def _apply_daily_delta(
         # keep="last" so delta rows win on duplicate dates (matches predictor)
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
-        # Split detection: log warning but still use the data.
-        # The weekly price collector handles splits properly during
-        # Saturday DataPhase1; feature compute trusts upstream data.
+        # Split detection → full-history RESTATEMENT (data#1298).
+        #
+        # The ArcticDB universe is append-only + windowed: a split restates the
+        # FULL adjusted history, but ArcticDB only ever got a recent window
+        # patched, leaving a split-boundary discontinuity that corrupts
+        # cross-boundary TRAINING features (verified on DD 2026-06-24). The
+        # root-cause fix is to back-adjust the ENTIRE pre-split window by the
+        # polygon-AUTHORITATIVE split factor here, at the point the full series
+        # is materialized for the downstream ``lib.write`` — so the series
+        # written to ArcticDB is continuous and on one adjusted scale
+        # (train == serve). We restate at WRITE time (not read time) because the
+        # backfill path already rewrites the full symbol; doing the restate in
+        # the read/window path would have to re-derive factors on every query
+        # and would not durably fix the stored discontinuity.
+        #
+        # yfinance ``auto_adjust`` LAGS a fresh split, so it cannot be trusted
+        # for restatement — the factor must come from polygon (see split_factor).
         returns = combined["Close"].pct_change().dropna()
         if (returns.abs() > _SPLIT_RETURN_THRESHOLD).any():
-            log.warning("Large move detected in %s (>45%% daily return) — using data as-is", ticker)
+            restated = _restate_split_window(ticker, combined)
+            if restated is not None:
+                combined = restated
+                split_tickers.add(ticker)
+            else:
+                log.warning(
+                    "Large move in %s (>45%% daily return) but no polygon split "
+                    "factor available — using data as-is (audit guard should flag)",
+                    ticker,
+                )
 
         price_data[ticker] = combined
         n_updated += 1
 
     log.info("Applied daily delta: %d tickers updated", n_updated)
     return price_data, split_tickers
+
+
+def _restate_split_window(
+    ticker: str, df: pd.DataFrame, *, client=None,
+) -> pd.DataFrame | None:
+    """Back-adjust ``df``'s pre-split history by the polygon-authoritative
+    cumulative split factor so the full series is split-consistent (data#1298).
+
+    Returns the restated frame, or ``None`` when no polygon split factor is
+    available (no events / polygon unreachable / events all predate the series)
+    so the caller can fall back to "use as-is" + the audit guard. The actual
+    factor math lives in :mod:`split_factor`; this wrapper isolates the
+    (network) polygon lookup so it can be patched out in tests.
+    """
+    try:
+        from split_factor import restate_series_for_splits, split_events
+
+        events = split_events(ticker, client=client)
+    except Exception as exc:  # network / auth / import — never hard-fail the run
+        log.warning(
+            "Split restatement for %s could not load polygon factors (%s) — "
+            "leaving series un-restated; audit guard should flag it",
+            ticker, exc,
+        )
+        return None
+    if not events:
+        return None
+    restated = restate_series_for_splits(df, events)
+    if restated is df:
+        # No row actually changed (every split predates the series) — treat as
+        # "no restatement available" so the >45%% move is still surfaced.
+        return None
+    log.info(
+        "Restated %s full history on polygon split factor (%d event(s)) — "
+        "ArcticDB write will be split-consistent (data#1298)",
+        ticker, len(events),
+    )
+    return restated
+
+
+def audit_split_jumps(
+    price_data: dict[str, pd.DataFrame],
+    *,
+    threshold: float = _SPLIT_RETURN_THRESHOLD,
+) -> dict[str, list[tuple[str, float]]]:
+    """Data-quality invariant: scan each series for an un-restated split jump.
+
+    Returns ``{ticker: [(date_str, daily_return), ...]}`` for every ticker whose
+    Close series still contains a ``|daily return| > threshold`` move. A clean,
+    fully-restated universe returns ``{}``. Surfacing this makes the data#1298
+    bug class impossible to land SILENTLY — a residual discontinuity (the
+    restate failed, or a new split slipped past) is now a visible invariant
+    violation an operator/cron can alert on and auto-restate.
+    """
+    offenders: dict[str, list[tuple[str, float]]] = {}
+    for ticker, df in price_data.items():
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        returns = df["Close"].pct_change().dropna()
+        hits = returns[returns.abs() > threshold]
+        if not hits.empty:
+            offenders[ticker] = [
+                (pd.Timestamp(idx).strftime("%Y-%m-%d"), float(val))
+                for idx, val in hits.items()
+            ]
+    return offenders
 
 
 _MACRO_SLIM_KEYS = {
