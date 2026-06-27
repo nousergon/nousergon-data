@@ -129,3 +129,58 @@ def test_403_does_not_pollute_grouped_daily_cache():
             "re-hit the API so an upgraded plan / different time window "
             "succeeds without manual cache busting."
         )
+
+
+# ── get_splits (data#1298: authoritative split factor source) ────────────────
+
+
+def _splits_response(events: list[dict]) -> dict:
+    """Shape of polygon /v3/reference/splits results."""
+    return {
+        "results": [
+            {
+                "execution_date": e["execution_date"],
+                "split_from": e["split_from"],
+                "split_to": e["split_to"],
+                "ticker": e.get("ticker", "DD"),
+            }
+            for e in events
+        ],
+        "status": "OK",
+    }
+
+
+def test_get_splits_parses_and_sorts():
+    client = _make_client()
+    resp = _splits_response(
+        [
+            {"execution_date": "2026-06-24", "split_from": 3, "split_to": 1},
+            {"execution_date": "2019-06-03", "split_from": 1, "split_to": 3},
+        ]
+    )
+    with patch.object(client, "_get", return_value=resp) as mock_get:
+        out = client.get_splits("DD")
+    assert mock_get.call_count == 1
+    # Sorted ascending by execution_date.
+    assert [e["execution_date"] for e in out] == ["2019-06-03", "2026-06-24"]
+    assert out[1] == {"execution_date": "2026-06-24", "split_from": 3, "split_to": 1}
+
+
+def test_get_splits_skips_malformed_rows():
+    client = _make_client()
+    resp = {
+        "results": [
+            {"execution_date": "2026-06-24", "split_from": 3, "split_to": 1},
+            {"execution_date": None, "split_from": 2, "split_to": 1},  # bad date
+            {"execution_date": "2025-01-01", "split_from": 0, "split_to": 1},  # bad ratio
+        ]
+    }
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_splits("DD")
+    assert out == [{"execution_date": "2026-06-24", "split_from": 3, "split_to": 1}]
+
+
+def test_get_splits_forbidden_returns_empty():
+    client = _make_client()
+    with patch.object(client, "_get", side_effect=PolygonForbiddenError("403")):
+        assert client.get_splits("DD") == []

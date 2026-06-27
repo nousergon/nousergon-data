@@ -273,6 +273,48 @@ class PolygonClient:
             "vwap": r.get("vw"),
         }
 
+    def get_splits(self, ticker: str) -> list[dict]:
+        """Fetch the corporate-split history for one ticker (authoritative).
+
+        Polygon is the authoritative corporate-action source (see data#1298):
+        yfinance ``auto_adjust`` LAGS a fresh split (it back-adjusts only the
+        most recent rows for a day or two), so it cannot be trusted to restate
+        a freshly-split ArcticDB universe series. The polygon ``/v3/reference/
+        splits`` endpoint carries the exact effective date + ratio the day the
+        split lands.
+
+        Returns a list of ``{"execution_date": "YYYY-MM-DD",
+        "split_from": int, "split_to": int}`` sorted ascending by date. A
+        forward N-for-1 split is ``split_from=1, split_to=N`` (one old share
+        becomes N new shares → adjusted price divides by N); a reverse 1-for-N
+        split is ``split_from=N, split_to=1``. The per-event multiplicative
+        factor applied to prices BEFORE the execution date is
+        ``split_from / split_to``.
+        """
+        results: list[dict] = []
+        try:
+            data = self._get(
+                "/v3/reference/splits",
+                params={"ticker": ticker, "limit": 1000, "order": "asc"},
+            )
+        except PolygonForbiddenError:
+            return []
+        for r in data.get("results", []) or []:
+            exec_date = r.get("execution_date")
+            sf = r.get("split_from")
+            st = r.get("split_to")
+            if not exec_date or not sf or not st:
+                continue
+            results.append(
+                {
+                    "execution_date": str(exec_date),
+                    "split_from": int(sf),
+                    "split_to": int(st),
+                }
+            )
+        results.sort(key=lambda r: r["execution_date"])
+        return results
+
     def get_daily_bars(
         self,
         ticker: str,
