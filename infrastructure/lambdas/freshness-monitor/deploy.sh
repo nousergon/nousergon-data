@@ -184,6 +184,15 @@ if $BOOTSTRAP; then
     # time but stayed muted). Code is now the source of truth for the flag —
     # a fresh bootstrap comes up enforcing. For an already-deployed function,
     # flip live via `aws lambda update-function-configuration` (no redeploy).
+    #
+    # config#1240 auto-remediation: FRESHNESS_MONITOR_RECOVERY_ENABLED defaults
+    # OFF (OBSERVE) — a fresh bootstrap LOGS the would-dispatch but calls no
+    # SF/Lambda and writes no marker. The dispatch path is flipped live ONLY
+    # after the end-to-end drill validates it (delete a recent load-bearing
+    # artifact, confirm the monitor auto-dispatches the correct backfill):
+    #   aws lambda update-function-configuration \
+    #     --function-name alpha-engine-freshness-monitor \
+    #     --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FRESHNESS_MONITOR_RECOVERY_ENABLED=true}'
     run aws lambda create-function \
       --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 \
@@ -192,7 +201,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 120 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true}' \
+      --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FRESHNESS_MONITOR_RECOVERY_ENABLED=false}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
