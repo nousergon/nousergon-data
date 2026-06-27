@@ -79,17 +79,24 @@ def _load_feature_cfg_overrides() -> dict:
     window to baseline would be an invisible behavior change (no-silent-
     fails: the failure surfaces at import, caught by SF preflight/CI).
     """
-    import os
     from pathlib import Path
 
     import yaml
 
-    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
+    # Canonical experiment-package config resolver (alpha-engine-config#1157):
+    # the lift of the five inline copies into the shared-lib chokepoint. The
+    # data-specific repo-local tail (``<repo>/config.yaml``, subdir-flattened) is
+    # preserved via repo_local_fallback; the per-key validation loop below is
+    # unchanged (a present-but-unknown override key still fails loud).
+    from alpha_engine_lib.config import resolve_experiment_config
+
     repo_root = Path(__file__).resolve().parent.parent
-    roots = [Path.home() / "alpha-engine-config", repo_root.parent / "alpha-engine-config"]
-    candidates = [r / "experiments" / exp / "data" / "config.yaml" for r in roots]
-    candidates += [r / "data" / "config.yaml" for r in roots]
-    candidates.append(repo_root / "config.yaml")
+    candidates = resolve_experiment_config(
+        "data",
+        "config.yaml",
+        repo_root=repo_root,
+        repo_local_fallback=repo_root / "config.yaml",
+    )
     for path in candidates:
         if not path.exists():
             continue

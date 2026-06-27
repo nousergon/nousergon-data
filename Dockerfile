@@ -1,7 +1,7 @@
 FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 
 # Install git — required for ``pip install git+https://...`` of
-# alpha-engine-lib below. The Lambda Python 3.12 base image does not
+# nousergon-lib below. The Lambda Python 3.12 base image does not
 # include git; pip's git-cloning command fails with "Cannot find
 # command 'git'" without this. Same fix applied to alpha-engine-research
 # Dockerfile after PR #105's lib-public flip exposed the gap. Caught
@@ -10,17 +10,17 @@ FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 # manager; ``-y`` auto-confirms.
 RUN microdnf install -y git && microdnf clean all
 
-# Install dependencies. alpha-engine-lib is installed from public git+https
+# Install dependencies. nousergon-lib is installed from public git+https
 # with the [flow_doctor] extra only — the [arcticdb,rag] extras in
 # requirements.txt are intentionally NOT pulled here, since Lambda only
 # runs Phase 2 alternative-data collection (no ArcticDB or RAG ingestion).
 # Excludes pytest / python-dotenv / pre-installed Lambda runtime deps
-# (boto3 etc.). The grep filter strips alpha-engine-lib from the
+# (boto3 etc.). The grep filter strips nousergon-lib from the
 # requirements file so the [flow_doctor]-only install above isn't
 # overridden by the [arcticdb,flow_doctor,rag] extras pinned for EC2.
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.59.4" && \
-    grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer|^alpha-engine-lib" requirements.txt > /tmp/req-lambda.txt && \
+RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0" && \
+    grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer|^nousergon-lib" requirements.txt > /tmp/req-lambda.txt && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt
 
