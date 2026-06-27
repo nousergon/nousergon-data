@@ -80,6 +80,40 @@ CHECK_RESULTS_KEY = "_freshness_monitor/check_results.json"
 HISTORY_KEY = "_freshness_monitor/history.json"
 CYCLE_VERDICT_KEY = "_freshness_monitor/cycle_verdict.json"
 
+# config#1240 — auto-remediation dispatch. The confirmed-miss path reads the
+# per-artifact `recovery:` spec from the registry and DISPATCHES the named
+# backfill primitive (SF start_execution / Lambda invoke) instead of (or, per
+# the spec's mode, in addition to) only paging. The monitor is a pure
+# reconciler — it never hardcodes per-artifact logic; it reads the declarative
+# spec and drives to desired state.
+#
+# DEDUP. A still-missing artifact would otherwise re-dispatch on every 15-min
+# poll until the heal lands and the next probe sees it fresh. We write an
+# in-progress marker to S3 keyed by the SAME per-cycle dedup label the alert
+# path uses (resolve_dedup_key). The marker's presence within a cooldown window
+# suppresses re-dispatch for that (artifact, cycle-window). The marker lives
+# under the already-granted `_freshness_monitor/` prefix (iam-policy.json
+# S3WriteMonitorArtifacts) so no new write grant is required.
+RECOVERY_MARKER_PREFIX = "_freshness_monitor/_recovery/"
+
+# Cooldown (minutes) after a dispatch during which the same (artifact,
+# cycle-window) is NOT re-dispatched. Sized longer than the 15-min poll so at
+# least one full backfill attempt completes before a retry is considered, but
+# short enough that a genuinely-failed heal is retried within the cycle. Env-
+# tunable to mirror the OBSERVE-mode cutover-by-CLI-flip pattern.
+RECOVERY_COOLDOWN_MINUTES = int(
+    os.environ.get("RECOVERY_COOLDOWN_MINUTES", "120")
+)
+
+# Master gate for the dispatch side effect, independent of ALERTS_ENABLED so
+# the cutover can stage: alerts can go live while dispatch stays in OBSERVE
+# (log the would-dispatch, write no marker, call no AWS) until validated. Phase
+# flips this via `aws lambda update-function-configuration` with no redeploy.
+RECOVERY_DISPATCH_ENABLED = (
+    os.environ.get("FRESHNESS_MONITOR_RECOVERY_ENABLED", "false").lower()
+    == "true"
+)
+
 # CloudWatch namespace for the per-cycle completion rollup metric. Shares
 # the substrate-health namespace so cycle-completion + substrate-row health
 # graph together. Dimensioned by Cadence only (low-cardinality, alarm-able).
@@ -155,6 +189,22 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
     ``scripts/validate_artifact_registry.py``) is the prevent-it-at-PR
     chokepoint; this is the runtime defense.
     """
+    return load_registry_with_recovery(s3_client, bucket, key)[0]
+
+
+def load_registry_with_recovery(
+    s3_client: Any, bucket: str, key: str
+) -> tuple[list[ArtifactSpec], dict[str, dict]]:
+    """Like :func:`load_registry`, but also returns the per-artifact
+    ``recovery:`` spec map (config#1240) keyed by ``artifact_id``.
+
+    ``ArtifactSpec`` is a frozen lib dataclass without a ``recovery``
+    field (the monitor's dispatch concern is not the substrate's
+    freshness concern), so the recovery block is parsed into a parallel
+    map rather than threaded onto the spec. Artifacts without a
+    ``recovery:`` block are simply absent from the map — the dispatch
+    path treats a missing key as "no auto-remediation, page only".
+    """
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read()
     data = yaml.safe_load(body)
@@ -163,13 +213,18 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
 
     defaults = data.get("defaults", {}) or {}
     specs: list[ArtifactSpec] = []
+    recovery_by_id: dict[str, dict] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
         # Strip any extension fields (forward-compat with future schema).
         spec_kwargs = {k: v for k, v in merged.items() if k in _SPEC_FIELDS}
-        specs.append(ArtifactSpec(**spec_kwargs))
-    return specs
+        spec = ArtifactSpec(**spec_kwargs)
+        specs.append(spec)
+        recovery = merged.get("recovery")
+        if isinstance(recovery, dict):
+            recovery_by_id[spec.artifact_id] = recovery
+    return specs, recovery_by_id
 
 
 # ── Per-spec probe (catches per-spec errors so one bad row doesn't sink the pass) ─
@@ -369,6 +424,210 @@ def _emit_cycle_verdict_error(stage: str) -> None:
             "failed to emit ArtifactFreshnessCycleVerdictError[%s] (non-fatal): %s",
             stage, exc,
         )
+
+
+# ── Auto-remediation dispatch (config#1240) ─────────────────────────────────
+#
+# Promote the monitor from alert-only to alert+heal. On a confirmed miss past
+# grace, an artifact carrying a `recovery:` spec gets its backfill primitive
+# DISPATCHED. The monitor reads the spec; it is NEVER hardcoded per artifact.
+
+
+# (resolve_current_cycle is imported at module top alongside the other
+# substrate entry points.)
+
+
+def _resolve_recovery_params(
+    params: dict[str, Any] | None, spec: ArtifactSpec, now: datetime
+) -> dict[str, Any]:
+    """Resolve ``{date}``/``{trading_day}``/``{cycle_label}`` placeholders in
+    a recovery spec's ``params`` against the CURRENT MISS's cycle.
+
+    The miss is for *this* cycle, so the backfill must target this cycle's
+    trading day — NOT "today" (a Saturday-cron miss probed Monday must still
+    backfill the Saturday cycle). We reuse the substrate's cycle resolution so
+    the date the backfill targets is exactly the date the probe checked.
+    Non-string param values pass through untouched.
+    """
+    if not params:
+        return {}
+    cycle_tick, cycle_label = resolve_current_cycle(spec, now)
+    iso = cycle_tick.date().isoformat()
+    resolved: dict[str, Any] = {}
+    for k, v in params.items():
+        if isinstance(v, str):
+            resolved[k] = v.format(date=iso, trading_day=iso, cycle_label=cycle_label)
+        else:
+            resolved[k] = v
+    return resolved
+
+
+def _recovery_marker_key(spec: ArtifactSpec, now: datetime) -> str:
+    """In-progress dedup marker key for the current (artifact, cycle-window).
+
+    Keyed by the SAME per-cycle label the alert dedup uses, so a backfill is
+    dispatched at most once per cycle per artifact regardless of how many
+    15-min polls observe the still-missing artifact before the heal lands.
+    """
+    _, label = resolve_current_cycle(spec, now)
+    return f"{RECOVERY_MARKER_PREFIX}{spec.artifact_id}/{label}.json"
+
+
+def _recovery_already_dispatched(
+    s3_client: Any, spec: ArtifactSpec, now: datetime
+) -> bool:
+    """True if a dispatch marker for this (artifact, cycle) exists AND is
+    within the cooldown window — i.e. a recovery is already in-flight and the
+    artifact simply hasn't reappeared yet, so we must NOT re-dispatch.
+
+    A marker older than the cooldown is treated as stale (the prior heal
+    evidently failed) and dispatch is allowed again. A HEAD failure other than
+    404 is treated as "assume dispatched" (fail-closed) so a transient S3 blip
+    can't trigger a dispatch storm.
+    """
+    key = _recovery_marker_key(spec, now)
+    try:
+        resp = s3_client.head_object(Bucket=REGISTRY_BUCKET, Key=key)
+    except Exception as exc:  # noqa: BLE001 — classify by error code
+        code = str(
+            getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        )
+        status = getattr(exc, "response", {}).get("ResponseMetadata", {}).get(
+            "HTTPStatusCode", 0
+        )
+        if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return False  # no marker → first dispatch for this cycle
+        # Any other error (403/500/network) → fail-closed: assume in-flight.
+        logger.warning(
+            "recovery marker HEAD for %s failed (%s) — assuming dispatched "
+            "to avoid a re-dispatch storm",
+            spec.artifact_id, exc,
+        )
+        return True
+    lm = resp.get("LastModified")
+    if lm is None:
+        return True
+    age_min = (now - lm).total_seconds() / 60.0
+    return age_min < RECOVERY_COOLDOWN_MINUTES
+
+
+def _write_recovery_marker(
+    s3_client: Any, spec: ArtifactSpec, now: datetime, payload: dict[str, Any]
+) -> None:
+    """Persist the in-progress marker so subsequent polls dedup against it."""
+    key = _recovery_marker_key(spec, now)
+    _put_json(s3_client, REGISTRY_BUCKET, key, payload)
+
+
+def _dispatch_recovery(
+    aws_clients: dict[str, Any],
+    spec: ArtifactSpec,
+    recovery: dict[str, Any],
+    now: datetime,
+) -> None:
+    """Dispatch the recovery primitive named by the spec.
+
+    ``type: step_function`` → ``stepfunctions.start_execution`` with the
+    resolved params JSON as input. ``type: lambda`` → ``lambda.invoke``
+    (Event/async) with the resolved params as the payload. Lazily-created
+    clients are cached in ``aws_clients`` so a pass dispatching several
+    recoveries shares one client per service.
+    """
+    rtype = recovery.get("type")
+    target = recovery.get("target")
+    resolved_params = _resolve_recovery_params(recovery.get("params"), spec, now)
+
+    if rtype == "step_function":
+        sf = aws_clients.get("stepfunctions")
+        if sf is None:
+            sf = boto3.client("stepfunctions")
+            aws_clients["stepfunctions"] = sf
+        sf.start_execution(
+            stateMachineArn=target,
+            input=json.dumps(resolved_params, default=str),
+        )
+    elif rtype == "lambda":
+        lam = aws_clients.get("lambda")
+        if lam is None:
+            lam = boto3.client("lambda")
+            aws_clients["lambda"] = lam
+        lam.invoke(
+            FunctionName=target,
+            InvocationType="Event",  # async fire-and-forget; the next probe verifies
+            Payload=json.dumps(resolved_params, default=str).encode("utf-8"),
+        )
+    else:
+        raise ValueError(f"unknown recovery.type={rtype!r} for {spec.artifact_id}")
+
+
+def _maybe_dispatch_recovery(
+    s3_client: Any,
+    aws_clients: dict[str, Any],
+    spec: ArtifactSpec,
+    recovery: dict[str, Any] | None,
+    result: CheckResult,
+    now: datetime,
+) -> bool:
+    """Auto-remediation entry point — mirror of :func:`_maybe_alert`.
+
+    Returns ``True`` iff a dispatch was actually performed this pass. Fires
+    only when ALL of:
+      - a ``recovery:`` spec exists for the artifact;
+      - the same confirmed-miss gate the alert path uses holds
+        (``state ∈ {missing, stale}`` past SLA — ``probe_failed`` is NOT
+        auto-healed: a broken probe means the monitor is blind, not that the
+        artifact is absent, so blind-dispatching a backfill is unsafe);
+      - no in-flight dispatch marker within the cooldown (dedup);
+      - :data:`RECOVERY_DISPATCH_ENABLED` (OBSERVE-mode gate — logs the
+        would-dispatch and writes NO marker / calls NO AWS when off).
+
+    On dispatch, an in-progress marker is written so the next 15-min poll
+    against the still-missing artifact dedups instead of re-dispatching.
+    """
+    if recovery is None:
+        return False
+    if result.state not in ("missing", "stale"):
+        return False
+    if result.sla_violated_by_minutes == 0:
+        return False  # still within SLA grace — same gate as _maybe_alert
+
+    if not RECOVERY_DISPATCH_ENABLED:
+        logger.info(
+            "OBSERVE-mode (recovery): would dispatch %s recovery for %s "
+            "(state=%s) target=%s",
+            recovery.get("type"), spec.artifact_id, result.state,
+            recovery.get("target"),
+        )
+        return False
+
+    # Dedup: a recovery already in-flight for this (artifact, cycle) → skip.
+    if _recovery_already_dispatched(s3_client, spec, now):
+        logger.info(
+            "recovery for %s already dispatched this cycle (deduped)",
+            spec.artifact_id,
+        )
+        return False
+
+    # Write the marker BEFORE dispatching so a dispatch that succeeds but
+    # whose marker-write would have failed can't loop; and so a crash between
+    # dispatch and marker-write errs toward not-re-dispatching. The marker is
+    # the dedup source of truth.
+    marker = {
+        "artifact_id": spec.artifact_id,
+        "dispatched_at": now.isoformat(),
+        "state": result.state,
+        "recovery_type": recovery.get("type"),
+        "target": recovery.get("target"),
+    }
+    _write_recovery_marker(s3_client, spec, now, marker)
+
+    _dispatch_recovery(aws_clients, spec, recovery, now)
+    logger.info(
+        "DISPATCHED %s recovery for %s (state=%s) target=%s",
+        recovery.get("type"), spec.artifact_id, result.state,
+        recovery.get("target"),
+    )
+    return True
 
 
 # ── Alerting (gated on ALERTS_ENABLED) ──────────────────────────────────────
@@ -743,13 +1002,22 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
-    specs = load_registry(s3, REGISTRY_BUCKET, REGISTRY_KEY)
-    logger.info("loaded %d specs from registry", len(specs))
+    specs, recovery_by_id = load_registry_with_recovery(
+        s3, REGISTRY_BUCKET, REGISTRY_KEY
+    )
+    logger.info(
+        "loaded %d specs from registry (%d with recovery specs)",
+        len(specs), len(recovery_by_id),
+    )
 
     # Walk and probe.
     pairs: list[tuple[ArtifactSpec, CheckResult]] = []
     alerted = 0
+    dispatched = 0
     per_spec_exceptions = 0
+    # Per-pass cache of lazily-created SF/Lambda clients (shared across the
+    # walk so a pass dispatching several recoveries reuses one client each).
+    aws_clients: dict[str, Any] = {}
     for spec in specs:
         result, exc = _check_one(s3, spec, now)
         if exc is not None:
@@ -758,7 +1026,32 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "per-spec exception for %s: %s", spec.artifact_id, exc,
             )
         pairs.append((spec, result))
-        if _maybe_alert(spec, result, now):
+
+        # config#1240 — auto-remediation. Attempt a dispatch on a confirmed
+        # miss (independently trapped so a dispatch failure can NEVER sink the
+        # monitor's primary alert/heartbeat deliverables). `mode: dispatch`
+        # suppresses the page once a heal is dispatched this cycle; the default
+        # `dispatch_and_page` pages AND heals (belt-and-braces).
+        recovery = recovery_by_id.get(spec.artifact_id)
+        did_dispatch = False
+        try:
+            did_dispatch = _maybe_dispatch_recovery(
+                s3, aws_clients, spec, recovery, result, now,
+            )
+        except Exception as disp_exc:  # noqa: BLE001 — dispatch must not sink the pass
+            logger.warning(
+                "recovery dispatch for %s failed (non-fatal): %s",
+                spec.artifact_id, disp_exc, exc_info=True,
+            )
+        if did_dispatch:
+            dispatched += 1
+
+        suppress_page = (
+            did_dispatch
+            and isinstance(recovery, dict)
+            and recovery.get("mode", "dispatch_and_page") == "dispatch"
+        )
+        if not suppress_page and _maybe_alert(spec, result, now):
             alerted += 1
 
     # Emit dashboard surface + self-heartbeat.
@@ -812,9 +1105,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             _emit_cycle_verdict_error("cw_metric_emit")
 
     logger.info(
-        "freshness-monitor complete: %s checked, %s alerted, %s per-spec exceptions, "
-        "duration=%.2fs",
-        heartbeat["n_entries_checked"], alerted, per_spec_exceptions,
+        "freshness-monitor complete: %s checked, %s alerted, %s dispatched, "
+        "%s per-spec exceptions, duration=%.2fs",
+        heartbeat["n_entries_checked"], alerted, dispatched, per_spec_exceptions,
         heartbeat["duration_seconds"],
     )
 
@@ -822,7 +1115,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "n_entries_checked": heartbeat["n_entries_checked"],
         "counts": heartbeat["counts"],
         "alerts_enabled": ALERTS_ENABLED,
+        "recovery_dispatch_enabled": RECOVERY_DISPATCH_ENABLED,
         "alerted": alerted,
+        "dispatched": dispatched,
         "per_spec_exceptions": per_spec_exceptions,
         "duration_seconds": heartbeat["duration_seconds"],
         "cycle_verdicts": cycle_verdicts,

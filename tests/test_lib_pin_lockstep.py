@@ -1,11 +1,19 @@
-"""Pin ``requirements.txt`` + ``Dockerfile`` to the same alpha-engine-lib version.
+"""Pin every lib-install surface to the same nousergon-lib version.
 
-The Dockerfile strips alpha-engine-lib from ``requirements.txt`` before
-``pip install`` (see the ``grep -vE ...alpha-engine-lib`` line in the
+(The dist was renamed ``alpha-engine-lib`` → ``nousergon-lib`` at v0.60.0;
+the historical incidents below predate the rename and reference the old
+``alpha_engine_lib`` import name accordingly — kept verbatim as the
+drift-class record.)
+
+The Dockerfile strips nousergon-lib from ``requirements.txt`` before
+``pip install`` (see the ``grep -vE ...nousergon-lib`` line in the
 Dockerfile RUN block) and instead installs the lib via a hardcoded
-``pip install "alpha-engine-lib@vX.Y.Z"`` line ABOVE that grep. So
+``pip install "nousergon-lib@vX.Y.Z"`` line ABOVE that grep. So
 bumping ``requirements.txt`` alone does NOT propagate to the Lambda
-image — the Dockerfile's hardcoded pin wins.
+image — the Dockerfile's hardcoded pin wins. The slim
+``requirements-daily-news.txt`` (standalone daily-news collector on the
+dashboard box) carries its own copy of the pin and its header demands
+lockstep with ``requirements.txt`` — so it is guarded here too.
 
 This drift class has bitten production multiple times:
 
@@ -20,7 +28,7 @@ This drift class has bitten production multiple times:
     Lambda canary failed at 17:22 UTC with the same
     ``alpha_engine_lib.secrets`` ModuleNotFoundError.
 
-This test re-greps both files on every CI run so a future single-file
+This test re-greps all three files on every CI run so a future single-file
 bump fails here, not in a canary.
 """
 
@@ -32,10 +40,10 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _REQUIREMENTS_PIN_RE = re.compile(
-    r"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+    r"nousergon-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
 _DOCKERFILE_PIN_RE = re.compile(
-    r'"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"'
+    r'"nousergon-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"'
 )
 
 
@@ -43,7 +51,7 @@ def _read_pin(filename: str, regex: re.Pattern[str]) -> str:
     text = (_REPO_ROOT / filename).read_text()
     match = regex.search(text)
     assert match is not None, (
-        f"could not find alpha-engine-lib pin in {filename}"
+        f"could not find nousergon-lib pin in {filename}"
     )
     return match.group(1)
 
@@ -51,9 +59,12 @@ def _read_pin(filename: str, regex: re.Pattern[str]) -> str:
 def test_requirements_and_dockerfile_pins_match():
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
     docker_pin = _read_pin("Dockerfile", _DOCKERFILE_PIN_RE)
-    assert req_pin == docker_pin, (
-        f"alpha-engine-lib pin drift: requirements.txt={req_pin!r} but "
-        f"Dockerfile={docker_pin!r}. Both must move in lockstep — the "
-        f"Dockerfile strips lib from requirements.txt before pip install, "
-        f"so requirements-only bumps don't propagate to the Lambda image."
+    daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
+    assert req_pin == docker_pin == daily_news_pin, (
+        f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
+        f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}. "
+        f"All three must move in lockstep — the Dockerfile strips lib from "
+        f"requirements.txt before pip install, so requirements-only bumps "
+        f"don't propagate to the Lambda image, and the slim daily-news file "
+        f"carries an independent copy of the pin."
     )

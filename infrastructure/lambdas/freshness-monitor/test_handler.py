@@ -910,3 +910,284 @@ def test_handler_cycle_verdict_error_metric_on_swallowed_failure(
         if m["MetricName"] == "ArtifactFreshnessCycleVerdictError"
     }
     assert "serialize_or_s3_write" in stages
+
+
+# ── Auto-remediation dispatch (config#1240) ─────────────────────────────────
+#
+# The freshness-monitor was alert-ONLY: a confirmed miss paged but never
+# healed. config#1240 wires the declarative `recovery:` spec to an actual
+# dispatch (SF start_execution / Lambda invoke) with per-(artifact, cycle)
+# dedup so a still-missing artifact is not re-dispatched every 15-min poll.
+#
+# These tests mock boto3 via a per-service client factory (S3 + stepfunctions
+# + lambda land on distinct recording mocks) and assert: (a) a recovery spec
+# triggers exactly one dispatch on a confirmed miss, (b) no dispatch when the
+# spec is absent, (c) the S3 marker dedups a re-poll.
+
+
+_RECOVERY_REGISTRY = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  calendar_aware: true
+  severity: warning
+artifacts:
+  - artifact_id: closes_recoverable
+    s3_key_template: "staging/daily_closes/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    severity: critical
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+    recovery:
+      type: step_function
+      target: "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
+      params:
+        trigger: freshness_monitor_backfill
+        trading_day: "{trading_day}"
+  - artifact_id: missing_no_recovery
+    s3_key_template: "staging/other/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    severity: critical
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+"""
+
+
+def _make_clients(fake_s3, sf_mock=None, lambda_mock=None):
+    """A boto3.client(service) factory routing each service to a distinct
+    recording mock; defaults to fresh mocks for sf/lambda."""
+    sf = sf_mock if sf_mock is not None else mock.Mock()
+    lam = lambda_mock if lambda_mock is not None else mock.Mock()
+
+    def _client(service, *a, **kw):
+        if service == "s3":
+            return fake_s3
+        if service == "stepfunctions":
+            return sf
+        if service == "lambda":
+            return lam
+        # cloudwatch and anything else land on the recording fake_s3 (it has
+        # put_metric_data) — mirrors the existing _run_handler convention.
+        return fake_s3
+
+    return _client, sf, lam
+
+
+def _run_recovery_handler(monkeypatch, fake_s3, fixed_now, *, recovery_enabled):
+    fake_s3._registry_body = _RECOVERY_REGISTRY
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)  # OBSERVE alerts
+    if recovery_enabled:
+        monkeypatch.setenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", "true")
+    else:
+        monkeypatch.delenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    factory, sf, lam = _make_clients(fake_s3)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    result = index.handler({}, None)
+    return result, sf, lam, index
+
+
+def test_recovery_dispatches_once_on_confirmed_miss(monkeypatch, fake_s3, fixed_now):
+    """(a) An artifact with a `recovery:` spec triggers EXACTLY one SF
+    dispatch on a confirmed miss, with the resolved trading_day threaded into
+    the SF input."""
+    # Both artifacts 404 (missing); fixed_now Sat 18:00 is well past the
+    # weekday SLA, so the miss is confirmed.
+    result, sf, lam, index = _run_recovery_handler(
+        monkeypatch, fake_s3, fixed_now, recovery_enabled=True
+    )
+
+    assert result["dispatched"] == 1
+    sf.start_execution.assert_called_once()
+    kwargs = sf.start_execution.call_args.kwargs
+    assert kwargs["stateMachineArn"].endswith("alpha-engine-weekday-pipeline")
+    payload = json.loads(kwargs["input"])
+    assert payload["trigger"] == "freshness_monitor_backfill"
+    # The placeholder resolved to a concrete ISO date (not the literal token).
+    assert payload["trading_day"] != "{trading_day}"
+    assert payload["trading_day"].startswith("2026-05")
+    lam.invoke.assert_not_called()
+
+
+def test_recovery_no_dispatch_when_spec_absent(monkeypatch, fake_s3, fixed_now):
+    """(b) The artifact WITHOUT a recovery spec (missing_no_recovery) is
+    missing too, but no dispatch fires for it — only the one recoverable
+    artifact dispatches."""
+    result, sf, lam, index = _run_recovery_handler(
+        monkeypatch, fake_s3, fixed_now, recovery_enabled=True
+    )
+    # Exactly one dispatch total → the no-recovery artifact contributed none.
+    assert result["dispatched"] == 1
+    assert sf.start_execution.call_count == 1
+
+
+def test_recovery_writes_dedup_marker(monkeypatch, fake_s3, fixed_now):
+    """A dispatch persists an in-progress marker under
+    _freshness_monitor/_recovery/ so a re-poll can dedup against it."""
+    _run_recovery_handler(monkeypatch, fake_s3, fixed_now, recovery_enabled=True)
+    marker_puts = [
+        k for (_, k, _) in fake_s3._put_calls
+        if k.startswith("_freshness_monitor/_recovery/closes_recoverable/")
+    ]
+    assert len(marker_puts) == 1
+
+
+def test_recovery_dedup_prevents_redispatch(monkeypatch, fake_s3, fixed_now):
+    """(c) DEDUP — a second poll while the artifact is STILL missing must NOT
+    re-dispatch: the in-progress marker (within cooldown) short-circuits."""
+    # Seed the marker as already present (fresh — modified at `now`), as if a
+    # prior poll dispatched. The recovery marker key embeds the cycle label.
+    fake_s3._registry_body = _RECOVERY_REGISTRY
+    monkeypatch.setenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", "true")
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+
+    from alpha_engine_lib.artifact_freshness import ArtifactSpec
+    spec = ArtifactSpec(
+        artifact_id="closes_recoverable", s3_bucket="alpha-engine-research",
+        s3_key_template="staging/daily_closes/{trading_day}.parquet",
+        cadence="weekday_sf", sla_minutes_after_cron=30, severity="critical",
+        owner_repo="alpha-engine-data", created_at=date(2025, 1, 1),
+    )
+    marker_key = index._recovery_marker_key(spec, fixed_now)
+    fake_s3._head_returns[marker_key] = {"LastModified": fixed_now}
+
+    factory, sf, lam = _make_clients(fake_s3)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({}, None)
+
+    assert result["dispatched"] == 0       # deduped
+    sf.start_execution.assert_not_called()
+
+
+def test_recovery_stale_marker_allows_redispatch(monkeypatch, fake_s3, fixed_now):
+    """A marker OLDER than the cooldown window is treated as a failed prior
+    heal — dispatch is allowed again (so a genuinely-stuck miss isn't stranded
+    forever behind a stale marker)."""
+    fake_s3._registry_body = _RECOVERY_REGISTRY
+    monkeypatch.setenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("RECOVERY_COOLDOWN_MINUTES", "120")
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+
+    from datetime import timedelta
+    from alpha_engine_lib.artifact_freshness import ArtifactSpec
+    spec = ArtifactSpec(
+        artifact_id="closes_recoverable", s3_bucket="alpha-engine-research",
+        s3_key_template="staging/daily_closes/{trading_day}.parquet",
+        cadence="weekday_sf", sla_minutes_after_cron=30, severity="critical",
+        owner_repo="alpha-engine-data", created_at=date(2025, 1, 1),
+    )
+    marker_key = index._recovery_marker_key(spec, fixed_now)
+    # 3h old > 120min cooldown → stale.
+    fake_s3._head_returns[marker_key] = {
+        "LastModified": fixed_now - timedelta(hours=3),
+    }
+
+    factory, sf, lam = _make_clients(fake_s3)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({}, None)
+    assert result["dispatched"] == 1
+    sf.start_execution.assert_called_once()
+
+
+def test_recovery_observe_mode_logs_no_dispatch(monkeypatch, fake_s3, fixed_now):
+    """OBSERVE gate: with FRESHNESS_MONITOR_RECOVERY_ENABLED unset, a
+    recoverable miss logs the would-dispatch but calls NO AWS and writes NO
+    marker — mirrors the alert OBSERVE-mode cutover discipline."""
+    result, sf, lam, index = _run_recovery_handler(
+        monkeypatch, fake_s3, fixed_now, recovery_enabled=False
+    )
+    assert result["dispatched"] == 0
+    assert result["recovery_dispatch_enabled"] is False
+    sf.start_execution.assert_not_called()
+    marker_puts = [
+        k for (_, k, _) in fake_s3._put_calls
+        if k.startswith("_freshness_monitor/_recovery/")
+    ]
+    assert marker_puts == []
+
+
+def test_recovery_dispatch_failure_does_not_sink_pass(monkeypatch, fake_s3, fixed_now):
+    """A dispatch exception (e.g. SF AccessDenied) must NOT sink the monitor:
+    the primary heartbeat + check_results are still written and the handler
+    returns normally."""
+    fake_s3._registry_body = _RECOVERY_REGISTRY
+    monkeypatch.setenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", "true")
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+
+    sf = mock.Mock()
+    sf.start_execution.side_effect = RuntimeError("States.AccessDenied")
+    factory, _, lam = _make_clients(fake_s3, sf_mock=sf)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({}, None)
+
+    assert result["dispatched"] == 0  # the dispatch raised → not counted
+    put_keys = [k for (_, k, _) in fake_s3._put_calls]
+    assert "_freshness_monitor/heartbeat.json" in put_keys
+    assert "_freshness_monitor/check_results.json" in put_keys
+
+
+def test_recovery_mode_dispatch_suppresses_page(monkeypatch, fake_s3, fixed_now):
+    """mode: dispatch suppresses the page once a heal is dispatched this cycle
+    (vs the default dispatch_and_page which does both)."""
+    registry = _RECOVERY_REGISTRY.replace(
+        b'        trading_day: "{trading_day}"\n',
+        b'        trading_day: "{trading_day}"\n      mode: dispatch\n',
+    )
+    fake_s3._registry_body = registry
+    monkeypatch.setenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")  # alerts ON
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    factory, sf, lam = _make_clients(fake_s3)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    publish_mock = mock.Mock()
+    monkeypatch.setattr(index, "publish", publish_mock)
+
+    result = index.handler({}, None)
+
+    assert result["dispatched"] == 1
+    # closes_recoverable is healed → NOT paged. missing_no_recovery has no
+    # recovery → still paged. So exactly one publish, for the no-recovery one.
+    paged_ids = [c.args[0] for c in publish_mock.call_args_list]
+    assert any("missing_no_recovery" in b for b in paged_ids)
+    assert not any("closes_recoverable" in b for b in paged_ids)
+
+
+def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
+    """load_registry_with_recovery returns the recovery map keyed by
+    artifact_id; artifacts without a block are absent from the map."""
+    fake_s3._registry_body = _RECOVERY_REGISTRY
+    import index
+    specs, recovery = index.load_registry_with_recovery(fake_s3, "b", "k")
+    assert len(specs) == 2
+    assert set(recovery) == {"closes_recoverable"}
+    assert recovery["closes_recoverable"]["type"] == "step_function"
+    # Back-compat: load_registry still returns just the list.
+    assert len(index.load_registry(fake_s3, "b", "k")) == 2
