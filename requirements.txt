@@ -12,7 +12,7 @@ edgartools>=2.0
 voyageai>=0.3
 jsonschema>=4.20
 arcticdb>=6.11
-# flow-doctor is pulled in transitively via alpha-engine-lib[flow-doctor].
+# flow-doctor is pulled in transitively via nousergon-lib[flow-doctor].
 # NOTE: the extra MUST be hyphenated — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
 # normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
@@ -32,4 +32,4 @@ arcticdb>=6.11
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-alpha-engine-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
