@@ -68,6 +68,10 @@ _load_dotenv()
 # captured by flow-doctor's ERROR handler.
 from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 from alpha_engine_lib.phase_registry import PhaseRegistry
+# Canonical experiment-package config resolver (alpha-engine-config#1157): the
+# lift of the five inline _find_config / load_config / config_loader copies into
+# the shared-lib chokepoint. load_config below delegates to it.
+from alpha_engine_lib.config import resolve_experiment_config
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -94,22 +98,20 @@ def load_config(path: str = "config.yaml") -> dict:
     ``reference``) first, then the legacy top-level alpha-engine-config/data/config.yaml,
     then the repo-local fallback (``path``). The experiment-package layer was already
     live in feature_engineer; this closes the gap that file's docstring references.
+
+    Delegates to the canonical nousergon-lib resolver (resolve_experiment_config,
+    alpha-engine-config#1157). The data ``Path(path)`` tail is preserved verbatim
+    via repo_local_fallback (``path`` is CWD-relative, not subdir-anchored).
     """
-    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
-    roots = [
-        Path.home() / "alpha-engine-config",
-        Path(__file__).parent.parent / "alpha-engine-config",
-    ]
-    search_paths = [r / "experiments" / exp / "data" / "config.yaml" for r in roots]
-    search_paths += [r / "data" / "config.yaml" for r in roots]
-    search_paths.append(Path(path))
-    for p in search_paths:
-        if p.exists():
-            with open(p) as f:
-                return yaml.safe_load(f)
-    raise FileNotFoundError(
-        f"Config not found. Searched: {[str(p) for p in search_paths]}"
+    resolved = resolve_experiment_config(
+        "data",
+        "config.yaml",
+        repo_root=Path(__file__).parent,
+        repo_local_fallback=Path(path),
+        resolve=True,
     )
+    with open(resolved) as f:
+        return yaml.safe_load(f)
 
 
 def _load_chronic_polygon_gaps(config: dict) -> list[str]:

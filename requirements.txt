@@ -32,4 +32,4 @@ arcticdb>=6.11
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-alpha-engine-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.59.4
+alpha-engine-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
