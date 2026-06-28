@@ -565,6 +565,137 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
+  # --------------------------------------------------------------------------
+  # L274 MutexConflict alarms (config#729)
+  # --------------------------------------------------------------------------
+  # The SF MutualExclusionGuard (L274) fails a duplicate-trigger execution with
+  # a terminal `MutexConflict` Fail. Today that's only visible in SF execution
+  # history + the SNS HandleFailure email. These metric-filters + alarms add a
+  # CloudWatch signal on the RATE of MutexConflict Fails per SF — the first
+  # non-zero count is the operator-action signal to investigate the duplicate
+  # trigger source (CFN drift, EB internal retry, operator double-paste,
+  # cross-region replay).
+  #
+  # Path chosen (per the issue's "lowest-substrate" guidance): a CloudWatch Logs
+  # metric filter on each SF's execution log group, matching the MutexConflict
+  # Cause text, into a custom AlphaEngine/StepFunctions metric — no new Lambda /
+  # EB-cron substrate. SF logging is enabled at level=ERROR with
+  # includeExecutionData=true (deploy_step_function*.sh), so the ExecutionFailed
+  # event carries the `MutexConflict` Error/Cause into the log group.
+  #
+  # The 3 log groups are created by the SF deploy scripts as
+  # /aws/stepfunctions/<state-machine-name>; the metric filters reference them
+  # by name (independent of whether the SF itself is CFN- or script-managed —
+  # the EOD pipeline is script-managed via update_eod_pipeline_sf.sh).
+  #
+  # Threshold is 1 over a 24h window (first fire = page) with
+  # TreatMissingData=notBreaching so the steady state (zero MutexConflicts) is OK.
+
+  WeekdayMutexConflictMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /aws/stepfunctions/alpha-engine-weekday-pipeline
+      FilterPattern: '"MutexConflict"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: MutexConflictFails
+          MetricValue: '1'
+          DefaultValue: 0
+          Dimensions:
+            - Key: StateMachine
+              Value: alpha-engine-weekday-pipeline
+
+  SaturdayMutexConflictMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /aws/stepfunctions/alpha-engine-saturday-pipeline
+      FilterPattern: '"MutexConflict"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: MutexConflictFails
+          MetricValue: '1'
+          DefaultValue: 0
+          Dimensions:
+            - Key: StateMachine
+              Value: alpha-engine-saturday-pipeline
+
+  EodMutexConflictMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /aws/stepfunctions/alpha-engine-eod-pipeline
+      FilterPattern: '"MutexConflict"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: MutexConflictFails
+          MetricValue: '1'
+          DefaultValue: 0
+          Dimensions:
+            - Key: StateMachine
+              Value: alpha-engine-eod-pipeline
+
+  WeekdayMutexConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-weekday-mutex-conflict
+      AlarmDescription: >-
+        L274 MutexConflict Fail on the weekday pipeline (duplicate-trigger guard
+        fired). First occurrence = investigate the duplicate-trigger source.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: MutexConflictFails
+      Dimensions:
+        - Name: StateMachine
+          Value: alpha-engine-weekday-pipeline
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  SaturdayMutexConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-saturday-mutex-conflict
+      AlarmDescription: >-
+        L274 MutexConflict Fail on the saturday pipeline (duplicate-trigger guard
+        fired). First occurrence = investigate the duplicate-trigger source.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: MutexConflictFails
+      Dimensions:
+        - Name: StateMachine
+          Value: alpha-engine-saturday-pipeline
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  EodMutexConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-eod-mutex-conflict
+      AlarmDescription: >-
+        L274 MutexConflict Fail on the eod pipeline (duplicate-trigger guard
+        fired). First occurrence = investigate the duplicate-trigger source.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: MutexConflictFails
+      Dimensions:
+        - Name: StateMachine
+          Value: alpha-engine-eod-pipeline
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
 # ============================================================================
 # Outputs
 # ============================================================================
