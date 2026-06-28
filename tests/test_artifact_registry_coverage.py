@@ -78,6 +78,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/metron_market_data.py": 1,  # one _write_json site → market_data/eod_closes/* + market_data/fx/*
     "collectors/prices.py": 1,
     "collectors/short_interest.py": 1,
+    "collectors/universe_classification.py": 1,  # market_data/universe_classification/{date,latest}.json — sector/country/industry for the ~900 universe board
     "collectors/signal_returns.py": 1,
     "collectors/universe_returns.py": 1,
     "data/cache.py": 1,
