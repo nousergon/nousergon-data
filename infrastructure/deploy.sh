@@ -12,7 +12,10 @@
 #   2. IAM role created (alpha-engine-data-role)
 #   3. ECR repository: alpha-engine-data-collector
 #   4. Docker installed and running
-#   5. .env file with FMP_API_KEY, EDGAR_IDENTITY
+#   5. Secrets (FMP_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY, …) present in SSM
+#      Parameter Store under /alpha-engine/* — the Lambda reads them at runtime
+#      via get_secret(); no .env is built into or sourced by this deploy
+#      (config#890 .env→SSM arc).
 #
 # Usage: ./infrastructure/deploy.sh
 
