@@ -29,7 +29,7 @@ import pandas as pd
 import yfinance as yf
 
 from builders._price_cache_writeboth import price_cache_write_prefixes
-from collectors.yfinance_quiet import log_yf_coverage, yf_quiet
+from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ def _refresh_stale(
 ) -> tuple[int, list[str]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
 
-    Runs under ``yf_quiet`` (collectors/yfinance_quiet.py): yfinance's
+    Runs under ``yf_quiet`` (nousergon_lib.yfinance_quiet): yfinance's
     per-symbol "possibly delisted" ERROR spray is demoted so one transient/
     unpriceable ticker can't storm Flow Doctor with a report per worded
     variant (the 2026-06-19 PCAR recurrence of the config#1029 PCKM storm).
