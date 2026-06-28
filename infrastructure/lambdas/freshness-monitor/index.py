@@ -154,9 +154,16 @@ _SPEC_FIELDS = frozenset(
         "recovery_key_template",
         "calendar_aware",
         "interval_minutes",
-        # Continuous active-window bounds (nousergon-lib >= v0.63.0) — scope a
-        # market-hours-only producer (the executor daemon's open_orders
-        # snapshot) so the 24/7 continuous floor doesn't false-alarm overnight.
+        # Continuous run-calendar (nousergon-lib >= v0.73.0) — the single
+        # source of truth for a continuous artifact's calendar-awareness
+        # (trading_days / all_days / market_hours). Drives both the idle
+        # short-circuit and a trading-day-aware freshness floor.
+        "run_calendar",
+        # Continuous active-window bounds. active_hours_utc is the
+        # market_hours session window (nousergon-lib >= v0.63.0); the
+        # active_trading_days_only boolean is DEPRECATED (subsumed by
+        # run_calendar="trading_days") but still parsed during the
+        # S3-contract-safe migration window.
         "active_trading_days_only",
         "active_hours_utc",
     }

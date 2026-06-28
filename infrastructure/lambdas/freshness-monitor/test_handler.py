@@ -205,6 +205,31 @@ artifacts:
     assert spec.active_hours_utc == (14, 21)
 
 
+def test_load_registry_threads_run_calendar(fake_s3):
+    """The continuous run_calendar enum (nousergon-lib >=0.73.0) must survive
+    the _SPEC_FIELDS strip and thread through to ArtifactSpec — the field that
+    ties a daily trading-day producer's freshness floor to the trading
+    calendar (config#1297 continuous-cadence fold-in)."""
+    fake_s3._registry_body = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+artifacts:
+  - artifact_id: health_alpha_engine_data
+    s3_key_template: "health/daily_data.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 60
+    severity: warning
+    owner_repo: alpha-engine-data
+    created_at: "2025-01-01"
+    run_calendar: trading_days
+"""
+    import index
+    spec = index.load_registry(fake_s3, "buck", "key")[0]
+    assert spec.run_calendar == "trading_days"
+
+
 # ── handler — alerts disabled (OBSERVE mode) ────────────────────────────────
 
 

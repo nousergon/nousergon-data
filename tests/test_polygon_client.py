@@ -184,3 +184,57 @@ def test_get_splits_forbidden_returns_empty():
     client = _make_client()
     with patch.object(client, "_get", side_effect=PolygonForbiddenError("403")):
         assert client.get_splits("DD") == []
+
+
+# ── get_recent_splits (config#717: window-wide corporate-action scan) ────────
+
+
+def test_get_recent_splits_range_scoped_single_call():
+    client = _make_client()
+    resp = {
+        "results": [
+            {"ticker": "AAPL", "execution_date": "2026-05-09",
+             "split_from": 1, "split_to": 10},
+            {"ticker": "FOO", "execution_date": "2026-05-08",
+             "split_from": 2, "split_to": 1},
+        ],
+        "status": "OK",
+    }
+    with patch.object(client, "_get", return_value=resp) as mock_get:
+        out = client.get_recent_splits("2026-05-01", "2026-05-15")
+    assert mock_get.call_count == 1
+    # Range filter passed to the splits endpoint (no ticker filter).
+    _, kwargs = mock_get.call_args
+    params = kwargs["params"]
+    assert params["execution_date.gte"] == "2026-05-01"
+    assert params["execution_date.lte"] == "2026-05-15"
+    assert "ticker" not in params
+    # Sorted ascending; carries ticker.
+    assert [e["execution_date"] for e in out] == ["2026-05-08", "2026-05-09"]
+    assert out[1]["ticker"] == "AAPL"
+
+
+def test_get_recent_splits_skips_malformed_rows():
+    client = _make_client()
+    resp = {
+        "results": [
+            {"ticker": "AAPL", "execution_date": "2026-05-09",
+             "split_from": 1, "split_to": 10},
+            {"ticker": None, "execution_date": "2026-05-08",
+             "split_from": 2, "split_to": 1},  # missing ticker
+            {"ticker": "BAR", "execution_date": None,
+             "split_from": 2, "split_to": 1},  # missing date
+        ]
+    }
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_recent_splits("2026-05-01", "2026-05-15")
+    assert out == [
+        {"ticker": "AAPL", "execution_date": "2026-05-09",
+         "split_from": 1, "split_to": 10},
+    ]
+
+
+def test_get_recent_splits_forbidden_returns_empty():
+    client = _make_client()
+    with patch.object(client, "_get", side_effect=PolygonForbiddenError("403")):
+        assert client.get_recent_splits("2026-05-01", "2026-05-15") == []
