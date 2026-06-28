@@ -24,6 +24,9 @@ Two collection modes (selected via the ``source`` parameter):
     masks the failure. When an existing parquet is being overwritten
     (the yfinance EOD pass wrote first), per-ticker Close discrepancy
     is logged so corporate-action drift / data-quality issues are visible.
+    With ``skip_if_canonical=True`` (window mode) the polygon side skips
+    dates already fully polygon-canonical EXCEPT those a recent split
+    restated — see ``collect``'s ``skip_if_canonical`` doc (config#717).
 
   * ``auto`` (default, legacy) — historical behavior: polygon → FRED →
     yfinance fallback chain. Kept for backfill and one-shot scripts that
@@ -344,6 +347,120 @@ def _previous_business_days(run_date: str, n: int) -> list[str]:
     return dates
 
 
+def _polygon_date_fully_canonical(
+    existing_df: pd.DataFrame,
+    tickers: list[str],
+) -> bool:
+    """True iff every STOCK ticker in ``tickers`` is already polygon-canonical
+    in ``existing_df`` — i.e. present with ``source="polygon"`` and a non-null
+    ``Close`` (config#717).
+
+    Only equities are considered: the FRED-index macro tickers
+    (^TNX/^VIX/^IRX/^VIX3M) never come from polygon, so they neither block a
+    polygon skip nor get demoted by one. If the parquet predates the ``source``
+    column (legacy write), it can't be proven canonical → returns False so the
+    legacy always-fetch path is preserved. An empty stock universe is vacuously
+    canonical (nothing for polygon to fetch).
+    """
+    if "source" not in existing_df.columns:
+        return False
+    stock_tickers = [t for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP]
+    if not stock_tickers:
+        return True
+    index = set(str(t) for t in existing_df.index)
+    for t in stock_tickers:
+        store_key = t.lstrip("^")
+        if store_key not in index:
+            return False
+        row = existing_df.loc[store_key]
+        if row.get("source") != "polygon" or pd.isna(row.get("Close")):
+            return False
+    return True
+
+
+# config#717: a split with execution date E retroactively restates the polygon
+# *adjusted* close of every date STRICTLY BEFORE E. So the split-aware polygon
+# skip-canonical optimization must re-fetch any window date that a recently
+# executed split would have restated, even if that date's parquet is already
+# fully polygon-canonical. We only consider splits whose execution date is
+# recent enough to plausibly touch a trailing window — anything older than the
+# window's oldest date can't restate a date inside the window that isn't already
+# correct (the date that needed restating was healed when the split first
+# landed). A small forward buffer covers a split announced with a near-future
+# effective date that polygon already lists.
+_SPLIT_LOOKAHEAD_DAYS = 7
+
+
+def _fetch_recent_split_dates(
+    window_dates: list[str],
+    *,
+    client=None,
+) -> set[str]:
+    """Return the subset of ``window_dates`` whose polygon adjusted close a
+    recently executed split has retroactively restated (config#717).
+
+    A split executing on date E divides/multiplies the adjusted close of every
+    date strictly before E. We query polygon for ALL splits executing in the
+    window's span (plus a small forward buffer) in ONE call, then mark every
+    window date that falls strictly before any such split's execution date as
+    "touched" — those must be re-fetched so the stored adjusted close stays on
+    the current scale; the rest are safe to skip if already canonical.
+
+    On any failure (403, network, empty) returns an empty set — i.e. NOTHING is
+    marked touched. The caller's skip decision then degrades safely: a date is
+    skipped only when it is BOTH fully canonical AND not touched, so an empty
+    "touched" set just means the canonical-only check governs. (If a split is
+    silently missed, the existing per-fetch discrepancy logging on the dates
+    that ARE fetched, plus the next pass's coverage, remain the backstop.)
+    """
+    if not window_dates:
+        return set()
+    if client is None:
+        try:
+            from polygon_client import polygon_client
+
+            client = polygon_client()
+        except Exception as exc:  # import / construction failure — degrade
+            logger.warning(
+                "config#717: could not obtain polygon client for split scan "
+                "(%s) — proceeding without corporate-action skip protection",
+                _scrub_api_key(exc),
+            )
+            return set()
+    oldest = min(window_dates)
+    newest = max(window_dates)
+    lookahead = (
+        datetime.strptime(newest, "%Y-%m-%d") + timedelta(days=_SPLIT_LOOKAHEAD_DAYS)
+    ).strftime("%Y-%m-%d")
+    try:
+        splits = client.get_recent_splits(oldest, lookahead)
+    except Exception as exc:
+        logger.warning(
+            "config#717: polygon split scan failed (%s) — proceeding without "
+            "corporate-action skip protection (canonical-only skip still applies)",
+            _scrub_api_key(exc),
+        )
+        return set()
+    if not splits:
+        return set()
+    touched: set[str] = set()
+    for ev in splits:
+        e = ev.get("execution_date")
+        if not e:
+            continue
+        for d in window_dates:
+            if d < e:  # ISO dates compare lexicographically == chronologically
+                touched.add(d)
+    if touched:
+        logger.info(
+            "config#717: %d split event(s) in [%s..%s] restate %d window date(s) "
+            "— those will be re-fetched (not skipped): %s",
+            len(splits), oldest, lookahead, len(touched),
+            ", ".join(sorted(touched)),
+        )
+    return touched
+
+
 def collect(
     bucket: str,
     tickers: list[str],
@@ -354,6 +471,7 @@ def collect(
     window_days: int = 1,
     skip_if_canonical: bool = False,
     fred_window_cache: dict[str, list[tuple[str, float]]] | None = None,
+    split_touched_dates: set[str] | None = None,
     equities_source: str = "polygon",
     index_source: str = "fred",
     fallback_source: str = "yfinance",
@@ -398,18 +516,37 @@ def collect(
                     cells that are NaN. Coverage gate evaluates the
                     merged-output denominator (existing canonical rows
                     contribute as if freshly fetched).
-                  - ``polygon_only`` mode: flag is *ignored*. Per
-                    2026-05-10 design decision (option a) polygon always
-                    re-overwrites within the window — this catches
-                    corporate-action backfills that retroactively shift
-                    polygon's adjusted close. The 14/day grouped-daily
-                    contract still holds because polygon makes one call
-                    per date in the window regardless of skip behavior.
+                  - ``polygon_only`` mode (config#717): the flag is now
+                    HONORED, split-aware. A date is skipped (no polygon
+                    grouped-daily call) iff its parquet is already fully
+                    polygon-canonical (every stock ticker present with
+                    ``source="polygon"`` + non-null ``Close``) AND no
+                    recently executed corporate action restated it. A
+                    split with execution date E retroactively divides /
+                    multiplies the adjusted close of every date BEFORE E,
+                    so those dates are re-fetched even when canonical;
+                    ``split_touched_dates`` carries the set of such dates
+                    (detected via the polygon splits endpoint, one
+                    range-scoped call per window). The discrepancy-logging
+                    / coalesce path stays intact for the dates that ARE
+                    fetched. Previously (option a) polygon blanket-ignored
+                    the flag and re-fetched every date — the 2026-06-03
+                    30-min-timeout root cause.
                   - ``auto`` mode: flag applied to the yfinance step
                     only; polygon step always runs.
 
                 Default False preserves legacy single-date overwrite
                 semantics for non-window callers.
+        split_touched_dates: set[str] | None = None
+                config#717. The set of dates a recently executed corporate
+                action (split) restated — these are re-fetched by the
+                polygon_only skip-canonical path even when their parquet is
+                already canonical. Computed once per window by
+                ``_collect_window`` (one range-scoped polygon splits call)
+                and threaded into each per-date ``collect``. A standalone
+                single-date polygon_only + skip_if_canonical caller computes
+                it inline. ``None`` ⇒ treated as "nothing touched" (the
+                canonical-only check then governs).
 
     Returns:
         Single-date mode (``window_days=1``): dict with ``status``,
@@ -462,6 +599,19 @@ def collect(
             fallback_source=fallback_source,
         )
 
+    # Single-date split-aware skip protection: when a window caller drives
+    # per-date collect()s it passes ``split_touched_dates`` down (computed once
+    # for the whole window). A standalone single-date polygon_only +
+    # skip_if_canonical caller (rare) computes it here for just this date so the
+    # corporate-action guard is never bypassed.
+    if (
+        source == "polygon_only"
+        and skip_if_canonical
+        and split_touched_dates is None
+        and window_days == 1
+    ):
+        split_touched_dates = _fetch_recent_split_dates([run_date])
+
     s3 = boto3.client("s3")
     key = f"{s3_prefix}{run_date}.parquet"
 
@@ -506,6 +656,14 @@ def collect(
             # rows means we fall back to the legacy destructive overwrite, so
             # warn loudly. The coverage gate still runs on the FRESH fetch, so
             # a real polygon outage is not masked by retained rows.
+            #
+            # config#717: split-aware skip-canonical. When skip_if_canonical=True
+            # the polygon side ALSO skips a date whose parquet is already fully
+            # polygon-canonical (every stock ticker has source="polygon" + a
+            # non-null Close) — EXCEPT dates a recent corporate action restated
+            # (``split_touched_dates``), which must be re-fetched so the stored
+            # adjusted close stays on the current scale. Mirrors the yfinance
+            # side's canonical-skip structure for consistency.
             try:
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 existing_df = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
@@ -523,6 +681,32 @@ def collect(
                     "will coalesce (retain-on-empty, priority-ranked) and log Close discrepancies",
                     last_modified.isoformat(), len(existing_close_for_discrepancy),
                 )
+                if skip_if_canonical and not dry_run:
+                    touched = split_touched_dates or set()
+                    is_touched = run_date in touched
+                    fully_canonical = _polygon_date_fully_canonical(
+                        existing_df, tickers,
+                    )
+                    if fully_canonical and not is_touched:
+                        logger.info(
+                            "[skip_if_canonical] polygon_only %s: parquet fully "
+                            "polygon-canonical and no recent corporate action "
+                            "restates it — skipping polygon re-fetch (saves one "
+                            "grouped-daily call)",
+                            run_date,
+                        )
+                        return {
+                            "status": "ok",
+                            "tickers_captured": 0,
+                            "skipped": True,
+                            "skipped_reason": "polygon_canonical",
+                            "source": source,
+                        }
+                    logger.info(
+                        "[skip_if_canonical] polygon_only %s: re-fetching "
+                        "(fully_canonical=%s, corporate_action_touched=%s)",
+                        run_date, fully_canonical, is_touched,
+                    )
             except Exception as exc:
                 logger.warning(
                     "polygon_only: failed to read existing parquet for coalesce/discrepancy "
@@ -852,8 +1036,15 @@ def _collect_window(
     ``skip_if_canonical=True`` propagates to every per-date call so the
     yfinance side skips tickers that already have an authoritative
     source in the existing parquet — keeps steady-state yfinance batch
-    cost near zero across the window. Polygon side ignores the flag
-    (option a, always overwrites).
+    cost near zero across the window. The polygon side now honors the
+    flag too (config#717): a date whose parquet is already fully
+    polygon-canonical is skipped (no grouped-daily call) UNLESS a
+    recently executed split restated its adjusted close. Those
+    corporate-action-touched dates are detected once for the whole
+    window via a single range-scoped polygon splits call
+    (``_fetch_recent_split_dates``) and threaded into each per-date
+    ``collect`` as ``split_touched_dates`` so the per-date polygon cost
+    drops to "only the dates that actually changed".
 
     Returns an aggregate dict; see ``collect`` docstring's "Window mode"
     return-shape section for the schema.
@@ -875,6 +1066,16 @@ def _collect_window(
             datetime.strptime(_oldest, "%Y-%m-%d") - timedelta(days=10)
         ).strftime("%Y-%m-%d")
         fred_window_cache = _fetch_fred_window(fred_tickers, _start, window_dates[0])
+    # ── config#717: scan corporate actions once for the whole window ─────────
+    # polygon_only + skip_if_canonical skips already-canonical dates to save the
+    # per-date grouped-daily call (the 2026-06-03 30-min-timeout root cause),
+    # but a split retroactively restates the adjusted close of every date before
+    # its execution date — those MUST be re-fetched. One range-scoped splits
+    # call covers the whole window (no per-date corporate-action I/O). Only run
+    # when the optimization is actually active.
+    split_touched_dates: set[str] | None = None
+    if source == "polygon_only" and skip_if_canonical and not dry_run:
+        split_touched_dates = _fetch_recent_split_dates(window_dates)
     # The newest date in the window is the TARGET date — the one
     # downstream (predictor inference / eod_reconcile) actually reads.
     # The older dates are best-effort *historical backfill*: a per-date
@@ -924,6 +1125,7 @@ def _collect_window(
                 window_days=1,
                 skip_if_canonical=skip_if_canonical,
                 fred_window_cache=fred_window_cache,  # L4492: 1 ranged call/series
+                split_touched_dates=split_touched_dates,  # config#717
                 equities_source=equities_source,
                 index_source=index_source,
                 fallback_source=fallback_source,

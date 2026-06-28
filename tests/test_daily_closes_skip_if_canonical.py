@@ -277,59 +277,206 @@ class TestSkipCanonicalYfinanceOnly:
         assert result.get("status") == "ok"
 
 
-# ── skip_if_canonical=True with polygon_only (option a — flag ignored) ──────
+# ── skip_if_canonical=True with polygon_only (config#717: split-aware skip) ──
 
 
-class TestSkipCanonicalPolygonOnlyIgnoresFlag:
-    """polygon_only mode ignores skip_if_canonical per option (a) —
-    polygon always overwrites within the window so corporate-action
-    backfills are absorbed. The 14/day grouped-daily contract still
-    holds because polygon makes one call per date regardless of
-    skip behavior."""
+def _polygon_side_factory(polygon_calls: list, close: float = 99.0):
+    """A ``_fetch_polygon_closes`` stand-in that records each call's date and
+    appends a fresh polygon row per ticker."""
 
-    def test_polygon_only_does_not_skip_canonical_polygon_tickers(self):
-        """Existing parquet has polygon-source rows — polygon_only mode
-        should still fetch every date in the window, ignoring the
-        skip flag."""
+    def _polygon_side(tickers, run_date, records, source):
+        polygon_calls.append(run_date)
+        for t in tickers:
+            records.append({
+                "ticker": t.lstrip("^"), "date": run_date,
+                "Open": close, "High": close, "Low": close, "Close": close,
+                "Adj_Close": close, "Volume": 1, "VWAP": close,
+                "source": "polygon",
+            })
+        return len(tickers)
+
+    return _polygon_side
+
+
+class TestSkipCanonicalPolygonOnlySplitAware:
+    """config#717: polygon_only + skip_if_canonical now skips a date whose
+    parquet is already fully polygon-canonical, EXCEPT dates a recently
+    executed split restated (those re-fetch so the adjusted close stays on
+    the current scale). Root-cause fix for the 2026-06-03 30-min timeout —
+    polygon previously blanket-ignored the flag and re-fetched every date."""
+
+    def test_skips_clean_canonical_polygon_date(self):
+        """All stock tickers polygon-canonical + no recent split → skip the
+        polygon grouped-daily call entirely."""
         s3 = _existing_parquet_with_sources({
             "AAPL": {"Close": 150.0, "source": "polygon"},
             "MSFT": {"Close": 300.0, "source": "polygon"},
         })
         polygon_calls: list = []
-
-        def _polygon_side(tickers, run_date, records, source):
-            polygon_calls.append(run_date)
-            for t in tickers:
-                records.append({
-                    "ticker": t.lstrip("^"), "date": run_date,
-                    "Open": 99.0, "High": 99.0, "Low": 99.0, "Close": 99.0,
-                    "Adj_Close": 99.0, "Volume": 1, "VWAP": 99.0,
-                    "source": "polygon",
-                })
-            return len(tickers)
-
         with patch("collectors.daily_closes.boto3.client", return_value=s3):
             with patch.object(
-                daily_closes, "_fetch_polygon_closes", side_effect=_polygon_side,
+                daily_closes, "_fetch_polygon_closes",
+                side_effect=_polygon_side_factory(polygon_calls),
             ), patch.object(
                 daily_closes, "_fetch_yfinance_closes", return_value=0
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_recent_split_dates", return_value=set(),
+            ):
+                result = daily_closes.collect(
+                    bucket="b", tickers=["AAPL", "MSFT"],
+                    run_date="2026-05-08",
+                    source="polygon_only", skip_if_canonical=True,
+                )
+        # Skipped: no polygon fetch, no S3 write, status ok+skipped.
+        assert polygon_calls == []
+        s3.put_object.assert_not_called()
+        assert result.get("skipped") is True
+        assert result.get("skipped_reason") == "polygon_canonical"
+
+    def test_refetches_date_touched_by_split(self):
+        """A split restating this date (date < execution_date) forces a
+        re-fetch even though the parquet is fully canonical."""
+        s3 = _existing_parquet_with_sources({
+            "AAPL": {"Close": 1500.0, "source": "polygon"},  # pre-split price
+            "MSFT": {"Close": 300.0, "source": "polygon"},
+        })
+        polygon_calls: list = []
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes",
+                side_effect=_polygon_side_factory(polygon_calls),
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_recent_split_dates",
+                return_value={"2026-05-08"},  # AAPL 10:1 executed after this date
+            ):
+                result = daily_closes.collect(
+                    bucket="b", tickers=["AAPL", "MSFT"],
+                    run_date="2026-05-08",
+                    source="polygon_only", skip_if_canonical=True,
+                )
+        # Re-fetched: one grouped-daily call, parquet rewritten with split-
+        # adjusted close.
+        assert polygon_calls == ["2026-05-08"]
+        assert result.get("skipped") is not True
+        out_df = pd.read_parquet(
+            io.BytesIO(s3.put_object.call_args.kwargs["Body"]), engine="pyarrow",
+        )
+        assert out_df.loc["AAPL", "Close"] == 99.0  # fresh restated value
+
+    def test_refetches_when_split_touched_dates_passed_directly(self):
+        """The window path threads ``split_touched_dates`` down — verify the
+        per-date collect honors it (and does not re-scan splits itself)."""
+        s3 = _existing_parquet_with_sources({
+            "AAPL": {"Close": 1500.0, "source": "polygon"},
+        })
+        polygon_calls: list = []
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes",
+                side_effect=_polygon_side_factory(polygon_calls),
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_recent_split_dates",
+            ) as scan_mock:
+                daily_closes.collect(
+                    bucket="b", tickers=["AAPL"],
+                    run_date="2026-05-08",
+                    source="polygon_only", skip_if_canonical=True,
+                    split_touched_dates={"2026-05-08"},
+                )
+        # split_touched_dates supplied → no inline split scan, and re-fetched.
+        scan_mock.assert_not_called()
+        assert polygon_calls == ["2026-05-08"]
+
+    def test_refetches_non_canonical_date(self):
+        """A ticker missing polygon source (legacy yfinance row) means the
+        date is NOT fully polygon-canonical → re-fetch even with no split."""
+        s3 = _existing_parquet_with_sources({
+            "AAPL": {"Close": 150.0, "source": "polygon"},
+            "MSFT": {"Close": 300.0, "source": "yfinance"},  # not polygon
+        })
+        polygon_calls: list = []
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes",
+                side_effect=_polygon_side_factory(polygon_calls),
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_recent_split_dates", return_value=set(),
             ):
                 daily_closes.collect(
                     bucket="b", tickers=["AAPL", "MSFT"],
                     run_date="2026-05-08",
                     source="polygon_only", skip_if_canonical=True,
                 )
-        # Polygon was called once (one grouped-daily for the date) and
-        # fetched both tickers regardless of their canonical state.
-        assert len(polygon_calls) == 1
-        # Verify the output overwrote the existing rows with fresh polygon data.
-        put_call = s3.put_object.call_args
-        out_df = pd.read_parquet(io.BytesIO(put_call.kwargs["Body"]), engine="pyarrow")
-        # Fresh polygon data has Close=99 (vs existing 150/300).
-        assert out_df.loc["AAPL", "Close"] == 99.0
-        assert out_df.loc["MSFT", "Close"] == 99.0
+        assert polygon_calls == ["2026-05-08"]
+
+    def test_first_fetch_no_existing_parquet_still_works(self):
+        """No existing parquet (first fetch) → polygon must fetch + write,
+        skip logic never triggers."""
+        s3 = MagicMock()
+        s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404"}}, "HeadObject",
+        )
+        s3.put_object.return_value = {"ETag": '"abc"'}
+        polygon_calls: list = []
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes",
+                side_effect=_polygon_side_factory(polygon_calls),
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_recent_split_dates", return_value=set(),
+            ):
+                result = daily_closes.collect(
+                    bucket="b", tickers=["AAPL", "MSFT"],
+                    run_date="2026-05-08",
+                    source="polygon_only", skip_if_canonical=True,
+                )
+        assert polygon_calls == ["2026-05-08"]
+        assert result.get("status") == "ok"
+        assert result.get("skipped") is not True
+
+    def test_legacy_default_polygon_overwrites_without_flag(self):
+        """skip_if_canonical=False (default) preserves the legacy overwrite —
+        polygon always re-fetches, no split scan."""
+        s3 = _existing_parquet_with_sources({
+            "AAPL": {"Close": 150.0, "source": "polygon"},
+        }, last_modified=datetime(2026, 5, 7, 21, 0, 0, tzinfo=timezone.utc))
+        polygon_calls: list = []
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes",
+                side_effect=_polygon_side_factory(polygon_calls),
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_recent_split_dates",
+            ) as scan_mock:
+                daily_closes.collect(
+                    bucket="b", tickers=["AAPL"],
+                    run_date="2026-05-08",
+                    source="polygon_only",  # skip_if_canonical defaults False
+                )
+        assert polygon_calls == ["2026-05-08"]
+        scan_mock.assert_not_called()
 
 
 # ── Read-failure fallback ───────────────────────────────────────────────────
@@ -412,3 +559,117 @@ class TestSkipCanonicalDefaultsFalse:
         # Legacy short-circuit: no yfinance call, returns "skipped".
         yf_mock.assert_not_called()
         assert result.get("skipped") is True
+
+
+# ── config#717 helper unit tests ────────────────────────────────────────────
+
+
+class TestPolygonDateFullyCanonical:
+    def test_all_polygon_canonical_returns_true(self):
+        df = pd.DataFrame(
+            [{"Close": 1.0, "source": "polygon"},
+             {"Close": 2.0, "source": "polygon"}],
+            index=pd.Index(["AAPL", "MSFT"], name="ticker"),
+        )
+        assert daily_closes._polygon_date_fully_canonical(df, ["AAPL", "MSFT"]) is True
+
+    def test_missing_ticker_returns_false(self):
+        df = pd.DataFrame(
+            [{"Close": 1.0, "source": "polygon"}],
+            index=pd.Index(["AAPL"], name="ticker"),
+        )
+        assert daily_closes._polygon_date_fully_canonical(df, ["AAPL", "MSFT"]) is False
+
+    def test_non_polygon_source_returns_false(self):
+        df = pd.DataFrame(
+            [{"Close": 1.0, "source": "yfinance"}],
+            index=pd.Index(["AAPL"], name="ticker"),
+        )
+        assert daily_closes._polygon_date_fully_canonical(df, ["AAPL"]) is False
+
+    def test_nan_close_returns_false(self):
+        df = pd.DataFrame(
+            [{"Close": float("nan"), "source": "polygon"}],
+            index=pd.Index(["AAPL"], name="ticker"),
+        )
+        assert daily_closes._polygon_date_fully_canonical(df, ["AAPL"]) is False
+
+    def test_no_source_column_returns_false(self):
+        df = pd.DataFrame(
+            [{"Close": 1.0}], index=pd.Index(["AAPL"], name="ticker"),
+        )
+        assert daily_closes._polygon_date_fully_canonical(df, ["AAPL"]) is False
+
+    def test_index_tickers_do_not_block_skip(self):
+        """FRED-index macro tickers never come from polygon — they must not
+        block a polygon skip nor be required to have source='polygon'."""
+        df = pd.DataFrame(
+            [{"Close": 1.0, "source": "polygon"},
+             {"Close": 20.0, "source": "fred"}],
+            index=pd.Index(["AAPL", "VIX"], name="ticker"),
+        )
+        # ^VIX is a FRED-index ticker; only AAPL (equity) must be polygon.
+        assert daily_closes._polygon_date_fully_canonical(df, ["AAPL", "^VIX"]) is True
+
+    def test_empty_stock_universe_vacuously_canonical(self):
+        df = pd.DataFrame(
+            [{"Close": 20.0, "source": "fred"}],
+            index=pd.Index(["VIX"], name="ticker"),
+        )
+        assert daily_closes._polygon_date_fully_canonical(df, ["^VIX"]) is True
+
+
+class TestFetchRecentSplitDates:
+    def test_marks_dates_before_split_execution(self):
+        client = MagicMock()
+        client.get_recent_splits.return_value = [
+            {"ticker": "AAPL", "execution_date": "2026-05-09",
+             "split_from": 1, "split_to": 10},
+        ]
+        window = ["2026-05-11", "2026-05-08", "2026-05-07"]  # newest-first
+        touched = daily_closes._fetch_recent_split_dates(window, client=client)
+        # Dates strictly before 2026-05-09 are restated.
+        assert touched == {"2026-05-08", "2026-05-07"}
+        # One range-scoped call covering [oldest .. newest+lookahead].
+        assert client.get_recent_splits.call_count == 1
+        args = client.get_recent_splits.call_args.args
+        assert args[0] == "2026-05-07"  # oldest
+
+    def test_no_splits_returns_empty(self):
+        client = MagicMock()
+        client.get_recent_splits.return_value = []
+        touched = daily_closes._fetch_recent_split_dates(
+            ["2026-05-08"], client=client,
+        )
+        assert touched == set()
+
+    def test_split_after_whole_window_touches_all(self):
+        client = MagicMock()
+        client.get_recent_splits.return_value = [
+            {"ticker": "X", "execution_date": "2026-06-01",
+             "split_from": 1, "split_to": 2},
+        ]
+        window = ["2026-05-09", "2026-05-08"]
+        touched = daily_closes._fetch_recent_split_dates(window, client=client)
+        assert touched == {"2026-05-09", "2026-05-08"}
+
+    def test_split_predating_window_touches_nothing(self):
+        client = MagicMock()
+        client.get_recent_splits.return_value = [
+            {"ticker": "X", "execution_date": "2026-05-07",
+             "split_from": 1, "split_to": 2},
+        ]
+        window = ["2026-05-09", "2026-05-08"]
+        touched = daily_closes._fetch_recent_split_dates(window, client=client)
+        assert touched == set()
+
+    def test_scan_failure_degrades_to_empty(self):
+        client = MagicMock()
+        client.get_recent_splits.side_effect = RuntimeError("polygon down")
+        touched = daily_closes._fetch_recent_split_dates(
+            ["2026-05-08"], client=client,
+        )
+        assert touched == set()
+
+    def test_empty_window_returns_empty(self):
+        assert daily_closes._fetch_recent_split_dates([]) == set()

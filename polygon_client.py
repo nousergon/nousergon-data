@@ -315,6 +315,57 @@ class PolygonClient:
         results.sort(key=lambda r: r["execution_date"])
         return results
 
+    def get_recent_splits(self, start_date: str, end_date: str) -> list[dict]:
+        """Fetch ALL corporate splits executing in ``[start_date, end_date]``.
+
+        Unlike :meth:`get_splits` (one ticker, full history), this queries the
+        ``/v3/reference/splits`` endpoint by ``execution_date`` range WITHOUT a
+        ticker filter — so the whole market's splits in a window come back in
+        ONE call (the endpoint paginates; we take the first page, ample for the
+        handful of splits that execute in a ~2-week window). This is what lets
+        the daily-closes polygon window skip already-canonical dates while still
+        re-fetching dates whose adjusted close a recent split has restated
+        (config#717), at a bounded one-call-per-window cost.
+
+        Returns ``[{"ticker": str, "execution_date": "YYYY-MM-DD",
+        "split_from": int, "split_to": int}]`` sorted ascending by date. A
+        forward N-for-1 split is ``split_from=1, split_to=N``; a reverse 1-for-N
+        split is ``split_from=N, split_to=1``. Malformed rows are skipped; a 403
+        (free-tier / bad key) returns ``[]`` so the caller degrades to the
+        legacy always-fetch behavior rather than hard-failing the window.
+        """
+        results: list[dict] = []
+        try:
+            data = self._get(
+                "/v3/reference/splits",
+                params={
+                    "execution_date.gte": start_date,
+                    "execution_date.lte": end_date,
+                    "limit": 1000,
+                    "order": "asc",
+                    "sort": "execution_date",
+                },
+            )
+        except PolygonForbiddenError:
+            return []
+        for r in data.get("results", []) or []:
+            exec_date = r.get("execution_date")
+            sf = r.get("split_from")
+            st = r.get("split_to")
+            ticker = r.get("ticker")
+            if not exec_date or not sf or not st or not ticker:
+                continue
+            results.append(
+                {
+                    "ticker": str(ticker),
+                    "execution_date": str(exec_date),
+                    "split_from": int(sf),
+                    "split_to": int(st),
+                }
+            )
+        results.sort(key=lambda r: r["execution_date"])
+        return results
+
     def get_daily_bars(
         self,
         ticker: str,
