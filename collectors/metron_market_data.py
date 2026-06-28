@@ -43,7 +43,7 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
-from collectors.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
+from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
 
 logger = logging.getLogger(__name__)
 
@@ -237,10 +237,11 @@ def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[
 # ── yfinance fetchers (default sources) ─────────────────────────────────────
 #
 # The yfinance log-noise chokepoint (quiet_yfinance / yf_quiet / log_yf_coverage)
-# lives in collectors/yfinance_quiet.py — an in-repo single source of truth since
-# the same bug class recurred through collectors/prices.py (2026-06-19, config#1029
-# follow-up). The underscored names below are kept as thin backward-compat aliases
-# so existing call sites + tests read unchanged.
+# now lives in the cross-repo source of truth nousergon_lib.yfinance_quiet (krepis),
+# lifted out of the former in-repo collectors/yfinance_quiet.py once the same bug
+# class recurred through collectors/prices.py (2026-06-19, config#1029 follow-up;
+# config#1161). The underscored names below are kept as thin backward-compat
+# aliases so existing call sites + tests read unchanged.
 
 _quiet_yfinance = quiet_yfinance
 _yf_quiet = yf_quiet
@@ -261,7 +262,7 @@ def _log_yf_coverage(
     *,
     error_on_empty: bool = False,
 ) -> None:
-    """Metron wrapper over :func:`yfinance_quiet.log_yf_coverage` (config#1029)."""
+    """Metron wrapper over :func:`nousergon_lib.yfinance_quiet.log_yf_coverage` (config#1029)."""
     log_yf_coverage(
         logger, kind, requested, covered,
         error_on_empty=error_on_empty, note=_METRON_COVERAGE_NOTE,
