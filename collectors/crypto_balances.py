@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -55,6 +56,17 @@ _COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 # chain → (CoinGecko id, display symbol)
 _COIN = {"BTC": ("bitcoin", "BTC"), "ETH": ("ethereum", "ETH")}
 
+# BTC extended-public-key (HD wallet) support. A single BTC address is NOT the wallet balance
+# — funds are spread across many addresses derived from one seed — so a self-custody wallet is
+# tracked by its xpub/ypub/zpub, from which we derive + sum every address. Prefix → BIP script
+# type: xpub=BIP44 legacy P2PKH, ypub=BIP49 P2SH-P2WPKH, zpub=BIP84 native-segwit P2WPKH.
+_XPUB_PREFIXES = ("xpub", "ypub", "zpub")
+# Gap limit: stop a branch after this many consecutive unused (tx_count==0) addresses (BIP44).
+_GAP_LIMIT = 20
+# Small politeness delay between per-address Esplora queries during a gap-limit scan, so a
+# many-address wallet doesn't trip the public providers' rate limits.
+_SCAN_DELAY_S = 0.05
+
 
 # ── HTTP via stdlib (no third-party dep → a dependency-free Lambda zip, no platform wheels) ─
 
@@ -79,18 +91,73 @@ def _post_json(url: str, payload: dict) -> Any:
 # ── Chain balance fetchers (injectable for tests) ───────────────────────────────────────
 
 
-def fetch_btc_balance(address: str) -> float:
-    """Confirmed BTC balance for ``address`` (funded − spent txo sums, sats → BTC). Tries each
-    Esplora provider in order; raises only if all fail (caught by the per-address fail-soft)."""
+def _is_extended_key(s: str) -> bool:
+    """True if ``s`` is a BTC extended public key (HD wallet) rather than a plain address."""
+    return s[:4] in _XPUB_PREFIXES
+
+
+def _esplora_address_stats(address: str) -> tuple[int, int, int]:
+    """``(funded_sats, spent_sats, tx_count)`` (confirmed) for a single BTC address, trying each
+    Esplora provider in order. Raises only if all fail (caught by the per-address fail-soft)."""
     last_err: Exception | None = None
     for base in _BTC_ESPLORA:
         try:
             cs = _get_json(f"{base}/address/{address}").get("chain_stats", {})
-            sats = int(cs.get("funded_txo_sum", 0)) - int(cs.get("spent_txo_sum", 0))
-            return sats / 1e8
+            return (
+                int(cs.get("funded_txo_sum", 0)),
+                int(cs.get("spent_txo_sum", 0)),
+                int(cs.get("tx_count", 0)),
+            )
         except Exception as e:  # noqa: BLE001 - try the next provider
             last_err = e
     raise RuntimeError(f"all BTC providers failed; last: {last_err}")
+
+
+def fetch_btc_balance(address: str) -> float:
+    """Confirmed BTC balance, in BTC. Dispatches: an extended public key (xpub/ypub/zpub) is an
+    HD wallet → derive + sum all its addresses; otherwise a single address (funded − spent)."""
+    if _is_extended_key(address):
+        return fetch_btc_xpub_balance(address)
+    funded, spent, _ = _esplora_address_stats(address)
+    return (funded - spent) / 1e8
+
+
+def _xpub_address_fn(xpub: str):
+    """Return ``child_hdkey -> address`` for the script type implied by the key's prefix
+    (xpub→P2PKH, ypub→P2SH-P2WPKH, zpub→P2WPKH). Imports embit lazily so the module loads
+    without the dep (only the xpub path needs it)."""
+    from embit import script
+
+    prefix = xpub[:4]
+    if prefix == "zpub":
+        return lambda c: script.p2wpkh(c).address()
+    if prefix == "ypub":
+        return lambda c: script.p2sh(script.p2wpkh(c)).address()
+    return lambda c: script.p2pkh(c).address()  # xpub (legacy)
+
+
+def fetch_btc_xpub_balance(xpub: str, *, gap_limit: int = _GAP_LIMIT) -> float:
+    """Total confirmed BTC across an HD wallet, in BTC. Derives addresses on both the receive
+    (0) and change (1) branches and sums their balances, extending each branch until
+    ``gap_limit`` consecutive unused (tx_count==0) addresses — the standard HD-wallet scan.
+    Derivation is client-side (trustless) via embit, verified against the BIP84 test vector."""
+    from embit import bip32
+
+    root = bip32.HDKey.from_string(xpub)
+    to_addr = _xpub_address_fn(xpub)
+    total_sats = 0
+    for branch in (0, 1):  # external (receive) + internal (change)
+        gap = 0
+        i = 0
+        while gap < gap_limit:
+            address = to_addr(root.derive([branch, i]))
+            funded, spent, tx_count = _esplora_address_stats(address)
+            total_sats += funded - spent
+            gap = 0 if tx_count else gap + 1
+            i += 1
+            if _SCAN_DELAY_S:
+                time.sleep(_SCAN_DELAY_S)
+    return total_sats / 1e8
 
 
 def fetch_eth_balance(address: str) -> float:
