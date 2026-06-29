@@ -1,6 +1,6 @@
 """alpha-engine-eod-backstop — same-day EOD-pipeline trigger of last resort.
 
-The EOD Step Function (``alpha-engine-eod-pipeline``) is normally started by
+The EOD Step Function (``ne-postclose-trading-pipeline``) is normally started by
 the trading daemon's shutdown hook (``daemon.py`` finally block). That is the
 SOLE trigger — a deliberate "no-backstop design". If the daemon dies before
 its shutdown hook, the SSM ``RunDaemon`` step never reaches the finally block,
@@ -57,7 +57,7 @@ ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
 
 EOD_SF_ARN = os.environ.get(
     "EOD_SF_ARN",
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline",
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
 )
 # The trading box (CaptureSnapshot / EODReconcile / StopTradingInstance target)
 # and the dashboard box (DailySubstrateHealthCheck target). Mirror the daemon's

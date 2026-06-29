@@ -42,11 +42,12 @@ _PINNED_SECRETS = frozenset(
     ]
 )
 
-# Files that are explicitly allowed to read secrets via os.environ — the
-# legacy ssm_secrets.py bulk-load shim is the only one; it covers
-# non-migrated reads in this repo and other repos pending PRs 3-7. The
-# shim itself is removed in PR 9 of the arc.
-_ALLOWED_FILES = frozenset(["ssm_secrets.py"])
+# Files that are explicitly allowed to read secrets via os.environ. The
+# legacy ``ssm_secrets.py`` bulk-load shim was the only entry; it was removed
+# in PR 9 of the .env→SSM arc (config#890), so the allowlist is now empty and
+# the invariant applies to every module. Re-add a filename here only if a new
+# deliberate shim is ever introduced.
+_ALLOWED_FILES: frozenset[str] = frozenset()
 
 _ENV_READ_RE = re.compile(
     r'os\.(?:environ\.get|getenv)\(\s*["\']([A-Z_][A-Z0-9_]*)["\']'

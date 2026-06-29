@@ -80,7 +80,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data
+from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
@@ -392,6 +392,46 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
     elif only in (None, "short_interest") and not si_enabled:
         logger.info("short_interest collector disabled via config — skipping")
         results["collectors"]["short_interest"] = {"status": "ok", "skipped": "disabled_in_config"}
+
+    # ── 4c. Universe classification ──────────────────────────────────────────
+    # Per-ticker yfinance Ticker.info scrape for sector/country-of-domicile/
+    # industry over the full S&P 500+400 universe — the country dimension the
+    # ~900-stock universe scoreboard (crucible-research scoring/universe_board.py)
+    # filters on alongside sector and the factor/valuation metrics. Domicile is
+    # near-static, so the weekly Saturday cadence is ample; the artifact is a
+    # single latest.json (+ dated copy). ~10 min on the spot off the constituents
+    # list already fetched earlier in this phase.
+    #
+    # Gated by config["universe_classification"]["enabled"] (default True), same
+    # soft-launch pattern as short_interest: flip enabled=false to run once
+    # manually with --only universe_classification, then back to true once stable.
+    uc_cfg = config.get("universe_classification", {})
+    uc_enabled = uc_cfg.get("enabled", True)
+    if only in (None, "universe_classification") and uc_enabled:
+        logger.info("=" * 60)
+        logger.info("COLLECTING: universe classification")
+        logger.info("=" * 60)
+        if not tickers:
+            logger.warning("No tickers available — skipping universe classification")
+            results["collectors"]["universe_classification"] = {
+                "status": "skipped", "reason": "no tickers",
+            }
+        else:
+            results["collectors"]["universe_classification"] = _phase_collect(
+                reg, "universe_classification",
+                lambda: universe_classification.collect(
+                    bucket=bucket,
+                    tickers=tickers,
+                    s3_prefix=market_prefix,
+                    run_date=run_date,
+                    inter_request_delay=uc_cfg.get("inter_request_delay", 0.4),
+                    dry_run=dry_run,
+                ),
+                artifact_key=f"{market_prefix}universe_classification/{run_date}.json",
+            )
+    elif only in (None, "universe_classification") and not uc_enabled:
+        logger.info("universe_classification collector disabled via config — skipping")
+        results["collectors"]["universe_classification"] = {"status": "ok", "skipped": "disabled_in_config"}
 
     # ── 5. Universe returns ──────────────────────────────────────────────────
     if only in (None, "universe_returns"):
@@ -2589,7 +2629,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "macro", "short_interest", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
+        choices=["constituents", "prices", "macro", "short_interest", "universe_classification", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
     )
     # Phase-registry recovery controls (L4528 — markers under data/{date}/.phases/).

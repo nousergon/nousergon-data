@@ -15,14 +15,14 @@ plan doc §3.5.
 
 **Per-SF watchdog semantics:**
 
-  - **Weekday SF** (``alpha-engine-weekday-pipeline``)
+  - **Weekday SF** (``ne-preopen-trading-pipeline``)
       Watch-day: TODAY is a trading day. If trading_calendar reports that
       ``last_closed_trading_day(now_utc).date() == now_utc.date() - 1``
       (i.e., the prior calendar day was a trading session), the Weekday SF
       should have fired today by 13:00 UTC. Alert if 0 executions started
       in the last 24h.
 
-  - **EOD SF** (``alpha-engine-eod-pipeline``)
+  - **EOD SF** (``ne-postclose-trading-pipeline``)
       Watch-day: same condition as Weekday — EOD fires after the trading
       day's daemon shutdown, which only happens on trading days. Window
       is TRADING-DAY-AWARE, NOT a fixed 24h calendar window: today's EOD
@@ -36,7 +36,7 @@ plan doc §3.5.
       the 2026-05-26 morning false-positive Telegram alert that drove
       this fix.
 
-  - **Saturday SF** (``alpha-engine-saturday-pipeline``)
+  - **Saturday SF** (``ne-weekly-freshness-pipeline``)
       Watch-day: TODAY is Sunday (weekday 6) — Saturday SF fires at 09:00
       UTC Saturday; by Sunday 14:00 UTC any missed firing is 24+h overdue.
       Alert if 0 executions started in the last 7 days. (One CW alarm with
@@ -98,13 +98,13 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
 
 SATURDAY_SF_ARN = (
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline"
 )
 WEEKDAY_SF_ARN = (
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
 )
 EOD_SF_ARN = (
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
 )
 
 # Watchdog-specific SNS topic — distinct from `alpha-engine-alerts` per

@@ -13,9 +13,9 @@ SF JSON definitions.
 
 | SF | Source ARN suffix | Pretty label |
 | --- | --- | --- |
-| Saturday weekly pipeline | `alpha-engine-saturday-pipeline` | `Saturday SF` |
-| Weekday daily pipeline   | `alpha-engine-weekday-pipeline`  | `Weekday SF` |
-| EOD post-market pipeline | `alpha-engine-eod-pipeline`      | `EOD SF` |
+| Saturday weekly pipeline | `ne-weekly-freshness-pipeline` | `Saturday SF` |
+| Weekday daily pipeline   | `ne-preopen-trading-pipeline`  | `Weekday SF` |
+| EOD post-market pipeline | `ne-postclose-trading-pipeline`      | `EOD SF` |
 
 | Status | Emoji | Push? | Extra detail |
 | --- | --- | --- | --- |

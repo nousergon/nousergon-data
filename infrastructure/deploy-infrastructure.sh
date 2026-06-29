@@ -106,37 +106,65 @@ aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json
 aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
-# ── 3. Update Step Functions directly ────────────────────────────────────────
+# ── 3. Update Step Function definitions (existence-aware) ────────────────────
+# Push the stamped ASL to each live state machine. CFN owns CREATION of the two
+# CFN-managed SFs (weekly-freshness, preopen-trading) via DefinitionS3Location —
+# on a fresh stack OR a StateMachineName change (a CFN replacement) it reads the
+# S3 copy uploaded in step 2. So here: UPDATE the SF if it exists, and for the
+# CFN pair SKIP-if-absent (CFN creates it in step 4 from S3). The post-close
+# (EOD) SF is NOT in CloudFormation — this script is its sole manager — so for it
+# we CREATE-if-absent. This keeps the deploy idempotent ACROSS the 2026-06-29
+# ne- rename cutover (config#1381), where the renamed SFs do not yet exist on the
+# first post-merge deploy. Pre-rename names: alpha-engine-{saturday,weekday,eod}.
 echo ""
 echo "==> Updating Step Function definitions..."
 
-SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
-DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"
-EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline"
+DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
+EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+# Shared SF execution role (the CFN StepFunctionsRoleArn default; all three
+# orchestration SFs run under it). Used only for the EOD create-if-absent path.
+SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-step-functions-role"
 
-# Pass the definition via file:// — NOT inline "$(cat ...)". The Saturday ASL is
-# ~131 KB and growing (one state per pipeline step); combined with the AWS
+sf_exists() {
+    aws stepfunctions describe-state-machine --state-machine-arn "$1" --query "name" --output text >/dev/null 2>&1
+}
+
+# Pass the definition via file:// — NOT inline "$(cat ...)". The weekly-freshness
+# ASL is ~131 KB and growing (one state per pipeline step); combined with the AWS
 # session-token env on the CI runner, an inline arg blows past the effective
 # ARG_MAX and the runner aborts with "aws: Argument list too long" (exit 126),
 # which silently leaves the live SF stamp behind origin/main HEAD and trips the
 # deploy-drift preflight on the next pipeline run. file:// reads from disk, so
 # the definition size is bounded only by the SF service limit (1 MB), not ARG_MAX.
-# Regression: 2026-06-04 — the Director SF state pushed the Saturday ASL over the
-# line and broke this deploy.
-aws stepfunctions update-state-machine --state-machine-arn "$SAT_ARN" --definition "file://$SAT_STAMPED" --query "updateDate" --output text
-echo "  Saturday pipeline updated."
+# Regression: 2026-06-04 — the Director SF state pushed the ASL over the line.
 
-aws stepfunctions update-state-machine --state-machine-arn "$DAILY_ARN" --definition "file://$DAILY_STAMPED" --query "updateDate" --output text
-echo "  Weekday pipeline updated."
+# CFN-managed SF: update if present, else defer creation to CloudFormation (step 4).
+update_or_defer_to_cfn() {
+    local arn="$1" stamped="$2" label="$3"
+    if sf_exists "$arn"; then
+        aws stepfunctions update-state-machine --state-machine-arn "$arn" --definition "file://$stamped" --query "updateDate" --output text
+        echo "  $label updated."
+    else
+        echo "  $label absent — CloudFormation will create it from S3 in step 4 (rename cutover)."
+    fi
+}
 
-# EOD SF (alpha-engine-eod-pipeline) — folded into auto-deploy 2026-06-23 (config#1173).
-# Previously deployed only by the manual infrastructure/update_eod_pipeline_sf.sh, which
-# nothing triggered on merge, so merged EOD SF changes silently never reached the live
-# state machine (drift hit 2026-06-22 via #458's nousergon_lib migration). Same
-# stamp + S3-copy + file:// update-state-machine pattern as Saturday/weekday above, so all
-# three orchestration SFs now stay in lockstep with origin/main on every merge.
-aws stepfunctions update-state-machine --state-machine-arn "$EOD_ARN" --definition "file://$EOD_STAMPED" --query "updateDate" --output text
-echo "  EOD pipeline updated."
+# Standalone SF (not in CFN — EOD): update if present, else create.
+update_or_create() {
+    local arn="$1" stamped="$2" name="$3" label="$4"
+    if sf_exists "$arn"; then
+        aws stepfunctions update-state-machine --state-machine-arn "$arn" --definition "file://$stamped" --query "updateDate" --output text
+        echo "  $label updated."
+    else
+        aws stepfunctions create-state-machine --name "$name" --definition "file://$stamped" --role-arn "$SF_ROLE_ARN" --query "stateMachineArn" --output text
+        echo "  $label created (was absent — rename cutover)."
+    fi
+}
+
+update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline"
+update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline"
+update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""

@@ -39,7 +39,7 @@ def _sf(exec_start: datetime | None):
 
     cli.list_executions.side_effect = _list
     cli.start_execution.return_value = {
-        "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:eod-backstop-x"
+        "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:eod-backstop-x"
     }
     return cli
 
@@ -117,7 +117,7 @@ class TestStartEodInput:
         sf = _sf(None)
         index._start_eod("2026-06-25", sf)
         kwargs = sf.start_execution.call_args.kwargs
-        assert kwargs["stateMachineArn"].endswith("alpha-engine-eod-pipeline")
+        assert kwargs["stateMachineArn"].endswith("ne-postclose-trading-pipeline")
         assert kwargs["name"].startswith("eod-backstop-2026-06-25-")
         import json
         payload = json.loads(kwargs["input"])

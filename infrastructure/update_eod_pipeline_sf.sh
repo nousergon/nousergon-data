@@ -12,7 +12,7 @@
 # Reads the state-machine definition from
 # infrastructure/step_function_eod.json (single source of truth, same
 # pattern as deploy_step_function.sh for the Saturday SF) and applies
-# it to alpha-engine-eod-pipeline. The JSON file is the authoritative
+# it to ne-postclose-trading-pipeline. The JSON file is the authoritative
 # definition — wiring tests pin its contents.
 #
 # Idempotent: re-running with the same definition is a no-op (AWS only
@@ -28,7 +28,7 @@ DEFN_FILE="$SCRIPT_DIR/step_function_eod.json"
 
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
-SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
 
 echo "=== Alpha Engine EOD Pipeline — SF Definition Update ==="
 echo "  Region:        $REGION"

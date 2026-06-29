@@ -27,8 +27,8 @@ sys.modules.setdefault("alpha_engine_lib.trading_calendar", _tc)
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
-SAT_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
-_EXEC_ARN = "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:friday-shell-2026-06-12-eodname"
+SAT_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
+_EXEC_ARN = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:friday-shell-2026-06-12-eodname"
 
 
 def _ts(sec: int) -> datetime:
@@ -117,7 +117,7 @@ def test_non_shell_run_is_a_noop():
 
 def test_wrong_state_machine_ignored():
     side, s3, _ = _fake_clients([])
-    bad = _event("SUCCEEDED", sm_arn="arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline")
+    bad = _event("SUCCEEDED", sm_arn="arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline")
     with patch("index.boto3.client", side_effect=side):
         out = index.handler(bad, None)
     assert out["reported"] is False and out["reason"] == "wrong_event"

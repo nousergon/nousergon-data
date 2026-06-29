@@ -9,6 +9,35 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "CheckRunMode"
+    },
+    "CheckRunMode": {
+      "Type": "Choice",
+      "Comment": "Cadence-preset gate (config#830). A single {\"mode\": \"backtest-eval\"} input expands (in ApplyBacktestEvalPreset) into the full skip-flag set that runs ONLY Backtester → Evaluator → NotifyComplete — the mid-week rerun shape that previously motivated a standalone state machine. This keeps ONE source of truth for the two stages (no verbatim-copied SF to drift) and one button instead of hand-passing ~17 skip flags. Missing/other mode → straight to CheckSkipLibPinDriftCheck, so scheduled Saturday runs and manual flag-driven partial runs are byte-identical to pre-config#830.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mode",
+              "StringEquals": "backtest-eval"
+            }
+          ],
+          "Next": "ApplyBacktestEvalPreset"
+        }
+      ],
+      "Default": "CheckSkipLibPinDriftCheck"
+    },
+    "ApplyBacktestEvalPreset": {
+      "Type": "Pass",
+      "Comment": "mode=backtest-eval ONLY (config#830). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training/drift-detection), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_drift_detection\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+      },
+      "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
     },
     "CheckSkipLibPinDriftCheck": {
@@ -2326,7 +2355,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "PredictorBacktest"
+          "Next": "CheckSkipPredictorBacktest"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -2345,6 +2374,26 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+    "CheckSkipPredictorBacktest": {
+      "Type": "Choice",
+      "Comment": "Skip-gate (config#830 — closes the gap that made a Backtester→Evaluator-only run impossible on the weekly SF; PredictorBacktest had no skip gate). {\"skip_predictor_backtest\": true} bypasses the PredictorBacktest stage (the predictor-backtest + Phase4 + pit-parity block, L4472 split) and routes to CheckSkipPortfolioOptimizerBacktest. Set by mode=backtest-eval, where only backtester/evaluator CODE changed so the predictor backtest is not needed. Missing flag = run as normal, so scheduled Saturday runs are unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_predictor_backtest",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_predictor_backtest",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPortfolioOptimizerBacktest"
+        }
+      ],
+      "Default": "PredictorBacktest"
     },
     "PredictorBacktest": {
       "Type": "Task",
@@ -2429,7 +2478,7 @@
         {
           "Variable": "$.predictor_backtest_poll.Status",
           "StringEquals": "Success",
-          "Next": "PortfolioOptimizerBacktest"
+          "Next": "CheckSkipPortfolioOptimizerBacktest"
         },
         {
           "Variable": "$.predictor_backtest_poll.Status",
@@ -2448,6 +2497,26 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForPredictorBacktest"
+    },
+    "CheckSkipPortfolioOptimizerBacktest": {
+      "Type": "Choice",
+      "Comment": "Skip-gate (config#830 — closes the gap that made a Backtester→Evaluator-only run impossible on the weekly SF; PortfolioOptimizerBacktest had no skip gate). {\"skip_portfolio_optimizer_backtest\": true} bypasses the PortfolioOptimizerBacktest stage (the optimizer/cov/gamma block, L4472 split) and routes to CheckSkipParity. Set by mode=backtest-eval. Missing flag = run as normal, so scheduled Saturday runs are unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_portfolio_optimizer_backtest",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_portfolio_optimizer_backtest",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipParity"
+        }
+      ],
+      "Default": "PortfolioOptimizerBacktest"
     },
     "PortfolioOptimizerBacktest": {
       "Type": "Task",
@@ -2690,7 +2759,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipPostEval"
         }
       ],
       "Default": "Evaluator"
@@ -2778,7 +2847,7 @@
         {
           "Variable": "$.evaluator_poll.Status",
           "StringEquals": "Success",
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipPostEval"
         },
         {
           "Variable": "$.evaluator_poll.Status",
@@ -2797,6 +2866,26 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForEvaluator"
+    },
+    "CheckSkipPostEval": {
+      "Type": "Choice",
+      "Comment": "Post-Evaluator tail skip-gate (config#830). {\"skip_post_eval\": true} stops the run right after Evaluator — bypassing the four full-run-only tail stages (SaturdayHealthCheck → WeeklySubstrateHealthCheck → ReportCard → Director, none of which previously had a skip gate) and routing straight to CheckShellRunNotify so the SUCCESS SNS notify (and the shell-run-tagged variant) still fire. This is the one behavioral gap a standalone Backtester→Evaluator SF used to cover; closing it here lets the weekly SF reproduce that shape via mode=backtest-eval with no forked state machine. The tail stages are advisory/observability only (health checks are non-blocking; ReportCard/Director are non-fatal advisories), so stopping before them is safe for a mid-week backtester/evaluator code rerun. Missing flag = run the full tail as normal, so scheduled Saturday runs are unaffected. Both inbound edges (CheckEvaluatorStatus Success and CheckSkipEvaluator skip) converge here, preserving the prior 'Evaluator-skipped still notifies' behavior.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_post_eval",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_post_eval",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "SaturdayHealthCheck"
     },
     "SaturdayHealthCheck": {
       "Type": "Task",

@@ -1,46 +1,33 @@
-"""alpha-engine-saturday-sf-watch-dispatcher — Saturday-SF Watch.
+"""alpha-engine-sf-watch-dispatcher — Fleet-SF Watch.
 
-STATUS (2026-06-26): **M2 dispatch is LIVE** — `AGENT_DISPATCH_ENABLED=true` on
-the deployed Lambda, so on a Saturday-pipeline failure this dispatcher fires the
-`repository_dispatch` that triggers the autonomous resilience agent
-(diagnose→fix→merge→rerun). The historical "M1 OBSERVE-only / no dispatch code"
-framing below is retained for arc context but is NO LONGER the runtime behavior.
+On a terminal failure of ANY of the three fleet Step Functions — Saturday
+(`ne-weekly-freshness-pipeline`), Weekday (`ne-preopen-trading-pipeline`),
+or EOD (`ne-postclose-trading-pipeline`) — this dispatcher writes a watch-log
+artifact and (when `AGENT_DISPATCH_ENABLED=true`) fires a `repository_dispatch`
+that triggers the autonomous resilience agent (diagnose→fix→merge→rerun) in
+`alpha-engine-config`. Generalized from the Saturday-only dispatcher
+(spec: nousergon/alpha-engine-config#1227, fleet fan-out: #1375).
 
-First slice of the Saturday-SF Watch arc (spec: nousergon/alpha-engine-config#1227).
-The arc's end state is an autonomous, SOTA-steered resilience agent that, on a
-Saturday SF (`alpha-engine-saturday-pipeline`) failure, diagnoses + enacts an
-institutional-grade reliability fix and reruns from the failed step
-(ask-forgiveness posture). This Lambda is **M1**: the dedicated trigger path +
-the watch-log artifact contract, in **OBSERVE mode only**. It does NOT invoke
-any agent and does NOT touch any repo, IAM, or SF definition.
+**Per-pipeline registry.** ``PIPELINES`` maps each SF name → its watch-log
+prefix + repository_dispatch event type, so the GHA workflow + dashboard filter
+by cadence and each pipeline carries its OWN kill-switch (in the agent charter).
+weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped on,
+independently of Saturday. Fan-out is additive: register a pipeline here, add its
+ARN to the single EventBridge rule (deploy.sh), widen the IAM ARNs.
 
 **Why this is NOT a second notifier.** The fleet already has
 `alpha-engine-sf-telegram-notifier` (subscribes to all three SFs / all statuses,
-pings loud on FAILED with the cause). Re-implementing notification here would be
-the redundant-path anti-pattern. This Lambda's distinct responsibilities are:
-
-  1. A **Saturday-only, terminal-failure-only** trigger (its own EventBridge rule
-     `alpha-engine-saturday-sf-watch-failed`) — the seam the M2 agent dispatch
-     will hang off.
-  2. The **watch-log artifact** at
-     ``s3://{WATCH_BUCKET}/consolidated/saturday_sf_watch/{run_date}.json`` — the
-     contract the M3 dashboard page reads. Establishing it now means the
-     dashboard + agent halves build against a stable shape.
-  3. A **distinct, SILENT** Telegram record (the notifier already buzzed loud) that
-     names the failed state + the artifact location and states OBSERVE mode.
+pings loud on FAILED with the cause). This Lambda's distinct responsibilities are:
+the **per-pipeline, terminal-failure-only** trigger (the seam the agent dispatch
+hangs off), the **watch-log artifact** the dashboard page reads, and a
+**distinct, SILENT** Telegram record (the notifier already buzzed loud).
 
 **Fail-loud (CLAUDE.md no-silent-fails).** The watch-log artifact write is the
-primary deliverable in OBSERVE mode → it RAISES on failure so a broken producer
-surfaces via the Lambda error metric + CW alarm. Enrichment (DescribeExecution /
-GetExecutionHistory) and the Telegram record are secondary observability hung off
-the primary path: their failure is logged at WARNING and recorded in the artifact
-(``cause``/``failed_state`` become null with a reason) — the artifact still
-records that a failure was detected.
-
-**M2 seam.** ``AGENT_DISPATCH_ENABLED`` (default ``"false"``) is read and echoed
-in the return value + artifact so the cutover to agent dispatch is a single env
-flip. M1 contains NO dispatch code — the ``repository_dispatch`` call is added in
-M2. Until then this Lambda is inert beyond observing.
+primary deliverable → it RAISES on failure so a broken producer surfaces via the
+Lambda error metric + CW alarm. Enrichment (DescribeExecution /
+GetExecutionHistory), the Telegram record, and the agent dispatch are secondary
+observability hung off the primary path: their failure is logged at WARNING and
+recorded in the artifact — the artifact still records that a failure was detected.
 """
 
 from __future__ import annotations
@@ -60,26 +47,70 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
-WATCH_PREFIX = os.environ.get("WATCH_PREFIX", "consolidated/saturday_sf_watch")
-# M2 gate — default OFF. When true, a Saturday failure also fires a
-# repository_dispatch that triggers the autonomous resilience agent (which
-# diagnoses → fixes → merges → reruns from the failed step). The watch-log is
-# written FIRST (so the agent reads fresh context), THEN the dispatch fires.
+# M2 gate — default OFF. When true, a failure also fires a repository_dispatch
+# that triggers the autonomous resilience agent (which diagnoses → fixes →
+# merges → reruns from the failed step). The watch-log is written FIRST (so the
+# agent reads fresh context), THEN the dispatch fires. The per-pipeline
+# autonomous-merge kill-switch is enforced agent-side (charter STEP 0), so this
+# single env gate can stay on fleet-wide while weekday/EOD soak in PROPOSE-ONLY.
 AGENT_DISPATCH_ENABLED = (
     os.environ.get("AGENT_DISPATCH_ENABLED", "false").lower() == "true"
 )
 # repository_dispatch target — the private alpha-engine-config repo hosts the
-# agent GHA workflow (on: repository_dispatch, types: [saturday-sf-failure]).
+# agent GHA workflow (on: repository_dispatch, types: [*-sf-failure]).
 DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
-DISPATCH_EVENT_TYPE = os.environ.get("DISPATCH_EVENT_TYPE", "saturday-sf-failure")
-# Dedicated fine-grained PAT (SecureString) scoped to the Saturday-SF-path
-# repos. Read at dispatch time only — never logged.
+# Dedicated fine-grained PAT (SecureString) scoped to the SF-path repos, shared
+# across pipelines. Read at dispatch time only — never logged.
 GITHUB_PAT_SSM_PARAM = os.environ.get(
     "GITHUB_PAT_SSM_PARAM", "/alpha-engine/saturday_sf_watch/github_pat"
 )
 _DISPATCH_TIMEOUT_SEC = 15
 
-SATURDAY_SF_NAME = "alpha-engine-saturday-pipeline"
+# --- Per-pipeline registry -------------------------------------------------
+# Fan-out is ADDITIVE: register a pipeline here, add its ARN to the single
+# EventBridge rule (deploy.sh), widen the IAM ARNs. Everything below — the
+# watch-log contract, dispatch, the agent charter — is pipeline-agnostic.
+# Each pipeline routes to its OWN watch-log prefix + repository_dispatch event
+# type (cadence-filterable) and its OWN kill-switch (charter-enforced).
+# `cadence_slug` is the FROZEN cadence label (saturday/weekday/eod) — the SFs
+# were renamed to function-descriptive ne- names (config#1381) but the derived
+# cadence-keyed resources (watch-log prefix, dispatch type, the charter's
+# /alpha-engine/<slug>_sf_watch/ kill-switch param) were intentionally NOT
+# renamed. The slug is the single source of truth for that mapping and is passed
+# to the agent so the charter never has to parse it back out of the SF name.
+# `label` is the human cadence label for the Telegram receipt.
+PIPELINES: dict[str, dict[str, str]] = {
+    "ne-weekly-freshness-pipeline": {
+        "cadence_slug": "saturday",
+        "label": "Weekly Freshness",
+        "watch_prefix": "consolidated/saturday_sf_watch",
+        "dispatch_event_type": "saturday-sf-failure",
+    },
+    "ne-preopen-trading-pipeline": {
+        "cadence_slug": "weekday",
+        "label": "Pre-open Trading",
+        "watch_prefix": "consolidated/weekday_sf_watch",
+        "dispatch_event_type": "weekday-sf-failure",
+    },
+    "ne-postclose-trading-pipeline": {
+        "cadence_slug": "eod",
+        "label": "Post-close Trading",
+        "watch_prefix": "consolidated/eod_sf_watch",
+        "dispatch_event_type": "eod-sf-failure",
+    },
+    # TRANSITIONAL (remove at the SF-rename cutover — config#1408 / re-exam
+    # 2026-07-03). The EOD SF still runs under its OLD name `alpha-engine-eod-
+    # pipeline` (saturday/weekday already renamed; EOD lags). Until cutover, the
+    # LIVE failures arrive under the old ARN, so the registry must recognize it —
+    # otherwise the handler ignores the event (the 2026-06-29 dead-watch gap).
+    # Routes to the SAME eod cadence resources as ne-postclose-trading-pipeline.
+    "alpha-engine-eod-pipeline": {
+        "cadence_slug": "eod",
+        "label": "Post-close Trading",
+        "watch_prefix": "consolidated/eod_sf_watch",
+        "dispatch_event_type": "eod-sf-failure",
+    },
+}
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600
 # Bound the history scan: fetch the newest N events (reverseOrder), reconstruct
@@ -188,13 +219,13 @@ def _run_date(describe_resp: dict | None, detail: dict) -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _artifact_key(run_date: str) -> str:
-    return f"{WATCH_PREFIX}/{run_date}.json"
+def _artifact_key(watch_prefix: str, run_date: str) -> str:
+    return f"{watch_prefix}/{run_date}.json"
 
 
 def _load_existing(s3, key: str) -> dict:
     """Read the existing watch-log for this date (so repeated failures in one
-    Saturday accumulate), or a fresh skeleton. A missing object (404/403) is the
+    run accumulate), or a fresh skeleton. A missing object (404/403) is the
     common first-failure-of-the-day case, NOT an error."""
     try:
         obj = s3.get_object(Bucket=WATCH_BUCKET, Key=key)
@@ -231,11 +262,11 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str)
     }
 
 
-def _write_watch_log(s3, run_date: str, record: dict) -> str:
+def _write_watch_log(s3, watch_prefix: str, run_date: str, record: dict) -> str:
     """Append the event to the date's watch-log and write it back. PRIMARY
     deliverable — RAISES on failure (fail-loud: a broken producer must surface
     via the Lambda error metric + CW alarm, never silently)."""
-    key = _artifact_key(run_date)
+    key = _artifact_key(watch_prefix, run_date)
     doc = _load_existing(s3, key)
     doc["schema_version"] = SCHEMA_VERSION
     doc["run_date"] = run_date
@@ -250,17 +281,27 @@ def _write_watch_log(s3, run_date: str, record: dict) -> str:
     return key
 
 
-def _notify(record: dict, key: str) -> bool:
+def _pipeline_label(pipeline_name: str) -> str:
+    """SF name → human cadence label for the Telegram receipt (from PIPELINES)."""
+    cfg = PIPELINES.get(pipeline_name)
+    if cfg:
+        return cfg["label"]
+    # Fallback for an unregistered name: strip the ne-/-pipeline affixes.
+    return pipeline_name.removeprefix("ne-").removesuffix("-pipeline") or pipeline_name
+
+
+def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     """Distinct, SILENT Telegram record. The sf-telegram-notifier already pinged
     loud on this FAILED event; this is the additive watch receipt (which state,
     where the artifact is, current dispatch mode). Best-effort — never raises.
     The header + footer reflect the LIVE ``AGENT_DISPATCH_ENABLED`` state so the
     receipt never claims observe-only while the agent is actually being
     dispatched (the 2026-06-26 stale-text bug)."""
-    label = "Saturday Preflight SF" if record["is_preflight"] else "Saturday SF"
+    cadence = _pipeline_label(pipeline_name)
+    label = f"{cadence} Preflight SF" if record["is_preflight"] else f"{cadence} SF"
     mode = "AUTO-FIX" if AGENT_DISPATCH_ENABLED else "OBSERVE"
     lines = [
-        f"\U0001f6f0️ *Saturday-SF Watch — {mode}*",
+        f"\U0001f6f0️ *Fleet-SF Watch — {mode}*",
         f"{label}: {record['status']}",
     ]
     if record.get("failed_state"):
@@ -287,9 +328,13 @@ def _get_github_pat() -> str:
     return resp["Parameter"]["Value"]
 
 
-def _maybe_dispatch_agent(record: dict, run_date: str, key: str) -> dict:
+def _maybe_dispatch_agent(
+    record: dict, run_date: str, key: str, cfg: dict, pipeline_name: str, sm_arn: str
+) -> dict:
     """When AGENT_DISPATCH_ENABLED, fire a repository_dispatch that triggers the
-    autonomous resilience-agent GHA workflow in DISPATCH_REPO.
+    autonomous resilience-agent GHA workflow in DISPATCH_REPO. The event type +
+    pipeline context come from the per-pipeline ``cfg`` so the single workflow
+    can route + the charter knows which SF to diagnose/rerun.
 
     Best-effort with a recording surface (CLAUDE.md no-silent-fails secondary
     carve-out): a GitHub/SSM outage logs WARN and is returned in the result, but
@@ -298,11 +343,15 @@ def _maybe_dispatch_agent(record: dict, run_date: str, key: str) -> dict:
     """
     if not AGENT_DISPATCH_ENABLED:
         return {"dispatched": False, "reason": "disabled"}
+    event_type = cfg["dispatch_event_type"]
     try:
         pat = _get_github_pat()
         payload = {
-            "event_type": DISPATCH_EVENT_TYPE,
+            "event_type": event_type,
             "client_payload": {
+                "pipeline_name": pipeline_name,
+                "cadence_slug": cfg["cadence_slug"],
+                "state_machine_arn": sm_arn,
                 "execution_arn": record.get("execution_arn", ""),
                 "failed_state": record.get("failed_state"),
                 "cause": record.get("cause"),
@@ -320,49 +369,51 @@ def _maybe_dispatch_agent(record: dict, run_date: str, key: str) -> dict:
                 "Authorization": f"Bearer {pat}",
                 "Accept": "application/vnd.github+json",
                 "Content-Type": "application/json",
-                "User-Agent": "saturday-sf-watch-dispatcher",
+                "User-Agent": "sf-watch-dispatcher",
             },
         )
         with urllib.request.urlopen(req, timeout=_DISPATCH_TIMEOUT_SEC) as resp:
             status_code = resp.status
         logger.info(
             "agent repository_dispatch sent to %s (type=%s, http=%s)",
-            DISPATCH_REPO, DISPATCH_EVENT_TYPE, status_code,
+            DISPATCH_REPO, event_type, status_code,
         )
-        return {"dispatched": True, "status_code": status_code}
+        return {"dispatched": True, "status_code": status_code, "event_type": event_type}
     except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised
         logger.warning("agent repository_dispatch failed (non-fatal): %s", exc)
         return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """EventBridge handler — fires only on Saturday SF terminal failure
+    """EventBridge handler — fires only on a registered fleet SF terminal failure
     (FAILED / TIMED_OUT / ABORTED), per the dedicated rule
-    ``alpha-engine-saturday-sf-watch-failed``.
+    ``alpha-engine-sf-watch-failed`` (scoped to the three SFs in ``PIPELINES``).
     """
     detail = event.get("detail") or {}
-    sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
+    sm_arn = detail.get("stateMachineArn") or ""
+    sm_name = sm_arn.rsplit(":", 1)[-1]
     status = detail.get("status", "UNKNOWN")
-    logger.info("Saturday-SF Watch: sf=%s status=%s (OBSERVE)", sm_name, status)
 
-    # Defensive: the rule scopes to the Saturday SF, but never act on anything else.
-    if sm_name != SATURDAY_SF_NAME:
-        logger.warning("ignoring non-Saturday SF event: %s", sm_name)
+    # Defensive: the rule scopes to the registered SFs, but never act on anything else.
+    cfg = PIPELINES.get(sm_name)
+    if cfg is None:
+        logger.warning("ignoring unregistered SF event: %s", sm_name)
         return {"ignored": True, "state_machine": sm_name, "status": status}
+    logger.info("Fleet-SF Watch: sf=%s status=%s", sm_name, status)
 
     describe_resp = _describe_execution(detail.get("executionArn", ""))
     run_date = _run_date(describe_resp, detail)
     record = _build_event_record(detail, describe_resp, run_date)
 
     s3 = _s3_client()
-    key = _write_watch_log(s3, run_date, record)  # PRIMARY — fail-loud
-    telegram_sent = _notify(record, key)          # secondary — best-effort
+    key = _write_watch_log(s3, cfg["watch_prefix"], run_date, record)  # PRIMARY — fail-loud
+    telegram_sent = _notify(record, key, sm_name)                      # secondary — best-effort
     # M2: fire the agent AFTER the watch-log lands (agent reads fresh context).
-    dispatch = _maybe_dispatch_agent(record, run_date, key)  # secondary
+    dispatch = _maybe_dispatch_agent(record, run_date, key, cfg, sm_name, sm_arn)  # secondary
 
     logger.info(
-        "Saturday-SF Watch recorded: run_date=%s failed_state=%s key=%s telegram=%s dispatched=%s",
-        run_date, record.get("failed_state"), key, telegram_sent, dispatch.get("dispatched"),
+        "Fleet-SF Watch recorded: sf=%s run_date=%s failed_state=%s key=%s telegram=%s dispatched=%s",
+        sm_name, run_date, record.get("failed_state"), key, telegram_sent, dispatch.get("dispatched"),
     )
     return {
         "status": status,

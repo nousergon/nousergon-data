@@ -1,7 +1,7 @@
 """alpha-engine-eod-success-friday-shell-trigger — kick the weekly shell-run.
 
 Subscribes to EventBridge ``Step Functions Execution Status Change`` events,
-filtered to ``alpha-engine-eod-pipeline`` + ``SUCCEEDED``. On every EOD-SF
+filtered to ``ne-postclose-trading-pipeline`` + ``SUCCEEDED``. On every EOD-SF
 success the handler computes the trading_day this execution closed against
 and, if that trading_day is a Friday, starts the Saturday Step Function in
 shell-run mode (``shell_run: true``) so the spot instances boot for real
@@ -58,9 +58,9 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
 
 SATURDAY_SF_ARN = (
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline"
 )
-EOD_SF_NAME = "alpha-engine-eod-pipeline"
+EOD_SF_NAME = "ne-postclose-trading-pipeline"
 
 TRADING_EC2_INSTANCE_ID = os.environ.get(
     "TRADING_EC2_INSTANCE_ID", "i-09b539c844515d549"

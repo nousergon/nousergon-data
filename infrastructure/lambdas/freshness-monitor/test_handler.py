@@ -967,7 +967,7 @@ artifacts:
     created_at: 2025-01-01
     recovery:
       type: step_function
-      target: "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
+      target: "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
       params:
         trigger: freshness_monitor_backfill
         trading_day: "{trading_day}"
@@ -1032,7 +1032,7 @@ def test_recovery_dispatches_once_on_confirmed_miss(monkeypatch, fake_s3, fixed_
     assert result["dispatched"] == 1
     sf.start_execution.assert_called_once()
     kwargs = sf.start_execution.call_args.kwargs
-    assert kwargs["stateMachineArn"].endswith("alpha-engine-weekday-pipeline")
+    assert kwargs["stateMachineArn"].endswith("ne-preopen-trading-pipeline")
     payload = json.loads(kwargs["input"])
     assert payload["trigger"] == "freshness_monitor_backfill"
     # The placeholder resolved to a concrete ISO date (not the literal token).

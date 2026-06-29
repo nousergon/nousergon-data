@@ -29,7 +29,7 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-STATE_MACHINE_NAME="alpha-engine-saturday-pipeline"
+STATE_MACHINE_NAME="ne-weekly-freshness-pipeline"
 ROLE_NAME="alpha-engine-step-functions-role"
 SNS_TOPIC_NAME="alpha-engine-alerts"
 EVENTBRIDGE_RULE="alpha-engine-saturday"
