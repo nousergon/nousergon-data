@@ -116,7 +116,7 @@ def test_shell_input_matches_lambda() -> None:
 
 
 def test_full_targets_correct_state_machine(runner_text: str) -> None:
-    assert "alpha-engine-saturday-pipeline" in runner_text
+    assert "ne-weekly-freshness-pipeline" in runner_text
 
 
 def test_full_suppresses_then_starts_safely(runner_text: str) -> None:

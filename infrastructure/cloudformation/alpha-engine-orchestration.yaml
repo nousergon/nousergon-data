@@ -130,7 +130,7 @@ Resources:
   SaturdayPipeline:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: alpha-engine-saturday-pipeline
+      StateMachineName: ne-weekly-freshness-pipeline
       RoleArn: !Ref StepFunctionsRoleArn
       DefinitionS3Location:
         Bucket: alpha-engine-research
@@ -145,7 +145,7 @@ Resources:
   WeekdayPipeline:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: alpha-engine-weekday-pipeline
+      StateMachineName: ne-preopen-trading-pipeline
       RoleArn: !Ref StepFunctionsRoleArn
       DefinitionS3Location:
         Bucket: alpha-engine-research

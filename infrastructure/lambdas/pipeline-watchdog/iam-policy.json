@@ -16,9 +16,9 @@
       "Effect": "Allow",
       "Action": ["states:ListExecutions"],
       "Resource": [
-        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
       ]
     },
     {

@@ -52,7 +52,7 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
-SF_NAME="alpha-engine-saturday-pipeline"
+SF_NAME="ne-weekly-freshness-pipeline"
 SF_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${SF_NAME}"
 SATURDAY_RULE="alpha-engine-saturday"
 SATURDAY_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${SATURDAY_RULE}"

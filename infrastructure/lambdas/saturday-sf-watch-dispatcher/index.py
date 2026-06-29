@@ -1,8 +1,8 @@
 """alpha-engine-sf-watch-dispatcher — Fleet-SF Watch.
 
 On a terminal failure of ANY of the three fleet Step Functions — Saturday
-(`alpha-engine-saturday-pipeline`), Weekday (`alpha-engine-weekday-pipeline`),
-or EOD (`alpha-engine-eod-pipeline`) — this dispatcher writes a watch-log
+(`ne-weekly-freshness-pipeline`), Weekday (`ne-preopen-trading-pipeline`),
+or EOD (`ne-postclose-trading-pipeline`) — this dispatcher writes a watch-log
 artifact and (when `AGENT_DISPATCH_ENABLED=true`) fires a `repository_dispatch`
 that triggers the autonomous resilience agent (diagnose→fix→merge→rerun) in
 `alpha-engine-config`. Generalized from the Saturday-only dispatcher
@@ -72,16 +72,29 @@ _DISPATCH_TIMEOUT_SEC = 15
 # watch-log contract, dispatch, the agent charter — is pipeline-agnostic.
 # Each pipeline routes to its OWN watch-log prefix + repository_dispatch event
 # type (cadence-filterable) and its OWN kill-switch (charter-enforced).
+# `cadence_slug` is the FROZEN cadence label (saturday/weekday/eod) — the SFs
+# were renamed to function-descriptive ne- names (config#1381) but the derived
+# cadence-keyed resources (watch-log prefix, dispatch type, the charter's
+# /alpha-engine/<slug>_sf_watch/ kill-switch param) were intentionally NOT
+# renamed. The slug is the single source of truth for that mapping and is passed
+# to the agent so the charter never has to parse it back out of the SF name.
+# `label` is the human cadence label for the Telegram receipt.
 PIPELINES: dict[str, dict[str, str]] = {
-    "alpha-engine-saturday-pipeline": {
+    "ne-weekly-freshness-pipeline": {
+        "cadence_slug": "saturday",
+        "label": "Weekly Freshness",
         "watch_prefix": "consolidated/saturday_sf_watch",
         "dispatch_event_type": "saturday-sf-failure",
     },
-    "alpha-engine-weekday-pipeline": {
+    "ne-preopen-trading-pipeline": {
+        "cadence_slug": "weekday",
+        "label": "Pre-open Trading",
         "watch_prefix": "consolidated/weekday_sf_watch",
         "dispatch_event_type": "weekday-sf-failure",
     },
-    "alpha-engine-eod-pipeline": {
+    "ne-postclose-trading-pipeline": {
+        "cadence_slug": "eod",
+        "label": "Post-close Trading",
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
     },
@@ -257,11 +270,12 @@ def _write_watch_log(s3, watch_prefix: str, run_date: str, record: dict) -> str:
 
 
 def _pipeline_label(pipeline_name: str) -> str:
-    """SF name → human cadence label for the Telegram receipt."""
-    slug = pipeline_name.removeprefix("alpha-engine-").removesuffix("-pipeline")
-    return {"saturday": "Saturday", "weekday": "Weekday", "eod": "EOD"}.get(
-        slug, slug or pipeline_name
-    )
+    """SF name → human cadence label for the Telegram receipt (from PIPELINES)."""
+    cfg = PIPELINES.get(pipeline_name)
+    if cfg:
+        return cfg["label"]
+    # Fallback for an unregistered name: strip the ne-/-pipeline affixes.
+    return pipeline_name.removeprefix("ne-").removesuffix("-pipeline") or pipeline_name
 
 
 def _notify(record: dict, key: str, pipeline_name: str) -> bool:
@@ -324,6 +338,7 @@ def _maybe_dispatch_agent(
             "event_type": event_type,
             "client_payload": {
                 "pipeline_name": pipeline_name,
+                "cadence_slug": cfg["cadence_slug"],
                 "state_machine_arn": sm_arn,
                 "execution_arn": record.get("execution_arn", ""),
                 "failed_state": record.get("failed_state"),

@@ -28,9 +28,9 @@ sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
-SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
-WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
-EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
+WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
+EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
 UNREGISTERED_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:some-other-pipeline"
 
 
@@ -135,7 +135,7 @@ def test_telegram_is_silent_and_records_artifact_location():
     kwargs = _telegram_mod.send_message.call_args.kwargs
     assert kwargs["disable_notification"] is True  # notifier already buzzed loud
     assert "Fleet-SF Watch — OBSERVE" in text
-    assert "Saturday SF: FAILED" in text  # pipeline-aware label
+    assert "Weekly Freshness SF: FAILED" in text  # pipeline-aware label
     assert "Failed state: RAGIngestion" in text
     assert "consolidated/saturday_sf_watch/2023-11-14.json" in text
     assert "observe-only" in text
@@ -210,7 +210,7 @@ def test_preflight_shell_run_marks_record():
     written = json.loads(s3.put_object.call_args.kwargs["Body"])
     assert written["events"][0]["is_preflight"] is True
     text = _telegram_mod.send_message.call_args.args[0]
-    assert "Saturday Preflight SF" in text
+    assert "Weekly Freshness Preflight SF" in text
 
 
 def test_unregistered_sf_is_ignored():
@@ -225,11 +225,11 @@ def test_weekday_sf_routes_to_weekday_prefix_and_label():
     factory, _, s3 = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
-    assert result["state_machine"] == "alpha-engine-weekday-pipeline"
+    assert result["state_machine"] == "ne-preopen-trading-pipeline"
     assert result["watch_log_key"] == "consolidated/weekday_sf_watch/2023-11-14.json"
     assert s3.put_object.call_args.kwargs["Key"].startswith("consolidated/weekday_sf_watch/")
     text = _telegram_mod.send_message.call_args.args[0]
-    assert "Weekday SF: FAILED" in text
+    assert "Pre-open Trading SF: FAILED" in text
 
 
 def test_eod_sf_routes_to_eod_prefix():
@@ -238,7 +238,7 @@ def test_eod_sf_routes_to_eod_prefix():
         result = index.handler(_event("FAILED", sm_arn=EOD_ARN), None)
     assert result["watch_log_key"] == "consolidated/eod_sf_watch/2023-11-14.json"
     text = _telegram_mod.send_message.call_args.args[0]
-    assert "EOD SF: FAILED" in text
+    assert "Post-close Trading SF: FAILED" in text
 
 
 @pytest.mark.parametrize("status", ["TIMED_OUT", "ABORTED"])
@@ -308,7 +308,7 @@ def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
     assert sent["url"].endswith("/repos/nousergon/alpha-engine-config/dispatches")
     assert sent["data"]["event_type"] == "saturday-sf-failure"
     cp = sent["data"]["client_payload"]
-    assert cp["pipeline_name"] == "alpha-engine-saturday-pipeline"
+    assert cp["pipeline_name"] == "ne-weekly-freshness-pipeline"
     assert cp["state_machine_arn"] == SATURDAY_ARN
     assert cp["failed_state"] == "RAGIngestion"
     assert cp["run_date"] == "2023-11-14"
@@ -335,7 +335,7 @@ def test_dispatch_routes_weekday_event_type(monkeypatch):
     assert result["agent_dispatch"]["event_type"] == "weekday-sf-failure"
     assert sent["data"]["event_type"] == "weekday-sf-failure"
     cp = sent["data"]["client_payload"]
-    assert cp["pipeline_name"] == "alpha-engine-weekday-pipeline"
+    assert cp["pipeline_name"] == "ne-preopen-trading-pipeline"
     assert cp["state_machine_arn"] == WEEKDAY_ARN
 
 

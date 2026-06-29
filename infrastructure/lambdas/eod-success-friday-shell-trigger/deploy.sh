@@ -3,7 +3,7 @@
 # Lambda and wire its EventBridge EOD-SUCCEEDED trigger.
 #
 # This Lambda subscribes to `aws.states` / "Step Functions Execution Status
-# Change" events for `alpha-engine-eod-pipeline` SUCCEEDED transitions only.
+# Change" events for `ne-postclose-trading-pipeline` SUCCEEDED transitions only.
 # On every EOD success it derives trading_day via the canonical
 # `alpha_engine_lib.trading_calendar.last_closed_trading_day` (handles UTC
 # rollover) and, if trading_day.weekday()==4 (Friday), invokes the Saturday
@@ -139,7 +139,7 @@ if $BOOTSTRAP; then
   "detail-type": ["Step Functions Execution Status Change"],
   "detail": {
     "stateMachineArn": [
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
     ],
     "status": ["SUCCEEDED"]
   }
@@ -199,8 +199,8 @@ if $SMOKE; then
   "detail-type": "Step Functions Execution Status Change",
   "detail": {
     "status": "SUCCEEDED",
-    "stateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline",
-    "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:smoke-test",
+    "stateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
+    "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:smoke-test",
     "name": "smoke-test",
     "startDate": 1779827700000,
     "stopDate": 1779828300000
