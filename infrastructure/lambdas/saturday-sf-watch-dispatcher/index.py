@@ -98,6 +98,18 @@ PIPELINES: dict[str, dict[str, str]] = {
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
     },
+    # TRANSITIONAL (remove at the SF-rename cutover — config#1408 / re-exam
+    # 2026-07-03). The EOD SF still runs under its OLD name `alpha-engine-eod-
+    # pipeline` (saturday/weekday already renamed; EOD lags). Until cutover, the
+    # LIVE failures arrive under the old ARN, so the registry must recognize it —
+    # otherwise the handler ignores the event (the 2026-06-29 dead-watch gap).
+    # Routes to the SAME eod cadence resources as ne-postclose-trading-pipeline.
+    "alpha-engine-eod-pipeline": {
+        "cadence_slug": "eod",
+        "label": "Post-close Trading",
+        "watch_prefix": "consolidated/eod_sf_watch",
+        "dispatch_event_type": "eod-sf-failure",
+    },
 }
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600
