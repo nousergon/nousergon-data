@@ -63,13 +63,12 @@ if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
-# ----- 1. Package: pip install deps + vendor the collector + zip -------------
+# ----- 1. Package: vendor the handler + collector + zip ----------------------
+# No third-party deps — the collector uses only stdlib (urllib) + boto3 (runtime-provided),
+# so the zip is just two .py files (no pip, no platform-specific wheels).
 
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
-
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 # Vendor the tested collector flat next to the handler (it has no intra-repo imports).

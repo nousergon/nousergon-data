@@ -44,7 +44,7 @@ def _fetchers(balances: dict[str, float]):
     """Balance fetchers keyed by chain, returning a canned balance (or raising for an
     address mapped to an Exception)."""
     def _make(chain):
-        def _fetch(address, *, session):
+        def _fetch(address):
             val = balances[chain]
             if isinstance(val, Exception):
                 raise val
@@ -56,9 +56,9 @@ def _fetchers(balances: dict[str, float]):
 def test_happy_path_writes_balances_and_values():
     s3 = _s3(_universe(("BTC", _BTC), ("ETH", _ETH)))
     r = cb.collect(
-        s3_client=s3, session=MagicMock(),
+        s3_client=s3,
         balance_fetchers=_fetchers({"BTC": 0.5, "ETH": 2.0}),
-        price_fetcher=lambda syms, *, session: {"BTC": 60000.0, "ETH": 3000.0},
+        price_fetcher=lambda syms: {"BTC": 60000.0, "ETH": 3000.0},
         now=_NOW,
     )
     assert r["status"] == "ok" and r["n_balances"] == 2 and r["n_failed"] == 0
@@ -73,9 +73,9 @@ def test_happy_path_writes_balances_and_values():
 def test_per_address_failure_is_soft():
     s3 = _s3(_universe(("BTC", _BTC), ("ETH", _ETH)))
     r = cb.collect(
-        s3_client=s3, session=MagicMock(),
+        s3_client=s3,
         balance_fetchers=_fetchers({"BTC": 0.5, "ETH": RuntimeError("rpc down")}),
-        price_fetcher=lambda syms, *, session: {"BTC": 60000.0},
+        price_fetcher=lambda syms: {"BTC": 60000.0},
         now=_NOW,
     )
     assert r["status"] == "ok" and r["n_balances"] == 1 and r["n_failed"] == 1
@@ -86,11 +86,11 @@ def test_per_address_failure_is_soft():
 def test_price_failure_still_writes_balances_without_value():
     s3 = _s3(_universe(("BTC", _BTC)))
 
-    def _boom(syms, *, session):
+    def _boom(syms):
         raise RuntimeError("coingecko 429")
 
     r = cb.collect(
-        s3_client=s3, session=MagicMock(),
+        s3_client=s3,
         balance_fetchers=_fetchers({"BTC": 1.0}), price_fetcher=_boom, now=_NOW,
     )
     assert r["status"] == "ok"
@@ -100,22 +100,22 @@ def test_price_failure_still_writes_balances_without_value():
 
 def test_no_addresses_skips_without_write():
     s3 = _s3(_universe())
-    r = cb.collect(s3_client=s3, session=MagicMock(), now=_NOW)
+    r = cb.collect(s3_client=s3, now=_NOW)
     assert r["status"] == "skipped" and s3.put_object.call_count == 0
 
 
 def test_missing_universe_artifact_skips():
     s3 = _s3(None)
-    r = cb.collect(s3_client=s3, session=MagicMock(), now=_NOW)
+    r = cb.collect(s3_client=s3, now=_NOW)
     assert r["status"] == "skipped" and s3.put_object.call_count == 0
 
 
 def test_all_failed_does_not_write():
     s3 = _s3(_universe(("ETH", _ETH)))
     r = cb.collect(
-        s3_client=s3, session=MagicMock(),
+        s3_client=s3,
         balance_fetchers=_fetchers({"ETH": RuntimeError("down")}),
-        price_fetcher=lambda syms, *, session: {}, now=_NOW,
+        price_fetcher=lambda syms: {}, now=_NOW,
     )
     assert r["status"] == "error" and s3.put_object.call_count == 0
 
@@ -123,9 +123,9 @@ def test_all_failed_does_not_write():
 def test_dry_run_does_not_write():
     s3 = _s3(_universe(("BTC", _BTC)))
     r = cb.collect(
-        s3_client=s3, session=MagicMock(),
+        s3_client=s3,
         balance_fetchers=_fetchers({"BTC": 1.0}),
-        price_fetcher=lambda syms, *, session: {"BTC": 50000.0},
+        price_fetcher=lambda syms: {"BTC": 50000.0},
         now=_NOW, dry_run=True,
     )
     assert r["status"] == "dry-run" and s3.put_object.call_count == 0

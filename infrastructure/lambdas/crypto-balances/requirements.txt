@@ -1,5 +1,0 @@
-# Bundled into the deployment zip via `pip install -t` (mirrors the sibling lambdas).
-# requests is needed by the vendored collectors/crypto_balances.py fetchers (BTC/ETH/price
-# HTTP). boto3 is provided by the Lambda python3.12 runtime; pinned for a reproducible build.
-requests>=2.31
-boto3>=1.34.0
