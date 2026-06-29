@@ -69,6 +69,11 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/prune_delisted_tickers.py": 1,
     "collectors/alternative.py": 3,
     "collectors/constituents.py": 2,
+    # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
+    # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
+    # installed) per "never register a freshness entry ahead of its producer" — registering
+    # now would report a false state=missing. Tracked in metron-ops#111.
+    "collectors/crypto_balances.py": 1,
     "collectors/daily_closes.py": 1,
     "collectors/daily_closes_fred_repair.py": 1,
     "collectors/fred_history.py": 1,
