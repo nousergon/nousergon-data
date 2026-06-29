@@ -115,11 +115,16 @@ class TestBacktesterTransition:
         # → PortfolioOptimizerBacktest → CheckSkipParity. CheckSkipEvaluator
         # (the eval-judge gate) stays reachable transitively through the whole
         # chain; pinned here by walking each status gate's Success edge.
+        # Post-config#830: skip-gates (CheckSkipPredictorBacktest /
+        # CheckSkipPortfolioOptimizerBacktest) precede the predictor + optimizer
+        # stages so mode=backtest-eval can bypass them; each defaults to running
+        # its stage, so the chain to CheckSkipEvaluator is unchanged on a normal run.
         bt = states["CheckBacktesterStatus"]
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "PredictorBacktest"
+        assert success_choice["Next"] == "CheckSkipPredictorBacktest"
+        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest"
 
         def _success(check):
             return next(
@@ -127,8 +132,10 @@ class TestBacktesterTransition:
                 if c.get("StringEquals") == "Success"
             )["Next"]
 
-        # Walk the L4472 split chain to the parity skip-gate.
-        assert _success("CheckPredictorBacktestStatus") == "PortfolioOptimizerBacktest"
+        # Walk the L4472 split chain (through the config#830 skip-gates) to the
+        # parity skip-gate.
+        assert _success("CheckPredictorBacktestStatus") == "CheckSkipPortfolioOptimizerBacktest"
+        assert states["CheckSkipPortfolioOptimizerBacktest"]["Default"] == "PortfolioOptimizerBacktest"
         assert _success("CheckPortfolioOptimizerBacktestStatus") == "CheckSkipParity"
 
         # skip_parity short-circuit reaches the Evaluator gate directly.
@@ -175,9 +182,10 @@ class TestSkipBacktesterPreservesEvalJudge:
 
     def test_evaluator_skip_gate_always_reaches_health_check(self, states):
         """Both branches of CheckSkipEvaluator must converge into the
-        health-check observability tail — the skip path goes to
-        SaturdayHealthCheck directly, and the run path goes to
-        Evaluator → CheckEvaluatorStatus → Success → SaturdayHealthCheck.
+        post-eval tail — the skip path and the run path
+        (Evaluator → CheckEvaluatorStatus → Success) both exit to
+        CheckSkipPostEval, the config#830 tail skip-gate, which defaults
+        to SaturdayHealthCheck (full observability tail).
 
         Post-2026-05-07 reorder: the eval-judge chain runs UPSTREAM of
         Evaluator (after DataPhase2, before PredictorTraining), so the
@@ -185,19 +193,23 @@ class TestSkipBacktesterPreservesEvalJudge:
         reachable from any skip-flag combination?) is now answered at
         the upstream junction (CheckSkipDataPhase2 → CheckSkipEvalJudge
         regardless of skip_data_phase2). At THIS junction, both
-        branches simply exit to the health-check tail; no judge gate
-        downstream to protect.
+        branches simply exit to the tail; no judge gate downstream to protect.
+
+        config#830: CheckSkipPostEval lets a mid-week mode=backtest-eval run
+        stop after Evaluator (skip the advisory tail), but it DEFAULTS to
+        SaturdayHealthCheck so a normal Saturday run still runs the full tail.
         """
         gate = states["CheckSkipEvaluator"]
         skip_choice = gate["Choices"][0]
-        assert skip_choice["Next"] == "SaturdayHealthCheck"
+        assert skip_choice["Next"] == "CheckSkipPostEval"
         assert gate["Default"] == "Evaluator"
-        # Run path success also exits to SaturdayHealthCheck (judge
-        # already ran upstream).
+        # Run path success also exits to the tail gate (judge already ran upstream).
         assert (
             states["CheckEvaluatorStatus"]["Choices"][0]["Next"]
-            == "SaturdayHealthCheck"
+            == "CheckSkipPostEval"
         )
+        # The tail gate defaults to the full health-check tail (normal run).
+        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
 
 
 class TestSkipEvalJudge:
@@ -795,15 +807,18 @@ class TestJudgeChainBeforePredictor:
 
     def test_evaluator_exits_directly_to_health_check(self, states):
         """Evaluator's success path no longer enters the judge chain
-        (judge ran upstream). It exits to SaturdayHealthCheck."""
+        (judge ran upstream). It exits to the post-eval tail gate
+        (CheckSkipPostEval, config#830), which defaults to SaturdayHealthCheck."""
         success = next(
             c for c in states["CheckEvaluatorStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "SaturdayHealthCheck"
-        # And the skip-evaluator path also goes to SaturdayHealthCheck
+        assert success["Next"] == "CheckSkipPostEval"
+        # And the skip-evaluator path also goes to CheckSkipPostEval
         # (the previous pre-reorder target was CheckSkipEvalJudge).
         assert (
             states["CheckSkipEvaluator"]["Choices"][0]["Next"]
-            == "SaturdayHealthCheck"
+            == "CheckSkipPostEval"
         )
+        # The tail gate defaults to the full health-check tail on a normal run.
+        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"

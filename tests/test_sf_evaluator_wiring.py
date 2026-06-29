@@ -57,14 +57,15 @@ class TestStatesPresent:
 
 class TestSkipEvaluator:
     def test_skip_flag_bypasses_to_health_check(self, states):
-        """Skipping the Evaluator state routes to SaturdayHealthCheck.
+        """Skipping the Evaluator state routes to the post-eval tail gate
+        (CheckSkipPostEval, config#830), which defaults to SaturdayHealthCheck.
 
         Post-2026-05-07 reorder: the eval-judge chain runs BEFORE
         Evaluator (after DataPhase2, before PredictorTraining), so by
         the time we reach this skip-gate, judge results are already
         persisted to S3 — there's no eval-judge chain downstream of
         Evaluator to skip. Skipping evaluator just exits the success
-        path to the health-check observability tail.
+        path to the post-eval observability tail.
         """
         skip = states["CheckSkipEvaluator"]
         choice = skip["Choices"][0]
@@ -74,10 +75,12 @@ class TestSkipEvaluator:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "SaturdayHealthCheck"
+        assert choice["Next"] == "CheckSkipPostEval"
+        # The tail gate defaults to the full health-check tail on a normal run.
+        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
         # Pre-reorder this routed to CheckSkipEvalJudge; post-reorder
         # judge chain is upstream of Evaluator so there's nothing to
-        # gate downstream — exit straight to the health-check tail.
+        # gate downstream — exit straight to the tail.
         assert choice["Next"] != "CheckSkipEvalJudge"
 
     def test_default_runs_evaluator(self, states):
@@ -176,16 +179,17 @@ class TestEvaluatorPollLoop:
         assert states["WaitForEvaluator"]["Next"] == "CheckEvaluatorStatus"
 
     def test_check_status_success_continues_to_health_check(self, states):
-        # On evaluator success the pipeline exits to the health-check
-        # observability tail. Post-2026-05-07 reorder, the eval-judge
-        # chain runs upstream of Evaluator, so there's no judge gate
-        # downstream — Evaluator is the last analytics-producing stage
-        # before health checks.
+        # On evaluator success the pipeline exits to the post-eval tail gate
+        # (CheckSkipPostEval, config#830), which defaults to SaturdayHealthCheck.
+        # Post-2026-05-07 reorder, the eval-judge chain runs upstream of
+        # Evaluator, so there's no judge gate downstream — Evaluator is the last
+        # analytics-producing stage before the health-check tail.
         bt = states["CheckEvaluatorStatus"]
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "SaturdayHealthCheck"
+        assert success_choice["Next"] == "CheckSkipPostEval"
+        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
 
     def test_check_status_in_progress_loops_to_wait(self, states):
         bt = states["CheckEvaluatorStatus"]

@@ -40,9 +40,13 @@ def test_gate_states_exist(states, name):
 
 
 def test_runs_first_off_initialize_input(sf, states):
-    # The gate is the very first thing after InitializeInput — before any state.
+    # The gate is the first WORKLOAD gate after InitializeInput. config#830
+    # inserted a cadence-preset gate (CheckRunMode) between InitializeInput and
+    # this gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the lib-pin
+    # gate still runs first for any non-preset input.
     assert sf["StartAt"] == "InitializeInput"
-    assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
+    assert states["InitializeInput"]["Next"] == "CheckRunMode"
+    assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
 
 
 def test_skip_gate_default_runs_check_and_skip_bypasses(states):
