@@ -547,16 +547,34 @@ class TestCfnMutexConflictAlarms:
             "MutexConflictFails metric (config#729)"
         )
 
-    def test_metric_filter_omits_defaultvalue(self, cfn_text):
-        # DefaultValue + Dimensions are mutually exclusive in AWS::Logs::
-        # MetricFilter; including both fails CFN create (the #516 deploy break).
+    def test_metric_filters_have_no_dimensions(self, cfn_text):
+        # AWS::Logs::MetricFilter rejects a metric transformation with Dimensions
+        # unless the dimension VALUE is a token extracted from the filter pattern
+        # ("the specified filter pattern does not support dimensions" — the
+        # #537-deploy break). Our pattern is a plain text match, so per-SF
+        # attribution is via DISTINCT MetricName, NOT Dimensions. Pin that the
+        # filter region carries no Dimensions and no DefaultValue.
         mf_start = cfn_text.index("MutexConflictMetricFilter")
         # Scan from the first metric filter to the first alarm block.
         mf_region = cfn_text[mf_start : cfn_text.index("MutexConflictAlarm")]
-        assert "DefaultValue" not in mf_region, (
-            "MutexConflict metric filters must NOT set DefaultValue — it is "
-            "mutually exclusive with Dimensions and fails CFN create"
+        assert "Dimensions" not in mf_region, (
+            "MutexConflict metric filters must NOT set Dimensions — a literal "
+            "dimension value is rejected at CFN create; use a distinct "
+            "MetricName per SF instead"
         )
+        assert "DefaultValue" not in mf_region, (
+            "MutexConflict metric filters must NOT set DefaultValue"
+        )
+
+    def test_each_sf_has_distinct_metric_name(self, cfn_text):
+        # Per-SF attribution requires a unique metric name per filter (no
+        # dimensions), each referenced by its own alarm.
+        for metric in ("WeeklyFreshnessMutexConflictFails",
+                       "PreopenTradingMutexConflictFails"):
+            assert cfn_text.count(metric) >= 2, (
+                f"{metric} must appear in both its metric filter and its alarm "
+                f"(distinct-metric-name attribution, config#729)"
+            )
 
     @pytest.mark.parametrize("sf_name", SF_NAMES)
     def test_alarm_present_for_each_sf(self, cfn_text, sf_name):
