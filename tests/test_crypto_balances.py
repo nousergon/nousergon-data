@@ -11,6 +11,8 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import pytest
+
 from collectors import crypto_balances as cb
 
 _BTC = "bc1q9zpgru5j9q3dccf6n5xm9wglv5jh0w8r4d5xkp"
@@ -129,3 +131,47 @@ def test_dry_run_does_not_write():
         now=_NOW, dry_run=True,
     )
     assert r["status"] == "dry-run" and s3.put_object.call_count == 0
+
+
+class TestProviderFallback:
+    """Each chain has multiple public providers tried in order — no single endpoint is a SPOF
+    (the original sole ETH RPC, cloudflare-eth.com, went dead and silently zeroed ETH)."""
+
+    def test_eth_falls_through_to_next_rpc(self, monkeypatch):
+        calls = []
+
+        def fake_post(url, payload):
+            calls.append(url)
+            if url == cb._ETH_RPCS[0]:
+                raise RuntimeError("rpc 0 unreachable")
+            return {"result": hex(2 * 10**18)}  # 2 ETH
+
+        monkeypatch.setattr(cb, "_post_json", fake_post)
+        assert cb.fetch_eth_balance(_ETH) == 2.0
+        assert calls[:2] == cb._ETH_RPCS[:2]
+
+    def test_eth_jsonrpc_error_falls_through(self, monkeypatch):
+        def fake_post(url, payload):
+            if url == cb._ETH_RPCS[0]:
+                return {"error": {"code": -32603, "message": "Internal error"}}  # the cloudflare failure
+            return {"result": hex(10**18)}  # 1 ETH
+
+        monkeypatch.setattr(cb, "_post_json", fake_post)
+        assert cb.fetch_eth_balance(_ETH) == 1.0
+
+    def test_eth_all_rpcs_fail_raises(self, monkeypatch):
+        def _boom(url, payload):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(cb, "_post_json", _boom)
+        with pytest.raises(RuntimeError):
+            cb.fetch_eth_balance(_ETH)
+
+    def test_btc_falls_through_to_mempool(self, monkeypatch):
+        def fake_get(url):
+            if url.startswith(cb._BTC_ESPLORA[0]):
+                raise RuntimeError("blockstream down")
+            return {"chain_stats": {"funded_txo_sum": 150_000_000, "spent_txo_sum": 50_000_000}}  # 1 BTC
+
+        monkeypatch.setattr(cb, "_get_json", fake_get)
+        assert cb.fetch_btc_balance(_BTC) == 1.0

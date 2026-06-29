@@ -38,8 +38,19 @@ HOLDINGS_SCHEMA_VERSION = 1
 
 _HTTP_TIMEOUT = 15
 _UA = {"User-Agent": "nousergon-crypto-balances/1.0"}
-_BLOCKSTREAM = "https://blockstream.info/api/address/{address}"
-_ETH_RPC = "https://cloudflare-eth.com"
+# Each chain has MULTIPLE free, no-key public providers tried in order — no single endpoint
+# is a SPOF (Cloudflare's cloudflare-eth.com gateway, the original sole ETH RPC, started
+# returning -32603 once deprecated; that one dead endpoint silently zeroed every ETH wallet).
+# BTC: Esplora-compatible address API (Blockstream → mempool.space fallback, same schema).
+_BTC_ESPLORA = ["https://blockstream.info/api", "https://mempool.space/api"]
+# ETH: JSON-RPC eth_getBalance on reliable keyless public nodes (PublicNode + dRPC both
+# verified live 2026-06-29; llamarpc kept as a last resort). NOT Ankr's public endpoint — it
+# now requires an API key, so it's a dead free fallback.
+_ETH_RPCS = [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org",
+    "https://eth.llamarpc.com",
+]
 _COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 # chain → (CoinGecko id, display symbol)
 _COIN = {"BTC": ("bitcoin", "BTC"), "ETH": ("ethereum", "ETH")}
@@ -69,19 +80,34 @@ def _post_json(url: str, payload: dict) -> Any:
 
 
 def fetch_btc_balance(address: str) -> float:
-    """Confirmed BTC balance for ``address`` (funded − spent txo sums, sats → BTC)."""
-    cs = _get_json(_BLOCKSTREAM.format(address=address)).get("chain_stats", {})
-    sats = int(cs.get("funded_txo_sum", 0)) - int(cs.get("spent_txo_sum", 0))
-    return sats / 1e8
+    """Confirmed BTC balance for ``address`` (funded − spent txo sums, sats → BTC). Tries each
+    Esplora provider in order; raises only if all fail (caught by the per-address fail-soft)."""
+    last_err: Exception | None = None
+    for base in _BTC_ESPLORA:
+        try:
+            cs = _get_json(f"{base}/address/{address}").get("chain_stats", {})
+            sats = int(cs.get("funded_txo_sum", 0)) - int(cs.get("spent_txo_sum", 0))
+            return sats / 1e8
+        except Exception as e:  # noqa: BLE001 - try the next provider
+            last_err = e
+    raise RuntimeError(f"all BTC providers failed; last: {last_err}")
 
 
 def fetch_eth_balance(address: str) -> float:
-    """Native ETH balance for ``address`` via JSON-RPC ``eth_getBalance`` (wei → ETH)."""
+    """Native ETH balance for ``address`` via JSON-RPC ``eth_getBalance`` (wei → ETH). Tries
+    each public RPC in order; a node-level JSON-RPC error counts as a failure and falls through
+    to the next. Raises only if all RPCs fail."""
     payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-    body = _post_json(_ETH_RPC, payload)
-    if "error" in body:
-        raise RuntimeError(f"eth_getBalance error: {body['error']}")
-    return int(body["result"], 16) / 1e18
+    last_err: Exception | None = None
+    for rpc in _ETH_RPCS:
+        try:
+            body = _post_json(rpc, payload)
+            if "error" in body:
+                raise RuntimeError(f"{rpc} eth_getBalance error: {body['error']}")
+            return int(body["result"], 16) / 1e18
+        except Exception as e:  # noqa: BLE001 - try the next RPC
+            last_err = e
+    raise RuntimeError(f"all ETH RPCs failed; last: {last_err}")
 
 
 def fetch_prices(symbols: Iterable[str]) -> dict[str, float]:
