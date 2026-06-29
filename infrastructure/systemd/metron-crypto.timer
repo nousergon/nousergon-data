@@ -1,0 +1,13 @@
+# Every 15 minutes, around the clock — crypto trades 24/7, so (unlike the intraday
+# market-data timer) there is no NYSE-session gate. A tick with no published wallet
+# addresses costs one S3 GET and exits "skipped". (metron-ops#111)
+[Unit]
+Description=Metron crypto wallet-balance producer every 15 min (24/7)
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+AccuracySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

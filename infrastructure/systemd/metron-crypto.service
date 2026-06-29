@@ -1,0 +1,19 @@
+# Metron crypto wallet-balance producer (metron-ops#111) — one shot per timer tick.
+# Reads Metron's published wallet-address universe (metron/crypto/wallet_addresses.json),
+# queries BTC/ETH balances via free public endpoints (Blockstream + a public ETH JSON-RPC),
+# prices via CoinGecko, and writes crypto/holdings.json for Metron's standalone crypto page.
+# Crypto is 24/7 (no market window) so the timer runs around the clock; per-address fetch
+# failures are WARN-logged + counted, never fatal. S3 write rides the instance role
+# (executor-role needs crypto/* in addition to market_data/* — see metron-ops#111).
+# Installed by infrastructure/install-metron-crypto.sh.
+[Unit]
+Description=Metron crypto wallet-balance producer (alpha-engine-data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine-data
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python -m collectors.crypto_balances
+TimeoutStartSec=300
