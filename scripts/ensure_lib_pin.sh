@@ -37,9 +37,16 @@ if [ ! -f "$req_file" ]; then
   exit 0
 fi
 
-libspec="$(grep -E '^alpha-engine-lib' "$req_file" | head -1 || true)"
+# Match the shared-lib pin under EITHER dist name: the package was renamed
+# `alpha-engine-lib` -> `nousergon-lib` at v0.60.0 (the AGPL rebrand). A grep
+# anchored to the OLD name silently stopped matching the renamed pin, so this
+# heal turned into a no-op on every renamed repo and boxes froze at the last
+# pre-rename version (the 2026-06-29 weekday MorningEnrich crash: box stuck at
+# alpha-engine-lib 0.59.4 while code pulled an import only present in v0.70.0).
+# Match both names so the heal survives the rename and any not-yet-renamed repo.
+libspec="$(grep -E '^(nousergon-lib|alpha-engine-lib)' "$req_file" | head -1 || true)"
 if [ -z "$libspec" ]; then
-  echo "ensure_lib_pin: no alpha-engine-lib pin in $req_file -- skipping" >&2
+  echo "ensure_lib_pin: no nousergon-lib/alpha-engine-lib pin in $req_file -- skipping" >&2
   exit 0
 fi
 
@@ -51,10 +58,10 @@ if [ -z "$pinned" ]; then
   exit 0
 fi
 
-installed="$(python -c 'import alpha_engine_lib as _l; print(_l.__version__)' 2>/dev/null || echo none)"
+installed="$(python -c 'import importlib,importlib.util as u; print(importlib.import_module("nousergon_lib" if u.find_spec("nousergon_lib") else "alpha_engine_lib").__version__)' 2>/dev/null || echo none)"
 
 if [ "$installed" = "$pinned" ]; then
-  echo "ensure_lib_pin: in sync (alpha-engine-lib v$installed)"
+  echo "ensure_lib_pin: in sync (shared lib v$installed)"
   exit 0
 fi
 
@@ -69,9 +76,9 @@ echo "ensure_lib_pin: drift -- installed=$installed pinned=v$pinned -- reinstall
 # never re-resolve" (L4591).
 pip install --quiet --force-reinstall --no-cache-dir "$libspec"
 
-healed="$(python -c 'import alpha_engine_lib as _l; print(_l.__version__)' 2>/dev/null || echo none)"
+healed="$(python -c 'import importlib,importlib.util as u; print(importlib.import_module("nousergon_lib" if u.find_spec("nousergon_lib") else "alpha_engine_lib").__version__)' 2>/dev/null || echo none)"
 if [ "$healed" != "$pinned" ]; then
   echo "ensure_lib_pin: FAILED to reconcile -- installed=$healed still != pinned=v$pinned" >&2
   exit 1
 fi
-echo "ensure_lib_pin: healed -> alpha-engine-lib v$healed"
+echo "ensure_lib_pin: healed -> shared lib v$healed"
