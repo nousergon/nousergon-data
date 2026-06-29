@@ -8,7 +8,7 @@ guaranteed around-the-clock execution with a CloudWatch trail and zero box coupl
 EventBridge-Scheduler wiring mirrors the sibling ``scheduled-groom-dispatcher``.
 
 Reuses the tested ``collectors.crypto_balances.collect()`` — vendored next to this handler
-by ``deploy.sh`` (it has no intra-repo imports, only stdlib + requests + boto3) — which reads
+by ``deploy.sh`` (it has no intra-repo imports, only stdlib + boto3) — which reads
 ``metron/crypto/wallet_addresses.json``, fetches BTC/ETH balances + prices, and writes
 ``crypto/holdings.json``.
 

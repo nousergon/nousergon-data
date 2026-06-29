@@ -23,11 +23,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
-
-import requests
 
 logger = logging.getLogger("crypto_balances")
 
@@ -37,6 +37,7 @@ HOLDINGS_KEY = "crypto/holdings.json"                          # producer → Me
 HOLDINGS_SCHEMA_VERSION = 1
 
 _HTTP_TIMEOUT = 15
+_UA = {"User-Agent": "nousergon-crypto-balances/1.0"}
 _BLOCKSTREAM = "https://blockstream.info/api/address/{address}"
 _ETH_RPC = "https://cloudflare-eth.com"
 _COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
@@ -44,39 +45,52 @@ _COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 _COIN = {"BTC": ("bitcoin", "BTC"), "ETH": ("ethereum", "ETH")}
 
 
+# ── HTTP via stdlib (no third-party dep → a dependency-free Lambda zip, no platform wheels) ─
+
+
+def _get_json(url: str) -> Any:
+    """GET ``url`` → parsed JSON. Raises (HTTPError/URLError) on a non-2xx or network error —
+    callers fail soft per address."""
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:  # noqa: S310 - fixed https hosts
+        return json.loads(r.read())
+
+
+def _post_json(url: str, payload: dict) -> Any:
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), method="POST",
+        headers={**_UA, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:  # noqa: S310 - fixed https host
+        return json.loads(r.read())
+
+
 # ── Chain balance fetchers (injectable for tests) ───────────────────────────────────────
 
 
-def fetch_btc_balance(address: str, *, session: requests.Session) -> float:
+def fetch_btc_balance(address: str) -> float:
     """Confirmed BTC balance for ``address`` (funded − spent txo sums, sats → BTC)."""
-    r = session.get(_BLOCKSTREAM.format(address=address), timeout=_HTTP_TIMEOUT)
-    r.raise_for_status()
-    cs = r.json().get("chain_stats", {})
+    cs = _get_json(_BLOCKSTREAM.format(address=address)).get("chain_stats", {})
     sats = int(cs.get("funded_txo_sum", 0)) - int(cs.get("spent_txo_sum", 0))
     return sats / 1e8
 
 
-def fetch_eth_balance(address: str, *, session: requests.Session) -> float:
+def fetch_eth_balance(address: str) -> float:
     """Native ETH balance for ``address`` via JSON-RPC ``eth_getBalance`` (wei → ETH)."""
     payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-    r = session.post(_ETH_RPC, json=payload, timeout=_HTTP_TIMEOUT)
-    r.raise_for_status()
-    body = r.json()
+    body = _post_json(_ETH_RPC, payload)
     if "error" in body:
         raise RuntimeError(f"eth_getBalance error: {body['error']}")
     return int(body["result"], 16) / 1e18
 
 
-def fetch_prices(symbols: Iterable[str], *, session: requests.Session) -> dict[str, float]:
+def fetch_prices(symbols: Iterable[str]) -> dict[str, float]:
     """``{symbol: usd_price}`` for the given chain symbols via CoinGecko simple price."""
     ids = sorted({_COIN[s][0] for s in symbols if s in _COIN})
     if not ids:
         return {}
-    r = session.get(
-        _COINGECKO, params={"ids": ",".join(ids), "vs_currencies": "usd"}, timeout=_HTTP_TIMEOUT
-    )
-    r.raise_for_status()
-    data = r.json()
+    url = _COINGECKO + "?" + urllib.parse.urlencode({"ids": ",".join(ids), "vs_currencies": "usd"})
+    data = _get_json(url)
     out: dict[str, float] = {}
     for sym, (cg_id, _) in _COIN.items():
         usd = data.get(cg_id, {}).get("usd")
@@ -118,7 +132,6 @@ def collect(
     *,
     bucket: str = DEFAULT_BUCKET,
     s3_client: Any = None,
-    session: requests.Session | None = None,
     balance_fetchers: dict[str, Callable[..., float]] | None = None,
     price_fetcher: Callable[..., dict[str, float]] | None = None,
     now: datetime | None = None,
@@ -126,16 +139,14 @@ def collect(
 ) -> dict:
     """Read the wallet-address universe, fetch balances + prices, write ``crypto/holdings.json``.
 
-    Returns a small status dict. ``s3_client`` / ``session`` / the fetchers are injectable for
-    tests. Per-address failures are WARN-logged + counted (``n_failed``), never fatal."""
+    Returns a small status dict. ``s3_client`` + the fetchers are injectable for tests.
+    Per-address failures are WARN-logged + counted (``n_failed``), never fatal."""
     now = now or datetime.now(UTC)
     fetchers = balance_fetchers or _BALANCE_FETCHERS
     price_fn = price_fetcher or fetch_prices
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    if session is None:
-        session = requests.Session()
 
     universe = _read_json(s3_client, bucket, WALLET_ADDRESSES_KEY)
     addresses = (universe or {}).get("addresses", [])
@@ -145,7 +156,7 @@ def collect(
 
     chains_present = {str(a.get("chain", "")).upper() for a in addresses}
     try:
-        prices = price_fn(chains_present, session=session)
+        prices = price_fn(chains_present)
     except Exception as e:  # noqa: BLE001 - prices are best-effort; balances still publish
         logger.warning("[crypto_balances] price fetch failed (values omitted this cycle): %s", e)
         prices = {}
@@ -161,7 +172,7 @@ def collect(
             logger.warning("[crypto_balances] unsupported/empty entry skipped: %r", a)
             continue
         try:
-            bal = fetcher(address, session=session)
+            bal = fetcher(address)
         except Exception as e:  # noqa: BLE001 - per-address fail-soft (recorded), never abort
             n_failed += 1
             logger.warning("[crypto_balances] %s balance fetch failed for %s: %s", chain, address, e)
