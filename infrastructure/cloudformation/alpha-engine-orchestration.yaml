@@ -617,9 +617,17 @@ Resources:
   # The filters key on the MutexConflict Cause text in the SF FailedEvent (logged
   # at level=ERROR + includeExecutionData=true via the LoggingConfiguration
   # above). DependsOn the log group so CFN creates the destination before the
-  # filter. DefaultValue is OMITTED (it is mutually exclusive with Dimensions in
-  # AWS::Logs::MetricFilter); the alarm's TreatMissingData=notBreaching covers
-  # the zero-conflict steady state (no match -> no data point -> alarm OK).
+  # filter.
+  #
+  # Per-SF attribution is via a DISTINCT MetricName per filter — NOT a Dimension.
+  # AWS::Logs::MetricFilter only permits dimensions whose VALUE is a token
+  # extracted from the filter pattern (e.g. `$.field`); a literal dimension value
+  # is rejected at create with "filter pattern does not support dimensions". Our
+  # pattern is a plain text match, so we give each SF its own metric name and
+  # point its alarm at that name. (DefaultValue is also omitted — it is mutually
+  # exclusive with dimensions and unnecessary here: the alarm's
+  # TreatMissingData=notBreaching covers the zero-conflict steady state, where no
+  # match -> no data point -> alarm OK.)
   #
   # EOD (ne-postclose-trading-pipeline) is intentionally NOT covered here: it is
   # script-managed (update_eod_pipeline_sf.sh, logging still OFF) and is
@@ -633,11 +641,8 @@ Resources:
       FilterPattern: '"MutexConflict"'
       MetricTransformations:
         - MetricNamespace: AlphaEngine/StepFunctions
-          MetricName: MutexConflictFails
+          MetricName: WeeklyFreshnessMutexConflictFails
           MetricValue: '1'
-          Dimensions:
-            - Key: StateMachine
-              Value: ne-weekly-freshness-pipeline
 
   PreopenTradingMutexConflictMetricFilter:
     Type: AWS::Logs::MetricFilter
@@ -647,11 +652,8 @@ Resources:
       FilterPattern: '"MutexConflict"'
       MetricTransformations:
         - MetricNamespace: AlphaEngine/StepFunctions
-          MetricName: MutexConflictFails
+          MetricName: PreopenTradingMutexConflictFails
           MetricValue: '1'
-          Dimensions:
-            - Key: StateMachine
-              Value: ne-preopen-trading-pipeline
 
   WeeklyFreshnessMutexConflictAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -662,10 +664,7 @@ Resources:
         (duplicate-trigger guard fired). First occurrence = investigate the
         duplicate-trigger source.
       Namespace: AlphaEngine/StepFunctions
-      MetricName: MutexConflictFails
-      Dimensions:
-        - Name: StateMachine
-          Value: ne-weekly-freshness-pipeline
+      MetricName: WeeklyFreshnessMutexConflictFails
       Statistic: Sum
       Period: 86400
       EvaluationPeriods: 1
@@ -684,10 +683,7 @@ Resources:
         (duplicate-trigger guard fired). First occurrence = investigate the
         duplicate-trigger source.
       Namespace: AlphaEngine/StepFunctions
-      MetricName: MutexConflictFails
-      Dimensions:
-        - Name: StateMachine
-          Value: ne-preopen-trading-pipeline
+      MetricName: PreopenTradingMutexConflictFails
       Statistic: Sum
       Period: 86400
       EvaluationPeriods: 1
