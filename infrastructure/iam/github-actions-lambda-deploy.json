@@ -305,6 +305,28 @@
         "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/alpha-engine-*-pipeline:*",
         "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*"
       ]
+    },
+    {
+      "Sid": "InfraDeployLogGroups",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:ListTagsForResource"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*"
+      ]
+    },
+    {
+      "Sid": "InfraDeployLogGroupsDescribe",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
     }
   ]
 }
