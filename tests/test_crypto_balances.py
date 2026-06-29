@@ -20,6 +20,9 @@ _ETH = "0x52908400098527886e0f7030069857d2e4169ee7"
 # Canonical BIP84 test vector (mnemonic "abandon abandon … about"): zpub + its m/…/0/0 address.
 _ZPUB = "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs"
 _ZPUB_FIRST_RECEIVE = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+# A bare xpub (BIP44 account key of the same test mnemonic) — its script type is ambiguous, so
+# the scanner derives all three types (the real-world Ledger-exports-segwit-as-xpub case).
+_XPUB = "xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj"
 _NOW = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
 
 
@@ -64,6 +67,7 @@ def test_happy_path_writes_balances_and_values():
         s3_client=s3,
         balance_fetchers=_fetchers({"BTC": 0.5, "ETH": 2.0}),
         price_fetcher=lambda syms: {"BTC": 60000.0, "ETH": 3000.0},
+        eth_token_fetcher=lambda a: [],
         now=_NOW,
     )
     assert r["status"] == "ok" and r["n_balances"] == 2 and r["n_failed"] == 0
@@ -81,6 +85,7 @@ def test_per_address_failure_is_soft():
         s3_client=s3,
         balance_fetchers=_fetchers({"BTC": 0.5, "ETH": RuntimeError("rpc down")}),
         price_fetcher=lambda syms: {"BTC": 60000.0},
+        eth_token_fetcher=lambda a: [],
         now=_NOW,
     )
     assert r["status"] == "ok" and r["n_balances"] == 1 and r["n_failed"] == 1
@@ -120,7 +125,7 @@ def test_all_failed_does_not_write():
     r = cb.collect(
         s3_client=s3,
         balance_fetchers=_fetchers({"ETH": RuntimeError("down")}),
-        price_fetcher=lambda syms: {}, now=_NOW,
+        price_fetcher=lambda syms: {}, eth_token_fetcher=lambda a: [], now=_NOW,
     )
     assert r["status"] == "error" and s3.put_object.call_count == 0
 
@@ -223,3 +228,74 @@ class TestXpub:
     def test_fetch_btc_single_address_path(self, monkeypatch):
         monkeypatch.setattr(cb, "_esplora_address_stats", lambda a: (150_000_000, 50_000_000, 1))
         assert cb.fetch_btc_balance(_BTC) == 1.0
+
+    def test_zpub_one_script_type_xpub_all_three(self):
+        assert len(cb._xpub_address_fns(_ZPUB)) == 1   # unambiguous version → P2WPKH only
+        assert len(cb._xpub_address_fns(_XPUB)) == 3   # ambiguous → scan P2PKH/P2SH-WPKH/P2WPKH
+
+    def test_xpub_scans_every_script_type(self, monkeypatch):
+        # All addresses empty → each script type's two branches hit the gap limit. With 3 types
+        # the scan does 3× the work of a single-type (zpub) key — proves all types are scanned.
+        monkeypatch.setattr(cb, "_SCAN_DELAY_S", 0)
+        n = {"x": 0, "z": 0}
+
+        monkeypatch.setattr(cb, "_esplora_address_stats", lambda a: (n.__setitem__("x", n["x"] + 1), (0, 0, 0))[1])
+        assert cb.fetch_btc_xpub_balance(_XPUB, gap_limit=2) == 0.0
+        monkeypatch.setattr(cb, "_esplora_address_stats", lambda a: (n.__setitem__("z", n["z"] + 1), (0, 0, 0))[1])
+        assert cb.fetch_btc_xpub_balance(_ZPUB, gap_limit=2) == 0.0
+        assert n["x"] == 3 * n["z"]  # 3 script types vs 1
+
+
+class TestEthTokens:
+    """ERC-20 token holdings for an ETH address (Blockscout v2). Only tokens with a USD
+    exchange_rate + value ≥ $1 are kept — spam/airdrop tokens (no rate) self-filter."""
+
+    def _blockscout(self):
+        return [
+            {"value": str(752_800_000_000_000_000), "token": {
+                "type": "ERC-20", "symbol": "STETH", "decimals": "18",
+                "exchange_rate": "1618.23", "address": "0xae7"}},
+            {"value": str(10**18), "token": {  # spam: no exchange_rate → dropped
+                "type": "ERC-20", "symbol": "SPAM", "decimals": "18",
+                "exchange_rate": None, "address": "0xspam"}},
+            {"value": str(10**17), "token": {  # dust: 0.1 × $0.001 = $0.0001 < $1 → dropped
+                "type": "ERC-20", "symbol": "DUST", "decimals": "18",
+                "exchange_rate": "0.001", "address": "0xdust"}},
+        ]
+
+    def test_filters_spam_and_dust(self, monkeypatch):
+        monkeypatch.setattr(cb, "_get_json", lambda url: self._blockscout())
+        toks = cb.fetch_eth_tokens(_ETH)
+        assert [t["symbol"] for t in toks] == ["STETH"]
+        assert toks[0]["value_usd"] == pytest.approx(0.7528 * 1618.23)
+        assert toks[0]["contract"] == "0xae7"
+
+    def test_collect_emits_native_eth_plus_token_rows(self):
+        s3 = _s3(_universe(("ETH", _ETH)))
+        r = cb.collect(
+            s3_client=s3,
+            balance_fetchers={"ETH": lambda a: 0.5},
+            price_fetcher=lambda syms: {"ETH": 2000.0},
+            eth_token_fetcher=lambda a: [{"symbol": "STETH", "balance": 1.0, "price_usd": 1600.0, "value_usd": 1600.0, "contract": "0xae7"}],
+            now=_NOW,
+        )
+        assert r["status"] == "ok" and r["n_balances"] == 2  # native ETH + 1 token
+        art = _puts(s3)[cb.HOLDINGS_KEY]
+        syms = [b["symbol"] for b in art["balances"]]
+        assert syms == ["ETH", "STETH"]
+        assert art["balances"][1]["value_usd"] == 1600.0
+
+    def test_token_fetch_failure_keeps_native_eth(self):
+        s3 = _s3(_universe(("ETH", _ETH)))
+
+        def _boom(a):
+            raise RuntimeError("blockscout down")
+
+        r = cb.collect(
+            s3_client=s3,
+            balance_fetchers={"ETH": lambda a: 0.5},
+            price_fetcher=lambda syms: {"ETH": 2000.0},
+            eth_token_fetcher=_boom, now=_NOW,
+        )
+        assert r["status"] == "ok" and r["n_balances"] == 1  # native ETH survives
+        assert _puts(s3)[cb.HOLDINGS_KEY]["balances"][0]["symbol"] == "ETH"
