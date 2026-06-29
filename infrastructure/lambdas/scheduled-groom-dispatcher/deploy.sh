@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy.sh — Create or update the alpha-engine-scheduled-groom-dispatcher Lambda
-# and wire its three EventBridge Scheduler rules (the reliable replacement for
+# and wire its EventBridge Scheduler rules (the reliable replacement for
 # the backlog-groom GHA `schedule:` crons — config#1322).
 #
 # Each Scheduler rule fires THIS Lambda on cadence; the Lambda repository_
@@ -10,10 +10,14 @@
 # (scheduler.amazonaws.com role, cron() expression, flexible-time-window) mirror
 # `infrastructure/run_weekly_offcycle.sh`.
 #
-# Cadence (UTC, mirrors the GHA crons exactly):
+# Cadence (UTC, mirrors the GHA crons exactly). Reduced 3->2/day on 2026-06-29
+# (the 15:00 UTC / 8am-PT run was dropped per usage pacing):
 #   07:00 Sun-Fri   cron(0 7 ? * SUN-FRI *)   FULL   # 12am PT, skips Sat
-#   15:00 Sun-Fri   cron(0 15 ? * SUN-FRI *)  FULL   # 8am PT, skips Sat
 #   23:00 daily     cron(0 23 * * ? *)        FULL   # 4pm PT, every day incl. Sat
+#
+# SCHED_NAMES is the source of truth: any live scheduler rule under the
+# alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
+# (deleted) on deploy, so removing a cadence here removes it live too.
 #
 # Managed OUTSIDE CloudFormation — same rationale as the sibling dispatchers
 # (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow;
@@ -45,22 +49,21 @@ FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 # Schedule definitions: name | cron expression (UTC) | JSON input (run_mode + label).
-# Mirrors backlog-groom.yml's three `schedule:` crons one-for-one.
+# Mirrors backlog-groom.yml's `schedule:` crons one-for-one.
 SCHED_NAMES=(
   "alpha-engine-scheduled-groom-0700-sunfri"
-  "alpha-engine-scheduled-groom-1500-sunfri"
   "alpha-engine-scheduled-groom-2300-daily"
 )
 SCHED_CRONS=(
   "cron(0 7 ? * SUN-FRI *)"
-  "cron(0 15 ? * SUN-FRI *)"
   "cron(0 23 * * ? *)"
 )
 SCHED_INPUTS=(
   '{"run_mode":"full","schedule":"0 7 * * 0-5"}'
-  '{"run_mode":"full","schedule":"0 15 * * 0-5"}'
   '{"run_mode":"full","schedule":"0 23 * * *"}'
 )
+# Prefix used to discover live rules for prune reconciliation (see step 2d).
+SCHED_PREFIX="alpha-engine-scheduled-groom-"
 
 DRY_RUN=false
 BOOTSTRAP=false
@@ -187,7 +190,7 @@ EOF
     sleep 10
   fi
 
-  # --- 2d. The three EventBridge Scheduler rules ---
+  # --- 2d. The EventBridge Scheduler rules ---
   for i in "${!SCHED_NAMES[@]}"; do
     name="${SCHED_NAMES[$i]}"
     cron="${SCHED_CRONS[$i]}"
@@ -223,6 +226,29 @@ EOF
       aws scheduler get-schedule --name "${name}" --region "${REGION}" \
         --query 'Name' --output text >/dev/null \
         || { echo "ERROR: Scheduler rule ${name} not found after create/update" >&2; exit 1; }
+    fi
+  done
+
+  # --- 2e. Prune reconciliation: delete any live rule under SCHED_PREFIX that is
+  # no longer in SCHED_NAMES (so dropping a cadence above removes it live too,
+  # rather than silently orphaning a still-firing schedule). Added 2026-06-29
+  # alongside the 3->2/day reduction (the 1500-sunfri rule is the first prunee).
+  echo "  Pruning orphaned Scheduler rules under prefix ${SCHED_PREFIX}..."
+  LIVE_RULES=$(aws scheduler list-schedules --name-prefix "${SCHED_PREFIX}" \
+    --region "${REGION}" --query 'Schedules[].Name' --output text 2>/dev/null || echo "")
+  for live in ${LIVE_RULES}; do
+    keep=false
+    for want in "${SCHED_NAMES[@]}"; do
+      [ "${live}" = "${want}" ] && { keep=true; break; }
+    done
+    if ! $keep; then
+      echo "    Deleting orphaned Scheduler rule: ${live}"
+      run aws scheduler delete-schedule --name "${live}" --region "${REGION}"
+      if ! $DRY_RUN; then
+        aws scheduler get-schedule --name "${live}" --region "${REGION}" \
+          --query 'Name' --output text >/dev/null 2>&1 \
+          && { echo "ERROR: Scheduler rule ${live} still present after delete" >&2; exit 1; }
+      fi
     fi
   done
 fi
