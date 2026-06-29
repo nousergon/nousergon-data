@@ -139,20 +139,27 @@ class TestChainOrdering:
         assert states["WaitForBacktester"]["Next"] == "CheckBacktesterStatus"
 
     def test_backtester_success_routes_to_predictor_backtest(self, states):
-        """L4472: Backtester (simulate-only) success hands off to the new
+        """L4472: Backtester (simulate-only) success hands off to the
         PredictorBacktest state, not directly to CheckSkipParity — the
         predictor+Phase4 block now runs in its own SF state so its runtime
-        no longer sums into the simulate SSM command."""
+        no longer sums into the simulate SSM command. config#830 inserted the
+        CheckSkipPredictorBacktest skip-gate in front of PredictorBacktest
+        (so mode=backtest-eval can bypass it); the gate's Default still runs
+        PredictorBacktest, so the handoff is unchanged on scheduled runs."""
         success = [
             c["Next"]
             for c in states["CheckBacktesterStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["PredictorBacktest"], (
-            "Backtester (simulate-only) success must hand off to "
-            "PredictorBacktest — the L4472 phase-split runs predictor+Phase4 "
-            "in its own state so a fresh simulate never carries the post-sweep "
-            "stack into one SSM execution timeout."
+        assert success == ["CheckSkipPredictorBacktest"], (
+            "Backtester (simulate-only) success must hand off to the "
+            "PredictorBacktest skip-gate — the L4472 phase-split runs "
+            "predictor+Phase4 in its own state so a fresh simulate never "
+            "carries the post-sweep stack into one SSM execution timeout."
+        )
+        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest", (
+            "CheckSkipPredictorBacktest must default to running PredictorBacktest "
+            "so a normal Saturday run is unaffected by the config#830 skip-gate."
         )
 
     def test_backtester_status_loops_and_default(self, states):
@@ -447,14 +454,20 @@ class TestL4472PhaseSplit:
 
     def test_chain_backtester_predictor_optimizer_parity(self, states):
         """Backtester → PredictorBacktest → PortfolioOptimizerBacktest →
-        CheckSkipParity, each via its status gate's Success edge."""
+        CheckSkipParity, each via its status gate's Success edge. config#830
+        inserted skip-gates (CheckSkipPredictorBacktest /
+        CheckSkipPortfolioOptimizerBacktest) in front of the predictor and
+        optimizer stages; each defaults to running its stage, so the L4472
+        chain ordering is preserved on a normal run."""
         def success(check):
             return [
                 c["Next"] for c in states[check]["Choices"]
                 if c.get("StringEquals") == "Success"
             ]
-        assert success("CheckBacktesterStatus") == ["PredictorBacktest"]
-        assert success("CheckPredictorBacktestStatus") == ["PortfolioOptimizerBacktest"]
+        assert success("CheckBacktesterStatus") == ["CheckSkipPredictorBacktest"]
+        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest"
+        assert success("CheckPredictorBacktestStatus") == ["CheckSkipPortfolioOptimizerBacktest"]
+        assert states["CheckSkipPortfolioOptimizerBacktest"]["Default"] == "PortfolioOptimizerBacktest"
         assert success("CheckPortfolioOptimizerBacktestStatus") == ["CheckSkipParity"]
 
     def test_predictor_backtest_invokes_predictor_mode(self, states):
