@@ -66,8 +66,7 @@ echo "==> Stamping Step Function definitions with git SHA..."
 SAT_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 DAILY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 EOD_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-BTEVAL_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$BTEVAL_STAMPED'" EXIT
+trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED'" EXIT
 python3 -c "
 import json, sys
 path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -99,23 +98,12 @@ if orig.startswith('[git:'):
 d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
 json.dump(d, open(path_out, 'w'), indent=2)
 " "$SCRIPT_DIR/step_function_eod.json" "$EOD_STAMPED" "$GIT_SHA"
-python3 -c "
-import json, sys
-path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
-d = json.load(open(path_in))
-orig = d.get('Comment', '')
-if orig.startswith('[git:'):
-    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
-d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
-json.dump(d, open(path_out, 'w'), indent=2)
-" "$SCRIPT_DIR/step_function_backtest_eval.json" "$BTEVAL_STAMPED" "$GIT_SHA"
 
 echo ""
 echo "==> Uploading Step Function definitions to S3..."
 aws s3 cp "$SAT_STAMPED" "s3://$BUCKET/infrastructure/step_function.json" --quiet
 aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json" --quiet
 aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
-aws s3 cp "$BTEVAL_STAMPED" "s3://$BUCKET/infrastructure/step_function_backtest_eval.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
 # ── 3. Update Step Functions directly ────────────────────────────────────────
@@ -125,7 +113,6 @@ echo "==> Updating Step Function definitions..."
 SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"
 EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
-BTEVAL_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-backtest-eval-pipeline"
 
 # Pass the definition via file:// — NOT inline "$(cat ...)". The Saturday ASL is
 # ~131 KB and growing (one state per pipeline step); combined with the AWS
@@ -150,20 +137,6 @@ echo "  Weekday pipeline updated."
 # three orchestration SFs now stay in lockstep with origin/main on every merge.
 aws stepfunctions update-state-machine --state-machine-arn "$EOD_ARN" --definition "file://$EOD_STAMPED" --query "updateDate" --output text
 echo "  EOD pipeline updated."
-
-# Backtest+Eval SF (alpha-engine-backtest-eval-pipeline) — config#830 mid-week rerun SF.
-# Created by the CloudFormation stack below (step 4) on first deploy, so on the very
-# first deploy this state machine does not exist yet and update-state-machine would
-# 404. Guard the update on existence: if the SF isn't there yet, the CFN create in
-# step 4 reads the freshly-uploaded S3 definition (CFN reads DefinitionS3Location on
-# create); every subsequent deploy updates it here in lockstep with origin/main, same
-# stamp + S3-copy + file:// pattern as the three SFs above.
-if aws stepfunctions describe-state-machine --state-machine-arn "$BTEVAL_ARN" --region "$REGION" &>/dev/null; then
-    aws stepfunctions update-state-machine --state-machine-arn "$BTEVAL_ARN" --definition "file://$BTEVAL_STAMPED" --query "updateDate" --output text
-    echo "  Backtest+Eval pipeline updated."
-else
-    echo "  Backtest+Eval pipeline not yet created — CloudFormation will create it from the uploaded S3 definition (step 4)."
-fi
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""

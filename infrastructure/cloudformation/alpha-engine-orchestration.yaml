@@ -152,30 +152,6 @@ Resources:
         Key: infrastructure/step_function_daily.json
 
   # --------------------------------------------------------------------------
-  # Step Functions — Backtest+Eval Pipeline (config#830)
-  # --------------------------------------------------------------------------
-  # Standalone mid-week rerun SF: Backtester → Evaluator → NotifyComplete only,
-  # reusing the exact state definitions from the Saturday SF. AWS Step Functions
-  # only supports `redrive` from FAILED executions, so when only backtester or
-  # evaluator CODE changes, re-running the full Saturday SF (DataPhase1 + RAG +
-  # Research + DataPhase2 + PredictorTraining) was ~80 min of waste. This SF runs
-  # just the two changed stages off the existing weekly data/research/training
-  # artifacts. Replaces the local-blocking
-  # crucible-backtester/infrastructure/spot_backtest_and_evaluate.sh shell chain
-  # for orchestrated reruns (the script stays for local dev). No EventBridge
-  # trigger — invoked manually from the console/CLI for mid-week partial reruns.
-  # Same DefinitionS3Location pattern as the other SFs: deploy-infrastructure.sh
-  # uploads the JSON to S3 and is the source of truth.
-  BacktestEvalPipeline:
-    Type: AWS::StepFunctions::StateMachine
-    Properties:
-      StateMachineName: alpha-engine-backtest-eval-pipeline
-      RoleArn: !Ref StepFunctionsRoleArn
-      DefinitionS3Location:
-        Bucket: alpha-engine-research
-        Key: infrastructure/step_function_backtest_eval.json
-
-  # --------------------------------------------------------------------------
   # EventBridge Rules — Pipeline Triggers
   # --------------------------------------------------------------------------
   SaturdayTrigger:
@@ -604,10 +580,6 @@ Outputs:
   WeekdayPipelineArn:
     Value: !Ref WeekdayPipeline
     Description: Weekday pipeline state machine ARN
-
-  BacktestEvalPipelineArn:
-    Value: !Ref BacktestEvalPipeline
-    Description: Backtest+Eval mid-week rerun pipeline state machine ARN (config#830)
 
   ExecutionMutexTableName:
     Value: !Ref ExecutionMutexTable
