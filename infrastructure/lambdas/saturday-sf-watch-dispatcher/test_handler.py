@@ -364,3 +364,42 @@ def test_pat_never_appears_in_result(monkeypatch):
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
     assert "ghp_SECRET_TOKEN" not in json.dumps(result)
+
+
+def _deploy_sh_rule_arns() -> set[str]:
+    """Parse the SF names out of deploy.sh's EventBridge EVENT_PATTERN
+    stateMachineArn list — the literal ARNs the live rule will match."""
+    import re
+
+    text = (Path(__file__).parent / "deploy.sh").read_text()
+    # The pattern lives in a heredoc; pull every stateMachine:<name> token that
+    # appears inside the EVENT_PATTERN block's stateMachineArn array.
+    start = text.index('"stateMachineArn"')
+    end = text.index("]", start)
+    block = text[start:end]
+    return set(re.findall(r"stateMachine:([A-Za-z0-9-]+)", block))
+
+
+def test_registry_and_eventbridge_rule_are_in_lockstep():
+    """REGRESSION GUARD (config#1408, 2026-06-29 dead-watch): every SF name in
+    index.PIPELINES MUST appear in deploy.sh's EventBridge rule pattern. The
+    handler ignores any SF not in the rule's ARN list never even reaches it;
+    any SF not in PIPELINES is ignored by the handler. The two must not drift —
+    that drift is exactly what silently disabled the watcher (code generalized
+    to 3 pipelines, the rule left at a single deleted ARN)."""
+    rule_arns = _deploy_sh_rule_arns()
+    registry = set(index.PIPELINES)
+    missing_from_rule = registry - rule_arns
+    assert not missing_from_rule, (
+        f"PIPELINES entries not covered by the EventBridge rule in deploy.sh: "
+        f"{sorted(missing_from_rule)} — their failures would never invoke the "
+        f"dispatcher. Add them to the EVENT_PATTERN stateMachineArn list."
+    )
+
+
+def test_live_old_named_eod_is_registered_during_rename_transition():
+    """Until the SF-rename cutover (config#1408 / re-exam 2026-07-03) the EOD SF
+    still runs as `alpha-engine-eod-pipeline`. Drop this assertion when the old
+    ARN is removed from the registry + rule at cutover."""
+    assert "alpha-engine-eod-pipeline" in index.PIPELINES
+    assert index.PIPELINES["alpha-engine-eod-pipeline"]["cadence_slug"] == "eod"
