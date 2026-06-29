@@ -15,7 +15,7 @@
       "Sid": "StartSaturdayShellRun",
       "Effect": "Allow",
       "Action": ["states:StartExecution"],
-      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
     }
   ]
 }

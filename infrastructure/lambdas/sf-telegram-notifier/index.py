@@ -41,21 +41,21 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 _SF_LABELS: dict[str, str] = {
-    "alpha-engine-saturday-pipeline": "Saturday SF",
-    "alpha-engine-weekday-pipeline": "Weekday SF",
-    "alpha-engine-eod-pipeline": "EOD SF",
+    "ne-weekly-freshness-pipeline": "Weekly Freshness SF",
+    "ne-preopen-trading-pipeline": "Pre-open Trading SF",
+    "ne-postclose-trading-pipeline": "Post-close Trading SF",
 }
 
-# 2026-05-23 Preflight Pipeline rename: when the Saturday SF runs as
+# 2026-05-23 Preflight Pipeline rename: when the weekly-freshness SF runs as
 # the Friday-PM preflight dry-pass (input ``shell_run=true``), surface a
-# distinct ``Saturday Preflight SF`` label in the Telegram message so
+# distinct ``Weekly Freshness Preflight SF`` label in the Telegram message so
 # the operator can tell the two flavors apart in the channel at a
 # glance. The state machine name is the same (the dry-pass IS the
-# Saturday SF with dry inputs per CLAUDE.md "don't add redundant paths
+# weekly-freshness SF with dry inputs per CLAUDE.md "don't add redundant paths
 # around load-bearing scheduled infra"); we differentiate via the
 # execution input flag, not via a separate SF.
 _PREFLIGHT_LABEL_OVERRIDE: dict[str, str] = {
-    "alpha-engine-saturday-pipeline": "Saturday Preflight SF",
+    "ne-weekly-freshness-pipeline": "Weekly Freshness Preflight SF",
 }
 
 _STATUS_EMOJI: dict[str, str] = {

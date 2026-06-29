@@ -68,7 +68,7 @@ def test_succeeded_dispatches_correct_repository_dispatch(monkeypatch):
         "detail": {
             "status": "SUCCEEDED",
             "name": "sat-run-1",
-            "stateMachineArn": "arn:aws:states:us-east-1:1:stateMachine:alpha-engine-saturday-pipeline",
+            "stateMachineArn": "arn:aws:states:us-east-1:1:stateMachine:ne-weekly-freshness-pipeline",
         }
     }
     out = idx.handler(event, None)

@@ -1,6 +1,6 @@
 # alpha-engine-eod-backstop
 
-Same-day backstop trigger for the EOD Step Function (`alpha-engine-eod-pipeline`). Phase 2 of the trading-day-gap arc (**config#1229**).
+Same-day backstop trigger for the EOD Step Function (`ne-postclose-trading-pipeline`). Phase 2 of the trading-day-gap arc (**config#1229**).
 
 ## Why
 
@@ -44,7 +44,7 @@ aws events enable-rule --name alpha-engine-eod-backstop-daily --region us-east-1
 
 | env var | default |
 |---|---|
-| `EOD_SF_ARN` | `…:stateMachine:alpha-engine-eod-pipeline` |
+| `EOD_SF_ARN` | `…:stateMachine:ne-postclose-trading-pipeline` |
 | `TRADING_INSTANCE_ID` | `i-018eb3307a21329bf` |
 | `DASHBOARD_INSTANCE_ID` | `i-09b539c844515d549` |
 | `SNS_TOPIC_ARN` | `…:alpha-engine-alerts` |

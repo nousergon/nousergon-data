@@ -31,10 +31,10 @@ import index  # noqa: E402
 
 
 EOD_ARN = (
-    "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+    "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
 )
 SATURDAY_ARN = (
-    "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
+    "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 )
 
 
@@ -54,7 +54,7 @@ def _event(
     detail: dict = {
         "status": status,
         "stateMachineArn": sm_arn,
-        "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:exec-001",
+        "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:exec-001",
         "name": "exec-001",
         "startDate": _epoch_ms(2026, 5, 22, 20, 15),
         "stopDate": stop_date_ms
@@ -81,7 +81,7 @@ def _patch_sfn(start_execution_return: dict | None = None, side_effect=None):
         fake_client.start_execution.return_value = (
             start_execution_return
             or {
-                "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:friday-shell-test",
+                "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:friday-shell-test",
                 "startDate": datetime(2026, 5, 22, 20, 25, tzinfo=timezone.utc),
             }
         )
@@ -165,7 +165,7 @@ def test_wrong_state_machine_arn_logs_and_returns_without_firing():
     """Defensive: rule filter mismatch should NOT raise but also not fire."""
     sfn_patch, fake_client = _patch_sfn()
     weekday_arn = (
-        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
     )
     with sfn_patch:
         result = index.handler(_event(sm_arn=weekday_arn), None)
