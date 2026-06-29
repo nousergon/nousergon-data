@@ -1,10 +1,10 @@
-"""Unit tests for saturday-sf-watch-dispatcher index.handler (M1, OBSERVE).
+"""Unit tests for sf-watch-dispatcher index.handler (Fleet-SF Watch).
 
 Stubs ``alpha_engine_lib.telegram.send_message`` (no live Telegram) and mocks
 boto3 stepfunctions + s3 clients. Asserts: watch-log artifact written (append +
 fresh-skeleton), failed-state extraction from history, fail-loud on the S3 write,
-best-effort enrichment + Telegram, non-Saturday guard, and the M2 dispatch seam
-stays OFF.
+best-effort enrichment + Telegram, per-pipeline routing (saturday/weekday prefix
++ dispatch event type), the unregistered-SF guard, and the dispatch seam.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ import index  # noqa: E402
 
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
+EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+UNREGISTERED_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:some-other-pipeline"
 
 
 class FakeClientError(Exception):
@@ -132,7 +134,8 @@ def test_telegram_is_silent_and_records_artifact_location():
     text = _telegram_mod.send_message.call_args.args[0]
     kwargs = _telegram_mod.send_message.call_args.kwargs
     assert kwargs["disable_notification"] is True  # notifier already buzzed loud
-    assert "Saturday-SF Watch — OBSERVE" in text
+    assert "Fleet-SF Watch — OBSERVE" in text
+    assert "Saturday SF: FAILED" in text  # pipeline-aware label
     assert "Failed state: RAGIngestion" in text
     assert "consolidated/saturday_sf_watch/2023-11-14.json" in text
     assert "observe-only" in text
@@ -210,12 +213,32 @@ def test_preflight_shell_run_marks_record():
     assert "Saturday Preflight SF" in text
 
 
-def test_non_saturday_sf_is_ignored():
+def test_unregistered_sf_is_ignored():
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=UNREGISTERED_ARN), None)
+    assert result["ignored"] is True
+    s3.put_object.assert_not_called()
+
+
+def test_weekday_sf_routes_to_weekday_prefix_and_label():
     factory, _, s3 = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
-    assert result["ignored"] is True
-    s3.put_object.assert_not_called()
+    assert result["state_machine"] == "alpha-engine-weekday-pipeline"
+    assert result["watch_log_key"] == "consolidated/weekday_sf_watch/2023-11-14.json"
+    assert s3.put_object.call_args.kwargs["Key"].startswith("consolidated/weekday_sf_watch/")
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "Weekday SF: FAILED" in text
+
+
+def test_eod_sf_routes_to_eod_prefix():
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=EOD_ARN), None)
+    assert result["watch_log_key"] == "consolidated/eod_sf_watch/2023-11-14.json"
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "EOD SF: FAILED" in text
 
 
 @pytest.mark.parametrize("status", ["TIMED_OUT", "ABORTED"])
@@ -278,16 +301,42 @@ def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
 
-    assert result["agent_dispatch"] == {"dispatched": True, "status_code": 204}
+    assert result["agent_dispatch"] == {
+        "dispatched": True, "status_code": 204, "event_type": "saturday-sf-failure",
+    }
     assert result["action"] == "dispatched"
     assert sent["url"].endswith("/repos/nousergon/alpha-engine-config/dispatches")
     assert sent["data"]["event_type"] == "saturday-sf-failure"
     cp = sent["data"]["client_payload"]
+    assert cp["pipeline_name"] == "alpha-engine-saturday-pipeline"
+    assert cp["state_machine_arn"] == SATURDAY_ARN
     assert cp["failed_state"] == "RAGIngestion"
     assert cp["run_date"] == "2023-11-14"
     assert cp["watch_log_key"] == "consolidated/saturday_sf_watch/2023-11-14.json"
     # Watch-log is written BEFORE dispatch (agent reads fresh context).
     s3.put_object.assert_called_once()
+
+
+def test_dispatch_routes_weekday_event_type(monkeypatch):
+    """A weekday failure dispatches the weekday-sf-failure event type + payload."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    sent = {}
+
+    def fake_urlopen(req, timeout=None):
+        sent["data"] = json.loads(req.data)
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+
+    assert result["agent_dispatch"]["event_type"] == "weekday-sf-failure"
+    assert sent["data"]["event_type"] == "weekday-sf-failure"
+    cp = sent["data"]["client_payload"]
+    assert cp["pipeline_name"] == "alpha-engine-weekday-pipeline"
+    assert cp["state_machine_arn"] == WEEKDAY_ARN
 
 
 def test_dispatch_error_recorded_not_raised(monkeypatch):

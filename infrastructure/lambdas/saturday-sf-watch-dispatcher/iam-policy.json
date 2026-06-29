@@ -27,19 +27,23 @@
       "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
     },
     {
-      "Sid": "ReadSaturdaySFExecution",
+      "Sid": "ReadFleetSFExecutions",
       "Effect": "Allow",
       "Action": [
         "states:DescribeExecution",
         "states:GetExecutionHistory"
       ],
-      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:*"
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-weekday-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:*"
+      ]
     },
     {
       "Sid": "WatchLogArtifactRW",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/saturday_sf_watch/*"
+      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
     }
   ]
 }
