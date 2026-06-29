@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-crypto-balances:*"
+    },
+    {
+      "Sid": "ReadWalletAddresses",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/metron/crypto/wallet_addresses.json"
+    },
+    {
+      "Sid": "WriteCryptoHoldings",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/crypto/holdings.json"
+    }
+  ]
+}
