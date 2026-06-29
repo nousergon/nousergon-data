@@ -429,6 +429,63 @@ class TestCfnExecutionMutexTable:
         )
 
 
+class TestCfnMutexConflictAlarms:
+    """The CFN template must wire a CloudWatch metric-filter + alarm per SF on
+    the L274 MutexConflict Fail (config#729). First non-zero count is the
+    operator-action signal to investigate the duplicate-trigger source. Raw-text
+    parsing per the TestCfnExecutionMutexTable precedent (CFN tags need a custom
+    loader)."""
+
+    # The 3 SF execution log groups carry the MutexConflict Cause at
+    # logging level=ERROR + includeExecutionData=true.
+    SF_NAMES = (
+        "alpha-engine-weekday-pipeline",
+        "alpha-engine-saturday-pipeline",
+        "alpha-engine-eod-pipeline",
+    )
+
+    @pytest.fixture(scope="class")
+    def cfn_text(self) -> str:
+        return CFN_PATH.read_text()
+
+    @pytest.mark.parametrize("sf_name", SF_NAMES)
+    def test_metric_filter_present_for_each_sf(self, cfn_text, sf_name):
+        assert f"/aws/stepfunctions/{sf_name}" in cfn_text, (
+            f"missing AWS::Logs::MetricFilter LogGroupName for {sf_name} — "
+            f"without it MutexConflict Fails on that SF produce no CW metric "
+            f"and no alarm can fire (config#729)"
+        )
+
+    def test_metric_filter_matches_mutexconflict(self, cfn_text):
+        assert "AWS::Logs::MetricFilter" in cfn_text
+        # The filter pattern must key on the MutexConflict Cause text so it only
+        # counts duplicate-trigger Fails, not every SF error.
+        assert "MutexConflictFails" in cfn_text, (
+            "the MutexConflict metric transformation must emit a dedicated "
+            "MutexConflictFails metric (config#729)"
+        )
+
+    @pytest.mark.parametrize("sf_name", SF_NAMES)
+    def test_alarm_present_for_each_sf(self, cfn_text, sf_name):
+        # alpha-engine-<cadence>-mutex-conflict
+        cadence = sf_name.split("-")[2]  # weekday / saturday / eod
+        alarm_name = f"alpha-engine-{cadence}-mutex-conflict"
+        assert alarm_name in cfn_text, (
+            f"missing CloudWatch alarm {alarm_name} for {sf_name} — the "
+            f"MutexConflict metric exists but nobody is paged on it (config#729)"
+        )
+
+    def test_alarms_route_to_alerts_topic(self, cfn_text):
+        # Each mutex-conflict alarm must page the existing AlertsTopic, not
+        # silently sit as a metric. Anchor on the first alarm block.
+        anchor = cfn_text.index("WeekdayMutexConflictAlarm:")
+        block = cfn_text[anchor : anchor + 900]
+        assert "!Ref AlertsTopic" in block, (
+            "MutexConflict alarm must fire the AlertsTopic SNS — otherwise it "
+            "is observability-only and defeats the config#729 goal"
+        )
+
+
 # ---------------------------------------------------------------------------
 # IAM — SF role has dynamodb:PutItem on the mutex table only
 # ---------------------------------------------------------------------------
