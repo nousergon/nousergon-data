@@ -490,3 +490,86 @@ class TestIamGrant:
                     f"(expected {MUTEX_TABLE_ARN}); got {r}. Broader scope "
                     f"violates least-privilege."
                 )
+
+
+class TestCfnMutexConflictAlarms:
+    """CFN must wire a CloudWatch metric-filter + alarm per CFN-managed SF on the
+    L274 MutexConflict Fail (config#729), AND the SFs must have execution logging
+    enabled so the filters have a live log group to read.
+
+    This is the post-#516 / post-ne-rename restore. #516 shipped filters on the
+    OLD alpha-engine-* log groups while the ne-* rename (config#1381) left all
+    SFs with logging OFF — so the filters had nothing to read. These assertions
+    pin the invariants that #516's text-only test missed: (a) the SF names the
+    filters target are the LIVE ne-* names, (b) those SFs actually have
+    LoggingConfiguration at level=ERROR, (c) the destination log groups are
+    declared CFN resources, (d) no DefaultValue (mutually exclusive with
+    Dimensions). Raw-text parsing per the TestCfnExecutionMutexTable precedent.
+    """
+
+    # The two CFN-managed SFs (EOD is script-managed + deferred — see CFN note).
+    SF_NAMES = (
+        "ne-weekly-freshness-pipeline",
+        "ne-preopen-trading-pipeline",
+    )
+
+    @pytest.fixture(scope="class")
+    def cfn_text(self) -> str:
+        return CFN_PATH.read_text()
+
+    @pytest.mark.parametrize("sf_name", SF_NAMES)
+    def test_metric_filter_present_for_each_sf(self, cfn_text, sf_name):
+        assert f"/aws/stepfunctions/{sf_name}" in cfn_text, (
+            f"missing AWS::Logs::MetricFilter LogGroupName for {sf_name} — "
+            f"without it MutexConflict Fails on that SF produce no CW metric "
+            f"and no alarm can fire (config#729)"
+        )
+
+    @pytest.mark.parametrize("sf_name", SF_NAMES)
+    def test_sf_has_execution_logging_enabled(self, cfn_text, sf_name):
+        # The metric filter is dead unless the SF logs its FailedEvents. Pin that
+        # a LogGroup resource exists for each SF AND LoggingConfiguration is set
+        # at level=ERROR. This is the invariant that would have caught the
+        # ne-rename logging regression #516 tripped over.
+        assert f"LogGroupName: /aws/stepfunctions/{sf_name}" in cfn_text, (
+            f"missing AWS::Logs::LogGroup for {sf_name} — the SF's "
+            f"LoggingConfiguration destination must be a declared CFN resource"
+        )
+        assert cfn_text.count("Level: ERROR") >= len(self.SF_NAMES), (
+            "each CFN-managed SF must have LoggingConfiguration Level=ERROR so "
+            "the MutexConflict Cause reaches the log group (config#729)"
+        )
+
+    def test_metric_filter_emits_mutexconflict_metric(self, cfn_text):
+        assert "AWS::Logs::MetricFilter" in cfn_text
+        assert "MutexConflictFails" in cfn_text, (
+            "the MutexConflict metric transformation must emit a dedicated "
+            "MutexConflictFails metric (config#729)"
+        )
+
+    def test_metric_filter_omits_defaultvalue(self, cfn_text):
+        # DefaultValue + Dimensions are mutually exclusive in AWS::Logs::
+        # MetricFilter; including both fails CFN create (the #516 deploy break).
+        mf_start = cfn_text.index("MutexConflictMetricFilter")
+        # Scan from the first metric filter to the first alarm block.
+        mf_region = cfn_text[mf_start : cfn_text.index("MutexConflictAlarm")]
+        assert "DefaultValue" not in mf_region, (
+            "MutexConflict metric filters must NOT set DefaultValue — it is "
+            "mutually exclusive with Dimensions and fails CFN create"
+        )
+
+    @pytest.mark.parametrize("sf_name", SF_NAMES)
+    def test_alarm_present_for_each_sf(self, cfn_text, sf_name):
+        # ne-<cadence>-...-mutex-conflict (strip the -pipeline suffix)
+        alarm_name = sf_name.replace("-pipeline", "") + "-mutex-conflict"
+        assert alarm_name in cfn_text, (
+            f"missing CloudWatch alarm {alarm_name} for {sf_name} — the "
+            f"MutexConflict metric exists but nobody is paged on it (config#729)"
+        )
+
+    def test_alarms_route_to_alerts_topic(self, cfn_text):
+        anchor = cfn_text.index("WeeklyFreshnessMutexConflictAlarm:")
+        block = cfn_text[anchor : anchor + 900]
+        assert "!Ref AlertsTopic" in block, (
+            "the weekly-freshness mutex-conflict alarm must page AlertsTopic"
+        )

@@ -139,6 +139,19 @@ Resources:
       # Alternative: inline definition via DefinitionString
       # Using S3 location so the JSON files in the repo are the source of truth.
       # Deploy script uploads JSON to S3 then updates the state machine.
+      # LoggingConfiguration is OWNED HERE (declarative SoT). The deploy
+      # script's update-state-machine call passes only --definition, which is a
+      # partial update (omitted loggingConfiguration is left unchanged), so this
+      # CFN-set logging is NOT wiped on each deploy. Logging the SF execution
+      # FailedEvents (level=ERROR) is what carries the L274 MutexConflict Cause
+      # into the log group for the metric filter below. The ne-* rename
+      # (config#1381) re-created these SFs without logging — this restores it.
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt WeeklyFreshnessLogGroup.Arn
 
   # --------------------------------------------------------------------------
   # Step Functions — Weekday Pipeline
@@ -151,6 +164,13 @@ Resources:
       DefinitionS3Location:
         Bucket: alpha-engine-research
         Key: infrastructure/step_function_daily.json
+      # LoggingConfiguration owned here — see SaturdayPipeline note above.
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PreopenTradingLogGroup.Arn
 
   # --------------------------------------------------------------------------
   # EventBridge Rules — Pipeline Triggers
@@ -561,6 +581,117 @@ Resources:
       Period: 3600
       EvaluationPeriods: 1
       Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # --------------------------------------------------------------------------
+  # SF execution log groups (CFN-owned) + L274 MutexConflict alarms (config#729)
+  # --------------------------------------------------------------------------
+  # These two LogGroups are the CloudWatch destinations for the two managed SFs'
+  # LoggingConfiguration (above). They MUST be CFN resources (not relied upon as
+  # side-effects of SF logging) so the metric filters below have a guaranteed,
+  # ordered dependency to attach to. Names match the live ne-* state machines.
+  # 30-day retention bounds cost (these are low-frequency pipelines: weekly +
+  # daily, ERROR-level so only failed-execution events are logged).
+  WeeklyFreshnessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-weekly-freshness-pipeline
+      RetentionInDays: 30
+
+  PreopenTradingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-preopen-trading-pipeline
+      RetentionInDays: 30
+
+  # The SF MutualExclusionGuard (L274) fails a duplicate-trigger execution with a
+  # terminal `MutexConflict` Fail — visible today only in SF execution history +
+  # the SNS HandleFailure email. These metric-filters + alarms add a CloudWatch
+  # signal on the RATE of MutexConflict Fails per SF; the first non-zero count
+  # pages the operator to investigate the duplicate-trigger source (CFN drift, EB
+  # internal retry, operator double-paste, cross-region replay).
+  #
+  # The filters key on the MutexConflict Cause text in the SF FailedEvent (logged
+  # at level=ERROR + includeExecutionData=true via the LoggingConfiguration
+  # above). DependsOn the log group so CFN creates the destination before the
+  # filter. DefaultValue is OMITTED (it is mutually exclusive with Dimensions in
+  # AWS::Logs::MetricFilter); the alarm's TreatMissingData=notBreaching covers
+  # the zero-conflict steady state (no match -> no data point -> alarm OK).
+  #
+  # EOD (ne-postclose-trading-pipeline) is intentionally NOT covered here: it is
+  # script-managed (update_eod_pipeline_sf.sh, logging still OFF) and is
+  # daemon-shutdown-triggered (single event), not cron-double-fire-prone. EOD
+  # coverage is tracked as a separate follow-up.
+  WeeklyFreshnessMutexConflictMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: WeeklyFreshnessLogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-weekly-freshness-pipeline
+      FilterPattern: '"MutexConflict"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: MutexConflictFails
+          MetricValue: '1'
+          Dimensions:
+            - Key: StateMachine
+              Value: ne-weekly-freshness-pipeline
+
+  PreopenTradingMutexConflictMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: PreopenTradingLogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-preopen-trading-pipeline
+      FilterPattern: '"MutexConflict"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: MutexConflictFails
+          MetricValue: '1'
+          Dimensions:
+            - Key: StateMachine
+              Value: ne-preopen-trading-pipeline
+
+  WeeklyFreshnessMutexConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ne-weekly-freshness-mutex-conflict
+      AlarmDescription: >-
+        L274 MutexConflict Fail on the weekly-freshness (Saturday) pipeline
+        (duplicate-trigger guard fired). First occurrence = investigate the
+        duplicate-trigger source.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: MutexConflictFails
+      Dimensions:
+        - Name: StateMachine
+          Value: ne-weekly-freshness-pipeline
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  PreopenTradingMutexConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ne-preopen-trading-mutex-conflict
+      AlarmDescription: >-
+        L274 MutexConflict Fail on the pre-open-trading (weekday) pipeline
+        (duplicate-trigger guard fired). First occurrence = investigate the
+        duplicate-trigger source.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: MutexConflictFails
+      Dimensions:
+        - Name: StateMachine
+          Value: ne-preopen-trading-pipeline
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions:
