@@ -109,7 +109,7 @@ if $BOOTSTRAP; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
     run aws lambda create-function --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 --role "${ROLE_ARN}" --handler index.handler \
-      --zip-file "fileb://${ZIP}" --timeout 60 --memory-size 256 \
+      --zip-file "fileb://${ZIP}" --timeout 120 --memory-size 256 \
       --environment 'Variables={LOG_LEVEL=INFO,CRYPTO_BALANCES_ENABLED=true,MARKET_DATA_BUCKET=alpha-engine-research}' \
       --region "${REGION}" --query 'FunctionArn' --output text
   else
@@ -162,6 +162,12 @@ run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
 fi
+
+# Ensure the runtime config matches (idempotent) — the BTC all-script-types xpub scan + ETH
+# token enumeration need headroom beyond the original 60s.
+echo "Ensuring timeout/memory: 120s / 256MB"
+run aws lambda update-function-configuration --function-name "${FUNCTION_NAME}" \
+  --timeout 120 --memory-size 256 --region "${REGION}" --query 'LastUpdateStatus' --output text
 echo "✓ Code deployed."
 
 # ----- 4. Smoke (real invoke — writes crypto/holdings.json if addresses exist) ---

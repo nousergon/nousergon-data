@@ -56,6 +56,13 @@ _COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 # chain → (CoinGecko id, display symbol)
 _COIN = {"BTC": ("bitcoin", "BTC"), "ETH": ("ethereum", "ETH")}
 
+# ERC-20 token balances for an ETH address. Blockscout's v2 API returns every token's balance
+# AND a USD ``exchange_rate`` in one keyless call — so spam/airdrop tokens (the bulk of any
+# active address's holdings) self-filter: they have no exchange_rate and are dropped. Only
+# tokens worth at least this many USD are emitted, to keep dust out of the view.
+_BLOCKSCOUT_TOKENS = "https://eth.blockscout.com/api/v2/addresses/{address}/token-balances"
+_TOKEN_MIN_USD = 1.0
+
 # BTC extended-public-key (HD wallet) support. A single BTC address is NOT the wallet balance
 # — funds are spread across many addresses derived from one seed — so a self-custody wallet is
 # tracked by its xpub/ypub/zpub, from which we derive + sum every address. Prefix → BIP script
@@ -122,41 +129,46 @@ def fetch_btc_balance(address: str) -> float:
     return (funded - spent) / 1e8
 
 
-def _xpub_address_fn(xpub: str):
-    """Return ``child_hdkey -> address`` for the script type implied by the key's prefix
-    (xpub→P2PKH, ypub→P2SH-P2WPKH, zpub→P2WPKH). Imports embit lazily so the module loads
-    without the dep (only the xpub path needs it)."""
+def _xpub_address_fns(xpub: str) -> list:
+    """``[child_hdkey -> address, …]`` — the script type(s) to derive for this key. ypub/zpub
+    version bytes are unambiguous (one type). A bare ``xpub`` is AMBIGUOUS: many wallets
+    (notably Ledger) export a native-segwit OR wrapped-segwit account as a plain xpub, so we
+    derive ALL THREE (P2PKH / P2SH-P2WPKH / P2WPKH) and sum — an account only uses one type, so
+    the unused ones contribute 0 while the funded one is found. Imports embit lazily."""
     from embit import script
 
     prefix = xpub[:4]
     if prefix == "zpub":
-        return lambda c: script.p2wpkh(c).address()
+        return [lambda c: script.p2wpkh(c).address()]
     if prefix == "ypub":
-        return lambda c: script.p2sh(script.p2wpkh(c)).address()
-    return lambda c: script.p2pkh(c).address()  # xpub (legacy)
+        return [lambda c: script.p2sh(script.p2wpkh(c)).address()]
+    return [  # xpub — try every script type
+        lambda c: script.p2wpkh(c).address(),
+        lambda c: script.p2sh(script.p2wpkh(c)).address(),
+        lambda c: script.p2pkh(c).address(),
+    ]
 
 
 def fetch_btc_xpub_balance(xpub: str, *, gap_limit: int = _GAP_LIMIT) -> float:
-    """Total confirmed BTC across an HD wallet, in BTC. Derives addresses on both the receive
-    (0) and change (1) branches and sums their balances, extending each branch until
+    """Total confirmed BTC across an HD wallet, in BTC. For each candidate script type, derives
+    the receive (0) + change (1) branches and sums balances, extending each branch until
     ``gap_limit`` consecutive unused (tx_count==0) addresses — the standard HD-wallet scan.
     Derivation is client-side (trustless) via embit, verified against the BIP84 test vector."""
     from embit import bip32
 
     root = bip32.HDKey.from_string(xpub)
-    to_addr = _xpub_address_fn(xpub)
     total_sats = 0
-    for branch in (0, 1):  # external (receive) + internal (change)
-        gap = 0
-        i = 0
-        while gap < gap_limit:
-            address = to_addr(root.derive([branch, i]))
-            funded, spent, tx_count = _esplora_address_stats(address)
-            total_sats += funded - spent
-            gap = 0 if tx_count else gap + 1
-            i += 1
-            if _SCAN_DELAY_S:
-                time.sleep(_SCAN_DELAY_S)
+    for to_addr in _xpub_address_fns(xpub):
+        for branch in (0, 1):  # external (receive) + internal (change)
+            gap = 0
+            i = 0
+            while gap < gap_limit:
+                funded, spent, tx_count = _esplora_address_stats(to_addr(root.derive([branch, i])))
+                total_sats += funded - spent
+                gap = 0 if tx_count else gap + 1
+                i += 1
+                if _SCAN_DELAY_S:
+                    time.sleep(_SCAN_DELAY_S)
     return total_sats / 1e8
 
 
@@ -175,6 +187,40 @@ def fetch_eth_balance(address: str) -> float:
         except Exception as e:  # noqa: BLE001 - try the next RPC
             last_err = e
     raise RuntimeError(f"all ETH RPCs failed; last: {last_err}")
+
+
+def fetch_eth_tokens(address: str) -> list[dict]:
+    """Priced ERC-20 token holdings for ``address`` as ``[{symbol, balance, price_usd,
+    value_usd, contract}, …]`` via Blockscout v2. Keeps only tokens with a USD exchange_rate
+    and value ≥ ``_TOKEN_MIN_USD`` (so spam/airdrop tokens, which carry no rate, drop out).
+    Best-effort — the caller treats a failure as "no tokens" so native ETH still publishes."""
+    data = _get_json(_BLOCKSCOUT_TOKENS.format(address=address))
+    out: list[dict] = []
+    for entry in data or []:
+        tok = entry.get("token") or {}
+        if tok.get("type") != "ERC-20":
+            continue
+        rate = tok.get("exchange_rate")
+        if not rate:
+            continue  # unpriced → spam/airdrop, drop
+        try:
+            decimals = int(tok.get("decimals") or 18)
+            balance = int(entry["value"]) / 10**decimals
+            price = float(rate)
+        except (TypeError, ValueError, KeyError):
+            continue
+        value = balance * price
+        if value < _TOKEN_MIN_USD:
+            continue
+        out.append({
+            "symbol": tok.get("symbol") or "?",
+            "balance": balance,
+            "price_usd": price,
+            "value_usd": value,
+            "contract": tok.get("address"),
+        })
+    out.sort(key=lambda t: t["value_usd"], reverse=True)
+    return out
 
 
 def fetch_prices(symbols: Iterable[str]) -> dict[str, float]:
@@ -227,6 +273,7 @@ def collect(
     s3_client: Any = None,
     balance_fetchers: dict[str, Callable[..., float]] | None = None,
     price_fetcher: Callable[..., dict[str, float]] | None = None,
+    eth_token_fetcher: Callable[[str], list[dict]] | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -237,6 +284,7 @@ def collect(
     now = now or datetime.now(UTC)
     fetchers = balance_fetchers or _BALANCE_FETCHERS
     price_fn = price_fetcher or fetch_prices
+    token_fn = eth_token_fetcher or fetch_eth_tokens
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
@@ -277,6 +325,14 @@ def collect(
             row["price_usd"] = px
             row["value_usd"] = bal * px
         balances.append(row)
+        # ETH: also enumerate priced ERC-20 token holdings (one row each). Best-effort — a
+        # token-fetch failure leaves the native ETH row in place (WARN, never abort the entry).
+        if chain == "ETH":
+            try:
+                for tok in token_fn(address):
+                    balances.append({"chain": "ETH", "address": address, **tok})
+            except Exception as e:  # noqa: BLE001 - tokens are additive to native ETH
+                logger.warning("[crypto_balances] ETH token fetch failed for %s: %s", address, e)
 
     if not balances:
         logger.warning("[crypto_balances] every address fetch failed (%d) — not writing", n_failed)
@@ -285,7 +341,7 @@ def collect(
     artifact = {
         "schema_version": HOLDINGS_SCHEMA_VERSION,
         "as_of_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": "blockstream+eth_rpc+coingecko",
+        "source": "blockstream+eth_rpc+coingecko+blockscout",
         "balances": balances,
         "prices": {s: prices[s] for s in sorted(prices)},
     }
