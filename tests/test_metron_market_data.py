@@ -155,13 +155,19 @@ class TestHistory:
             return {s: [("2026-06-11", 100.0)] for s in syms}
 
         result = mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=lambda c: {})
+        # Factor/sector ETFs + the index proxies (markets-strip YTD/LTM) + the fund-proxy
+        # ETFs (late-fund-NAV reconcile backstop) must all be requested + published.
         assert set(mmd.RISK_FACTOR_ETFS) <= set(requested)  # all factor ETFs requested
+        assert set(mmd.INDEX_PROXY_SYMBOLS) <= set(requested)  # QQQ/IWM/ONEQ get close_history → YTD/LTM
+        assert set(mmd.FUND_PROXY_ETFS) <= set(requested)  # IXUS published for the fund reconcile
         assert "AAPL" in requested  # held symbols still included
         puts = _puts(s3)
-        for etf in ("SPY", "XLK", "MTUM"):
+        for etf in ("SPY", "XLK", "MTUM", "QQQ", "IWM", "ONEQ", "IXUS"):
             key = f"market_data/close_history/{etf}.json"
             assert key in puts and puts[key]["currency"] == "USD"
-        assert result["close_series"] == len(set(["AAPL", "1299.HK", *mmd.RISK_FACTOR_ETFS]))
+        assert result["close_series"] == len(set(
+            ["AAPL", "1299.HK", *mmd.RISK_FACTOR_ETFS, *mmd.INDEX_PROXY_SYMBOLS, *mmd.FUND_PROXY_ETFS]
+        ))
 
     def test_history_dry_run_and_empty_universe(self):
         s3 = _universe_s3(_UNIVERSE)
@@ -442,6 +448,12 @@ class TestIntraday:
         "IWM": {"last": 215.3, "open": 216.0, "prev_close": 216.5,
                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
     }
+    # Fund-proxy quotes — SPY already in _INDEX_QUOTES; IXUS is the intl proxy. The real
+    # fetcher is called separately for the fund-proxy set, so the stub must know IXUS too.
+    _FUND_PROXY_QUOTES = {
+        "IXUS": {"last": 72.4, "open": 72.0, "prev_close": 71.9,
+                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+    }
 
     @staticmethod
     def _stub(*maps):
@@ -465,14 +477,16 @@ class TestIntraday:
     def test_writes_quotes_with_currency_when_open_and_app_active(self):
         s3 = self._s3()
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
+            bucket="b", s3_client=s3,
+            intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
             now=self._RTH,
         )
         assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 4
+        assert result["fund_proxies"] == len(mmd.FUND_PROXY_ETFS)
         puts = _puts(s3)
         assert set(puts) == {"market_data/intraday/latest.json"}
         art = puts["market_data/intraday/latest.json"]
-        assert art["schema_version"] == mmd.INTRADAY_SCHEMA_VERSION == 2
+        assert art["schema_version"] == mmd.INTRADAY_SCHEMA_VERSION == 3
         assert art["source"] == "yfinance_delayed"
         assert art["as_of_utc"] == "2026-06-12T15:00:00Z"
         # Currency joined from the universe (the consumer FX-converts the P&L legs).
@@ -483,6 +497,10 @@ class TestIntraday:
         assert set(art["indices"]) == set(mmd.INDEX_PROXY_SYMBOLS)
         assert art["indices"]["SPY"]["currency"] == "USD"
         assert art["indices"]["SPY"]["last"] == 605.2 and art["indices"]["SPY"]["prev_close"] == 602.4
+        # Fund proxies land under a DEDICATED `fund_proxies` map (USD), not `indices`.
+        assert set(art["fund_proxies"]) == set(mmd.FUND_PROXY_ETFS)
+        assert "IXUS" in art["fund_proxies"] and art["fund_proxies"]["IXUS"]["currency"] == "USD"
+        assert art["fund_proxies"]["IXUS"]["last"] == 72.4
 
     def test_index_proxies_fetched_even_with_empty_universe(self):
         """The markets strip is market context — published even when nothing is held."""
