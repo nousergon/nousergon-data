@@ -1,7 +1,7 @@
 """alpha-engine-friday-shell-run-report — consolidate the Friday shell-run result.
 
 Subscribes to EventBridge ``Step Functions Execution Status Change`` events for
-the ``alpha-engine-saturday-pipeline`` state machine (terminal transitions:
+the ``alpha-engine-weekly-pipeline`` state machine (terminal transitions:
 SUCCEEDED / FAILED / TIMED_OUT / ABORTED). For executions that ran in **shell-run
 mode** (``shell_run: true`` / ``pipeline_role: "shell-run"`` in the execution
 input — the Friday-PM dry preflight of the Saturday SF), the handler reads the
@@ -43,7 +43,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
-SATURDAY_SF_NAME = "alpha-engine-saturday-pipeline"
+SATURDAY_SF_NAME = "alpha-engine-weekly-pipeline"
 S3_BUCKET = os.environ.get("S3_BUCKET", "alpha-engine-research")
 SNS_TOPIC_ARN = os.environ.get(
     "SNS_TOPIC_ARN", f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:alpha-engine-alerts"

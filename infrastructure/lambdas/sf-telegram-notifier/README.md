@@ -13,7 +13,7 @@ SF JSON definitions.
 
 | SF | Source ARN suffix | Pretty label |
 | --- | --- | --- |
-| Saturday weekly pipeline | `alpha-engine-saturday-pipeline` | `Saturday SF` |
+| Saturday weekly pipeline | `alpha-engine-weekly-pipeline` | `Saturday SF` |
 | Weekday daily pipeline   | `alpha-engine-weekday-pipeline`  | `Weekday SF` |
 | EOD post-market pipeline | `alpha-engine-eod-pipeline`      | `EOD SF` |
 

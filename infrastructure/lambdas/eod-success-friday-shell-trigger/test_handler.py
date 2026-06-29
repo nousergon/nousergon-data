@@ -34,7 +34,7 @@ EOD_ARN = (
     "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
 )
 SATURDAY_ARN = (
-    "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
+    "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekly-pipeline"
 )
 
 
@@ -81,7 +81,7 @@ def _patch_sfn(start_execution_return: dict | None = None, side_effect=None):
         fake_client.start_execution.return_value = (
             start_execution_return
             or {
-                "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:friday-shell-test",
+                "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-weekly-pipeline:friday-shell-test",
                 "startDate": datetime(2026, 5, 22, 20, 25, tzinfo=timezone.utc),
             }
         )

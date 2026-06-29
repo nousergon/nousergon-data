@@ -85,7 +85,7 @@ python3 -m pytest infrastructure/lambdas/saturday-sf-watch-dispatcher/test_handl
 
 ```
 detail.status:           FAILED | TIMED_OUT | ABORTED   (rule-scoped)
-detail.stateMachineArn:  arn:...:stateMachine:alpha-engine-saturday-pipeline
+detail.stateMachineArn:  arn:...:stateMachine:alpha-engine-weekly-pipeline
 detail.executionArn:     execution arn
 detail.name:             execution id
 detail.startDate:        epoch ms

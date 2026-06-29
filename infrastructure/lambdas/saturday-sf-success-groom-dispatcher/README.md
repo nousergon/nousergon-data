@@ -7,7 +7,7 @@ groomed immediately rather than waiting for the next scheduled 10pm-PT run.
 ## How it fits
 
 ```
-alpha-engine-saturday-pipeline  ──SUCCEEDED──▶  EventBridge rule
+alpha-engine-weekly-pipeline  ──SUCCEEDED──▶  EventBridge rule
   (status change event)                         alpha-engine-saturday-succeeded-groom
                                                         │ target
                                                         ▼

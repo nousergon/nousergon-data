@@ -81,10 +81,14 @@ class TestChainOrdering:
         # 2026-06-08: L4517 inserted the lib-pin drift gate as the new first
         # state; its skip/check/gate Defaults converge on CheckMutexRole, so the
         # downstream mutex→CheckShellRun→CheckSkipMorningEnrich chain is unchanged.
-        assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck", (
-            "InitializeInput now hands off to the L4517 lib-pin drift gate; see "
-            "tests/test_sf_lib_pin_drift_wiring.py for the gate→mutex chain"
+        # groom #830: CheckModePreset (mode=backtest-eval expansion) is the new
+        # first hop; its Default is the L4517 lib-pin drift gate, so the chain
+        # below is unchanged.
+        assert states["InitializeInput"]["Next"] == "CheckModePreset", (
+            "InitializeInput now hands off to the groom #830 mode-preset gate, "
+            "whose Default is the L4517 lib-pin drift gate"
         )
+        assert states["CheckModePreset"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass must route to CheckShellRun so the pre-mutex "
             "downstream chain is byte-identical for operator/missing-role inputs"

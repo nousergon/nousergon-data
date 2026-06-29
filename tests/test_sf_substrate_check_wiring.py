@@ -52,15 +52,25 @@ class TestChainOrdering:
     """Wiring goes: SaturdayHealthCheck → WaitForSat → Substrate → WaitForSubstrate → Notify."""
 
     def test_wait_for_saturday_health_check_routes_to_substrate(self, states):
+        # groom #830: the substrate check now sits behind CheckSkipWeeklySubstrate-
+        # HealthCheck so the backtest-eval mode preset can stop the run after
+        # Evaluator. The gate's Default still hands off to the substrate check, so
+        # the real Saturday run (no skip flag) is unchanged.
         wait_state = states["WaitForSaturdayHealthCheck"]
-        assert wait_state["Next"] == "WeeklySubstrateHealthCheck", (
-            "WaitForSaturdayHealthCheck must hand off to the substrate check, "
+        assert wait_state["Next"] == "CheckSkipWeeklySubstrateHealthCheck", (
+            "WaitForSaturdayHealthCheck must hand off to the substrate skip-gate, "
             "not skip directly to NotifyComplete."
+        )
+        assert (
+            states["CheckSkipWeeklySubstrateHealthCheck"]["Default"]
+            == "WeeklySubstrateHealthCheck"
         )
 
     def test_wait_for_saturday_catch_routes_to_substrate(self, states):
         catches = states["WaitForSaturdayHealthCheck"]["Catch"]
-        assert any(c["Next"] == "WeeklySubstrateHealthCheck" for c in catches), (
+        assert any(
+            c["Next"] == "CheckSkipWeeklySubstrateHealthCheck" for c in catches
+        ), (
             "If freshness polling fails, substrate check must still run — "
             "they're independent observability paths."
         )
@@ -85,10 +95,20 @@ class TestChainOrdering:
         # path still preserves the success edge. On the Friday preflight both states
         # RUN (dry, via dry_run.$=$.research_dry — ROADMAP L4504), they are not
         # skipped, so the wiring is identical on real + preflight runs.
+        #
+        # groom #830: ReportCard and Director each sit behind their own skip-gate
+        # (CheckSkipReportCard / CheckSkipDirector) so the backtest-eval mode preset
+        # can stop the run after Evaluator. Each gate's Default routes to the
+        # original state, so the real Saturday run (no skip flags) is unchanged; the
+        # skip edges collapse the tail straight to CheckShellRunNotify.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckSkipReportCard"
         )
-        assert states["ReportCard"]["Next"] == "Director"
+        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
+        assert states["ReportCard"]["Next"] == "CheckSkipDirector"
+        assert states["CheckSkipDirector"]["Default"] == "Director"
+        assert states["CheckSkipDirector"]["Choices"][0]["Next"] == "CheckShellRunNotify"
         assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
         assert states["Director"]["Next"] == "CheckShellRunNotify"
         assert all(c["Next"] == "CheckShellRunNotify" for c in states["Director"]["Catch"])

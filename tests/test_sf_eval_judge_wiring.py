@@ -190,14 +190,17 @@ class TestSkipBacktesterPreservesEvalJudge:
         """
         gate = states["CheckSkipEvaluator"]
         skip_choice = gate["Choices"][0]
-        assert skip_choice["Next"] == "SaturdayHealthCheck"
+        # groom #830: the health-check tail now sits behind CheckSkipSaturday-
+        # HealthCheck; its Default leads to SaturdayHealthCheck, so both the
+        # skip-evaluator and success paths still converge on the same tail.
+        assert skip_choice["Next"] == "CheckSkipSaturdayHealthCheck"
         assert gate["Default"] == "Evaluator"
-        # Run path success also exits to SaturdayHealthCheck (judge
-        # already ran upstream).
+        # Run path success also exits to the same gate (judge already ran upstream).
         assert (
             states["CheckEvaluatorStatus"]["Choices"][0]["Next"]
-            == "SaturdayHealthCheck"
+            == "CheckSkipSaturdayHealthCheck"
         )
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"
 
 
 class TestSkipEvalJudge:
@@ -795,15 +798,19 @@ class TestJudgeChainBeforePredictor:
 
     def test_evaluator_exits_directly_to_health_check(self, states):
         """Evaluator's success path no longer enters the judge chain
-        (judge ran upstream). It exits to SaturdayHealthCheck."""
+        (judge ran upstream). It exits to the health-check tail, which
+        groom #830 fronted with CheckSkipSaturdayHealthCheck so the
+        backtest-eval mode preset can stop the run after Evaluator."""
         success = next(
             c for c in states["CheckEvaluatorStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "SaturdayHealthCheck"
-        # And the skip-evaluator path also goes to SaturdayHealthCheck
+        assert success["Next"] == "CheckSkipSaturdayHealthCheck"
+        # And the skip-evaluator path also goes to the same gate
         # (the previous pre-reorder target was CheckSkipEvalJudge).
         assert (
             states["CheckSkipEvaluator"]["Choices"][0]["Next"]
-            == "SaturdayHealthCheck"
+            == "CheckSkipSaturdayHealthCheck"
         )
+        # The gate's Default is the unchanged SaturdayHealthCheck.
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"

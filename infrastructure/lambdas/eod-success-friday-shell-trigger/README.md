@@ -78,7 +78,7 @@ alpha-engine-eod-success-friday-shell-trigger
        ├──► last_closed_trading_day(stopDate UTC) → trading_day
        │
        └──► if trading_day.weekday() == FRI:
-                states:StartExecution on alpha-engine-saturday-pipeline
+                states:StartExecution on alpha-engine-weekly-pipeline
                 with input { ec2_instance_id, sns_topic_arn, shell_run: true }
 ```
 
@@ -107,7 +107,7 @@ changelog-cloudwatch-mirror convention.
 
 - `logs:CreateLogGroup/Stream + PutLogEvents` on the Lambda's own log group
 - `states:StartExecution` on
-  `arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline`
+  `arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekly-pipeline`
   (single-target scope — cannot start any other SF)
 
 ## Cutover plan

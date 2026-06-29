@@ -170,7 +170,11 @@ class TestMutexWiring:
         # state after InitializeInput; its skip-default + gate-default converge
         # on CheckMutexRole — the mutex still sits between entry and the
         # former-first-state, one gate further down.
-        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
+        # groom #830: CheckModePreset (mode=backtest-eval expansion) is now the
+        # first hop; its Default is CheckSkipLibPinDriftCheck, so the mutex still
+        # sits between entry and the former-first-state.
+        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckModePreset"
+        assert saturday_sf["States"]["CheckModePreset"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):

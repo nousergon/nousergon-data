@@ -9,6 +9,35 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "CheckModePreset"
+    },
+    "CheckModePreset": {
+      "Type": "Choice",
+      "Comment": "Mode-preset expansion for InitializeInput. A single {\"mode\": ...} token expands into a canonical skip-flag set so operators don't have to pass every flag by hand. {\"mode\": \"backtest-eval\"} routes to ApplyBacktestEvalModeDefaults, which seeds the four tail skip flags (skip_saturday_health_check / skip_weekly_substrate_health_check / skip_report_card / skip_director) so the run executes the data→backtest→parity→evaluator spine and then STOPS after Evaluator — the partial-run shape a standalone backtest-eval Step Function would have provided, folded into this weekly pipeline instead (groom #830). No mode / any other mode falls through to CheckSkipLibPinDriftCheck byte-identically to the pre-preset run. Mirrors the CheckShellRun → ApplyShellRunDefaults preset shape.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mode",
+              "StringEquals": "backtest-eval"
+            }
+          ],
+          "Next": "ApplyBacktestEvalModeDefaults"
+        }
+      ],
+      "Default": "CheckSkipLibPinDriftCheck"
+    },
+    "ApplyBacktestEvalModeDefaults": {
+      "Type": "Pass",
+      "Comment": "mode=backtest-eval ONLY. Merges the tail skip-flag blob OVER the current state (States.JsonMerge($, blob, false) — second arg wins) so the mode token actually enforces the partial-run shape: skip_saturday_health_check, skip_weekly_substrate_health_check, skip_report_card and skip_director are all set true, making the four tail CheckSkip gates route the run straight from Evaluator to CheckShellRunNotify (success notify) without running the health checks, report card or director. Mirrors ApplyShellRunDefaults: the preset blob wins over $, and every other field (run_date, ec2_instance_id, sns_topic_arn, the dry-path control vars) is preserved untouched.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($,States.StringToJson('{\"skip_saturday_health_check\":true,\"skip_weekly_substrate_health_check\":true,\"skip_report_card\":true,\"skip_director\":true}'),false)"
+      },
+      "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
     },
     "CheckSkipLibPinDriftCheck": {
@@ -2690,7 +2719,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipSaturdayHealthCheck"
         }
       ],
       "Default": "Evaluator"
@@ -2778,7 +2807,7 @@
         {
           "Variable": "$.evaluator_poll.Status",
           "StringEquals": "Success",
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipSaturdayHealthCheck"
         },
         {
           "Variable": "$.evaluator_poll.Status",
@@ -2797,6 +2826,26 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForEvaluator"
+    },
+    "CheckSkipSaturdayHealthCheck": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_saturday_health_check\": true} bypasses the post-pipeline artifact-freshness health check (health_checker.py --alert) and routes to the next tail gate (CheckSkipWeeklySubstrateHealthCheck). Set by the backtest-eval mode preset so a partial run stops after Evaluator; missing flag = run the health check as normal. The health check is non-blocking observability, so skipping it never changes pipeline correctness.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_saturday_health_check",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_saturday_health_check",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipWeeklySubstrateHealthCheck"
+        }
+      ],
+      "Default": "SaturdayHealthCheck"
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
@@ -2858,7 +2907,7 @@
             "States.ALL"
           ],
           "Comment": "Non-blocking — continue to substrate check even if freshness polling fails. SaturdayHealthCheck (artifact freshness) and WeeklySubstrateHealthCheck (row-driven inventory validation) are independent observability paths; both must run.",
-          "Next": "WeeklySubstrateHealthCheck",
+          "Next": "CheckSkipWeeklySubstrateHealthCheck",
           "ResultPath": "$.health_check_error"
         }
       ],
@@ -2869,7 +2918,27 @@
         "StandardErrorContent.$": "$.StandardErrorContent"
       },
       "ResultPath": "$.health_check_poll",
-      "Next": "WeeklySubstrateHealthCheck"
+      "Next": "CheckSkipWeeklySubstrateHealthCheck"
+    },
+    "CheckSkipWeeklySubstrateHealthCheck": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_weekly_substrate_health_check\": true} bypasses the Phase 2→3 transparency-substrate health check and routes to the next tail gate (CheckSkipReportCard). Set by the backtest-eval mode preset so a partial run stops after Evaluator; missing flag = run the substrate check as normal. The substrate check is non-blocking observability, so skipping it never changes pipeline correctness.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_weekly_substrate_health_check",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_weekly_substrate_health_check",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipReportCard"
+        }
+      ],
+      "Default": "WeeklySubstrateHealthCheck"
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
@@ -2946,7 +3015,27 @@
         "StandardErrorContent.$": "$.StandardErrorContent"
       },
       "ResultPath": "$.substrate_check_poll",
-      "Next": "ReportCard"
+      "Next": "CheckSkipReportCard"
+    },
+    "CheckSkipReportCard": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_report_card\": true} bypasses the Evaluator Report Card v2 build and routes to the next tail gate (CheckSkipDirector). Set by the backtest-eval mode preset so a partial run stops after Evaluator; missing flag = build the report card as normal.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_report_card",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_report_card",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipDirector"
+        }
+      ],
+      "Default": "ReportCard"
     },
     "ReportCard": {
       "Type": "Task",
@@ -2982,7 +3071,27 @@
         }
       ],
       "ResultPath": "$.report_card_result",
-      "Next": "Director"
+      "Next": "CheckSkipDirector"
+    },
+    "CheckSkipDirector": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_director\": true} bypasses the Director Opus call (the final weekly-SF task) and routes straight to CheckShellRunNotify, which still emits the success notify. Set by the backtest-eval mode preset so a partial run stops after Evaluator; missing flag = run the Director as normal. Skipping all four tail gates is exactly the backtest-eval partial run: Evaluator→notify, nothing in between.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_director",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_director",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "Director"
     },
     "Director": {
       "Type": "Task",

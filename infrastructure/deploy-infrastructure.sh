@@ -110,7 +110,7 @@ echo "  Uploaded to s3://$BUCKET/infrastructure/"
 echo ""
 echo "==> Updating Step Function definitions..."
 
-SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
+SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-weekly-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"
 EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
 

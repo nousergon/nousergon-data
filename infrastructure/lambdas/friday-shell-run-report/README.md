@@ -7,7 +7,7 @@ preflight of the Saturday Step Function). Closes ROADMAP **L658** design point 5
 
 ## What it does
 
-Subscribes (EventBridge) to `alpha-engine-saturday-pipeline` **terminal**
+Subscribes (EventBridge) to `alpha-engine-weekly-pipeline` **terminal**
 execution-status transitions (`SUCCEEDED` / `FAILED` / `TIMED_OUT` / `ABORTED`).
 For executions that ran in **shell-run mode** (`shell_run: true` /
 `pipeline_role: "shell-run"` — started by the sibling

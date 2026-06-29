@@ -74,7 +74,12 @@ class TestSkipEvaluator:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "SaturdayHealthCheck"
+        # groom #830: the health-check tail now sits behind CheckSkipSaturday-
+        # HealthCheck (so the backtest-eval mode preset can stop after Evaluator).
+        # Skipping the Evaluator still exits to that gate, whose Default leads to
+        # SaturdayHealthCheck — the observability tail is unchanged on a real run.
+        assert choice["Next"] == "CheckSkipSaturdayHealthCheck"
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"
         # Pre-reorder this routed to CheckSkipEvalJudge; post-reorder
         # judge chain is upstream of Evaluator so there's nothing to
         # gate downstream — exit straight to the health-check tail.
@@ -185,7 +190,10 @@ class TestEvaluatorPollLoop:
         success_choice = next(
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert success_choice["Next"] == "SaturdayHealthCheck"
+        # groom #830: success now exits through CheckSkipSaturdayHealthCheck whose
+        # Default is SaturdayHealthCheck, so the real run reaches the same tail.
+        assert success_choice["Next"] == "CheckSkipSaturdayHealthCheck"
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"
 
     def test_check_status_in_progress_loops_to_wait(self, states):
         bt = states["CheckEvaluatorStatus"]

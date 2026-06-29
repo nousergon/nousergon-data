@@ -2,7 +2,7 @@
 sf_preflight.py — Predict whether the Saturday SF would succeed BEFORE
 launching a spot.
 
-Today's Saturday SF (alpha-engine-saturday-pipeline) is a 50-min spot run
+Today's Saturday SF (alpha-engine-weekly-pipeline) is a 50-min spot run
 that costs 1 polygon API call (free-tier 5/min budget) per attempt and a
 spot bootstrap (~3 min wall-clock + IAM/SSM dance). Repeated launch-fail
 cycles burn polygon quota and operator hours. This module simulates the

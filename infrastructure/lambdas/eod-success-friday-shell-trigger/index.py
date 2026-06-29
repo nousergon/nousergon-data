@@ -58,7 +58,7 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
 
 SATURDAY_SF_ARN = (
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-weekly-pipeline"
 )
 EOD_SF_NAME = "alpha-engine-eod-pipeline"
 

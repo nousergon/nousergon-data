@@ -3,7 +3,7 @@
 # and wire its EventBridge trigger.
 #
 # Subscribes to `aws.states` / "Step Functions Execution Status Change" events
-# for `alpha-engine-saturday-pipeline` terminal transitions (SUCCEEDED / FAILED
+# for `alpha-engine-weekly-pipeline` terminal transitions (SUCCEEDED / FAILED
 # / TIMED_OUT / ABORTED). The handler no-ops on real Saturday runs and, for
 # shell-run executions (shell_run=true), reads the execution history and writes
 # the consolidated report to s3://alpha-engine-research/friday-shell-run/{date}/
@@ -104,7 +104,7 @@ if $BOOTSTRAP; then
   "source": ["aws.states"],
   "detail-type": ["Step Functions Execution Status Change"],
   "detail": {
-    "stateMachineArn": ["arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"],
+    "stateMachineArn": ["arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-weekly-pipeline"],
     "status": ["SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"]
   }
 }

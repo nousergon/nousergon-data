@@ -40,9 +40,12 @@ def test_gate_states_exist(states, name):
 
 
 def test_runs_first_off_initialize_input(sf, states):
-    # The gate is the very first thing after InitializeInput — before any state.
+    # The gate is the first real hop after InitializeInput. groom #830 inserted
+    # CheckModePreset (the mode=backtest-eval expansion) between them; its Default
+    # is CheckSkipLibPinDriftCheck, so the lib-pin gate still precedes any state.
     assert sf["StartAt"] == "InitializeInput"
-    assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
+    assert states["InitializeInput"]["Next"] == "CheckModePreset"
+    assert states["CheckModePreset"]["Default"] == "CheckSkipLibPinDriftCheck"
 
 
 def test_skip_gate_default_runs_check_and_skip_bypasses(states):

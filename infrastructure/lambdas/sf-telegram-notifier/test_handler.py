@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
 
-SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
+SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekly-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
 EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
 
@@ -175,7 +175,7 @@ def test_send_message_failure_returned_in_result():
 
 
 def test_label_lookup_table_covers_all_three_sfs():
-    assert index._SF_LABELS["alpha-engine-saturday-pipeline"] == "Saturday SF"
+    assert index._SF_LABELS["alpha-engine-weekly-pipeline"] == "Saturday SF"
     assert index._SF_LABELS["alpha-engine-weekday-pipeline"] == "Weekday SF"
     assert index._SF_LABELS["alpha-engine-eod-pipeline"] == "EOD SF"
 
@@ -311,7 +311,7 @@ class TestPreflightLabel:
         """The override map is intentionally Saturday-only — the
         weekday + EOD SFs don't have a preflight variant."""
         assert index._PREFLIGHT_LABEL_OVERRIDE == {
-            "alpha-engine-saturday-pipeline": "Saturday Preflight SF",
+            "alpha-engine-weekly-pipeline": "Saturday Preflight SF",
         }
 
 

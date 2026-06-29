@@ -27,8 +27,8 @@ sys.modules.setdefault("alpha_engine_lib.trading_calendar", _tc)
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
-SAT_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
-_EXEC_ARN = "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:friday-shell-2026-06-12-eodname"
+SAT_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekly-pipeline"
+_EXEC_ARN = "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-weekly-pipeline:friday-shell-2026-06-12-eodname"
 
 
 def _ts(sec: int) -> datetime:

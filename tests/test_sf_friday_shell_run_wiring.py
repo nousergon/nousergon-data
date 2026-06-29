@@ -103,6 +103,14 @@ _EXPECTED_SKIPS = {
     "skip_backtester",
     "skip_parity",
     "skip_evaluator",
+    # Added by groom #830 — the four tail gates that let mode=backtest-eval
+    # stop the run after Evaluator (CheckSkipSaturdayHealthCheck /
+    # CheckSkipWeeklySubstrateHealthCheck / CheckSkipReportCard /
+    # CheckSkipDirector).
+    "skip_saturday_health_check",
+    "skip_weekly_substrate_health_check",
+    "skip_report_card",
+    "skip_director",
 }
 
 # KEYSTONE + skip-exception rewire: the 8 SPOT workload states. Under
@@ -394,7 +402,11 @@ class TestStrictSuperset:
         # 2026-06-08 (L4517): the lib-pin drift gate precedes the mutex; its
         # paths converge on CheckMutexRole (see test_sf_lib_pin_drift_wiring.py),
         # so the mutex→CheckShellRun superset property below is unchanged.
-        assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
+        # groom #830: InitializeInput now routes through CheckModePreset (the
+        # mode=backtest-eval expansion); its Default is the unchanged
+        # CheckSkipLibPinDriftCheck, so the superset property below is preserved.
+        assert states["InitializeInput"]["Next"] == "CheckModePreset"
+        assert states["CheckModePreset"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass path must route to CheckShellRun so the shell-run "
             "chain remains a strict superset for non-cadence inputs"
@@ -688,11 +700,18 @@ class TestConsolidatedNotify:
         # grading/advisory succeed or fail. On the Friday preflight the states
         # still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) — they are
         # not skipped — so the success edge is identical on real + preflight runs.
+        # groom #830: ReportCard and Director each sit behind a skip-gate
+        # (CheckSkipReportCard / CheckSkipDirector) so the backtest-eval mode preset
+        # can stop the run after Evaluator. Each gate's Default routes to the
+        # original state, so the shell-run path is unchanged.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckSkipReportCard"
         )
+        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
         report_card = states["ReportCard"]
-        assert report_card["Next"] == "Director"
+        assert report_card["Next"] == "CheckSkipDirector"
+        assert states["CheckSkipDirector"]["Default"] == "Director"
         assert all(c["Next"] == "CheckShellRunNotify" for c in report_card["Catch"])
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"
@@ -959,8 +978,11 @@ class TestHappyPathTraversal:
         # InitializeInput; with no skip flag + no drift, its skip/check/gate
         # Defaults converge on CheckMutexRole — same downstream chain, three
         # extra states in the visited order.
+        # groom #830: CheckModePreset is the new first hop after InitializeInput;
+        # with no mode token it falls through to CheckSkipLibPinDriftCheck.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            "CheckModePreset",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",

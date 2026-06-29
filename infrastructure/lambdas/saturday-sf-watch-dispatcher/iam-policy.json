@@ -33,7 +33,7 @@
         "states:DescribeExecution",
         "states:GetExecutionHistory"
       ],
-      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:*"
+      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-weekly-pipeline:*"
     },
     {
       "Sid": "WatchLogArtifactRW",

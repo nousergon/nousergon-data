@@ -36,7 +36,7 @@ plan doc §3.5.
       the 2026-05-26 morning false-positive Telegram alert that drove
       this fix.
 
-  - **Saturday SF** (``alpha-engine-saturday-pipeline``)
+  - **Saturday SF** (``alpha-engine-weekly-pipeline``)
       Watch-day: TODAY is Sunday (weekday 6) — Saturday SF fires at 09:00
       UTC Saturday; by Sunday 14:00 UTC any missed firing is 24+h overdue.
       Alert if 0 executions started in the last 7 days. (One CW alarm with
@@ -98,7 +98,7 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
 
 SATURDAY_SF_ARN = (
-    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-weekly-pipeline"
 )
 WEEKDAY_SF_ARN = (
     f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline"

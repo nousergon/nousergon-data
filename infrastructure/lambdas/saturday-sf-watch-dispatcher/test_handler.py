@@ -28,7 +28,7 @@ sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
-SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
+SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekly-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
 
 

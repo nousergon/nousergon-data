@@ -8,7 +8,7 @@ framing below is retained for arc context but is NO LONGER the runtime behavior.
 
 First slice of the Saturday-SF Watch arc (spec: nousergon/alpha-engine-config#1227).
 The arc's end state is an autonomous, SOTA-steered resilience agent that, on a
-Saturday SF (`alpha-engine-saturday-pipeline`) failure, diagnoses + enacts an
+Saturday SF (`alpha-engine-weekly-pipeline`) failure, diagnoses + enacts an
 institutional-grade reliability fix and reruns from the failed step
 (ask-forgiveness posture). This Lambda is **M1**: the dedicated trigger path +
 the watch-log artifact contract, in **OBSERVE mode only**. It does NOT invoke
@@ -79,7 +79,7 @@ GITHUB_PAT_SSM_PARAM = os.environ.get(
 )
 _DISPATCH_TIMEOUT_SEC = 15
 
-SATURDAY_SF_NAME = "alpha-engine-saturday-pipeline"
+SATURDAY_SF_NAME = "alpha-engine-weekly-pipeline"
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600
 # Bound the history scan: fetch the newest N events (reverseOrder), reconstruct

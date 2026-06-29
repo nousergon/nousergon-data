@@ -41,7 +41,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 _SF_LABELS: dict[str, str] = {
-    "alpha-engine-saturday-pipeline": "Saturday SF",
+    "alpha-engine-weekly-pipeline": "Saturday SF",
     "alpha-engine-weekday-pipeline": "Weekday SF",
     "alpha-engine-eod-pipeline": "EOD SF",
 }
@@ -55,7 +55,7 @@ _SF_LABELS: dict[str, str] = {
 # around load-bearing scheduled infra"); we differentiate via the
 # execution input flag, not via a separate SF.
 _PREFLIGHT_LABEL_OVERRIDE: dict[str, str] = {
-    "alpha-engine-saturday-pipeline": "Saturday Preflight SF",
+    "alpha-engine-weekly-pipeline": "Saturday Preflight SF",
 }
 
 _STATUS_EMOJI: dict[str, str] = {
