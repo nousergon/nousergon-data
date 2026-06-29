@@ -63,15 +63,18 @@ if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
-# ----- 1. Package: vendor the handler + collector + zip ----------------------
-# No third-party deps — the collector uses only stdlib (urllib) + boto3 (runtime-provided),
-# so the zip is just two .py files (no pip, no platform-specific wheels).
+# ----- 1. Package: deps (embit) + vendor the handler + collector + zip -------
+# embit is pure-Python-capable + ships a prebuilt linux_x86_64 libsecp256k1, so `pip install
+# -t` on any host yields a Lambda-safe package (no platform-wheel selection). The collector is
+# vendored flat (it has no intra-repo imports); boto3 comes from the runtime.
 
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
 
+echo "Installing deps into ${PKG} (pip install -t)..."
+python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
+
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
-# Vendor the tested collector flat next to the handler (it has no intra-repo imports).
 cp "${REPO_ROOT}/collectors/crypto_balances.py" "${PKG}/crypto_balances.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")

@@ -1,0 +1,6 @@
+# Bundled into the deployment zip via `pip install -t`. ONLY embit (BTC HD-wallet xpub
+# derivation) — it's pure-Python-capable and ships a prebuilt linux_x86_64 libsecp256k1 (the
+# Lambda arch) with a pure-Python fallback, so `pip install -t` on any host yields a Lambda-safe
+# package (no platform-wheel selection). boto3 is NOT listed — the python3.12 runtime provides
+# it, and bundling it would bloat the zip by ~17 MB for nothing.
+embit>=0.7.0

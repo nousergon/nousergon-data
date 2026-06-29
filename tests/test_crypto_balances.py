@@ -17,6 +17,9 @@ from collectors import crypto_balances as cb
 
 _BTC = "bc1q9zpgru5j9q3dccf6n5xm9wglv5jh0w8r4d5xkp"
 _ETH = "0x52908400098527886e0f7030069857d2e4169ee7"
+# Canonical BIP84 test vector (mnemonic "abandon abandon … about"): zpub + its m/…/0/0 address.
+_ZPUB = "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs"
+_ZPUB_FIRST_RECEIVE = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
 _NOW = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
 
 
@@ -171,7 +174,52 @@ class TestProviderFallback:
         def fake_get(url):
             if url.startswith(cb._BTC_ESPLORA[0]):
                 raise RuntimeError("blockstream down")
-            return {"chain_stats": {"funded_txo_sum": 150_000_000, "spent_txo_sum": 50_000_000}}  # 1 BTC
+            return {"chain_stats": {"funded_txo_sum": 150_000_000, "spent_txo_sum": 50_000_000, "tx_count": 1}}  # 1 BTC
 
         monkeypatch.setattr(cb, "_get_json", fake_get)
+        assert cb.fetch_btc_balance(_BTC) == 1.0
+
+
+class TestXpub:
+    """HD-wallet (xpub/ypub/zpub) support — a single BTC address isn't the wallet balance, so
+    self-custody wallets are tracked by an extended key whose addresses we derive + sum."""
+
+    def test_is_extended_key(self):
+        assert cb._is_extended_key(_ZPUB)
+        assert not cb._is_extended_key(_BTC)
+
+    def test_derivation_matches_bip84_vector(self, monkeypatch):
+        # Real embit derivation: the first receive address must be the canonical BIP84 vector.
+        seen: list[str] = []
+
+        def fake_stats(addr):
+            seen.append(addr)
+            return (0, 0, 0)  # all empty → the scan terminates at the gap limit
+
+        monkeypatch.setattr(cb, "_esplora_address_stats", fake_stats)
+        monkeypatch.setattr(cb, "_SCAN_DELAY_S", 0)
+        assert cb.fetch_btc_xpub_balance(_ZPUB, gap_limit=3) == 0.0
+        assert seen[0] == _ZPUB_FIRST_RECEIVE
+
+    def test_gap_limit_sums_then_stops(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_stats(addr):
+            calls["n"] += 1
+            if calls["n"] == 1:  # first receive address holds a net 1 BTC
+                return (150_000_000, 50_000_000, 1)
+            return (0, 0, 0)
+
+        monkeypatch.setattr(cb, "_esplora_address_stats", fake_stats)
+        monkeypatch.setattr(cb, "_SCAN_DELAY_S", 0)
+        assert cb.fetch_btc_xpub_balance(_ZPUB, gap_limit=3) == 1.0
+        # receive: 0 used + 3 empty (gap hits 3) = 4 calls; change: 3 empty = 3 calls → 7 total.
+        assert calls["n"] == 7
+
+    def test_fetch_btc_dispatches_xpub(self, monkeypatch):
+        monkeypatch.setattr(cb, "fetch_btc_xpub_balance", lambda x, **k: 2.5)
+        assert cb.fetch_btc_balance(_ZPUB) == 2.5
+
+    def test_fetch_btc_single_address_path(self, monkeypatch):
+        monkeypatch.setattr(cb, "_esplora_address_stats", lambda a: (150_000_000, 50_000_000, 1))
         assert cb.fetch_btc_balance(_BTC) == 1.0

@@ -4,6 +4,10 @@ pyarrow>=14.0
 yfinance>=0.2.36
 requests>=2.31
 pyyaml>=6.0
+# Bitcoin HD-wallet (xpub/ypub/zpub) derivation for the crypto-balances producer
+# (collectors/crypto_balances.py). Pure-Python-capable (ships a prebuilt linux libsecp256k1
+# + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
+embit>=0.7.0
 numpy>=1.24
 feedparser>=6.0
 beautifulsoup4>=4.12
