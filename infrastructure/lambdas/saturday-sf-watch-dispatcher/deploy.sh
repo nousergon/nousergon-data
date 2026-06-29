@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the alpha-engine-saturday-sf-watch-dispatcher
-# Lambda and wire its EventBridge trigger (Saturday SF terminal failure only).
+# deploy.sh — Create or update the sf-watch-dispatcher Lambda and wire its
+# EventBridge trigger (terminal failure of ANY of the three fleet SFs:
+# saturday / weekday / eod).
 #
-# Saturday-SF Watch arc, M1 (OBSERVE). The Lambda writes a watch-log artifact
-# to s3://alpha-engine-research/consolidated/saturday_sf_watch/{run_date}.json
-# and sends a SILENT Telegram receipt. It invokes NO agent (AGENT_DISPATCH_ENABLED
-# default false). Spec: nousergon/alpha-engine-config#1227.
+# Fleet-SF Watch (generalized from Saturday-only; spec: #1227, fan-out: #1375).
+# The Lambda writes a per-pipeline watch-log artifact to
+# s3://alpha-engine-research/consolidated/{saturday|weekday|eod}_sf_watch/{run_date}.json
+# and sends a SILENT Telegram receipt; with AGENT_DISPATCH_ENABLED=true it also
+# fires the per-pipeline repository_dispatch to the resilience agent.
+#
+# NOTE: FUNCTION_NAME / RULE_NAME retain the "saturday" string for now so the
+# routine code-update path keeps targeting the LIVE function — renaming is a
+# tracked fast-follow (config#1375) coupled to a re-bootstrap. Re-running with
+# --bootstrap updates the EXISTING rule's event pattern in place to the 3 ARNs.
 #
 # Managed outside CloudFormation — same rationale as sf-telegram-notifier +
 # spot-orphan-reaper (keeps the github-actions-lambda-deploy OIDC role's blast
@@ -124,7 +131,8 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge rule: Saturday SF terminal-failure statuses ONLY.
+  # EventBridge rule: terminal-failure statuses of ANY of the three fleet SFs.
+  # One rule, one target — keep the ARN list in lockstep with index.PIPELINES.
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -132,7 +140,9 @@ if $BOOTSTRAP; then
   "detail-type": ["Step Functions Execution Status Change"],
   "detail": {
     "stateMachineArn": [
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }
@@ -142,7 +152,7 @@ EOF
   run aws events put-rule \
     --name "${RULE_NAME}" \
     --event-pattern "${EVENT_PATTERN}" \
-    --description "Saturday SF terminal failure → alpha-engine-saturday-sf-watch-dispatcher (OBSERVE)" \
+    --description "Fleet SF (saturday/weekday/eod) terminal failure → sf-watch-dispatcher" \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
