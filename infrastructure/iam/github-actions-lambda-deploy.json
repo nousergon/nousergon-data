@@ -292,6 +292,19 @@
         "s3:PutObject"
       ],
       "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
+    },
+    {
+      "Sid": "InfraDeployMetricFilters",
+      "Effect": "Allow",
+      "Action": [
+        "logs:PutMetricFilter",
+        "logs:DeleteMetricFilter",
+        "logs:DescribeMetricFilters"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/alpha-engine-*-pipeline:*",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*"
+      ]
     }
   ]
 }
