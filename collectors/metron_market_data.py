@@ -66,6 +66,15 @@ RISK_FACTOR_ETFS = [
     "SPY", "MTUM", "QUAL", "USMV", "VLUE", "SIZE",  # market + iShares MSCI USA style factors
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY",  # GICS sector SPDRs
 ]
+# Tracking-proxy ETFs for late-striking mutual funds (Metron fund-NAV estimate). A mutual
+# fund's NAV strikes hours after the EOD run, so its same-day move is estimated from a proxy
+# ETF tracking the same exposure (metron api/services/fund_proxy.py: FNILX→SPY large-cap,
+# FZILX/FTIHX→IXUS total-intl-ex-US). The FULL distinct proxy set — these are NOT held, so
+# their close_history (reconcile fallback) + a dedicated intraday `fund_proxies` quote map
+# (the same-day estimate) must be published here or the spine has no proxy data. SPY's
+# close_history already comes via RISK_FACTOR_ETFS; the union just guarantees coverage and
+# gives the live estimate a single source for every proxy. All USD.
+FUND_PROXY_ETFS = ["SPY", "IXUS"]
 # Reference data — GICS sector per held symbol + SPY's sector weights (Brinson
 # attribution), and each held symbol's next earnings date (Calendar page). Moves
 # Metron's last yfinance fetches to the spine so Metron reads ALL external data here.
@@ -152,7 +161,7 @@ SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → countr
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
 FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow (balance sheet)
-INTRADAY_SCHEMA_VERSION = 2  # v2: additive `indices` map (major-index ETF proxies)
+INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
 TECHNICALS_SCHEMA_VERSION = 1
 VALUATION_MEDIANS_SCHEMA_VERSION = 1
 ANALYST_SCHEMA_VERSION = 1  # consensus rating + price targets + #analysts (free sources)
@@ -776,10 +785,14 @@ def collect_history(
     if not holdings:
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
-    # Held symbols + the factor/sector ETFs Metron's risk/attribution need (USD,
-    # independent of holdings) — without these the spine can't serve their close_history
-    # and risk/attribution stay blank (metron-ops#43).
-    hist_symbols = sorted(set(ccy_by_yf) | set(RISK_FACTOR_ETFS))
+    # Held symbols + the factor/sector ETFs Metron's risk/attribution need (metron-ops#43),
+    # + the major-index ETF proxies (so the Overview markets strip resolves YTD/LTM for
+    # QQQ/IWM/ONEQ — not just SPY, which only worked because it's in RISK_FACTOR_ETFS),
+    # + the fund-proxy ETFs (close_history backstop for the late-fund-NAV reconcile). All
+    # USD, independent of holdings — without them the spine has no close_history for these.
+    hist_symbols = sorted(
+        set(ccy_by_yf) | set(RISK_FACTOR_ETFS) | set(INDEX_PROXY_SYMBOLS) | set(FUND_PROXY_ETFS)
+    )
     closes = (close_history_source or _yfinance_close_history)(hist_symbols)
     fx = (fx_history_source or _yfinance_fx_history)(currencies)
     if dry_run:
@@ -1516,8 +1529,9 @@ def collect_intraday(
 
         market_data/intraday/latest.json
             {schema_version, as_of_utc, source: "yfinance_delayed",
-             quotes:  {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
-             indices: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
+             quotes:       {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
+             indices:      {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
+             fund_proxies: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
 
     ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading box
     (infrastructure/systemd/metron-intraday.timer), gated on the NYSE session window
@@ -1552,7 +1566,15 @@ def collect_intraday(
     for q in indices.values():
         q["currency"] = BASE_CURRENCY
 
-    n_suspect = _flag_suspect_quotes(quotes) + _flag_suspect_quotes(indices)
+    # Fund-proxy ETF quotes — the same-day move that estimates a late-striking mutual fund's
+    # return (metron fund_proxy.py). Kept in a DEDICATED map (not `indices`, which is the 4
+    # headline-index proxies) so the consumer has one clean source for every proxy and IXUS
+    # never reads as a headline index. Always fetched, independent of holdings.
+    fund_proxies = fetch(list(FUND_PROXY_ETFS))
+    for q in fund_proxies.values():
+        q["currency"] = BASE_CURRENCY
+
+    n_suspect = _flag_suspect_quotes(quotes) + _flag_suspect_quotes(indices) + _flag_suspect_quotes(fund_proxies)
     if n_suspect:
         logger.warning("[metron_market_data] %d intraday quote(s) flagged suspect (>40%% vs prev close)", n_suspect)
     artifact = {
@@ -1561,18 +1583,22 @@ def collect_intraday(
         "source": "yfinance_delayed",
         "quotes": dict(sorted(quotes.items())),
         "indices": dict(sorted(indices.items())),
+        "fund_proxies": dict(sorted(fund_proxies.items())),
     }
     if dry_run:
-        logger.info("[metron_market_data] DRY-RUN intraday: %d quotes, %d indices (not written)",
-                    len(quotes), len(indices))
-        return {"status": "ok_dry_run", "quotes": len(quotes), "indices": len(indices)}
+        logger.info("[metron_market_data] DRY-RUN intraday: %d quotes, %d indices, %d fund-proxies (not written)",
+                    len(quotes), len(indices), len(fund_proxies))
+        return {"status": "ok_dry_run", "quotes": len(quotes), "indices": len(indices),
+                "fund_proxies": len(fund_proxies)}
     try:
         _write_json(s3_client, bucket, f"{INTRADAY_PREFIX}latest.json", artifact)
     except Exception as e:  # fail loud — the timer unit's journal + freshness scan record it
         logger.error("[metron_market_data] intraday write failed: %s", e)
         return {"status": "error", "error": str(e)}
-    logger.info("[metron_market_data] wrote %d intraday quotes + %d indices", len(quotes), len(indices))
-    return {"status": "ok", "universe": len(holdings), "quotes": len(quotes), "indices": len(indices)}
+    logger.info("[metron_market_data] wrote %d intraday quotes + %d indices + %d fund-proxies",
+                len(quotes), len(indices), len(fund_proxies))
+    return {"status": "ok", "universe": len(holdings), "quotes": len(quotes),
+            "indices": len(indices), "fund_proxies": len(fund_proxies)}
 
 
 def main(argv: list[str] | None = None) -> int:
