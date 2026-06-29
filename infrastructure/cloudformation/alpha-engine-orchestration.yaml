@@ -121,8 +121,9 @@ Resources:
   # resources lived in this stack, every CI deploy hit a perm-cascade on
   # the github-actions-lambda-deploy OIDC role (iam:TagRole, iam:GetRole,
   # ...). Orphaning the Lambda kept the OIDC role narrow and removed the
-  # cascade. See ROADMAP "SNS-mirror Lambda — orphan vs CF management"
-  # for the full trade-off + future reconsideration triggers.
+  # cascade. See alpha-engine-config#860 "SNS-mirror Lambda — orphan vs CF
+  # management" (migrated from ROADMAP.md on 2026-06-11, config PR #623) for
+  # the full trade-off + future reconsideration triggers.
 
   # --------------------------------------------------------------------------
   # Step Functions — Saturday Pipeline
