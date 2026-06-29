@@ -101,8 +101,15 @@ _EXPECTED_SKIPS = {
     "skip_predictor_training",
     "skip_drift_detection",
     "skip_backtester",
+    # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
+    # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
+    # and PortfolioOptimizerBacktest (L4472 split) previously had no skip gate, and
+    # the post-eval tail (health checks/report-card/director) could not be stopped.
+    "skip_predictor_backtest",
+    "skip_portfolio_optimizer_backtest",
     "skip_parity",
     "skip_evaluator",
+    "skip_post_eval",
 }
 
 # KEYSTONE + skip-exception rewire: the 8 SPOT workload states. Under
@@ -394,7 +401,10 @@ class TestStrictSuperset:
         # 2026-06-08 (L4517): the lib-pin drift gate precedes the mutex; its
         # paths converge on CheckMutexRole (see test_sf_lib_pin_drift_wiring.py),
         # so the mutex→CheckShellRun superset property below is unchanged.
-        assert states["InitializeInput"]["Next"] == "CheckSkipLibPinDriftCheck"
+        # config#830: CheckRunMode (cadence preset) precedes the lib-pin gate;
+        # its Default → CheckSkipLibPinDriftCheck, so the superset chain holds.
+        assert states["InitializeInput"]["Next"] == "CheckRunMode"
+        assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass path must route to CheckShellRun so the shell-run "
             "chain remains a strict superset for non-cadence inputs"
@@ -959,8 +969,12 @@ class TestHappyPathTraversal:
         # InitializeInput; with no skip flag + no drift, its skip/check/gate
         # Defaults converge on CheckMutexRole — same downstream chain, three
         # extra states in the visited order.
+        # config#830: CheckRunMode (cadence preset) sits between InitializeInput
+        # and the lib-pin gate; with no `mode` on the input it takes its Default
+        # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            "CheckRunMode",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",

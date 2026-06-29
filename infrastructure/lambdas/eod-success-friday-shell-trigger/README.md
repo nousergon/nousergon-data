@@ -1,7 +1,7 @@
 # eod-success-friday-shell-trigger
 
 Subscribes to EventBridge `Step Functions Execution Status Change` events
-for `alpha-engine-eod-pipeline` SUCCEEDED transitions and, when the
+for `ne-postclose-trading-pipeline` SUCCEEDED transitions and, when the
 underlying trading_day is a Friday, starts the Saturday Step Function in
 shell-run mode (`shell_run: true`).
 
@@ -70,7 +70,7 @@ EOD SF reaches SUCCEEDED
        ▼
 EventBridge default bus
    (aws.states / Step Functions Execution Status Change,
-    filtered to alpha-engine-eod-pipeline + SUCCEEDED only)
+    filtered to ne-postclose-trading-pipeline + SUCCEEDED only)
        │
        ▼
 alpha-engine-eod-success-friday-shell-trigger
@@ -78,7 +78,7 @@ alpha-engine-eod-success-friday-shell-trigger
        ├──► last_closed_trading_day(stopDate UTC) → trading_day
        │
        └──► if trading_day.weekday() == FRI:
-                states:StartExecution on alpha-engine-saturday-pipeline
+                states:StartExecution on ne-weekly-freshness-pipeline
                 with input { ec2_instance_id, sns_topic_arn, shell_run: true }
 ```
 
@@ -107,7 +107,7 @@ changelog-cloudwatch-mirror convention.
 
 - `logs:CreateLogGroup/Stream + PutLogEvents` on the Lambda's own log group
 - `states:StartExecution` on
-  `arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline`
+  `arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline`
   (single-target scope — cannot start any other SF)
 
 ## Cutover plan

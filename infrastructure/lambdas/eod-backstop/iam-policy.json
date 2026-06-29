@@ -24,7 +24,7 @@
         "states:ListExecutions",
         "states:StartExecution"
       ],
-      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
     }
   ]
 }

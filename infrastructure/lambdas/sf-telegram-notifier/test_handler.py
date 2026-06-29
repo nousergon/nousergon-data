@@ -28,9 +28,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
 
-SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline"
-WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
-EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
+WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
+EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
 
 
 def _event(status: str, sm_arn: str = SATURDAY_ARN, **detail_overrides) -> dict:
@@ -59,7 +59,7 @@ def test_running_sends_silent_message_without_duration_or_cause():
 
     _telegram_mod.send_message.assert_called_once()
     text, kwargs = _telegram_mod.send_message.call_args.args[0], _telegram_mod.send_message.call_args.kwargs
-    assert "Saturday SF — RUNNING" in text
+    assert "Weekly Freshness SF — RUNNING" in text
     assert "Execution: exec-001" in text
     assert "Duration:" not in text
     assert "Cause:" not in text
@@ -75,7 +75,7 @@ def test_succeeded_sends_loud_message_with_duration():
 
     text = _telegram_mod.send_message.call_args.args[0]
     kwargs = _telegram_mod.send_message.call_args.kwargs
-    assert "Weekday SF — SUCCEEDED" in text
+    assert "Pre-open Trading SF — SUCCEEDED" in text
     assert "Duration: 1m" in text
     assert kwargs["disable_notification"] is False
     assert result["silent"] is False
@@ -105,7 +105,7 @@ def test_failed_fetches_and_includes_cause():
     )
     text = _telegram_mod.send_message.call_args.args[0]
     kwargs = _telegram_mod.send_message.call_args.kwargs
-    assert "EOD SF — FAILED" in text
+    assert "Post-close Trading SF — FAILED" in text
     assert "Cause: States.TaskFailed: EODReconcile state failed: NoCredentialsError" in text
     assert kwargs["disable_notification"] is False
     assert result["status"] == "FAILED"
@@ -120,7 +120,7 @@ def test_failed_with_describe_execution_error_still_sends():
         result = index.handler(event, None)
 
     text = _telegram_mod.send_message.call_args.args[0]
-    assert "Saturday SF — FAILED" in text
+    assert "Weekly Freshness SF — FAILED" in text
     assert "Cause:" not in text  # enrichment silently dropped
     assert result["telegram_sent"] is True
 
@@ -146,7 +146,7 @@ def test_timed_out_sends_loud_message():
     index.handler(event, None)
     text = _telegram_mod.send_message.call_args.args[0]
     kwargs = _telegram_mod.send_message.call_args.kwargs
-    assert "Saturday SF — TIMED_OUT" in text
+    assert "Weekly Freshness SF — TIMED_OUT" in text
     assert kwargs["disable_notification"] is False
 
 
@@ -155,7 +155,7 @@ def test_aborted_sends_loud_message():
     index.handler(event, None)
     text = _telegram_mod.send_message.call_args.args[0]
     kwargs = _telegram_mod.send_message.call_args.kwargs
-    assert "Saturday SF — ABORTED" in text
+    assert "Weekly Freshness SF — ABORTED" in text
     assert kwargs["disable_notification"] is False
 
 
@@ -175,15 +175,15 @@ def test_send_message_failure_returned_in_result():
 
 
 def test_label_lookup_table_covers_all_three_sfs():
-    assert index._SF_LABELS["alpha-engine-saturday-pipeline"] == "Saturday SF"
-    assert index._SF_LABELS["alpha-engine-weekday-pipeline"] == "Weekday SF"
-    assert index._SF_LABELS["alpha-engine-eod-pipeline"] == "EOD SF"
+    assert index._SF_LABELS["ne-weekly-freshness-pipeline"] == "Weekly Freshness SF"
+    assert index._SF_LABELS["ne-preopen-trading-pipeline"] == "Pre-open Trading SF"
+    assert index._SF_LABELS["ne-postclose-trading-pipeline"] == "Post-close Trading SF"
 
 
 class TestPreflightLabel:
-    """2026-05-23 rename: the Saturday SF's Friday-PM dry-pass execution
-    (input ``shell_run=true``) surfaces 'Saturday Preflight SF' in the
-    Telegram message instead of 'Saturday SF', so the operator can tell
+    """2026-05-23 rename: the Weekly Freshness SF's Friday-PM dry-pass execution
+    (input ``shell_run=true``) surfaces 'Weekly Freshness Preflight SF' in the
+    Telegram message instead of 'Weekly Freshness SF', so the operator can tell
     a green/red preflight result apart from a real Saturday result at a
     glance. Same state machine; differentiated via execution input flag.
     """
@@ -202,12 +202,12 @@ class TestPreflightLabel:
         with patch("index.boto3.client", return_value=fake_sf_client):
             index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Saturday Preflight SF — SUCCEEDED" in text, (
-            f"shell_run=true on Saturday SF must surface "
-            f"'Saturday Preflight SF' label; got: {text!r}"
+        assert "Weekly Freshness Preflight SF — SUCCEEDED" in text, (
+            f"shell_run=true on Weekly Freshness SF must surface "
+            f"'Weekly Freshness Preflight SF' label; got: {text!r}"
         )
-        # Default label must NOT appear (Saturday SF != Saturday Preflight SF)
-        assert "Saturday SF —" not in text
+        # Default label must NOT appear (Weekly Freshness SF != Weekly Freshness Preflight SF)
+        assert "Weekly Freshness SF —" not in text
 
     def test_saturday_without_shell_run_uses_default_label(self):
         event = _event("SUCCEEDED", sm_arn=SATURDAY_ARN)
@@ -220,7 +220,7 @@ class TestPreflightLabel:
         with patch("index.boto3.client", return_value=fake_sf_client):
             index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Saturday SF — SUCCEEDED" in text
+        assert "Weekly Freshness SF — SUCCEEDED" in text
         assert "Preflight" not in text
 
     def test_saturday_with_shell_run_false_uses_default_label(self):
@@ -236,13 +236,13 @@ class TestPreflightLabel:
         with patch("index.boto3.client", return_value=fake_sf_client):
             index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Saturday SF — SUCCEEDED" in text
+        assert "Weekly Freshness SF — SUCCEEDED" in text
         assert "Preflight" not in text
 
     def test_non_saturday_sf_with_shell_run_true_keeps_default_label(self):
-        """Defensive: shell_run=true on Weekday or EOD SF (which can't
+        """Defensive: shell_run=true on Weekday or Post-close Trading SF (which can't
         actually happen in practice) keeps the default label — only the
-        Saturday SF has a Preflight variant."""
+        Weekly Freshness SF has a Preflight variant."""
         event = _event("SUCCEEDED", sm_arn=WEEKDAY_ARN)
         fake_sf_client = MagicMock()
         fake_sf_client.describe_execution.return_value = {
@@ -253,12 +253,12 @@ class TestPreflightLabel:
         with patch("index.boto3.client", return_value=fake_sf_client):
             index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Weekday SF — SUCCEEDED" in text
+        assert "Pre-open Trading SF — SUCCEEDED" in text
         assert "Preflight" not in text
 
     def test_describe_execution_error_falls_back_to_default_label(self):
         """boto3 hiccup must not break the notify path — falls back to
-        the default 'Saturday SF' label (the alert still fires)."""
+        the default 'Weekly Freshness SF' label (the alert still fires)."""
         event = _event("SUCCEEDED", sm_arn=SATURDAY_ARN)
         fake_sf_client = MagicMock()
         fake_sf_client.describe_execution.side_effect = RuntimeError(
@@ -267,7 +267,7 @@ class TestPreflightLabel:
         with patch("index.boto3.client", return_value=fake_sf_client):
             result = index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Saturday SF — SUCCEEDED" in text
+        assert "Weekly Freshness SF — SUCCEEDED" in text
         assert result["telegram_sent"] is True
 
     def test_malformed_input_json_falls_back_to_default_label(self):
@@ -283,13 +283,13 @@ class TestPreflightLabel:
         with patch("index.boto3.client", return_value=fake_sf_client):
             index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Saturday SF — FAILED" in text
+        assert "Weekly Freshness SF — FAILED" in text
         # The cause enrichment STILL works — parsing input is independent
         # of error/cause extraction.
         assert "Cause: E: C" in text
 
     def test_failed_preflight_includes_both_label_and_cause(self):
-        """Combined path: a FAILED Saturday Preflight SF event must
+        """Combined path: a FAILED Weekly Freshness Preflight SF event must
         surface BOTH the Preflight label AND the cause enrichment from
         a single DescribeExecution call."""
         event = self._saturday_preflight_event("FAILED")
@@ -304,14 +304,14 @@ class TestPreflightLabel:
         # Verify single boto3 client call (not duplicated for preflight + cause)
         bc.assert_called_once_with("stepfunctions", region_name=index.REGION)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Saturday Preflight SF — FAILED" in text
+        assert "Weekly Freshness Preflight SF — FAILED" in text
         assert "Cause: States.TaskFailed: MorningEnrich state failed" in text
 
     def test_preflight_label_override_map_pins_saturday_only(self):
         """The override map is intentionally Saturday-only — the
-        weekday + EOD SFs don't have a preflight variant."""
+        weekday + Post-close Trading SFs don't have a preflight variant."""
         assert index._PREFLIGHT_LABEL_OVERRIDE == {
-            "alpha-engine-saturday-pipeline": "Saturday Preflight SF",
+            "ne-weekly-freshness-pipeline": "Weekly Freshness Preflight SF",
         }
 
 

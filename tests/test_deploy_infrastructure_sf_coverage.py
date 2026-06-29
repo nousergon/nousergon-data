@@ -2,7 +2,7 @@
 ``infrastructure/`` MUST be auto-deployed by ``deploy-infrastructure.sh``.
 
 This pins the fix for config#1173: the EOD SF (``step_function_eod.json`` →
-``alpha-engine-eod-pipeline``) used to be deployed ONLY by the manual
+``ne-postclose-trading-pipeline``) used to be deployed ONLY by the manual
 ``update_eod_pipeline_sf.sh``, which nothing triggered on merge. Merged EOD SF
 changes therefore silently never reached the live state machine (drift hit
 2026-06-22 via #458's ``nousergon_lib`` migration — weekday + Saturday
@@ -61,17 +61,20 @@ def test_sf_definition_uploaded_to_s3(sf_file: str) -> None:
 
 
 def test_update_state_machine_called_for_each_sf() -> None:
-    """Each SF definition has a corresponding update-state-machine deploy.
+    """Each SF definition has a corresponding deploy in the script.
 
-    We count the ``update-state-machine`` invocations rather than tie each to a
-    literal ARN string (the ARNs are built from shell vars) and require at least
-    one per SF definition file.
+    We count the DISTINCT state-machine names the script applies (parsed from the
+    ``...:stateMachine:<name>`` ARN strings) rather than literal
+    ``update-state-machine`` occurrences: since the 2026-06-29 ne- rename the
+    deploy uses existence-aware helpers (``update_or_defer_to_cfn`` /
+    ``update_or_create``) so the CFN-managed pair is create-deferred to the stack
+    and the literal call count no longer maps 1:1 to SFs. Require at least one
+    deployed name per SF definition file.
     """
-    script = _DEPLOY.read_text()
-    n_updates = script.count("aws stepfunctions update-state-machine")
-    assert n_updates >= len(_SF_FILES), (
-        f"deploy-infrastructure.sh has {n_updates} update-state-machine "
-        f"call(s) for {len(_SF_FILES)} SF definition file(s) "
+    deployed = _sf_names_deployed_by_script()
+    assert len(deployed) >= len(_SF_FILES), (
+        f"deploy-infrastructure.sh applies {len(deployed)} state machine(s) "
+        f"({sorted(deployed)}) for {len(_SF_FILES)} SF definition file(s) "
         f"({_SF_FILES}); every orchestration SF must be applied on merge "
         f"(config#1173)."
     )
@@ -81,15 +84,15 @@ def test_eod_state_machine_is_auto_deployed() -> None:
     """Explicit pin for the config#1173 regression target.
 
     The EOD SF + its state-machine name must both be wired into the deploy
-    script so the auto-deploy path covers ``alpha-engine-eod-pipeline``.
+    script so the auto-deploy path covers ``ne-postclose-trading-pipeline``.
     """
     script = _DEPLOY.read_text()
     assert "step_function_eod.json" in script, (
         "EOD SF definition not referenced by deploy-infrastructure.sh "
         "(config#1173 regression)."
     )
-    assert "alpha-engine-eod-pipeline" in script, (
-        "alpha-engine-eod-pipeline state machine not deployed by "
+    assert "ne-postclose-trading-pipeline" in script, (
+        "ne-postclose-trading-pipeline state machine not deployed by "
         "deploy-infrastructure.sh (config#1173 regression)."
     )
 
@@ -118,7 +121,9 @@ def _sf_names_deployed_by_script() -> set[str]:
     in full in the script.
     """
     script = _DEPLOY.read_text()
-    return set(re.findall(r"stateMachine:(alpha-engine-[a-z0-9-]+pipeline)", script))
+    return set(
+        re.findall(r"stateMachine:((?:alpha-engine|ne)-[a-z0-9-]+pipeline)", script)
+    )
 
 
 def _sf_arn_patterns_granted_in_policy() -> list[str]:

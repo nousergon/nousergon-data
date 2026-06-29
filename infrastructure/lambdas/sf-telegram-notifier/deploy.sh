@@ -132,9 +132,9 @@ if $BOOTSTRAP; then
   "detail-type": ["Step Functions Execution Status Change"],
   "detail": {
     "stateMachineArn": [
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-saturday-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-weekday-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
     ],
     "status": ["RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"]
   }
@@ -193,8 +193,8 @@ if $SMOKE; then
   "detail-type": "Step Functions Execution Status Change",
   "detail": {
     "status": "SUCCEEDED",
-    "stateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
-    "executionArn": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:smoke-test",
+    "stateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+    "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:smoke-test",
     "name": "smoke-test",
     "startDate": 0,
     "stopDate": 60000

@@ -19,7 +19,7 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-STATE_MACHINE_NAME="alpha-engine-weekday-pipeline"
+STATE_MACHINE_NAME="ne-preopen-trading-pipeline"
 ROLE_NAME="alpha-engine-step-functions-role"  # reuse from Saturday pipeline
 SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts"
 EVENTBRIDGE_RULE="alpha-engine-weekday"

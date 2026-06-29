@@ -111,13 +111,18 @@
       "Sid": "InfraDeploySFDefinition",
       "Effect": "Allow",
       "Action": [
+        "states:CreateStateMachine",
         "states:UpdateStateMachine",
+        "states:DeleteStateMachine",
         "states:DescribeStateMachine",
         "states:ListTagsForResource",
         "states:TagResource",
         "states:UntagResource"
       ],
-      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-*-pipeline"
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-*-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-*-pipeline"
+      ]
     },
     {
       "Sid": "InfraDeployResourceCRUD",

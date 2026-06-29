@@ -24,7 +24,7 @@ invocation:
      — the monitor monitors itself; substrate-health-check daily
      watches the heartbeat.
   5. For misses past SLA (``state ∈ {missing, stale, probe_failed}``),
-     route to :func:`alpha_engine_lib.alerts.publish` with
+     route to :func:`krepis.alerts.publish` with
      ``dedup_key=resolve_dedup_key(spec, now)`` — dedup collapses
      4×/hour retries to one alert per cycle per artifact.
   6. **OBSERVE-mode gate**: when env
@@ -54,7 +54,7 @@ from typing import Any
 import boto3
 import yaml
 
-from alpha_engine_lib.alerts import publish
+from krepis.alerts import publish
 from alpha_engine_lib.artifact_freshness import (
     ArtifactSpec,
     CheckResult,
