@@ -1,0 +1,6 @@
+# Only the stable `telegram.send_message` primitive is used here — no extras.
+# Mirrors the sibling saturday-sf-watch-dispatcher pin (same Fleet-Watch family);
+# the lambda-dir requirements are NOT lockstep-bound to the repo-root pin
+# (tests/test_lib_pin_lockstep.py scans only requirements.txt / Dockerfile /
+# requirements-daily-news.txt), so a recent telegram-stable pin is sufficient.
+alpha-engine-lib @ git+https://github.com/nousergon/nousergon-lib@v0.59.4
