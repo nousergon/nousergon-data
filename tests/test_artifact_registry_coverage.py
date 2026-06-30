@@ -93,6 +93,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # is grandfathered out of ARTIFACT_REGISTRY.yaml (no freshness row) per "never
     # register a freshness entry ahead of/without a periodic producer".
     "corporate_actions/registry.py": 1,
+    # corporate_actions.sync (PR4, config#1433) rewrites the EXISTING
+    # staging/daily_closes/{date}.parquet archive IN PLACE (split restatement) —
+    # it produces no NEW artifact (that prefix already has its freshness SLA via
+    # the daily_closes collector), so no new ARTIFACT_REGISTRY row is required;
+    # this single PUT site is the in-place archive write-back.
+    "corporate_actions/__init__.py": 1,
     "data/cache.py": 1,
     "data/derived/analyst_revisions.py": 2,
     "data/derived/news_aggregates.py": 2,
