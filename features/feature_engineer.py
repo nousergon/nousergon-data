@@ -312,6 +312,7 @@ def compute_features(
     fundamental_data: dict | None = None,
     vix3m_series: pd.Series | None = None,
     xsect_dispersion: pd.Series | None = None,
+    close_col: str = "Close",
 ) -> pd.DataFrame:
     """
     Compute all technical, macro, and alternative data features for a full OHLCV DataFrame.
@@ -321,6 +322,15 @@ def compute_features(
     df : pd.DataFrame
         Must contain columns: Close, Volume (Open/High/Low optional).
         Index should be a DatetimeIndex sorted ascending.
+    close_col : str, default "Close"
+        The column used as the price series that feeds every close-derived
+        feature (the single basis chokepoint — ~70 downstream feature sites
+        inherit it). Defaults to ``"Close"`` (the live behaviour — unchanged).
+        The corporate-actions CRSP migration (PR7, config#1434) passes
+        ``close_col="total_return_close"`` to recompute features on the
+        total-return basis for the OFFLINE scratch build, WITHOUT mutating
+        this default. The live flip of the default basis is gated to PR7-7c.
+        Open/High/Low stay raw (split-adjusted level) by design.
     spy_series : SPY Close prices (DatetimeIndex).
     vix_series : VIX Close prices (DatetimeIndex).
     sector_etf_series : Sector ETF Close prices (DatetimeIndex).
@@ -360,7 +370,12 @@ def compute_features(
     if not df.index.is_monotonic_increasing:
         df = df.sort_index()
 
-    close = df["Close"].astype(float)
+    if close_col not in df.columns:
+        raise KeyError(
+            f"compute_features: close_col {close_col!r} not in df columns "
+            f"{list(df.columns)}"
+        )
+    close = df[close_col].astype(float)
     volume = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(0.0, index=df.index)
 
     # ── RSI ─────────────────────────────────────────────────────────────────

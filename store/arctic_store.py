@@ -40,6 +40,27 @@ ARCTIC_PREFIX = "arcticdb"
 OHLCV_COLS: list[str] = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 PROVENANCE_COL: str = "source"
 
+# CRSP total-return basis column (corporate-actions PR7, config#1434).
+# ``Close`` stays the split-adjusted price LEVEL (polygon-authoritative);
+# ``total_return_close`` is that same series further dividend-back-adjusted
+# (the SEPARATE total-return axis built by
+# ``corporate_actions.total_return_series``). It is persisted immediately
+# AFTER ``Close`` in the canonical layout so the price-level and
+# return-basis columns sit adjacent. ADDITIVE: it is absent on every live
+# ``universe`` symbol today (the ``to_arctic_canonical`` guard makes it a
+# no-op there) and is laid down only on the OFFLINE scratch CRSP-basis
+# build (``builders/migrate_universe_crsp_basis.py``). The live basis flip
+# (features + label recomputed on this column) is gated to PR7-7c after the
+# shadow-retrain/backtest gate — NOT this PR.
+TOTAL_RETURN_COL: str = "total_return_close"
+
+# Live ArcticDB library names a scratch migration must NEVER target. The
+# offline CRSP-basis build writes a distinct scratch library
+# (e.g. ``universe_crsp``); ``get_scratch_universe_lib`` refuses these
+# names structurally so a misconfigured ``--scratch-lib`` can't clobber
+# the live universe / macro libraries the live pipeline reads.
+_LIVE_LIB_NAMES: frozenset[str] = frozenset({"universe", "macro"})
+
 _arctic_instance: adb.Arctic | None = None
 
 
@@ -68,6 +89,31 @@ def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     """Get the macro library (market-wide time series)."""
     arctic = _get_arctic(bucket)
     return arctic.get_library("macro", create_if_missing=True)
+
+
+def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
+    """Get a SCRATCH universe-shaped library for an offline migration build.
+
+    Used by ``builders/migrate_universe_crsp_basis.py`` (corporate-actions
+    PR7-7a, config#1434) to write the reconstructed CRSP-basis universe into
+    an isolated library (default ``universe_crsp``) WITHOUT ever touching the
+    live ``universe`` library the daily/weekly pipelines read.
+
+    Structurally refuses the live library names (``universe`` / ``macro``):
+    a scratch build must use a distinct name, so a misconfigured
+    ``--scratch-lib`` can never clobber live data. This is the single
+    chokepoint enforcing the "offline, live-untouched" contract — every
+    scratch write goes through here.
+    """
+    if name in _LIVE_LIB_NAMES:
+        raise ValueError(
+            f"refusing to open {name!r} as a scratch library — it is a LIVE "
+            f"ArcticDB library the live pipeline reads. A scratch migration "
+            f"must use a distinct name (e.g. 'universe_crsp'). Live names: "
+            f"{sorted(_LIVE_LIB_NAMES)}"
+        )
+    arctic = _get_arctic(bucket)
+    return arctic.get_library(name, create_if_missing=True)
 
 
 def reset_connection():
@@ -131,8 +177,12 @@ def to_arctic_canonical(
 
     Behaviour:
         - Intersect-then-reorder. Columns outside
-          ``OHLCV_COLS + [PROVENANCE_COL] + features`` are DROPPED
-          (matches the prior per-site recipe).
+          ``OHLCV_COLS + [TOTAL_RETURN_COL] + [PROVENANCE_COL] + features``
+          are DROPPED (matches the prior per-site recipe).
+        - ``TOTAL_RETURN_COL`` (``total_return_close``), when present, is
+          placed immediately AFTER ``Close`` (CRSP basis, PR7 config#1434).
+          Absent on live universe symbols → the layout is byte-identical to
+          the pre-PR7 ``OHLCV + source + features`` order there (additive).
         - Empty frames pass through unchanged (no copy).
         - Frames already in canonical order and free of categoricals
           pass through unchanged (no copy).
@@ -156,8 +206,22 @@ def to_arctic_canonical(
         from features.feature_engineer import FEATURES as _FEATURES
         features = _FEATURES
 
+    # Build the OHLCV head, splicing total_return_close in right after Close
+    # (CRSP basis, PR7 config#1434). The guard keeps this a no-op for live
+    # universe symbols (which carry no total_return_close column).
+    head: list[str] = []
+    for c in OHLCV_COLS:
+        if c in df.columns:
+            head.append(c)
+        if c == "Close" and TOTAL_RETURN_COL in df.columns:
+            head.append(TOTAL_RETURN_COL)
+    # Degenerate guard: total_return_close present but no Close (shouldn't
+    # happen in practice) — still keep it rather than silently dropping it.
+    if TOTAL_RETURN_COL in df.columns and TOTAL_RETURN_COL not in head:
+        head.append(TOTAL_RETURN_COL)
+
     canonical: list[str] = (
-        [c for c in OHLCV_COLS if c in df.columns]
+        head
         + ([PROVENANCE_COL] if PROVENANCE_COL in df.columns else [])
         + [f for f in features if f in df.columns]
     )
