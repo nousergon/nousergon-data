@@ -1,5 +1,13 @@
-"""
-split_factor.py — polygon-authoritative split factors for full-history restatement.
+"""corporate_actions._split_math — polygon-authoritative split factor math.
+
+Moved here from the top-level ``split_factor.py`` shim (corporate-actions
+program PR6, config#1433): the split-restatement math is part of the unified
+corporate-actions model, not a stray top-level module. It is RE-EXPORTED from
+``corporate_actions`` (``from corporate_actions import cumulative_factor,
+restate_series_for_splits, split_events``) so consumers depend on the package,
+not on a loose module name. No behavior changed in the move — the factor
+convention is byte-for-byte the one validated on the DD 2026-06-24 reverse
+split.
 
 WHY THIS EXISTS (data#1298):
     The ArcticDB universe library (predictor TRAINING input) is append-only +

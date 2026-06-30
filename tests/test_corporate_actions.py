@@ -19,7 +19,7 @@ from botocore.exceptions import ClientError
 
 import corporate_actions as ca
 from corporate_actions import CorporateActionRegistry
-from split_factor import restate_series_for_splits
+from corporate_actions import restate_series_for_splits
 
 
 class _FakeS3:
@@ -170,10 +170,15 @@ class TestDetectSplits:
         client.get_recent_splits.side_effect = RuntimeError("polygon down")
         assert ca.detect_splits("2026-06-01", "2026-06-30", client=client) == []
 
-    def test_renames_not_implemented(self):
-        # Dividends are now implemented (PR5); renames remain deferred.
-        with pytest.raises(NotImplementedError):
-            ca.detect_renames("2026-06-01", "2026-06-30")
+    def test_renames_now_implemented(self):
+        # Renames are implemented (PR6): detect_renames takes CANDIDATE tickers
+        # and returns a RenameDetection (no longer a NotImplementedError stub).
+        client = MagicMock()
+        client.get_ticker_events.return_value = []
+        result = ca.detect_renames(["FOO"], client=client)
+        assert isinstance(result, ca.RenameDetection)
+        assert result.renames == []
+        assert result.failed_candidates == set()
 
 
 class TestApply:

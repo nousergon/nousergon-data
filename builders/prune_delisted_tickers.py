@@ -1,5 +1,15 @@
 """builders/prune_delisted_tickers.py — orchestrated delisted-ticker cleanup.
 
+Before any deletion, RENAME-triggered migration runs (corporate-actions PR6,
+config#1433): a candidate going missing may be a 1:1 ticker RENAME, not a
+delisting. Each candidate is checked against polygon's ticker-events API; a
+``ticker_change`` where the candidate is the OLD ticker MIGRATES its ArcticDB
+history to the new symbol key (predictor continuity) and removes it from the
+prune set. Mergers of the acquired symbol have no ticker_change and prune as a
+delisting (NOT spliced). HISTORY-SAFETY: a candidate whose rename detection /
+migration FAILS is SKIPPED this pass — never pruned on a detection failure, so
+a polygon outage cannot delete a renamed symbol's history before it migrates.
+
 Removes ArcticDB universe symbols that meet BOTH conditions:
 
   (A) Absent from the latest ``market_data/weekly/{date}/constituents.json``
@@ -42,14 +52,51 @@ from datetime import datetime, timedelta, timezone
 import boto3
 import pandas as pd
 
+import corporate_actions as ca
 from builders._constituents_loader import load_constituents_for_run_date
 from features.compute import DEFAULT_BUCKET, _SKIP_TICKERS, _is_sector_etf
+from polygon_client import polygon_client
 from store.arctic_store import get_universe_lib
 
 log = logging.getLogger(__name__)
 
 DEFAULT_ABSENT_DAYS = 14
 AUDIT_PREFIX = "builders/prune_audit/"
+
+
+def _build_registry(s3, bucket: str):
+    """Construct a ``CorporateActionRegistry`` from an S3 client + bucket, or
+    ``None`` when no usable client is available (mirrors
+    ``features.compute._build_registry``). Used by the rename-migration phase to
+    record renames + enforce exactly-once ArcticDB symbol migration."""
+    if s3 is None:
+        return None
+    try:
+        return ca.CorporateActionRegistry(s3, bucket)
+    except Exception as exc:  # noqa: BLE001 - degrade, never hard-fail the prune
+        log.warning(
+            "could not build corporate-action registry (%s) — rename "
+            "migration degraded this pass", exc,
+        )
+        return None
+
+
+def _build_rename_client():
+    """Construct a polygon client for rename detection, or ``None`` on failure.
+
+    Indirected through a module-level seam (``builders.prune_delisted_tickers.
+    polygon_client``) so tests patch it without a live API call. A construction
+    failure degrades to ``None`` → the caller treats EVERY candidate as a
+    detection failure and prunes none of them this pass (history-safety)."""
+    try:
+        return polygon_client()
+    except Exception as exc:  # noqa: BLE001 - degrade, never hard-fail the prune
+        log.warning(
+            "could not construct polygon client for rename detection (%s) — "
+            "no rename detection this pass; refusing to prune on an "
+            "unverifiable candidate set (history-safety)", exc,
+        )
+        return None
 
 
 def _load_latest_constituents(
@@ -210,6 +257,87 @@ def prune_delisted_tickers(
             len(candidates),
         )
 
+    # ── PR6: rename-triggered ArcticDB migration BEFORE the prune deletion ───
+    # A prune candidate going missing from constituents/daily_closes may be a
+    # 1:1 ticker RENAME (e.g. FB -> META), NOT a delisting. Query polygon
+    # ticker-events for every candidate FIRST: a ``ticker_change`` where the
+    # candidate is the OLD ticker means it was renamed → MIGRATE its full
+    # ArcticDB history to the new key (predictor continuity) and REMOVE it from
+    # the prune set. A genuine delist / merger-OF-THE-ACQUIRED has no
+    # ticker_change and prunes as today (mergers are NOT spliced).
+    #
+    # Ordering is load-bearing: migration MUST run before the deletion loop, or
+    # the prune would delete the orphaned old-symbol history before it can be
+    # carried over.
+    #
+    # HISTORY-SAFETY: a candidate whose rename DETECTION (or migration) FAILS
+    # is SKIPPED this pass — never pruned on a failure. A polygon outage must
+    # not cause a renamed symbol's history to be wrongly deleted; the candidate
+    # is re-examined next pass once detection succeeds.
+    registry = _build_registry(s3, bucket)
+    rename_client = _build_rename_client()
+    run_id = f"prune-{today.strftime('%Y-%m-%d')}"
+    migrated: list[dict] = []
+    skipped_rename_detect_failed: list[str] = []
+    skip_prune: set[str] = set()
+
+    if candidates and (registry is None or rename_client is None):
+        # Cannot run rename detection (no registry or no polygon client) → we
+        # cannot confirm any candidate is a delist vs a rename. Refuse to prune
+        # blind this pass (history-safety).
+        log.warning(
+            "prune: rename detection unavailable (registry=%s polygon=%s) — "
+            "refusing to prune %d candidate(s) this pass (history-safety)",
+            registry is not None, rename_client is not None, len(candidates),
+        )
+        skipped_rename_detect_failed = list(candidates)
+        skip_prune = set(candidates)
+    elif candidates:
+        detection = ca.detect_renames(candidates, client=rename_client)
+        for action in detection.renames:
+            old_t, new_t = action.old_ticker, action.new_ticker
+            record = {
+                "old_ticker": old_t,
+                "new_ticker": new_t,
+                "ex_date": action.ex_date,
+                "action_id": action.action_id,
+                "migrated": False,
+            }
+            if apply:
+                try:
+                    did = ca.migrate_symbol(
+                        universe_lib, old_t, new_t,
+                        registry=registry, run_id=run_id, ex_date=action.ex_date,
+                    )
+                    record["migrated"] = bool(did)
+                    skip_prune.add(old_t)  # migrated (or already-applied) — not a delist
+                    log.warning(
+                        "RENAME-MIGRATED ticker=%s -> %s ex_date=%s applied=%s",
+                        old_t, new_t, action.ex_date, did,
+                    )
+                except Exception as exc:  # noqa: BLE001 - skip, never prune the rename
+                    log.warning(
+                        "migrate_symbol failed for %s -> %s (%s) — NOT pruning "
+                        "%s this pass (history-safety)", old_t, new_t, exc, old_t,
+                    )
+                    record["error"] = str(exc)
+                    skip_prune.add(old_t)
+                    skipped_rename_detect_failed.append(old_t)
+            else:
+                log.info(
+                    "DRY-RUN would migrate ticker=%s -> %s ex_date=%s",
+                    old_t, new_t, action.ex_date,
+                )
+                skip_prune.add(old_t)  # in dry-run, exclude from the would-prune set too
+            migrated.append(record)
+        # Candidates whose ticker-events query RAISED — skip pruning this pass.
+        for cand in sorted(detection.failed_candidates):
+            skip_prune.add(cand)
+            skipped_rename_detect_failed.append(cand)
+
+    if skip_prune:
+        candidates = [c for c in candidates if c not in skip_prune]
+
     pruned: list[dict] = []
     skipped_recent: list[dict] = []
     skipped_unreadable: list[str] = []
@@ -268,16 +396,21 @@ def prune_delisted_tickers(
         "pruned_count": len(pruned),
         "skipped_recent_count": len(skipped_recent),
         "skipped_unreadable_count": len(skipped_unreadable),
+        "migrated_count": len([m for m in migrated if m.get("migrated")]),
+        "skipped_rename_detect_failed_count": len(skipped_rename_detect_failed),
         "pruned": pruned,
         "skipped_recent": skipped_recent,
         "skipped_unreadable": skipped_unreadable,
+        "migrated": migrated,
+        "skipped_rename_detect_failed": sorted(set(skipped_rename_detect_failed)),
     }
 
     log.info(
-        "prune_delisted_tickers: applied=%s candidates=%d pruned=%d "
-        "skipped_recent=%d skipped_unreadable=%d",
-        apply, len(candidates), len(pruned),
+        "prune_delisted_tickers: applied=%s pruned=%d migrated=%d "
+        "skipped_recent=%d skipped_unreadable=%d skipped_rename_detect_failed=%d",
+        apply, len(pruned), summary["migrated_count"],
         len(skipped_recent), len(skipped_unreadable),
+        len(skipped_rename_detect_failed),
     )
 
     # Always write the audit, even on dry-run + zero-prune — gives Sat

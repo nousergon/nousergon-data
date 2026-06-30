@@ -469,6 +469,70 @@ class PolygonClient:
         results.sort(key=lambda r: r["ex_dividend_date"])
         return results
 
+    def get_ticker_events(self, ticker: str) -> list[dict]:
+        """Fetch ticker-RENAME events for one ticker (corporate-actions PR6,
+        config#1433).
+
+        Queries the polygon ticker-events API
+        (``/vX/reference/tickers/{ticker}/events``). polygon resolves the
+        ticker to its underlying entity (figi/cik) and returns that entity's
+        FULL ticker history as a list of ``ticker_change`` events, each carrying
+        the ticker the entity changed TO and the date of the change (e.g. an
+        entity that IPO'd as ``FB`` on 2012-05-18 then became ``META`` on
+        2022-06-09 returns both as ``ticker_change`` events). Consecutive
+        changes — sorted ascending by date — define old->new RENAME PAIRS; the
+        EARLIEST event is the initial listing (no prior ticker) and yields no
+        pair.
+
+        There is NO whole-market "all renames in a range" endpoint — this API
+        is per-ticker — so detection is prune-triggered (a symbol going missing
+        from constituents is what flags it), see
+        ``corporate_actions.detect_renames``.
+
+        Returns ``[{"date": "YYYY-MM-DD", "old_ticker": str,
+        "new_ticker": str}]`` sorted ascending by date (one per adjacent
+        transition; no-op pairs where old == new are dropped). A 403
+        (free-tier / bad key) returns ``[]`` (mirrors :meth:`get_splits`); the
+        apiKey is scrubbed from any raised error by the shared ``_get`` path.
+        Any OTHER failure (network / 5xx after retries / unexpected) PROPAGATES
+        — ``detect_renames`` catches it per-candidate and refuses to prune that
+        candidate this pass (history-safety: a detection outage must never
+        delete a symbol that might be a rename).
+        """
+        try:
+            data = self._get(f"/vX/reference/tickers/{ticker}/events")
+        except PolygonForbiddenError:
+            return []
+        results_obj = data.get("results") or {}
+        events = results_obj.get("events") or []
+        # Collect ascending (date, new_ticker) transitions from ticker_change
+        # events; ignore any other event type the endpoint may carry.
+        changes: list[dict] = []
+        for ev in events:
+            if ev.get("type") != "ticker_change":
+                continue
+            date = ev.get("date")
+            tc = ev.get("ticker_change") or {}
+            new_t = tc.get("ticker")
+            if not date or not new_t:
+                continue
+            changes.append({"date": str(date), "ticker": str(new_t)})
+        changes.sort(key=lambda c: c["date"])
+        # Adjacent transitions form the old->new rename pairs. The earliest
+        # change is the initial listing (no prior ticker) → no pair.
+        pairs: list[dict] = []
+        for prev, cur in zip(changes, changes[1:]):
+            if prev["ticker"] == cur["ticker"]:
+                continue  # defensive: drop a no-op repeat
+            pairs.append(
+                {
+                    "date": cur["date"],
+                    "old_ticker": prev["ticker"],
+                    "new_ticker": cur["ticker"],
+                }
+            )
+        return pairs
+
     def get_daily_bars(
         self,
         ticker: str,

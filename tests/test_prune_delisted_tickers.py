@@ -77,6 +77,13 @@ def _patch_targets(monkeypatch, *, s3_mock, universe_lib_mock):
         _mod, "boto3", MagicMock(client=lambda *a, **k: s3_mock),
     )
     monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: universe_lib_mock)
+    # PR6: prune now runs rename detection before deletion. Default the polygon
+    # seam to a fake that reports NO ticker_change for any candidate, so the
+    # two-condition prune invariants below behave exactly as pre-PR6 (a genuine
+    # delist with no rename). Tests that exercise renames patch this themselves.
+    no_rename_poly = MagicMock()
+    no_rename_poly.get_ticker_events.return_value = []
+    monkeypatch.setattr(_mod, "polygon_client", lambda *a, **k: no_rename_poly)
 
 
 # ── A. Two-condition invariant ─────────────────────────────────────────────────
@@ -572,3 +579,196 @@ def test_tickers_override_and_constituents_override_mutually_exclusive(monkeypat
             tickers_override=["AAPL"],
             constituents_override={"AAPL"},
         )
+
+
+# ── D. PR6: rename-triggered migration BEFORE the prune deletion ──────────────
+
+import io  # noqa: E402
+
+import numpy as np  # noqa: E402
+from botocore.exceptions import ClientError  # noqa: E402
+
+import corporate_actions as ca  # noqa: E402
+
+
+class _FakeS3Registry:
+    """In-memory S3 double with proper 404 semantics so a real
+    CorporateActionRegistry round-trips its write-once markers (a MagicMock s3
+    would make head_object truthy and falsely report everything 'applied')."""
+
+    def __init__(self):
+        self.store: dict[str, bytes] = {}
+
+    def _err(self, code, op):
+        return ClientError({"Error": {"Code": code, "Message": "x"}}, op)
+
+    def head_object(self, *, Bucket, Key):
+        if Key not in self.store:
+            raise self._err("404", "HeadObject")
+        return {"ContentLength": len(self.store[Key])}
+
+    def get_object(self, *, Bucket, Key):
+        if Key not in self.store:
+            raise self._err("NoSuchKey", "GetObject")
+        return {"Body": io.BytesIO(self.store[Key])}
+
+    def put_object(self, *, Bucket, Key, Body, ContentType=None):
+        self.store[Key] = Body if isinstance(Body, bytes) else bytes(Body)
+        return {"ETag": '"x"'}
+
+    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+        keys = sorted(k for k in self.store if k.startswith(Prefix))
+        return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+
+def _real_universe_lib(tmp_path, symbols: dict[str, str]):
+    """A REAL LMDB ArcticDB universe seeded with one row per symbol at the given
+    last_date (so has_symbol / read / write / delete all behave for real)."""
+    adb = pytest.importorskip("arcticdb")
+    ac = adb.Arctic(f"lmdb://{tmp_path}")
+    lib = ac.get_library("universe", create_if_missing=True)
+    for ticker, last_date in symbols.items():
+        idx = pd.DatetimeIndex([pd.Timestamp(last_date)])
+        df = pd.DataFrame(
+            {"Open": [1.0], "High": [1.0], "Low": [1.0],
+             "Close": [100.0], "Volume": [1e6]},
+            index=idx,
+        )
+        lib.write(ticker, df)
+    return lib
+
+
+def _patch_rename(monkeypatch, *, s3_mock, universe_lib, events_by_ticker, raise_for=None):
+    """Patch prune for the rename phase: boto3 + get_universe_lib + a real
+    registry (proper marker semantics) + a fake polygon ticker-events client."""
+    monkeypatch.setattr(_mod, "boto3", MagicMock(client=lambda *a, **k: s3_mock))
+    monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: universe_lib)
+    reg = ca.CorporateActionRegistry(_FakeS3Registry(), "alpha-engine-research")
+    monkeypatch.setattr(_mod, "_build_registry", lambda *a, **k: reg)
+
+    raise_for = raise_for or set()
+    poly = MagicMock()
+
+    def fake_events(ticker):
+        if ticker in raise_for:
+            raise RuntimeError(f"polygon down for {ticker}")
+        # Translate (date,new) into the get_ticker_events pair shape.
+        return events_by_ticker.get(ticker, [])
+
+    poly.get_ticker_events.side_effect = fake_events
+    monkeypatch.setattr(_mod, "polygon_client", lambda *a, **k: poly)
+    return reg
+
+
+def test_renamed_candidate_is_migrated_not_pruned(monkeypatch, tmp_path):
+    """FB renamed -> META: FB is MIGRATED (history under META, FB gone) and NOT
+    in the prune list; a true delist (DEAD) IS pruned. Migration runs BEFORE the
+    deletion (FB's history survives under META rather than being deleted)."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _real_universe_lib(tmp_path, {
+        "AAPL": "2026-04-25",   # in constituents → never a candidate
+        "FB": "2026-04-01",     # absent + stale → candidate, but RENAMED
+        "DEAD": "2026-04-01",   # absent + stale → candidate, true delist
+    })
+    _patch_rename(
+        monkeypatch, s3_mock=s3, universe_lib=lib,
+        events_by_ticker={
+            "FB": [{"date": "2026-04-10", "old_ticker": "FB", "new_ticker": "META"}],
+            "DEAD": [],
+        },
+    )
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-04-28"),
+    )
+
+    # FB migrated, not pruned.
+    assert summary["migrated_count"] == 1
+    assert summary["migrated"][0]["old_ticker"] == "FB"
+    assert summary["migrated"][0]["new_ticker"] == "META"
+    assert summary["migrated"][0]["migrated"] is True
+    pruned_tickers = {p["ticker"] for p in summary["pruned"]}
+    assert "FB" not in pruned_tickers
+    # FB's history carried to META (proves migration ran before any delete).
+    assert lib.has_symbol("META")
+    assert not lib.has_symbol("FB")
+    # True delist pruned.
+    assert "DEAD" in pruned_tickers
+    assert not lib.has_symbol("DEAD")
+    assert lib.has_symbol("AAPL")
+
+
+def test_polygon_detection_failure_does_not_prune_candidate(monkeypatch, tmp_path):
+    """History-safety: a candidate whose ticker-events query RAISES must NOT be
+    pruned this pass (it might be an undetected rename), while a confirmed delist
+    still prunes."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _real_universe_lib(tmp_path, {
+        "AAPL": "2026-04-25",
+        "FB": "2026-04-01",     # detection RAISES → must be skipped, not pruned
+        "DEAD": "2026-04-01",   # confirmed no rename → pruned
+    })
+    _patch_rename(
+        monkeypatch, s3_mock=s3, universe_lib=lib,
+        events_by_ticker={"DEAD": []},
+        raise_for={"FB"},
+    )
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-04-28"),
+    )
+
+    pruned_tickers = {p["ticker"] for p in summary["pruned"]}
+    assert "FB" not in pruned_tickers
+    assert "FB" in summary["skipped_rename_detect_failed"]
+    assert lib.has_symbol("FB")  # history preserved — NOT deleted on a failure
+    # The confirmed delist still prunes.
+    assert "DEAD" in pruned_tickers
+    assert not lib.has_symbol("DEAD")
+
+
+def test_no_polygon_client_refuses_to_prune_blind(monkeypatch, tmp_path):
+    """If the polygon client can't be constructed, rename detection is
+    impossible → refuse to prune ANY candidate this pass (history-safety)."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _real_universe_lib(tmp_path, {
+        "AAPL": "2026-04-25", "DEAD": "2026-04-01",
+    })
+    monkeypatch.setattr(_mod, "boto3", MagicMock(client=lambda *a, **k: s3))
+    monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: lib)
+    reg = ca.CorporateActionRegistry(_FakeS3Registry(), "alpha-engine-research")
+    monkeypatch.setattr(_mod, "_build_registry", lambda *a, **k: reg)
+    monkeypatch.setattr(_mod, "polygon_client", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no key")))
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert "DEAD" in summary["skipped_rename_detect_failed"]
+    assert lib.has_symbol("DEAD")
+
+
+def test_dry_run_does_not_migrate_or_prune(monkeypatch, tmp_path):
+    """apply=False: detection reports the rename but NO ArcticDB mutation."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _real_universe_lib(tmp_path, {
+        "AAPL": "2026-04-25", "FB": "2026-04-01",
+    })
+    _patch_rename(
+        monkeypatch, s3_mock=s3, universe_lib=lib,
+        events_by_ticker={
+            "FB": [{"date": "2026-04-10", "old_ticker": "FB", "new_ticker": "META"}],
+        },
+    )
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=False, today=pd.Timestamp("2026-04-28"),
+    )
+
+    # Reported as a would-migrate, but not actually migrated, and FB untouched.
+    assert summary["migrated_count"] == 0
+    assert {m["old_ticker"] for m in summary["migrated"]} == {"FB"}
+    assert lib.has_symbol("FB")
+    assert not lib.has_symbol("META")
+    assert summary["pruned_count"] == 0
