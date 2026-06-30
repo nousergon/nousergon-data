@@ -107,6 +107,11 @@ def test_schedule_event_launches_spot_and_sends_async_ssm(monkeypatch):
     # BEFORE the clone (regression guard for the first cutover failure).
     assert "dnf install -y -q git python3.12" in cmd
     assert cmd.index("dnf install") < cmd.index("git clone")
+    # SSM RunShellScript has no $HOME — git config/clone need it (cutover bug #2).
+    assert "export HOME=/root" in cmd
+    # Under `set -u` in a double-quoted context, a `$`-encoded run_url ($252F...)
+    # would expand as positional params and abort the prelude (cutover bug #3).
+    assert "$252F" not in cmd
     assert sent["Parameters"]["executionTimeout"] == [str(idx.MAX_RUNTIME_SECONDS)]
 
 
