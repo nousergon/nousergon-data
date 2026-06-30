@@ -322,7 +322,7 @@ class TestSkipCanonicalPolygonOnlySplitAware:
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_recent_split_dates", return_value=set(),
+                daily_closes, "_recent_split_events", return_value=[],
             ):
                 result = daily_closes.collect(
                     bucket="b", tickers=["AAPL", "MSFT"],
@@ -352,8 +352,12 @@ class TestSkipCanonicalPolygonOnlySplitAware:
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_recent_split_dates",
-                return_value={"2026-05-08"},  # AAPL 10:1 executed after this date
+                daily_closes, "_recent_split_events",
+                # AAPL 10:1 executes 2026-05-11, restating 2026-05-08 (date < ex)
+                return_value=[
+                    {"ticker": "AAPL", "execution_date": "2026-05-11",
+                     "split_from": 1, "split_to": 10},
+                ],
             ):
                 result = daily_closes.collect(
                     bucket="b", tickers=["AAPL", "MSFT"],
@@ -385,7 +389,7 @@ class TestSkipCanonicalPolygonOnlySplitAware:
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_recent_split_dates",
+                daily_closes, "_recent_split_events",
             ) as scan_mock:
                 daily_closes.collect(
                     bucket="b", tickers=["AAPL"],
@@ -414,7 +418,7 @@ class TestSkipCanonicalPolygonOnlySplitAware:
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_recent_split_dates", return_value=set(),
+                daily_closes, "_recent_split_events", return_value=[],
             ):
                 daily_closes.collect(
                     bucket="b", tickers=["AAPL", "MSFT"],
@@ -441,7 +445,7 @@ class TestSkipCanonicalPolygonOnlySplitAware:
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_recent_split_dates", return_value=set(),
+                daily_closes, "_recent_split_events", return_value=[],
             ):
                 result = daily_closes.collect(
                     bucket="b", tickers=["AAPL", "MSFT"],
@@ -468,7 +472,7 @@ class TestSkipCanonicalPolygonOnlySplitAware:
             ), patch.object(
                 daily_closes, "_fetch_fred_closes", return_value=0
             ), patch.object(
-                daily_closes, "_fetch_recent_split_dates",
+                daily_closes, "_recent_split_events",
             ) as scan_mock:
                 daily_closes.collect(
                     bucket="b", tickers=["AAPL"],

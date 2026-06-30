@@ -391,6 +391,72 @@ def _polygon_date_fully_canonical(
 _SPLIT_LOOKAHEAD_DAYS = 7
 
 
+def _recent_split_events(
+    window_dates: list[str],
+    *,
+    client=None,
+) -> list[dict]:
+    """Fetch ALL polygon split events executing over ``window_dates``' span
+    (plus a small forward buffer) in ONE call (config#717).
+
+    Extracted so the window scan can derive BOTH the
+    ``_fetch_recent_split_dates`` skip-set AND the ``corporate_actions``
+    detected-record set from a SINGLE polygon ``get_recent_splits`` call — no
+    second API hit (the whole point of the config#717 one-call-per-window
+    budget). Each event is ``{"ticker", "execution_date", "split_from",
+    "split_to"}``. On any failure (client construction, 403, network) DEGRADES
+    GRACEFULLY to ``[]`` (apiKey scrubbed from logs) — a corporate-action miss
+    must never hard-fail the window.
+    """
+    if not window_dates:
+        return []
+    if client is None:
+        try:
+            from polygon_client import polygon_client
+
+            client = polygon_client()
+        except Exception as exc:  # import / construction failure — degrade
+            logger.warning(
+                "config#717: could not obtain polygon client for split scan "
+                "(%s) — proceeding without corporate-action skip protection",
+                _scrub_api_key(exc),
+            )
+            return []
+    oldest = min(window_dates)
+    newest = max(window_dates)
+    lookahead = (
+        datetime.strptime(newest, "%Y-%m-%d") + timedelta(days=_SPLIT_LOOKAHEAD_DAYS)
+    ).strftime("%Y-%m-%d")
+    try:
+        return client.get_recent_splits(oldest, lookahead)
+    except Exception as exc:
+        logger.warning(
+            "config#717: polygon split scan failed (%s) — proceeding without "
+            "corporate-action skip protection (canonical-only skip still applies)",
+            _scrub_api_key(exc),
+        )
+        return []
+
+
+def _touched_dates_from_split_events(
+    window_dates: list[str],
+    splits: list[dict],
+) -> set[str]:
+    """Mark every window date strictly before any split's execution date as
+    "touched" (must be re-fetched — its adjusted close was restated)."""
+    if not splits:
+        return set()
+    touched: set[str] = set()
+    for ev in splits:
+        e = ev.get("execution_date")
+        if not e:
+            continue
+        for d in window_dates:
+            if d < e:  # ISO dates compare lexicographically == chronologically
+                touched.add(d)
+    return touched
+
+
 def _fetch_recent_split_dates(
     window_dates: list[str],
     *,
@@ -415,42 +481,13 @@ def _fetch_recent_split_dates(
     """
     if not window_dates:
         return set()
-    if client is None:
-        try:
-            from polygon_client import polygon_client
-
-            client = polygon_client()
-        except Exception as exc:  # import / construction failure — degrade
-            logger.warning(
-                "config#717: could not obtain polygon client for split scan "
-                "(%s) — proceeding without corporate-action skip protection",
-                _scrub_api_key(exc),
-            )
-            return set()
+    splits = _recent_split_events(window_dates, client=client)
+    touched = _touched_dates_from_split_events(window_dates, splits)
     oldest = min(window_dates)
     newest = max(window_dates)
     lookahead = (
         datetime.strptime(newest, "%Y-%m-%d") + timedelta(days=_SPLIT_LOOKAHEAD_DAYS)
     ).strftime("%Y-%m-%d")
-    try:
-        splits = client.get_recent_splits(oldest, lookahead)
-    except Exception as exc:
-        logger.warning(
-            "config#717: polygon split scan failed (%s) — proceeding without "
-            "corporate-action skip protection (canonical-only skip still applies)",
-            _scrub_api_key(exc),
-        )
-        return set()
-    if not splits:
-        return set()
-    touched: set[str] = set()
-    for ev in splits:
-        e = ev.get("execution_date")
-        if not e:
-            continue
-        for d in window_dates:
-            if d < e:  # ISO dates compare lexicographically == chronologically
-                touched.add(d)
     if touched:
         logger.info(
             "config#717: %d split event(s) in [%s..%s] restate %d window date(s) "
@@ -459,6 +496,141 @@ def _fetch_recent_split_dates(
             ", ".join(sorted(touched)),
         )
     return touched
+
+
+# Sentinel distinguishing "caller passed no registry, build one if applicable"
+# (a genuine standalone single-date call) from "window orchestrator explicitly
+# passed a registry (possibly None)" — so a per-date collect() driven by
+# _collect_window never builds its own registry (one per window, not one per
+# date). See collect()/_collect_window.
+_REGISTRY_UNSET = object()
+
+
+def _build_corporate_action_registry(
+    window_dates: list[str],
+    bucket: str,
+    *,
+    dry_run: bool,
+    run_id: str,
+    need_touched: bool,
+):
+    """Detect splits over ``window_dates`` in ONE polygon call and (when live)
+    build a ``CorporateActionRegistry`` with the detected splits recorded.
+
+    Returns ``(registry_or_None, split_touched_dates_or_None)``. The single
+    ``_recent_split_events`` fetch feeds BOTH the config#717 skip-set (when
+    ``need_touched``) AND the corporate-actions detected records — no second
+    polygon call. Registry construction / recording is best-effort: any failure
+    WARNs (apiKey scrubbed) and degrades to ``registry=None`` so the discrepancy
+    classifier falls back to the text ``_split_ratio_hint`` rather than
+    hard-failing the collection run.
+    """
+    if not window_dates:
+        return None, (set() if need_touched else None)
+    events = _recent_split_events(window_dates)
+    touched: set[str] | None = None
+    if need_touched:
+        touched = _touched_dates_from_split_events(window_dates, events)
+        if touched:
+            oldest, newest = min(window_dates), max(window_dates)
+            lookahead = (
+                datetime.strptime(newest, "%Y-%m-%d")
+                + timedelta(days=_SPLIT_LOOKAHEAD_DAYS)
+            ).strftime("%Y-%m-%d")
+            logger.info(
+                "config#717: %d split event(s) in [%s..%s] restate %d window "
+                "date(s) — those will be re-fetched (not skipped): %s",
+                len(events), oldest, lookahead, len(touched),
+                ", ".join(sorted(touched)),
+            )
+
+    registry = None
+    if not dry_run and bucket:
+        try:
+            import corporate_actions
+
+            registry = corporate_actions.CorporateActionRegistry(
+                boto3.client("s3"), bucket
+            )
+            actions = corporate_actions.splits_from_events(events)
+            n_new = 0
+            for action in actions:
+                try:
+                    if registry.record_detected(action, run_id=run_id):
+                        n_new += 1
+                except Exception as exc:
+                    # Per-action record failure must not lose the others or the
+                    # run — WARN (recording surface) and continue.
+                    logger.warning(
+                        "corporate_actions: record_detected failed for %s @ %s "
+                        "(%s)",
+                        action.ticker, action.ex_date, _scrub_api_key(exc),
+                    )
+            if actions:
+                logger.info(
+                    "corporate_actions: %d split action(s) detected over "
+                    "[%s..%s] (run_id=%s, %d newly recorded)",
+                    len(actions), min(window_dates), max(window_dates),
+                    run_id, n_new,
+                )
+        except Exception as exc:
+            logger.warning(
+                "corporate_actions: registry unavailable (%s) — discrepancy "
+                "classification falls back to the text split-ratio hint",
+                _scrub_api_key(exc),
+            )
+            registry = None
+    return registry, touched
+
+
+def _send_corporate_action_email(actions: list, run_date: str) -> None:
+    """Send ONE informational email summarizing confirmed corporate actions that
+    restated adjusted history this run (best-effort, NEVER raises).
+
+    These are EXPECTED restatements (a detected split), not anomalies — the
+    email exists so the operator sees "system saw HON's 1-for-2 reverse split
+    and the >5% adjusted-close jump it caused is accounted for", rather than the
+    silence of a suppressed ERROR. A send failure WARNs (recording surface per
+    the no-silent-fails rule) but must not fail the collection run.
+    """
+    if not actions:
+        return
+    n = len({a.action_id for a in actions})
+    subject = f"📋 Corporate action(s) detected & restated — {n} ticker(s)"
+    lines = [
+        "The data pipeline detected the following corporate action(s); Polygon's",
+        "adjusted history has restated the affected dates. This is EXPECTED — the",
+        "resulting >5% adjusted-close change is accounted for, no action needed.",
+        "",
+    ]
+    seen: set[str] = set()
+    for action in actions:
+        if action.action_id in seen:
+            continue
+        seen.add(action.action_id)
+        lines.append(
+            f"  • {action.ticker}: {action.human()} (ex-date {action.ex_date})"
+        )
+    lines += [
+        "",
+        "Polygon adjusted history restated; expected — no action needed.",
+    ]
+    body = "\n".join(lines)
+    try:
+        from emailer import send_email
+
+        send_email(subject, body)
+        logger.info(
+            "corporate_actions: informational email sent for %d action(s) "
+            "(run_date=%s)",
+            n, run_date,
+        )
+    except Exception as exc:
+        logger.warning(
+            "corporate_actions: informational email send failed (%s) — "
+            "restatement still logged at WARN (corporate_action_restatement)",
+            _scrub_api_key(exc),
+        )
 
 
 def collect(
@@ -475,6 +647,8 @@ def collect(
     equities_source: str = "polygon",
     index_source: str = "fred",
     fallback_source: str = "yfinance",
+    registry=_REGISTRY_UNSET,
+    _emit_ca_email: bool = True,
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -599,18 +773,36 @@ def collect(
             fallback_source=fallback_source,
         )
 
-    # Single-date split-aware skip protection: when a window caller drives
-    # per-date collect()s it passes ``split_touched_dates`` down (computed once
-    # for the whole window). A standalone single-date polygon_only +
-    # skip_if_canonical caller (rare) computes it here for just this date so the
-    # corporate-action guard is never bypassed.
-    if (
-        source == "polygon_only"
-        and skip_if_canonical
-        and split_touched_dates is None
-        and window_days == 1
-    ):
-        split_touched_dates = _fetch_recent_split_dates([run_date])
+    # Single-date split-aware skip protection + corporate-action registry: when
+    # a window caller drives per-date collect()s it passes both
+    # ``split_touched_dates`` and an explicit ``registry`` down (computed/built
+    # once for the whole window). A standalone single-date polygon_only caller
+    # (rare) builds them here for just this date — ONE polygon split fetch feeds
+    # both — so neither the config#717 skip guard nor the registry-aware
+    # discrepancy classification is bypassed.
+    if registry is _REGISTRY_UNSET:
+        registry = None
+        # Only when this standalone call would have scanned splits anyway
+        # (polygon_only + skip_if_canonical + no pre-threaded touched set): ONE
+        # _recent_split_events fetch feeds BOTH the config#717 skip-set AND the
+        # registry. When split_touched_dates was threaded in (window-driven) or
+        # skip_if_canonical is off (legacy overwrite), we neither scan nor build
+        # a registry — preserving the no-extra-call contract of those paths
+        # (registry stays None ⇒ discrepancy logging falls back to the text
+        # split-ratio hint, the pre-config#1431 behavior).
+        if (
+            source == "polygon_only"
+            and window_days == 1
+            and skip_if_canonical
+            and split_touched_dates is None
+        ):
+            registry, split_touched_dates = _build_corporate_action_registry(
+                [run_date],
+                bucket,
+                dry_run=dry_run,
+                run_id=run_date,
+                need_touched=True,
+            )
 
     s3 = boto3.client("s3")
     key = f"{s3_prefix}{run_date}.parquet"
@@ -961,8 +1153,19 @@ def collect(
     )
 
     # Discrepancy logging (polygon_only mode, when overwriting an existing parquet)
+    explained_actions: list = []
     if existing_close_for_discrepancy and polygon_count > 0:
-        _log_close_discrepancies(closes_df, existing_close_for_discrepancy, run_date)
+        explained_actions = _log_close_discrepancies(
+            closes_df, existing_close_for_discrepancy, run_date, registry=registry,
+        )
+
+    # ONE informational email per run for confirmed corporate-action
+    # restatements — but only when THIS collect() owns the email (standalone
+    # single-date call). When driven by _collect_window, the email is deferred
+    # (``_emit_ca_email=False``) and sent ONCE at the window level over all
+    # dates. Never in dry_run (registry is None there, so no explained actions).
+    if _emit_ca_email and not dry_run and explained_actions:
+        _send_corporate_action_email(explained_actions, run_date)
 
     if dry_run:
         return {
@@ -972,6 +1175,7 @@ def collect(
             "fred": fred_count,
             "yfinance": yfinance_count,
             "source": source,
+            "corporate_actions": explained_actions,
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -996,6 +1200,7 @@ def collect(
             "fred": fred_count,
             "yfinance": yfinance_count,
             "source": source,
+            "corporate_actions": explained_actions,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1073,9 +1278,31 @@ def _collect_window(
     # its execution date — those MUST be re-fetched. One range-scoped splits
     # call covers the whole window (no per-date corporate-action I/O). Only run
     # when the optimization is actually active.
+    # config#1431 (corporate-actions program): ONE polygon split scan for the
+    # whole window feeds BOTH the config#717 skip-set AND the
+    # CorporateActionRegistry (detected-records + the registry-aware discrepancy
+    # classifier). Built once here and threaded into every per-date collect() as
+    # an EXPLICIT ``registry`` so no per-date call builds its own (one fetch per
+    # window, not per date). Built for polygon_only (where discrepancy logging
+    # runs) regardless of skip_if_canonical; the touched-date skip-set is only
+    # derived when skip_if_canonical is on.
+    # Gated identically to the pre-config#1431 config#717 split scan
+    # (polygon_only + skip_if_canonical + live): that path ALREADY made one
+    # ``get_recent_splits`` call per window — we now route it through
+    # ``_recent_split_events`` so the SAME single call feeds both the skip-set
+    # and the registry (no extra polygon call). A polygon_only window without
+    # skip_if_canonical neither scans nor builds a registry (registry stays None
+    # ⇒ discrepancy logging keeps the text split-ratio hint — no regression).
     split_touched_dates: set[str] | None = None
+    registry = None
     if source == "polygon_only" and skip_if_canonical and not dry_run:
-        split_touched_dates = _fetch_recent_split_dates(window_dates)
+        registry, split_touched_dates = _build_corporate_action_registry(
+            window_dates,
+            bucket,
+            dry_run=dry_run,
+            run_id=window_dates[0],  # target date identifies the window run
+            need_touched=True,
+        )
     # The newest date in the window is the TARGET date — the one
     # downstream (predictor inference / eod_reconcile) actually reads.
     # The older dates are best-effort *historical backfill*: a per-date
@@ -1109,6 +1336,7 @@ def _collect_window(
         "yfinance": 0,
         "skipped_dates": [],
         "backfill_failed_dates": [],
+        "corporate_actions": [],
     }
     # Iterate oldest → newest so the most recent date's parquet is the
     # last one written. Matches the operator mental model "the latest
@@ -1126,6 +1354,8 @@ def _collect_window(
                 skip_if_canonical=skip_if_canonical,
                 fred_window_cache=fred_window_cache,  # L4492: 1 ranged call/series
                 split_touched_dates=split_touched_dates,  # config#717
+                registry=registry,  # config#1431: one registry per window
+                _emit_ca_email=False,  # email sent ONCE at window level below
                 equities_source=equities_source,
                 index_source=index_source,
                 fallback_source=fallback_source,
@@ -1151,6 +1381,16 @@ def _collect_window(
                 aggregate[k] += result[k]
         if result.get("skipped"):
             aggregate["skipped_dates"].append(d)
+        # config#1431: accumulate confirmed corporate-action restatements across
+        # the window for the single informational email sent below.
+        if result.get("corporate_actions"):
+            aggregate["corporate_actions"].extend(result["corporate_actions"])
+
+    # config#1431: ONE informational email per window run for confirmed
+    # corporate-action restatements (deduped by action_id in the email layer).
+    # Skipped in dry_run (registry is None → no explained actions accumulate).
+    if not dry_run and aggregate["corporate_actions"]:
+        _send_corporate_action_email(aggregate["corporate_actions"], target_date)
 
     # ── Fatality is TARGET-driven, not "any per-date error" ─────────────
     _target = aggregate["per_date"].get(target_date)
@@ -1365,7 +1605,9 @@ def _log_close_discrepancies(
     new_df: pd.DataFrame,
     prior_close: dict[str, float],
     run_date: str,
-) -> None:
+    *,
+    registry=None,
+) -> list:
     """Log per-ticker Close discrepancy when polygon overwrites yfinance.
 
     A small drift (<1%) is normal — different feeds, slight tick-time offsets,
@@ -1384,11 +1626,25 @@ def _log_close_discrepancies(
     (`fred_restatement`) and are excluded from the flow-doctor ERROR filter. The
     recording surface stays (per feedback_no_silent_fails) — just at the right
     severity. Pattern observed twice (2026-05-12, 2026-06-02).
+
+    config#1431 (corporate-actions program): when a ``registry`` is supplied, a
+    >5% equity jump that the registry can attribute to a DETECTED corporate
+    action (a confirmed split whose ``expected_factor`` matches ``new/prior``)
+    is the EXPECTED adjusted-history restatement, NOT an anomaly — it logs at
+    WARN (`corporate_action_restatement`) and is excluded from the flow-doctor
+    ERROR filter (fixing the HON 1-for-2 reverse-split false-ERROR). The
+    authoritative registry takes precedence over the secondary
+    ``_split_ratio_hint`` text heuristic (which stays, now only annotating the
+    UNEXPLAINED ERROR branch). Returns the list of explained
+    ``CorporateAction``s seen this run (for the run's one informational email);
+    deduped at the email layer.
     """
     n_compared = 0
     n_warn = 0
     n_error = 0
     n_restatement = 0
+    n_corporate_action = 0
+    explained_actions: list = []
     biggest: tuple[str, float] = ("", 0.0)
     for ticker in new_df.index:
         prior = prior_close.get(str(ticker))
@@ -1407,6 +1663,28 @@ def _log_close_discrepancies(
                 ticker, run_date, prior, float(new_close), pct_diff * 100,
             )
             n_restatement += 1
+        elif (
+            pct_diff > _DISCREPANCY_ERROR_PCT
+            and registry is not None
+            and (
+                action := registry.explains_discrepancy(
+                    str(ticker), run_date, prior, float(new_close)
+                )
+            )
+            is not None
+        ):
+            # config#1431: confirmed corporate-action restatement (the registry
+            # is AUTHORITATIVE) — expected adjusted-history restatement, WARN not
+            # ERROR, excluded from the flow-doctor ERROR filter.
+            logger.warning(
+                "corporate_action_restatement %s @ %s: Close %.4f → %.4f "
+                "(%.2f%% diff vs prior parquet) — confirmed %s (registry %s), "
+                "adjusted history restated (expected, no action needed)",
+                ticker, run_date, prior, float(new_close), pct_diff * 100,
+                action.human(), action.action_id,
+            )
+            n_corporate_action += 1
+            explained_actions.append(action)
         elif pct_diff > _DISCREPANCY_ERROR_PCT:
             logger.error(
                 "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)%s — "
@@ -1425,10 +1703,11 @@ def _log_close_discrepancies(
             biggest = (str(ticker), pct_diff)
     logger.info(
         "polygon_only discrepancy summary for %s: compared=%d warn(>1%%)=%d error(>5%%)=%d "
-        "fred_restatement(>5%%)=%d biggest=%s@%.2f%%",
-        run_date, n_compared, n_warn, n_error, n_restatement,
+        "fred_restatement(>5%%)=%d corporate_action(>5%%)=%d biggest=%s@%.2f%%",
+        run_date, n_compared, n_warn, n_error, n_restatement, n_corporate_action,
         biggest[0] or "n/a", biggest[1] * 100,
     )
+    return explained_actions
 
 
 def _fred_record(store_ticker: str, date_str: str, close: float) -> dict:

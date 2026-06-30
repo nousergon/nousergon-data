@@ -86,6 +86,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/universe_classification.py": 1,  # market_data/universe_classification/{date,latest}.json — sector/country/industry for the ~900 universe board
     "collectors/signal_returns.py": 1,
     "collectors/universe_returns.py": 1,
+    # corporate_actions/actions/{action_id}.json + applied/{store}/{action_id}.json —
+    # EVENT-DRIVEN corporate-action provenance records (config#1431), written only
+    # when a split is detected/applied. NOT a periodic freshness-SLA artifact: there
+    # is no cadence to monitor and the absence of a split is not an incident, so this
+    # is grandfathered out of ARTIFACT_REGISTRY.yaml (no freshness row) per "never
+    # register a freshness entry ahead of/without a periodic producer".
+    "corporate_actions/registry.py": 1,
     "data/cache.py": 1,
     "data/derived/analyst_revisions.py": 2,
     "data/derived/news_aggregates.py": 2,
