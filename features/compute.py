@@ -36,7 +36,9 @@ import numpy as np
 import pandas as pd
 
 import hashlib
+from dataclasses import dataclass
 
+import corporate_actions as ca
 from features.cross_sectional import apply_factor_zscores
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.registry import upload_registry
@@ -48,8 +50,28 @@ log = logging.getLogger(__name__)
 DEFAULT_BUCKET = "alpha-engine-research"
 FEATURE_STORE_PREFIX = "features/"
 
-# Large-move warning threshold (>45% daily return, e.g. stock splits, VIX spikes)
-_SPLIT_RETURN_THRESHOLD = 0.45
+# Registry-aware split-jump audit (PR3, config#1433). The screen threshold is
+# the DIAGNOSTIC band — it must be low enough to SURFACE sub-45% splits
+# (3-for-2 = -33%, 4-for-3 = -25%) so the latent bug the old >45% heuristic
+# missed becomes visible. The BLOCKING raise condition is NOT this magnitude —
+# it is registry-driven (a residual jump that a registered action EXPLAINS),
+# which is what lets a sub-45% registered split be caught WITHOUT false-failing
+# on a legitimate large move (a real ±33% earnings move has no registered
+# action, so it is only ever WARN-classified as "suspected").
+_ACTION_JUMP_SCREEN_THRESHOLD = 0.18
+# A residual un-flattened split jump is the split factor multiplied by the real
+# overnight move, so the observed boundary ratio is "factor × (1 ± small)" — a
+# loose relative tol (vs the registry's exact 0.5% same-date tol) confirms the
+# residual jump IS the split (not a coincident legit move on a flattened
+# boundary) without requiring the move to equal the factor to feed-rounding.
+_AUDIT_FACTOR_REL_TOL = 0.15
+# The un-flattened jump appears at the first trading row on/after the split's
+# ex_date; allow a few days' slack for weekend/holiday gaps between ex_date and
+# the first observed row.
+_AUDIT_EX_DATE_WINDOW_DAYS = 4
+# The logical store split restatement targets (shared by the Saturday backfill
+# and the daily feature-snapshot delta — see corporate_actions.STORE_*).
+_RESTATE_STORE = ca.STORE_ARCTICDB_UNIVERSE
 
 # Closed-set of provenance source values written to the `source` column on
 # universe rows. Stored as a pandas Categorical so the in-memory cost is
@@ -222,8 +244,70 @@ def _load_delta_from_daily_closes(
     return ticker_rows
 
 
+def _build_registry(s3, bucket: str):
+    """Construct a ``CorporateActionRegistry`` from an S3 client + bucket, or
+    ``None`` when no usable client is available.
+
+    Returning ``None`` keeps legacy positional / dry-run callers (and unit
+    tests that pass ``s3=None``) free of S3 + polygon I/O: with no registry,
+    ``_apply_daily_delta`` performs no corporate-action detection or
+    restatement (production callers — backfill, feature-snapshot — always pass
+    a registry).
+    """
+    if s3 is None:
+        return None
+    try:
+        return ca.CorporateActionRegistry(s3, bucket)
+    except Exception as exc:  # noqa: BLE001 - degrade, never hard-fail the load
+        log.warning(
+            "could not build corporate-action registry (%s) — split "
+            "restatement degraded this pass", exc,
+        )
+        return None
+
+
+def _detect_split_actions(
+    start_date, end_date, registry, *, run_id: str,
+) -> dict[str, list]:
+    """AUTHORITATIVELY detect splits executing in ``[start_date, end_date]`` via
+    polygon, persist each in the registry (write-if-absent), and group them by
+    ticker.
+
+    This REPLACES the old ">45% single-day return" magnitude heuristic that
+    *triggered* restatement: that heuristic silently MISSED sub-45% splits
+    (3-for-2 = -33%, 4-for-3 = -25%) and could false-trigger on a legitimate
+    large move. The polygon split feed is the authoritative trigger; magnitude
+    no longer gates restatement. Returns ``{}`` (degrade) on any detection
+    failure — a detection miss must never hard-fail the load; the blocking
+    audit is the backstop for a genuinely missed restatement.
+    """
+    start_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+    end_str = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+    try:
+        actions = ca.detect_splits(start_str, end_str)
+    except Exception as exc:  # noqa: BLE001 - detect_splits already degrades
+        log.warning(
+            "corporate-action split detection failed (%s) — no restatement "
+            "this pass", exc,
+        )
+        return {}
+    by_ticker: dict[str, list] = {}
+    for action in actions:
+        if registry is not None:
+            try:
+                registry.record_detected(action, run_id=run_id)
+            except Exception as exc:  # noqa: BLE001 - provenance write best-effort
+                log.warning(
+                    "record_detected failed for %s (%s) — continuing",
+                    action.action_id, exc,
+                )
+        by_ticker.setdefault(action.ticker, []).append(action)
+    return by_ticker
+
+
 def _apply_daily_delta(
     s3, bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
+    *, registry=None,
 ) -> tuple[dict[str, pd.DataFrame], set[str]]:
     """
     Append daily_closes delta rows to price DataFrames.
@@ -233,8 +317,16 @@ def _apply_daily_delta(
        the target date (not just the target date's file).
     2. Uses ``duplicated(keep='last')`` so delta rows override cache rows
        on the same date.
-    3. Detects splits (>45% single-day return) and returns those tickers
-       for yfinance re-fetch.
+    3. Restates EVERY registered split (regardless of magnitude) through
+       ``corporate_actions.apply`` — authoritative polygon detection replaces
+       the old >45% trigger, fixing the latent sub-45% miss (PR3, config#1433).
+       Restatement is exactly-once via the registry's applied markers, so the
+       feature-snapshot path's load of an already-restated ArcticDB series is a
+       no-op rather than a double-apply.
+
+    ``registry`` (keyword-only) is a ``CorporateActionRegistry``; when ``None``
+    (legacy positional callers / ``s3=None`` tests) NO corporate-action
+    detection or restatement is performed.
 
     Returns (updated_price_data, split_tickers).
     """
@@ -264,6 +356,15 @@ def _apply_daily_delta(
     if not ticker_rows:
         log.info("No daily_closes delta files found — using cache as-is")
         return price_data, set()
+
+    # Registry-driven, authoritative split detection over the delta window
+    # (PR3, config#1433). No-op when no registry (legacy / dry-run callers).
+    actions_by_ticker: dict[str, list] = {}
+    if registry is not None:
+        actions_by_ticker = _detect_split_actions(
+            slim_last_date, today, registry,
+            run_id=f"apply_daily_delta:{date_str}",
+        )
 
     split_tickers: set[str] = set()
     n_updated = 0
@@ -301,35 +402,36 @@ def _apply_daily_delta(
         # keep="last" so delta rows win on duplicate dates (matches predictor)
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
-        # Split detection → full-history RESTATEMENT (data#1298).
+        # Registry-driven full-history RESTATEMENT (data#1298, PR3 config#1433).
         #
         # The ArcticDB universe is append-only + windowed: a split restates the
         # FULL adjusted history, but ArcticDB only ever got a recent window
         # patched, leaving a split-boundary discontinuity that corrupts
-        # cross-boundary TRAINING features (verified on DD 2026-06-24). The
-        # root-cause fix is to back-adjust the ENTIRE pre-split window by the
-        # polygon-AUTHORITATIVE split factor here, at the point the full series
-        # is materialized for the downstream ``lib.write`` — so the series
-        # written to ArcticDB is continuous and on one adjusted scale
-        # (train == serve). We restate at WRITE time (not read time) because the
-        # backfill path already rewrites the full symbol; doing the restate in
-        # the read/window path would have to re-derive factors on every query
-        # and would not durably fix the stored discontinuity.
+        # cross-boundary TRAINING features. We back-adjust the ENTIRE pre-split
+        # window by the polygon-authoritative split factor here, where the full
+        # series is materialized for the downstream ``lib.write`` (train ==
+        # serve, continuous on one adjusted scale).
         #
-        # yfinance ``auto_adjust`` LAGS a fresh split, so it cannot be trusted
-        # for restatement — the factor must come from polygon (see split_factor).
-        returns = combined["Close"].pct_change().dropna()
-        if (returns.abs() > _SPLIT_RETURN_THRESHOLD).any():
-            restated = _restate_split_window(ticker, combined)
-            if restated is not None:
-                combined = restated
+        # Restatement is now triggered by an AUTHORITATIVE registered split (not
+        # the old >45% magnitude heuristic, which silently missed sub-45%
+        # splits), and routed through ``corporate_actions.apply`` with
+        # registry-backed exactly-once idempotency: an action already marked
+        # applied to this store is skipped, so re-applying to an already-
+        # restated series (the daily snapshot loads the restated ArcticDB) is a
+        # no-op rather than a double-apply.
+        ticker_actions = actions_by_ticker.get(ticker)
+        if ticker_actions:
+            combined, applied = ca.apply(
+                combined, ticker_actions,
+                store=_RESTATE_STORE,
+                registry=registry,
+                run_id=f"apply_daily_delta:{date_str}",
+            )
+            if any(
+                r["status"] == "applied" and r["n_rows_adjusted"] > 0
+                for r in applied
+            ):
                 split_tickers.add(ticker)
-            else:
-                log.warning(
-                    "Large move in %s (>45%% daily return) but no polygon split "
-                    "factor available — using data as-is (audit guard should flag)",
-                    ticker,
-                )
 
         price_data[ticker] = combined
         n_updated += 1
@@ -338,70 +440,106 @@ def _apply_daily_delta(
     return price_data, split_tickers
 
 
-def _restate_split_window(
-    ticker: str, df: pd.DataFrame, *, client=None,
-) -> pd.DataFrame | None:
-    """Back-adjust ``df``'s pre-split history by the polygon-authoritative
-    cumulative split factor so the full series is split-consistent (data#1298).
+@dataclass(frozen=True)
+class ActionJumpAudit:
+    """Result of :func:`audit_action_jumps` — residual jumps partitioned by
+    whether a registered corporate action EXPLAINS them.
 
-    Returns the restated frame, or ``None`` when no polygon split factor is
-    available (no events / polygon unreachable / events all predate the series)
-    so the caller can fall back to "use as-is" + the audit guard. The actual
-    factor math lives in :mod:`split_factor`; this wrapper isolates the
-    (network) polygon lookup so it can be patched out in tests.
+    ``missed`` (``{ticker: [(date, daily_return, action_id), ...]}``) is the
+    BLOCKING class: a registered split that was left un-flattened (data#1298
+    corruption). ``suspected`` (``{ticker: [(date, daily_return), ...]}``) is a
+    large move with NO registered action — a legit move or polygon-missed
+    action — WARN only, never blocking.
     """
-    try:
-        from split_factor import restate_series_for_splits, split_events
 
-        events = split_events(ticker, client=client)
-    except Exception as exc:  # network / auth / import — never hard-fail the run
-        log.warning(
-            "Split restatement for %s could not load polygon factors (%s) — "
-            "leaving series un-restated; audit guard should flag it",
-            ticker, exc,
-        )
-        return None
-    if not events:
-        return None
-    restated = restate_series_for_splits(df, events)
-    if restated is df:
-        # No row actually changed (every split predates the series) — treat as
-        # "no restatement available" so the >45%% move is still surfaced.
-        return None
-    log.info(
-        "Restated %s full history on polygon split factor (%d event(s)) — "
-        "ArcticDB write will be split-consistent (data#1298)",
-        ticker, len(events),
-    )
-    return restated
+    missed: dict[str, list[tuple[str, float, str]]]
+    suspected: dict[str, list[tuple[str, float]]]
 
 
-def audit_split_jumps(
+def _explaining_split(actions: list, jump_date: pd.Timestamp, ret: float):
+    """Return the registered split action that EXPLAINS an un-flattened jump at
+    ``jump_date`` (daily return ``ret``), or ``None``.
+
+    A match requires BOTH (i) the action's ex_date sits at the jump (the
+    un-flattened boundary appears at the first row on/after the ex_date) and
+    (ii) the observed boundary ratio ``close[d]/close[d-1] = 1+ret`` matches the
+    split factor within ``_AUDIT_FACTOR_REL_TOL`` — so it is the SPLIT, not a
+    coincident legitimate move on an already-flattened boundary.
+    """
+    observed = 1.0 + float(ret)  # close[d] / close[d-1]
+    for action in actions:
+        try:
+            ex = pd.Timestamp(action.ex_date).normalize()
+        except Exception:  # noqa: BLE001 - malformed ex_date, skip candidate
+            continue
+        if abs((ex - jump_date).days) > _AUDIT_EX_DATE_WINDOW_DAYS:
+            continue
+        try:
+            expected = ca.expected_factor(action)  # == split_from / split_to
+        except Exception:  # noqa: BLE001 - non-split / missing ratio, skip
+            continue
+        if expected <= 0:
+            continue
+        if abs(observed - expected) <= _AUDIT_FACTOR_REL_TOL * expected:
+            return action
+    return None
+
+
+def audit_action_jumps(
     price_data: dict[str, pd.DataFrame],
+    registry,
     *,
-    threshold: float = _SPLIT_RETURN_THRESHOLD,
-) -> dict[str, list[tuple[str, float]]]:
-    """Data-quality invariant: scan each series for an un-restated split jump.
+    screen_threshold: float = _ACTION_JUMP_SCREEN_THRESHOLD,
+) -> ActionJumpAudit:
+    """Registry-aware data-quality post-condition over the materialized series.
 
-    Returns ``{ticker: [(date_str, daily_return), ...]}`` for every ticker whose
-    Close series still contains a ``|daily return| > threshold`` move. A clean,
-    fully-restated universe returns ``{}``. Surfacing this makes the data#1298
-    bug class impossible to land SILENTLY — a residual discontinuity (the
-    restate failed, or a new split slipped past) is now a visible invariant
-    violation an operator/cron can alert on and auto-restate.
+    For every residual ``|daily move| > screen_threshold``, classify it:
+
+      * **MISSED** — a registered split's ex_date sits at the jump AND the move
+        matches its factor → the restatement of a KNOWN action was missed (the
+        data#1298 corruption class). BLOCKING at the training-write chokepoint.
+      * **SUSPECTED** — a large move with NO registered action explaining it (a
+        legit ±33% earnings move, or a polygon-missed action). WARN only.
+
+    The RAISE condition (``missed``) is registry-driven, NOT raw magnitude —
+    which is exactly what lets a sub-45% registered split be caught without
+    false-failing on a legitimate large move. ``screen_threshold`` is the
+    diagnostic floor (low enough to surface sub-45% splits). ``registry`` may
+    be ``None`` — then no action can explain anything and every residual is
+    ``suspected``.
     """
-    offenders: dict[str, list[tuple[str, float]]] = {}
+    splits_by_ticker: dict[str, list] = {}
+    if registry is not None:
+        try:
+            for action in registry.list_actions(types=["split"]):
+                splits_by_ticker.setdefault(action.ticker, []).append(action)
+        except Exception as exc:  # noqa: BLE001 - degrade to all-suspected
+            log.warning(
+                "audit_action_jumps: registry list_actions failed (%s) — "
+                "treating all residuals as suspected", exc,
+            )
+
+    missed: dict[str, list[tuple[str, float, str]]] = {}
+    suspected: dict[str, list[tuple[str, float]]] = {}
     for ticker, df in price_data.items():
         if df is None or df.empty or "Close" not in df.columns:
             continue
         returns = df["Close"].pct_change().dropna()
-        hits = returns[returns.abs() > threshold]
-        if not hits.empty:
-            offenders[ticker] = [
-                (pd.Timestamp(idx).strftime("%Y-%m-%d"), float(val))
-                for idx, val in hits.items()
-            ]
-    return offenders
+        hits = returns[returns.abs() > screen_threshold]
+        if hits.empty:
+            continue
+        ticker_actions = splits_by_ticker.get(ticker, [])
+        for idx, val in hits.items():
+            jump_date = pd.Timestamp(idx).normalize()
+            date_str = jump_date.strftime("%Y-%m-%d")
+            action = _explaining_split(ticker_actions, jump_date, float(val))
+            if action is not None:
+                missed.setdefault(ticker, []).append(
+                    (date_str, float(val), action.action_id)
+                )
+            else:
+                suspected.setdefault(ticker, []).append((date_str, float(val)))
+    return ActionJumpAudit(missed=missed, suspected=suspected)
 
 
 _MACRO_SLIM_KEYS = {
@@ -494,7 +632,33 @@ def _load_prices_and_macro(
         return {}, {}
 
     price_data = dict(source)
-    price_data, _split_tickers = _apply_daily_delta(s3, bucket, date_str, price_data)
+    registry = _build_registry(s3, bucket)
+    price_data, _split_tickers = _apply_daily_delta(
+        s3, bucket, date_str, price_data, registry=registry,
+    )
+
+    # Inference-side post-condition: LOUD-BUT-LOGGED, never raises here. The
+    # snapshot must not silently halt inference on a residual, and the BLOCKING
+    # gate is the backfill training-write chokepoint (a residual here is a
+    # known-issue signal, not a corruption of the written snapshot per se).
+    if registry is not None:
+        audit = audit_action_jumps(price_data, registry)
+        if audit.missed:
+            log.error(
+                "feature-snapshot load: %d ticker(s) carry an un-flattened "
+                "KNOWN registered split (data#1298) — %s",
+                len(audit.missed),
+                {t: audit.missed[t] for t in sorted(audit.missed)[:20]},
+            )
+        if audit.suspected:
+            log.warning(
+                "feature-snapshot load: %d ticker(s) carry a suspected large "
+                "move with no registered action (legit move / polygon-missed) "
+                "— %s",
+                len(audit.suspected),
+                {t: audit.suspected[t] for t in sorted(audit.suspected)[:20]},
+            )
+
     macro = _extract_macro(price_data, source)
 
     return price_data, macro

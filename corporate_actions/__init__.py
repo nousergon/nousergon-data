@@ -56,7 +56,9 @@ log = logging.getLogger(__name__)
 __all__ = [
     "CorporateAction",
     "CorporateActionRegistry",
+    "CorporateActionAuditError",
     "expected_factor",
+    "apply",
     "detect_splits",
     "detect_dividends",
     "detect_renames",
@@ -68,6 +70,32 @@ __all__ = [
 _TYPE_SPLIT = "split"
 _TYPE_DIVIDEND = "dividend"
 _TYPE_RENAME = "rename"
+
+# The logical store a restatement targets. Both the Saturday full backfill
+# (rebuilds from the S3 price cache) and the daily feature-snapshot delta
+# (reads the already-restated ArcticDB) write into / read from the SAME
+# logical store, so the applied-marker namespace is shared — that is exactly
+# what makes ``apply`` exactly-once across the two paths (the daily snapshot
+# load of an already-restated series sees the backfill's applied marker and
+# skips, the double-apply guard of PR3 §4).
+STORE_ARCTICDB_UNIVERSE = "arcticdb_universe"
+
+
+class CorporateActionAuditError(RuntimeError):
+    """A KNOWN, registered corporate action was left un-flattened in a series
+    about to be written to a training store.
+
+    This is the BLOCKING half of the registry-aware post-condition audit
+    (``audit_action_jumps`` → backfill chokepoint, PR3 §3): a residual
+    split-magnitude jump that a registered action *explains* (the action's
+    ex_date sits at the jump and the move matches its factor) means the
+    restatement of a known action was MISSED — the data#1298 corruption class.
+    It is raised so the ArcticDB ``lib.write`` cannot land the discontinuity
+    silently. It is DISTINCT from a *suspected* residual — a large move with NO
+    registered action explaining it (a legitimate earnings move, or a
+    polygon-missed action) — which is a WARN, never a raise, so a real ±33%
+    move does not halt the pipeline.
+    """
 
 
 @dataclass(frozen=True)
@@ -235,6 +263,125 @@ def expected_factor(action: CorporateAction) -> float:
         f"expected_factor not implemented for action type {action.type!r} "
         "(only splits implemented this PR)"
     )
+
+
+def apply(
+    df: pd.DataFrame,
+    actions: list["CorporateAction"],
+    *,
+    store: str,
+    registry: "CorporateActionRegistry | None" = None,
+    run_id: str | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Restate a SINGLE ticker's price frame so its full history is corporate-
+    action-consistent, routing all split restatement through ``split_factor``.
+
+    ``df`` is one ticker's OHLCV(+) frame (DatetimeIndex). ``actions`` are the
+    ``CorporateAction``s that pertain to THAT frame's ticker (the caller filters
+    by ticker — this PR only restates SPLIT actions; a dividend/rename action
+    passed in raises ``NotImplementedError`` because their factor math ships in a
+    later PR). The full-history multiplicative restatement itself is delegated to
+    :func:`split_factor.restate_series_for_splits` (price ×factor, volume ÷factor
+    for every row strictly before each split's ex_date) — this function never
+    re-derives the factor convention.
+
+    Idempotency — registry-backed, DECOUPLED from source purity
+    -----------------------------------------------------------
+    ``restate_series_for_splits`` is NOT idempotent on its own (it always applies
+    the FULL cumulative factor), so re-applying it to an already-restated series
+    double-adjusts. Two layers guard against that:
+
+      * When a ``registry`` is supplied, an action already marked applied to
+        ``store`` (``registry.is_applied``) is SKIPPED (``status="noop"``) — this
+        is the exactly-once marker that makes the daily feature-snapshot path
+        (which reads the already-restated ArcticDB universe) a no-op rather than
+        a double-apply (PR3 §4), and that survives re-runs durably via S3.
+        After a real restatement the action is ``registry.mark_applied``-ed.
+      * When ``registry is None`` (direct unit tests / dry-run), there is no
+        durable marker — idempotency is then purely STRUCTURAL: the caller is
+        expected to restate from the raw/un-restated source each time, and
+        ``restate_series_for_splits`` yields the same result for the same raw
+        input (re-running it on its OWN output would double-adjust, which is why
+        the registry markers exist for the production reruns).
+
+    The BLOCKING ``audit_action_jumps`` post-condition (PR3 §3) is the
+    correctness backstop on top of both: any residual / double-applied
+    discontinuity at a registered action's ex_date is surfaced (and, at the
+    training-write chokepoint, RAISED) rather than landing silently.
+
+    Returns ``(restated_df, applied_results)`` where each ``applied_result`` is
+    ``{"action_id", "store", "n_rows_adjusted", "factor", "status"}`` and
+    ``status`` is ``"applied"`` (restated this call) or ``"noop"`` (already
+    applied per the registry — not re-adjusted).
+    """
+    applied_results: list[dict] = []
+    if df is None or getattr(df, "empty", True) or not actions:
+        return df, applied_results
+
+    # Only splits are restated this PR. A dividend/rename action reaching here
+    # is a caller error (detect_dividends/detect_renames are NotImplemented), so
+    # fail loud rather than silently dropping it.
+    split_actions: list[CorporateAction] = []
+    for a in actions:
+        if a.type == _TYPE_SPLIT:
+            split_actions.append(a)
+        elif a.type in (_TYPE_DIVIDEND, _TYPE_RENAME):
+            raise NotImplementedError(
+                f"corporate_actions.apply: {a.type!r} actions are deferred to a "
+                "later PR of the program (splits only this PR)"
+            )
+        else:
+            raise ValueError(
+                f"corporate_actions.apply: unknown action type {a.type!r}"
+            )
+
+    if not split_actions:
+        return df, applied_results
+
+    idx = df.index if isinstance(df.index, pd.DatetimeIndex) else pd.to_datetime(df.index)
+
+    events_to_apply: list[CorporateAction] = []
+    for a in split_actions:
+        factor = expected_factor(a)  # == split_from / split_to (authoritative)
+        # Exactly-once: skip an action already folded into this store.
+        if registry is not None and registry.is_applied(store, a.action_id):
+            applied_results.append({
+                "action_id": a.action_id,
+                "store": store,
+                "n_rows_adjusted": 0,
+                "factor": factor,
+                "status": "noop",
+            })
+            continue
+        events_to_apply.append(a)
+
+    if not events_to_apply:
+        return df, applied_results
+
+    events = [
+        {
+            "execution_date": a.ex_date,
+            "split_from": a.split_from,
+            "split_to": a.split_to,
+        }
+        for a in events_to_apply
+    ]
+    restated = split_factor.restate_series_for_splits(df, events)
+
+    for a in events_to_apply:
+        ex = pd.Timestamp(a.ex_date).normalize()
+        n_rows_adjusted = int((idx < ex).sum())
+        applied_results.append({
+            "action_id": a.action_id,
+            "store": store,
+            "n_rows_adjusted": n_rows_adjusted,
+            "factor": expected_factor(a),
+            "status": "applied",
+        })
+        if registry is not None:
+            registry.mark_applied(a, store, run_id=run_id)
+
+    return restated, applied_results
 
 
 def splits_from_events(events: list[dict]) -> list["CorporateAction"]:

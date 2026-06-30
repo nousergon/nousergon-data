@@ -124,11 +124,15 @@ class CorporateActionRegistry:
                 k = obj.get("Key")
                 if k and k.endswith(".json"):
                     keys.append(k)
-            if resp.get("IsTruncated"):
-                token = resp.get("NextContinuationToken")
-                if not token:
-                    break
-            else:
+            if not resp.get("IsTruncated"):
+                break
+            # Continue ONLY on a real (non-empty string) continuation token. S3
+            # always supplies one when IsTruncated is True; refusing anything
+            # else (None / empty / a non-str) is a hard guard against an
+            # unbounded pagination loop on a malformed or degenerate paginator
+            # response — terminate rather than spin.
+            token = resp.get("NextContinuationToken")
+            if not isinstance(token, str) or not token:
                 break
         return keys
 
