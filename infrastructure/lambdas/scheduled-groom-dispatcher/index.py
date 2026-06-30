@@ -109,6 +109,11 @@ def _bootstrap_command(run_mode: str, run_url: str) -> str:
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 fail() {{ echo "[groom-prelude] FATAL: $1"; shutdown -h now; exit 1; }}
+# Stock AL2023 ships neither git nor python3.12. Install BEFORE the clone (git is
+# needed now; python3.12 gives the groom the same interpreter as the GHA runner —
+# mirrors spot_data_weekly.sh's bootstrap, which installs the same set).
+dnf install -y -q git python3.12 python3.12-pip >/dev/null 2>&1 \
+  || fail "runtime install (git/python3.12) failed"
 PAT=$(aws ssm get-parameter --name {GROOM_GH_PAT_SSM} --with-decryption \
   --query Parameter.Value --output text --region {REGION} 2>/dev/null) || fail "PAT read failed"
 [ -n "$PAT" ] || fail "PAT empty"

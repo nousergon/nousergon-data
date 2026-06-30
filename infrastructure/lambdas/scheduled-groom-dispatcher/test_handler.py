@@ -103,6 +103,10 @@ def test_schedule_event_launches_spot_and_sends_async_ssm(monkeypatch):
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
     assert "groom_spot_bootstrap.sh --mode full" in cmd
+    # AL2023 ships neither git nor python3.12 — the prelude must install them
+    # BEFORE the clone (regression guard for the first cutover failure).
+    assert "dnf install -y -q git python3.12" in cmd
+    assert cmd.index("dnf install") < cmd.index("git clone")
     assert sent["Parameters"]["executionTimeout"] == [str(idx.MAX_RUNTIME_SECONDS)]
 
 
