@@ -77,13 +77,28 @@ class TestGateShape:
 class TestEntryEdgesRouteThroughGates:
     """Every edge that used to enter a task now enters its skip-gate."""
 
-    def test_trading_day_success_enters_morning_enrich_gate(self, states):
-        nexts = [c["Next"] for c in states["CheckTradingDayResult"]["Choices"]]
-        assert "CheckSkipMorningEnrich" in nexts
-        assert "MorningEnrich" not in nexts
+    def test_trading_day_gate_runs_before_box_then_enters_morning_gate(self, states):
+        # config#1430: the NYSE holiday check moved OFF the box into the predictor
+        # Lambda and now gates BEFORE StartExecutorEC2.
+        assert states["DeployDriftGate"]["Default"] == "TradingDayGate"
+        assert states["TradingDayGateChoice"]["Default"] == "StartExecutorEC2"
+        false_branch = [
+            c["Next"]
+            for c in states["TradingDayGateChoice"]["Choices"]
+            if c.get("BooleanEquals") is False
+        ]
+        assert false_branch == ["NotifyHolidaySkip"]
+        # Once the box is up, the SSM-ready success branch enters the first morning
+        # work gate (CheckSkipMorningEnrich) — it no longer runs an on-box check.
+        online = [
+            c["Next"]
+            for c in states["SSMReadyChoice"]["Choices"]
+            if "And" in c
+        ]
+        assert online == ["CheckSkipMorningEnrich"]
 
-    def test_trading_day_check_failed_enters_morning_enrich_gate(self, states):
-        assert states["TradingDayCheckFailed"]["Next"] == "CheckSkipMorningEnrich"
+    def test_trading_day_gate_failed_proceeds_as_trading_day(self, states):
+        assert states["TradingDayGateFailed"]["Next"] == "StartExecutorEC2"
 
     def test_morning_enrich_success_enters_append_gate(self, states):
         # L4608: the slow daily_append is now its own load-bearing state behind
