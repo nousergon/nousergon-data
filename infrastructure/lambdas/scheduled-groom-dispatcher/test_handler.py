@@ -1,117 +1,155 @@
-"""Unit tests for the EventBridge-Scheduler → scheduled groom dispatcher.
+"""Unit tests for the EventBridge-Scheduler → groom-spot dispatcher (config#1432).
 
-No AWS / GitHub calls — SSM and urllib are monkeypatched. Validates: a schedule
-event posts the correct repository_dispatch to alpha-engine-config carrying the
-run_mode; run_mode normalisation/fallback; the kill-switch short-circuits; and
-(UNLIKE the convenience success-dispatcher) a dispatch failure RAISES so
-EventBridge retries + the error metric surface a dropped pass.
+Hermetic: `nousergon_lib.ec2_spot` and `boto3` are stubbed in sys.modules BEFORE
+importing index, so the tests run without either installed (matching how
+deploy.sh runs them with bare python3). Validates: a schedule event launches a
+spot box and fires an async SSM command carrying the run_mode; the on-demand
+fallback on spot capacity exhaustion; run_mode normalisation; the kill-switch
+short-circuit; and fail-loud (a launch failure RAISES so EventBridge retries +
+the error metric surface the miss).
 """
 
 from __future__ import annotations
 
 import importlib
-import json
 import os
 import sys
+import types
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-def _load(monkeypatch, **env):
-    for k, v in env.items():
+# ── Stub nousergon_lib.ec2_spot + boto3 before importing index ─────────────────
+class _SpotLaunchError(Exception):
+    pass
+
+
+class _SpotCapacityExhausted(_SpotLaunchError):
+    pass
+
+
+def _install_stubs(launch_impl, boto_clients):
+    ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
+    ec2_spot_mod.SpotLaunchError = _SpotLaunchError
+    ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
+    ec2_spot_mod.launch = launch_impl
+    pkg = types.ModuleType("nousergon_lib")
+    pkg.ec2_spot = ec2_spot_mod
+    sys.modules["nousergon_lib"] = pkg
+    sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
+
+    boto3_mod = types.ModuleType("boto3")
+    boto3_mod.client = lambda name, **kw: boto_clients[name]
+    sys.modules["boto3"] = boto3_mod
+
+
+class _FakeWaiter:
+    def wait(self, **kw):
+        return None
+
+
+class _FakeEc2:
+    def get_waiter(self, name):
+        return _FakeWaiter()
+
+
+class _FakeSsm:
+    def __init__(self):
+        self.sent = []
+
+    def describe_instance_information(self, **kw):
+        return {"InstanceInformationList": [{"PingStatus": "Online"}]}
+
+    def send_command(self, **kw):
+        self.sent.append(kw)
+        return {"Command": {"CommandId": "cmd-123"}}
+
+
+def _load(monkeypatch, *, launch_impl=None, env=None):
+    for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
+    ssm = _FakeSsm()
+    clients = {"ec2": _FakeEc2(), "ssm": ssm}
+    if launch_impl is None:
+        launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
+    _install_stubs(launch_impl, clients)
     import index
 
     importlib.reload(index)
+    index._test_ssm = ssm  # expose for assertions
     return index
 
 
-def _stub_resp(status=204):
-    class _Resp:
-        def __init__(self):
-            self.status = status
+def test_schedule_event_launches_spot_and_sends_async_ssm(monkeypatch):
+    calls = {}
 
-        def __enter__(self):
-            return self
+    def _launch(types_, subnets, **kw):
+        calls["spot"] = kw.get("spot")
+        calls["profile"] = kw.get("iam_instance_profile")
+        return "i-abc"
 
-        def __exit__(self, *a):
-            return False
-
-    return _Resp()
-
-
-def test_schedule_event_dispatches_correct_repository_dispatch(monkeypatch):
-    idx = _load(monkeypatch, GROOM_DISPATCH_ENABLED="true")
-    monkeypatch.setattr(idx, "_get_github_pat", lambda: "tok")
-    captured = {}
-
-    def _fake_urlopen(req, timeout=0):
-        captured["url"] = req.full_url
-        captured["body"] = json.loads(req.data.decode())
-        captured["auth"] = req.headers.get("Authorization")
-        return _stub_resp(204)
-
-    monkeypatch.setattr(idx.urllib.request, "urlopen", _fake_urlopen)
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    assert out["groom"]["dispatched"] is True
-    assert out["groom"]["status_code"] == 204
-    assert out["groom"]["run_mode"] == "full"
-    assert captured["url"].endswith("/repos/nousergon/alpha-engine-config/dispatches")
-    assert captured["body"]["event_type"] == "scheduled-groom"
-    assert captured["body"]["client_payload"]["run_mode"] == "full"
-    assert captured["body"]["client_payload"]["phase"] == "full"
-    assert captured["body"]["client_payload"]["schedule"] == "0 23 * * *"
-    assert captured["auth"] == "Bearer tok"
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["instance_id"] == "i-abc"
+    assert g["market"] == "spot"
+    assert g["command_id"] == "cmd-123"
+    assert g["run_mode"] == "full"
+    assert calls["spot"] is True
+    # The async SSM command carries the bootstrap that runs the FULL groom.
+    sent = idx._test_ssm.sent[0]
+    cmd = sent["Parameters"]["commands"][0]
+    assert "groom_spot_bootstrap.sh --mode full" in cmd
+    assert sent["Parameters"]["executionTimeout"] == [str(idx.MAX_RUNTIME_SECONDS)]
+
+
+def test_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        if kw.get("spot"):
+            raise _SpotCapacityExhausted("no capacity in any pool")
+        return "i-ondemand"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "x"}, None)
+    assert out["groom"]["market"] == "on-demand"
+    assert out["groom"]["instance_id"] == "i-ondemand"
+    assert seen == [True, False]  # tried spot, then on-demand
 
 
 def test_unknown_run_mode_falls_back_to_full(monkeypatch):
-    idx = _load(monkeypatch, GROOM_DISPATCH_ENABLED="true")
-    monkeypatch.setattr(idx, "_get_github_pat", lambda: "tok")
-    captured = {}
-
-    def _fake_urlopen(req, timeout=0):
-        captured["body"] = json.loads(req.data.decode())
-        return _stub_resp(204)
-
-    monkeypatch.setattr(idx.urllib.request, "urlopen", _fake_urlopen)
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "bogus"}, None)
     assert out["groom"]["run_mode"] == "full"
-    assert captured["body"]["client_payload"]["run_mode"] == "full"
+    assert "--mode full" in idx._test_ssm.sent[0]["Parameters"]["commands"][0]
 
 
 def test_sweep_run_mode_is_forwarded(monkeypatch):
-    idx = _load(monkeypatch, GROOM_DISPATCH_ENABLED="true")
-    monkeypatch.setattr(idx, "_get_github_pat", lambda: "tok")
-    captured = {}
-
-    def _fake_urlopen(req, timeout=0):
-        captured["body"] = json.loads(req.data.decode())
-        return _stub_resp(204)
-
-    monkeypatch.setattr(idx.urllib.request, "urlopen", _fake_urlopen)
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "sweep"}, None)
     assert out["groom"]["run_mode"] == "sweep"
-    assert captured["body"]["client_payload"]["run_mode"] == "sweep"
+    assert "--mode sweep" in idx._test_ssm.sent[0]["Parameters"]["commands"][0]
 
 
 def test_disabled_flag_short_circuits(monkeypatch):
-    idx = _load(monkeypatch, GROOM_DISPATCH_ENABLED="false")
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "false"})
     out = idx.handler({"run_mode": "full"}, None)
-    assert out["groom"]["dispatched"] is False
+    assert out["groom"]["launched"] is False
     assert out["groom"]["reason"] == "disabled"
+    assert idx._test_ssm.sent == []  # nothing launched
 
 
-def test_dispatch_failure_raises(monkeypatch):
-    # Fail-loud: a scheduled groom is the deliverable, so a GitHub failure must
+def test_launch_failure_raises(monkeypatch):
+    # Fail-loud: a scheduled groom is the deliverable, so a launch failure must
     # RAISE (EventBridge retries + the Lambda error metric record the miss).
-    idx = _load(monkeypatch, GROOM_DISPATCH_ENABLED="true")
-    monkeypatch.setattr(idx, "_get_github_pat", lambda: "tok")
+    def _boom(types_, subnets, **kw):
+        raise _SpotLaunchError("RunInstances denied")
 
-    def _boom(req, timeout=0):
-        raise RuntimeError("github down")
-
-    monkeypatch.setattr(idx.urllib.request, "urlopen", _boom)
-    with pytest.raises(RuntimeError, match="github down"):
+    idx = _load(monkeypatch, launch_impl=_boom, env={"GROOM_DISPATCH_ENABLED": "true"})
+    with pytest.raises(_SpotLaunchError, match="RunInstances denied"):
         idx.handler({"run_mode": "full"}, None)
