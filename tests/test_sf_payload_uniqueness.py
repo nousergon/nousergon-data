@@ -119,6 +119,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
 # Weekday SF — alpha-engine-predictor Lambdas
 _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "DeployDriftCheck": frozenset({"action"}),
+    # config#1430: NYSE trading-day gate, moved OFF the box into the
+    # predictor-inference Lambda and run BEFORE StartExecutorEC2 (replaces the
+    # cold-box SSM trading_calendar check whose stdout was unreliably captured).
+    "TradingDayGate": frozenset({"action"}),
     "PredictorInference": frozenset({"action"}),
     "CheckPredictorCoverage": frozenset({"action"}),
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),

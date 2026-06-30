@@ -116,124 +116,52 @@
           "Next": "HandleFailure"
         }
       ],
-      "Default": "StartExecutorEC2"
+      "Default": "TradingDayGate"
     },
 
-    "CheckTradingDay": {
+    "TradingDayGate": {
       "Type": "Task",
-      "Comment": "Skip pipeline on NYSE holidays. Runs on ae-trading via the alpha-engine-lib trading_calendar module (no repo clone needed — lib is installed in alpha-engine venv).",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Comment": "NYSE trading-day gate, run BEFORE StartExecutorEC2. Invokes the predictor Lambda (action=check_trading_day) — pure calendar math, no box dependency. Replaces the prior on-box SSM trading_calendar check whose stdout was unreliably captured on a just-cold-booted instance (2026-06-30 false trading-day-check failure alert; config#1430). On holiday the box is never booted.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "export FLOW_DOCTOR_ENABLED=1",
-            "export ALPHA_ENGINE_DEPLOYED=1",
-            "cd /home/ec2-user/alpha-engine",
-            "source .venv/bin/activate",
-            "python -m nousergon_lib.trading_calendar"
-          ],
-          "executionTimeout": ["30"]
-        },
-        "TimeoutSeconds": 30
-      },
-      "TimeoutSeconds": 60,
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "TradingDayCheckFailed",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.trading_day_result",
-      "Next": "WaitForTradingDayCheck"
-    },
-
-    "WaitForTradingDayCheck": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.trading_day_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": { "action": "check_trading_day" }
       },
       "Retry": [
         {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 5,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException","Lambda.TooManyRequestsException","States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "TradingDayCheckFailed",
-          "ResultPath": "$.error"
-        }
+        { "ErrorEquals": ["States.ALL"], "Next": "TradingDayGateFailed", "ResultPath": "$.trading_day_gate_error" }
       ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent",
-        "StandardOutputContent.$": "$.StandardOutputContent"
-      },
-      "ResultPath": "$.trading_day_poll",
-      "Next": "CheckTradingDayResult"
+      "ResultPath": "$.trading_day_gate",
+      "Next": "TradingDayGateChoice"
     },
 
-    "CheckTradingDayResult": {
+    "TradingDayGateChoice": {
       "Type": "Choice",
-      "Comment": "Check SSM status first (InProgress/Pending = poll again), then check stdout for TRADING_DAY vs MARKET_CLOSED marker. Script always exits 0 — Failed means a real error.",
+      "Comment": "Holiday/weekend (is_trading_day=false) -> skip without ever booting the box. Trading day or any non-false result -> proceed. Fail-open to trading matches the prior fail-soft posture: missing a real trading day is worse than a wasted holiday boot.",
       "Choices": [
-        {
-          "Variable": "$.trading_day_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "TradingDayCheckWait"
-        },
-        {
-          "Variable": "$.trading_day_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "TradingDayCheckWait"
-        },
-        {
-          "Variable": "$.trading_day_poll.Status",
-          "StringEquals": "Failed",
-          "Next": "TradingDayCheckFailed"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.trading_day_poll.Status",
-              "StringEquals": "Success"
-            },
-            {
-              "Variable": "$.trading_day_poll.StandardOutputContent",
-              "StringMatches": "*MARKET_CLOSED*"
-            }
-          ],
-          "Next": "StopExecutorOnHoliday"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.trading_day_poll.Status",
-              "StringEquals": "Success"
-            },
-            {
-              "Variable": "$.trading_day_poll.StandardOutputContent",
-              "StringMatches": "*TRADING DAY*"
-            }
-          ],
-          "Next": "CheckSkipMorningEnrich"
-        }
+        { "Variable": "$.trading_day_gate.Payload.is_trading_day", "BooleanEquals": false, "Next": "NotifyHolidaySkip" }
       ],
-      "Default": "TradingDayCheckFailed"
+      "Default": "StartExecutorEC2"
+    },
+
+    "TradingDayGateFailed": {
+      "Type": "Task",
+      "Comment": "Trading-day gate Lambda failed for infrastructure reasons — alert and proceed (assume trading day). Predictor inference + downstream remain gated on enrichment success.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline — Trading Day Gate Failed (Proceeding)",
+        "Message.$": "States.Format('Trading-day gate Lambda failed (infra error, not a holiday detection). Pipeline proceeding as trading day. Error: {}', States.JsonToString($.trading_day_gate_error))"
+      },
+      "ResultPath": "$.trading_day_gate_error_notify",
+      "Next": "StartExecutorEC2"
     },
 
     "MorningEnrich": {
@@ -475,52 +403,14 @@
       "Next": "WaitForChronicGap"
     },
 
-    "TradingDayCheckWait": {
-      "Type": "Wait",
-      "Seconds": 5,
-      "Next": "WaitForTradingDayCheck"
-    },
-
-    "TradingDayCheckFailed": {
-      "Type": "Task",
-      "Comment": "Trading day check failed for infrastructure reasons — alert and proceed (assume trading day). Routes to MorningEnrich same as the trading-day success path; predictor inference still gated on enrichment success.",
-      "Resource": "arn:aws:states:::sns:publish",
-      "Parameters": {
-        "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — Trading Day Check Failed (Proceeding)",
-        "Message.$": "States.Format('Trading day check failed (SSM error, not a holiday detection). Pipeline proceeding as trading day. State: {}', States.JsonToString($))"
-      },
-      "ResultPath": "$.trading_day_error_notify",
-      "Next": "CheckSkipMorningEnrich"
-    },
-
-    "StopExecutorOnHoliday": {
-      "Type": "Task",
-      "Comment": "Stop ae-trading on holidays — we started it speculatively before CheckTradingDay, so clean up.",
-      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
-      "Parameters": {
-        "InstanceIds.$": "$.trading_instance_id"
-      },
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Comment": "Stop failure non-fatal — EventBridge Scheduler at 1:30 PM PT is the backstop.",
-          "Next": "NotifyHolidaySkip",
-          "ResultPath": "$.holiday_stop_error"
-        }
-      ],
-      "ResultPath": "$.holiday_stop_result",
-      "Next": "NotifyHolidaySkip"
-    },
-
     "NotifyHolidaySkip": {
       "Type": "Task",
-      "Comment": "Notify that pipeline was skipped — trading_calendar stdout contains MARKET_CLOSED",
+      "Comment": "Notify that the pipeline was skipped — TradingDayGate reported is_trading_day=false (NYSE holiday/weekend). The executor box was never started (gate runs before StartExecutorEC2).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekday Pipeline — Skipped (Market Holiday)",
-        "Message": "Daily pipeline skipped — NYSE is closed today (market holiday or weekend). No inference or trading. ae-trading stopped."
+        "Message": "Daily pipeline skipped — NYSE is closed today (market holiday or weekend). No inference or trading. The executor box was not started."
       },
       "ResultPath": "$.holiday_notify",
       "End": true
@@ -569,7 +459,7 @@
 
     "DescribeInstanceInfo": {
       "Type": "Task",
-      "Comment": "Poll SSM-agent registration on the trading instance. Replaces the prior fixed Wait 60s, which was insufficient on cold-boot t3.small (race observed 2026-05-05 morning — Ssm.InvalidInstanceIdException at CheckTradingDay because PingStatus had not yet flipped to Online when the SSM SendCommand fired). SSMReadyChoice routes to CheckTradingDay when PingStatus=Online or HandleFailure when the bounded retry budget (~3 min) is exhausted.",
+      "Comment": "Poll SSM-agent registration on the trading instance. Replaces the prior fixed Wait 60s, which was insufficient on cold-boot t3.small (race observed 2026-05-05 morning — Ssm.InvalidInstanceIdException at the first SSM step because PingStatus had not yet flipped to Online when the SSM SendCommand fired). SSMReadyChoice routes to CheckSkipMorningEnrich (the first morning work gate; the NYSE holiday check now runs BEFORE the box boots via TradingDayGate, config#1430) when PingStatus=Online or HandleFailure when the bounded retry budget (~3 min) is exhausted.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
       "Parameters": {
         "Filters": [
@@ -601,7 +491,7 @@
 
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online → CheckTradingDay. Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
+      "Comment": "PingStatus=Online → CheckSkipMorningEnrich (the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
       "Choices": [
         {
           "And": [
@@ -614,7 +504,7 @@
               "StringEquals": "Online"
             }
           ],
-          "Next": "CheckTradingDay"
+          "Next": "CheckSkipMorningEnrich"
         },
         {
           "Variable": "$.ssm_poll.attempts",
