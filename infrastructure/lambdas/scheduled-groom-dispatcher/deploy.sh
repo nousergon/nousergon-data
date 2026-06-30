@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # deploy.sh — Create or update the alpha-engine-scheduled-groom-dispatcher Lambda
-# and wire its EventBridge Scheduler rules (the reliable replacement for
-# the backlog-groom GHA `schedule:` crons — config#1322).
+# and wire its EventBridge Scheduler rules (config#1322, #1432).
 #
-# Each Scheduler rule fires THIS Lambda on cadence; the Lambda repository_
-# dispatches the backlog groom (nousergon/alpha-engine-config :: backlog-groom.yml,
-# type `scheduled-groom`) carrying the run-mode in client_payload. Mirrors the
-# sibling `saturday-sf-success-groom-dispatcher`; EventBridge Scheduler conventions
-# (scheduler.amazonaws.com role, cron() expression, flexible-time-window) mirror
-# `infrastructure/run_weekly_offcycle.sh`.
+# Each Scheduler rule fires THIS Lambda on cadence; the Lambda LAUNCHES A
+# DEDICATED EC2 SPOT BOX (nousergon_lib.ec2_spot, on-demand fallback) and fires an
+# async SSM command that clones nousergon/alpha-engine-config and runs the SAME
+# scripts/groom_run.sh entrypoint the GHA workflow uses, then self-terminates.
+# This moves the heavy ~hours-long groom OFF the org's 2,000 included PRIVATE-repo
+# GHA Actions minutes (config#1432; was: a repository_dispatch into backlog-groom.yml).
+# EventBridge Scheduler conventions (scheduler.amazonaws.com role, cron()
+# expression, flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
+#
+# IAM (iam-policy.json): the Lambda needs ec2:RunInstances + iam:PassRole (the
+# executor role) + ssm:SendCommand. The BOX reads all secrets itself from SSM via
+# its instance profile (alpha-engine-executor-role → ssm:GetParameter on
+# /alpha-engine/*), so the Lambda needs NO secret access.
 #
 # Cadence (UTC, mirrors the GHA crons exactly). Reduced 3->2/day on 2026-06-29
 # (the 15:00 UTC / 8am-PT run was dropped per usage pacing):
@@ -22,8 +28,10 @@
 # Managed OUTSIDE CloudFormation — same rationale as the sibling dispatchers
 # (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow;
 # operator-deployed only). Merging the PR has ZERO live effect until an operator
-# runs this with --bootstrap, AND the GHA `schedule:` crons stay live as a
-# backstop until a multi-day on-time-firing soak confirms this path.
+# runs this with --bootstrap. CUTOVER (config#1432): after a manual --smoke spot
+# run validates end-to-end, deploy this AND disable the GHA `schedule:` crons in
+# backlog-groom.yml together (so there is no double-groom and no gap). NOTE:
+# --smoke fires a REAL groom on a REAL spot box.
 #
 # Usage:
 #   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only

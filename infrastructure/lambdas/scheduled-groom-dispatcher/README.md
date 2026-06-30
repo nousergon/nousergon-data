@@ -1,32 +1,41 @@
 # scheduled-groom-dispatcher
 
 Fires the autonomous backlog groom on a **reliable, on-time cadence** via
-**EventBridge Scheduler → `repository_dispatch`**, replacing the
-`backlog-groom.yml` GitHub Actions `schedule:` crons, which are best-effort and
-fire late or are silently dropped (config#1322).
+**EventBridge Scheduler → a dedicated EC2 spot box** (config#1322 for the
+cadence; config#1432 for the spot move). EventBridge Scheduler replaces the
+best-effort GHA `schedule:` crons; the spot box replaces the GitHub-hosted
+runner so the ~hours-long groom stops burning the org's 2,000 included
+PRIVATE-repo GHA Actions minutes (public repos are free; the groom ran in the
+private `alpha-engine-config` repo). The box runs the SAME
+`scripts/groom_run.sh` entrypoint the GHA workflow uses (single source of truth),
+then self-terminates (~$2/mo).
 
 > **Status: UNVALIDATED.** This is the IaC + handler only. It has **zero live
-> effect** until an operator runs `deploy.sh --bootstrap`, and the GHA
-> `schedule:` crons stay live as a belt-and-suspenders backstop until a multi-day
-> on-time-firing soak confirms this path (see **Soak** below). Only then can the
-> GHA crons be removed.
+> effect** until an operator runs `deploy.sh --bootstrap`. **Cutover** (config#1432):
+> after a manual `--smoke` spot run validates end-to-end, deploy this AND disable
+> the GHA `schedule:` crons in `backlog-groom.yml` together — so there is no
+> double-groom and no gap. `workflow_dispatch` stays as the manual escape hatch.
 
 ## How it fits
 
 ```
-EventBridge Scheduler rules (UTC, cron)              THIS Lambda
-  alpha-engine-scheduled-groom-0700-sunfri  ─┐       (repository_dispatch)
-  alpha-engine-scheduled-groom-2300-daily   ─┴─────▶  type: scheduled-groom
-                                                      client_payload.run_mode
-                                                              │
-                                                              ▼
-                            nousergon/alpha-engine-config :: backlog-groom.yml
-                         (on: repository_dispatch[scheduled-groom] → run_mode-routed groom)
+EventBridge Scheduler rules (UTC, cron)            THIS Lambda
+  alpha-engine-scheduled-groom-0700-sunfri  ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-2300-daily   ─┴────▶    (spot; on-demand fallback)
+                                                    2. wait instance running + SSM Online
+                                                    3. async ssm send-command (detached):
+                                                          │
+                                                          ▼
+   EC2 spot box (AL2023, alpha-engine-executor-profile)
+     prelude: read PAT (SSM) → clone alpha-engine-config
+       → infrastructure/groom_spot_bootstrap.sh --mode <full|sweep>
+         → scripts/groom_run.sh  (budget gate → driver/sweep → digest-verify)
+     → shutdown -h now (InstanceInitiatedShutdownBehavior=terminate)
 ```
 
-It mirrors the sibling `saturday-sf-success-groom-dispatcher` and **reuses the
-same SSM PAT** (`/alpha-engine/saturday_sf_watch/github_pat`) for the
-repository_dispatch — no new credential. The EventBridge Scheduler conventions
+The **box** reads the cross-repo PAT (`/alpha-engine/saturday_sf_watch/github_pat`)
+and all other secrets itself from SSM via its instance profile — no new
+credential, and this Lambda needs no secret access. The EventBridge Scheduler conventions
 (`scheduler.amazonaws.com` execution role, `cron()` expression, OFF
 flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
