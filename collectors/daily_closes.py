@@ -545,6 +545,7 @@ def _build_corporate_action_registry(
             )
 
     registry = None
+    detected_actions: list = []
     if not dry_run and bucket:
         try:
             import corporate_actions
@@ -553,6 +554,7 @@ def _build_corporate_action_registry(
                 boto3.client("s3"), bucket
             )
             actions = corporate_actions.splits_from_events(events)
+            detected_actions = actions
             n_new = 0
             for action in actions:
                 try:
@@ -580,7 +582,12 @@ def _build_corporate_action_registry(
                 _scrub_api_key(exc),
             )
             registry = None
-    return registry, touched
+            detected_actions = []
+    # The detected actions are returned so the window orchestrator can hand them
+    # (with the registry) to ``corporate_actions.sync`` WITHOUT a second polygon
+    # call (PR4, config#1433) — the single ``_recent_split_events`` fetch above
+    # is reused for detection, the config#717 skip-set, AND the sync restatement.
+    return registry, touched, detected_actions
 
 
 def _send_corporate_action_email(actions: list, run_date: str) -> None:
@@ -796,12 +803,14 @@ def collect(
             and skip_if_canonical
             and split_touched_dates is None
         ):
-            registry, split_touched_dates = _build_corporate_action_registry(
-                [run_date],
-                bucket,
-                dry_run=dry_run,
-                run_id=run_date,
-                need_touched=True,
+            registry, split_touched_dates, _detected_actions = (
+                _build_corporate_action_registry(
+                    [run_date],
+                    bucket,
+                    dry_run=dry_run,
+                    run_id=run_date,
+                    need_touched=True,
+                )
             )
 
     s3 = boto3.client("s3")
@@ -1296,13 +1305,63 @@ def _collect_window(
     split_touched_dates: set[str] | None = None
     registry = None
     if source == "polygon_only" and skip_if_canonical and not dry_run:
-        registry, split_touched_dates = _build_corporate_action_registry(
-            window_dates,
-            bucket,
-            dry_run=dry_run,
-            run_id=window_dates[0],  # target date identifies the window run
-            need_touched=True,
+        registry, split_touched_dates, detected_actions = (
+            _build_corporate_action_registry(
+                window_dates,
+                bucket,
+                dry_run=dry_run,
+                run_id=window_dates[0],  # target date identifies the window run
+                need_touched=True,
+            )
         )
+        # ── PR4 (config#1433): unified corporate-action sync, ONCE at the START ─
+        # Restate ALL stores (the daily_closes archive parquets + the ArcticDB
+        # universe) for every detected split BEFORE the per-date collect loop
+        # (re-)writes parquets and BEFORE downstream daily_append reads the
+        # universe — so the split-boundary discontinuity is flattened up front
+        # instead of re-forming mid-week between Saturday backfills. Reuses the
+        # registry + actions already detected above (NO extra polygon call), and
+        # is scoped to the requested universe. Best-effort: a sync failure WARNs
+        # and the morning collection proceeds (the per-date discrepancy logging,
+        # the morning polygon re-fetch, and the blocking Saturday backfill audit
+        # all remain in place).
+        if registry is not None and detected_actions:
+            try:
+                import corporate_actions
+
+                sync_result = corporate_actions.sync(
+                    boto3.client("s3"),
+                    bucket,
+                    min(window_dates),
+                    max(window_dates),
+                    stores=[
+                        corporate_actions.STORE_DAILY_CLOSES_ARCHIVE,
+                        corporate_actions.STORE_ARCTICDB_UNIVERSE,
+                    ],
+                    run_id=window_dates[0],
+                    tickers=tickers,
+                    registry=registry,
+                    actions=detected_actions,
+                )
+                n_applied = sum(
+                    1
+                    for store_results in sync_result.applied.values()
+                    for r in store_results
+                    if r.get("status") == "applied" and r.get("n_rows_adjusted", 0) > 0
+                )
+                logger.info(
+                    "corporate_actions.sync: %d detected, %d restatement(s) "
+                    "applied across %d store(s) over [%s..%s] (run_id=%s)",
+                    len(sync_result.detected), n_applied,
+                    len(sync_result.applied), min(window_dates), max(window_dates),
+                    window_dates[0],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "corporate_actions.sync failed (%s) — proceeding with the "
+                    "morning collection; per-date re-fetch + Saturday backfill "
+                    "audit remain the heal", _scrub_api_key(exc),
+                )
     # The newest date in the window is the TARGET date — the one
     # downstream (predictor inference / eod_reconcile) actually reads.
     # The older dates are best-effort *historical backfill*: a per-date
