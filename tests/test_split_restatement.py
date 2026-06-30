@@ -27,7 +27,7 @@ from botocore.exceptions import ClientError
 import corporate_actions as ca
 import features.compute as compute
 from corporate_actions import CorporateActionRegistry
-from split_factor import (
+from corporate_actions import (
     cumulative_factor,
     restate_series_for_splits,
 )
@@ -441,3 +441,32 @@ def test_backfill_proceeds_on_suspected_only(monkeypatch):
     # Must NOT raise CorporateActionAuditError — proceeds to a normal summary.
     result = _bf.backfill(ticker_filter=None)
     assert result.get("status") != "error"
+
+
+# ── PR6: split_factor.py shim consolidated into corporate_actions + deleted ───
+
+
+def test_split_factor_shim_deleted():
+    """The top-level split_factor.py shim is GONE (its math moved into
+    corporate_actions._split_math, re-exported from the package). Importing it
+    must fail so no consumer silently re-grows a dependency on the loose name."""
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("split_factor")
+
+
+def test_split_math_reexported_from_package():
+    """The split-factor math is importable from the package surface (the
+    repointed import path for every former split_factor consumer)."""
+    from corporate_actions import (  # noqa: F401
+        cumulative_factor,
+        restate_series_for_splits,
+        split_events,
+    )
+
+    # Parity sanity: the moved cumulative_factor still computes the reverse-split
+    # factor (pre-ex prices ×3 for a 1-for-3 reverse split).
+    events = [{"execution_date": "2026-06-24", "split_from": 3, "split_to": 1}]
+    assert cumulative_factor(events, "2026-06-12") == pytest.approx(3.0)
+    assert cumulative_factor(events, "2026-06-24") == pytest.approx(1.0)

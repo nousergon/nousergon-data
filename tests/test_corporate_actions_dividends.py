@@ -30,7 +30,7 @@ from botocore.exceptions import ClientError
 import corporate_actions as ca
 from corporate_actions import CorporateActionRegistry
 from polygon_client import PolygonClient, PolygonForbiddenError
-from split_factor import restate_series_for_splits
+from corporate_actions import restate_series_for_splits
 
 
 # ── polygon_client.get_dividends / get_recent_dividends ──────────────────────

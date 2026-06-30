@@ -3,8 +3,9 @@
 WHY THIS EXISTS (unified corporate-actions program, config#1431):
     Corporate actions (splits, dividends, renames) retroactively restate a
     ticker's adjusted price history. The data pipeline already DETECTS splits
-    (``polygon_client.get_recent_splits`` + ``split_factor.py``) and RESTATES
-    them into the ArcticDB universe (data#1298), but it had no first-class,
+    (``polygon_client.get_recent_splits`` + the split-factor math, now in
+    ``corporate_actions._split_math``) and RESTATES them into the ArcticDB
+    universe (data#1298), but it had no first-class,
     auditable *model* of a corporate action and no durable record of which
     actions were detected/applied. That gap produced two symptoms:
 
@@ -17,27 +18,28 @@ WHY THIS EXISTS (unified corporate-actions program, config#1431):
          action X to store Y", which a robust restatement path needs to stay
          idempotent across reruns.
 
-    This module is the FOUNDATION layer of the program (PR1+PR2): a frozen
-    ``CorporateAction`` dataclass with a deterministic ``action_id``, a
-    polygon-backed ``detect_splits`` built ON ``split_factor.py`` (the
-    authoritative factor convention), and a ``CorporateActionRegistry`` (S3
-    JSON) that makes the split-restatement discrepancy classification
-    *registry-authoritative* rather than text-heuristic.
+    The program's foundation is a frozen ``CorporateAction`` dataclass with a
+    deterministic ``action_id``, polygon-backed detectors (``detect_splits`` /
+    ``detect_dividends`` / ``detect_renames``) built ON the split-factor math
+    (``corporate_actions._split_math``, the authoritative factor convention),
+    and a ``CorporateActionRegistry`` (S3 JSON) that makes the split-restatement
+    discrepancy classification *registry-authoritative* rather than
+    text-heuristic, and the per-(action, store) restatement idempotent.
 
-    This PR is behavior-ADDITIVE: it does NOT change the existing
-    split-RESTATEMENT path (``split_factor.restate_series_for_splits`` /
-    ArcticDB write) — that is a later PR. It only adds the module + registry
-    and RECLASSIFIES the discrepancy log (confirmed split -> WARN, not ERROR)
-    plus one informational notification.
+    The split RESTATEMENT path lives in :func:`apply` / :func:`sync` (PR3/PR4);
+    dividends are RECORDED ONLY (CRSP-separate total-return series, PR5); and
+    ticker RENAMES (PR6) are an identity-preserving 1:1 symbol remap migrated by
+    :func:`migrate_symbol` rather than a price restatement — mergers of the
+    acquired symbol are NOT spliced, they delist via the existing prune path.
 
-CONVENTION (inherited from ``split_factor.py``):
+CONVENTION (the split factor, in ``corporate_actions._split_math``):
     A forward N-for-1 split (``split_from=1, split_to=N``) divides the adjusted
     price by N for every date STRICTLY BEFORE the ex (execution) date. A reverse
     1-for-N split (``split_from=N, split_to=1``) multiplies by N. The per-event
     multiplicative factor applied to dates strictly before ``ex_date`` is
     therefore ``split_from / split_to`` — and we delegate to
-    ``split_factor.cumulative_factor`` so this module never re-derives the
-    authoritative factor independently.
+    :func:`cumulative_factor` so this module never re-derives the authoritative
+    factor independently.
 """
 
 from __future__ import annotations
@@ -49,7 +51,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-import split_factor
+from corporate_actions._split_math import (
+    cumulative_factor,
+    restate_series_for_splits,
+    split_events,
+)
 from corporate_actions.registry import CorporateActionRegistry
 
 log = logging.getLogger(__name__)
@@ -71,10 +77,19 @@ __all__ = [
     "detect_renames",
     "splits_from_events",
     "dividends_from_events",
+    "renames_from_events",
+    "RenameDetection",
+    "migrate_symbol",
+    # split-factor math re-exported from the package (moved out of the
+    # deprecated top-level ``split_factor.py`` shim, PR6 config#1433).
+    "cumulative_factor",
+    "restate_series_for_splits",
+    "split_events",
 ]
 
-# Action types implemented this PR. Dividends/renames are modeled (fields exist)
-# but their detection/factor are deferred to later PRs of the program.
+# Action types. Splits restate the price level (apply/sync); dividends are
+# RECORDED ONLY (CRSP-separate, PR5); renames are an identity-preserving 1:1
+# symbol remap migrated by migrate_symbol (PR6) — never a price restatement.
 _TYPE_SPLIT = "split"
 _TYPE_DIVIDEND = "dividend"
 _TYPE_RENAME = "rename"
@@ -142,10 +157,10 @@ class CorporateAction:
     # split fields
     split_from: int | None = None
     split_to: int | None = None
-    # dividend fields (modeled now, detected in a later PR)
+    # dividend fields (detected by detect_dividends, recorded CRSP-separate)
     cash_amount: float | None = None
     dividend_kind: str | None = None
-    # rename fields (modeled now, detected in a later PR)
+    # rename fields (detected by detect_renames; migrated by migrate_symbol)
     old_ticker: str | None = None
     new_ticker: str | None = None
     # provenance
@@ -222,6 +237,37 @@ class CorporateAction:
             raw=dict(raw or {}),
         )
 
+    @classmethod
+    def from_rename(
+        cls,
+        old_ticker: str,
+        new_ticker: str,
+        ex_date: str,
+        *,
+        source: str = "polygon",
+        raw: dict | None = None,
+    ) -> "CorporateAction":
+        """Build a ticker-rename action (1:1 identity-preserving symbol remap).
+
+        A rename is the polygon ``ticker_change`` event: on ``ex_date`` the
+        entity's symbol changes from ``old_ticker`` to ``new_ticker`` (e.g.
+        FB -> META on 2022-06-09). ``ticker`` is set to ``old_ticker`` so the
+        action keys off the symbol the pipeline already holds (the one going
+        missing from constituents) — that is the side the migration reads from.
+        ``action_id`` is derived deterministically from
+        ``(type, old_ticker, ex_date, old->new)`` so the same rename folds to
+        one id across reruns (the write-once exactly-once migration property).
+        """
+        return cls(
+            type=_TYPE_RENAME,
+            ticker=str(old_ticker),
+            ex_date=str(ex_date),
+            old_ticker=str(old_ticker),
+            new_ticker=str(new_ticker),
+            source=source,
+            raw=dict(raw or {}),
+        )
+
     # ── (de)serialization ────────────────────────────────────────────────
     def to_dict(self) -> dict:
         """JSON-serializable view (the registry persists this + audit fields)."""
@@ -288,7 +334,7 @@ def expected_factor(action: CorporateAction) -> float:
     (``split_from=2, split_to=1``) yields ``2.0`` (pre-split prices double on
     the post-split adjusted scale); a forward 10-for-1 split
     (``split_from=1, split_to=10``) yields ``0.1`` (pre-split prices are divided
-    by 10). We DELEGATE to ``split_factor.cumulative_factor`` (the authoritative
+    by 10). We DELEGATE to :func:`cumulative_factor` (the authoritative
     convention) rather than re-deriving the ratio independently — the cumulative
     factor of a single event evaluated one day before the ex date is exactly
     ``split_from/split_to``.
@@ -308,7 +354,7 @@ def expected_factor(action: CorporateAction) -> float:
         day_before = (
             pd.Timestamp(action.ex_date) - pd.Timedelta(days=1)
         ).strftime("%Y-%m-%d")
-        return split_factor.cumulative_factor([ev], day_before)
+        return cumulative_factor([ev], day_before)
     # TODO(corporate-actions program): implement dividend / rename expected
     # factors in a later PR. Fail loud rather than silently returning 1.0.
     raise NotImplementedError(
@@ -324,7 +370,7 @@ def expected_factor(action: CorporateAction) -> float:
 # primitives below compute that distinct series; they NEVER mutate a price store
 # or a feature. PR7 consumes the registry-recorded dividend events to build +
 # persist the total-return series under the new schema — these are the math it
-# will call. Kept here (not in split_factor) because the split factor convention
+# will call. Kept here (not in _split_math) because the split factor convention
 # is multiplicative on the price LEVEL whereas a dividend factor is a back-adjust
 # applied to a SEPARATE return series.
 
@@ -366,7 +412,7 @@ def total_return_series(
     ``pd.Series`` (the total-return close); **it does NOT mutate ``price_df``** and
     is wired into NO store/feature — PR7 consumes it.
 
-    Method (mirrors ``split_factor`` compounding correctness, but on a return
+    Method (mirrors the split-factor compounding correctness, but on a return
     series): process dividends OLDEST→NEWEST; for each ex-date E, read the close
     on the trading day strictly BEFORE E from the RUNNING series, compute
     ``dividend_factor(cash, close_prev)``, and multiply every row STRICTLY BEFORE
@@ -423,14 +469,15 @@ def apply(
     run_id: str | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Restate a SINGLE ticker's price frame so its full history is corporate-
-    action-consistent, routing all split restatement through ``split_factor``.
+    action-consistent, routing all split restatement through the split-factor
+    math (``corporate_actions._split_math``).
 
     ``df`` is one ticker's OHLCV(+) frame (DatetimeIndex). ``actions`` are the
     ``CorporateAction``s that pertain to THAT frame's ticker (the caller filters
     by ticker — this PR only restates SPLIT actions; a dividend/rename action
     passed in raises ``NotImplementedError`` because their factor math ships in a
     later PR). The full-history multiplicative restatement itself is delegated to
-    :func:`split_factor.restate_series_for_splits` (price ×factor, volume ÷factor
+    :func:`restate_series_for_splits` (price ×factor, volume ÷factor
     for every row strictly before each split's ex_date) — this function never
     re-derives the factor convention.
 
@@ -529,7 +576,7 @@ def apply(
         }
         for a in events_to_apply
     ]
-    restated = split_factor.restate_series_for_splits(df, events)
+    restated = restate_series_for_splits(df, events)
 
     for a in events_to_apply:
         ex = pd.Timestamp(a.ex_date).normalize()
@@ -550,7 +597,7 @@ def apply(
 # ── sync: unified, pre-read orchestration across ALL stores (PR4, config#1433) ─
 
 # Price / volume columns a daily-closes archive parquet carries that a split
-# restates (mirrors split_factor.restate_series_for_splits' defaults; only the
+# restates (mirrors restate_series_for_splits' defaults; only the
 # columns actually present in a given parquet are touched).
 _ARCHIVE_PRICE_COLS = ("Open", "High", "Low", "Close", "VWAP", "Adj_Close")
 _ARCHIVE_VOLUME_COLS = ("Volume",)
@@ -740,8 +787,6 @@ def _sync_daily_closes_archive(
     is NOT multiplied (only marked) — so neither a sync re-run NOR an
     independent polygon re-fetch can double-adjust it. WRITE-THEN-MARK as well.
     """
-    from split_factor import restate_series_for_splits
-
     results: list[dict] = []
     wdates = sorted(window_dates)
     for a in actions:
@@ -1123,8 +1168,214 @@ def detect_dividends(
     return dividends_from_events(events)
 
 
-def detect_renames(start_date: str, end_date: str, *, client=None):
-    """Not implemented this PR (modeled fields exist; detection is a later PR)."""
-    raise NotImplementedError(
-        "detect_renames is deferred to a later PR of the corporate-actions program"
+def renames_from_events(candidate: str, events: list[dict]) -> list["CorporateAction"]:
+    """Map polygon ticker-events rename pairs to rename ``CorporateAction``s for
+    ONE candidate.
+
+    ``events`` is :meth:`polygon_client.PolygonClient.get_ticker_events` output —
+    ``[{"date", "old_ticker", "new_ticker"}]`` ascending. Emits a rename action
+    for every pair whose ``old_ticker`` equals ``candidate`` (the candidate was
+    renamed AWAY to ``new_ticker`` — the 1:1 identity-preserving remap this PR
+    migrates). Pairs where the candidate is the NEW side (it is the survivor of
+    some earlier rename, still live) are NOT emitted — only the symbol going
+    missing triggers a migration off itself. Pure transform (no I/O); malformed
+    or no-op (old == new) rows are skipped.
+    """
+    actions: list[CorporateAction] = []
+    for ev in events or []:
+        old_t = ev.get("old_ticker")
+        new_t = ev.get("new_ticker")
+        date = ev.get("date")
+        if not old_t or not new_t or not date or old_t == new_t:
+            continue
+        if str(old_t) != str(candidate):
+            continue
+        actions.append(
+            CorporateAction.from_rename(
+                old_ticker=str(old_t),
+                new_ticker=str(new_t),
+                ex_date=str(date),
+                source="polygon",
+                raw=dict(ev),
+            )
+        )
+    return actions
+
+
+@dataclass
+class RenameDetection:
+    """Result of a prune-triggered ticker-rename scan over candidate tickers.
+
+    ``renames`` — the detected old->new rename ``CorporateAction``s (one per
+    candidate that polygon reports as the OLD side of a ``ticker_change``).
+
+    ``failed_candidates`` — candidates whose ticker-events query RAISED (polygon
+    unreachable / 5xx / unexpected, or client construction failed). The prune
+    wiring MUST NOT prune these this pass: a detection OUTAGE must never delete a
+    symbol that might be a rename. They are retried next pass.
+
+    A candidate queried successfully with NO ``ticker_change`` is in NEITHER set
+    — it is a CONFIRMED non-rename (genuine delist / merger-of-acquired) and is
+    safe to prune as a delisting.
+    """
+
+    renames: list = field(default_factory=list)
+    failed_candidates: set = field(default_factory=set)
+
+
+def detect_renames(candidate_tickers, *, client=None) -> "RenameDetection":
+    """Prune-triggered ticker-rename detection (corporate-actions PR6,
+    config#1433).
+
+    polygon has NO "all renames in a date range" endpoint — the ticker-events
+    API is PER-TICKER — so detection is not a range scan. The natural signal is
+    already in the pipeline: a symbol going MISSING from constituents /
+    daily_closes (a prune candidate) is what flags it for examination. For each
+    candidate we query :meth:`PolygonClient.get_ticker_events` and emit a rename
+    when the candidate is the OLD side of a ``ticker_change`` (it was renamed
+    away — an identity-preserving 1:1 remap whose ArcticDB history :func:
+    `migrate_symbol` carries to the new key so the predictor stays continuous).
+
+    A candidate with NO ticker_change is a genuine delist or a
+    merger-OF-THE-ACQUIRED — NOT spliced (merging two companies' histories is
+    poison for the predictor); it falls through to the existing prune path.
+
+    HISTORY-SAFETY (the load-bearing failure semantics): detection is
+    best-effort but its FAILURE is NEVER silently treated as "no rename". A
+    candidate whose query RAISES is recorded in ``failed_candidates`` so the
+    prune wiring SKIPS pruning it this pass — a polygon outage must not cause a
+    renamed symbol's history to be wrongly deleted before it can be migrated.
+    Only a SUCCESSFUL query that returns no rename confirms a candidate is safe
+    to prune. Returns a :class:`RenameDetection`.
+    """
+    result = RenameDetection()
+    candidates = [str(t) for t in (candidate_tickers or [])]
+    if not candidates:
+        return result
+    if client is None:
+        try:
+            from polygon_client import polygon_client
+
+            client = polygon_client()
+        except Exception as exc:  # noqa: BLE001 - construction failure degrades
+            # We cannot confirm ANY candidate is not a rename — treat EVERY
+            # candidate as a detection failure (none confirmed safe to prune).
+            log.warning(
+                "corporate_actions.detect_renames: could not obtain polygon "
+                "client (%s) — skipping rename detection for %d candidate(s); "
+                "none confirmed safe to prune this pass (history-safety)",
+                _scrub(exc), len(candidates),
+            )
+            result.failed_candidates.update(candidates)
+            return result
+    for cand in candidates:
+        try:
+            events = client.get_ticker_events(cand)
+        except Exception as exc:  # noqa: BLE001 - per-candidate degrade + RECORD
+            log.warning(
+                "corporate_actions.detect_renames: ticker-events query failed "
+                "for %s (%s) — NOT pruning this candidate this pass "
+                "(history-safety)", cand, _scrub(exc),
+            )
+            result.failed_candidates.add(cand)
+            continue
+        result.renames.extend(renames_from_events(cand, events))
+    return result
+
+
+def migrate_symbol(
+    universe_lib,
+    old_ticker: str,
+    new_ticker: str,
+    *,
+    registry: "CorporateActionRegistry",
+    run_id: str,
+    ex_date: str | None = None,
+) -> bool:
+    """Migrate ONE ArcticDB universe symbol ``old_ticker`` -> ``new_ticker`` for
+    a 1:1 ticker rename (corporate-actions PR6, config#1433).
+
+    Identity-preserving remap: read ``old_ticker``'s FULL series, write it
+    VERBATIM under the ``new_ticker`` key, delete ``old_ticker`` — so the
+    predictor keeps a CONTINUOUS history across the rename (e.g. FB's history
+    lives under META). The frame is re-keyed AS READ (no re-projection): it was
+    already written through the canonical chokepoint, and a pure remap must not
+    transform the data it carries.
+
+    EXACTLY-ONCE via the registry ``arcticdb_universe`` applied marker, keyed on
+    the rename ``action_id``. WRITE-THEN-MARK: the marker is written ONLY after
+    the new key is written AND the old key deleted, so a mid-migration failure
+    never leaves a false "applied" marker (a re-run re-attempts cleanly).
+    Idempotent: a second call sees ``is_applied`` True and returns ``False``
+    without touching ArcticDB. ``ex_date`` makes the marker id match the detected
+    rename's ``action_id`` (the prune wiring passes the detected action's
+    ex_date); a standalone call may omit it.
+
+    NEW-ALREADY-EXISTS (safe choice, documented): if ``new_ticker`` already
+    holds its OWN history, we do NOT overwrite or merge it — merging two real
+    histories is exactly the splice this program forbids (a live ``new_ticker``
+    series is already maintained by ``daily_append``; the orphaned ``old_ticker``
+    series is the SAME entity pre-rename and is now superseded). We log a WARN,
+    delete the orphaned ``old_ticker`` key so it cannot linger as a phantom
+    constituent, mark applied, and return ``True``.
+
+    Returns ``True`` if a migration (or its idempotent new-exists cleanup) ran
+    this call, ``False`` if it was already applied.
+    """
+    action = CorporateAction.from_rename(
+        old_ticker=old_ticker,
+        new_ticker=new_ticker,
+        ex_date=str(ex_date) if ex_date is not None else "",
     )
+    if registry is not None and registry.is_applied(STORE_ARCTICDB_UNIVERSE, action.action_id):
+        log.info(
+            "corporate_actions.migrate_symbol: %s -> %s already applied "
+            "(action_id=%s) — noop", old_ticker, new_ticker, action.action_id,
+        )
+        return False
+
+    # Record the rename action for provenance (write-if-absent; harmless if the
+    # prune wiring already recorded it).
+    if registry is not None:
+        try:
+            registry.record_detected(action, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - provenance best-effort
+            log.warning(
+                "corporate_actions.migrate_symbol: record_detected failed for "
+                "%s (%s)", action.action_id, _scrub(exc),
+            )
+
+    # Source must exist to migrate. If the old key is gone, there is nothing to
+    # carry — treat as a no-op success (a prior run may have migrated + deleted).
+    if not universe_lib.has_symbol(old_ticker):
+        log.warning(
+            "corporate_actions.migrate_symbol: %s not in ArcticDB universe — "
+            "nothing to migrate to %s", old_ticker, new_ticker,
+        )
+        return False
+
+    if universe_lib.has_symbol(new_ticker):
+        # new already has its own live history — DO NOT splice. Drop the orphaned
+        # old key so it can't masquerade as a phantom constituent.
+        log.warning(
+            "corporate_actions.migrate_symbol: %s already has ArcticDB history "
+            "— NOT overwriting/merging (no splice); deleting orphaned source %s "
+            "(superseded by the live %s series)", new_ticker, old_ticker, new_ticker,
+        )
+        universe_lib.delete(old_ticker)
+        if registry is not None:
+            registry.mark_applied(action, STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+        return True
+
+    df = universe_lib.read(old_ticker).data
+    # WRITE-THEN-(DELETE)-THEN-MARK: new key written first, old deleted, marker
+    # last — a failure anywhere before the mark leaves no false "applied" record.
+    universe_lib.write(new_ticker, df, prune_previous_versions=True)
+    universe_lib.delete(old_ticker)
+    if registry is not None:
+        registry.mark_applied(action, STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+    log.warning(
+        "corporate_actions.migrate_symbol: MIGRATED %s -> %s (%d rows) "
+        "action_id=%s", old_ticker, new_ticker, len(df), action.action_id,
+    )
+    return True

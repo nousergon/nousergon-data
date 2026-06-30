@@ -32,7 +32,7 @@ from botocore.exceptions import ClientError
 
 import corporate_actions as ca
 from corporate_actions import CorporateActionRegistry
-from split_factor import restate_series_for_splits
+from corporate_actions import restate_series_for_splits
 
 
 # ── in-memory S3 double (registry markers + daily_closes parquet round-trip) ──

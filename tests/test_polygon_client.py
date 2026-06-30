@@ -238,3 +238,104 @@ def test_get_recent_splits_forbidden_returns_empty():
     client = _make_client()
     with patch.object(client, "_get", side_effect=PolygonForbiddenError("403")):
         assert client.get_recent_splits("2026-05-01", "2026-05-15") == []
+
+
+# ── get_ticker_events (corporate-actions PR6: ticker-rename detection) ─────────
+
+
+def _events_response(changes: list[dict], *, name: str = "Meta Platforms, Inc.") -> dict:
+    """Shape of polygon /vX/reference/tickers/{id}/events results.
+
+    ``changes`` are ``{"date", "ticker"}`` (the ticker the entity changed TO on
+    that date) — polygon lists the IPO listing as the earliest ticker_change too.
+    """
+    return {
+        "results": {
+            "name": name,
+            "figi": "BBG000MM2P62",
+            "events": [
+                {"type": "ticker_change", "date": c["date"],
+                 "ticker_change": {"ticker": c["ticker"]}}
+                for c in changes
+            ],
+        },
+        "status": "OK",
+    }
+
+
+def test_get_ticker_events_parses_adjacent_rename_pairs():
+    """FB (IPO 2012) -> META (2022): the adjacent transition is the rename pair;
+    the earliest listing yields no pair."""
+    client = _make_client()
+    resp = _events_response([
+        {"date": "2022-06-09", "ticker": "META"},
+        {"date": "2012-05-18", "ticker": "FB"},
+    ])
+    with patch.object(client, "_get", return_value=resp) as mock_get:
+        out = client.get_ticker_events("FB")
+    assert mock_get.call_count == 1
+    # Endpoint path carries the queried ticker.
+    args, _ = mock_get.call_args
+    assert args[0] == "/vX/reference/tickers/FB/events"
+    assert out == [
+        {"date": "2022-06-09", "old_ticker": "FB", "new_ticker": "META"},
+    ]
+
+
+def test_get_ticker_events_multi_hop_chain():
+    """Two renames produce two adjacent old->new pairs, ascending by date."""
+    client = _make_client()
+    resp = _events_response([
+        {"date": "2012-05-18", "ticker": "AAA"},
+        {"date": "2018-01-02", "ticker": "BBB"},
+        {"date": "2023-03-03", "ticker": "CCC"},
+    ])
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_ticker_events("AAA")
+    assert out == [
+        {"date": "2018-01-02", "old_ticker": "AAA", "new_ticker": "BBB"},
+        {"date": "2023-03-03", "old_ticker": "BBB", "new_ticker": "CCC"},
+    ]
+
+
+def test_get_ticker_events_single_listing_no_rename():
+    """A ticker with only its IPO listing (no later change) has no rename pair —
+    the genuine-delist / merger-of-acquired signal."""
+    client = _make_client()
+    resp = _events_response([{"date": "2012-05-18", "ticker": "XYZ"}])
+    with patch.object(client, "_get", return_value=resp):
+        assert client.get_ticker_events("XYZ") == []
+
+
+def test_get_ticker_events_ignores_non_ticker_change_events():
+    client = _make_client()
+    resp = {
+        "results": {
+            "name": "X",
+            "events": [
+                {"type": "ticker_change", "date": "2012-05-18",
+                 "ticker_change": {"ticker": "OLD"}},
+                {"type": "delisted", "date": "2020-01-01"},  # not a ticker_change
+                {"type": "ticker_change", "date": "2022-06-09",
+                 "ticker_change": {"ticker": "NEW"}},
+            ],
+        },
+    }
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_ticker_events("OLD")
+    assert out == [
+        {"date": "2022-06-09", "old_ticker": "OLD", "new_ticker": "NEW"},
+    ]
+
+
+def test_get_ticker_events_forbidden_returns_empty():
+    client = _make_client()
+    with patch.object(client, "_get", side_effect=PolygonForbiddenError("403")):
+        assert client.get_ticker_events("FB") == []
+
+
+def test_get_ticker_events_empty_results_object():
+    """No results / no events key → []."""
+    client = _make_client()
+    with patch.object(client, "_get", return_value={"status": "OK"}):
+        assert client.get_ticker_events("FB") == []

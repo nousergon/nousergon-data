@@ -122,6 +122,12 @@ def test_spy_in_universe_is_never_pruned_even_when_absent_and_stale(monkeypatch)
     monkeypatch.setattr(
         _prune_mod, "get_universe_lib", lambda *a, **k: lib
     )
+    # PR6: prune runs rename detection before deletion — neutralize the polygon
+    # seam (HOLX is a genuine delist, no ticker_change) so this guard tests the
+    # SKIP-protection path, not rename detection.
+    no_rename_poly = MagicMock()
+    no_rename_poly.get_ticker_events.return_value = []
+    monkeypatch.setattr(_prune_mod, "polygon_client", lambda *a, **k: no_rename_poly)
 
     summary = _prune_mod.prune_delisted_tickers(
         absent_days=14, apply=True, today=pd.Timestamp("2026-04-28")
