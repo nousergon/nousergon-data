@@ -75,6 +75,8 @@ __all__ = [
     "detect_splits",
     "detect_dividends",
     "detect_renames",
+    "get_splits",
+    "get_dividends",
     "splits_from_events",
     "dividends_from_events",
     "renames_from_events",
@@ -1040,6 +1042,96 @@ def splits_from_events(events: list[dict]) -> list["CorporateAction"]:
             )
         )
     return actions
+
+
+def get_splits(ticker: str, *, client=None) -> list["CorporateAction"]:
+    """Per-ticker, FULL-history split events for ``ticker`` as
+    ``CorporateAction``s (type="split", ex_date = polygon execution_date).
+
+    Sibling of :func:`detect_splits` (which scans the whole market over a
+    date RANGE for the daily sync) — this is the one-ticker, full-history
+    fetch the offline CRSP-basis migration (PR7, config#1434) needs to
+    reconstruct a ticker's entire split-adjusted history. Wraps
+    ``polygon_client.get_splits`` (which returns ``{"execution_date",
+    "split_from", "split_to"}`` dicts WITHOUT a ticker key) and injects the
+    ticker so each event maps to a content-addressed split ``CorporateAction``.
+    The client is constructed lazily (mirroring :func:`detect_splits`) and any
+    construction/fetch failure DEGRADES GRACEFULLY to ``[]`` (apiKey scrubbed)
+    — never hard-fails the caller; the migration's reconciliation backstop is
+    what catches a genuinely missing split.
+    """
+    if client is None:
+        try:
+            from polygon_client import polygon_client
+
+            client = polygon_client()
+        except Exception as exc:  # import / construction failure — degrade
+            from polygon_client import _scrub_api_key
+
+            log.warning(
+                "corporate_actions.get_splits: could not obtain polygon client "
+                "(%s) — returning no splits for %s",
+                _scrub_api_key(exc), ticker,
+            )
+            return []
+    try:
+        events = client.get_splits(ticker)
+    except Exception as exc:
+        from polygon_client import _scrub_api_key
+
+        log.warning(
+            "corporate_actions.get_splits: polygon split fetch failed for %s "
+            "(%s) — returning no splits",
+            ticker, _scrub_api_key(exc),
+        )
+        return []
+    # client.get_splits omits the ticker key; inject it so splits_from_events
+    # can build the content-addressed action.
+    return splits_from_events([{**ev, "ticker": ticker} for ev in events])
+
+
+def get_dividends(ticker: str, *, client=None) -> list["CorporateAction"]:
+    """Per-ticker, FULL-history cash-dividend events for ``ticker`` as
+    ``CorporateAction``s (type="dividend", ex_date = polygon ex_dividend_date,
+    cash_amount + dividend_kind populated).
+
+    Sibling of :func:`detect_dividends` (whole-market range scan) — the
+    one-ticker, full-history fetch the offline CRSP-basis migration (PR7,
+    config#1434) consumes to build the SEPARATE total-return series
+    (``total_return_series``). Dividends are CRSP-separate: these actions are
+    NEVER passed to a price-store ``apply`` (which raises on a dividend) —
+    they feed only the total-return-axis math. Wraps
+    ``polygon_client.get_dividends`` (returns ``{"ex_dividend_date",
+    "cash_amount", "dividend_type"}`` dicts WITHOUT a ticker key); injects the
+    ticker, constructs the client lazily, and DEGRADES GRACEFULLY to ``[]`` on
+    any failure (apiKey scrubbed).
+    """
+    if client is None:
+        try:
+            from polygon_client import polygon_client
+
+            client = polygon_client()
+        except Exception as exc:  # import / construction failure — degrade
+            from polygon_client import _scrub_api_key
+
+            log.warning(
+                "corporate_actions.get_dividends: could not obtain polygon "
+                "client (%s) — returning no dividends for %s",
+                _scrub_api_key(exc), ticker,
+            )
+            return []
+    try:
+        events = client.get_dividends(ticker)
+    except Exception as exc:
+        from polygon_client import _scrub_api_key
+
+        log.warning(
+            "corporate_actions.get_dividends: polygon dividend fetch failed "
+            "for %s (%s) — returning no dividends",
+            ticker, _scrub_api_key(exc),
+        )
+        return []
+    return dividends_from_events([{**ev, "ticker": ticker} for ev in events])
 
 
 def detect_splits(

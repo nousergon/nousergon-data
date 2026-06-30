@@ -64,6 +64,33 @@ lift of this contract from alpha-engine-data into
 
 ---
 
+## 2a. Price-basis columns (CRSP — NOT feature-catalog entries)
+
+These are price/return LEVEL columns persisted on the universe library
+alongside the feature catalog. They are **not** in `registry.py::CATALOG`
+or §3 (those are the engineered features); they are the price basis the
+features are computed *from*. Canonical column order is the single source
+of truth in `store/arctic_store.py` (`OHLCV_COLS` + `TOTAL_RETURN_COL` +
+`source` + FEATURES).
+
+| Column | Units | Compute | Consumers |
+|---|---|---|---|
+| `Close` | absolute price (split-adjusted LEVEL) | polygon-authoritative split restatement (`corporate_actions.apply` → `_split_math.restate_series_for_splits`); changes only on splits | features (basis), executor, research, predictor |
+| `total_return_close` | absolute price (split-adjusted + dividend-back-adjusted; total-return axis) | `Close` further back-adjusted by registry dividend events via `corporate_actions.total_return_series` — a SEPARATE series that does NOT mutate `Close` | features (basis at PR7-7c cutover), predictor label (7c) |
+
+**Status (PR7-7a, config#1434):** `total_return_close` is ADDITIVE and,
+as of this PR, written ONLY to the OFFLINE scratch CRSP-basis library
+(`builders/migrate_universe_crsp_basis.py` → `universe_crsp`). The live
+`universe` library does not yet carry it, and the feature/label basis
+still reads `Close`. The flip of the feature basis
+(`feature_engineer.py` `close_col` default → `total_return_close`), the
+ne-data + predictor label flip, and the `backfill`/`daily_append`
+dual-writer are GATED to PR7-7c after the shadow-retrain + backtest gate.
+Placed immediately after `Close` in the canonical layout so the price-level
+and return-basis columns sit adjacent.
+
+---
+
 ## 3. Field catalog — units, compute, consumers
 
 Sorted by group, matching `features/registry.py::CATALOG`. Every entry

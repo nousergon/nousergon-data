@@ -64,6 +64,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/_price_cache_writeboth.py": 1,
     "builders/daily_append.py": 2,  # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents, config#1150)
+    # builders/migrate_universe_crsp_basis_audit/{ts}.json — the per-ticker CRSP
+    # reconciliation REPORT (corporate-actions PR7-7a, config#1434). Like the
+    # other one-off migration-audit PUTs (feature_order / vwap below), this is an
+    # EVENT-DRIVEN operator-run artifact, NOT a periodic freshness-SLA artifact:
+    # there is no cadence to monitor and the migration is a manual spot run, so it
+    # is grandfathered out of ARTIFACT_REGISTRY.yaml (no freshness row) — pinned
+    # here only to force operator review of the new PUT site.
+    "builders/migrate_universe_crsp_basis.py": 1,
     "builders/migrate_universe_feature_order.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
