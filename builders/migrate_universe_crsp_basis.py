@@ -47,6 +47,37 @@ log. Both series are total-return and anchored at the latest split-adjusted
 price, so within tolerance they should be identical up to feed rounding; the
 NEW one is polygon-authoritative.
 
+Scoping the gate to the training window (``--reconcile-start``)
+---------------------------------------------------------------
+Polygon's corporate-action history is SPARSE before ~2019 — for split /
+restructuring names (e.g. DD, HON, KLAC) a full-10y reconciliation fails at
+~2016 dates with huge residuals because the deep-history split/dividend events
+simply aren't in polygon, while the SAME names reconcile cleanly inside the
+recent window where polygon coverage is complete. The predictor only trains on
+a clamped recent window (``TRAIN_START_DATE``), so per Brian's decision
+(2026-06-30, after the subset dry-run surfaced the coverage gap) the
+reconciliation + basis-trust GATE is scoped to the predictor training window;
+deep pre-window history stays yfinance-backed best-effort.
+
+``--reconcile-start YYYY-MM-DD`` scopes the pass/fail GATE: residuals on common
+dates strictly BEFORE ``reconcile_start`` are EXCLUDED from the gate (deep
+pre-window history the model never trains on), while every in-window residual
+(``>= reconcile_start``) STILL fails loud. **The full history is STILL WRITTEN**
+to the scratch library (pre-window rows included, best-effort basis) — only the
+GATE is scoped, and the audit report makes the scope explicit (per-ticker
+in-window vs excluded date counts + a best-effort flag). Default
+(``--reconcile-start`` unset) is UNCHANGED: full-history reconciliation, so the
+operator must OPT IN to scoping.
+
+CRITICAL — warmup buffer. The operator MUST set ``--reconcile-start`` to the
+predictor ``TRAIN_START_DATE`` MINUS the maximum feature lookback (~252 trading
+days ≈ 1 calendar year; e.g. ``mom_12_1`` uses ``close.shift(252)``), NOT to
+``TRAIN_START_DATE`` itself. Warmup features at the FIRST training date are
+computed from prices up to ~252 trading days earlier, so those earlier rows must
+also be reconciled (clean) for the gate to actually protect every value the
+model trains on. Using ``train_start`` directly would leave the warmup window
+unguarded — a silent hole exactly where the model's first labels are built.
+
 NOTE — this PR ships the SCRIPT + tests only. The actual 10y / ~900-ticker
 scratch-library build is a separate OPERATIONAL (spot) run; do NOT run this
 against a live/large ArcticDB from a dev box.
@@ -61,6 +92,9 @@ Usage::
     python -m builders.migrate_universe_crsp_basis --apply              # write scratch lib
     python -m builders.migrate_universe_crsp_basis --tickers AAPL,MMM   # subset (testing)
     python -m builders.migrate_universe_crsp_basis --scratch-lib universe_crsp_v2
+    # scope the GATE to the training window + ~1y warmup buffer (TRAIN_START_DATE
+    # minus ~252 trading days); deep pre-window history stays best-effort:
+    python -m builders.migrate_universe_crsp_basis --reconcile-start 2020-01-01
 """
 
 from __future__ import annotations
@@ -125,12 +159,21 @@ class ReconcileRecord:
 
     ticker: str
     status: str  # "within_tol" | "out_of_tol" | "no_overlap"
-    n_common_dates: int
+    n_common_dates: int  # dates that GATE the pass/fail decision (in-window when scoped)
     max_rel_dev: float
     max_dev_date: str | None
     explained: bool
     explanation: str
     nearest_action: str | None = None
+    # ── reconcile-window scoping (--reconcile-start) ──────────────────────────
+    # The gate considers ONLY common dates >= reconcile_start (the predictor
+    # training window + warmup buffer); residuals strictly before it are
+    # EXCLUDED from the gate (deep pre-window history the model never trains on,
+    # where polygon corporate-action coverage is sparse). Made explicit here so
+    # the audit report shows the scope — no silent loosening.
+    reconcile_start: str | None = None  # None ⇒ full-history (default, unchanged)
+    n_common_in_window: int = 0  # common dates >= reconcile_start (gate these)
+    n_common_excluded: int = 0  # common dates < reconcile_start (best-effort, ungated)
 
     def to_dict(self) -> dict:
         return {
@@ -142,6 +185,10 @@ class ReconcileRecord:
             "explained": self.explained,
             "explanation": self.explanation,
             "nearest_action": self.nearest_action,
+            "reconcile_start": self.reconcile_start,
+            "n_common_in_window": self.n_common_in_window,
+            "n_common_excluded": self.n_common_excluded,
+            "pre_window_best_effort": self.n_common_excluded > 0,
         }
 
 
@@ -327,6 +374,7 @@ def reconcile_total_return(
     dividend_actions: list | None = None,
     rel_tol: float = DEFAULT_RECONCILE_REL_TOL,
     known_divergence: bool = False,
+    reconcile_start: str | pd.Timestamp | None = None,
 ) -> ReconcileRecord:
     """Compare the NEW ``total_return_close`` against the retiring yfinance
     total-return ``Close`` for one ticker.
@@ -346,13 +394,52 @@ def reconcile_total_return(
         (``explained=False``): a ticker we cannot reconcile is a fail-loud
         condition, not a silent skip.
 
+    ``reconcile_start`` (the predictor training window start MINUS the feature
+    warmup buffer — see the module docstring) scopes the GATE: only common dates
+    ``>= reconcile_start`` are compared for the pass/fail decision (max_rel_dev,
+    status, attribution are all computed over the IN-WINDOW subset); common dates
+    strictly before it are EXCLUDED from the gate (counted, reported, flagged
+    best-effort — deep pre-window history the model never trains on). When
+    ``None`` (default) the full common history gates, behavior is UNCHANGED. If
+    scoping leaves ZERO in-window common dates, that is ``no_overlap`` /
+    fail-loud (the training-window data is unreconcilable, not a silent skip).
+
     Attributes the worst-deviation date to the nearest registered action (within
     ``_ACTION_ATTRIBUTION_WINDOW_DAYS``) for the report — diagnostic only.
     """
     new_tr_close = new_tr_close.dropna()
     old_close = old_close.dropna()
     common = new_tr_close.index.intersection(old_close.index)
-    if len(common) == 0:
+
+    reconcile_start_ts = (
+        pd.Timestamp(reconcile_start).normalize() if reconcile_start is not None else None
+    )
+    reconcile_start_str = (
+        reconcile_start_ts.strftime("%Y-%m-%d") if reconcile_start_ts is not None else None
+    )
+
+    # GATE scope: only common dates >= reconcile_start gate the decision; dates
+    # strictly before it are deep pre-window history (best-effort, ungated).
+    if reconcile_start_ts is not None:
+        in_window = common[common.normalize() >= reconcile_start_ts]
+    else:
+        in_window = common
+    n_total = len(common)
+    n_in_window = len(in_window)
+    n_excluded = n_total - n_in_window
+
+    if n_in_window == 0:
+        if reconcile_start_ts is not None and n_total > 0:
+            explanation = (
+                f"no common dates >= reconcile_start {reconcile_start_str} "
+                f"({n_excluded} pre-window common date(s) excluded) — the "
+                f"training-window data is unreconcilable (fail-loud, not skipped)"
+            )
+        else:
+            explanation = (
+                "no common dates between new total_return_close and old "
+                "yfinance Close — cannot reconcile (fail-loud, not skipped)"
+            )
         return ReconcileRecord(
             ticker=ticker,
             status="no_overlap",
@@ -360,40 +447,49 @@ def reconcile_total_return(
             max_rel_dev=float("inf"),
             max_dev_date=None,
             explained=False,
-            explanation=(
-                "no common dates between new total_return_close and old "
-                "yfinance Close — cannot reconcile (fail-loud, not skipped)"
-            ),
+            explanation=explanation,
+            reconcile_start=reconcile_start_str,
+            n_common_in_window=0,
+            n_common_excluded=n_excluded,
         )
 
-    a = new_tr_close.reindex(common).to_numpy(dtype="float64")
-    b = old_close.reindex(common).to_numpy(dtype="float64")
+    a = new_tr_close.reindex(in_window).to_numpy(dtype="float64")
+    b = old_close.reindex(in_window).to_numpy(dtype="float64")
     denom = np.where(np.abs(b) > 1e-12, np.abs(b), np.nan)
     rel_dev = np.abs(a - b) / denom
     # NaN denom (old close ~0) → ignore that date rather than emit inf.
     rel_dev = np.where(np.isfinite(rel_dev), rel_dev, 0.0)
     worst_pos = int(np.argmax(rel_dev))
     max_rel_dev = float(rel_dev[worst_pos])
-    max_dev_date = pd.Timestamp(common[worst_pos]).strftime("%Y-%m-%d")
+    max_dev_date = pd.Timestamp(in_window[worst_pos]).strftime("%Y-%m-%d")
 
     all_actions = list(split_actions or []) + list(dividend_actions or [])
     near = _nearest_action(
-        pd.Timestamp(common[worst_pos]).normalize(),
+        pd.Timestamp(in_window[worst_pos]).normalize(),
         all_actions,
         _ACTION_ATTRIBUTION_WINDOW_DAYS,
     )
     nearest_action = near.human() if near is not None else None
 
+    scope_note = (
+        f" [gate scoped to >= {reconcile_start_str}: {n_in_window} in-window, "
+        f"{n_excluded} pre-window best-effort excluded]"
+        if reconcile_start_ts is not None else ""
+    )
+
     if max_rel_dev <= rel_tol:
         return ReconcileRecord(
             ticker=ticker,
             status="within_tol",
-            n_common_dates=len(common),
+            n_common_dates=n_in_window,
             max_rel_dev=max_rel_dev,
             max_dev_date=max_dev_date,
             explained=True,
-            explanation=f"within tol ({max_rel_dev:.4%} <= {rel_tol:.2%})",
+            explanation=f"within tol ({max_rel_dev:.4%} <= {rel_tol:.2%}){scope_note}",
             nearest_action=nearest_action,
+            reconcile_start=reconcile_start_str,
+            n_common_in_window=n_in_window,
+            n_common_excluded=n_excluded,
         )
 
     if known_divergence:
@@ -401,16 +497,20 @@ def reconcile_total_return(
             f"OUT-OF-TOL ({max_rel_dev:.4%} > {rel_tol:.2%}) at {max_dev_date} "
             f"but operator-acknowledged known divergence"
             + (f" (nearest action: {nearest_action})" if nearest_action else "")
+            + scope_note
         )
         return ReconcileRecord(
             ticker=ticker,
             status="out_of_tol",
-            n_common_dates=len(common),
+            n_common_dates=n_in_window,
             max_rel_dev=max_rel_dev,
             max_dev_date=max_dev_date,
             explained=True,
             explanation=explanation,
             nearest_action=nearest_action,
+            reconcile_start=reconcile_start_str,
+            n_common_in_window=n_in_window,
+            n_common_excluded=n_excluded,
         )
 
     explanation = (
@@ -419,16 +519,20 @@ def reconcile_total_return(
         f"polygon-vs-yfinance divergence"
         + (f"; nearest registered action: {nearest_action}" if nearest_action
            else "; NO registered action near this date")
+        + scope_note
     )
     return ReconcileRecord(
         ticker=ticker,
         status="out_of_tol",
-        n_common_dates=len(common),
+        n_common_dates=n_in_window,
         max_rel_dev=max_rel_dev,
         max_dev_date=max_dev_date,
         explained=False,
         explanation=explanation,
         nearest_action=nearest_action,
+        reconcile_start=reconcile_start_str,
+        n_common_in_window=n_in_window,
+        n_common_excluded=n_excluded,
     )
 
 
@@ -469,6 +573,7 @@ def migrate_universe_crsp_basis(
     tickers_override: list[str] | None = None,
     rel_tol: float = DEFAULT_RECONCILE_REL_TOL,
     known_divergence_tickers: frozenset[str] | None = None,
+    reconcile_start: str | None = None,
     workers: int | None = None,
     raw_fetch=None,
     client=None,
@@ -499,6 +604,14 @@ def migrate_universe_crsp_basis(
         Operator-acknowledged documented divergences — these tickers' out-of-tol
         residuals are reported but do NOT fail the run. Default: none (every
         out-of-tol residual fails loud).
+    reconcile_start
+        ``YYYY-MM-DD`` lower bound scoping the reconciliation GATE to the
+        predictor training window (+ feature warmup buffer — see the module
+        docstring). Residuals on common dates ``< reconcile_start`` are EXCLUDED
+        from the pass/fail decision (deep pre-window history, best-effort basis,
+        polygon coverage sparse); in-window residuals STILL fail loud. The full
+        history is still WRITTEN to scratch regardless. Default ``None``:
+        full-history reconciliation (UNCHANGED, conservative — operator opts in).
     raw_fetch / client
         Injectable RAW-price fetcher ``(ticker) -> DataFrame`` and polygon client
         (for tests / alternate sources). Default: yfinance ``auto_adjust=False``
@@ -586,6 +699,7 @@ def migrate_universe_crsp_basis(
                 dividend_actions=dividend_actions,
                 rel_tol=rel_tol,
                 known_divergence=ticker in known_divergence_tickers,
+                reconcile_start=reconcile_start,
             )
 
             out = TickerOutcome(
@@ -665,11 +779,26 @@ def migrate_universe_crsp_basis(
         lvl("RECONCILE %s status=%s max_rel_dev=%.4f date=%s — %s",
             r.ticker, r.status, r.max_rel_dev, r.max_dev_date, r.explanation)
 
+    # Reconcile-window scope summary: make the gate scope EXPLICIT in the audit —
+    # the start used, aggregate in-window vs excluded date counts, and a flag that
+    # pre-window rows are written best-effort / unreconciled (no silent loosening).
+    total_in_window = sum(r.n_common_in_window for r in records)
+    total_excluded = sum(r.n_common_excluded for r in records)
+    tickers_with_excluded = sum(1 for r in records if r.n_common_excluded > 0)
+
     summary = {
         "status": "ok" if (not unexplained and not errors) else "fail",
         "applied": apply,
         "scratch_lib": scratch_lib,
         "rel_tol": rel_tol,
+        "reconcile_start": reconcile_start,
+        "reconcile_scope": (
+            "full_history" if reconcile_start is None
+            else f"gated >= {reconcile_start} (pre-window rows written best-effort/unreconciled)"
+        ),
+        "in_window_dates_total": total_in_window,
+        "excluded_pre_window_dates_total": total_excluded,
+        "tickers_with_excluded_pre_window": tickers_with_excluded,
         "live_universe_size": len(arctic_symbols),
         "targets_count": len(targets),
         "reconciled_count": len(records),
@@ -695,11 +824,13 @@ def migrate_universe_crsp_basis(
     _write_audit(s3, bucket, summary)
 
     log.info(
-        "migrate_universe_crsp_basis: applied=%s targets=%d reconciled=%d "
-        "within_tol=%d out_of_tol=%d no_overlap=%d unexplained=%d errors=%d "
-        "written=%d elapsed=%.1fs",
-        apply, len(targets), len(records), len(within_tol), len(out_of_tol),
-        len(no_overlap), len(unexplained), len(errors), written, elapsed,
+        "migrate_universe_crsp_basis: applied=%s reconcile_start=%s targets=%d "
+        "reconciled=%d within_tol=%d out_of_tol=%d no_overlap=%d unexplained=%d "
+        "errors=%d written=%d in_window_dates=%d excluded_pre_window_dates=%d "
+        "elapsed=%.1fs",
+        apply, reconcile_start, len(targets), len(records), len(within_tol),
+        len(out_of_tol), len(no_overlap), len(unexplained), len(errors), written,
+        total_in_window, total_excluded, elapsed,
     )
 
     # ── FAIL LOUD ─────────────────────────────────────────────────────────────
@@ -777,6 +908,20 @@ def main():
              "operator-acknowledged known divergence (reported, not fatal).",
     )
     parser.add_argument(
+        "--reconcile-start",
+        help="YYYY-MM-DD lower bound scoping the reconciliation GATE to the "
+             "predictor training window. Residuals on common dates BEFORE this "
+             "are EXCLUDED from the pass/fail gate (deep pre-window history, "
+             "best-effort, where polygon corporate-action coverage is sparse); "
+             "in-window residuals STILL fail loud and the full history is still "
+             "WRITTEN to scratch. CRITICAL: set this to the predictor "
+             "TRAIN_START_DATE MINUS the max feature lookback (~252 trading days "
+             "≈ 1 calendar year; e.g. mom_12_1 uses close.shift(252)) — NOT "
+             "train_start itself — so warmup features at the first training date "
+             "are computed on reconciled data. Default unset: full-history "
+             "reconciliation (UNCHANGED; operator opts in to scoping).",
+    )
+    parser.add_argument(
         "--bucket", default=DEFAULT_BUCKET,
         help=f"S3 bucket (default: {DEFAULT_BUCKET})",
     )
@@ -798,6 +943,7 @@ def main():
         tickers_override=tickers_override,
         rel_tol=args.rel_tol,
         known_divergence_tickers=known,
+        reconcile_start=args.reconcile_start,
     )
     print(json.dumps(result, indent=2, default=str))
 
