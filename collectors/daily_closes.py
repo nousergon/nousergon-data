@@ -1350,11 +1350,13 @@ def _collect_window(
                     if r.get("status") == "applied" and r.get("n_rows_adjusted", 0) > 0
                 )
                 logger.info(
-                    "corporate_actions.sync: %d detected, %d restatement(s) "
-                    "applied across %d store(s) over [%s..%s] (run_id=%s)",
+                    "corporate_actions.sync: %d split(s) detected, %d "
+                    "restatement(s) applied across %d store(s), %d dividend(s) "
+                    "recorded (CRSP-separate, no price restate, no email) over "
+                    "[%s..%s] (run_id=%s)",
                     len(sync_result.detected), n_applied,
-                    len(sync_result.applied), min(window_dates), max(window_dates),
-                    window_dates[0],
+                    len(sync_result.applied), len(sync_result.dividends),
+                    min(window_dates), max(window_dates), window_dates[0],
                 )
             except Exception as exc:
                 logger.warning(
