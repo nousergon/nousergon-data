@@ -108,6 +108,8 @@ def _bootstrap_command(run_mode: str, run_url: str) -> str:
     """
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
+# SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
+export HOME=/root
 fail() {{ echo "[groom-prelude] FATAL: $1"; shutdown -h now; exit 1; }}
 # Stock AL2023 ships neither git nor python3.12. Install BEFORE the clone (git is
 # needed now; python3.12 gives the groom the same interpreter as the GHA runner —
@@ -202,10 +204,13 @@ def _launch_groom_spot(run_mode: str, schedule_label: str) -> dict:
     instance_id, market = _launch_instance()
     logger.info("launched groom box %s (%s)", instance_id, market)
     _wait_ssm_online(instance_id)
+    # IMPORTANT: this string is embedded in the prelude's bash double-quoted
+    # `--run-url "..."`, so it MUST NOT contain `$` — the AWS console's normal
+    # `$252F` log-group encoding would expand as positional params ($2, $5...)
+    # under `set -u` and abort the prelude. Keep it `$`-free.
     run_url = (
         f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}"
-        f"#logsV2:log-groups/log-group/$252Falpha-engine$252Fgroom-spot"
-        f"$3FfilterPattern$3D{instance_id}"
+        f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
     )
     command_id = _send_bootstrap(instance_id, run_mode, run_url)
     logger.info(
