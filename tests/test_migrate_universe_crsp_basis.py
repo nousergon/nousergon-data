@@ -408,3 +408,164 @@ def test_record_round_trips_to_dict():
     )
     d = rec.to_dict()
     assert d["ticker"] == "X" and d["status"] == "within_tol"
+    # New reconcile-window scope fields default to the unscoped (full-history) shape.
+    assert d["reconcile_start"] is None
+    assert d["n_common_in_window"] == 0
+    assert d["n_common_excluded"] == 0
+    assert d["pre_window_best_effort"] is False
+
+
+# ── reconcile-window scoping (--reconcile-start) ──────────────────────────────
+#
+# Polygon's corporate-action history is sparse pre-~2019, so a full-10y
+# reconciliation fails at deep-history dates for split/restructuring names while
+# the recent (training) window reconciles cleanly. --reconcile-start scopes the
+# pass/fail GATE to the predictor training window (+ warmup buffer); pre-window
+# residuals are excluded from the gate but the full history is still written.
+
+
+def _windowed_residual_frame(bad_date_idx: int):
+    """New vs old total-return Close that are clean EXCEPT a large residual at the
+    single date ``bad_date_idx`` — used to place an out-of-tol residual either
+    before or after a reconcile_start boundary."""
+    idx = pd.bdate_range("2016-01-01", periods=8)
+    new = pd.Series([50.0] * 8, index=idx)
+    old = new.copy()
+    old.iloc[bad_date_idx] = 40.0  # ~20% residual at one date
+    return idx, new, old
+
+
+def test_reconcile_pre_window_residual_excluded_when_scoped():
+    """An OUT-OF-TOL residual at a PRE-reconcile_start date reconciles as
+    within-tol/pass when reconcile_start excludes that date."""
+    idx, new, old = _windowed_residual_frame(bad_date_idx=1)  # bad date = idx[1]
+    reconcile_start = idx[4].strftime("%Y-%m-%d")  # excludes idx[0..3]
+    rec = reconcile_total_return(
+        "X", new, old, rel_tol=0.02, reconcile_start=reconcile_start,
+    )
+    assert rec.status == "within_tol"
+    assert rec.explained is True
+    assert rec.max_rel_dev <= 0.02
+    # The bad pre-window date was excluded from the gate, counted as best-effort.
+    assert rec.n_common_excluded == 4
+    assert rec.n_common_in_window == 4
+    assert rec.reconcile_start == reconcile_start
+
+
+def test_reconcile_pre_window_residual_still_fails_with_default():
+    """Regression guard: the SAME pre-window residual, with reconcile_start=None
+    (default full-history), STILL fails loud (out_of_tol + unexplained)."""
+    idx, new, old = _windowed_residual_frame(bad_date_idx=1)
+    rec = reconcile_total_return("X", new, old, rel_tol=0.02)  # default: full history
+    assert rec.status == "out_of_tol"
+    assert rec.explained is False
+    assert rec.max_rel_dev > 0.02
+    # Default shape: nothing excluded, everything gates.
+    assert rec.reconcile_start is None
+    assert rec.n_common_excluded == 0
+    assert rec.n_common_in_window == len(idx)
+
+
+def test_reconcile_in_window_residual_still_fails_loud_when_scoped():
+    """An IN-WINDOW (>= reconcile_start) out-of-tol residual STILL fails loud
+    regardless of reconcile_start — the gate still protects training+warmup data."""
+    idx, new, old = _windowed_residual_frame(bad_date_idx=6)  # bad date = idx[6]
+    reconcile_start = idx[4].strftime("%Y-%m-%d")  # idx[6] is IN window
+    rec = reconcile_total_return(
+        "X", new, old, rel_tol=0.02, reconcile_start=reconcile_start,
+    )
+    assert rec.status == "out_of_tol"
+    assert rec.explained is False
+    assert rec.max_rel_dev > 0.02
+    assert rec.max_dev_date == idx[6].strftime("%Y-%m-%d")
+    assert rec.n_common_in_window == 4
+    assert rec.n_common_excluded == 4
+
+
+def test_reconcile_no_in_window_dates_is_unexplained():
+    """A reconcile_start beyond all common dates leaves zero in-window dates →
+    no_overlap / fail-loud (the training-window data is unreconcilable)."""
+    idx, new, old = _windowed_residual_frame(bad_date_idx=1)
+    rec = reconcile_total_return(
+        "X", new, old, rel_tol=0.02, reconcile_start="2099-01-01",
+    )
+    assert rec.status == "no_overlap"
+    assert rec.explained is False
+    assert rec.n_common_in_window == 0
+    assert rec.n_common_excluded == len(idx)
+
+
+def test_orchestration_scoped_excludes_pre_window_residual(monkeypatch):
+    """Orchestration: a pre-window out-of-tol residual that fails by default
+    PASSES when reconcile_start scopes the gate, and the report records the
+    reconcile_start + in-window/excluded date counts + best-effort flag."""
+    raw_frames, old_closes, client = _clean_setup()
+    idx = raw_frames["X"].index
+    # Corrupt the OLD close only at the earliest (pre-window) date.
+    bad = old_closes["X"].copy()
+    bad.iloc[0] = 30.0  # huge residual at idx[0]
+    old_closes["X"] = bad
+    _patch_orchestration(monkeypatch, old_closes=old_closes)
+
+    reconcile_start = idx[2].strftime("%Y-%m-%d")  # excludes idx[0..1]
+    result = m.migrate_universe_crsp_basis(
+        apply=False,
+        raw_fetch=lambda t: raw_frames[t],
+        client=client,
+        rel_tol=0.02,
+        reconcile_start=reconcile_start,
+        workers=1,
+    )
+    assert result["status"] == "ok"
+    assert result["within_tol_count"] == 1
+    assert result["unexplained_count"] == 0
+    # Report records the scope.
+    assert result["reconcile_start"] == reconcile_start
+    assert result["reconcile_scope"].startswith("gated >=")
+    assert result["excluded_pre_window_dates_total"] >= 1
+    assert result["tickers_with_excluded_pre_window"] == 1
+    rec = result["reconciliations"][0]
+    assert rec["reconcile_start"] == reconcile_start
+    assert rec["n_common_excluded"] >= 1
+    assert rec["pre_window_best_effort"] is True
+
+
+def test_orchestration_default_no_reconcile_start_unchanged(monkeypatch):
+    """Default (no reconcile_start): the SAME pre-window residual STILL fails loud
+    — full-history behavior is unchanged."""
+    raw_frames, old_closes, client = _clean_setup()
+    bad = old_closes["X"].copy()
+    bad.iloc[0] = 30.0
+    old_closes["X"] = bad
+    _patch_orchestration(monkeypatch, old_closes=old_closes)
+
+    with pytest.raises(RuntimeError, match="FAILED LOUD"):
+        m.migrate_universe_crsp_basis(
+            apply=False,
+            raw_fetch=lambda t: raw_frames[t],
+            client=client,
+            rel_tol=0.02,
+            workers=1,  # reconcile_start defaults to None
+        )
+
+
+def test_orchestration_in_window_residual_fails_loud_when_scoped(monkeypatch):
+    """Orchestration: an IN-WINDOW out-of-tol residual STILL fails loud even with
+    reconcile_start set — the gate protects every row the model trains on."""
+    raw_frames, old_closes, client = _clean_setup()
+    idx = raw_frames["X"].index
+    bad = old_closes["X"].copy()
+    bad.iloc[5] = 30.0  # huge residual at the LAST (in-window) date
+    old_closes["X"] = bad
+    _patch_orchestration(monkeypatch, old_closes=old_closes)
+
+    reconcile_start = idx[2].strftime("%Y-%m-%d")  # idx[5] is IN window
+    with pytest.raises(RuntimeError, match="FAILED LOUD"):
+        m.migrate_universe_crsp_basis(
+            apply=False,
+            raw_fetch=lambda t: raw_frames[t],
+            client=client,
+            rel_tol=0.02,
+            reconcile_start=reconcile_start,
+            workers=1,
+        )
