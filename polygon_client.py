@@ -366,6 +366,109 @@ class PolygonClient:
         results.sort(key=lambda r: r["execution_date"])
         return results
 
+    def get_dividends(self, ticker: str) -> list[dict]:
+        """Fetch the cash-dividend history for one ticker (authoritative).
+
+        Sibling of :meth:`get_splits` for the corporate-actions program
+        (config#1433). Dividends are tracked as a SEPARATE total-return series
+        (CRSP/Barra basis) and are NEVER folded into the stored split-adjusted
+        price level — this endpoint is the authoritative source of the cash
+        amount + ex-dividend date the total-return-factor math consumes.
+
+        Queries ``/v3/reference/dividends?ticker=`` (full history, paginated;
+        we take the first page — ``limit=1000`` is ample for decades of
+        quarterly dividends). Returns a list of
+        ``{"ex_dividend_date": "YYYY-MM-DD", "cash_amount": float,
+        "dividend_type": str, ...}`` sorted ascending by ex_dividend_date.
+        Malformed rows (missing ex date / non-positive cash amount) are
+        skipped; a 403 (free-tier / bad key) returns ``[]`` so a dividend
+        detection miss degrades gracefully rather than hard-failing.
+        """
+        results: list[dict] = []
+        try:
+            data = self._get(
+                "/v3/reference/dividends",
+                params={"ticker": ticker, "limit": 1000, "order": "asc"},
+            )
+        except PolygonForbiddenError:
+            return []
+        for r in data.get("results", []) or []:
+            ex_date = r.get("ex_dividend_date")
+            cash = r.get("cash_amount")
+            if not ex_date or cash is None:
+                continue
+            try:
+                cash_f = float(cash)
+            except (TypeError, ValueError):
+                continue
+            if cash_f <= 0:
+                continue
+            results.append(
+                {
+                    "ex_dividend_date": str(ex_date),
+                    "cash_amount": cash_f,
+                    "dividend_type": str(r.get("dividend_type") or ""),
+                }
+            )
+        results.sort(key=lambda r: r["ex_dividend_date"])
+        return results
+
+    def get_recent_dividends(self, start_date: str, end_date: str) -> list[dict]:
+        """Fetch ALL cash dividends going ex in ``[start_date, end_date]``.
+
+        Sibling of :meth:`get_recent_splits` — queries the
+        ``/v3/reference/dividends`` endpoint by ``ex_dividend_date`` range
+        WITHOUT a ticker filter, so the whole market's dividends in a window
+        come back in ONE call (the endpoint paginates; we take the first page,
+        ample for a ~2-week window even though dividends are far more frequent
+        than splits — hundreds of names go ex per quarter). This is the
+        one-call-per-window scan the corporate-actions ``sync`` uses to RECORD
+        dividend events into the registry (CRSP-separate: recorded only, never
+        applied to a price store).
+
+        Returns ``[{"ticker": str, "ex_dividend_date": "YYYY-MM-DD",
+        "cash_amount": float, "dividend_type": str}]`` sorted ascending by ex
+        date. Malformed rows (missing ticker / ex date / non-positive cash
+        amount) are skipped; a 403 (free-tier / bad key) returns ``[]`` so the
+        caller degrades gracefully rather than hard-failing the window.
+        """
+        results: list[dict] = []
+        try:
+            data = self._get(
+                "/v3/reference/dividends",
+                params={
+                    "ex_dividend_date.gte": start_date,
+                    "ex_dividend_date.lte": end_date,
+                    "limit": 1000,
+                    "order": "asc",
+                    "sort": "ex_dividend_date",
+                },
+            )
+        except PolygonForbiddenError:
+            return []
+        for r in data.get("results", []) or []:
+            ex_date = r.get("ex_dividend_date")
+            cash = r.get("cash_amount")
+            ticker = r.get("ticker")
+            if not ticker or not ex_date or cash is None:
+                continue
+            try:
+                cash_f = float(cash)
+            except (TypeError, ValueError):
+                continue
+            if cash_f <= 0:
+                continue
+            results.append(
+                {
+                    "ticker": str(ticker),
+                    "ex_dividend_date": str(ex_date),
+                    "cash_amount": cash_f,
+                    "dividend_type": str(r.get("dividend_type") or ""),
+                }
+            )
+        results.sort(key=lambda r: r["ex_dividend_date"])
+        return results
+
     def get_daily_bars(
         self,
         ticker: str,

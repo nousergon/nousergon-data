@@ -46,6 +46,7 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 import split_factor
@@ -61,12 +62,15 @@ __all__ = [
     "STORE_DAILY_CLOSES_ARCHIVE",
     "SyncResult",
     "expected_factor",
+    "dividend_factor",
+    "total_return_series",
     "apply",
     "sync",
     "detect_splits",
     "detect_dividends",
     "detect_renames",
     "splits_from_events",
+    "dividends_from_events",
 ]
 
 # Action types implemented this PR. Dividends/renames are modeled (fields exist)
@@ -192,6 +196,32 @@ class CorporateAction:
             raw=dict(raw or {}),
         )
 
+    @classmethod
+    def from_dividend(
+        cls,
+        ticker: str,
+        ex_date: str,
+        cash_amount: float,
+        dividend_kind: str | None = None,
+        *,
+        source: str = "polygon",
+        raw: dict | None = None,
+    ) -> "CorporateAction":
+        """Build a cash-dividend action; ``action_id`` is derived
+        deterministically from ``(type, ticker, ex_date, cash_amount:kind)`` so
+        two dividends on different ex dates OR different amounts never collide
+        (the ``_detail`` discriminator folds in ``cash_amount``; ``ex_date`` is
+        already in the id payload)."""
+        return cls(
+            type=_TYPE_DIVIDEND,
+            ticker=str(ticker),
+            ex_date=str(ex_date),
+            cash_amount=float(cash_amount),
+            dividend_kind=(str(dividend_kind) if dividend_kind is not None else None),
+            source=source,
+            raw=dict(raw or {}),
+        )
+
     # ── (de)serialization ────────────────────────────────────────────────
     def to_dict(self) -> dict:
         """JSON-serializable view (the registry persists this + audit fields)."""
@@ -287,6 +317,103 @@ def expected_factor(action: CorporateAction) -> float:
     )
 
 
+# ── dividends: total-return factor MATH (CRSP/Barra basis) ───────────────────
+#
+# Dividends are tracked as a SEPARATE total-return series and MUST NOT be folded
+# into the stored split-adjusted price LEVEL (Brian-decided, config#1433). The
+# primitives below compute that distinct series; they NEVER mutate a price store
+# or a feature. PR7 consumes the registry-recorded dividend events to build +
+# persist the total-return series under the new schema — these are the math it
+# will call. Kept here (not in split_factor) because the split factor convention
+# is multiplicative on the price LEVEL whereas a dividend factor is a back-adjust
+# applied to a SEPARATE return series.
+
+
+def dividend_factor(cash_amount: float, close_prev: float) -> float:
+    """The CRSP/yfinance total-return back-adjust factor for one cash dividend.
+
+    A dividend of ``cash_amount`` going ex when the prior close is ``close_prev``
+    back-adjusts every PRE-ex price by ``1 - cash_amount/close_prev`` to build a
+    total-return series (the post-ex price drop by the dividend is "added back"
+    into the pre-ex prices so the series is continuous through the ex-date drop).
+    This is the standard CRSP/Barra adjustment factor; it is applied to a
+    SEPARATE total-return series, never to the stored split-adjusted price level.
+
+    ``close_prev`` must be > 0 (the trading day BEFORE the ex-date). The factor is
+    in ``(0, 1]`` for a normal dividend (``0 < cash_amount < close_prev``).
+    """
+    cash = float(cash_amount)
+    cp = float(close_prev)
+    if not (cp > 0):
+        raise ValueError(
+            f"dividend_factor: close_prev must be > 0, got {close_prev!r}"
+        )
+    return 1.0 - cash / cp
+
+
+def total_return_series(
+    price_df: pd.DataFrame,
+    dividend_actions: list["CorporateAction"],
+    *,
+    close_col: str = "Close",
+) -> pd.Series:
+    """Build a SEPARATE total-return-adjusted close from a (split-adjusted) price
+    series + the dividend events — the CRSP primitive (config#1433).
+
+    ``price_df`` is one ticker's price frame (DatetimeIndex), already on whatever
+    split-adjusted scale the caller maintains. ``dividend_actions`` are the
+    ``type="dividend"`` :class:`CorporateAction`s for that ticker. Returns a NEW
+    ``pd.Series`` (the total-return close); **it does NOT mutate ``price_df``** and
+    is wired into NO store/feature — PR7 consumes it.
+
+    Method (mirrors ``split_factor`` compounding correctness, but on a return
+    series): process dividends OLDEST→NEWEST; for each ex-date E, read the close
+    on the trading day strictly BEFORE E from the RUNNING series, compute
+    ``dividend_factor(cash, close_prev)``, and multiply every row STRICTLY BEFORE
+    E by that factor. Oldest→newest ordering keeps each factor's ``close_prev`` on
+    the un-back-adjusted scale (an earlier dividend only touches rows before its
+    own — earlier — ex-date, which are strictly before this dividend's
+    ``close_prev`` row), so the factors compound multiplicatively exactly like
+    CRSP. Splits and dividends stay INDEPENDENT: ``price_df`` carries the split
+    adjustment on the price level; this returns that series further
+    dividend-adjusted on the SEPARATE total-return axis.
+
+    Dividends whose ex-date is on/before the first row (no earlier row to adjust)
+    contribute nothing and are skipped. The input series order/index is preserved.
+    """
+    if price_df is None or getattr(price_df, "empty", True):
+        return pd.Series(dtype="float64", name="tr_close")
+    if close_col not in price_df.columns:
+        raise KeyError(
+            f"total_return_series: close_col {close_col!r} not in price_df columns "
+            f"{list(price_df.columns)}"
+        )
+    idx = (
+        price_df.index
+        if isinstance(price_df.index, pd.DatetimeIndex)
+        else pd.to_datetime(price_df.index)
+    )
+    # Operate on a private numpy copy so price_df is never mutated; close_prev is
+    # always read from this RUNNING array (the compounding state).
+    vals = price_df[close_col].to_numpy(dtype="float64").copy()
+    ts = pd.DatetimeIndex(idx).normalize().to_numpy()
+
+    divs = [a for a in (dividend_actions or []) if a.type == _TYPE_DIVIDEND]
+    divs.sort(key=lambda a: pd.Timestamp(a.ex_date).normalize())
+    for a in divs:
+        if a.cash_amount is None:
+            continue
+        ex = np.datetime64(pd.Timestamp(a.ex_date).normalize())
+        before = ts < ex
+        if not before.any():
+            continue  # ex-date at/before first row — nothing earlier to adjust
+        prev_pos = int(np.nonzero(before)[0][-1])  # last row strictly before ex
+        factor = dividend_factor(a.cash_amount, vals[prev_pos])
+        vals[before] = vals[before] * factor
+
+    return pd.Series(vals, index=price_df.index, name="tr_close")
+
+
 def apply(
     df: pd.DataFrame,
     actions: list["CorporateAction"],
@@ -340,17 +467,31 @@ def apply(
     if df is None or getattr(df, "empty", True) or not actions:
         return df, applied_results
 
-    # Only splits are restated this PR. A dividend/rename action reaching here
-    # is a caller error (detect_dividends/detect_renames are NotImplemented), so
-    # fail loud rather than silently dropping it.
+    # Only splits mutate the stored PRICE LEVEL. A dividend reaching here is a
+    # caller error: dividends are CRSP-SEPARATE — they are tracked as a distinct
+    # total-return series (see ``dividend_factor`` / ``total_return_series``) and
+    # MUST NOT be folded into the split-adjusted price level ``apply`` restates.
+    # The registry is the dividend persistence layer (``sync`` records them, does
+    # NOT apply them); PR7 consumes the recorded events to build + persist the TR
+    # series under the new schema. So we fail loud rather than ever multiplying a
+    # price by a dividend factor here. Renames are likewise not a price-level
+    # restatement (deferred to a later PR).
     split_actions: list[CorporateAction] = []
     for a in actions:
         if a.type == _TYPE_SPLIT:
             split_actions.append(a)
-        elif a.type in (_TYPE_DIVIDEND, _TYPE_RENAME):
+        elif a.type == _TYPE_DIVIDEND:
             raise NotImplementedError(
-                f"corporate_actions.apply: {a.type!r} actions are deferred to a "
-                "later PR of the program (splits only this PR)"
+                "corporate_actions.apply: dividend actions are CRSP-separate and "
+                "must NOT mutate the split-adjusted price level — use "
+                "total_return_series to build the SEPARATE total-return series "
+                "(sync records dividends to the registry; PR7 persists the TR "
+                "series). Passing a dividend to apply() is a caller error."
+            )
+        elif a.type == _TYPE_RENAME:
+            raise NotImplementedError(
+                "corporate_actions.apply: rename actions are deferred to a later "
+                "PR of the program (splits only mutate the price level here)"
             )
         else:
             raise ValueError(
@@ -434,11 +575,21 @@ class SyncResult:
     * ``notices`` — the subset of ``detected`` that actually restated at least
       one row in at least one store this run (the operator-notification set:
       "the system saw this action and brought the stores onto its scale").
+      SPLITS ONLY — dividends are NEVER notices (CRSP-separate, sub-threshold,
+      and frequent; see ``dividends``).
+    * ``dividends`` — the dividend :class:`CorporateAction`s detected/recorded
+      over the window this run (write-if-absent into the registry). RECORDED
+      ONLY: dividends are CRSP-separate, never applied to a price store, and —
+      because they are frequent (~quarterly × hundreds of names) and cause
+      sub-5% ex-date drops (below the discrepancy ERROR band) — they emit NO
+      per-dividend email/notice (that would be noise). The count feeds the
+      summary log only; PR7 consumes the recorded events to build the TR series.
     """
 
     detected: list = field(default_factory=list)
     applied: dict = field(default_factory=dict)
     notices: list = field(default_factory=list)
+    dividends: list = field(default_factory=list)
 
 
 def _scrub(exc: object) -> str:
@@ -683,6 +834,7 @@ def sync(
     tickers: list[str] | None = None,
     registry: "CorporateActionRegistry | None" = None,
     actions: list | None = None,
+    dividend_actions: list | None = None,
 ) -> SyncResult:
     """Unified corporate-action restatement across ALL ``stores`` (PR4,
     config#1433) — ONE pre-read orchestration entry point so the split-boundary
@@ -708,7 +860,12 @@ def sync(
         per-(action_id, store, date) granularity, with a boundary scale check so
         it can never double-adjust an already-restated parquet.
 
-    Splits-only this PR (dividends/renames are not detected yet). Best-effort +
+    Dividends are ALSO detected + recorded over the window (one extra
+    ``get_recent_dividends`` call, or the reused ``dividend_actions``), but
+    RECORDED ONLY — they are CRSP-separate (tracked as a distinct total-return
+    series, never folded into the price level) and frequent + sub-threshold, so
+    they restate NO store and emit NO per-dividend email/notice; only their
+    count enters the summary. Renames are not detected yet. Best-effort +
     fail-loud: a per-store / per-ticker failure WARNs (apiKey scrubbed) and
     continues — the PRIMARY morning collection must not die because one symbol's
     restatement failed — but the failure is RECORDED (never silently swallowed),
@@ -736,6 +893,36 @@ def sync(
                 a.action_id, _scrub(exc),
             )
         detected.append(a)
+
+    # (a') detect (or reuse) + RECORD dividends — CRSP-separate, RECORDED ONLY.
+    # Dividends never restate a price store (they are tracked as a distinct
+    # total-return series, built later by PR7 from these recorded events) and
+    # never become a notice/email (frequent + sub-5% ex-date drop, below the
+    # discrepancy ERROR band). One extra polygon call (gated like the split scan
+    # — sync is only invoked on the live, non-dry-run path), or the reused
+    # ``dividend_actions`` when the caller already scanned them. A detection miss
+    # degrades to [] inside detect_dividends and must never fail the sync.
+    if dividend_actions is None:
+        try:
+            dividend_actions = detect_dividends(start_str, end_str)
+        except Exception as exc:  # noqa: BLE001 - detection best-effort
+            log.warning(
+                "corporate_actions.sync: dividend detection failed (%s) — "
+                "recording no dividends this run", _scrub(exc),
+            )
+            dividend_actions = []
+    dividends: list = []
+    for a in dividend_actions or []:
+        if a.type != _TYPE_DIVIDEND:
+            continue
+        try:
+            registry.record_detected(a, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - provenance write best-effort
+            log.warning(
+                "corporate_actions.sync: record_detected failed for dividend "
+                "%s (%s)", a.action_id, _scrub(exc),
+            )
+        dividends.append(a)
 
     # Restatement is scoped to the requested ticker universe (when given); the
     # detected/recorded set above is NOT scoped (the discrepancy classifier and
@@ -776,7 +963,9 @@ def sync(
                     restated_action_ids.add(r["action_id"])
 
     notices = [a for a in detected if a.action_id in restated_action_ids]
-    return SyncResult(detected=detected, applied=applied, notices=notices)
+    return SyncResult(
+        detected=detected, applied=applied, notices=notices, dividends=dividends,
+    )
 
 
 def splits_from_events(events: list[dict]) -> list["CorporateAction"]:
@@ -853,11 +1042,85 @@ def detect_splits(
     return splits_from_events(events)
 
 
-def detect_dividends(start_date: str, end_date: str, *, client=None):
-    """Not implemented this PR (modeled fields exist; detection is a later PR)."""
-    raise NotImplementedError(
-        "detect_dividends is deferred to a later PR of the corporate-actions program"
-    )
+def dividends_from_events(events: list[dict]) -> list["CorporateAction"]:
+    """Map polygon ``get_recent_dividends`` event dicts to ``CorporateAction``s.
+
+    Each event is ``{"ticker", "ex_dividend_date", "cash_amount",
+    "dividend_type"}``. Pure transform (no I/O) so callers that already fetched
+    the events can reuse them WITHOUT a second polygon call. Malformed rows
+    (missing ticker / ex date / non-positive cash amount) are skipped — the same
+    discipline ``polygon_client.get_recent_dividends`` applies, re-asserted here
+    so a hand-built event list is also guarded.
+    """
+    actions: list[CorporateAction] = []
+    for ev in events or []:
+        ticker = ev.get("ticker")
+        ex_date = ev.get("ex_dividend_date")
+        cash = ev.get("cash_amount")
+        if not ticker or not ex_date or cash is None:
+            continue
+        try:
+            cash_f = float(cash)
+        except (TypeError, ValueError):
+            continue
+        if cash_f <= 0:
+            continue
+        actions.append(
+            CorporateAction.from_dividend(
+                ticker=str(ticker),
+                ex_date=str(ex_date),
+                cash_amount=cash_f,
+                dividend_kind=ev.get("dividend_type"),
+                source="polygon",
+                raw=dict(ev),
+            )
+        )
+    return actions
+
+
+def detect_dividends(
+    start_date: str,
+    end_date: str,
+    *,
+    client=None,
+) -> list["CorporateAction"]:
+    """Detect all cash dividends going ex in ``[start_date, end_date]`` as
+    ``CorporateAction``s (type="dividend", ex_date = polygon ex_dividend_date,
+    cash_amount + dividend_kind populated).
+
+    Mirrors :func:`detect_splits`: wraps ``polygon_client.get_recent_dividends``
+    (the whole-market, one-call range scan), constructs the client lazily, and
+    DEGRADES GRACEFULLY to ``[]`` on any construction/fetch failure (apiKey
+    scrubbed) — a dividend detection miss must never hard-fail the data
+    pipeline. Dividends are RECORDED ONLY (CRSP-separate): the returned actions
+    feed ``sync``'s registry capture, never a price-store ``apply``.
+    """
+    if client is None:
+        try:
+            from polygon_client import polygon_client
+
+            client = polygon_client()
+        except Exception as exc:  # import / construction failure — degrade
+            from polygon_client import _scrub_api_key
+
+            log.warning(
+                "corporate_actions.detect_dividends: could not obtain polygon "
+                "client (%s) — returning no detected dividends",
+                _scrub_api_key(exc),
+            )
+            return []
+    try:
+        events = client.get_recent_dividends(start_date, end_date)
+    except Exception as exc:
+        from polygon_client import _scrub_api_key
+
+        log.warning(
+            "corporate_actions.detect_dividends: polygon dividend scan failed "
+            "(%s) — returning no detected dividends",
+            _scrub_api_key(exc),
+        )
+        return []
+    return dividends_from_events(events)
 
 
 def detect_renames(start_date: str, end_date: str, *, client=None):

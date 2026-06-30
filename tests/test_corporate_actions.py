@@ -170,9 +170,8 @@ class TestDetectSplits:
         client.get_recent_splits.side_effect = RuntimeError("polygon down")
         assert ca.detect_splits("2026-06-01", "2026-06-30", client=client) == []
 
-    def test_dividends_and_renames_not_implemented(self):
-        with pytest.raises(NotImplementedError):
-            ca.detect_dividends("2026-06-01", "2026-06-30")
+    def test_renames_not_implemented(self):
+        # Dividends are now implemented (PR5); renames remain deferred.
         with pytest.raises(NotImplementedError):
             ca.detect_renames("2026-06-01", "2026-06-30")
 
