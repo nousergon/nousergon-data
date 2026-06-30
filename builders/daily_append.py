@@ -717,6 +717,63 @@ def _build_writer_id() -> str:
     return f"daily_append-{user}-pid{os.getpid()}"
 
 
+def _ensure_history_restated(
+    ticker: str,
+    hist: pd.DataFrame,
+    actions: list,
+    registry,
+    universe_lib,
+    date_str: str,
+) -> pd.DataFrame:
+    """Basis-consistency guard (PR4, config#1433): restate ``ticker``'s FULL
+    ArcticDB history for any registered split NOT yet applied to the universe,
+    BEFORE today's (post-split-scale) row is spliced onto it.
+
+    daily_append appends today's polygon row onto an ArcticDB history that may
+    still be pre-split until Saturday's backfill. The morning ``daily_closes``
+    sync (earlier in the weekday SF) normally restates the universe first, so in
+    steady state ``is_applied`` is already True here and this is a fast no-op.
+    This is the ROBUST backstop for "sync missed/skipped / standalone run": we
+    restate-then-append rather than ever appending onto an un-restated history.
+
+    WRITE-THEN-MARK: the ``arcticdb_universe`` applied marker is the shared
+    exactly-once contract with both ``sync`` and the Saturday backfill — it is
+    written ONLY after the full-history rewrite lands, so a failed rewrite never
+    leaves the marker (and a later read) believing the history is restated when
+    it is not. Returns the (possibly restated) history to splice today's row on.
+    """
+    import corporate_actions as _ca
+
+    pending = [
+        a for a in actions
+        if not registry.is_applied(_ca.STORE_ARCTICDB_UNIVERSE, a.action_id)
+    ]
+    if not pending:
+        return hist
+
+    run_id = f"daily_append:{date_str}"
+    # registry=None ⇒ apply does the math + row counts WITHOUT marking, so the
+    # mark below is strictly write-then-mark.
+    restated, applied = _ca.apply(
+        hist, pending, store=_ca.STORE_ARCTICDB_UNIVERSE, registry=None, run_id=run_id,
+    )
+    n_changed = sum(1 for r in applied if r["n_rows_adjusted"] > 0)
+    if n_changed:
+        log.warning(
+            "daily_append basis-consistency: %s ArcticDB history was NOT yet "
+            "restated for %d registered split(s) (morning sync missed/skipped) "
+            "— restating full history BEFORE append so today's row lands on a "
+            "continuous adjusted scale, not a split-boundary splice (data#1298)",
+            ticker, n_changed,
+        )
+        universe_lib.write(
+            ticker, to_arctic_canonical(restated), prune_previous_versions=True,
+        )
+    for a in pending:
+        registry.mark_applied(a, _ca.STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+    return restated if n_changed else hist
+
+
 def daily_append(
     date_str: str | None = None,
     bucket: str = DEFAULT_BUCKET,
@@ -1199,6 +1256,29 @@ def _daily_append_impl(
     # JSON / unknown types — fail fast before the chunked pass begins).
     block_anomaly_types = _load_block_anomaly_types()
 
+    # ── Corporate-action basis-consistency guard setup (PR4, config#1433) ────
+    # Build the registry + the registered splits grouped by ticker ONCE.
+    # Registry-driven (NO polygon call). In steady state every relevant split is
+    # already applied (the morning sync did it), so the per-ticker guard below is
+    # a cheap ``is_applied`` no-op; it only does work as a backstop when a
+    # symbol's history is somehow still un-restated when we are about to append.
+    ca_registry = None
+    splits_by_ticker: dict[str, list] = {}
+    if not dry_run:
+        try:
+            import corporate_actions as _ca
+
+            ca_registry = _ca.CorporateActionRegistry(s3, bucket)
+            for _action in ca_registry.list_actions(types=["split"]):
+                splits_by_ticker.setdefault(_action.ticker, []).append(_action)
+        except Exception as exc:
+            log.warning(
+                "daily_append: corporate-action registry unavailable (%s) — "
+                "basis-consistency guard inactive this run", exc,
+            )
+            ca_registry = None
+            splits_by_ticker = {}
+
     # ── 4. Chunked universe pass ─────────────────────────────────────────────
     # The full-universe Phase 1+2 in one shot holds ~900 ticker histories in
     # memory simultaneously (~180MB peak resident) — on the 2GB t3.small
@@ -1293,6 +1373,29 @@ def _daily_append_impl(
                 if np.isnan(bar["Close"]):
                     n_skip += 1
                     continue
+
+                # ── basis-consistency guard (PR4, config#1433) ──────────────
+                # Before splicing today's (post-split-scale) row onto this
+                # symbol's history, ensure the history is restated for any
+                # registered split (restate-then-append, never append onto an
+                # un-restated basis). No-op in steady state (morning sync did it).
+                if ca_registry is not None and ticker in splits_by_ticker:
+                    try:
+                        hist = _ensure_history_restated(
+                            ticker, hist, splits_by_ticker[ticker],
+                            ca_registry, universe_lib, date_str,
+                        )
+                        hists_by_ticker[ticker] = hist
+                    except Exception as exc:
+                        # Fail-loud (recorded), but a single symbol's guard
+                        # failure must not abort the whole universe pass; the
+                        # Saturday backfill's BLOCKING audit remains the gate.
+                        log.warning(
+                            "daily_append basis-consistency guard failed for %s "
+                            "(%s) — appending on the existing basis; Saturday "
+                            "backfill audit remains the correctness gate",
+                            ticker, exc,
+                        )
 
                 new_row_data = {col: bar.get(col, np.nan) for col in OHLCV_COLS}
                 # Carry per-row provenance through to the ArcticDB write. Source

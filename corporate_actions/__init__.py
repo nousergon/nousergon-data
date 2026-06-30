@@ -57,8 +57,12 @@ __all__ = [
     "CorporateAction",
     "CorporateActionRegistry",
     "CorporateActionAuditError",
+    "STORE_ARCTICDB_UNIVERSE",
+    "STORE_DAILY_CLOSES_ARCHIVE",
+    "SyncResult",
     "expected_factor",
     "apply",
+    "sync",
     "detect_splits",
     "detect_dividends",
     "detect_renames",
@@ -79,6 +83,24 @@ _TYPE_RENAME = "rename"
 # load of an already-restated series sees the backfill's applied marker and
 # skips, the double-apply guard of PR3 §4).
 STORE_ARCTICDB_UNIVERSE = "arcticdb_universe"
+
+# The per-date ``staging/daily_closes/{date}.parquet`` archive — the second
+# store ``sync`` (PR4, config#1433) restates in place. Unlike the ArcticDB
+# universe (rebuilt from the S3 price cache every Saturday), a daily-closes
+# parquet is a cross-sectional SNAPSHOT (index=ticker, one trading date per
+# file) that CANNOT be re-derived from a raw source on demand inside ``sync``
+# (polygon grouped-daily is rate-limited + best-effort, and the morning
+# pass's own polygon re-fetch is a separate, opportunistic mechanism). So the
+# durable registry ``applied`` marker is the SOLE idempotency guard for this
+# store — and it is recorded at PER-(action_id, store, DATE) granularity
+# (the marker store passed to the registry is ``f"{STORE_DAILY_CLOSES_ARCHIVE}
+# /{date}"``), NOT a single per-(action_id, store) marker. Rationale: the live
+# window slides forward and a per-date parquet can ENTER the affected set on a
+# later run (a missing/late date materializes); a coarse per-store marker would
+# then skip that newly-present parquet and leave a split-boundary discontinuity
+# in it. A per-date marker guarantees each parquet is restated exactly once,
+# whenever it first appears, regardless of when the others were done.
+STORE_DAILY_CLOSES_ARCHIVE = "daily_closes_archive"
 
 
 class CorporateActionAuditError(RuntimeError):
@@ -382,6 +404,379 @@ def apply(
             registry.mark_applied(a, store, run_id=run_id)
 
     return restated, applied_results
+
+
+# ── sync: unified, pre-read orchestration across ALL stores (PR4, config#1433) ─
+
+# Price / volume columns a daily-closes archive parquet carries that a split
+# restates (mirrors split_factor.restate_series_for_splits' defaults; only the
+# columns actually present in a given parquet are touched).
+_ARCHIVE_PRICE_COLS = ("Open", "High", "Low", "Close", "VWAP", "Adj_Close")
+_ARCHIVE_VOLUME_COLS = ("Volume",)
+# Relative tolerance for the daily-closes archive SCALE VERIFICATION (old vs
+# already-restated). Splits are integer ratios (factor <= 0.5 or >= 2), so the
+# observed pre→post boundary ratio is either ~factor (un-restated) or ~1.0
+# (already restated) — both well separated from each other, so a generous tol
+# absorbs multi-day price drift without confusing the two regimes.
+_ARCHIVE_SCALE_REL_TOL = 0.15
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    """Summary returned by :func:`sync`.
+
+    * ``detected`` — the split :class:`CorporateAction`s detected/recorded over
+      the window this run (write-if-absent into the registry).
+    * ``applied`` — ``{store: [apply_result_dict, ...]}``; each dict carries
+      ``action_id`` / ``store`` / ``ticker`` / ``n_rows_adjusted`` / ``factor``
+      / ``status`` (``"applied"`` | ``"noop"`` | ``"skipped"``) plus, for the
+      daily-closes archive, a ``date``.
+    * ``notices`` — the subset of ``detected`` that actually restated at least
+      one row in at least one store this run (the operator-notification set:
+      "the system saw this action and brought the stores onto its scale").
+    """
+
+    detected: list = field(default_factory=list)
+    applied: dict = field(default_factory=dict)
+    notices: list = field(default_factory=list)
+
+
+def _scrub(exc: object) -> str:
+    """Scrub a polygon apiKey from an exception/text before logging (lazy import
+    so ``corporate_actions`` stays free of a hard ``polygon_client`` dep)."""
+    try:
+        from polygon_client import _scrub_api_key
+
+        return _scrub_api_key(exc)
+    except Exception:  # noqa: BLE001 - logging-path fallback, never raise
+        return str(exc)
+
+
+def _sync_arcticdb_universe(
+    bucket: str, ticker: str, actions: list, registry, run_id: str | None,
+) -> list[dict]:
+    """Mid-week restatement of ONE ArcticDB universe symbol (the gap PR4 closes).
+
+    Reads the symbol's FULL series, restates every not-yet-applied split via the
+    shared :func:`apply` math, and rewrites it so daily-appended rows land on a
+    continuous adjusted scale BEFORE ``daily_append`` reads (today the universe
+    history is only restated at Saturday backfill, so the split-boundary
+    discontinuity re-forms mid-week).
+
+    WRITE-THEN-MARK: the registry ``applied`` marker is the contract
+    ``builders/daily_append.py``'s basis-consistency guard trusts to mean "the
+    ArcticDB history is on the restated scale". So the marker is written ONLY
+    after the ``lib.write`` actually lands — a mark-before-write would let a
+    failed rewrite leave daily_append appending onto an un-restated history
+    (the exact corruption this arc prevents). We therefore drive ``apply`` with
+    ``registry=None`` (math + is_applied skip handled here) and mark explicitly.
+    """
+    from store.arctic_store import get_universe_lib, to_arctic_canonical
+
+    lib = get_universe_lib(bucket)
+    try:
+        df = lib.read(ticker).data
+    except Exception as exc:  # noqa: BLE001 - symbol absent ⇒ nothing to restate
+        log.info(
+            "corporate_actions.sync: %s not in ArcticDB universe — no arctic "
+            "restate (%s)", ticker, _scrub(exc),
+        )
+        return []
+
+    results: list[dict] = []
+    pending: list = []
+    for a in actions:
+        if registry is not None and registry.is_applied(STORE_ARCTICDB_UNIVERSE, a.action_id):
+            results.append({
+                "action_id": a.action_id, "store": STORE_ARCTICDB_UNIVERSE,
+                "ticker": ticker, "n_rows_adjusted": 0,
+                "factor": expected_factor(a), "status": "noop",
+            })
+        else:
+            pending.append(a)
+    if not pending:
+        return results
+
+    # registry=None: compute the restatement + per-action row counts WITHOUT
+    # marking, so the mark below is strictly write-then-mark.
+    restated, applied_math = apply(
+        df, pending, store=STORE_ARCTICDB_UNIVERSE, registry=None, run_id=run_id,
+    )
+    if any(r["n_rows_adjusted"] > 0 for r in applied_math):
+        lib.write(ticker, to_arctic_canonical(restated), prune_previous_versions=True)
+    if registry is not None:
+        for a in pending:
+            registry.mark_applied(a, STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+    for r in applied_math:
+        r = dict(r)
+        r["ticker"] = ticker
+        results.append(r)
+    return results
+
+
+def _read_archive_parquet(s3, bucket: str, prefix: str, date: str):
+    """Read ``{prefix}{date}.parquet`` (index=ticker) or ``None`` if absent."""
+    import io
+
+    key = f"{prefix}{date}.parquet"
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception:  # noqa: BLE001 - missing / unreadable ⇒ caller skips date
+        return None
+    try:
+        return pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+    except Exception as exc:  # noqa: BLE001 - corrupt parquet ⇒ skip, never crash
+        log.warning(
+            "corporate_actions.sync: could not read %s (%s) — skipping date",
+            key, _scrub(exc),
+        )
+        return None
+
+
+def _write_archive_parquet(s3, bucket: str, prefix: str, date: str, df) -> None:
+    import io
+
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", compression="snappy", index=True)
+    buf.seek(0)
+    s3.put_object(
+        Bucket=bucket, Key=f"{prefix}{date}.parquet", Body=buf.getvalue(),
+        ContentType="application/octet-stream",
+    )
+
+
+def _classify_archive_scale(c_candidate, c_post, factor: float) -> str:
+    """Is the candidate row on the OLD (pre-split) or already-restated scale?
+
+    Uses the post-split reference close ``c_post`` (a window date on/after the
+    ex date, definitionally on the current scale). The observed boundary ratio
+    ``c_post / c_candidate`` is ~``factor`` when the candidate is un-restated and
+    ~``1.0`` once it has been lifted onto the post-split scale. Returns
+    ``"old"`` | ``"new"`` | ``"unknown"`` (the last when no reference is
+    available or the ratio is ambiguous — in which case ``sync`` conservatively
+    declines to multiply, leaving the morning polygon re-fetch / Saturday
+    backfill as the heal, so it can NEVER double-apply onto an already-restated
+    parquet — the only-the-marker-guards-this-store risk).
+    """
+    try:
+        cc = float(c_candidate)
+        cp = float(c_post)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not (cc > 0 and cp > 0 and factor > 0):
+        return "unknown"
+    ratio = cp / cc
+    if abs(ratio - factor) <= _ARCHIVE_SCALE_REL_TOL * factor:
+        return "old"
+    if abs(ratio - 1.0) <= _ARCHIVE_SCALE_REL_TOL:
+        return "new"
+    return "unknown"
+
+
+def _sync_daily_closes_archive(
+    s3, bucket: str, ticker: str, actions: list, window_dates: list[str],
+    registry, run_id: str | None, *, prefix: str = "staging/daily_closes/",
+) -> list[dict]:
+    """Restate ONE ticker's rows across the affected daily-closes archive
+    parquets in the live window — in place, per-date, idempotently.
+
+    Idempotency is PURELY registry-marker driven (a per-date parquet cannot be
+    re-derived from a raw source here), at PER-(action_id, store, DATE)
+    granularity. To stay safe against the morning pass's SEPARATE polygon
+    re-fetch (which also restates touched dates, via ``adjusted=true``), every
+    multiply is gated on a boundary SCALE VERIFICATION
+    (:func:`_classify_archive_scale`): a parquet already on the post-split scale
+    is NOT multiplied (only marked) — so neither a sync re-run NOR an
+    independent polygon re-fetch can double-adjust it. WRITE-THEN-MARK as well.
+    """
+    from split_factor import restate_series_for_splits
+
+    results: list[dict] = []
+    wdates = sorted(window_dates)
+    for a in actions:
+        ex = pd.Timestamp(a.ex_date).normalize()
+        factor = expected_factor(a)
+        affected = [d for d in wdates if pd.Timestamp(d).normalize() < ex]
+        post_dates = [d for d in wdates if pd.Timestamp(d).normalize() >= ex]
+        # Post-split reference close for scale verification (earliest on/after ex).
+        c_post = None
+        for pd_date in post_dates:
+            post_df = _read_archive_parquet(s3, bucket, prefix, pd_date)
+            if post_df is not None and ticker in post_df.index and "Close" in post_df.columns:
+                c_post = post_df.at[ticker, "Close"]
+                break
+        for d in affected:
+            store_d = f"{STORE_DAILY_CLOSES_ARCHIVE}/{d}"
+            if registry is not None and registry.is_applied(store_d, a.action_id):
+                results.append({
+                    "action_id": a.action_id, "store": STORE_DAILY_CLOSES_ARCHIVE,
+                    "ticker": ticker, "date": d, "n_rows_adjusted": 0,
+                    "factor": factor, "status": "noop",
+                })
+                continue
+            df_d = _read_archive_parquet(s3, bucket, prefix, d)
+            if df_d is None or ticker not in df_d.index or "Close" not in df_d.columns:
+                # Parquet missing / ticker absent — nothing to restate (and do
+                # NOT mark, so a later run re-checks once it materializes).
+                continue
+            scale = _classify_archive_scale(df_d.at[ticker, "Close"], c_post, factor)
+            if scale == "old":
+                cols = [
+                    c for c in (*_ARCHIVE_PRICE_COLS, *_ARCHIVE_VOLUME_COLS)
+                    if c in df_d.columns
+                ]
+                tmp = df_d.loc[[ticker], cols].copy()
+                tmp.index = pd.DatetimeIndex([pd.Timestamp(d)])
+                ev = [{
+                    "execution_date": a.ex_date,
+                    "split_from": a.split_from, "split_to": a.split_to,
+                }]
+                restated_tmp = restate_series_for_splits(tmp, ev)
+                for col in cols:
+                    df_d.at[ticker, col] = restated_tmp.iloc[0][col]
+                _write_archive_parquet(s3, bucket, prefix, d, df_d)
+                if registry is not None:
+                    registry.mark_applied(a, store_d, run_id=run_id)
+                results.append({
+                    "action_id": a.action_id, "store": STORE_DAILY_CLOSES_ARCHIVE,
+                    "ticker": ticker, "date": d, "n_rows_adjusted": 1,
+                    "factor": factor, "status": "applied",
+                })
+            elif scale == "new":
+                # Already on the post-split scale (e.g. the morning polygon
+                # re-fetch restated it on a prior run) — record the marker so we
+                # don't re-examine, but DO NOT multiply.
+                if registry is not None:
+                    registry.mark_applied(a, store_d, run_id=run_id)
+                results.append({
+                    "action_id": a.action_id, "store": STORE_DAILY_CLOSES_ARCHIVE,
+                    "ticker": ticker, "date": d, "n_rows_adjusted": 0,
+                    "factor": factor, "status": "noop",
+                })
+            else:
+                # Unverifiable scale (no reference / ambiguous ratio) — decline to
+                # multiply (cannot prove old-scale ⇒ refuse to risk a double
+                # adjust). Leave UN-marked; the morning polygon re-fetch / Saturday
+                # backfill remain the heal. Recorded, not silently dropped.
+                log.warning(
+                    "corporate_actions.sync: cannot verify %s %s scale on %s "
+                    "(no post-split reference in window) — skipping archive "
+                    "restate, leaving heal to polygon re-fetch / backfill",
+                    ticker, a.human(), d,
+                )
+                results.append({
+                    "action_id": a.action_id, "store": STORE_DAILY_CLOSES_ARCHIVE,
+                    "ticker": ticker, "date": d, "n_rows_adjusted": 0,
+                    "factor": factor, "status": "skipped",
+                })
+    return results
+
+
+def sync(
+    s3,
+    bucket: str,
+    start_date,
+    end_date,
+    *,
+    stores: list[str],
+    run_id: str,
+    tickers: list[str] | None = None,
+    registry: "CorporateActionRegistry | None" = None,
+    actions: list | None = None,
+) -> SyncResult:
+    """Unified corporate-action restatement across ALL ``stores`` (PR4,
+    config#1433) — ONE pre-read orchestration entry point so the split-boundary
+    discontinuity is flattened BEFORE any consumer reads.
+
+    (a) Detects splits over ``[start_date, end_date]`` (or REUSES the
+    already-detected ``actions`` — the morning collector passes both its
+    ``registry`` and the splits it already scanned, so ``sync`` adds NO extra
+    polygon call) and records each write-if-absent. (b) For each detected split
+    and each requested store, restates the affected ticker(s) — SKIPPING any
+    ``(action, store)`` the registry already marks applied — and marks applied.
+    (c) Returns a :class:`SyncResult` summary.
+
+    Per-store topology:
+
+      * ``STORE_ARCTICDB_UNIVERSE`` — read the symbol's full series, restate via
+        the shared :func:`apply` math, write back (the mid-week restatement that
+        keeps daily-appended rows consistent; idempotent vs the Saturday
+        backfill via the shared ``arcticdb_universe`` applied marker — backfill
+        sees ``is_applied=True`` and will not re-apply, per PR3 §4).
+      * ``STORE_DAILY_CLOSES_ARCHIVE`` — restate the per-date archive parquets in
+        the live window in place; idempotency is registry-marker-only, at
+        per-(action_id, store, date) granularity, with a boundary scale check so
+        it can never double-adjust an already-restated parquet.
+
+    Splits-only this PR (dividends/renames are not detected yet). Best-effort +
+    fail-loud: a per-store / per-ticker failure WARNs (apiKey scrubbed) and
+    continues — the PRIMARY morning collection must not die because one symbol's
+    restatement failed — but the failure is RECORDED (never silently swallowed),
+    and the blocking backfill audit (PR3 §3) remains the train-write correctness
+    gate.
+    """
+    start_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+    end_str = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+    if registry is None:
+        registry = CorporateActionRegistry(s3, bucket)
+
+    # (a) detect (or reuse) + record write-if-absent.
+    if actions is None:
+        actions = detect_splits(start_str, end_str)
+    ticker_set = set(tickers) if tickers is not None else None
+    detected: list = []
+    for a in actions:
+        if a.type != _TYPE_SPLIT:
+            continue
+        try:
+            registry.record_detected(a, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - provenance write best-effort
+            log.warning(
+                "corporate_actions.sync: record_detected failed for %s (%s)",
+                a.action_id, _scrub(exc),
+            )
+        detected.append(a)
+
+    # Restatement is scoped to the requested ticker universe (when given); the
+    # detected/recorded set above is NOT scoped (the discrepancy classifier and
+    # provenance trail want every detected action).
+    by_ticker: dict[str, list] = {}
+    for a in detected:
+        if ticker_set is not None and a.ticker not in ticker_set:
+            continue
+        by_ticker.setdefault(a.ticker, []).append(a)
+
+    window_dates = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start_str, end_str)]
+
+    applied: dict[str, list] = {store: [] for store in stores}
+    restated_action_ids: set[str] = set()
+    for store in stores:
+        for ticker, tactions in by_ticker.items():
+            try:
+                if store == STORE_ARCTICDB_UNIVERSE:
+                    res = _sync_arcticdb_universe(
+                        bucket, ticker, tactions, registry, run_id,
+                    )
+                elif store == STORE_DAILY_CLOSES_ARCHIVE:
+                    res = _sync_daily_closes_archive(
+                        s3, bucket, ticker, tactions, window_dates, registry, run_id,
+                    )
+                else:
+                    raise ValueError(f"corporate_actions.sync: unknown store {store!r}")
+            except Exception as exc:  # noqa: BLE001 - per-store/ticker degrade
+                log.warning(
+                    "corporate_actions.sync: restate failed for store=%s "
+                    "ticker=%s (%s) — continuing; backfill audit remains the "
+                    "correctness gate", store, ticker, _scrub(exc),
+                )
+                continue
+            applied[store].extend(res)
+            for r in res:
+                if r.get("status") == "applied" and r.get("n_rows_adjusted", 0) > 0:
+                    restated_action_ids.add(r["action_id"])
+
+    notices = [a for a in detected if a.action_id in restated_action_ids]
+    return SyncResult(detected=detected, applied=applied, notices=notices)
 
 
 def splits_from_events(events: list[dict]) -> list["CorporateAction"]:
