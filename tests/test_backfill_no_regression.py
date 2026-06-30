@@ -173,7 +173,7 @@ def test_full_backfill_calls_apply_daily_delta():
     universe_lib = MagicMock()
     macro_lib = MagicMock()
 
-    delta_mock = MagicMock(side_effect=lambda s3, b, d, pd_: (pd_, set()))
+    delta_mock = MagicMock(side_effect=lambda s3, b, d, pd_, **_kw: (pd_, set()))
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
          patch.object(_bf, "_apply_daily_delta", delta_mock), \
@@ -210,7 +210,7 @@ def test_full_backfill_calls_regression_preflight():
     regression_mock = MagicMock()
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
-         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_, **_kw: (pd_, set())), \
          patch.object(_bf, "_assert_no_arctic_regression", regression_mock), \
          patch.object(_bf, "_load_current_constituents", return_value=set(price_data.keys())), \
          patch.object(_bf, "_extract_macro_series", return_value={}), \
@@ -246,7 +246,7 @@ def test_ticker_filter_skips_regression_preflight():
     regression_mock = MagicMock()
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
-         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_, **_kw: (pd_, set())), \
          patch.object(_bf, "_assert_no_arctic_regression", regression_mock), \
          patch.object(_bf, "_load_current_constituents", return_value=set(price_data.keys())), \
          patch.object(_bf, "_extract_macro_series", return_value={}), \
@@ -315,7 +315,7 @@ def test_backfill_skips_tickers_absent_from_constituents():
     macro_lib = MagicMock()
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
-         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_, **_kw: (pd_, set())), \
          patch.object(_bf, "_assert_no_arctic_regression"), \
          patch.object(_bf, "_load_current_constituents",
                       return_value={"AAPL", "MSFT"}), \
@@ -356,7 +356,7 @@ def test_backfill_hard_fails_when_constituents_load_fails():
     price_data = {"AAPL": _ohlcv("2024-01-01", n=400)}
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
-         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_, **_kw: (pd_, set())), \
          patch.object(_bf, "_assert_no_arctic_regression"), \
          patch.object(_bf, "_load_current_constituents",
                       side_effect=RuntimeError("S3 503")), \

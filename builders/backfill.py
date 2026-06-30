@@ -43,7 +43,8 @@ from features.compute import (
     _SKIP_TICKERS,
     _UNIVERSE_EXTRA,
     _apply_daily_delta,
-    audit_split_jumps,
+    _build_registry,
+    audit_action_jumps,
     _is_sector_etf,
     _load_parquet_from_s3,
     _load_sector_map,
@@ -51,6 +52,7 @@ from features.compute import (
     _load_cached_alternative,
     make_source_series,
 )
+from corporate_actions import CorporateActionAuditError
 from store.arctic_store import (
     OHLCV_COLS as _CANONICAL_OHLCV_COLS,
     PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
@@ -385,28 +387,47 @@ def backfill(
     # ``features/compute.py::_apply_daily_delta`` so both feature-snapshot and
     # backfill share the same freshness semantics.
     if not dry_run:
-        price_data, split_tickers = _apply_daily_delta(s3, bucket, today_str, price_data)
+        # Shared registry: the same instance drives detection/restatement in
+        # ``_apply_daily_delta`` AND the post-condition audit below, so the
+        # audit sees this run's just-detected actions.
+        registry = _build_registry(s3, bucket)
+        price_data, split_tickers = _apply_daily_delta(
+            s3, bucket, today_str, price_data, registry=registry,
+        )
         if split_tickers:
-            # data#1298: these tickers had a split detected and their FULL
-            # history restated by the polygon-authoritative factor before the
-            # full-series ``lib.write`` below, so ArcticDB is rewritten on one
-            # continuous adjusted scale (train == serve), not windowed-patched.
+            # data#1298: these tickers had a registered split detected and their
+            # FULL history restated by the polygon-authoritative factor before
+            # the full-series ``lib.write`` below, so ArcticDB is rewritten on
+            # one continuous adjusted scale (train == serve), not windowed.
             log.info(
                 "Split restatement applied to %d ticker(s) before ArcticDB "
                 "rewrite (data#1298): %s",
                 len(split_tickers), sorted(split_tickers),
             )
 
-        # Standing split-jump audit guard (data#1298): a residual >45% daily
-        # move means a split slipped past restatement. Surface it loudly so the
-        # discontinuity can't land in ArcticDB silently.
-        residual = audit_split_jumps(price_data)
-        if residual:
-            log.error(
-                "Split-jump audit: %d ticker(s) STILL carry an un-restated "
-                ">45%% daily move after delta+restate (data#1298) — investigate "
-                "/ re-restate before downstream training: %s",
-                len(residual), {t: residual[t] for t in sorted(residual)[:20]},
+        # BLOCKING, registry-aware split-jump audit (PR3 §3, config#1433): the
+        # post-condition on the materialized series, evaluated BEFORE any
+        # ``lib.write``. A residual jump that a registered action EXPLAINS is a
+        # MISSED restatement of a KNOWN action (data#1298 corruption) → RAISE so
+        # the discontinuity cannot land in ArcticDB. A residual with NO
+        # registered action is SUSPECTED (legit large move / polygon-missed) →
+        # WARN and proceed (a real ±33% move must not halt training).
+        audit = audit_action_jumps(price_data, registry)
+        if audit.suspected:
+            log.warning(
+                "Split-jump audit: %d ticker(s) carry a SUSPECTED large move "
+                "with NO registered action (legitimate move or polygon-missed) "
+                "— proceeding, not blocking: %s",
+                len(audit.suspected),
+                {t: audit.suspected[t] for t in sorted(audit.suspected)[:20]},
+            )
+        if audit.missed:
+            raise CorporateActionAuditError(
+                f"Split-jump audit: {len(audit.missed)} ticker(s) STILL carry "
+                f"an un-flattened KNOWN registered split (data#1298) after "
+                f"delta+restate — refusing to write the discontinuity to "
+                f"ArcticDB: "
+                f"{ {t: audit.missed[t] for t in sorted(audit.missed)[:20]} }"
             )
 
     macro = _extract_macro_series(price_data)
