@@ -205,6 +205,14 @@ class TickerOutcome:
     error: str | None = None
     written: bool = False
     new_df: pd.DataFrame | None = field(default=None, repr=False)
+    # Splits the feed reported but ``corporate_actions.apply`` declined to
+    # apply because the raw close shows no corroborating price move
+    # (config#1455 price-evidence gate) — human-readable ``"TICKER ratio
+    # (ex_date)"`` strings. Surfaced explicitly in the audit report so an
+    # out-of-tol reconciliation residual caused by a feed-reported-but-
+    # unconfirmed split is diagnosed as exactly that, not a generic
+    # "missing/doubled/mis-ratio'd" guess.
+    unconfirmed_splits: list[str] = field(default_factory=list)
 
 
 # ── raw price fetch (yfinance auto_adjust=False) ──────────────────────────────
@@ -687,9 +695,23 @@ def migrate_universe_crsp_basis(
             split_actions = ca.get_splits(ticker, client=client)
             dividend_actions = ca.get_dividends(ticker, client=client)
 
-            new_df, _applied = reconstruct_basis(
+            new_df, applied = reconstruct_basis(
                 ticker, raw_df, split_actions, dividend_actions,
             )
+            unconfirmed_splits = [
+                f"{ticker} {a.human()} ({a.ex_date})"
+                for a in split_actions
+                if any(
+                    r.get("action_id") == a.action_id and r.get("status") == "unconfirmed"
+                    for r in applied
+                )
+            ]
+            if unconfirmed_splits:
+                log.warning(
+                    "%s: %d feed-reported split(s) NOT applied — no "
+                    "corroborating price move (config#1455): %s",
+                    ticker, len(unconfirmed_splits), unconfirmed_splits,
+                )
 
             rec = reconcile_total_return(
                 ticker,
@@ -708,6 +730,7 @@ def migrate_universe_crsp_basis(
                 n_rows=len(new_df),
                 n_splits=len(split_actions),
                 n_dividends=len(dividend_actions),
+                unconfirmed_splits=unconfirmed_splits,
             )
 
             if apply:
@@ -742,6 +765,7 @@ def migrate_universe_crsp_basis(
     errors: list[dict] = []
     no_old_close: list[str] = []
     fetch_empty: list[str] = []
+    unconfirmed_splits: list[str] = []
     written = 0
 
     for o in outcomes:
@@ -754,6 +778,8 @@ def migrate_universe_crsp_basis(
         elif o.outcome == "error":
             errors.append({"ticker": o.ticker, "error": o.error})
             log.error("CRSP migration error for %s: %s", o.ticker, o.error)
+        if o.unconfirmed_splits:
+            unconfirmed_splits.extend(o.unconfirmed_splits)
 
     # ── WRITE scratch (apply) — only after all reconciliations computed ───────
     if apply:
@@ -809,6 +835,7 @@ def migrate_universe_crsp_basis(
         "no_old_close_count": len(no_old_close),
         "fetch_empty_count": len(fetch_empty),
         "errors_count": len(errors),
+        "unconfirmed_splits_count": len(unconfirmed_splits),
         "written_count": written,
         "elapsed_seconds": round(elapsed, 1),
         "workers": workers,
@@ -816,6 +843,15 @@ def migrate_universe_crsp_basis(
         "unexplained": [r.to_dict() for r in unexplained],
         "no_old_close": no_old_close,
         "fetch_empty": fetch_empty,
+        # Feed-reported splits corporate_actions.apply declined to apply (no
+        # corroborating price move — config#1455). NOT applied to Close/
+        # total_return_close for these tickers, so an out-of-tol residual on
+        # one of these names is diagnosed as exactly this, not a generic
+        # "missing/doubled/mis-ratio'd" guess. Still counted in the ticker's
+        # n_splits; does NOT by itself fail the run (the reconciliation gate
+        # is the actual pass/fail signal — a name whose feed-reported split
+        # was correctly withheld may still reconcile within_tol).
+        "unconfirmed_splits": unconfirmed_splits,
         "errors": errors,
         "known_divergence_tickers": sorted(known_divergence_tickers),
     }
@@ -826,11 +862,11 @@ def migrate_universe_crsp_basis(
     log.info(
         "migrate_universe_crsp_basis: applied=%s reconcile_start=%s targets=%d "
         "reconciled=%d within_tol=%d out_of_tol=%d no_overlap=%d unexplained=%d "
-        "errors=%d written=%d in_window_dates=%d excluded_pre_window_dates=%d "
-        "elapsed=%.1fs",
+        "errors=%d unconfirmed_splits=%d written=%d in_window_dates=%d "
+        "excluded_pre_window_dates=%d elapsed=%.1fs",
         apply, reconcile_start, len(targets), len(records), len(within_tol),
-        len(out_of_tol), len(no_overlap), len(unexplained), len(errors), written,
-        total_in_window, total_excluded, elapsed,
+        len(out_of_tol), len(no_overlap), len(unexplained), len(errors),
+        len(unconfirmed_splits), written, total_in_window, total_excluded, elapsed,
     )
 
     # ── FAIL LOUD ─────────────────────────────────────────────────────────────
