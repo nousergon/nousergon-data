@@ -52,13 +52,21 @@ class TestGatePresenceAndShape:
 
 
 class TestEntryEdgesRouteThroughGates:
-    def test_mutex_paths_enter_post_market_gate(self, states):
-        # All three entries to PostMarketData now go through the gate.
-        assert states["CheckMutexRole"]["Default"] == "CheckSkipPostMarketData"
-        assert states["AcquireMutex"]["Next"] == "CheckSkipPostMarketData"
+    def test_mutex_paths_enter_instance_start_then_post_market_gate(self, states):
+        # 2026-06-30: all three post-mutex entries now go through the
+        # StartTradingInstance re-runnability guard first, which — once the box
+        # is SSM-Online — converges on the CheckSkipPostMarketData rerun-gate
+        # chain. (The ensure-running block is pinned in detail by
+        # test_sf_eod_instance_start_wiring.py.)
+        assert states["CheckMutexRole"]["Default"] == "StartTradingInstance"
+        assert states["AcquireMutex"]["Next"] == "StartTradingInstance"
         failopen = [c["Next"] for c in states["AcquireMutex"]["Catch"]
                     if "States.ALL" in c["ErrorEquals"]]
-        assert failopen == ["CheckSkipPostMarketData"]
+        assert failopen == ["StartTradingInstance"]
+        # The ensure-running block's SSM-ready path must land on the first gate.
+        online = [c["Next"] for c in states["SSMReadyChoice"]["Choices"]
+                  if any(x.get("StringEquals") == "Online" for x in c.get("And", []))]
+        assert online == ["CheckSkipPostMarketData"]
 
     def test_post_market_success_enters_arctic_append_gate(self, states):
         succ = [c["Next"] for c in states["CheckPostMarketStatus"]["Choices"]

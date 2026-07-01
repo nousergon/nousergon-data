@@ -458,6 +458,16 @@ class TestEODSFTopLevelFieldsClosed:
             "skip_capture_snapshot",
             "skip_eod_reconcile",
             "skip_daily_substrate_health_check",
+            # StartTradingInstance re-runnability guard (2026-06-30) —
+            # ec2:startInstances emits $.ec2_start_result; the SSM-readiness
+            # poll emits $.ssm_describe_result (describeInstanceInformation) and
+            # $.ssm_poll (bounded attempts counter). Ensures the box is up +
+            # SSM-Online before the first sendCommand, so an operator recovery
+            # rerun after the prior run's ForceStopInstance no longer dies with
+            # Ssm.InvalidInstanceIdException.
+            "ec2_start_result",
+            "ssm_describe_result",
+            "ssm_poll",
         }
     )
 

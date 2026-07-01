@@ -77,11 +77,14 @@ CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run"}
 FORMER_FIRST_STATE_BY_SF = {
     "saturday": ("step_function.json", "CheckShellRun"),
     "weekday": ("step_function_daily.json", "DeployDriftCheck"),
-    # L4607: the EOD SF's first post-mutex state is now the per-task rerun
-    # gate CheckSkipPostMarketData (whose Default runs PostMarketData), not
-    # PostMarketData directly. The mutex still routes to the pipeline's first
-    # work state — that state is just the skip-gate now.
-    "eod": ("step_function_eod.json", "CheckSkipPostMarketData"),
+    # 2026-06-30: the EOD SF's first post-mutex state is now the re-runnability
+    # guard StartTradingInstance (ec2:startInstances → SSM-readiness poll), which
+    # then flows into the CheckSkipPostMarketData rerun-gate chain. Inserted
+    # because an operator recovery rerun landed on a stopped instance (the prior
+    # run's ForceStopInstance) and the first ssm:sendCommand died with
+    # Ssm.InvalidInstanceIdException. The mutex still routes to the pipeline's
+    # first post-mutex work state — that state is just the ensure-running gate now.
+    "eod": ("step_function_eod.json", "StartTradingInstance"),
 }
 
 
