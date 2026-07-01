@@ -31,6 +31,7 @@ import index  # noqa: E402
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+GROOM_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch"
 UNREGISTERED_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:some-other-pipeline"
 
 
@@ -364,6 +365,72 @@ def test_pat_never_appears_in_result(monkeypatch):
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
     assert "ghp_SECRET_TOKEN" not in json.dumps(result)
+
+
+def test_groom_failure_never_dispatches_even_when_globally_enabled(monkeypatch):
+    """config#1535 regression guard: groom has has_listener=False, so even with
+    the global AGENT_DISPATCH_ENABLED kill-switch on, no repository_dispatch
+    fires for it — no workflow listens for `groom-sf-failure` yet, so firing
+    one would be a wasted call misrepresented as real remediation."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
+    assert result["action"] == "observe"
+    assert fired["called"] is False  # no HTTP call attempted at all
+
+
+def test_groom_telegram_never_claims_autonomous_fix(monkeypatch):
+    """The Telegram receipt must say 'observe-only for this pipeline', never
+    'autonomous fix ACTIVE', even with the global flag on — the 2026-07-01
+    bug this fixes was exactly this false claim for groom."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "Fleet-SF Watch — OBSERVE" in text
+    assert "Backlog Groom SF: FAILED" in text
+    assert "autonomous fix ACTIVE" not in text
+    assert "observe-only for this pipeline" in text
+
+
+def test_groom_watch_log_records_has_listener_false(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
+    written = json.loads(s3.put_object.call_args.kwargs["Body"])
+    event = written["events"][-1]
+    assert event["has_listener"] is False
+    assert event["action"] == "observe"
+    assert event["agent_dispatch_enabled"] is True  # global flag recorded as-is, for audit
+
+
+def test_saturday_still_dispatches_normally_alongside_groom_fix(monkeypatch):
+    """Non-regression: the has_listener plumbing must not change behavior for
+    the 3 trading pipelines, which all default has_listener=True."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=SATURDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
 
 
 def _deploy_sh_rule_arns() -> set[str]:
