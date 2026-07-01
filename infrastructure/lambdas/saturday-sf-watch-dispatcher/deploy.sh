@@ -131,8 +131,9 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge rule: terminal-failure statuses of ANY of the three fleet SFs.
-  # One rule, one target — keep the ARN list in lockstep with index.PIPELINES.
+  # EventBridge rule: terminal-failure statuses of ANY of the four registered
+  # SFs (3 trading pipelines + the groom dispatch SF, config#1472). One rule,
+  # one target — keep the ARN list in lockstep with index.PIPELINES.
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -143,7 +144,8 @@ if $BOOTSTRAP; then
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-dispatch"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }
@@ -153,7 +155,7 @@ EOF
   run aws events put-rule \
     --name "${RULE_NAME}" \
     --event-pattern "${EVENT_PATTERN}" \
-    --description "Fleet SF (saturday/weekday/eod) terminal failure → sf-watch-dispatcher" \
+    --description "Fleet SF (saturday/weekday/eod/groom) terminal failure → sf-watch-dispatcher" \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 

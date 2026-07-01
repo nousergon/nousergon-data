@@ -1,0 +1,141 @@
+{
+  "Comment": "Backlog groom dispatch (config#1472) — wraps the EventBridge Scheduler -> Lambda -> EC2-spot-via-SSM dispatch chain in a Step Function so the fleet's existing Fleet-SF Watch resilience/observability agent covers groom runs the SAME way it covers the Saturday/weekday/EOD pipelines, instead of via a bespoke external liveness-probe Lambda. The heavy grooming logic is UNCHANGED — this SF only orchestrates: invoke the existing alpha-engine-scheduled-groom-dispatcher Lambda (launches the spot box + fires the async SSM command, exactly as it already does), then poll the SSM command to a terminal state so the SF's OWN execution status (SUCCEEDED/FAILED) is truthful. The spot box still self-terminates on its own EXIT trap regardless of what this SF observes — this adds observability, it does not change the dispatch mechanism.",
+  "StartAt": "LaunchGroomSpot",
+  "States": {
+    "LaunchGroomSpot": {
+      "Type": "Task",
+      "Comment": "Invoke the EXISTING scheduled-groom-dispatcher Lambda unchanged — it launches the spot box (or on-demand on capacity exhaustion), waits for SSM Online, and fires the async detached SSM RunShellScript command, returning {launched, instance_id, command_id, market, run_mode, model, issue_filter} (or {launched:false, reason:'disabled'} under the GROOM_DISPATCH_ENABLED kill-switch). The execution input IS the same JSON payload the EventBridge Scheduler rule used to pass directly to the Lambda (run_mode/model/issue_filter/schedule) — this SF is a pass-through wrapper, not a redesign of the payload contract.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
+        "Payload.$": "$"
+      },
+      "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "A launch failure (spot+on-demand exhaustion, SSM send failure, etc.) — the Lambda itself already terminates any partially-launched box before re-raising, so no cleanup needed here.",
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.groomLaunch",
+      "Next": "CheckLaunched"
+    },
+    "CheckLaunched": {
+      "Type": "Choice",
+      "Comment": "GROOM_DISPATCH_ENABLED=false is an intentional kill-switch skip, not a failure — route to a clean Succeed rather than polling a box that was never launched.",
+      "Choices": [
+        {
+          "Variable": "$.groomLaunch.Payload.groom.launched",
+          "BooleanEquals": true,
+          "Next": "PollGroomCommand"
+        }
+      ],
+      "Default": "GroomSkipped"
+    },
+    "PollGroomCommand": {
+      "Type": "Task",
+      "Comment": "Poll the async SSM command to a terminal state. No attempt-cap/counter here (mirrors the fleet's existing poll-loop convention, e.g. step_function_eod.json's PostMarketData/WaitForPostMarketData) — the underlying command is itself bounded by groom_spot_bootstrap.sh's own hard watchdog (MAX_RUNTIME_SECONDS, default 21600s/6h) plus the spot-orphan-reaper's 6.5h fleet cap, so this loop always resolves to a terminal SSM status without needing its own ceiling.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.groomLaunch.Payload.groom.command_id",
+        "InstanceId.$": "$.groomLaunch.Payload.groom.instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException", "Ssm.InvocationDoesNotExist"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
+      "ResultPath": "$.groomPoll",
+      "Next": "CheckGroomStatus"
+    },
+    "CheckGroomStatus": {
+      "Type": "Choice",
+      "Comment": "Default routes to GroomStatusError so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed — mirrors CheckPostMarketStatus/CheckEODStatus.",
+      "Choices": [
+        {"Variable": "$.groomPoll.Status", "StringEquals": "Success", "Next": "GroomSucceeded"},
+        {"Variable": "$.groomPoll.Status", "StringEquals": "InProgress", "Next": "GroomWait"},
+        {"Variable": "$.groomPoll.Status", "StringEquals": "Pending", "Next": "GroomWait"},
+        {"Variable": "$.groomPoll.Status", "StringEquals": "Delayed", "Next": "GroomWait"}
+      ],
+      "Default": "GroomStatusError"
+    },
+    "GroomWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "PollGroomCommand"
+    },
+    "GroomStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path — synthesize $.error from the poll result so HandleFailure's JsonToString($.error) has something to stringify. Covers Failed/Cancelled/TimedOut and any status not explicitly modeled above.",
+      "Parameters": {
+        "source": "groom_status",
+        "status.$": "$.groomPoll.Status",
+        "status_details.$": "$.groomPoll.StatusDetails",
+        "response_code.$": "$.groomPoll.ResponseCode",
+        "command_id.$": "$.groomPoll.CommandId",
+        "instance_id.$": "$.groomPoll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Comment": "Failure alert via SNS (same topic the fleet SFs already use). No force-stop step is needed here — unlike the persistent trading instance the EOD SF guards, the groom spot box tears itself down via groom_spot_bootstrap.sh's own EXIT trap regardless of what this SF observes; there is no idle-cost risk to guard against.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine Backlog Groom — FAILED",
+        "Message.$": "States.Format('Backlog groom dispatch failed. Error: {}', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.failure_notify",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Defense-in-depth: an SNS publish failure must not block the SF from reaching its own FAILED terminal state (which is what Fleet-SF Watch's EventBridge pattern actually listens for).",
+          "Next": "FailExecution",
+          "ResultPath": "$.failure_notify_error"
+        }
+      ],
+      "Next": "FailExecution"
+    },
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "GroomDispatchFailure",
+      "Cause": "Backlog groom dispatch failed — see the SNS alert / groom-spot CloudWatch log group for detail."
+    },
+    "GroomSucceeded": {
+      "Type": "Succeed"
+    },
+    "GroomSkipped": {
+      "Type": "Succeed",
+      "Comment": "GROOM_DISPATCH_ENABLED=false kill-switch — intentional no-op, not a failure."
+    }
+  }
+}
