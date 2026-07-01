@@ -46,3 +46,9 @@ Thumbs.db
 
 # Claude Code local agent worktrees + state (never commit)
 .claude/worktrees/
+
+# Private feature pack (alpha-engine-config#1032) — alpha-bearing feature
+# compute never lands in this public repo. This is a LOCAL convention
+# landing-spot only; NOUSERGON_PRIVATE_FEATURE_PACK may point anywhere on
+# disk (see features/private_pack.py). Never remove this entry.
+private_features/
