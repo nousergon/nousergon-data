@@ -162,7 +162,7 @@ if $BOOTSTRAP; then
       --role "${ROLE_ARN}" \
       --handler index.handler \
       --zip-file "fileb://${ZIP}" \
-      --timeout 30 \
+      --timeout 300 \
       --memory-size 256 \
       --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true}' \
       --region "${REGION}" \

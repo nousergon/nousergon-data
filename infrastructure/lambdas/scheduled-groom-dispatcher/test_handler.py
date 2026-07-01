@@ -51,8 +51,15 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
+    def __init__(self):
+        self.terminated = []
+
     def get_waiter(self, name):
         return _FakeWaiter()
+
+    def terminate_instances(self, InstanceIds):  # noqa: N803 — boto3 kwarg name
+        self.terminated.extend(InstanceIds)
+        return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
 
 
 class _FakeSsm:
@@ -71,7 +78,8 @@ def _load(monkeypatch, *, launch_impl=None, env=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
-    clients = {"ec2": _FakeEc2(), "ssm": ssm}
+    ec2 = _FakeEc2()
+    clients = {"ec2": ec2, "ssm": ssm}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
@@ -79,6 +87,7 @@ def _load(monkeypatch, *, launch_impl=None, env=None):
 
     importlib.reload(index)
     index._test_ssm = ssm  # expose for assertions
+    index._test_ec2 = ec2
     return index
 
 
@@ -162,3 +171,23 @@ def test_launch_failure_raises(monkeypatch):
     idx = _load(monkeypatch, launch_impl=_boom, env={"GROOM_DISPATCH_ENABLED": "true"})
     with pytest.raises(_SpotLaunchError, match="RunInstances denied"):
         idx.handler({"run_mode": "full"}, None)
+
+
+def test_post_launch_failure_terminates_instance_no_orphan(monkeypatch):
+    # If the box launches but a later step (SSM-online / SendCommand) fails, the
+    # box would orphan (no bootstrap → no watchdog/trap). The dispatcher must
+    # terminate it before re-raising. Regression cover for the 2026-06-30 orphan.
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: "i-orphan",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
+
+    def _boom_send(**kw):
+        raise RuntimeError("SSM SendCommand failed")
+
+    idx._test_ssm.send_command = _boom_send
+    with pytest.raises(RuntimeError, match="SendCommand failed"):
+        idx.handler({"run_mode": "full"}, None)
+    # The just-launched box was terminated (not orphaned) before the re-raise.
+    assert idx._test_ec2.terminated == ["i-orphan"]
