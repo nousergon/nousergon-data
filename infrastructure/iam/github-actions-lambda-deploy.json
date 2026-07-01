@@ -26,7 +26,9 @@
         "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-predictor",
         "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-data-collector",
         "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-health-check",
-        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-evaluator"
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-evaluator",
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-replay-counterfactual",
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-replay-concordance"
       ]
     },
     {
