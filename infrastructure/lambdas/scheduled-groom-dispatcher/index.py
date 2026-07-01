@@ -195,6 +195,22 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str) -> str:
     return resp["Command"]["CommandId"]
 
 
+def _terminate_instance(instance_id: str) -> None:
+    """Best-effort terminate of a just-launched box whose post-launch steps
+    failed. Without this the box orphans: it received no bootstrap, so neither
+    the in-script watchdog nor the EXIT trap (both armed BY the bootstrap) is
+    running to tear it down — it idles until manually killed. Never masks the
+    original error (logged, not raised)."""
+    try:
+        boto3.client("ec2", region_name=REGION).terminate_instances(InstanceIds=[instance_id])
+        logger.warning("terminated groom box %s after post-launch failure (no orphan)", instance_id)
+    except Exception as exc:  # noqa: BLE001 — cleanup; the original error re-raises below
+        logger.error(
+            "FAILED to terminate %s after a post-launch error (%s) — MANUAL cleanup needed",
+            instance_id, exc,
+        )
+
+
 def _launch_groom_spot(run_mode: str, schedule_label: str) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
@@ -203,16 +219,25 @@ def _launch_groom_spot(run_mode: str, schedule_label: str) -> dict:
 
     instance_id, market = _launch_instance()
     logger.info("launched groom box %s (%s)", instance_id, market)
-    _wait_ssm_online(instance_id)
-    # IMPORTANT: this string is embedded in the prelude's bash double-quoted
-    # `--run-url "..."`, so it MUST NOT contain `$` — the AWS console's normal
-    # `$252F` log-group encoding would expand as positional params ($2, $5...)
-    # under `set -u` and abort the prelude. Keep it `$`-free.
-    run_url = (
-        f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}"
-        f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
-    )
-    command_id = _send_bootstrap(instance_id, run_mode, run_url)
+    # Once the box is up, ANY failure before the bootstrap command is delivered
+    # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
+    # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
+    # leaving it idling. (A hard Lambda-timeout KILL can't run this — that's why
+    # the function timeout is also sized well above the launch+online budget.)
+    try:
+        _wait_ssm_online(instance_id)
+        # IMPORTANT: this string is embedded in the prelude's bash double-quoted
+        # `--run-url "..."`, so it MUST NOT contain `$` — the AWS console's normal
+        # `$252F` log-group encoding would expand as positional params ($2, $5...)
+        # under `set -u` and abort the prelude. Keep it `$`-free.
+        run_url = (
+            f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}"
+            f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
+        )
+        command_id = _send_bootstrap(instance_id, run_mode, run_url)
+    except Exception:
+        _terminate_instance(instance_id)
+        raise
     logger.info(
         "groom dispatched: instance=%s market=%s command=%s run_mode=%s schedule=%s",
         instance_id,

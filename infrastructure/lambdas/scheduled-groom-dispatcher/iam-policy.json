@@ -39,6 +39,15 @@
         "ssm:DescribeInstanceInformation"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "TerminateGroomSpotOnError",
+      "Effect": "Allow",
+      "Action": ["ec2:TerminateInstances"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "ec2:ResourceTag/Name": "alpha-engine-groom-spot" }
+      }
     }
   ]
 }
