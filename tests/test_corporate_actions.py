@@ -135,6 +135,17 @@ class TestExpectedFactor:
             == "10-for-1 forward split"
         )
 
+    def test_human_description_non_clean_ratio_not_floor_divided(self):
+        """config#1455: a non-integer ratio (e.g. polygon's 1000:1061
+        stock-dividend-style 'split') previously floor-divided to 1061//1000==1
+        and printed as the misleading, no-op-looking '1-for-1 forward split' —
+        derailing the investigation into whether the action was real. It must
+        print the EXACT ratio instead of a rounded lie."""
+        a = ca.CorporateAction.from_split("HON", "2025-10-30", 1000, 1061)
+        assert a.human() == "1061-for-1000 forward split"
+        b = ca.CorporateAction.from_split("DD", "2025-11-03", 100, 239)
+        assert b.human() == "239-for-100 forward split"
+
 
 class TestDetectSplits:
     def _fake_client(self, events):
@@ -265,3 +276,93 @@ class TestApply:
         assert out is df and res == []
         out2, res2 = ca.apply(pd.DataFrame(), [ca.CorporateAction.from_split("DD", "2026-06-24", 3, 1)], store=self._STORE)
         assert res2 == []
+
+    def test_phantom_split_is_unconfirmed_not_applied(self):
+        """config#1455 root cause: a feed can report a split (execution_date
+        in the past, real ratio) that never happened in the real market — the
+        raw close shows NO boundary discontinuity. ``apply`` must NOT bake
+        that factor into Close; it must report ``status="unconfirmed"`` and
+        leave the frame untouched for that action."""
+        df = _unfolded_reverse_split_frame()  # flat ~$48 the whole way through
+        # A 10-for-1 forward split with NO corresponding ~10x price drop
+        # anywhere in the (flat) series — exactly the live KLAC 2026-06-12
+        # case (config#1455 audit evidence).
+        phantom = ca.CorporateAction.from_split("KLAC", "2026-06-15", 1, 10)
+
+        out, results = ca.apply(df, [phantom], store=self._STORE, registry=None)
+
+        pd.testing.assert_frame_equal(out, df)  # untouched — factor NOT applied
+        assert len(results) == 1
+        assert results[0]["status"] == "unconfirmed"
+        assert results[0]["action_id"] == phantom.action_id
+        assert results[0]["n_rows_adjusted"] == 0
+
+    def test_confirmed_and_phantom_splits_partition_independently(self):
+        """One real (price-corroborated) split and one phantom split in the
+        SAME call: the real one restates normally, the phantom one is
+        withheld — each action's fate is independent."""
+        df = _unfolded_reverse_split_frame()  # real ~3x jump at 2026-06-24
+        real = ca.CorporateAction.from_split("DD", "2026-06-24", 3, 1)
+        phantom = ca.CorporateAction.from_split("DD", "2026-06-24", 1, 10)
+
+        out, results = ca.apply(df, [real, phantom], store=self._STORE, registry=None)
+
+        by_id = {r["action_id"]: r for r in results}
+        assert by_id[real.action_id]["status"] == "applied"
+        assert by_id[phantom.action_id]["status"] == "unconfirmed"
+        # The real split's restatement still lands (boundary jump flattened).
+        assert out["Close"].pct_change().abs().max() < 0.45
+
+    def test_unconfirmed_split_does_not_mark_registry(self):
+        """An unconfirmed action must be re-checked every run, not remembered
+        as permanently skipped — so it must NOT durably mark the registry."""
+        reg = _registry()
+        df = _unfolded_reverse_split_frame()
+        phantom = ca.CorporateAction.from_split("KLAC", "2026-06-15", 1, 10)
+
+        _out, results = ca.apply(df, [phantom], store=self._STORE, registry=reg, run_id="r1")
+        assert results[0]["status"] == "unconfirmed"
+        assert reg.is_applied(self._STORE, phantom.action_id) is False
+
+
+class TestHasPriceEvidence:
+    def test_real_reverse_split_confirmed(self):
+        df = _unfolded_reverse_split_frame()  # genuine ~3x jump at 2026-06-24
+        action = ca.CorporateAction.from_split("DD", "2026-06-24", 3, 1)
+        assert ca.has_price_evidence(df["Close"], action) is True
+
+    def test_phantom_split_not_confirmed(self):
+        df = _unfolded_reverse_split_frame()  # flat through the claimed date
+        action = ca.CorporateAction.from_split("KLAC", "2026-06-15", 1, 10)
+        assert ca.has_price_evidence(df["Close"], action) is False
+
+    def test_forward_split_boundary_ratio_direction(self):
+        """A forward N-for-1 split's raw boundary ratio close[post]/close[pre]
+        is expected_factor directly (< 1, price DROPS at the split) — not its
+        reciprocal. Regression guard for the ratio-direction bug caught in
+        development (inverted target_ratio made every real split look
+        unconfirmed)."""
+        idx = pd.bdate_range("2026-01-01", "2026-02-01")
+        pre = idx < pd.Timestamp("2026-01-20")
+        close = pd.Series(np.where(pre, 100.0, 25.0), index=idx)  # clean 4:1 drop
+        action = ca.CorporateAction.from_split("X", "2026-01-20", 1, 4)
+        assert ca.has_price_evidence(close, action) is True
+
+    def test_no_window_coverage_degrades_to_true(self):
+        """A series that doesn't cover the ex_date window can't disprove the
+        action — degrades to trusting the feed (pre-existing behavior) rather
+        than blocking on missing data."""
+        idx = pd.bdate_range("2020-01-01", "2020-01-10")
+        close = pd.Series(100.0, index=idx)
+        action = ca.CorporateAction.from_split("X", "2026-06-15", 1, 10)
+        assert ca.has_price_evidence(close, action) is True
+
+    def test_empty_series_degrades_to_true(self):
+        action = ca.CorporateAction.from_split("X", "2026-06-15", 1, 10)
+        assert ca.has_price_evidence(pd.Series(dtype="float64"), action) is True
+
+    def test_dividend_and_rename_always_true(self):
+        """Only splits mutate the price level; has_price_evidence is a no-op
+        gate for other action types (apply() rejects them independently)."""
+        div = ca.CorporateAction(type="dividend", ticker="X", ex_date="2026-01-01", cash_amount=0.5)
+        assert ca.has_price_evidence(pd.Series([1.0]), div) is True
