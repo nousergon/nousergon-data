@@ -391,7 +391,7 @@
     },
     "EODReconcile": {
       "Type": "Task",
-      "Comment": "Run EOD reconciliation on trading EC2 — reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask.",
+      "Comment": "Run EOD reconciliation on trading EC2 — reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Refreshes the executor checkout to origin/main via the canonical boot-pull.sh BEFORE running eod_reconcile.py: the trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD, so eod_reconcile.py's ExecutorPreflight deploy-drift guard hard-fails (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull; EOD refused on b7e52b1 vs main@8c3014e). Refreshing here makes reconcile run latest main by construction. boot-pull is run as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); the root-side eod_reconcile.py already reads HEAD via a safe.directory workaround. FAIL-LOUD PRESERVED: the drift guard remains the authoritative gate — if boot-pull fails (auth/network), the checkout stays stale and eod_reconcile.py hard-fails with its actionable message (the `|| echo` only surfaces a breadcrumb; it does not swallow — the guard downstream is loud).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -400,6 +400,7 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
+            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1 || echo '[eod-preflight] boot-pull deploy refresh returned non-zero; eod_reconcile deploy-drift guard will surface any staleness LOUD'",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "export ALPHA_ENGINE_DEPLOYED=1",
             "export FLOW_DOCTOR_ENABLED=1",
@@ -407,11 +408,11 @@
             "trap 'aws s3 cp /var/log/eod.log \"s3://alpha-engine-research/_ssm_logs/eod/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/eod_reconcile.py 2>&1 | tee /var/log/eod.log"
           ],
-          "executionTimeout": ["120"]
+          "executionTimeout": ["600"]
         },
-        "TimeoutSeconds": 120
+        "TimeoutSeconds": 600
       },
-      "TimeoutSeconds": 180,
+      "TimeoutSeconds": 660,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
