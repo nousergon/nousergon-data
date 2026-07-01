@@ -117,25 +117,21 @@ PIPELINES: dict[str, dict[str, object]] = {
     # Backlog groom dispatch (config#1472) — wraps the EC2-spot-via-SSM groom
     # dispatch in a Step Function purely for uniform observability (watch-log
     # artifact + silent Telegram record), replacing the bespoke external
-    # liveness-probe Lambda (data#556). `has_listener=False` (config#1535):
-    # `.github/workflows/sf-watch.yml`'s `types:` allowlist does NOT include
-    # `dispatch_event_type` below, so a groom failure gets full watch-log +
-    # Telegram coverage, but NO repository_dispatch fires and the notification
-    # copy says so honestly — it must NOT claim "autonomous fix ACTIVE" when no
-    # workflow is listening (config#1535, the exact bug this field fixes).
-    # Groom failures are almost always operational (spot capacity, SSM
-    # misfire) rather than a code defect, so wiring this into the SAME
-    # code-fix-via-PR resilience-agent charter the trading pipelines use needs
-    # its own deliberate autonomy-posture decision first (mirrors the still-open
-    # weekday/EOD soak-exit decision in config#1408) — tracked separately, not
-    # bundled into this SF-wrap. Flip to True ONLY once `groom-sf-failure` is
-    # actually added to sf-watch.yml's `types:` list.
+    # liveness-probe Lambda (data#556). `has_listener=True` (2026-07-01 follow-
+    # up to config#1535): `groom-sf-failure` is now in sf-watch.yml's `types:`
+    # allowlist and the charter (.github/sf-watch-prompt.md) has a dedicated
+    # groom guardrail (STEP 2.5 case 4) — classify-first (most groom failures
+    # are transient infra, not a code defect), plain rerun (no skip-flags, the
+    # groom SF has no multi-stage idempotency concern). Its kill-switch
+    # (/alpha-engine/groom_sf_watch/autonomous_merge_enabled) defaults `true`
+    # from day one — lower stakes than any trading pipeline since it touches no
+    # live capital, unlike weekday/EOD which soak PROPOSE-ONLY (config#1408).
     "alpha-engine-groom-dispatch": {
         "cadence_slug": "groom",
         "label": "Backlog Groom",
         "watch_prefix": "consolidated/groom_sf_watch",
         "dispatch_event_type": "groom-sf-failure",
-        "has_listener": False,
+        "has_listener": True,
     },
 }
 SCHEMA_VERSION = 1
