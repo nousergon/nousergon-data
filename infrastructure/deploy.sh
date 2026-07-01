@@ -153,7 +153,13 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
   # alert per (Lambda, version) — lib v0.24.0 substrate (L221
   # retrofit 2026-05-22). Best-effort; trailing || true never
   # overrides the deploy's exit 1.
-  python3 -m nousergon_lib.alerts publish \
+  # Target is krepis.alerts (config#1339/config#1545): alerts relocated to
+  # krepis at nousergon-lib v0.66.0, and the runner-side install this call
+  # depends on had drifted to a stale alpha-engine-lib@v0.26.0 pin whose
+  # import name (alpha_engine_lib) never matched this nousergon_lib call —
+  # the exact L221 alert this comment describes had been silently dead
+  # (ModuleNotFoundError swallowed by || true) since that pin went stale.
+  python3 -m krepis.alerts publish \
     --severity error \
     --source "alpha-engine-data/infrastructure/deploy.sh" \
     --dedup-key "canary-fail-${FUNCTION_NAME}-v${VERSION}" \
