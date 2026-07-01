@@ -108,15 +108,42 @@ aws lambda create-alias \
   --region "$REGION"
 echo "  Alias 'live' -> version $VERSION"
 
-# Canary
+# Canary — POST-promotion (the 'live' alias already moved to $VERSION above).
+#
+# Invoke via the shared ``krepis.aws invoke-canary`` CLI (config#1494, published
+# in krepis 0.7.0) instead of a bare ``aws lambda invoke``. The CLI retries ONLY
+# on the throttle/concurrency signal (TooManyRequestsException /
+# ReservedFunctionConcurrentInvocationLimitExceeded) with bounded backoff+jitter,
+# writes the response payload to --out, prints the invoke metadata JSON to stdout,
+# exits 0 on invoke-API success and 1 on a non-throttle boto error or throttle
+# exhaustion. boto3 path — no ``--cli-binary-format``/base64.
 echo "  Running canary (dry_run=true)..."
 CANARY_OUT=$(mktemp)
-aws lambda invoke \
-  --function-name "${FUNCTION_NAME}:live" \
-  --payload '{"phase": 2, "dry_run": true}' \
-  --cli-binary-format raw-in-base64-out \
-  --region "$REGION" \
-  "$CANARY_OUT" > /dev/null
+if ! python3 -m krepis.aws invoke-canary \
+    --function-name "${FUNCTION_NAME}:live" \
+    --payload '{"phase": 2, "dry_run": true}' \
+    --out "$CANARY_OUT" \
+    --region "$REGION" \
+    --max-attempts 6 \
+    --label "${FUNCTION_NAME}-canary" > /dev/null; then
+  # The invoke API never returned a payload — either a non-throttle error, or
+  # the reserved-concurrency slot stayed busy past the bounded retry window.
+  # The deploy itself SUCCEEDED (the live alias already moved to $VERSION); a
+  # never-run smoke test is NOT a canary failure, so do NOT roll back —
+  # reverting a healthy deploy because we couldn't get a test slot would be the
+  # wrong action. Surface loud (fail the job) + alert so an operator confirms
+  # the live version by hand. Distinct dedup-key from the bad-STATUS rollback
+  # path below.
+  rm -f "$CANARY_OUT"
+  echo "  ERROR: canary could not be invoked (slot contention or invoke error) — deploy left LIVE on v${VERSION}, NOT rolled back."
+  python3 -m krepis.alerts publish \
+    --severity error \
+    --source "alpha-engine-data/infrastructure/deploy.sh" \
+    --dedup-key "canary-uninvokable-${FUNCTION_NAME}-v${VERSION}" \
+    --message "Canary could NOT be invoked for ${FUNCTION_NAME} v${VERSION} (throttle/concurrency or invoke error, retries exhausted). Live alias LEFT on v${VERSION} — deploy succeeded, NOT rolled back. Verify the live version manually." \
+    || true
+  exit 1
+fi
 
 CANARY_STATUS=$(python3 -c "
 import json, sys
