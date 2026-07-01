@@ -36,7 +36,7 @@
           "Next": "AcquireMutex"
         }
       ],
-      "Default": "CheckSkipPostMarketData"
+      "Default": "StartTradingInstance"
     },
     "AcquireMutex": {
       "Type": "Task",
@@ -77,17 +77,113 @@
             "States.ALL"
           ],
           "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block the EOD reconcile + instance-stop path. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable (reconcile + stop trading EC2) survives a mutex-side failure. The error is captured in $.mutex_error for forensic review.",
-          "Next": "CheckSkipPostMarketData",
+          "Next": "StartTradingInstance",
           "ResultPath": "$.mutex_error"
         }
       ],
       "ResultPath": "$.mutex_result",
-      "Next": "CheckSkipPostMarketData"
+      "Next": "StartTradingInstance"
     },
     "MutexConflict": {
       "Type": "Fail",
       "Error": "MutexConflict",
       "Cause": "L274: another EOD execution with the same pipeline_role + start-minute already holds the mutex. Cost-guard note: the EOD SF's HandleFailure \u2192 ForceStopInstance chain is unreachable from a Fail state, but a duplicate EOD execution by definition means another EOD execution IS running the cost-guard path; the trading instance still gets stopped."
+    },
+    "StartTradingInstance": {
+      "Type": "Task",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it — so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand → 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 → SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.ec2_start_result",
+      "Next": "WaitForInstanceReady"
+    },
+    "WaitForInstanceReady": {
+      "Type": "Wait",
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Seconds": 15,
+      "Next": "InitSSMPollCounter"
+    },
+    "InitSSMPollCounter": {
+      "Type": "Pass",
+      "Comment": "Initialize attempts counter for the SSM-readiness poll loop.",
+      "Result": {"attempts": 0},
+      "ResultPath": "$.ssm_poll",
+      "Next": "DescribeInstanceInfo"
+    },
+    "DescribeInstanceInfo": {
+      "Type": "Task",
+      "Comment": "Poll SSM-agent registration on the trading instance until PingStatus=Online, so the first EOD ssm:sendCommand never fires against a stopped / not-yet-registered box (the Ssm.InvalidInstanceIdException failure mode). Mirrors the daily SF DescribeInstanceInfo (config#1430).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
+      "Parameters": {
+        "Filters": [
+          {"Key": "InstanceIds", "Values.$": "$.trading_instance_id"}
+        ]
+      },
+      "TimeoutSeconds": 15,
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.ssm_describe_result",
+      "Next": "SSMReadyChoice"
+    },
+    "SSMReadyChoice": {
+      "Type": "Choice",
+      "Comment": "PingStatus=Online → CheckSkipPostMarketData (enter the per-task rerun gates). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails — the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile — an unreachable box fails the execution loud.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus", "IsPresent": true},
+            {"Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus", "StringEquals": "Online"}
+          ],
+          "Next": "CheckSkipPostMarketData"
+        },
+        {
+          "Variable": "$.ssm_poll.attempts",
+          "NumericGreaterThanEquals": 12,
+          "Next": "HandleFailure"
+        }
+      ],
+      "Default": "WaitSSMPoll"
+    },
+    "WaitSSMPoll": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementSSMPoll"
+    },
+    "IncrementSSMPoll": {
+      "Type": "Pass",
+      "Parameters": {"attempts.$": "States.MathAdd($.ssm_poll.attempts, 1)"},
+      "ResultPath": "$.ssm_poll",
+      "Next": "DescribeInstanceInfo"
     },
     "PostMarketData": {
       "Type": "Task",
