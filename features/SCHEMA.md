@@ -221,6 +221,36 @@ outlier ticker cannot dominate the downstream factor-return regression
 | `roe_zscore` | z-score | Cross-sectional z of `roe`, ±3σ winsorized | executor (Barra QUALITY — profitability loading, C.3) |
 | `size_zscore` | z-score | Cross-sectional z of `log(market_cap_raw)`, ±3σ winsorized (log pre-transform; non-positive cap → NaN, excluded) | research (Barra SIZE loading for momentum+beta+size score-neutralization, config#1142); executor risk-model (Barra SIZE — potential C.3 consumer) |
 
+### 3b. Private-pack columns (alpha-engine-config#1032) — disclosure format
+
+Alpha-bearing columns computed by a private feature pack
+(`features/private_pack.py`, discovered at runtime via
+`NOUSERGON_PRIVATE_FEATURE_PACK`) per the private-edge divergence policy
+(config#1031: new alpha-bearing feature recipes land private-first). They
+ARE ordinary `registry.CATALOG` entries and DO get a row in this table —
+consumers still need name, units, and who reads it. The one thing this
+repo does not disclose is HOW the value is computed.
+
+**Disclosure rule:** a private-pack row's `Compute` cell is the literal
+sentinel `private pack` — no formula, no source ref, no hint at the
+signal. Name (units-suffixed per §1) + units + consumer are the full
+public surface. `registry.FeatureEntry.compute` is set to
+`registry.PRIVATE_PACK_COMPUTE` for these rows, which is what lets
+`test_schema_contract.py` tell a private-pack row apart from an
+undocumented public one (a public column with a blank/missing formula is
+a bug; a private-pack column with `compute="private pack"` is by design).
+
+There are no private-pack columns registered in this public repo today —
+this subsection is the mechanism's contract, exercised end-to-end by
+`tests/test_private_feature_pack.py` against a throwaway test fixture
+(`tests/fixtures/dummy_private_pack.py`), not by a real entry here. When
+the first real alpha-bearing column lands, add a table with the same
+four columns as §3 (Field / Units / Compute / Consumers) directly below
+this paragraph; the `Field` cell is the backticked column name (e.g. a
+hypothetical `some_alpha_signal_zscore`), `Compute` is always the literal
+`private pack`, and `Units` / `Consumers` are filled in exactly as they
+would be for a public row.
+
 ---
 
 ## 4. PR checklist for new features
@@ -240,6 +270,28 @@ Before opening a PR that adds a column to `compute_features`:
    the consuming repo that pins the expected units.
 6. `pytest tests/test_schema_contract.py` must pass.
 
+### 4b. PR checklist for a NEW private-pack column (alpha-engine-config#1032)
+
+Before landing a new alpha-bearing column through the private pack:
+
+1. Pick a units-suffixed name per §1, same as a public column.
+2. Add a `FeatureEntry(name, group, description="private pack", ...,
+   compute=registry.PRIVATE_PACK_COMPUTE)` to `features/registry.py::CATALOG`.
+   The `description` field may say WHO consumes it and WHY at a level
+   consistent with §3b's disclosure rule, but must not describe the
+   compute.
+3. Add a row to §3b of this file (name + units + `private pack` + consumer
+   — no formula).
+4. Do **NOT** add the column to `features/feature_engineer.py::FEATURES`
+   — it must be produced by the private pack's `add_private_features`,
+   not by public `compute_features` (`test_private_pack_entries_are_absent_from_public_features`
+   enforces this).
+5. Implement `add_private_features` + `PRIVATE_FEATURE_NAMES` in the
+   private pack module pointed to by `NOUSERGON_PRIVATE_FEATURE_PACK` —
+   see `features/private_pack.py` for the contract.
+6. `pytest tests/test_schema_contract.py tests/test_private_feature_pack.py`
+   must pass.
+
 ---
 
 ## 5. Historical reference
@@ -249,3 +301,4 @@ Before opening a PR that adds a column to `compute_features`:
 | 2026-05-25 | L1995 Phase 1 standalone scanner Lambda surfaces `scanner_tickers=[]`; audit reveals `avg_volume_20d` units mismatch with Research scanner consumer; Option E selected as SOTA fix. |
 | 2026-05-25 | This SCHEMA.md + additive `avg_volume_20d_raw` + naming-convention rule shipped as the institutional substrate (alpha-engine-data Phase 1). |
 | 2026-05-26 | C.1 of optimizer-sota-upgrades-260526 — 8 factor-loading `*_zscore` columns added (cross-sectional ±3σ-winsorized z-scores) as substrate for the executor's Σ = B·F·Bᵀ + D risk decomposition. |
+| 2026-07-01 | alpha-engine-config#1032 (private-edge divergence policy, config#1031) — private feature-pack loading mechanism (`features/private_pack.py`) + `compute=PRIVATE_PACK_COMPUTE` schema-contract sentinel (§3b) shipped. No alpha-bearing column has landed through it yet; only the throwaway fixture in `tests/fixtures/dummy_private_pack.py` exercises the mechanism. |

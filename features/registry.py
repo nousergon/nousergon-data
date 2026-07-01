@@ -16,6 +16,21 @@ from dataclasses import asdict, dataclass
 logger = logging.getLogger(__name__)
 
 
+#: Sentinel ``compute=`` value for alpha-bearing columns produced by a
+#: private feature pack (alpha-engine-config#1032 — private-edge divergence
+#: policy, config#1031). A ``FeatureEntry`` carrying this sentinel asserts
+#: the column is real (registered, units-suffixed, consumer-documented) but
+#: intentionally omits WHAT computes it. See ``features/private_pack.py``
+#: for the loading mechanism and ``features/SCHEMA.md`` §3b for the
+#: disclosure format consumers see. The schema-contract CI
+#: (``tests/test_schema_contract.py``) exempts entries carrying this
+#: sentinel from the public-emit-list (``feature_engineer.FEATURES``) sync
+#: requirement — everything else (CATALOG registration, units-suffix,
+#: SCHEMA.md row, consumer) is still enforced identically to a public
+#: column.
+PRIVATE_PACK_COMPUTE = "private-pack"
+
+
 @dataclass(frozen=True)
 class FeatureEntry:
     name: str
@@ -25,6 +40,13 @@ class FeatureEntry:
     source: str = ""    # yfinance | fmp | computed
     refresh: str = ""   # daily | weekly | quarterly
     per_ticker: bool = True  # False for macro features (one row per date)
+    # "" (default) for every public column — parity with FEATURES is
+    # enforced as before. Set to PRIVATE_PACK_COMPUTE for a column supplied
+    # by a private feature pack (features/private_pack.py); such columns
+    # are exempt from the FEATURES-emit-list sync check but still require
+    # a units-suffixed name, a SCHEMA.md §3 row, and a named consumer —
+    # see test_schema_contract.py.
+    compute: str = ""
 
 
 # ── Feature Catalog ──────────────────────────────────────────────────────────

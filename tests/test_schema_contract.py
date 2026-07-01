@@ -16,6 +16,20 @@ silent units mismatch on ``avg_volume_20d`` (predictor ratio vs. scanner
 raw shares) that hid for months. The contract layer codifies the
 ``_raw / _ratio / _zscore / _pct / _log_return`` naming convention and
 catches future misnamed columns at PR time.
+
+**Private-pack exemption (alpha-engine-config#1032).** A ``CATALOG``
+entry with ``compute=registry.PRIVATE_PACK_COMPUTE`` ("private-pack") is
+an alpha-bearing column supplied at runtime by a private feature pack
+(``features/private_pack.py``) rather than by this repo's
+``feature_engineer.compute_features``. Such entries are exempt from the
+``FEATURES`` emit-list sync check ONLY — they must still: be registered
+in ``CATALOG``, carry a units-suffixed name (or a written grandfather
+exception), and appear in ``SCHEMA.md`` §3 with a real consumer. The one
+thing SCHEMA.md is permitted to omit for these rows is the ``Compute``
+column body (the literal sentinel replaces the formula/description —
+see SCHEMA.md §3b). This is the one contract change #1032 makes; every
+other invariant below is unchanged and applies identically to
+private-pack rows.
 """
 
 from __future__ import annotations
@@ -32,7 +46,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from features.feature_engineer import FEATURES, compute_features
-from features.registry import CATALOG
+from features.registry import CATALOG, PRIVATE_PACK_COMPUTE
 
 
 _FEATURES_DIR = Path(__file__).resolve().parents[1] / "features"
@@ -75,12 +89,21 @@ def _parse_schema_md_fields() -> set[str]:
 
 
 def test_features_and_catalog_are_in_sync():
-    """``FEATURES`` (emit list) and ``CATALOG`` (registry) must agree."""
+    """``FEATURES`` (emit list) and ``CATALOG`` (registry) must agree.
+
+    Private-pack entries (``compute=PRIVATE_PACK_COMPUTE``) are exempt
+    from this sync — they are, by design, never in the PUBLIC
+    ``feature_engineer.FEATURES`` emit list (alpha-engine-config#1032).
+    They are still required to appear in CATALOG (this test's other
+    direction) and in SCHEMA.md (enforced separately below).
+    """
     catalog_names = {f.name for f in CATALOG}
+    private_pack_names = {f.name for f in CATALOG if f.compute == PRIVATE_PACK_COMPUTE}
+    public_catalog_names = catalog_names - private_pack_names
     features = set(FEATURES)
 
     missing_from_catalog = features - catalog_names
-    missing_from_features = catalog_names - features
+    missing_from_features = public_catalog_names - features
 
     assert not missing_from_catalog, (
         f"Columns in FEATURES but missing from registry.CATALOG "
@@ -88,8 +111,30 @@ def test_features_and_catalog_are_in_sync():
     )
     assert not missing_from_features, (
         f"Columns in registry.CATALOG but missing from FEATURES "
-        f"(remove from CATALOG or add to feature_engineer.FEATURES): "
-        f"{sorted(missing_from_features)}"
+        f"(remove from CATALOG, add to feature_engineer.FEATURES, or if this "
+        f"is an alpha-bearing private-pack column mark it "
+        f"compute=PRIVATE_PACK_COMPUTE): {sorted(missing_from_features)}"
+    )
+
+
+def test_private_pack_entries_are_absent_from_public_features():
+    """Private-pack CATALOG entries must NEVER leak into the public emit list.
+
+    The inverse of the sync exemption above: if a private-pack-marked
+    column somehow ALSO appears in feature_engineer.FEATURES, the public
+    repo is emitting (i.e. computing) it itself — which defeats the
+    entire point of the private-pack mechanism. This is the sniff test
+    that would catch someone flipping compute= back to "" without also
+    removing the column from the public compute path, or vice versa.
+    """
+    features = set(FEATURES)
+    private_pack_names = {f.name for f in CATALOG if f.compute == PRIVATE_PACK_COMPUTE}
+    leaked = private_pack_names & features
+    assert not leaked, (
+        "Column(s) marked compute=PRIVATE_PACK_COMPUTE also appear in the "
+        f"public feature_engineer.FEATURES emit list: {sorted(leaked)}. "
+        "A private-pack column must be computed ONLY by the private pack — "
+        "remove it from FEATURES or drop the private-pack marking."
     )
 
 

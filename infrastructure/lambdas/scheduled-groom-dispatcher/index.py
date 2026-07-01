@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 import boto3
@@ -87,6 +88,13 @@ CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
 _VALID_RUN_MODES = {"full", "sweep"}
 _DEFAULT_RUN_MODE = "full"
+_VALID_ISSUE_FILTERS = {"default", "high-only"}
+_DEFAULT_ISSUE_FILTER = "default"
+_DEFAULT_MODEL = "claude-sonnet-5"
+# Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
+# shell command below) — model ids are Lambda-config-controlled, not raw user
+# input, but this is cheap and rules out shell-metacharacter injection outright.
+_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def _resolve_run_mode(event: dict) -> str:
@@ -98,7 +106,25 @@ def _resolve_run_mode(event: dict) -> str:
     return rm
 
 
-def _bootstrap_command(run_mode: str, run_url: str) -> str:
+def _resolve_issue_filter(event: dict) -> str:
+    """Pull issue_filter from the schedule input; unknown/missing → default (Sonnet queue)."""
+    f = str(event.get("issue_filter") or _DEFAULT_ISSUE_FILTER).strip().lower()
+    if f not in _VALID_ISSUE_FILTERS:
+        logger.warning("unknown issue_filter %r — defaulting to %s", f, _DEFAULT_ISSUE_FILTER)
+        f = _DEFAULT_ISSUE_FILTER
+    return f
+
+
+def _resolve_model(event: dict) -> str:
+    """Pull model from the schedule input; missing/malformed → default (Sonnet 5)."""
+    m = str(event.get("model") or _DEFAULT_MODEL).strip()
+    if not _MODEL_RE.match(m):
+        logger.warning("malformed model %r — defaulting to %s", m, _DEFAULT_MODEL)
+        m = _DEFAULT_MODEL
+    return m
+
+
+def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -125,6 +151,8 @@ git clone --depth 1 --branch {GROOM_BRANCH} \
   "https://x-access-token:${{PAT}}@github.com/{GROOM_REPO}.git" \
   /home/ec2-user/alpha-engine-config || fail "clone failed"
 cd /home/ec2-user/alpha-engine-config
+export GROOM_MODEL={model}
+export GROOM_ISSUE_FILTER={issue_filter}
 exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"
 """
 
@@ -173,15 +201,15 @@ def _wait_ssm_online(instance_id: str) -> None:
     )
 
 
-def _send_bootstrap(instance_id: str, run_mode: str, run_url: str) -> str:
+def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
-        Comment=f"backlog groom ({run_mode}) — config#1432",
+        Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495",
         Parameters={
-            "commands": [_bootstrap_command(run_mode, run_url)],
+            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter)],
             # Execution timeout (NOT the start timeout) — without this SSM kills the
             # command at the 3600s default, guillotining a multi-hour groom.
             "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
@@ -211,7 +239,7 @@ def _terminate_instance(instance_id: str) -> None:
         )
 
 
-def _launch_groom_spot(run_mode: str, schedule_label: str) -> dict:
+def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -234,16 +262,18 @@ def _launch_groom_spot(run_mode: str, schedule_label: str) -> dict:
             f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}"
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
-        command_id = _send_bootstrap(instance_id, run_mode, run_url)
+        command_id = _send_bootstrap(instance_id, run_mode, run_url, model, issue_filter)
     except Exception:
         _terminate_instance(instance_id)
         raise
     logger.info(
-        "groom dispatched: instance=%s market=%s command=%s run_mode=%s schedule=%s",
+        "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s schedule=%s",
         instance_id,
         market,
         command_id,
         run_mode,
+        model,
+        issue_filter,
         schedule_label,
     )
     return {
@@ -252,17 +282,25 @@ def _launch_groom_spot(run_mode: str, schedule_label: str) -> dict:
         "market": market,
         "command_id": command_id,
         "run_mode": run_mode,
+        "model": model,
+        "issue_filter": issue_filter,
     }
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
-    `event` is the schedule's JSON input, e.g. {"run_mode": "full", "schedule": "0 23 * * *"}.
+    `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
+    "claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 15 * * *"}.
+    `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
+    (the two pre-existing Sonnet schedules don't set them).
     """
     event = event or {}
     run_mode = _resolve_run_mode(event)
+    model = _resolve_model(event)
+    issue_filter = _resolve_issue_filter(event)
     schedule_label = str(event.get("schedule") or "unknown")
-    logger.info("scheduled groom trigger: run_mode=%s schedule=%s", run_mode, schedule_label)
-    result = _launch_groom_spot(run_mode, schedule_label)
+    logger.info("scheduled groom trigger: run_mode=%s model=%s issue_filter=%s schedule=%s",
+                run_mode, model, issue_filter, schedule_label)
+    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter)
     return {"groom": result}

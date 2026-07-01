@@ -41,6 +41,7 @@ from dataclasses import dataclass
 import corporate_actions as ca
 from features.cross_sectional import apply_factor_zscores
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
+from features.private_pack import apply_private_features
 from features.registry import upload_registry
 from features.writer import write_feature_snapshot
 
@@ -891,6 +892,13 @@ def compute_and_write(
     # (alpha-engine executor) consumes to build Σ = B·F·Bᵀ + D. Winsorized
     # at ±3σ then standardized (Barra USE4 / AQR convention).
     features_df = apply_factor_zscores(features_df)
+
+    # alpha-engine-config#1032: append private-pack alpha-bearing columns
+    # AFTER the public per-ticker compute + cross-sectional zscores, BEFORE
+    # write — the same extension point as apply_factor_zscores above. No-op
+    # (features_df unchanged) unless NOUSERGON_PRIVATE_FEATURE_PACK is set;
+    # every public/CI run takes this no-op path. See features/private_pack.py.
+    features_df = apply_private_features(features_df)
 
     if dry_run:
         log.info(

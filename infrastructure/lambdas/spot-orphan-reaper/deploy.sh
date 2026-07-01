@@ -27,6 +27,12 @@ RULE_NAME="alpha-engine-spot-orphan-reaper-hourly"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
+# Canonical function env — defined ONCE so the create / update / smoke paths can
+# never drift out of lockstep. MAX_SPOT_BUDGET_SECONDS is the single global reap
+# cap (longest fleet watchdog; see index.py docstring); GRACE covers scan cadence.
+PROD_ENV='Variables={MAX_SPOT_BUDGET_SECONDS=21600,GRACE_SECONDS=1800,DRY_RUN=false}'
+SMOKE_ENV='Variables={MAX_SPOT_BUDGET_SECONDS=21600,GRACE_SECONDS=1800,DRY_RUN=true}'
+
 DRY_RUN=false
 BOOTSTRAP=false
 SMOKE=false
@@ -106,7 +112,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 128 \
-      --environment 'Variables={GRACE_SECONDS=1800,DRY_RUN=false}' \
+      --environment "${PROD_ENV}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   fi
@@ -162,6 +168,20 @@ fi
 
 echo "✓ Code deployed."
 
+# Converge function env on EVERY deploy. `update-function-code` does not touch
+# env, so an existing function would otherwise keep whatever env it had — this is
+# how MAX_SPOT_BUDGET_SECONDS lands on an already-created reaper (and how any
+# interim env override gets reset to the canonical value).
+if ! $DRY_RUN; then
+  aws lambda update-function-configuration \
+    --function-name "${FUNCTION_NAME}" \
+    --environment "${PROD_ENV}" \
+    --region "${REGION}" \
+    --query 'LastUpdateStatus' --output text > /dev/null
+  aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+  echo "✓ Env converged: ${PROD_ENV}"
+fi
+
 # ----- 3. Smoke (dry-run scan) ----------------------------------------------
 
 if $SMOKE; then
@@ -172,7 +192,7 @@ if $SMOKE; then
   # Override DRY_RUN at the env layer for the smoke invoke
   aws lambda update-function-configuration \
     --function-name "${FUNCTION_NAME}" \
-    --environment 'Variables={GRACE_SECONDS=1800,DRY_RUN=true}' \
+    --environment "${SMOKE_ENV}" \
     --region "${REGION}" \
     --query 'LastUpdateStatus' --output text > /dev/null
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
@@ -185,10 +205,10 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
 
-  # Restore production DRY_RUN=false
+  # Restore production env (DRY_RUN=false)
   aws lambda update-function-configuration \
     --function-name "${FUNCTION_NAME}" \
-    --environment 'Variables={GRACE_SECONDS=1800,DRY_RUN=false}' \
+    --environment "${PROD_ENV}" \
     --region "${REGION}" \
     --query 'LastUpdateStatus' --output text > /dev/null
 fi
