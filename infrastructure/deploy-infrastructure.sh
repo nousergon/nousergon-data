@@ -66,7 +66,8 @@ echo "==> Stamping Step Function definitions with git SHA..."
 SAT_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 DAILY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 EOD_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED'" EXIT
+GROOM_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
+trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$GROOM_STAMPED'" EXIT
 python3 -c "
 import json, sys
 path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -98,12 +99,23 @@ if orig.startswith('[git:'):
 d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
 json.dump(d, open(path_out, 'w'), indent=2)
 " "$SCRIPT_DIR/step_function_eod.json" "$EOD_STAMPED" "$GIT_SHA"
+python3 -c "
+import json, sys
+path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path_in))
+orig = d.get('Comment', '')
+if orig.startswith('[git:'):
+    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
+d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
+json.dump(d, open(path_out, 'w'), indent=2)
+" "$SCRIPT_DIR/step_function_groom.json" "$GROOM_STAMPED" "$GIT_SHA"
 
 echo ""
 echo "==> Uploading Step Function definitions to S3..."
 aws s3 cp "$SAT_STAMPED" "s3://$BUCKET/infrastructure/step_function.json" --quiet
 aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json" --quiet
 aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
+aws s3 cp "$GROOM_STAMPED" "s3://$BUCKET/infrastructure/step_function_groom.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
 # ── 3. Update Step Function definitions (existence-aware) ────────────────────
@@ -122,6 +134,7 @@ echo "==> Updating Step Function definitions..."
 SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+GROOM_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-pipeline"
 # Shared SF execution role (the CFN StepFunctionsRoleArn default; all three
 # orchestration SFs run under it). Used only for the EOD create-if-absent path.
 SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-step-functions-role"
@@ -165,6 +178,7 @@ update_or_create() {
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline"
 update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline"
+update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-pipeline" "Backlog groom pipeline"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""
