@@ -124,7 +124,27 @@ def _resolve_model(event: dict) -> str:
     return m
 
 
-def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str) -> str:
+def _resolve_soft_limit_min(event: dict) -> int | None:
+    """Optional bounded-test override — NOT set by any of the 3 live schedules
+    (their SCHED_INPUTS carry no such key), only by a manual `aws lambda invoke`
+    validating a change before/without waiting for the cron. Missing/invalid →
+    None (groom_run.sh's own static/dynamic-budget default applies)."""
+    raw = event.get("soft_limit_min")
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("malformed soft_limit_min %r — ignoring (default budget applies)", raw)
+        return None
+    if n <= 0:
+        logger.warning("non-positive soft_limit_min %r — ignoring (default budget applies)", raw)
+        return None
+    return n
+
+
+def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
+                       soft_limit_min: int | None = None) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -132,6 +152,7 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     minimal clone glue (it needs the PAT before it can clone the private repo).
     Any prelude failure shuts the box down so a botched launch never idles.
     """
+    soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -153,7 +174,7 @@ git clone --depth 1 --branch {GROOM_BRANCH} \
 cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
-exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"
+exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -201,7 +222,8 @@ def _wait_ssm_online(instance_id: str) -> None:
     )
 
 
-def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str) -> str:
+def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
+                    soft_limit_min: int | None = None) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
@@ -209,7 +231,7 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
         DocumentName="AWS-RunShellScript",
         Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495",
         Parameters={
-            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter)],
+            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter, soft_limit_min)],
             # Execution timeout (NOT the start timeout) — without this SSM kills the
             # command at the 3600s default, guillotining a multi-hour groom.
             "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
@@ -239,7 +261,8 @@ def _terminate_instance(instance_id: str) -> None:
         )
 
 
-def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str) -> dict:
+def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
+                       soft_limit_min: int | None = None) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -262,7 +285,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}"
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
-        command_id = _send_bootstrap(instance_id, run_mode, run_url, model, issue_filter)
+        command_id = _send_bootstrap(instance_id, run_mode, run_url, model, issue_filter, soft_limit_min)
     except Exception:
         _terminate_instance(instance_id)
         raise
@@ -293,14 +316,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
     "claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 15 * * *"}.
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
-    (the two pre-existing Sonnet schedules don't set them).
+    (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
+    a manual-invoke-ONLY bounded-test override — no live schedule sets it.
     """
     event = event or {}
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
+    soft_limit_min = _resolve_soft_limit_min(event)
     schedule_label = str(event.get("schedule") or "unknown")
-    logger.info("scheduled groom trigger: run_mode=%s model=%s issue_filter=%s schedule=%s",
-                run_mode, model, issue_filter, schedule_label)
-    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter)
+    logger.info("scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s schedule=%s",
+                run_mode, model, issue_filter, soft_limit_min, schedule_label)
+    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min)
     return {"groom": result}
