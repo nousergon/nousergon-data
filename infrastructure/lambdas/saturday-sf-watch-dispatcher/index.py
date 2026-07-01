@@ -110,6 +110,26 @@ PIPELINES: dict[str, dict[str, str]] = {
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
     },
+    # Backlog groom dispatch (config#1472) — wraps the EC2-spot-via-SSM groom
+    # dispatch in a Step Function purely for uniform observability (watch-log
+    # artifact + silent Telegram record), replacing the bespoke external
+    # liveness-probe Lambda (data#556). `dispatch_event_type` is DELIBERATELY
+    # given a distinct, not-yet-wired type: `.github/workflows/sf-watch.yml`'s
+    # `types:` allowlist does NOT include it, so a groom failure gets full
+    # watch-log + Telegram coverage but the repository_dispatch call (if
+    # AGENT_DISPATCH_ENABLED) lands as a safe no-op — no workflow listens for
+    # it yet. Groom failures are almost always operational (spot capacity, SSM
+    # misfire) rather than a code defect, so wiring it into the SAME
+    # code-fix-via-PR resilience-agent charter the trading pipelines use needs
+    # its own deliberate autonomy-posture decision first (mirrors the still-open
+    # weekday/EOD soak-exit decision in config#1408) — tracked separately, not
+    # bundled into this SF-wrap.
+    "alpha-engine-groom-dispatch": {
+        "cadence_slug": "groom",
+        "label": "Backlog Groom",
+        "watch_prefix": "consolidated/groom_sf_watch",
+        "dispatch_event_type": "groom-sf-failure",
+    },
 }
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600

@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the alpha-engine-scheduled-groom-dispatcher Lambda
-# and wire its EventBridge Scheduler rules (config#1322, #1432).
+# deploy.sh — Create or update the alpha-engine-scheduled-groom-dispatcher Lambda,
+# the alpha-engine-groom-dispatch Step Function that wraps it, and wire the
+# EventBridge Scheduler rules to start SF executions (config#1322, #1432, #1472).
 #
-# Each Scheduler rule fires THIS Lambda on cadence; the Lambda LAUNCHES A
-# DEDICATED EC2 SPOT BOX (nousergon_lib.ec2_spot, on-demand fallback) and fires an
-# async SSM command that clones nousergon/alpha-engine-config and runs the SAME
-# scripts/groom_run.sh entrypoint the GHA workflow uses, then self-terminates.
-# This moves the heavy ~hours-long groom OFF the org's 2,000 included PRIVATE-repo
-# GHA Actions minutes (config#1432; was: a repository_dispatch into backlog-groom.yml).
-# EventBridge Scheduler conventions (scheduler.amazonaws.com role, cron()
-# expression, flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
+# Each Scheduler rule now starts an execution of the alpha-engine-groom-dispatch
+# STEP FUNCTION (config#1472 — was: directly invoking the Lambda). The SF's sole
+# job is orchestration/observability: invoke this Lambda (UNCHANGED — it still
+# launches the spot box + fires the async SSM command exactly as before), then
+# poll the SSM command to a real terminal status so the SF's own execution
+# status (SUCCEEDED/FAILED) is truthful — which is what plugs the groom into the
+# EXISTING Fleet-SF Watch resilience/observability agent (the same mechanism
+# that already watches the Saturday/weekday/EOD pipelines), instead of the
+# bespoke external liveness-probe Lambda (nousergon-data#556). The heavy
+# grooming logic is completely unchanged — nothing about scripts/groom_run.sh
+# or the spot box's own self-termination changes.
 #
 # IAM (iam-policy.json): the Lambda needs ec2:RunInstances + iam:PassRole (the
 # executor role) + ssm:SendCommand. The BOX reads all secrets itself from SSM via
 # its instance profile (alpha-engine-executor-role → ssm:GetParameter on
-# /alpha-engine/*), so the Lambda needs NO secret access.
+# /alpha-engine/*), so the Lambda needs NO secret access. The SF's OWN execution
+# role (sf-execution-iam-policy.json) needs only lambda:InvokeFunction (on this
+# Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
+# failure) — it never touches secrets or launches anything itself.
 #
 # Cadence (UTC, mirrors the GHA crons exactly). Reduced 3->2/day on 2026-06-29
 # (the 15:00 UTC / 8am-PT run was dropped per usage pacing); a 3rd schedule was
@@ -49,15 +56,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUNCTION_NAME="alpha-engine-scheduled-groom-dispatcher"
 ROLE_NAME="alpha-engine-scheduled-groom-dispatcher-role"
 POLICY_NAME="alpha-engine-scheduled-groom-dispatcher-policy"
+# The Step Function that wraps the Lambda (config#1472). "dispatch" (not
+# "-pipeline") to distinguish it from the fleet's trading-orchestration SFs
+# while still reading clearly as the dispatch mechanism.
+SF_NAME="alpha-engine-groom-dispatch"
+SF_ROLE_NAME="alpha-engine-groom-sf-role"
+SF_POLICY_NAME="alpha-engine-groom-sf-policy"
+SF_DEFINITION_FILE="${SCRIPT_DIR}/../../step_function_groom.json"
 # EventBridge Scheduler execution role (assumed by scheduler.amazonaws.com to
-# invoke the Lambda). Single-target blast radius: lambda:InvokeFunction on this
-# function only.
+# START THE SF). Single-target blast radius: states:StartExecution on this SF
+# only (config#1472 — was lambda:InvokeFunction directly on the Lambda).
 SCHED_ROLE_NAME="alpha-engine-scheduled-groom-dispatcher-scheduler-role"
-SCHED_POLICY_NAME="invoke-scheduled-groom-dispatcher"
+SCHED_POLICY_NAME="start-execution-groom-dispatch"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
 FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+SF_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${SF_NAME}"
+SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SF_ROLE_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 # Schedule definitions: name | cron expression (UTC) | JSON input (run_mode +
@@ -80,7 +96,7 @@ SCHED_INPUTS=(
   '{"run_mode":"full","schedule":"0 23 * * *"}'
   '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","schedule":"0 15 * * *"}'
 )
-# Prefix used to discover live rules for prune reconciliation (see step 2d).
+# Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
 
 DRY_RUN=false
@@ -181,23 +197,67 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # --- 2c. EventBridge Scheduler execution role (invoke this Lambda only) ---
+  # --- 2c. The groom-dispatch Step Function (config#1472) ---
+  SF_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"states.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${SF_ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  Creating SF execution role: ${SF_ROLE_NAME}"
+    run aws iam create-role \
+      --role-name "${SF_ROLE_NAME}" \
+      --assume-role-policy-document "${SF_TRUST}" \
+      --description "Execution role for ${SF_NAME} — invokes the groom Lambda + polls SSM (config#1472)" \
+      --query 'Role.RoleName' --output text
+  else
+    echo "  SF execution role exists: ${SF_ROLE_NAME}"
+  fi
+  echo "  Applying SF policy: ${SF_POLICY_NAME}"
+  run aws iam put-role-policy \
+    --role-name "${SF_ROLE_NAME}" \
+    --policy-name "${SF_POLICY_NAME}" \
+    --policy-document "file://${SCRIPT_DIR}/sf-execution-iam-policy.json"
+
+  if ! $DRY_RUN; then
+    echo "  Waiting 10s for SF role propagation..."
+    sleep 10
+  fi
+
+  if ! aws stepfunctions describe-state-machine --state-machine-arn "${SF_ARN}" \
+      --query 'name' --output text >/dev/null 2>&1; then
+    echo "  Creating Step Function: ${SF_NAME}"
+    run aws stepfunctions create-state-machine \
+      --name "${SF_NAME}" \
+      --definition "file://${SF_DEFINITION_FILE}" \
+      --role-arn "${SF_ROLE_ARN}" \
+      --type STANDARD \
+      --logging-configuration "level=ERROR,includeExecutionData=false,destinations=[{cloudWatchLogsLogGroup={logGroupArn=arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/vendedlogs/states/${SF_NAME}:*}}]" \
+      --region "${REGION}" \
+      --query 'stateMachineArn' --output text
+  else
+    echo "  Step Function exists, updating definition: ${SF_NAME}"
+    run aws stepfunctions update-state-machine \
+      --state-machine-arn "${SF_ARN}" \
+      --definition "file://${SF_DEFINITION_FILE}" \
+      --role-arn "${SF_ROLE_ARN}" \
+      --region "${REGION}" \
+      --query 'updateDate' --output text
+  fi
+
+  # --- 2d. EventBridge Scheduler execution role (start THIS SF only) ---
   SCHED_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   if ! aws iam get-role --role-name "${SCHED_ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
     echo "  Creating Scheduler execution role: ${SCHED_ROLE_NAME}"
     run aws iam create-role \
       --role-name "${SCHED_ROLE_NAME}" \
       --assume-role-policy-document "${SCHED_TRUST}" \
-      --description "EventBridge Scheduler role: invoke ${FUNCTION_NAME} on the groom cadence" \
+      --description "EventBridge Scheduler role: start ${SF_NAME} on the groom cadence" \
       --query 'Role.RoleName' --output text
   else
     echo "  Scheduler execution role exists: ${SCHED_ROLE_NAME}"
   fi
   SCHED_INVOKE_POLICY=$(cat <<EOF
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunction"],"Resource":"${FN_ARN}"}]}
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["states:StartExecution"],"Resource":"${SF_ARN}"}]}
 EOF
 )
-  echo "  Applying Scheduler invoke policy: ${SCHED_POLICY_NAME}"
+  echo "  Applying Scheduler start-execution policy: ${SCHED_POLICY_NAME}"
   run aws iam put-role-policy \
     --role-name "${SCHED_ROLE_NAME}" \
     --policy-name "${SCHED_POLICY_NAME}" \
@@ -208,13 +268,13 @@ EOF
     sleep 10
   fi
 
-  # --- 2d. The EventBridge Scheduler rules ---
+  # --- 2e. The EventBridge Scheduler rules (target = SF, not the Lambda) ---
   for i in "${!SCHED_NAMES[@]}"; do
     name="${SCHED_NAMES[$i]}"
     cron="${SCHED_CRONS[$i]}"
     input="${SCHED_INPUTS[$i]}"
     target=$(cat <<EOF
-{"Arn":"${FN_ARN}","RoleArn":"${SCHED_ROLE_ARN}","Input":"$(printf '%s' "$input" | sed 's/"/\\"/g')"}
+{"Arn":"${SF_ARN}","RoleArn":"${SCHED_ROLE_ARN}","Input":"$(printf '%s' "$input" | sed 's/"/\\"/g')"}
 EOF
 )
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" \
@@ -247,7 +307,7 @@ EOF
     fi
   done
 
-  # --- 2e. Prune reconciliation: delete any live rule under SCHED_PREFIX that is
+  # --- 2f. Prune reconciliation: delete any live rule under SCHED_PREFIX that is
   # no longer in SCHED_NAMES (so dropping a cadence above removes it live too,
   # rather than silently orphaning a still-firing schedule). Added 2026-06-29
   # alongside the 3->2/day reduction (the 1500-sunfri rule is the first prunee).
@@ -288,18 +348,21 @@ fi
 
 echo "✓ Code deployed."
 
-# ----- 4. Smoke (synthetic schedule event) ----------------------------------
+# ----- 4. Smoke (synthetic schedule event, via the SF — the real live path) --
 
 if $SMOKE; then
   echo ""
-  echo "Smoke-testing via direct invoke (synthetic schedule event, run_mode=full)..."
-  RESP=$(mktemp)
-  aws lambda invoke \
-    --function-name "${FUNCTION_NAME}" \
-    --cli-binary-format raw-in-base64-out \
-    --payload '{"run_mode":"full","schedule":"smoke-test"}' \
+  echo "Smoke-testing via SF start-execution (synthetic schedule event, run_mode=full)..."
+  echo "⚠ this starts a REAL execution of ${SF_NAME}, which invokes the Lambda and fires a REAL groom."
+  EXEC_ARN=$(aws stepfunctions start-execution \
+    --state-machine-arn "${SF_ARN}" \
+    --input '{"run_mode":"full","schedule":"smoke-test"}' \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    --query 'executionArn' --output text)
+  echo "Started execution: ${EXEC_ARN}"
+  echo "(async — poll with: aws stepfunctions describe-execution --execution-arn ${EXEC_ARN} --region ${REGION})"
+  RESP=$(mktemp)
+  echo "{\"executionArn\": \"${EXEC_ARN}\"}" > "${RESP}"
   cat "${RESP}"
   echo ""
   rm -f "${RESP}"
