@@ -1,0 +1,5 @@
+# Only nousergon_lib.trading_calendar (is_trading_day) is needed. Pinned to
+# alpha-engine-data's main lib pin so the NYSE-holiday calendar the adjuster
+# reasons over matches the rest of the fleet (avoids a divergent holiday set
+# deciding when the weekly run fires).
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.77.0
