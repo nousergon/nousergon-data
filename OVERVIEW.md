@@ -32,6 +32,7 @@ Centralized data collection — price universe, macro, alternative data, feature
 | Engineered feature store | [`features/feature_engineer.py`](features/feature_engineer.py) |
 | Feature registry | [`features/registry.py`](features/registry.py) |
 | Feature reader / writer | [`features/reader.py`](features/reader.py), [`features/writer.py`](features/writer.py) |
+| Private feature-pack loader (config#1032) | [`features/private_pack.py`](features/private_pack.py) |
 | Daily-append builder (ArcticDB) | [`builders/daily_append.py`](builders/daily_append.py) |
 | Backfill builder | [`builders/backfill.py`](builders/backfill.py) |
 | Delisted-ticker pruner | [`builders/prune_delisted_tickers.py`](builders/prune_delisted_tickers.py) |
