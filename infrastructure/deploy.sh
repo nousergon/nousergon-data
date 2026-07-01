@@ -108,15 +108,67 @@ aws lambda create-alias \
   --region "$REGION"
 echo "  Alias 'live' -> version $VERSION"
 
+# ── Throttle-aware Lambda invoke (bounded, jittered retry) ───────────────────
+# A canary `aws lambda invoke` can throttle (TooManyRequestsException /
+# ReservedFunctionConcurrentInvocationLimitExceeded) when the function's
+# concurrency slot is momentarily occupied — an overlapping deploy's canary
+# (cancelling a GitHub Actions run does NOT stop the Lambda execution it
+# already dispatched) or an in-flight scheduled invocation. The AWS CLI's own
+# retry (max 2) can't outwait an in-flight execution, and under `set -euo
+# pipefail` the invoke's non-zero exit aborts the whole deploy on a transient
+# smoke-test throttle (bit crucible-research CI 2026-07-01). This retries ONLY
+# on that throttle signal (bounded exp backoff + jitter, ~3 min); non-throttle
+# errors are not retried; exhaustion returns non-zero (fail loud).
+# Args: <output-file> <aws lambda invoke flags...>  (output positional appended).
+_invoke_lambda_with_throttle_retry() {
+  local out_file="$1"; shift
+  local max_attempts=6 attempt=1 rc base sleep_s err_file
+  err_file=$(mktemp)
+  while :; do
+    rc=0
+    aws lambda invoke "$@" "$out_file" >/dev/null 2>"$err_file" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$err_file"
+      return 0
+    fi
+    if [ "$attempt" -lt "$max_attempts" ] && \
+       grep -qE 'TooManyRequestsException|ReservedFunctionConcurrentInvocationLimitExceeded' "$err_file"; then
+      base=$(( 2 ** (attempt - 1) * 5 ))   # 5, 10, 20, 40, 80s
+      sleep_s=$(( base + RANDOM % 5 ))     # + 0-4s jitter
+      echo "  Canary invoke throttled — concurrency slot busy (attempt ${attempt}/${max_attempts}); retrying in ${sleep_s}s..." >&2
+      sleep "$sleep_s"
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    echo "  ERROR: canary invoke failed (exit ${rc}) after ${attempt} attempt(s):" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return "$rc"
+  done
+}
+
 # Canary
 echo "  Running canary (dry_run=true)..."
 CANARY_OUT=$(mktemp)
-aws lambda invoke \
-  --function-name "${FUNCTION_NAME}:live" \
-  --payload '{"phase": 2, "dry_run": true}' \
-  --cli-binary-format raw-in-base64-out \
-  --region "$REGION" \
-  "$CANARY_OUT" > /dev/null
+if ! _invoke_lambda_with_throttle_retry "$CANARY_OUT" \
+    --function-name "${FUNCTION_NAME}:live" \
+    --payload '{"phase": 2, "dry_run": true}' \
+    --cli-binary-format raw-in-base64-out \
+    --region "$REGION"; then
+  # The invoke API never returned a payload (non-throttle error, or the slot
+  # stayed busy past the bounded retry window). The deploy SUCCEEDED (alias is
+  # already on $VERSION); a never-run smoke test is NOT a canary failure, so do
+  # NOT roll back. Surface loud + alert so an operator confirms the live version.
+  rm -f "$CANARY_OUT"
+  echo "  ERROR: canary could not be invoked (slot contention or invoke error) — deploy left LIVE on v${VERSION}, NOT rolled back."
+  python3 -m nousergon_lib.alerts publish \
+    --severity error \
+    --source "alpha-engine-data/infrastructure/deploy.sh" \
+    --dedup-key "canary-uninvokable-${FUNCTION_NAME}-v${VERSION}" \
+    --message "Canary could NOT be invoked for ${FUNCTION_NAME} v${VERSION} (throttle/concurrency or invoke error, retries exhausted). Live alias LEFT on v${VERSION} — deploy succeeded, NOT rolled back. Verify the live version manually." \
+    || true
+  exit 1
+fi
 
 CANARY_STATUS=$(python3 -c "
 import json, sys
