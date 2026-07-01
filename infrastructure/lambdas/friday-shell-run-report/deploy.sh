@@ -95,11 +95,20 @@ if $BOOTSTRAP; then
   else
     echo "  Lambda exists, code will be updated in step 3"
   fi
+fi
 
-  # EventBridge rule: Saturday SF terminal transitions (SUCCEEDED/FAILED/TIMED_OUT/ABORTED).
-  # The handler no-ops on non-shell-run executions, so no input-content filter is needed.
-  echo "  Creating EventBridge rule: ${RULE_NAME}"
-  EVENT_PATTERN=$(cat <<EOF
+# ----- 2b. Reconcile EventBridge rule (ALWAYS — not bootstrap-gated) --------
+#
+# config#1453/config#1460: a rename that changes an SF ARN must be picked up
+# by a PLAIN `deploy.sh` run, not just the first-time `--bootstrap` (this
+# rule was one of the two EventBridge triggers the ne-* rename silently
+# dropped). put-rule/put-targets/add-permission are idempotent create-or-
+# update calls, so reconciling on every deploy converges the live rule to
+# source with no bootstrap dependency. Requires the Lambda to already exist
+# (i.e. `--bootstrap` has run at least once).
+# The handler no-ops on non-shell-run executions, so no input-content filter is needed.
+echo "Reconciling EventBridge rule: ${RULE_NAME}"
+EVENT_PATTERN=$(cat <<EOF
 {
   "source": ["aws.states"],
   "detail-type": ["Step Functions Execution Status Change"],
@@ -110,18 +119,17 @@ if $BOOTSTRAP; then
 }
 EOF
 )
-  run aws events put-rule --name "${RULE_NAME}" --event-pattern "${EVENT_PATTERN}" \
-    --description "Consolidated Friday shell-run report on Saturday SF terminal (Lambda shell-run-guards)" \
-    --region "${REGION}" --query 'RuleArn' --output text
+run aws events put-rule --name "${RULE_NAME}" --event-pattern "${EVENT_PATTERN}" \
+  --description "Consolidated Friday shell-run report on Saturday SF terminal (Lambda shell-run-guards)" \
+  --region "${REGION}" --query 'RuleArn' --output text
 
-  FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
-  run aws events put-targets --rule "${RULE_NAME}" --targets "Id=1,Arn=${FN_ARN}" --region "${REGION}"
+FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+run aws events put-targets --rule "${RULE_NAME}" --targets "Id=1,Arn=${FN_ARN}" --region "${REGION}"
 
-  RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
-  run aws lambda add-permission --function-name "${FUNCTION_NAME}" \
-    --statement-id "eventbridge-${RULE_NAME}" --action lambda:InvokeFunction \
-    --principal events.amazonaws.com --source-arn "${RULE_ARN}" --region "${REGION}" 2>/dev/null || true
-fi
+RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
+run aws lambda add-permission --function-name "${FUNCTION_NAME}" \
+  --statement-id "eventbridge-${RULE_NAME}" --action lambda:InvokeFunction \
+  --principal events.amazonaws.com --source-arn "${RULE_ARN}" --region "${REGION}" 2>/dev/null || true
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
 
