@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timezone
 
 import boto3
 import pandas as pd
@@ -81,6 +81,14 @@ def collect(
 
     # Step 2: Backfill score_performance returns via universe_returns JOIN
     results["backfill_score_returns"] = _backfill_score_returns(db_path, dry_run)
+
+    # Step 2c: Phase-2 dual-write of the long-format score_performance_outcomes
+    # table (EPIC config#1483). Emits one row per (signal, score_date, horizon)
+    # for the canonical HorizonPolicy horizons, sourced from universe_returns
+    # decimals + validated against the nousergon_lib outcome_record contract.
+    # ADDITIVE + SECONDARY during the >=1-week dual-write soak — the wide
+    # score_performance columns (Step 2) stay primary until the Phase-4 cutover.
+    results["backfill_outcome_records"] = _backfill_outcome_records(db_path, dry_run)
 
     # Step 2b: Drift gate — emit canonical-context coverage as a CW gauge
     # so an alarm fires if the producer ever regresses (e.g. signals.json
@@ -532,6 +540,207 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
 
     except Exception as e:
         logger.error("backfill_score_returns failed: %s", e)
+        return {"status": "error", "error": str(e), "rows_written": 0}
+
+
+# ── Step 2c: Long-format outcome dual-write (EPIC config#1483 Phase 2) ─────────
+
+
+def _ensure_score_performance_outcomes_schema(conn) -> None:
+    """Create the long-format ``score_performance_outcomes`` table if absent.
+
+    The config#1483 root-cause fix for the wide horizon-suffixed columns: one
+    row per (signal, score_date, horizon_days) so a horizon change is a DATA
+    change, not a fleet-wide column rename. Field names + semantics mirror
+    ``nousergon_lib.contracts`` ``outcome_record`` (v1) and
+    ``nousergon_lib.quant.horizons.OutcomeColumns``. Self-creating (IF NOT
+    EXISTS) so this producer is Phase-2-self-sufficient; the authoritative
+    research-side migration + consumer reads land in Phase 3. Returns/spy
+    stored as DECIMALS (matching the universe_returns source + log_alpha),
+    NOT the legacy percent quirk of the wide columns.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS score_performance_outcomes (
+            id             INTEGER PRIMARY KEY,
+            signal_id      TEXT NOT NULL,
+            symbol         TEXT NOT NULL,
+            score_date     TEXT NOT NULL,
+            horizon_days   INTEGER NOT NULL,
+            beat_spy       INTEGER,
+            stock_return   REAL,
+            spy_return     REAL,
+            log_alpha      REAL,
+            is_primary     INTEGER NOT NULL,
+            resolved_at    TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(signal_id, horizon_days)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spo_horizon ON score_performance_outcomes(horizon_days)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spo_score_date ON score_performance_outcomes(score_date)"
+    )
+    conn.commit()
+
+
+def _backfill_outcome_records(
+    db_path: str, dry_run: bool, resolved_at: str | None = None, policy=None,
+) -> dict:
+    """Dual-write the long-format ``score_performance_outcomes`` rows alongside
+    the wide ``score_performance`` columns (EPIC config#1483 Phase 2).
+
+    For each canonical ``HorizonPolicy`` horizon (primary 21d + diagnostics),
+    reads the DECIMAL forward returns straight from ``universe_returns`` (the
+    same JOIN Step 2 uses, before its percent conversion), derives the
+    long-format record, VALIDATES it against the ``outcome_record`` contract
+    (fail-loud on a shape/label violation), and idempotently inserts it. The
+    canonical primary horizon carries the log-domain ``log_alpha``; diagnostic
+    horizons carry ``log_alpha = NULL`` (no canonical alpha at a non-primary
+    horizon — the contract's if/then permits null only when ``is_primary`` is
+    False). Legacy 10d/30d horizons are deliberately NOT carried into the
+    canonical store — only the policy horizons.
+
+    ``resolved_at``/``policy`` are injectable for deterministic tests.
+    """
+    from nousergon_lib.contracts import validate
+    from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+    policy = policy or DEFAULT_POLICY
+    resolved_at = resolved_at or datetime.now(timezone.utc).isoformat()
+
+    try:
+        conn = sqlite3.connect(db_path)
+        _ensure_score_performance_outcomes_schema(conn)
+
+        ur_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()
+        }
+        has_log = {"log_return_21d", "log_spy_return_21d"} <= ur_cols
+        written = 0
+
+        for h in policy.all_horizons:
+            hcol = f"{h}d"
+            need = {f"return_{hcol}", f"spy_return_{hcol}", f"beat_spy_{hcol}"}
+            if not need <= ur_cols:
+                # A policy horizon whose universe_returns columns don't exist
+                # yet (e.g. a newly-added diagnostic horizon before its data
+                # collector ships). Skip + WARN — graceful-empty, detectable.
+                logger.warning(
+                    "score_performance_outcomes: universe_returns lacks %s — "
+                    "skipping horizon %dd",
+                    sorted(need - ur_cols), h,
+                )
+                continue
+
+            is_primary = policy.is_primary(h)
+            log_select = (
+                ", ur.log_return_21d, ur.log_spy_return_21d"
+                if (is_primary and has_log)
+                else ""
+            )
+            rows = conn.execute(
+                f"""
+                SELECT sp.symbol, sp.score_date,
+                       ur.return_{hcol}, ur.spy_return_{hcol}, ur.beat_spy_{hcol}{log_select}
+                FROM score_performance sp
+                JOIN universe_returns ur
+                  ON ur.ticker = sp.symbol AND ur.eval_date = sp.score_date
+                WHERE ur.return_{hcol} IS NOT NULL
+                """
+            ).fetchall()
+
+            for row in rows:
+                symbol, score_date, stock_return, spy_return, beat_spy = row[:5]
+                # A resolved record requires both legs; a missing spy leg means
+                # the outcome isn't fully resolved yet — skip (re-picked up on a
+                # later run once universe_returns has it).
+                if stock_return is None or spy_return is None:
+                    continue
+
+                log_alpha = None
+                if is_primary and has_log:
+                    lr, lsr = row[5], row[6]
+                    if lr is not None:
+                        log_alpha = round(lr - (lsr if lsr is not None else 0.0), 6)
+                if is_primary and log_alpha is None:
+                    # The primary row MUST carry the canonical label; writing a
+                    # null-alpha primary would violate the contract. Skip + WARN
+                    # rather than fabricate — the row lands once the log columns
+                    # resolve. (Post-#197 universe_returns always has them.)
+                    logger.warning(
+                        "score_performance_outcomes: canonical log_alpha "
+                        "unavailable for primary %dd row %s@%s — skipping",
+                        h, symbol, score_date,
+                    )
+                    continue
+
+                # beat_spy: prefer the stored flag; derive from the decimal
+                # legs when null (mirrors Step 2's beat_spy repair), never
+                # fabricate.
+                beat = bool(beat_spy) if beat_spy is not None else (stock_return > spy_return)
+
+                record = {
+                    "schema_version": 1,
+                    "signal_id": f"{symbol}:{score_date}",
+                    "score_date": score_date,
+                    "horizon_days": int(h),
+                    "beat_spy": beat,
+                    "stock_return": float(stock_return),
+                    "spy_return": float(spy_return),
+                    "log_alpha": float(log_alpha) if log_alpha is not None else None,
+                    "resolved_at": resolved_at,
+                    "is_primary": is_primary,
+                }
+                # Fail-loud on a contract violation — a malformed record is a
+                # producer bug (caught by the step-level except → status:error,
+                # which surfaces as collect() status:partial, NOT a silent skip).
+                validate("outcome_record", record)
+
+                if not dry_run:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO score_performance_outcomes
+                            (signal_id, symbol, score_date, horizon_days, beat_spy,
+                             stock_return, spy_return, log_alpha, is_primary,
+                             resolved_at, schema_version)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record["signal_id"], symbol, score_date, int(h),
+                            1 if beat else 0,
+                            record["stock_return"], record["spy_return"],
+                            record["log_alpha"],
+                            1 if is_primary else 0,
+                            resolved_at, 1,
+                        ),
+                    )
+                written += 1
+
+        if not dry_run:
+            conn.commit()
+        conn.close()
+
+        if written:
+            logger.info(
+                "Dual-wrote %d long-format score_performance_outcomes rows "
+                "(config#1483 Phase 2)", written,
+            )
+        return {"status": "ok", "rows_written": written}
+
+    except Exception as e:
+        # no-silent-fails carve-out (~/Development/CLAUDE.md): (a) failure mode =
+        # the NEW long-format dual-write (schema / contract / JOIN bug); (b) the
+        # primary deliverable — the wide score_performance columns (Step 2,
+        # already committed) — survives, and the live eval system reads THOSE,
+        # not this table, during the soak; (c) recording surface = this ERROR
+        # log + status:error in the returned dict, which bubbles to collect()'s
+        # has_errors → overall status:partial. At the Phase-4 cutover this store
+        # becomes primary and this handler flips to fail-loud (re-raise).
+        logger.error("backfill_outcome_records failed: %s", e)
         return {"status": "error", "error": str(e), "rows_written": 0}
 
 
