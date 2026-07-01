@@ -1,0 +1,47 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-weekly-schedule-adjuster:*"
+    },
+    {
+      "Sid": "ListRulesForReconcile",
+      "Effect": "Allow",
+      "Action": ["events:ListRules", "events:ListTargetsByRule", "events:DescribeRule"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ToggleSaturdayCron",
+      "Effect": "Allow",
+      "Action": ["events:EnableRule", "events:DisableRule"],
+      "Resource": "arn:aws:events:us-east-1:711398986525:rule/alpha-engine-saturday"
+    },
+    {
+      "Sid": "ManageWeeklyOneShots",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:PutTargets",
+        "events:RemoveTargets",
+        "events:DeleteRule"
+      ],
+      "Resource": "arn:aws:events:us-east-1:711398986525:rule/alpha-engine-weekly-oneshot-*"
+    },
+    {
+      "Sid": "PassSfnTargetRoleToOneShot",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-eventbridge-sfn-role",
+      "Condition": {
+        "StringEquals": {"iam:PassedToService": "events.amazonaws.com"}
+      }
+    }
+  ]
+}
