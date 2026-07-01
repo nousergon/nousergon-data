@@ -41,6 +41,7 @@ weaken that.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -48,11 +49,26 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 
+# 2026-07-01 (EOD run_date-threading fix): EODReconcile's Parameters.commands
+# moved from a plain JSON array to a `commands.$ States.Array(...)` intrinsic
+# expression (needed to splice $.run_date via States.Format — see
+# test_sf_ssm_pipefail_wiring.py's _LIB_CLI_RE docstring for why the inline
+# bash-trap form can't live in a commands.$ context). None of this file's
+# assertions check exact list equality — only substring/ordering checks — so
+# extracting each single-quoted literal argument (the plain setup lines AND
+# the States.Format(...) template string, which still contains the
+# boot-pull.sh / eod_reconcile.py substrings these tests key off) preserves
+# every check unchanged.
+_QUOTED_ARG_RE = re.compile(r"'([^']*)'")
+
 
 @pytest.fixture(scope="module")
 def eod_commands() -> list[str]:
     doc = json.loads(_SF_PATH.read_text())
-    return doc["States"]["EODReconcile"]["Parameters"]["Parameters"]["commands"]
+    params = doc["States"]["EODReconcile"]["Parameters"]["Parameters"]
+    if "commands" in params:
+        return params["commands"]
+    return _QUOTED_ARG_RE.findall(params["commands.$"])
 
 
 def _index_of(cmds: list[str], needle: str) -> int:
