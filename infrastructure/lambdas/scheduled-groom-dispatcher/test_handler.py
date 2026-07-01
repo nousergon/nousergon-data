@@ -202,6 +202,29 @@ def test_malformed_model_falls_back_to_default(monkeypatch):
     assert "export GROOM_MODEL=claude-sonnet-5" in cmd
 
 
+def test_soft_limit_min_override_forwarded_for_bounded_test(monkeypatch):
+    # A manual invoke can bound a test run (e.g. 60 min) without touching any
+    # live schedule — none of the 3 SCHED_INPUTS carry this key.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"run_mode": "full", "issue_filter": "high-only", "soft_limit_min": 60}, None)
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "--soft-limit-min 60" in cmd
+
+
+def test_missing_soft_limit_min_omits_the_flag(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"run_mode": "full"}, None)
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "--soft-limit-min" not in cmd
+
+
+def test_malformed_soft_limit_min_ignored(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"run_mode": "full", "soft_limit_min": "not-a-number"}, None)
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "--soft-limit-min" not in cmd
+
+
 def test_disabled_flag_short_circuits(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "false"})
     out = idx.handler({"run_mode": "full"}, None)
