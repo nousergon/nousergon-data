@@ -345,6 +345,44 @@ def test_orchestration_known_divergence_does_not_fail(monkeypatch):
     assert result["unexplained_count"] == 0
 
 
+def test_orchestration_phantom_split_surfaced_not_applied(monkeypatch):
+    """config#1455 root cause: a feed-reported split with NO corroborating
+    price move (e.g. live polygon returning a past execution_date for KLAC/
+    HON/DD with no matching market discontinuity) must NOT be baked into
+    Close/total_return_close, and must be surfaced in the audit report as
+    ``unconfirmed_splits`` — not silently applied, and not misdiagnosed as a
+    generic reconciliation residual."""
+    idx = pd.bdate_range("2026-06-01", periods=6)
+    # Flat raw series — NO real split anywhere in it.
+    raw = pd.DataFrame({"Close": [50.0] * 6, "Volume": [1e6] * 6}, index=idx)
+    raw_frames = {"X": raw}
+    old_closes = {"X": pd.Series([50.0] * 6, index=idx)}  # matches raw exactly
+    # Feed reports a 10-for-1 split that never happened (phantom, config#1455).
+    client = _FakePolygon(
+        splits={"X": [{"execution_date": idx[3].strftime("%Y-%m-%d"),
+                       "split_from": 1, "split_to": 10}]},
+        dividends={"X": []},
+    )
+    _patch_orchestration(monkeypatch, old_closes=old_closes)
+
+    result = m.migrate_universe_crsp_basis(
+        apply=False,
+        raw_fetch=lambda t: raw_frames[t],
+        client=client,
+        rel_tol=0.02,
+        workers=1,
+    )
+    # The phantom split was NOT applied — reconstruction stays flat $50,
+    # matching old_close exactly, so the ticker reconciles clean (the gate's
+    # job: correctly WITHHOLDING an unconfirmed action lets a clean name pass
+    # instead of false-failing on a fictitious 10x factor).
+    assert result["status"] == "ok"
+    assert result["within_tol_count"] == 1
+    assert result["unexplained_count"] == 0
+    assert result["unconfirmed_splits_count"] == 1
+    assert result["unconfirmed_splits"] == ["X 10-for-1 forward split (2026-06-04)"]
+
+
 def test_orchestration_apply_writes_scratch_lib_only(monkeypatch, tmp_path):
     """Apply path: the reconstructed series is written to a REAL (LMDB) scratch
     library, and the live universe lib is never written."""
