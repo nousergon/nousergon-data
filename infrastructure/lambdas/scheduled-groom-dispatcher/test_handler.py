@@ -154,6 +154,54 @@ def test_sweep_run_mode_is_forwarded(monkeypatch):
     assert "--mode sweep" in idx._test_ssm.sent[0]["Parameters"]["commands"][0]
 
 
+def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
+    # The 3rd (Opus, 8am PT) schedule's event carries model + issue_filter —
+    # these must reach the box as exported env vars ahead of the bootstrap exec.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {"run_mode": "full", "model": "claude-opus-4-8", "issue_filter": "high-only",
+         "schedule": "0 15 * * *"},
+        None,
+    )
+    g = out["groom"]
+    assert g["model"] == "claude-opus-4-8"
+    assert g["issue_filter"] == "high-only"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_MODEL=claude-opus-4-8" in cmd
+    assert "export GROOM_ISSUE_FILTER=high-only" in cmd
+    assert cmd.index("export GROOM_MODEL") < cmd.index("groom_spot_bootstrap.sh")
+
+
+def test_missing_model_and_issue_filter_default_to_sonnet_queue(monkeypatch):
+    # The 2 pre-existing Sonnet schedules don't set model/issue_filter — must
+    # default exactly like before this feature (no behavior change for them).
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    g = out["groom"]
+    assert g["model"] == "claude-sonnet-5"
+    assert g["issue_filter"] == "default"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+    assert "export GROOM_ISSUE_FILTER=default" in cmd
+
+
+def test_unknown_issue_filter_falls_back_to_default(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "issue_filter": "bogus"}, None)
+    assert out["groom"]["issue_filter"] == "default"
+
+
+def test_malformed_model_falls_back_to_default(monkeypatch):
+    # A model string with shell metacharacters must be rejected outright rather
+    # than embedded into the SSM command (defense-in-depth allowlist).
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "model": "claude; rm -rf /"}, None)
+    assert out["groom"]["model"] == "claude-sonnet-5"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "claude; rm -rf /" not in cmd
+    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+
+
 def test_disabled_flag_short_circuits(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "false"})
     out = idx.handler({"run_mode": "full"}, None)

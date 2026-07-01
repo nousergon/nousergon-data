@@ -17,9 +17,13 @@
 # /alpha-engine/*), so the Lambda needs NO secret access.
 #
 # Cadence (UTC, mirrors the GHA crons exactly). Reduced 3->2/day on 2026-06-29
-# (the 15:00 UTC / 8am-PT run was dropped per usage pacing):
-#   07:00 Sun-Fri   cron(0 7 ? * SUN-FRI *)   FULL   # 12am PT, skips Sat
-#   23:00 daily     cron(0 23 * * ? *)        FULL   # 4pm PT, every day incl. Sat
+# (the 15:00 UTC / 8am-PT run was dropped per usage pacing); a 3rd schedule was
+# re-added 2026-07-01 (config#1495 follow-up) at the SAME 15:00 UTC slot, now
+# running a DIFFERENT tier — Opus, complexity:high ONLY — not a reinstatement
+# of the old Sonnet drain-phase run:
+#   07:00 Sun-Fri   cron(0 7 ? * SUN-FRI *)   FULL   Sonnet, default queue   # 12am PT, skips Sat
+#   23:00 daily     cron(0 23 * * ? *)        FULL   Sonnet, default queue  # 4pm PT, every day incl. Sat
+#   15:00 daily     cron(0 15 * * ? *)        FULL   Opus,   high-only      # 8am PT, every day
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -56,19 +60,25 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
-# Schedule definitions: name | cron expression (UTC) | JSON input (run_mode + label).
-# Mirrors backlog-groom.yml's `schedule:` crons one-for-one.
+# Schedule definitions: name | cron expression (UTC) | JSON input (run_mode +
+# label, plus model/issue_filter for the Opus high-tier schedule). The two
+# Sonnet schedules omit model/issue_filter — the Lambda defaults them to
+# claude-sonnet-5 / "default" (the pre-existing mid-tier queue), so this is not
+# a behavior change for them.
 SCHED_NAMES=(
   "alpha-engine-scheduled-groom-0700-sunfri"
   "alpha-engine-scheduled-groom-2300-daily"
+  "alpha-engine-scheduled-groom-1500-daily-opus-high"
 )
 SCHED_CRONS=(
   "cron(0 7 ? * SUN-FRI *)"
   "cron(0 23 * * ? *)"
+  "cron(0 15 * * ? *)"
 )
 SCHED_INPUTS=(
   '{"run_mode":"full","schedule":"0 7 * * 0-5"}'
   '{"run_mode":"full","schedule":"0 23 * * *"}'
+  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","schedule":"0 15 * * *"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2d).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"

@@ -10,24 +10,26 @@ private `alpha-engine-config` repo). The box runs the SAME
 `scripts/groom_run.sh` entrypoint the GHA workflow uses (single source of truth),
 then self-terminates (~$2/mo).
 
-> **Status: UNVALIDATED.** This is the IaC + handler only. It has **zero live
-> effect** until an operator runs `deploy.sh --bootstrap`. **Cutover** (config#1432):
-> after a manual `--smoke` spot run validates end-to-end, deploy this AND disable
-> the GHA `schedule:` crons in `backlog-groom.yml` together — so there is no
-> double-groom and no gap. `workflow_dispatch` stays as the manual escape hatch.
+> **Status: LIVE** (cutover 2026-06-30, config#1432). This is the sole scheduler
+> for the backlog groom — the GHA `schedule:` crons in `backlog-groom.yml` have
+> been REMOVED; that workflow now runs only on `workflow_dispatch` (manual
+> escape hatch). Any code change here needs `deploy.sh` (code-only, or
+> `--bootstrap` when a schedule/IAM changes) run by an operator with AWS creds
+> before it has live effect — merging the PR alone does not deploy it.
 
 ## How it fits
 
 ```
-EventBridge Scheduler rules (UTC, cron)            THIS Lambda
-  alpha-engine-scheduled-groom-0700-sunfri  ─┐      1. nousergon_lib.ec2_spot.launch()
-  alpha-engine-scheduled-groom-2300-daily   ─┴────▶    (spot; on-demand fallback)
-                                                    2. wait instance running + SSM Online
-                                                    3. async ssm send-command (detached):
-                                                          │
-                                                          ▼
+EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
+  alpha-engine-scheduled-groom-0700-sunfri          ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-2300-daily           ─┼───▶     (spot; on-demand fallback)
+  alpha-engine-scheduled-groom-1500-daily-opus-high ─┘      2. wait instance running + SSM Online
+                                                             3. async ssm send-command (detached):
+                                                                   │
+                                                                   ▼
    EC2 spot box (AL2023, alpha-engine-executor-profile)
      prelude: read PAT (SSM) → clone alpha-engine-config
+       → export GROOM_MODEL / GROOM_ISSUE_FILTER (from the schedule's event)
        → infrastructure/groom_spot_bootstrap.sh --mode <full|sweep>
          → scripts/groom_run.sh  (budget gate → driver/sweep → digest-verify)
      → shutdown -h now (InstanceInitiatedShutdownBehavior=terminate)
@@ -39,17 +41,28 @@ credential, and this Lambda needs no secret access. The EventBridge Scheduler co
 (`scheduler.amazonaws.com` execution role, `cron()` expression, OFF
 flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
-## Cadence — one-for-one with the GHA crons it replaces
+## Cadence
 
-| Scheduler rule | Expression (UTC) | GHA cron replaced | PT | Day mask | run_mode |
-|---|---|---|---|---|---|
-| `…-0700-sunfri` | `cron(0 7 ? * SUN-FRI *)` | `0 7 * * 0-5` | 12am | Sun–Fri (skips Sat) | full |
-| `…-2300-daily` | `cron(0 23 * * ? *)` | `0 23 * * *` | 4pm | daily incl. Sat | full |
+| Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
+|---|---|---|---|---|---|---|
+| `…-0700-sunfri` | `cron(0 7 ? * SUN-FRI *)` | 12am | Sun–Fri (skips Sat) | full | claude-sonnet-5 | default |
+| `…-2300-daily` | `cron(0 23 * * ? *)` | 4pm | daily incl. Sat | full | claude-sonnet-5 | default |
+| `…-1500-daily-opus-high` | `cron(0 15 * * ? *)` | 8am | daily (all 7) | full | claude-opus-4-8 | high-only |
 
 > **Reduced 3→2/day on 2026-06-29** (usage pacing): the former
-> `…-1500-sunfri` rule (`cron(0 15 ? * SUN-FRI *)`, 8am PT) was dropped.
-> `deploy.sh` step 2e prunes it from live on the next `--bootstrap`; the matching
-> `0 15 * * 0-5` GHA cron is removed in the same change.
+> `…-1500-sunfri` rule (`cron(0 15 ? * SUN-FRI *)`, 8am PT, Sonnet/default) was
+> dropped. **Re-added 2026-07-01** at the same 15:00 UTC slot (config#1495
+> follow-up) as a DIFFERENT tier, not a reinstatement: `…-1500-daily-opus-high`
+> runs **Opus** against **`complexity:high` issues only** — the queue the two
+> Sonnet schedules above explicitly exclude. It shares the SAME weekly Max-quota
+> reserve-for-interactive budget gate (`scripts/groom_budget.py`) as the Sonnet
+> schedules — it competes for the same pool, not a separate one — and shuts
+> down immediately/cleanly if the `complexity:high` queue is empty (a
+> `total == 0` clean stop, never a floor-breach false-positive; see
+> `scripts/groom_driver.py`). An issue an Opus chunk judges to need Brian's own
+> judgment (a genuine, irreducible product/architecture fork — not mere
+> difficulty) gets relabeled `complexity:ultra`, which permanently exits ALL
+> automated grooming (both this schedule and the two Sonnet ones).
 
 The Sat-skip rationale is carried verbatim from `backlog-groom.yml`: the
 `…-0700-sunfri` rule avoids colliding with the 09:00-UTC Crucible Saturday
@@ -60,14 +73,20 @@ EventBridge Scheduler cron uses 6 fields `cron(min hour day-of-month month
 day-of-week year)` with `?` for an unspecified day field and `SUN-FRI` for the
 day-of-week mask.
 
-## Run-mode routing
+## Schedule-input routing
 
-Each schedule passes a JSON input `{"run_mode": "...", "schedule": "..."}`. The
-Lambda forwards `run_mode` into `client_payload` (also as `phase` for
-forward-compat); `backlog-groom.yml`'s run-mode step reads
-`github.event.client_payload.run_mode` to route `full` vs `sweep`. Both
-current rules are `full` (the drain-phase default). An unknown/missing run_mode
-degrades to `full`.
+Each schedule passes a JSON input, e.g. `{"run_mode": "full", "model":
+"claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 15 * * *"}`.
+The Lambda resolves each field (unknown/missing values degrade to a safe
+default — `full` / `claude-sonnet-5` / `default`) and exports `GROOM_MODEL` +
+`GROOM_ISSUE_FILTER` in the SSM bootstrap prelude ahead of invoking
+`groom_spot_bootstrap.sh --mode <run_mode>`, which forwards them into
+`scripts/groom_run.sh` → `scripts/groom_driver.py` (`--issue-filter` selects
+the Sonnet default queue vs. the Opus `complexity:high`-only queue; `--model`
+is passed straight to the `claude -p` invocation). `model` is validated against
+a conservative allowlist regex before being embedded in the shell command
+(defense-in-depth — the event is Lambda-config-controlled, not raw user input,
+but injection protection is cheap).
 
 ## Contract & safety
 
@@ -96,32 +115,19 @@ Merging the PR has **zero live effect** until an operator runs `--bootstrap`.
 `GROOM_DISPATCH_ENABLED` defaults on) **triggers an actual groom run** — use
 intentionally.
 
-## Validation — apply + on-time-firing soak (REQUIRED before removing GHA crons)
+## Validating a new/changed schedule
 
-1. **Prereq**: the `alpha-engine-config` PR adding the `scheduled-groom`
-   dispatch type + run-mode routing must be merged (cross-linked below).
-2. **Apply**: `bash …/deploy.sh --bootstrap` (operator with AWS creds).
-3. **Verify wiring**: `aws scheduler list-schedules --name-prefix
-   alpha-engine-scheduled-groom --region us-east-1` shows both; `--smoke`
-   produces a backlog-groom run in alpha-engine-config Actions.
-4. **Soak (multi-day)**: confirm each rule fires **on time** for a week — compare
-   the EventBridge/Lambda CloudWatch invocation timestamps against the cron and
-   confirm a matching `repository_dispatch` (`scheduled-groom`) backlog-groom run
-   appears within a minute. Watch the Lambda `Errors` metric stays at 0.
-5. **Cut over**: only after the soak confirms reliable on-time firing, remove the
-   remaining `schedule:` crons from `backlog-groom.yml` (a follow-up PR), leaving
-   EventBridge as the sole scheduler. Until then both run (the workflow's
-   `concurrency` group serialises any rare overlap, so the belt-and-suspenders
-   window is harmless).
-
-## Prerequisite in alpha-engine-config
-
-`backlog-groom.yml` must listen for the trigger and honor the run-mode:
-
-```yaml
-on:
-  repository_dispatch:
-    types: [saturday-sf-success-groom, scheduled-groom]
-```
-
-(the run-mode step reads `github.event.client_payload.run_mode`).
+1. **Apply**: `bash …/deploy.sh --bootstrap` (operator with AWS creds) — creates/
+   updates the 3 Scheduler rules from `SCHED_NAMES`/`SCHED_CRONS`/`SCHED_INPUTS`
+   and prunes any live rule under the prefix no longer listed there.
+2. **Verify wiring**: `aws scheduler list-schedules --name-prefix
+   alpha-engine-scheduled-groom --region us-east-1` shows all 3.
+3. **Bounded manual test**: `aws lambda invoke` with the target schedule's JSON
+   input (see the Cadence table) to fire an on-demand run without waiting for
+   the cron; add `"soft_limit_min"` handling is NOT read by the Lambda itself —
+   cap a manual box's runtime by SSH/SSM-exporting `SOFT_LIMIT_MIN` before
+   `groom_spot_bootstrap.sh --soft-limit-min <n>` runs, or invoke the bootstrap
+   script directly with that flag on a manually launched box.
+4. **Soak**: confirm the rule fires on time and produces (or, for `high-only`,
+   cleanly no-ops on) a `groom-digest` issue in `alpha-engine-config`; watch the
+   Lambda `Errors` metric stays at 0.
