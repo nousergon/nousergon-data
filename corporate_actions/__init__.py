@@ -311,15 +311,30 @@ class CorporateAction:
 
     # ── human description ────────────────────────────────────────────────
     def human(self) -> str:
-        """A human-readable one-liner, e.g. '1-for-2 reverse split'."""
+        """A human-readable one-liner, e.g. '1-for-2 reverse split'.
+
+        Uses the EXACT ``split_from``/``split_to`` ratio, not a floor-divided
+        approximation: a non-clean-integer ratio (e.g. polygon's ``1000:1061``
+        stock-dividend-style "split", ~1.061x) previously floor-divided to
+        ``1061 // 1000 == 1`` and printed as the misleading, no-op-looking
+        "1-for-1 forward split" — which derailed the config#1455 investigation
+        (the diagnostic label made a real ~6.1% action look like garbage data).
+        A clean integer ratio (the common case, e.g. 4:1) still prints as
+        before; anything else prints the raw ``split_from:split_to`` ratio so
+        the reader sees the true numbers rather than a rounded lie.
+        """
         if self.type == _TYPE_SPLIT and self.split_from and self.split_to:
             if self.split_to >= self.split_from:
                 # forward N-for-1 (split_from=1, split_to=N)
-                n = self.split_to // self.split_from
-                return f"{n}-for-1 forward split"
+                if self.split_to % self.split_from == 0:
+                    n = self.split_to // self.split_from
+                    return f"{n}-for-1 forward split"
+                return f"{self.split_to}-for-{self.split_from} forward split"
             # reverse 1-for-N (split_from=N, split_to=1)
-            n = self.split_from // self.split_to
-            return f"1-for-{n} reverse split"
+            if self.split_from % self.split_to == 0:
+                n = self.split_from // self.split_to
+                return f"1-for-{n} reverse split"
+            return f"{self.split_to}-for-{self.split_from} reverse split"
         if self.type == _TYPE_DIVIDEND:
             return f"dividend {self.cash_amount} ({self.dividend_kind})"
         if self.type == _TYPE_RENAME:
@@ -363,6 +378,94 @@ def expected_factor(action: CorporateAction) -> float:
         f"expected_factor not implemented for action type {action.type!r} "
         "(only splits implemented this PR)"
     )
+
+
+# Relative tolerance for the price-evidence boundary-ratio check
+# (``has_price_evidence``): splits are integer-ish ratios (factor <= 0.5 or
+# >= 2 for anything that would ever be reported as a split), so the observed
+# close[d]/close[d-1] boundary ratio at a REAL split sits close to
+# 1/expected_factor; a generous 15% band absorbs ordinary multi-day price
+# drift around the ex_date without confusing a real split with a coincident
+# earnings-move noop. Mirrors ``features.compute._AUDIT_FACTOR_REL_TOL`` (the
+# existing post-condition audit's tolerance) — same discipline, applied as a
+# PRE-condition here so a phantom action never reaches the price level.
+_PRICE_EVIDENCE_REL_TOL = 0.15
+
+# Window (calendar days) around ex_date searched for the boundary-ratio price
+# evidence — mirrors ``features.compute._AUDIT_EX_DATE_WINDOW_DAYS`` (a split
+# can print 1-2 sessions late/early relative to the polygon execution_date on
+# a thin feed).
+_PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS = 4
+
+
+def has_price_evidence(
+    close: pd.Series,
+    action: CorporateAction,
+    *,
+    rel_tol: float = _PRICE_EVIDENCE_REL_TOL,
+    window_days: int = _PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS,
+) -> bool:
+    """Does the RAW (unadjusted) ``close`` series actually show a price move
+    corroborating ``action`` (a split) around its ``ex_date``?
+
+    A corporate-action FEED can report a split that never happened in the real
+    market (a premature/erroneous/duplicate feed entry — observed live:
+    polygon returning ``execution_date`` in the past with no matching price
+    discontinuity, config#1455). Blindly trusting every feed event and
+    dividing/multiplying the ENTIRE pre-ex_date history by its factor bakes a
+    fictitious jump into the adjusted series — the mirror-image corruption of
+    the un-flattened-known-split case ``audit_action_jumps`` already catches
+    (PR3 §3): there, a REAL split's factor is missing from the series; here, a
+    FAKE split's factor gets baked in. Both are "trust polygon's stated
+    factor without checking the market agrees."
+
+    Looks for at least one adjacent trading-day pair straddling ``ex_date``
+    (within ``window_days``) on the RAW, UNADJUSTED close whose ratio
+    ``close[d]/close[d-1]`` is within ``rel_tol`` of ``expected_factor(action)``
+    (the boundary ratio a real split of this size prints on unadjusted prices —
+    ``expected_factor`` is exactly the multiplier that brings a PRE-ex_date raw
+    price onto the POST-ex_date scale, so the same multiplier is what the raw
+    series' own pre→post boundary ratio shows: e.g. a reverse 1-for-3 split,
+    ``expected_factor=3.0``, triples the raw price at the boundary; a forward
+    4-for-1 split, ``expected_factor=0.25``, quarters it). Returns ``True`` on
+    ANY matching boundary in the window (a split can print 1-2 sessions
+    late/early on a thin feed) or if ``close`` doesn't cover the window at all
+    (can't disprove it — degrades to trusting the feed, the PRE-existing
+    behavior, rather than blocking on missing data). Returns ``False`` only
+    when the window IS covered and NO boundary pair matches — the confident
+    "this action has no price corroboration" case.
+    """
+    if action.type != _TYPE_SPLIT:
+        return True  # only splits mutate the price level; nothing to check
+    expected = expected_factor(action)
+    if expected <= 0:
+        return True  # malformed ratio — expected_factor already guards this
+    # Boundary ratio close[d]/close[d-1] for d the first row on/after ex_date,
+    # on UNADJUSTED prices, IS expected_factor (see docstring).
+    target_ratio = expected
+
+    if close is None or close.empty:
+        return True  # no series to check against — can't disprove, don't block
+
+    idx = close.index if isinstance(close.index, pd.DatetimeIndex) else pd.to_datetime(close.index)
+    s = pd.Series(close.to_numpy(dtype="float64"), index=idx).sort_index()
+    s = s[s > 0]  # a non-positive close can't form a meaningful ratio
+    if s.empty:
+        return True
+
+    ex = pd.Timestamp(action.ex_date).normalize()
+    lo = ex - pd.Timedelta(days=window_days)
+    hi = ex + pd.Timedelta(days=window_days)
+    window = s[(s.index >= lo) & (s.index <= hi)]
+    if len(window) < 2:
+        # Window not covered by this series (e.g. ticker's history starts
+        # after ex_date, or a sparse feed) — can't disprove, don't block.
+        return True
+
+    ratios = (window / window.shift(1)).dropna()
+    if ratios.empty:
+        return True
+    return bool((ratios.sub(target_ratio).abs() <= rel_tol * target_ratio).any())
 
 
 # ── dividends: total-return factor MATH (CRSP/Barra basis) ───────────────────
@@ -509,8 +612,12 @@ def apply(
 
     Returns ``(restated_df, applied_results)`` where each ``applied_result`` is
     ``{"action_id", "store", "n_rows_adjusted", "factor", "status"}`` and
-    ``status`` is ``"applied"`` (restated this call) or ``"noop"`` (already
-    applied per the registry — not re-adjusted).
+    ``status`` is ``"applied"`` (restated this call), ``"noop"`` (already
+    applied per the registry — not re-adjusted), or ``"unconfirmed"`` (the feed
+    reported the action but the raw close shows NO corroborating price move
+    around ``ex_date`` — NOT applied, config#1455 price-evidence gate; never
+    marks the registry, so it is re-checked every call rather than remembered
+    as permanently skipped).
     """
     applied_results: list[dict] = []
     if df is None or getattr(df, "empty", True) or not actions:
@@ -551,6 +658,7 @@ def apply(
         return df, applied_results
 
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else pd.to_datetime(df.index)
+    raw_close = df["Close"] if "Close" in df.columns else None
 
     events_to_apply: list[CorporateAction] = []
     for a in split_actions:
@@ -564,6 +672,33 @@ def apply(
                 "factor": factor,
                 "status": "noop",
             })
+            continue
+        # PRICE-EVIDENCE gate (config#1455): a feed can report a split that
+        # never happened in the real market (observed live: polygon returning
+        # a past execution_date with no matching price discontinuity — the
+        # mirror-image of the un-flattened-KNOWN-split corruption
+        # ``audit_action_jumps`` catches post-hoc). Check BEFORE restating so
+        # a phantom factor never reaches the price level: an action with no
+        # corroborating boundary move on the raw close is NOT applied here —
+        # it is surfaced as ``status="unconfirmed"`` (loud, visible, never
+        # silently dropped) so the caller can WARN/notify rather than bake in
+        # a fictitious jump. Never marks the registry (an unconfirmed action
+        # must be re-checked every run, not remembered as skipped).
+        if not has_price_evidence(raw_close, a):
+            applied_results.append({
+                "action_id": a.action_id,
+                "store": store,
+                "n_rows_adjusted": 0,
+                "factor": factor,
+                "status": "unconfirmed",
+            })
+            log.warning(
+                "corporate_actions.apply: %s %s (%s) has NO corroborating "
+                "price move on the raw close within the ex_date window — "
+                "NOT applying (feed-reported split with no market evidence, "
+                "config#1455); action_id=%s",
+                a.ticker, a.human(), store, a.action_id,
+            )
             continue
         events_to_apply.append(a)
 
