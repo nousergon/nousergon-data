@@ -176,8 +176,19 @@ def test_weekday_sf_ssm_blocks_export_flow_doctor_enabled() -> None:
 
 
 _TEE_WORK_RE = re.compile(r"\| tee (?:-a )?(/var/log/[\w.-]+\.log)")
+# Accepts all three historical/current import names for the same module:
+# alpha_engine_lib.ssm_log_capture (original) -> nousergon_lib.ssm_log_capture
+# (rename shim) -> krepis.ssm_log_capture (v0.66.0 MIT lift, the current
+# canonical path). This regex was stale at only the FIRST name until
+# 2026-07-01 (config#1552-adjacent EOD date-thread fix) — genuinely never
+# updated across either migration, so states written after either rename
+# would have silently failed this guard. New states should invoke
+# krepis.ssm_log_capture directly per the no-shortcuts / complete-the-
+# migration rule; existing states on the older names are left as-is (not a
+# blanket forced migration in this PR).
 _LIB_CLI_RE = re.compile(
-    r"alpha_engine_lib\.ssm_log_capture\s+run\s+.*?--slug\s+(\S+)\s+--log\s+(/var/log/[\w.-]+\.log)"
+    r"(?:alpha_engine_lib|nousergon_lib|krepis)\.ssm_log_capture"
+    r"\s+run\s+.*?--slug\s+(\S+)\s+--log\s+(/var/log/[\w.-]+\.log)"
 )
 
 
