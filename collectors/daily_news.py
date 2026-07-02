@@ -4,20 +4,28 @@ Mirrors the Saturday ``run_news_pipeline`` chain (news aggregator →
 ``NewsNLPPipeline`` → ``aggregate_and_write``) but on a WEEKDAY cadence over a
 small, high-value universe:
 
-    robodashboard holdings  ∪  alpha-engine signals universe (tracked + recs)
+    Metron held tickers  ∪  alpha-engine signals universe (tracked + recs)
 
 and writes to a SEPARATE eval-artifact prefix (``data/news_aggregates_daily/``)
-with a ``latest.json`` sidecar, so the robodashboard morning brief gets a stable
-pointer to the freshest pull without knowing the trading day. The Saturday
+with a ``latest.json`` sidecar, so the morning brief gets a stable pointer to the
+freshest pull without knowing the trading day. The Saturday
 ``data/news_aggregates/`` artifact (full signals universe, 168h, RAG-ingested)
 is untouched — this is an additive daily companion.
+
+The held-ticker source is Metron's nightly ``metron/holdings_universe.json``
+(config#1506) — the successor to the retired ``robodashboard/holdings_universe.json``
+(nousergon/metron-ops#119). Same symbols-only ``{"tickers": [...]}`` shape; Metron
+publishes it on its ``daily-refresh`` (metron-refresh.timer, 21:30 UTC among the
+post-close window), so this union re-sources Brian's held names that robodashboard's
+retired producer used to feed. Still fail-soft: a missing/unreadable holdings file
+degrades to AE's own signal universe rather than aborting the pull.
 
 Deterministic: APIs (Polygon/GDELT/Yahoo) + dictionary NLP (Loughran-McDonald +
 rule-based events). No LLM, no API spend — honors
 ``[[preference_llm_calls_confined_to_research_module]]``.
 
 Why a small universe (vs. all ~900 constituents): the only daily consumers are
-robodashboard's brief (the held names) and AE's own tracked set — and Polygon's
+the morning brief (the held names) and AE's own tracked set — and Polygon's
 free tier is 5 req/min, so a per-ticker pull over 900 names is infeasible in any
 morning window. The full universe stays on the weekly Saturday cadence.
 
@@ -51,20 +59,31 @@ logger = logging.getLogger(__name__)
 DAILY_PREFIX = "data/news_aggregates_daily"
 ARTICLES_PREFIX = "data/news_articles_daily"
 DIGEST_PREFIX = "data/news_digest_daily"
-HOLDINGS_UNIVERSE_KEY = "robodashboard/holdings_universe.json"
+# Metron's nightly held-ticker snapshot — the robodashboard successor (config#1506,
+# nousergon/metron-ops#119). Same symbols-only ``{"tickers": [...]}`` shape the retired
+# robodashboard/holdings_universe.json had; published by Metron's daily-refresh (see
+# metron api/services/data_spine.py::publish_holdings_universe). This is the SAME S3
+# object collectors/metron_market_data.py reads for its yf-priced universe — the
+# ``tickers`` slice is the news-universe view of that same held set.
+HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_BUCKET = "alpha-engine-research"
 
 
 def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
-    """Read robodashboard's published held-ticker symbols (fail-soft → [])."""
+    """Read Metron's published held-ticker symbols (fail-soft → []).
+
+    Reads the symbols-only ``tickers`` slice of ``metron/holdings_universe.json``
+    (config#1506) — the robodashboard successor. Same ``{"tickers": [...]}`` contract
+    the retired ``robodashboard/holdings_universe.json`` had, so the parse is unchanged.
+    """
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=HOLDINGS_UNIVERSE_KEY)
         data = json.loads(obj["Body"].read())
         tickers = [
             str(t).strip().upper() for t in data.get("tickers", []) if str(t).strip()
         ]
-        logger.info("[daily_news] loaded %d robodashboard holdings tickers", len(tickers))
+        logger.info("[daily_news] loaded %d Metron holdings tickers", len(tickers))
         return tickers
     except Exception as e:  # missing object, no creds, parse error, etc.
         logger.warning(
@@ -75,7 +94,7 @@ def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
 
 
 def assemble_universe(bucket: str, s3_client: Any) -> list[str]:
-    """Union robodashboard holdings ∪ AE signals universe (tracked + recs).
+    """Union Metron held tickers ∪ AE signals universe (tracked + recs).
 
     Each slice is fail-soft: a missing holdings file or signals.json degrades
     to whatever is available rather than aborting the pull.

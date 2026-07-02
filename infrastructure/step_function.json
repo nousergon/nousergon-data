@@ -1049,7 +1049,8 @@
                 "Payload": {
                   "force_sonnet_pass": true,
                   "date.$": "$.eval_cadence.eval_date",
-                  "dry_run_llm.$": "$.research_dry"
+                  "dry_run_llm.$": "$.research_dry",
+                  "capture_lookback_days": 6
                 }
               },
               "TimeoutSeconds": 300,
@@ -1086,7 +1087,8 @@
                 "Payload": {
                   "force_sonnet_pass": false,
                   "date.$": "$.eval_cadence.eval_date",
-                  "dry_run_llm.$": "$.research_dry"
+                  "dry_run_llm.$": "$.research_dry",
+                  "capture_lookback_days": 6
                 }
               },
               "TimeoutSeconds": 300,

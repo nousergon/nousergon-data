@@ -141,6 +141,18 @@ class CorporateActionAuditError(RuntimeError):
     """
 
 
+def _normalize_ratio_field(value):
+    """Normalize a split-ratio field: integral → int (id-stable), else float.
+
+    Raises ``ValueError`` on non-positive/non-numeric input — a malformed
+    ratio must fail loud at construction, never become a silent 1:1 no-op.
+    """
+    f = float(value)
+    if not (f > 0) or f != f:
+        raise ValueError(f"split ratio field must be a positive number, got {value!r}")
+    return int(f) if f.is_integer() else f
+
+
 @dataclass(frozen=True)
 class CorporateAction:
     """An immutable, content-addressed corporate-action record.
@@ -156,9 +168,11 @@ class CorporateAction:
     type: str  # "split" | "dividend" | "rename"
     ticker: str
     ex_date: str  # YYYY-MM-DD; the adjustment applies to rows STRICTLY BEFORE this
-    # split fields
-    split_from: int | None = None
-    split_to: int | None = None
+    # split fields — fractional for spinoff-style records (1000:1061, 1:1.2);
+    # integral values are normalized to int so content-addressed ids are
+    # stable across int/float construction paths.
+    split_from: int | float | None = None
+    split_to: int | float | None = None
     # dividend fields (detected by detect_dividends, recorded CRSP-separate)
     cash_amount: float | None = None
     dividend_kind: str | None = None
@@ -196,19 +210,26 @@ class CorporateAction:
         cls,
         ticker: str,
         ex_date: str,
-        split_from: int,
-        split_to: int,
+        split_from: "int | float",
+        split_to: "int | float",
         *,
         source: str = "polygon",
         raw: dict | None = None,
     ) -> "CorporateAction":
-        """Build a split action; ``action_id`` is derived deterministically."""
+        """Build a split action; ``action_id`` is derived deterministically.
+
+        Ratio fields accept FRACTIONAL values (polygon's spinoff-style
+        ``1000:1061`` / ``1:1.2`` records — an ``int()`` cast here silently
+        truncated those factors before 2026-07-02); integral values normalize
+        to ``int`` so the content-addressed id is unchanged for the dominant
+        integer-ratio case.
+        """
         return cls(
             type=_TYPE_SPLIT,
             ticker=str(ticker),
             ex_date=str(ex_date),
-            split_from=int(split_from),
-            split_to=int(split_to),
+            split_from=_normalize_ratio_field(split_from),
+            split_to=_normalize_ratio_field(split_to),
             source=source,
             raw=dict(raw or {}),
         )
@@ -397,6 +418,104 @@ _PRICE_EVIDENCE_REL_TOL = 0.15
 # a thin feed).
 _PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS = 4
 
+# A factor must sit at least this far (multiplicatively) from 1.0 for the
+# direct-vs-inverse orientation test to be discriminable from ordinary daily
+# drift: 1.45 keeps every real split ratio (3:2 = 1.5 and up) in scope while
+# excluding the near-1 spinoff-adjustment records (1000:1061 ≈ 1.061) whose
+# stated factor, inverse, and market noise share one tolerance band.
+_ORIENTATION_MIN_SEPARATION = 1.45
+
+
+def price_evidence_orientation(
+    close: pd.Series,
+    action: CorporateAction,
+    *,
+    rel_tol: float = _PRICE_EVIDENCE_REL_TOL,
+    window_days: int = _PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS,
+) -> str:
+    """Classify what the RAW ``close`` series says about ``action``'s factor
+    DIRECTION around its ``ex_date``.
+
+    A corporate-action FEED can report a split that never happened (config#1455
+    phantom class) — or, observed live 2026-07-01/02, report a REAL split with
+    the ``split_from``/``split_to`` ratio INVERTED (polygon published HON's
+    forward 1:2 as ``2:1`` — then deleted the record upstream — and DD's
+    forward 1:3 as ``3:1``; blindly applying the stated factor multiplied both
+    tickers' full pre-ex histories instead of dividing them). The market's own
+    boundary move is ground truth for the DIRECTION polygon's adjusted
+    aggregates actually applied, so the factor we fold into a price store must
+    be corroborated against it, not trusted from the feed's field ordering.
+
+    Looks at every adjacent trading-day pair in ±``window_days`` of ``ex_date``
+    on the RAW close (a real split prints its factor as the boundary ratio
+    ``close[d]/close[d-1]``) and returns one of:
+
+      * ``"direct"``    — a boundary matches ``expected_factor(action)`` and
+        none matches its inverse: the feed's orientation is market-confirmed.
+      * ``"inverse"``   — a boundary matches ``1/expected_factor`` and none
+        matches the stated factor: the feed record is inverted; the
+        market-corrected factor is ``1/expected_factor``.
+      * ``"ambiguous"`` — boundaries match BOTH orientations (seen when a
+        prior basis-splice corruption fabricates the direct ratio while the
+        real move prints the inverse — the HON 2026-07-01 series). Nothing
+        can be trusted here; the caller must refuse.
+      * ``"none"``      — the window is covered but no boundary matches
+        either orientation (the phantom-split case).
+      * ``"uncovered"`` — the series doesn't cover the window (< 2 rows), so
+        the market can neither confirm nor refute.
+
+    Non-split actions return ``"direct"`` (nothing to check — only splits
+    mutate the price level) as does a malformed factor (``expected_factor``
+    guards those upstream).
+    """
+    if action.type != _TYPE_SPLIT:
+        return "direct"  # only splits mutate the price level; nothing to check
+    expected = expected_factor(action)
+    if expected <= 0:
+        return "direct"  # malformed ratio — expected_factor already guards this
+
+    if close is None or close.empty:
+        return "uncovered"
+
+    idx = close.index if isinstance(close.index, pd.DatetimeIndex) else pd.to_datetime(close.index)
+    s = pd.Series(close.to_numpy(dtype="float64"), index=idx).sort_index()
+    s = s[s > 0]  # a non-positive close can't form a meaningful ratio
+    if s.empty:
+        return "uncovered"
+
+    ex = pd.Timestamp(action.ex_date).normalize()
+    lo = ex - pd.Timedelta(days=window_days)
+    hi = ex + pd.Timedelta(days=window_days)
+    window = s[(s.index >= lo) & (s.index <= hi)]
+    if len(window) < 2:
+        # Window not covered by this series (e.g. ticker's history starts
+        # after ex_date, or a sparse feed).
+        return "uncovered"
+
+    ratios = (window / window.shift(1)).dropna()
+    if ratios.empty:
+        return "uncovered"
+
+    direct_hit = bool((ratios.sub(expected).abs() <= rel_tol * expected).any())
+
+    # Orientation is only DISCRIMINABLE when the factor sits well away from
+    # 1.0 — for a near-1 factor (polygon's 1000:1061 spinoff-style records)
+    # the stated factor, its inverse, and ordinary daily drift all fall inside
+    # one tolerance band, so inverse/ambiguous verdicts would be noise. Those
+    # factors keep the legacy direct-only semantics.
+    if 1.0 / _ORIENTATION_MIN_SEPARATION < expected < _ORIENTATION_MIN_SEPARATION:
+        return "direct" if direct_hit else "none"
+
+    inverse = 1.0 / expected
+    inverse_hit = bool((ratios.sub(inverse).abs() <= rel_tol * inverse).any())
+    if direct_hit and inverse_hit:
+        return "ambiguous"
+    if direct_hit:
+        return "direct"
+    if inverse_hit:
+        return "inverse"
+    return "none"
+
 
 def has_price_evidence(
     close: pd.Series,
@@ -405,67 +524,17 @@ def has_price_evidence(
     rel_tol: float = _PRICE_EVIDENCE_REL_TOL,
     window_days: int = _PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS,
 ) -> bool:
-    """Does the RAW (unadjusted) ``close`` series actually show a price move
-    corroborating ``action`` (a split) around its ``ex_date``?
-
-    A corporate-action FEED can report a split that never happened in the real
-    market (a premature/erroneous/duplicate feed entry — observed live:
-    polygon returning ``execution_date`` in the past with no matching price
-    discontinuity, config#1455). Blindly trusting every feed event and
-    dividing/multiplying the ENTIRE pre-ex_date history by its factor bakes a
-    fictitious jump into the adjusted series — the mirror-image corruption of
-    the un-flattened-known-split case ``audit_action_jumps`` already catches
-    (PR3 §3): there, a REAL split's factor is missing from the series; here, a
-    FAKE split's factor gets baked in. Both are "trust polygon's stated
-    factor without checking the market agrees."
-
-    Looks for at least one adjacent trading-day pair straddling ``ex_date``
-    (within ``window_days``) on the RAW, UNADJUSTED close whose ratio
-    ``close[d]/close[d-1]`` is within ``rel_tol`` of ``expected_factor(action)``
-    (the boundary ratio a real split of this size prints on unadjusted prices —
-    ``expected_factor`` is exactly the multiplier that brings a PRE-ex_date raw
-    price onto the POST-ex_date scale, so the same multiplier is what the raw
-    series' own pre→post boundary ratio shows: e.g. a reverse 1-for-3 split,
-    ``expected_factor=3.0``, triples the raw price at the boundary; a forward
-    4-for-1 split, ``expected_factor=0.25``, quarters it). Returns ``True`` on
-    ANY matching boundary in the window (a split can print 1-2 sessions
-    late/early on a thin feed) or if ``close`` doesn't cover the window at all
-    (can't disprove it — degrades to trusting the feed, the PRE-existing
-    behavior, rather than blocking on missing data). Returns ``False`` only
-    when the window IS covered and NO boundary pair matches — the confident
-    "this action has no price corroboration" case.
+    """Back-compat wrapper over :func:`price_evidence_orientation` — True iff
+    the market confirms the action's STATED orientation. Note the semantic
+    tightening (2026-07-02): an uncovered window now returns ``False`` (do not
+    mutate a price level on zero corroboration) where it previously trusted
+    the feed — the inverted-record incident showed feed trust without market
+    evidence is how full-history corruption happens. With no pre-ex rows in
+    frame there is nothing to restate anyway, so the safe answer costs nothing.
     """
-    if action.type != _TYPE_SPLIT:
-        return True  # only splits mutate the price level; nothing to check
-    expected = expected_factor(action)
-    if expected <= 0:
-        return True  # malformed ratio — expected_factor already guards this
-    # Boundary ratio close[d]/close[d-1] for d the first row on/after ex_date,
-    # on UNADJUSTED prices, IS expected_factor (see docstring).
-    target_ratio = expected
-
-    if close is None or close.empty:
-        return True  # no series to check against — can't disprove, don't block
-
-    idx = close.index if isinstance(close.index, pd.DatetimeIndex) else pd.to_datetime(close.index)
-    s = pd.Series(close.to_numpy(dtype="float64"), index=idx).sort_index()
-    s = s[s > 0]  # a non-positive close can't form a meaningful ratio
-    if s.empty:
-        return True
-
-    ex = pd.Timestamp(action.ex_date).normalize()
-    lo = ex - pd.Timedelta(days=window_days)
-    hi = ex + pd.Timedelta(days=window_days)
-    window = s[(s.index >= lo) & (s.index <= hi)]
-    if len(window) < 2:
-        # Window not covered by this series (e.g. ticker's history starts
-        # after ex_date, or a sparse feed) — can't disprove, don't block.
-        return True
-
-    ratios = (window / window.shift(1)).dropna()
-    if ratios.empty:
-        return True
-    return bool((ratios.sub(target_ratio).abs() <= rel_tol * target_ratio).any())
+    return price_evidence_orientation(
+        close, action, rel_tol=rel_tol, window_days=window_days,
+    ) == "direct"
 
 
 # ── dividends: total-return factor MATH (CRSP/Barra basis) ───────────────────
@@ -660,9 +729,17 @@ def apply(
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else pd.to_datetime(df.index)
     raw_close = df["Close"] if "Close" in df.columns else None
 
-    events_to_apply: list[CorporateAction] = []
+    # (action, effective_factor, orientation_corrected) triples cleared to
+    # restate. ``effective_factor`` is the MARKET-CORROBORATED multiplier for
+    # pre-ex rows — equal to the feed's ``expected_factor`` when the market
+    # confirms the stated orientation, and its inverse when the market shows
+    # the feed record is inverted (observed live 2026-07-01/02: polygon
+    # published HON's forward 1:2 as ``2:1`` and DD's forward 1:3 as ``3:1``,
+    # which — applied as stated — multiplied both full histories instead of
+    # dividing them).
+    events_to_apply: list[tuple[CorporateAction, float, bool]] = []
     for a in split_actions:
-        factor = expected_factor(a)  # == split_from / split_to (authoritative)
+        factor = expected_factor(a)  # == split_from / split_to (as stated by feed)
         # Exactly-once: skip an action already folded into this store.
         if registry is not None and registry.is_applied(store, a.action_id):
             applied_results.append({
@@ -673,56 +750,117 @@ def apply(
                 "status": "noop",
             })
             continue
-        # PRICE-EVIDENCE gate (config#1455): a feed can report a split that
-        # never happened in the real market (observed live: polygon returning
-        # a past execution_date with no matching price discontinuity — the
-        # mirror-image of the un-flattened-KNOWN-split corruption
-        # ``audit_action_jumps`` catches post-hoc). Check BEFORE restating so
-        # a phantom factor never reaches the price level: an action with no
-        # corroborating boundary move on the raw close is NOT applied here —
-        # it is surfaced as ``status="unconfirmed"`` (loud, visible, never
-        # silently dropped) so the caller can WARN/notify rather than bake in
-        # a fictitious jump. Never marks the registry (an unconfirmed action
-        # must be re-checked every run, not remembered as skipped).
-        if not has_price_evidence(raw_close, a):
+        # PRICE-EVIDENCE + ORIENTATION gate (config#1455 + 2026-07-02
+        # inverted-record incident): the market's own boundary move is the
+        # ground truth for BOTH whether the action is real (phantom check) and
+        # which DIRECTION its factor applies (orientation check). The stated
+        # factor reaches the price level only when the raw close corroborates
+        # it; an unambiguous inverse match applies the market-corrected
+        # 1/factor (loud WARN + flagged in the result); ambiguous/none/
+        # uncovered never mutate the store and never mark the registry (an
+        # unresolved action must be re-checked every run, not remembered as
+        # skipped).
+        orientation = price_evidence_orientation(raw_close, a)
+        if orientation == "direct":
+            events_to_apply.append((a, factor, False))
+        elif orientation == "inverse":
+            corrected = 1.0 / factor
+            applied_note = (
+                "corporate_actions.apply: %s %s (%s) — feed record is "
+                "INVERTED: raw close boundary matches 1/factor=%.6g, not the "
+                "stated factor %.6g. Applying the MARKET-CORRECTED factor "
+                "(orientation_corrected=True); action_id=%s"
+            )
+            log.warning(
+                applied_note, a.ticker, a.human(), store, corrected, factor,
+                a.action_id,
+            )
+            events_to_apply.append((a, corrected, True))
+        else:
             applied_results.append({
                 "action_id": a.action_id,
                 "store": store,
                 "n_rows_adjusted": 0,
                 "factor": factor,
-                "status": "unconfirmed",
+                "status": (
+                    "ambiguous_evidence" if orientation == "ambiguous"
+                    else "unconfirmed"
+                ),
             })
-            log.warning(
-                "corporate_actions.apply: %s %s (%s) has NO corroborating "
-                "price move on the raw close within the ex_date window — "
-                "NOT applying (feed-reported split with no market evidence, "
-                "config#1455); action_id=%s",
-                a.ticker, a.human(), store, a.action_id,
-            )
+            if orientation == "ambiguous":
+                log.error(
+                    "corporate_actions.apply: %s %s (%s) — raw close matches "
+                    "BOTH the stated factor and its inverse around ex_date "
+                    "(a prior basis-splice corruption can fabricate the "
+                    "stated-direction ratio). REFUSING to restate — resolve "
+                    "the series basis first; action_id=%s",
+                    a.ticker, a.human(), store, a.action_id,
+                )
+            else:
+                log.warning(
+                    "corporate_actions.apply: %s %s (%s) has NO corroborating "
+                    "price move on the raw close within the ex_date window "
+                    "(orientation=%s) — NOT applying (feed-reported split "
+                    "with no market evidence, config#1455); action_id=%s",
+                    a.ticker, a.human(), store, orientation, a.action_id,
+                )
             continue
-        events_to_apply.append(a)
 
     if not events_to_apply:
         return df, applied_results
 
+    # Feed ``restate_series_for_splits`` the MARKET-CORROBORATED factor: for an
+    # orientation-corrected action the from/to pair is swapped so the shared
+    # factor convention (multiply pre-ex rows by split_from/split_to) yields
+    # the corrected multiplier.
     events = [
         {
             "execution_date": a.ex_date,
-            "split_from": a.split_from,
-            "split_to": a.split_to,
+            "split_from": a.split_to if corrected_flag else a.split_from,
+            "split_to": a.split_from if corrected_flag else a.split_to,
         }
-        for a in events_to_apply
+        for a, _eff, corrected_flag in events_to_apply
     ]
     restated = restate_series_for_splits(df, events)
 
-    for a in events_to_apply:
+    # POST-RESTATE boundary audit (2026-07-02): on the OUTPUT frame, no
+    # boundary pair around any applied ex_date may still print the applied
+    # factor or its inverse — a residual means the restatement went the wrong
+    # direction or double-applied (the corruption this function exists to
+    # prevent). Fail loud BEFORE the caller writes. Near-1 factors are exempt
+    # (a correctly-flattened ~1.0 boundary is indistinguishable from a near-1
+    # factor within tolerance, so the audit would false-fail).
+    if "Close" in restated.columns:
+        for a, eff, _corrected_flag in events_to_apply:
+            stated = expected_factor(a)
+            if 1.0 / _ORIENTATION_MIN_SEPARATION < stated < _ORIENTATION_MIN_SEPARATION:
+                continue
+            residual = price_evidence_orientation(
+                restated["Close"],
+                CorporateAction.from_split(
+                    a.ticker, a.ex_date, a.split_from, a.split_to,
+                    source=a.source, raw=a.raw,
+                ),
+            )
+            if residual in ("direct", "inverse", "ambiguous"):
+                raise CorporateActionAuditError(
+                    f"corporate_actions.apply: post-restate residual boundary "
+                    f"for {a.ticker} {a.human()} (store={store}, "
+                    f"orientation={residual}, effective_factor={eff:.6g}, "
+                    f"action_id={a.action_id}) — restatement did not flatten "
+                    f"the ex_date boundary; refusing so the caller does not "
+                    f"persist a corrupted series"
+                )
+
+    for a, eff, corrected_flag in events_to_apply:
         ex = pd.Timestamp(a.ex_date).normalize()
         n_rows_adjusted = int((idx < ex).sum())
         applied_results.append({
             "action_id": a.action_id,
             "store": store,
             "n_rows_adjusted": n_rows_adjusted,
-            "factor": expected_factor(a),
+            "factor": eff,
+            "orientation_corrected": corrected_flag,
             "status": "applied",
         })
         if registry is not None:
@@ -839,9 +977,20 @@ def _sync_arcticdb_universe(
     )
     if any(r["n_rows_adjusted"] > 0 for r in applied_math):
         lib.write(ticker, to_arctic_canonical(restated), prune_previous_versions=True)
+    # Mark ONLY actions apply() actually folded in (status == "applied").
+    # Marking an unconfirmed/ambiguous refusal would poison the exactly-once
+    # contract: the marker permanently blocks the restatement it falsely
+    # claims happened (2026-07-01 incident — HON/DD were marked applied on a
+    # refused/corrupted apply and their un-restated histories were frozen
+    # behind the marker). A refused action stays pending and is re-checked
+    # every run — loud, never silently dropped.
     if registry is not None:
+        applied_ids = {
+            r["action_id"] for r in applied_math if r["status"] == "applied"
+        }
         for a in pending:
-            registry.mark_applied(a, STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+            if a.action_id in applied_ids:
+                registry.mark_applied(a, STORE_ARCTICDB_UNIVERSE, run_id=run_id)
     for r in applied_math:
         r = dict(r)
         r["ticker"] = ticker

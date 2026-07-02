@@ -18,7 +18,8 @@ Schedule-aware, per-trigger accounting:
 1. Enumerate every scheduled groom trigger in the last `GROOM_LOOKBACK_HOURS`
    that has had `GROOM_CEILING_MIN + GROOM_MARGIN_MIN` to finish (so a still-running
    groom never false-alarms). The schedule mirrors the dispatcher's crons
-   (07:00 Sun-Fri, 23:00 daily) and is overridable via `GROOM_SCHEDULE` (JSON).
+   (07:00 daily, 15:00 daily Opus high-only, 23:00 daily) and is overridable via
+   `GROOM_SCHEDULE` (JSON).
 2. Fetch recent `groom-digest`-labeled issues from `nousergon/alpha-engine-config`
    (success digests **and** loud-failure issues both carry the label).
 3. For each trigger, assert a digest was created inside its run window
@@ -43,16 +44,26 @@ terminal-failure event for the existing watcher to hang off. Wrapping the groom
 dispatch in a Step Function so the existing Fleet-SF Watch covers it natively is
 the tracked **"SF later"** follow-up; this Lambda is the **"probe now"** half.
 
-## Deploy (operator-gated, outside CloudFormation)
+## Deploy
+
+**Code: auto-deploys on merge to main** (2026-07-02) via
+`.github/workflows/deploy-groom-liveness-probe.yml` — no operator action
+needed for a code-only PR (e.g. adding a schedule entry to `_DEFAULT_SCHEDULE`,
+per config#1571).
+
+**Cadence / IAM: still operator-gated, outside CloudFormation** — the CI OIDC
+role deliberately cannot create/modify IAM roles (fleet-wide policy). Run by
+hand:
 
 ```
 bash deploy.sh --dry-run     # show actions
-bash deploy.sh --bootstrap   # first-time: create role + Lambda + 2 Scheduler rules
-bash deploy.sh               # update code only
+bash deploy.sh --bootstrap   # first-time / cadence change: create role + Lambda + 2 Scheduler rules
+bash deploy.sh               # update code only (same command CI runs)
 bash deploy.sh --smoke       # invoke once (read-only; pings only on a REAL miss)
 ```
 
-Merging the PR has **zero** live effect until an operator runs `--bootstrap`.
+A PR that changes `SCHED_CRONS` (this probe's own invocation cadence) or
+`iam-policy.json` has zero live effect until an operator runs `--bootstrap`.
 Recommend wiring a CloudWatch alarm on this function's `Errors` metric (the
 fail-loud contract assumes one).
 

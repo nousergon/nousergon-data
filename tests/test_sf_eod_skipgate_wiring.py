@@ -26,6 +26,10 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 # daily_append, mirroring the weekday MorningArcticAppend split L4608) — it gets
 # its own skip-gate so a recovery rerun can skip whichever half already completed.
 _CHAIN = [
+    # config#1549 — the hoisted top-of-pipeline executor-deploy refresh gate runs
+    # FIRST (right after the SSM-readiness gate), so the entire EOD run executes
+    # latest origin/main by construction. Skipping it resumes at the first work gate.
+    ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipPostMarketData"),
     ("CheckSkipPostMarketData", "PostMarketData", "skip_post_market_data", "CheckSkipPostMarketArcticAppend"),
     ("CheckSkipPostMarketArcticAppend", "PostMarketArcticAppend", "skip_post_market_arctic_append", "CheckSkipCaptureSnapshot"),
     ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "CheckSkipEODReconcile"),
@@ -52,13 +56,30 @@ class TestGatePresenceAndShape:
 
 
 class TestEntryEdgesRouteThroughGates:
-    def test_mutex_paths_enter_post_market_gate(self, states):
-        # All three entries to PostMarketData now go through the gate.
-        assert states["CheckMutexRole"]["Default"] == "CheckSkipPostMarketData"
-        assert states["AcquireMutex"]["Next"] == "CheckSkipPostMarketData"
+    def test_mutex_paths_enter_instance_start_then_post_market_gate(self, states):
+        # 2026-06-30: all three post-mutex entries now go through the
+        # StartTradingInstance re-runnability guard first, which — once the box
+        # is SSM-Online — converges on the CheckSkipPostMarketData rerun-gate
+        # chain. (The ensure-running block is pinned in detail by
+        # test_sf_eod_instance_start_wiring.py.)
+        assert states["CheckMutexRole"]["Default"] == "StartTradingInstance"
+        assert states["AcquireMutex"]["Next"] == "StartTradingInstance"
         failopen = [c["Next"] for c in states["AcquireMutex"]["Catch"]
                     if "States.ALL" in c["ErrorEquals"]]
-        assert failopen == ["CheckSkipPostMarketData"]
+        assert failopen == ["StartTradingInstance"]
+        # The ensure-running block's SSM-ready path must land on the first gate,
+        # which is now the hoisted deploy-refresh gate (config#1549).
+        online = [c["Next"] for c in states["SSMReadyChoice"]["Choices"]
+                  if any(x.get("StringEquals") == "Online" for x in c.get("And", []))]
+        assert online == ["CheckSkipRefreshExecutorDeploy"]
+
+    def test_refresh_success_enters_post_market_gate(self, states):
+        # config#1549: after the deploy refresh succeeds, control enters the
+        # first work gate (CheckSkipPostMarketData) — the whole run now executes
+        # on latest origin/main.
+        succ = [c["Next"] for c in states["CheckRefreshExecutorDeployStatus"]["Choices"]
+                if c.get("StringEquals") == "Success"]
+        assert succ == ["CheckSkipPostMarketData"]
 
     def test_post_market_success_enters_arctic_append_gate(self, states):
         succ = [c["Next"] for c in states["CheckPostMarketStatus"]["Choices"]
@@ -84,7 +105,7 @@ class TestEntryEdgesRouteThroughGates:
 class TestPaths:
     def _walk(self, states, skip_flags):
         gates = {c[0] for c in _CHAIN}
-        order, seen, cur = [], set(), "CheckSkipPostMarketData"
+        order, seen, cur = [], set(), "CheckSkipRefreshExecutorDeploy"
         while cur and cur in states and cur not in seen:
             seen.add(cur)
             st = states[cur]
@@ -116,14 +137,24 @@ class TestPaths:
         # Cost-guard cleanup must ALWAYS run.
         assert order == ["StopTradingInstance"]
 
+    def test_skip_refresh_resumes_at_post_market_data(self, states):
+        # config#1549: skipping only the deploy refresh (e.g. an operator rerun
+        # on a box already known fresh) resumes at the first work task.
+        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
+        assert "RefreshExecutorDeploy" not in order
+        assert order[0] == "PostMarketData"
+        assert order[-1] == "StopTradingInstance"
+
     def test_skip_post_market_resumes_at_arctic_append(self, states):
-        order = self._walk(states, skip_flags={"skip_post_market_data"})
+        # Also skip the leading refresh gate so the walk starts cleanly at the
+        # PostMarket portion under test (config#1549 added the refresh gate first).
+        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
         assert "PostMarketData" not in order
         assert order[0] == "PostMarketArcticAppend"
         assert order[-1] == "StopTradingInstance"
 
     def test_skip_post_market_and_arctic_append_resumes_at_snapshot(self, states):
-        order = self._walk(states, skip_flags={"skip_post_market_data", "skip_post_market_arctic_append"})
+        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data", "skip_post_market_arctic_append"})
         assert "PostMarketData" not in order
         assert "PostMarketArcticAppend" not in order
         assert order[0] == "CaptureSnapshot"

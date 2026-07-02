@@ -16,7 +16,13 @@ from collectors import daily_news
 
 
 def _mock_s3(holdings=None, signals_universe=None):
-    """S3 mock serving the holdings_universe.json key and a signals.json."""
+    """S3 mock serving the Metron holdings_universe.json key and a signals.json.
+
+    The holdings object mirrors Metron's REAL published payload
+    (``metron/holdings_universe.json`` — config#1506): the symbols-only ``tickers``
+    slice the union consumes, alongside the ``holdings``/``currencies`` fields the
+    market-data producer reads. daily_news must read ONLY ``tickers`` and ignore the rest.
+    """
     s3 = MagicMock()
     s3.list_objects_v2.return_value = {
         "CommonPrefixes": [{"Prefix": "signals/2026-06-05/"}],
@@ -26,7 +32,16 @@ def _mock_s3(holdings=None, signals_universe=None):
         if Key == daily_news.HOLDINGS_UNIVERSE_KEY:
             if holdings is None:
                 raise RuntimeError("NoSuchKey")
-            return {"Body": BytesIO(json.dumps({"tickers": holdings}).encode())}
+            payload = {
+                "schema_version": 2,
+                "as_of": "2026-07-02",
+                "source": "metron",
+                # Full Metron shape — daily_news must pick out `tickers` and ignore these.
+                "holdings": [{"yf_symbol": t, "currency": "USD"} for t in holdings],
+                "currencies": [],
+                "tickers": holdings,
+            }
+            return {"Body": BytesIO(json.dumps(payload).encode())}
         if Key.endswith("signals.json"):
             uni = [{"ticker": t} for t in (signals_universe or [])]
             return {"Body": BytesIO(json.dumps({"universe": uni}).encode())}
@@ -36,9 +51,22 @@ def _mock_s3(holdings=None, signals_universe=None):
     return s3
 
 
+def test_holdings_universe_key_points_at_metron():
+    # config#1506: the held-ticker source is Metron's snapshot, NOT the retired
+    # robodashboard producer (nousergon/metron-ops#119).
+    assert daily_news.HOLDINGS_UNIVERSE_KEY == "metron/holdings_universe.json"
+
+
 def test_assemble_universe_unions_dedupes_sorts():
     s3 = _mock_s3(holdings=["AAPL", "tsla"], signals_universe=["AAPL", "MSFT"])
     assert daily_news.assemble_universe("b", s3) == ["AAPL", "MSFT", "TSLA"]
+
+
+def test_load_holdings_reads_tickers_slice_of_metron_payload():
+    # daily_news consumes ONLY the symbols-only `tickers` slice of Metron's payload —
+    # the `holdings`/`currencies` (yf-priced) fields are the market-data producer's view.
+    s3 = _mock_s3(holdings=["AAPL", "nvda"], signals_universe=[])
+    assert daily_news._load_holdings_universe("b", s3) == ["AAPL", "NVDA"]
 
 
 def test_assemble_universe_fail_soft_no_holdings():

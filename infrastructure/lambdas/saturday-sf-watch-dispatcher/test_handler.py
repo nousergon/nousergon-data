@@ -31,6 +31,7 @@ import index  # noqa: E402
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+GROOM_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch"
 UNREGISTERED_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:some-other-pipeline"
 
 
@@ -364,6 +365,107 @@ def test_pat_never_appears_in_result(monkeypatch):
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
     assert "ghp_SECRET_TOKEN" not in json.dumps(result)
+
+
+def test_groom_failure_dispatches_when_enabled(monkeypatch):
+    """2026-07-01 (config#1535 follow-up): groom flipped to has_listener=True
+    once `groom-sf-failure` was added to sf-watch.yml's `types:` allowlist and
+    the charter gained a dedicated groom guardrail — it now dispatches exactly
+    like the trading pipelines when the global flag is on."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    sent = {}
+
+    def fake_urlopen(req, timeout=None):
+        sent["data"] = json.loads(req.data)
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
+    assert result["agent_dispatch"] == {
+        "dispatched": True, "status_code": 204, "event_type": "groom-sf-failure",
+    }
+    assert result["action"] == "dispatched"
+    assert sent["data"]["event_type"] == "groom-sf-failure"
+    assert sent["data"]["client_payload"]["cadence_slug"] == "groom"
+
+
+def test_groom_telegram_claims_autonomous_fix_when_dispatched(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "Fleet-SF Watch — AUTO-FIX" in text
+    assert "Backlog Groom SF: FAILED" in text
+    assert "autonomous fix ACTIVE" in text
+
+
+def test_groom_watch_log_records_has_listener_true(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
+    written = json.loads(s3.put_object.call_args.kwargs["Body"])
+    event = written["events"][-1]
+    assert event["has_listener"] is True
+    assert event["action"] == "dispatch"
+    assert event["agent_dispatch_enabled"] is True
+
+
+def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkeypatch):
+    """Regression guard for the has_listener MECHANISM itself (config#1535):
+    a pipeline registered with has_listener=False must never fire a
+    repository_dispatch nor claim "autonomous fix ACTIVE", regardless of the
+    global kill-switch — exercised here via a synthetic entry now that groom
+    (the original motivating case) has flipped to True."""
+    fake_pipelines = dict(index.PIPELINES)
+    fake_pipelines["some-other-pipeline"] = {
+        "cadence_slug": "other",
+        "label": "Some Other Pipeline",
+        "watch_prefix": "consolidated/other_sf_watch",
+        "dispatch_event_type": "other-sf-failure",
+        "has_listener": False,
+    }
+    monkeypatch.setattr(index, "PIPELINES", fake_pipelines)
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=UNREGISTERED_ARN), None)
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
+    assert result["action"] == "observe"
+    assert fired["called"] is False
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "Fleet-SF Watch — OBSERVE" in text
+    assert "autonomous fix ACTIVE" not in text
+    assert "observe-only for this pipeline" in text
+
+
+def test_saturday_still_dispatches_normally_alongside_groom_fix(monkeypatch):
+    """Non-regression: the has_listener plumbing must not change behavior for
+    the 3 trading pipelines, which all default has_listener=True."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=SATURDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
 
 
 def _deploy_sh_rule_arns() -> set[str]:

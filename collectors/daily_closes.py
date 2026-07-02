@@ -317,8 +317,8 @@ def _polygon_symbol(store_ticker: str) -> str:
 
 
 def _previous_business_days(run_date: str, n: int) -> list[str]:
-    """Return ``n`` business days ending on ``run_date`` (inclusive),
-    newest first. ``n=1`` returns the most-recent business day at or
+    """Return ``n`` NYSE TRADING days ending at-or-before ``run_date``,
+    newest first. ``n=1`` returns the most-recent trading day at or
     before ``run_date``.
 
     Used by :func:`collect` in window-scan mode to enumerate the dates
@@ -326,23 +326,47 @@ def _previous_business_days(run_date: str, n: int) -> list[str]:
     by the caller — one ``grouped-daily`` call per date in the returned
     list, total ``n`` polygon calls regardless of universe size.
 
-    Saturday / Sunday ``run_date`` walks back to the prior Friday before
-    starting the window, so a Sat SF firing at 02:00 PT doesn't burn a
-    slot on a non-trading day. NYSE holiday handling lives downstream —
-    holidays return zero rows from polygon and an empty yfinance batch,
-    which the per-date skip logic handles gracefully.
+    HOLIDAY-AWARE since 2026-07-02 (config#1572): this helper was
+    weekday-only, on the documented assumption that "holidays return zero
+    rows from polygon and an empty yfinance batch" downstream. That
+    assumption was FALSE in practice — the first post-Juneteenth
+    yfinance-mode window enumerated 2026-06-19, the batch fetch returned
+    data anyway, and a fabricated 924-row parquet for a closed market day
+    entered the archive (and, via the Saturday backfill delta, the
+    ArcticDB training store universe-wide). Non-trading days must never be
+    enumerated for collection; ``alpha_engine_lib.trading_calendar`` is
+    the same source of truth the Step Function's CheckTradingDay gate uses.
     """
+    from alpha_engine_lib.trading_calendar import is_trading_day
+
     if n < 1:
         raise ValueError(f"window n must be >= 1, got {n}")
     cur = datetime.strptime(run_date, "%Y-%m-%d").date()
-    # Normalize the starting point to a business day.
-    while cur.weekday() >= 5:  # Sat=5, Sun=6
+    # Runaway guard: a broken calendar must fail loud, not spin backwards.
+    max_steps = n * 3 + 30
+    steps = 0
+    # Normalize the starting point to a trading day.
+    while not is_trading_day(cur):
         cur = cur - timedelta(days=1)
+        steps += 1
+        if steps > max_steps:
+            raise RuntimeError(
+                f"_previous_business_days: no trading day within {max_steps} "
+                f"calendar days before {run_date} — trading_calendar appears broken"
+            )
     dates: list[str] = [cur.isoformat()]
     for _ in range(n - 1):
         cur = cur - timedelta(days=1)
-        while cur.weekday() >= 5:
+        steps += 1
+        while not is_trading_day(cur):
             cur = cur - timedelta(days=1)
+            steps += 1
+            if steps > max_steps:
+                raise RuntimeError(
+                    f"_previous_business_days: exhausted {max_steps} steps "
+                    f"walking {n} trading days back from {run_date} — "
+                    f"trading_calendar appears broken"
+                )
         dates.append(cur.isoformat())
     return dates
 
@@ -656,6 +680,7 @@ def collect(
     fallback_source: str = "yfinance",
     registry=_REGISTRY_UNSET,
     _emit_ca_email: bool = True,
+    _defer_unexplained_errors: bool = False,
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -689,7 +714,12 @@ def collect(
                 ``source ∈ {"yfinance", "polygon"}`` AND ``Close`` is not
                 null), and skips fetching those tickers from yfinance.
                 Existing canonical rows are then merged into the output
-                parquet. Implements the source-precedence-ladder skip-set
+                parquet via ``_coalesce_by_source_priority`` (config#720 —
+                the same source-priority-waterfall primitive every mode
+                uses; a fresh yfinance/auto fetch is equal-or-higher
+                priority than a canonical prior row of the same tier, so it
+                always wins the merge, matching the pre-#720 behavior).
+                Implements the source-precedence-ladder skip-set
                 semantic from the windowed-data-reconciliation arc:
 
                   - ``yfinance_only`` mode: skips canonical tickers (any
@@ -765,6 +795,26 @@ def collect(
 
         run_date = default_run_date()
 
+    # NYSE-calendar gate (config#1572): a daily-closes parquet for a
+    # non-trading day is fabricated data by definition — polygon and yfinance
+    # have no session to serve, and whatever a batch fetch returns anyway gets
+    # persisted as a phantom day (2026-06-19 Juneteenth: 924 fabricated
+    # yfinance rows entered the archive and, via the Saturday backfill delta,
+    # the ArcticDB training store universe-wide). Window mode normalizes its
+    # anchor to a trading day (weekend/holiday SF fire-times are legitimate);
+    # a SINGLE-date call for a non-trading day is always a caller error and
+    # fails loud.
+    from alpha_engine_lib.trading_calendar import is_trading_day as _is_td
+
+    _run_dt = datetime.strptime(run_date, "%Y-%m-%d").date()
+    if window_days == 1 and not _is_td(_run_dt):
+        raise ValueError(
+            f"collect: run_date={run_date} is not an NYSE trading day — "
+            f"refusing to write a phantom daily-closes parquet (config#1572). "
+            f"If polygon/NYSE calendars diverged, fix "
+            f"alpha_engine_lib.trading_calendar, not this guard."
+        )
+
     if window_days > 1:
         return _collect_window(
             bucket=bucket,
@@ -823,17 +873,22 @@ def collect(
     # Skip-on-exists short-circuit (yfinance_only + auto only) returns inside
     # the live branch since dry_run by definition isn't going to write.
     existing_close_for_discrepancy: dict[str, float] | None = None
-    # Full prior-parquet rows (with ``source``), used by the polygon_only
-    # source-priority coalesce so a transient live-fetch gap retains the prior
+    # Full prior-parquet rows (with ``source``) fed to the single
+    # ``_coalesce_by_source_priority`` merge (config#720: the one preservation
+    # primitive for every mode) so a transient live-fetch gap retains the prior
     # value instead of blanking it. Empty unless an existing parquet is read.
+    #
+    # ``polygon_only`` populates this with EVERY prior row (any source) — the
+    # coalesce's own priority waterfall decides retain/overwrite/downgrade-block.
+    # ``yfinance_only``/``auto`` + ``skip_if_canonical=True`` populate it with
+    # only the rows already carrying an authoritative source (yfinance/polygon)
+    # and a non-null Close — mirrors the pre-config#720 ``canonical_existing_rows``
+    # filter exactly, so those modes' coalesce input (and therefore output) is
+    # unchanged; yfinance/auto's own fresh fetch is equal-or-higher priority
+    # than a canonical prior row of the same tier, so it naturally lands in the
+    # coalesce's "restatement wins"/"new_only" branches — the "equal-priority
+    # case" the consolidation issue (config#720) describes.
     existing_rows_for_merge: list[dict] = []
-    # When skip_if_canonical=True, ``canonical_existing_rows`` carries
-    # the records dicts for tickers in the existing parquet that already
-    # have an authoritative source (yfinance / polygon) and a non-null
-    # Close. They get merged into the output records before write so
-    # the parquet preserves prior canonical state across the window
-    # scan. Empty when skip_if_canonical=False (legacy overwrite path).
-    canonical_existing_rows: list[dict] = []
     canonical_skip_set: set[str] = set()
     from botocore.exceptions import ClientError
     head = None
@@ -915,11 +970,13 @@ def collect(
                     exc,
                 )
         elif skip_if_canonical:
-            # yfinance_only / auto + skip_if_canonical=True: read the
-            # full parquet, extract canonical rows so they survive into
-            # the merged output. Bypass the post-close-skip short-circuit
-            # below — the whole point of windowed reconciliation is to
-            # fill NaN cells in older dates that legacy logic would skip.
+            # yfinance_only / auto + skip_if_canonical=True: read the full
+            # parquet, extract canonical rows so they survive into the merged
+            # output via the shared ``_coalesce_by_source_priority`` step
+            # below (config#720 — same primitive polygon_only uses). Bypass
+            # the post-close-skip short-circuit below — the whole point of
+            # windowed reconciliation is to fill NaN cells in older dates
+            # that legacy logic would skip.
             try:
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 existing_df = pd.read_parquet(
@@ -937,7 +994,7 @@ def collect(
                             canonical_skip_set.add(str(t))
                             preserved = {"ticker": str(t)}
                             preserved.update(row.to_dict())
-                            canonical_existing_rows.append(preserved)
+                            existing_rows_for_merge.append(preserved)
                 logger.info(
                     "[skip_if_canonical] %s: %d existing canonical "
                     "tickers will be preserved; yfinance fetch reduced "
@@ -956,7 +1013,7 @@ def collect(
                     run_date, exc,
                 )
                 canonical_skip_set = set()
-                canonical_existing_rows = []
+                existing_rows_for_merge = []
         elif not dry_run and _is_post_close_write(last_modified, run_date):
             logger.info(
                 "Daily closes already exist for %s (post-close at %s, source=%s) — skipping",
@@ -1051,8 +1108,8 @@ def collect(
     missing = [t for t in tickers if t.lstrip("^") not in captured_tickers]
     # When skip_if_canonical=True (yfinance_only / auto window mode), drop
     # tickers that already have an authoritative source in the existing
-    # parquet — those rows will be merged from ``canonical_existing_rows``
-    # before write, so refetching them would just churn API budget.
+    # parquet — those rows will be merged back via the source-priority
+    # coalesce below, so refetching them would just churn API budget.
     if canonical_skip_set:
         before = len(missing)
         missing = [t for t in missing if t.lstrip("^") not in canonical_skip_set]
@@ -1082,22 +1139,37 @@ def collect(
                 records, missing, run_date,
             )
 
+    # ── Source-priority coalesce (yfinance_only / auto) — config#720 ─────────
     # Merge preserved canonical rows from the existing parquet into the
-    # records list. These are tickers we deliberately skipped fetching
-    # — they survive into the output unchanged. Polygon-only mode has
-    # ``canonical_existing_rows`` empty by construction (skip flag
-    # ignored per option (a)), so the legacy overwrite path is preserved.
-    if canonical_existing_rows:
-        already_captured = {r["ticker"] for r in records}
-        merged_in = 0
-        for row in canonical_existing_rows:
-            if row["ticker"] not in already_captured:
-                records.append(row)
-                merged_in += 1
+    # records list via the SAME ``_coalesce_by_source_priority`` primitive
+    # ``polygon_only`` uses below (config#720: unify the two preservation
+    # mechanisms). ``existing_rows_for_merge`` here holds only the rows
+    # already carrying an authoritative source (yfinance/polygon) + non-null
+    # Close (populated above, identical filter to the pre-#720
+    # ``canonical_existing_rows``), and yfinance/auto's own fresh fetch is
+    # equal-or-higher priority than a canonical prior row of the same
+    # tier — so this fresh fetch always lands in the coalesce's
+    # "restatement wins" / "new_only" branches, the "equal-priority case"
+    # the consolidation subsumes; a ticker this run couldn't (re)capture
+    # retains its prior canonical row exactly as before.
+    #
+    # Deliberately runs BEFORE the coverage gate below (unlike the
+    # polygon_only coalesce, which runs after) — preserved canonical rows
+    # must count toward the coverage denominator here, matching the
+    # documented ``skip_if_canonical`` contract ("coverage gate evaluates
+    # the merged-output denominator"). polygon_only has
+    # ``existing_rows_for_merge`` empty at this point (only populated in its
+    # own branch above), so this is a no-op for that mode.
+    if source != "polygon_only" and existing_rows_for_merge:
+        records, canon_merge_stats = _coalesce_by_source_priority(
+            records, existing_rows_for_merge, run_date,
+        )
         logger.info(
-            "[skip_if_canonical] %s: merged %d preserved canonical rows "
-            "into output records",
-            run_date, merged_in,
+            "[skip_if_canonical] %s: coalesce retained %d preserved canonical "
+            "row(s), overwrote %d, new %d (total %d)",
+            run_date, canon_merge_stats["retained"],
+            canon_merge_stats["overwritten"], canon_merge_stats["new_only"],
+            len(records),
         )
 
     # ── Coverage gates — per-mode hard-fails ─────────────────────────────────
@@ -1134,8 +1206,10 @@ def collect(
     # while polygon restatements still win and a lower-tier fresh value can't
     # downgrade a higher-tier existing cell. Runs AFTER the coverage gate, so a
     # genuine polygon outage still hard-fails on the FRESH fetch before any
-    # retained rows could mask it. (yfinance_only / auto preserve prior state
-    # via ``canonical_existing_rows`` above, so the coalesce is polygon_only.)
+    # retained rows could mask it. (yfinance_only / auto already ran the SAME
+    # ``_coalesce_by_source_priority`` primitive above, before the coverage
+    # gate — config#720 unified both modes onto this one function; only the
+    # gate-ordering and the existing-rows population differ per mode.)
     if source == "polygon_only" and existing_rows_for_merge:
         records, merge_stats = _coalesce_by_source_priority(
             records, existing_rows_for_merge, run_date,
@@ -1163,9 +1237,11 @@ def collect(
 
     # Discrepancy logging (polygon_only mode, when overwriting an existing parquet)
     explained_actions: list = []
+    unexplained_discrepancies: list = []
     if existing_close_for_discrepancy and polygon_count > 0:
-        explained_actions = _log_close_discrepancies(
+        explained_actions, unexplained_discrepancies = _log_close_discrepancies(
             closes_df, existing_close_for_discrepancy, run_date, registry=registry,
+            defer_unexplained=_defer_unexplained_errors,
         )
 
     # ONE informational email per run for confirmed corporate-action
@@ -1185,6 +1261,7 @@ def collect(
             "yfinance": yfinance_count,
             "source": source,
             "corporate_actions": explained_actions,
+            "unexplained_discrepancies": unexplained_discrepancies,
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1210,6 +1287,7 @@ def collect(
             "yfinance": yfinance_count,
             "source": source,
             "corporate_actions": explained_actions,
+            "unexplained_discrepancies": unexplained_discrepancies,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1398,6 +1476,7 @@ def _collect_window(
         "skipped_dates": [],
         "backfill_failed_dates": [],
         "corporate_actions": [],
+        "unexplained_discrepancies": [],
     }
     # Iterate oldest → newest so the most recent date's parquet is the
     # last one written. Matches the operator mental model "the latest
@@ -1417,6 +1496,7 @@ def _collect_window(
                 split_touched_dates=split_touched_dates,  # config#717
                 registry=registry,  # config#1431: one registry per window
                 _emit_ca_email=False,  # email sent ONCE at window level below
+                _defer_unexplained_errors=True,  # aggregated ONCE below (2026-07-02)
                 equities_source=equities_source,
                 index_source=index_source,
                 fallback_source=fallback_source,
@@ -1446,12 +1526,26 @@ def _collect_window(
         # the window for the single informational email sent below.
         if result.get("corporate_actions"):
             aggregate["corporate_actions"].extend(result["corporate_actions"])
+        if result.get("unexplained_discrepancies"):
+            aggregate["unexplained_discrepancies"].extend(
+                result["unexplained_discrepancies"]
+            )
 
     # config#1431: ONE informational email per window run for confirmed
     # corporate-action restatements (deduped by action_id in the email layer).
     # Skipped in dry_run (registry is None → no explained actions accumulate).
     if not dry_run and aggregate["corporate_actions"]:
         _send_corporate_action_email(aggregate["corporate_actions"], target_date)
+
+    # 2026-07-02: window-level roll-up of the UNEXPLAINED >5% overwrites the
+    # per-date calls deferred. A corporate-action restatement touches every
+    # window date with ONE uniform ratio — six per-date ERROR emails for one
+    # HON event was misrouting. Uniform-ratio groups (≥2 dates, same ticker,
+    # ratio agreeing within tolerance) page ONCE with the inferred factor;
+    # singletons keep the original per-date ERROR semantics.
+    _emit_window_unexplained_discrepancies(
+        aggregate["unexplained_discrepancies"], target_date,
+    )
 
     # ── Fatality is TARGET-driven, not "any per-date error" ─────────────
     _target = aggregate["per_date"].get(target_date)
@@ -1662,13 +1756,65 @@ def _split_ratio_hint(prior: float, new: float) -> str:
     return ""
 
 
+# Two window dates' unexplained overwrite ratios "agree" (same corporate-action
+# restatement) when they differ by less than this relative tolerance.
+_UNIFORM_RATIO_REL_TOL = 0.02
+
+
+def _emit_window_unexplained_discrepancies(rows: list, target_date: str) -> None:
+    """Window-level roll-up of unexplained >5% overwrite discrepancies.
+
+    Groups rows by ticker; a group whose ratios all agree within
+    ``_UNIFORM_RATIO_REL_TOL`` across ≥2 dates is ONE event (a corporate-action
+    restatement sweeping the window — the 2026-07-02 HON case produced six
+    per-date ERROR emails for one 2:1 separation) and pages ONCE with the
+    inferred factor. Non-uniform groups and singletons page per row, preserving
+    the original per-date ERROR semantics.
+    """
+    if not rows:
+        return
+    by_ticker: dict[str, list] = {}
+    for r in rows:
+        by_ticker.setdefault(r["ticker"], []).append(r)
+    for ticker, group in sorted(by_ticker.items()):
+        ratios = [g["ratio"] for g in group]
+        mean_ratio = sum(ratios) / len(ratios)
+        uniform = len(group) >= 2 and all(
+            abs(r - mean_ratio) <= _UNIFORM_RATIO_REL_TOL * mean_ratio
+            for r in ratios
+        )
+        if uniform:
+            dates = ", ".join(sorted(g["date"] for g in group))
+            logger.error(
+                "polygon_only OVERWRITE %s: UNIFORM ×%.4f restatement across "
+                "%d window date(s) [%s]%s — one event, consistent with a "
+                "corporate action restating adjusted history that has NO "
+                "matching registry/feed record (or an inverted one); check "
+                "the split calendar and the corporate-action registry before "
+                "downstream consumers re-read",
+                ticker, mean_ratio, len(group), dates,
+                _split_ratio_hint(group[0]["prior"], group[0]["new"]),
+            )
+        else:
+            for g in group:
+                pct = abs(g["new"] - g["prior"]) / g["prior"] * 100
+                logger.error(
+                    "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f "
+                    "(%.2f%% diff vs prior parquet)%s — investigate before "
+                    "downstream consumers re-read",
+                    g["ticker"], g["date"], g["prior"], g["new"], pct,
+                    _split_ratio_hint(g["prior"], g["new"]),
+                )
+
+
 def _log_close_discrepancies(
     new_df: pd.DataFrame,
     prior_close: dict[str, float],
     run_date: str,
     *,
     registry=None,
-) -> list:
+    defer_unexplained: bool = False,
+) -> "tuple[list, list]":
     """Log per-ticker Close discrepancy when polygon overwrites yfinance.
 
     A small drift (<1%) is normal — different feeds, slight tick-time offsets,
@@ -1696,9 +1842,19 @@ def _log_close_discrepancies(
     ERROR filter (fixing the HON 1-for-2 reverse-split false-ERROR). The
     authoritative registry takes precedence over the secondary
     ``_split_ratio_hint`` text heuristic (which stays, now only annotating the
-    UNEXPLAINED ERROR branch). Returns the list of explained
-    ``CorporateAction``s seen this run (for the run's one informational email);
-    deduped at the email layer.
+    UNEXPLAINED ERROR branch).
+
+    2026-07-02 (six-ERROR-email incident): with ``defer_unexplained=True`` the
+    unexplained >5% rows are NOT logged at ERROR here — they are returned for
+    the WINDOW caller to aggregate (a corporate-action restatement touches
+    every window date with ONE uniform ratio; six per-date ERROR emails for
+    one event is misrouting, and a genuinely unexplained uniform-ratio group
+    should page ONCE with the inferred factor). Per-date WARN still records
+    each row (``feedback_no_silent_fails`` — the surface stays, severity moves
+    to the aggregate).
+
+    Returns ``(explained_actions, unexplained_rows)`` where each unexplained
+    row is ``{"ticker", "date", "prior", "new", "ratio"}``.
     """
     n_compared = 0
     n_warn = 0
@@ -1706,6 +1862,7 @@ def _log_close_discrepancies(
     n_restatement = 0
     n_corporate_action = 0
     explained_actions: list = []
+    unexplained_rows: list = []
     biggest: tuple[str, float] = ("", 0.0)
     for ticker in new_df.index:
         prior = prior_close.get(str(ticker))
@@ -1747,12 +1904,31 @@ def _log_close_discrepancies(
             n_corporate_action += 1
             explained_actions.append(action)
         elif pct_diff > _DISCREPANCY_ERROR_PCT:
-            logger.error(
-                "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)%s — "
-                "investigate before downstream consumers re-read",
-                ticker, run_date, prior, float(new_close), pct_diff * 100,
-                _split_ratio_hint(prior, float(new_close)),
-            )
+            unexplained_rows.append({
+                "ticker": str(ticker),
+                "date": run_date,
+                "prior": float(prior),
+                "new": float(new_close),
+                "ratio": float(new_close) / float(prior),
+            })
+            if defer_unexplained:
+                # Window caller aggregates uniform-ratio groups into ONE
+                # ERROR; the per-row surface stays at WARN so nothing is
+                # silently dropped (feedback_no_silent_fails).
+                logger.warning(
+                    "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f "
+                    "(%.2f%% diff vs prior parquet)%s — deferred to the "
+                    "window-level unexplained-discrepancy aggregation",
+                    ticker, run_date, prior, float(new_close), pct_diff * 100,
+                    _split_ratio_hint(prior, float(new_close)),
+                )
+            else:
+                logger.error(
+                    "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)%s — "
+                    "investigate before downstream consumers re-read",
+                    ticker, run_date, prior, float(new_close), pct_diff * 100,
+                    _split_ratio_hint(prior, float(new_close)),
+                )
             n_error += 1
         elif pct_diff > _DISCREPANCY_WARN_PCT:
             logger.warning(
@@ -1768,7 +1944,7 @@ def _log_close_discrepancies(
         run_date, n_compared, n_warn, n_error, n_restatement, n_corporate_action,
         biggest[0] or "n/a", biggest[1] * 100,
     )
-    return explained_actions
+    return explained_actions, unexplained_rows
 
 
 def _fred_record(store_ticker: str, date_str: str, close: float) -> dict:

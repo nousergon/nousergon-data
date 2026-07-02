@@ -79,10 +79,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "Research": frozenset({"dry_run_llm.$", "force", "weekly_run", "skip_dry_run_gate"}),
     "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
     "EvalJudgeSubmitWeekly": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
     "EvalJudgePoll": frozenset(
         {"batch_id.$", "dry_run_llm.$", "max_wait_seconds", "submit_iso.$"}
@@ -458,6 +458,26 @@ class TestEODSFTopLevelFieldsClosed:
             "skip_capture_snapshot",
             "skip_eod_reconcile",
             "skip_daily_substrate_health_check",
+            # StartTradingInstance re-runnability guard (2026-06-30) —
+            # ec2:startInstances emits $.ec2_start_result; the SSM-readiness
+            # poll emits $.ssm_describe_result (describeInstanceInformation) and
+            # $.ssm_poll (bounded attempts counter). Ensures the box is up +
+            # SSM-Online before the first sendCommand, so an operator recovery
+            # rerun after the prior run's ForceStopInstance no longer dies with
+            # Ssm.InvalidInstanceIdException.
+            "ec2_start_result",
+            "ssm_describe_result",
+            "ssm_poll",
+            # config#1549 — top-of-pipeline executor-deploy refresh chokepoint.
+            # CheckSkipRefreshExecutorDeploy reads $.skip_refresh_executor_deploy
+            # (optional rerun flag); RefreshExecutorDeploy emits
+            # $.refresh_executor_deploy_result (sendCommand) and its poll emits
+            # $.refresh_executor_deploy_poll (getCommandInvocation, trimmed by
+            # ResultSelector). Hoists nousergon-data#574's per-step boot-pull to
+            # a single chokepoint so the whole EOD run executes latest main.
+            "skip_refresh_executor_deploy",
+            "refresh_executor_deploy_result",
+            "refresh_executor_deploy_poll",
         }
     )
 

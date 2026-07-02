@@ -769,9 +769,203 @@ def _ensure_history_restated(
         universe_lib.write(
             ticker, to_arctic_canonical(restated), prune_previous_versions=True,
         )
+    # Mark ONLY actions apply() actually folded in (status == "applied") —
+    # marking an unconfirmed/ambiguous refusal poisons the exactly-once
+    # contract (the 2026-07-01 incident: HON/DD marked applied on refused
+    # applies, permanently freezing their un-restated histories behind the
+    # marker). A refused action stays pending and re-checks every run.
+    applied_ids = {r["action_id"] for r in applied if r["status"] == "applied"}
     for a in pending:
-        registry.mark_applied(a, _ca.STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+        if a.action_id in applied_ids:
+            registry.mark_applied(a, _ca.STORE_ARCTICDB_UNIVERSE, run_id=run_id)
+        else:
+            log.warning(
+                "daily_append basis-consistency: %s action %s NOT marked "
+                "applied (apply() refused it) — will re-check next run",
+                ticker, a.action_id,
+            )
     return restated if n_changed else hist
+
+
+# An incoming-row-vs-prior-stored-close ratio at or beyond this multiple (or
+# its reciprocal) engages the splice basis-guard's checks. Genuine market
+# moves overlap the split-ratio zone (2026 scan: CAR −48%, KD −55% are real),
+# so crossing this threshold is a TRIGGER for the deterministic tests
+# (registered-action match, same-date stored-row disagreement), never a
+# refusal by magnitude alone.
+_SPLICE_GUARD_SOFT_RATIO = 1.5
+# Tolerance for matching the observed splice ratio to a registered action's
+# factor (mirrors corporate_actions._PRICE_EVIDENCE_REL_TOL).
+_SPLICE_GUARD_REL_TOL = 0.15
+# Operator escape hatch for a GENUINE ≥90% market move the guard would
+# otherwise refuse: comma-separated TICKER:YYYY-MM-DD entries.
+_SPLICE_GUARD_ALLOW_ENV = "DAILY_APPEND_SPLICE_GUARD_ALLOW"
+# Price fields scaled by a split factor (volume scales inversely).
+_SPLICE_PRICE_FIELDS = ("Open", "High", "Low", "Close", "VWAP")
+
+
+def _splice_basis_guard(
+    ticker: str,
+    bar,
+    hist: pd.DataFrame,
+    today_ts,
+    actions: list,
+    registry,
+):
+    """Refuse — or deterministically restate — an incoming daily row whose
+    close sits on a different adjusted basis than the stored history.
+
+    The discriminator between a basis mismatch and a genuine market move
+    (calibrated on the 2026 universe scan: STRL +52%, CAR −48%, KD −55% are
+    all REAL single-day moves that overlap the 2:1-split ratio zone, so
+    magnitude alone cannot refuse):
+
+      * A registered split with ``ex_date > row_date`` already applied to the
+        store explains a ``1/factor`` gap exactly → the row arrived on the
+        pre-action basis (polygon restates its aggregates only once the ex
+        date lands — the CRWD 2026-06-30 case). Deterministic: restate it.
+      * A split-like disagreement with an ALREADY-STORED row for the SAME
+        date whose value coheres with its own neighbors is NEVER a market
+        move (same date, same market — the HON 2026-06-26 case: incoming
+        464.42 vs stored 232.21 on a series whose 06-25 was 231.24) →
+        refuse the overwrite, keep the stored row.
+      * A pure append (no stored same-date row) with an unexplained
+        split-like ratio can be a genuine crash/pop → WRITE it, but at
+        ERROR severity so the flow-doctor pages the same day (if it was a
+        missed corporate action, the registry detection + restatement path
+        heals it as soon as a record lands; if it never lands, the page is
+        the operator's cue).
+
+    Returns ``(bar, verdict)`` with verdict ``"ok"`` / ``"restated"`` /
+    ``"refused"``. Fail-open on missing inputs (no prior close / NaN bar
+    close): the guard protects against DISCONTINUITY; absence of evidence is
+    not one. ``DAILY_APPEND_SPLICE_GUARD_ALLOW=TICKER:YYYY-MM-DD`` force-writes
+    through a refusal.
+    """
+    import corporate_actions as _ca
+
+    try:
+        bar_close = float(bar["Close"])
+    except Exception:  # noqa: BLE001 - NaN/absent close is handled upstream
+        return bar, "ok"
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return bar, "ok"
+    prior = hist.loc[hist.index < today_ts, "Close"].dropna()
+    if prior.empty or not np.isfinite(bar_close) or bar_close <= 0:
+        return bar, "ok"
+    prior_close = float(prior.iloc[-1])
+    if prior_close <= 0:
+        return bar, "ok"
+
+    ratio = bar_close / prior_close
+    if 1.0 / _SPLICE_GUARD_SOFT_RATIO < ratio < _SPLICE_GUARD_SOFT_RATIO:
+        return bar, "ok"
+
+    # A registered split whose ex_date is AFTER this row's date and which is
+    # already folded into the stored history explains the gap exactly: the
+    # incoming row is pre-action basis, the store is post-action basis, and
+    # the observed ratio is 1/factor. Restate the row by the action's factor.
+    for a in actions:
+        if getattr(a, "type", None) != "split":
+            continue
+        try:
+            ex_ts = pd.Timestamp(a.ex_date).normalize()
+            factor = _ca.expected_factor(a)
+        except Exception:  # noqa: BLE001 - malformed action, can't explain
+            continue
+        if factor <= 0 or ex_ts <= today_ts:
+            continue
+        if registry is not None and not registry.is_applied(
+            _ca.STORE_ARCTICDB_UNIVERSE, a.action_id
+        ):
+            continue
+        expected_gap = 1.0 / factor
+        if abs(ratio - expected_gap) <= _SPLICE_GUARD_REL_TOL * expected_gap:
+            restated_bar = bar.copy()
+            for fld in _SPLICE_PRICE_FIELDS:
+                try:
+                    val = float(restated_bar[fld])
+                except Exception:  # noqa: BLE001 - absent/NaN field, skip
+                    continue
+                if np.isfinite(val):
+                    restated_bar[fld] = val * factor
+            try:
+                vol = float(restated_bar["Volume"])
+                if np.isfinite(vol):
+                    restated_bar["Volume"] = round(vol / factor)
+            except Exception:  # noqa: BLE001 - absent/NaN volume, skip
+                pass
+            log.warning(
+                "daily_append splice basis-guard: %s @ %s row arrived on the "
+                "PRE-action basis (ratio %.4f vs stored history; registered "
+                "%s, ex %s, already applied to the store) — restated the "
+                "incoming row by factor %.6g before splice",
+                ticker, today_ts.date(), ratio, a.human(), a.ex_date, factor,
+            )
+            return restated_bar, "restated"
+
+    allow = {
+        entry.strip()
+        for entry in os.environ.get(_SPLICE_GUARD_ALLOW_ENV, "").split(",")
+        if entry.strip()
+    }
+    allowlisted = f"{ticker}:{today_ts.date()}" in allow
+
+    # Same-date disagreement test: an on-basis stored row for THIS date that
+    # coheres with its own prior neighbor cannot be re-printed a split-like
+    # factor away by the same market — the incoming row is off-basis.
+    stored_same = None
+    if today_ts in hist.index:
+        try:
+            v = float(hist.loc[today_ts, "Close"])
+            if np.isfinite(v) and v > 0:
+                stored_same = v
+        except Exception:  # noqa: BLE001 - malformed stored cell, no verdict
+            stored_same = None
+    if stored_same is not None:
+        same_ratio = bar_close / stored_same
+        stored_coheres = (
+            1.0 / _SPLICE_GUARD_SOFT_RATIO
+            < stored_same / prior_close
+            < _SPLICE_GUARD_SOFT_RATIO
+        )
+        if (
+            not (1.0 / _SPLICE_GUARD_SOFT_RATIO < same_ratio < _SPLICE_GUARD_SOFT_RATIO)
+            and stored_coheres
+        ):
+            if allowlisted:
+                log.warning(
+                    "daily_append splice basis-guard: %s @ %s same-date "
+                    "disagreement (incoming %.4f vs stored %.4f) is "
+                    "operator-allowlisted via %s — overwriting",
+                    ticker, today_ts.date(), bar_close, stored_same,
+                    _SPLICE_GUARD_ALLOW_ENV,
+                )
+                return bar, "ok"
+            log.error(
+                "daily_append splice basis-guard: REFUSING %s @ %s — incoming "
+                "close %.4f disagrees with the ALREADY-STORED close %.4f for "
+                "the SAME date by a split-like factor (%.4f) while the stored "
+                "row coheres with its neighbors. Same-date same-market "
+                "disagreement is a basis mismatch, never a move (2026-06-26 "
+                "HON incident class) — keeping the stored row. Force with "
+                "%s=%s:%s",
+                ticker, today_ts.date(), bar_close, stored_same, same_ratio,
+                _SPLICE_GUARD_ALLOW_ENV, ticker, today_ts.date(),
+            )
+            return bar, "refused"
+
+    # Pure append with an unexplained split-like ratio: can be a genuine
+    # crash/pop (CAR −48%, KD −55% verified real) — write it, page loudly.
+    log.error(
+        "daily_append splice basis-guard: %s @ %s incoming close %.4f vs "
+        "prior stored close %.4f (ratio %.4f) is split-like and NO registered "
+        "corporate action explains it. Writing (a genuine move is possible), "
+        "but if a corporate-action record lands later the restatement path "
+        "must flatten this boundary — verify the split calendar",
+        ticker, today_ts.date(), bar_close, prior_close, ratio,
+    )
+    return bar, "ok"
 
 
 def daily_append(
@@ -887,6 +1081,23 @@ def _daily_append_impl(
         from dates import default_run_date  # config#1014: trading-day axis
 
         date_str = default_run_date()
+
+    # NYSE-calendar gate (config#1572): appending a row for a non-trading day
+    # plants a phantom session in the ArcticDB training store (2026-06-19
+    # Juneteenth entered universe-wide via a fabricated daily-closes parquet).
+    # A non-trading date_str is always a caller error — fail loud, same
+    # calendar source of truth as the Step Function's CheckTradingDay gate.
+    from datetime import date as _date
+
+    from alpha_engine_lib.trading_calendar import is_trading_day as _is_td
+
+    if not _is_td(_date.fromisoformat(date_str)):
+        raise ValueError(
+            f"daily_append: date_str={date_str} is not an NYSE trading day — "
+            f"refusing to append a phantom session to the universe "
+            f"(config#1572)."
+        )
+
     today_ts = pd.Timestamp(date_str)
     t0 = time.time()
 
@@ -1396,6 +1607,26 @@ def _daily_append_impl(
                             "backfill audit remains the correctness gate",
                             ticker, exc,
                         )
+
+                # ── splice basis-guard (2026-07-02 incident) ────────────────
+                # The incoming row and the stored history can sit on DIFFERENT
+                # adjusted bases around a corporate action: polygon serves the
+                # pre-action basis until the ex date lands (CRWD 6/30 spliced
+                # raw at 763.14 onto a ×0.25-restated series), and an old-basis
+                # parquet row can land on a freshly-rebuilt clean series (HON
+                # 6/26 = 464.42 onto the new-basis history — the discontinuity
+                # that later fed FALSE price evidence to an inverted feed
+                # record). Never splice a split-like discontinuity raw: restate
+                # the incoming row when a registered action deterministically
+                # explains the basis gap, refuse it (loud) otherwise.
+                bar, splice_verdict = _splice_basis_guard(
+                    ticker, bar, hist, today_ts,
+                    splits_by_ticker.get(ticker, []), ca_registry,
+                )
+                if splice_verdict == "refused":
+                    n_quality_blocked += 1
+                    quality_blocked_details.append((ticker, "splice_basis_guard"))
+                    continue
 
                 new_row_data = {col: bar.get(col, np.nan) for col in OHLCV_COLS}
                 # Carry per-row provenance through to the ArcticDB write. Source

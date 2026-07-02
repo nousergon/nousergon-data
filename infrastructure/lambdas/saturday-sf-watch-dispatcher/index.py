@@ -79,24 +79,27 @@ _DISPATCH_TIMEOUT_SEC = 15
 # renamed. The slug is the single source of truth for that mapping and is passed
 # to the agent so the charter never has to parse it back out of the SF name.
 # `label` is the human cadence label for the Telegram receipt.
-PIPELINES: dict[str, dict[str, str]] = {
+PIPELINES: dict[str, dict[str, object]] = {
     "ne-weekly-freshness-pipeline": {
         "cadence_slug": "saturday",
         "label": "Weekly Freshness",
         "watch_prefix": "consolidated/saturday_sf_watch",
         "dispatch_event_type": "saturday-sf-failure",
+        "has_listener": True,
     },
     "ne-preopen-trading-pipeline": {
         "cadence_slug": "weekday",
         "label": "Pre-open Trading",
         "watch_prefix": "consolidated/weekday_sf_watch",
         "dispatch_event_type": "weekday-sf-failure",
+        "has_listener": True,
     },
     "ne-postclose-trading-pipeline": {
         "cadence_slug": "eod",
         "label": "Post-close Trading",
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
+        "has_listener": True,
     },
     # TRANSITIONAL (remove at the SF-rename cutover — config#1408 / re-exam
     # 2026-07-03). The EOD SF still runs under its OLD name `alpha-engine-eod-
@@ -109,26 +112,26 @@ PIPELINES: dict[str, dict[str, str]] = {
         "label": "Post-close Trading",
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
+        "has_listener": True,
     },
     # Backlog groom dispatch (config#1472) — wraps the EC2-spot-via-SSM groom
     # dispatch in a Step Function purely for uniform observability (watch-log
     # artifact + silent Telegram record), replacing the bespoke external
-    # liveness-probe Lambda (data#556). `dispatch_event_type` is DELIBERATELY
-    # given a distinct, not-yet-wired type: `.github/workflows/sf-watch.yml`'s
-    # `types:` allowlist does NOT include it, so a groom failure gets full
-    # watch-log + Telegram coverage but the repository_dispatch call (if
-    # AGENT_DISPATCH_ENABLED) lands as a safe no-op — no workflow listens for
-    # it yet. Groom failures are almost always operational (spot capacity, SSM
-    # misfire) rather than a code defect, so wiring it into the SAME
-    # code-fix-via-PR resilience-agent charter the trading pipelines use needs
-    # its own deliberate autonomy-posture decision first (mirrors the still-open
-    # weekday/EOD soak-exit decision in config#1408) — tracked separately, not
-    # bundled into this SF-wrap.
+    # liveness-probe Lambda (data#556). `has_listener=True` (2026-07-01 follow-
+    # up to config#1535): `groom-sf-failure` is now in sf-watch.yml's `types:`
+    # allowlist and the charter (.github/sf-watch-prompt.md) has a dedicated
+    # groom guardrail (STEP 2.5 case 4) — classify-first (most groom failures
+    # are transient infra, not a code defect), plain rerun (no skip-flags, the
+    # groom SF has no multi-stage idempotency concern). Its kill-switch
+    # (/alpha-engine/groom_sf_watch/autonomous_merge_enabled) defaults `true`
+    # from day one — lower stakes than any trading pipeline since it touches no
+    # live capital, unlike weekday/EOD which soak PROPOSE-ONLY (config#1408).
     "alpha-engine-groom-dispatch": {
         "cadence_slug": "groom",
         "label": "Backlog Groom",
         "watch_prefix": "consolidated/groom_sf_watch",
         "dispatch_event_type": "groom-sf-failure",
+        "has_listener": True,
     },
 }
 SCHEMA_VERSION = 1
@@ -259,10 +262,15 @@ def _load_existing(s3, key: str) -> dict:
     return {"schema_version": SCHEMA_VERSION, "events": []}
 
 
-def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str) -> dict:
+def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str, cfg: dict) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
     cause = _failure_cause(describe_resp)
     failed_state = _failed_state_from_history(detail.get("executionArn", ""))
+    # config#1535: "will an agent actually be dispatched" depends on BOTH the
+    # global kill-switch AND this specific pipeline having a wired listener —
+    # not the global flag alone (that was the bug: claiming "dispatch" for a
+    # pipeline no workflow listens for).
+    will_dispatch = AGENT_DISPATCH_ENABLED and bool(cfg.get("has_listener", True))
     return {
         "detected_at": now_iso,
         "status": detail.get("status", "UNKNOWN"),
@@ -274,11 +282,13 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str)
         "is_preflight": _is_preflight(describe_resp),
         # `lane` is filled by the dispatched agent (null until it classifies).
         # `action` reflects intent at write time (the log is written just BEFORE
-        # the dispatch fires): "dispatch" when the agent is being triggered,
-        # "observe" only when AGENT_DISPATCH_ENABLED is false.
+        # the dispatch fires): "dispatch" only when an agent will genuinely be
+        # triggered; "observe" when the kill-switch is off OR this pipeline has
+        # no wired listener yet.
         "lane": None,
-        "action": "dispatch" if AGENT_DISPATCH_ENABLED else "observe",
+        "action": "dispatch" if will_dispatch else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
+        "has_listener": bool(cfg.get("has_listener", True)),
     }
 
 
@@ -314,12 +324,17 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     """Distinct, SILENT Telegram record. The sf-telegram-notifier already pinged
     loud on this FAILED event; this is the additive watch receipt (which state,
     where the artifact is, current dispatch mode). Best-effort — never raises.
-    The header + footer reflect the LIVE ``AGENT_DISPATCH_ENABLED`` state so the
-    receipt never claims observe-only while the agent is actually being
-    dispatched (the 2026-06-26 stale-text bug)."""
+    The header + footer reflect the LIVE ``AGENT_DISPATCH_ENABLED`` state AND
+    whether this specific pipeline has a wired listener (config#1535 — the
+    receipt must never claim "autonomous fix ACTIVE" when no workflow is
+    actually listening for this pipeline's dispatch_event_type, same spirit as
+    the 2026-06-26 stale-text bug this pattern originally fixed)."""
+    cfg = PIPELINES.get(pipeline_name) or {}
+    has_listener = bool(cfg.get("has_listener", True))
     cadence = _pipeline_label(pipeline_name)
     label = f"{cadence} Preflight SF" if record["is_preflight"] else f"{cadence} SF"
-    mode = "AUTO-FIX" if AGENT_DISPATCH_ENABLED else "OBSERVE"
+    will_dispatch = AGENT_DISPATCH_ENABLED and has_listener
+    mode = "AUTO-FIX" if will_dispatch else "OBSERVE"
     lines = [
         f"\U0001f6f0️ *Fleet-SF Watch — {mode}*",
         f"{label}: {record['status']}",
@@ -329,11 +344,13 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     if record.get("cause"):
         lines.append(f"Cause: {record['cause']}")
     lines.append(f"Watch log: s3://{WATCH_BUCKET}/{key}")
-    lines.append(
-        "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
-        if AGENT_DISPATCH_ENABLED
-        else "_autonomous fix DISABLED (observe-only)_"
-    )
+    if will_dispatch:
+        footer = "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
+    elif AGENT_DISPATCH_ENABLED and not has_listener:
+        footer = "_observe-only for this pipeline — no autonomous remediation wired yet (needs Brian)_"
+    else:
+        footer = "_autonomous fix DISABLED (observe-only)_"
+    lines.append(footer)
     try:
         return bool(send_message("\n".join(lines), disable_notification=True))
     except Exception as exc:  # noqa: BLE001 — secondary observability
@@ -363,6 +380,12 @@ def _maybe_dispatch_agent(
     """
     if not AGENT_DISPATCH_ENABLED:
         return {"dispatched": False, "reason": "disabled"}
+    if not cfg.get("has_listener", True):
+        # config#1535: don't fire a repository_dispatch that no workflow is
+        # listening for — a wasted HTTP call, and inconsistent with the
+        # notification copy correctly saying "no autonomous fix" for this
+        # pipeline (see _notify).
+        return {"dispatched": False, "reason": "no_listener"}
     event_type = cfg["dispatch_event_type"]
     try:
         pat = _get_github_pat()
@@ -423,7 +446,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     describe_resp = _describe_execution(detail.get("executionArn", ""))
     run_date = _run_date(describe_resp, detail)
-    record = _build_event_record(detail, describe_resp, run_date)
+    record = _build_event_record(detail, describe_resp, run_date, cfg)
 
     s3 = _s3_client()
     key = _write_watch_log(s3, cfg["watch_prefix"], run_date, record)  # PRIMARY — fail-loud

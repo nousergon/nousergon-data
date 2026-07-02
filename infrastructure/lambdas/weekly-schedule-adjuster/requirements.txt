@@ -1,0 +1,5 @@
+# No external runtime deps. boto3 is provided by the Lambda runtime, and the
+# NYSE trading calendar is VENDORED into index.py (a pure-Python holiday set +
+# session check) — the canonical nousergon_lib is mypyc/pydantic-compiled and
+# its platform-specific .so wheels cannot be bundled into a Lambda zip from a
+# dev Mac. test_handler.py drift-guards the vendored set against the lib.

@@ -77,11 +77,14 @@ CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run"}
 FORMER_FIRST_STATE_BY_SF = {
     "saturday": ("step_function.json", "CheckShellRun"),
     "weekday": ("step_function_daily.json", "DeployDriftCheck"),
-    # L4607: the EOD SF's first post-mutex state is now the per-task rerun
-    # gate CheckSkipPostMarketData (whose Default runs PostMarketData), not
-    # PostMarketData directly. The mutex still routes to the pipeline's first
-    # work state — that state is just the skip-gate now.
-    "eod": ("step_function_eod.json", "CheckSkipPostMarketData"),
+    # 2026-06-30: the EOD SF's first post-mutex state is now the re-runnability
+    # guard StartTradingInstance (ec2:startInstances → SSM-readiness poll), which
+    # then flows into the CheckSkipPostMarketData rerun-gate chain. Inserted
+    # because an operator recovery rerun landed on a stopped instance (the prior
+    # run's ForceStopInstance) and the first ssm:sendCommand died with
+    # Ssm.InvalidInstanceIdException. The mutex still routes to the pipeline's
+    # first post-mutex work state — that state is just the ensure-running gate now.
+    "eod": ("step_function_eod.json", "StartTradingInstance"),
 }
 
 
@@ -590,4 +593,157 @@ class TestCfnMutexConflictAlarms:
         block = cfn_text[anchor : anchor + 900]
         assert "!Ref AlertsTopic" in block, (
             "the weekly-freshness mutex-conflict alarm must page AlertsTopic"
+        )
+
+
+class TestCfnEodMutexConflictAlarm:
+    """EOD (ne-postclose-trading-pipeline) MutexConflict coverage (config#1416).
+
+    EOD is script-managed (update_eod_pipeline_sf.sh + deploy-infrastructure.sh's
+    update_or_create()), not a CFN AWS::StepFunctions::StateMachine resource. Per
+    the design note in alpha-engine-orchestration.yaml, this means EOD's log
+    group is deliberately NOT a CFN resource (unlike the weekly/preopen pair in
+    TestCfnMutexConflictAlarms) — the scripts create it idempotently, out of
+    band, before setting LoggingConfiguration on the state machine. Only the
+    metric-filter + alarm (which read the log group by literal name) are CFN
+    resources. These tests pin that shape so a future "cleanup" doesn't
+    "fix" the asymmetry by adding a CFN LogGroup for EOD, which would break
+    deploy ordering (see the CFN comment + PR description for the full
+    reasoning).
+    """
+
+    EOD_LOG_GROUP_NAME = "/aws/stepfunctions/ne-postclose-trading-pipeline"
+
+    @pytest.fixture(scope="class")
+    def cfn_text(self) -> str:
+        return CFN_PATH.read_text()
+
+    def test_metric_filter_present(self, cfn_text):
+        assert "PostcloseTradingMutexConflictMetricFilter:" in cfn_text, (
+            "missing AWS::Logs::MetricFilter resource for the EOD pipeline "
+            "(config#1416)"
+        )
+        assert "PostcloseTradingMutexConflictFails" in cfn_text, (
+            "EOD metric filter must emit a dedicated "
+            "PostcloseTradingMutexConflictFails metric"
+        )
+
+    def test_alarm_present(self, cfn_text):
+        assert "PostcloseTradingMutexConflictAlarm:" in cfn_text, (
+            "missing CloudWatch alarm resource for the EOD pipeline "
+            "(config#1416)"
+        )
+        assert "ne-postclose-trading-mutex-conflict" in cfn_text, (
+            "missing the ne-postclose-trading-mutex-conflict AlarmName"
+        )
+
+    def test_metric_filter_log_group_name_matches_script_managed_group(
+        self, cfn_text
+    ):
+        anchor = cfn_text.index("PostcloseTradingMutexConflictMetricFilter:")
+        block = cfn_text[anchor : anchor + 500]
+        assert f"LogGroupName: {self.EOD_LOG_GROUP_NAME}" in block, (
+            "EOD metric filter LogGroupName must match the literal log group "
+            "name the scripts create (update_eod_pipeline_sf.sh / "
+            "deploy-infrastructure.sh) — /aws/stepfunctions/"
+            "ne-postclose-trading-pipeline"
+        )
+
+    def test_metric_filter_has_no_dimensions_or_default_value(self, cfn_text):
+        mf_start = cfn_text.index("PostcloseTradingMutexConflictMetricFilter")
+        mf_region = cfn_text[
+            mf_start : cfn_text.index("PostcloseTradingMutexConflictAlarm")
+        ]
+        assert "Dimensions" not in mf_region, (
+            "EOD MutexConflict metric filter must NOT set Dimensions — same "
+            "invariant as the weekly/preopen pair (config#729)"
+        )
+        assert "DefaultValue" not in mf_region, (
+            "EOD MutexConflict metric filter must NOT set DefaultValue"
+        )
+
+    def test_alarm_routes_to_alerts_topic(self, cfn_text):
+        anchor = cfn_text.index("PostcloseTradingMutexConflictAlarm:")
+        block = cfn_text[anchor : anchor + 900]
+        assert "!Ref AlertsTopic" in block, (
+            "the postclose-trading mutex-conflict alarm must page AlertsTopic"
+        )
+
+    def test_eod_log_group_is_not_a_cfn_resource(self, cfn_text):
+        # Regression guard: unlike WeeklyFreshnessLogGroup / PreopenTradingLogGroup,
+        # EOD's log group must NOT become a CFN AWS::Logs::LogGroup resource.
+        # Reasoning (config#1416): deploy-infrastructure.sh runs the
+        # script-managed state-machine update (step 3, update_or_create()) BEFORE
+        # the CFN stack deploy (step 4). If EOD's log group were CFN-owned, the
+        # first deploy after this change would try to set LoggingConfiguration
+        # in step 3 pointing at a log group CFN hasn't created yet (step 4 hasn't
+        # run) -> ResourceNotFoundException. The scripts create the log group
+        # idempotently out of band instead; CFN owns only the filter + alarm.
+        assert "PostcloseTradingLogGroup" not in cfn_text, (
+            "EOD's log group must NOT be a CFN resource (no "
+            "PostcloseTradingLogGroup) — it is created idempotently by "
+            "update_eod_pipeline_sf.sh / deploy-infrastructure.sh instead. "
+            "See config#1416: a CFN-owned log group here would break deploy "
+            "ordering (script step runs before the CFN stack deploy step)."
+        )
+
+
+class TestEodLoggingScriptWiring:
+    """Text-contains checks over the two shell scripts that manage the
+    script-managed EOD state machine (config#1416). This repo has no
+    bash-execution test harness, so — same style as the CFN raw-text tests
+    above — these pin the presence of the AWS CLI flags/calls that enable EOD
+    execution logging, without actually invoking AWS.
+    """
+
+    @pytest.fixture(scope="class")
+    def update_eod_script_text(self) -> str:
+        return (INFRA / "update_eod_pipeline_sf.sh").read_text()
+
+    @pytest.fixture(scope="class")
+    def deploy_infra_script_text(self) -> str:
+        return (INFRA / "deploy-infrastructure.sh").read_text()
+
+    def test_update_eod_script_enables_logging(self, update_eod_script_text):
+        assert "--logging-configuration" in update_eod_script_text, (
+            "update_eod_pipeline_sf.sh must pass --logging-configuration to "
+            "update-state-machine so the manual-fallback path also enables "
+            "EOD execution logging (config#1416)"
+        )
+        assert "create-log-group" in update_eod_script_text, (
+            "update_eod_pipeline_sf.sh must idempotently ensure the EOD log "
+            "group exists (create-log-group) before enabling logging"
+        )
+        assert "put-retention-policy" in update_eod_script_text, (
+            "update_eod_pipeline_sf.sh must set retention on the EOD log group"
+        )
+
+    def test_deploy_infra_script_enables_logging_for_eod_only(
+        self, deploy_infra_script_text
+    ):
+        assert "create-log-group" in deploy_infra_script_text, (
+            "deploy-infrastructure.sh must idempotently ensure the EOD log "
+            "group exists before the update_or_create() call for EOD "
+            "(config#1416)"
+        )
+
+        eod_call_line = next(
+            line
+            for line in deploy_infra_script_text.splitlines()
+            if "update_or_create" in line and "$EOD_ARN" in line
+        )
+        groom_call_line = next(
+            line
+            for line in deploy_infra_script_text.splitlines()
+            if "update_or_create" in line and "$GROOM_ARN" in line
+        )
+
+        assert "EOD_LOGGING_CONFIG" in eod_call_line, (
+            "the update_or_create() call site for $EOD_ARN must pass the "
+            "logging-configuration variable as its 5th argument (config#1416)"
+        )
+        assert "EOD_LOGGING_CONFIG" not in groom_call_line, (
+            "the update_or_create() call site for $GROOM_ARN must NOT pass "
+            "any logging-configuration argument — groom's behavior must be "
+            "unchanged by config#1416"
         )

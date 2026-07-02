@@ -406,3 +406,48 @@ class TestWindowOrchestration:
         assert captured == ["2026-05-06", "2026-05-07", "2026-05-08"]
         assert result["status"] == "ok"
         assert result["backfill_failed_dates"] == []
+
+
+# ── NYSE-holiday awareness (config#1572, 2026-07-02) ─────────────────────────
+#
+# _previous_business_days was weekday-only; the first post-Juneteenth
+# yfinance-mode window enumerated 2026-06-19 (a closed market day), the batch
+# fetch returned data anyway, and a fabricated 924-row parquet entered the
+# archive — then ArcticDB universe-wide via the Saturday backfill delta.
+
+
+class TestPreviousBusinessDaysHolidayAware:
+    def test_window_skips_juneteenth(self):
+        # Monday 6/22 walking back 3 trading days must skip Fri 6/19
+        # (Juneteenth 2026): 6/22 → 6/18 → 6/17.
+        assert daily_closes._previous_business_days("2026-06-22", n=3) == [
+            "2026-06-22", "2026-06-18", "2026-06-17",
+        ]
+
+    def test_holiday_run_date_normalizes_to_prior_trading_day(self):
+        # Friday 7/3 (Independence Day observed) anchors to Thu 7/2.
+        assert daily_closes._previous_business_days("2026-07-03", n=2) == [
+            "2026-07-02", "2026-07-01",
+        ]
+
+    def test_holiday_weekend_combo(self):
+        # Monday 7/6: back 2 trading days crosses the 7/3 holiday + weekend.
+        assert daily_closes._previous_business_days("2026-07-06", n=2) == [
+            "2026-07-06", "2026-07-02",
+        ]
+
+
+class TestCollectRefusesNonTradingDay:
+    def test_single_date_holiday_raises(self):
+        with pytest.raises(ValueError, match="not an NYSE trading day"):
+            daily_closes.collect(
+                "test-bucket", ["AAPL"], run_date="2026-06-19",
+                source="polygon_only",
+            )
+
+    def test_single_date_weekend_raises(self):
+        with pytest.raises(ValueError, match="not an NYSE trading day"):
+            daily_closes.collect(
+                "test-bucket", ["AAPL"], run_date="2026-07-04",
+                source="yfinance_only",
+            )

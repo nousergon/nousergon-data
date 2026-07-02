@@ -629,10 +629,11 @@ Resources:
   # TreatMissingData=notBreaching covers the zero-conflict steady state, where no
   # match -> no data point -> alarm OK.)
   #
-  # EOD (ne-postclose-trading-pipeline) is intentionally NOT covered here: it is
-  # script-managed (update_eod_pipeline_sf.sh, logging still OFF) and is
-  # daemon-shutdown-triggered (single event), not cron-double-fire-prone. EOD
-  # coverage is tracked as a separate follow-up.
+  # EOD (ne-postclose-trading-pipeline) is now covered too — see the
+  # PostcloseTradingMutexConflict* resources below (config#1416). It is still
+  # script-managed (update_eod_pipeline_sf.sh + deploy-infrastructure.sh), so
+  # unlike the two SFs above, its log group is deliberately NOT a CFN
+  # resource — see the comment on that section for why.
   WeeklyFreshnessMutexConflictMetricFilter:
     Type: AWS::Logs::MetricFilter
     DependsOn: WeeklyFreshnessLogGroup
@@ -684,6 +685,48 @@ Resources:
         duplicate-trigger source.
       Namespace: AlphaEngine/StepFunctions
       MetricName: PreopenTradingMutexConflictFails
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # --------------------------------------------------------------------------
+  # EOD (ne-postclose-trading-pipeline) MutexConflict alarm (config#1416)
+  # --------------------------------------------------------------------------
+  # EOD is script-managed (infrastructure/update_eod_pipeline_sf.sh +
+  # deploy-infrastructure.sh's update_or_create()), not a CFN
+  # AWS::StepFunctions::StateMachine resource, so — unlike the weekly/preopen
+  # pair above — its log group is NOT a CFN resource: the scripts create it
+  # idempotently (create-log-group + put-retention-policy) before setting
+  # LoggingConfiguration on the state machine. CFN owns only the filter +
+  # alarm below, which read the log group by its literal name. This ordering
+  # is deliberate: the scripts' state-machine update (deploy-infrastructure.sh
+  # step 3) runs BEFORE this stack's deploy (step 4), so a CFN-owned log group
+  # would not exist yet on first deploy.
+  PostcloseTradingMutexConflictMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-postclose-trading-pipeline
+      FilterPattern: '"MutexConflict"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: PostcloseTradingMutexConflictFails
+          MetricValue: '1'
+
+  PostcloseTradingMutexConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ne-postclose-trading-mutex-conflict
+      AlarmDescription: >-
+        L274 MutexConflict Fail on the post-close (EOD) pipeline
+        (duplicate-trigger guard fired). First occurrence = investigate the
+        duplicate-trigger source.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: PostcloseTradingMutexConflictFails
       Statistic: Sum
       Period: 86400
       EvaluationPeriods: 1

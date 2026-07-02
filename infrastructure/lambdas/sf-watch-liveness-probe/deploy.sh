@@ -1,55 +1,49 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the alpha-engine-groom-liveness-probe Lambda and
-# wire its EventBridge Scheduler rules.
+# deploy.sh — Create or update the alpha-engine-sf-watch-liveness-probe Lambda
+# and wire its EventBridge Scheduler rules.
 #
-# WHY: the EC2-spot backlog groom (config#1432) self-reports its terminal state
-# (a `groom-digest` issue + Telegram ping), but only when the box lives long
-# enough to run groom_run.sh's reporting trap. SILENT modes — spot reclaim
-# mid-run, OOM/panic before the trap, a lost SSM command, a broken dispatcher
-# Lambda, a disabled/misconfigured schedule (the 2026-06-29 dead-trigger class) —
-# file NOTHING. This probe is the external watchdog: schedule-aware, it asserts
-# every scheduled groom that has had time to finish filed a terminal digest, and
-# LOUD-pings Telegram for any that didn't. (The "probe now" half; the
-# Step-Function-wrap that would let the existing Fleet-SF Watch cover the groom
-# natively is the tracked "SF later" follow-up.)
+# WHY: Fleet-SF Watch (saturday-sf-watch-dispatcher) is event-driven — it only
+# fires when a registered pipeline's SF reaches a terminal FAILED/TIMED_OUT/
+# ABORTED status via its EventBridge rule. Nothing notices if the WATCHER's own
+# wiring silently breaks — exactly what happened 2026-06-29: the rule pointed
+# at a deleted SF ARN for an unknown period, and the Lambda's own Errors metric
+# stayed at zero the whole time (it simply never got invoked). This probe is
+# the external watchdog FOR the watchdog: read-only, schedule-aware, asserts
+# the rule/registry/target-Lambda wiring is intact, and LOUD-pings Telegram
+# only when something's actually broken (silent-unless-broken, mirroring the
+# groom-liveness-probe's philosophy one layer up).
 #
-# IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds + the shared
-# Fleet-Watch PAT) + s3 Get/Put on the dedup state key. No EC2/SSM-send — it only
-# READS state, never launches anything.
+# IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds) +
+# events:DescribeRule/ListTargetsByRule + states:DescribeStateMachine (scoped to
+# the 5 registered pipeline ARNs) + lambda:GetFunctionConfiguration (scoped to
+# the dispatcher) + s3 Get/Put on the dedup state key. Entirely read-only — no
+# launch/send/write-anywhere-else permissions.
 #
-# Cadence (UTC): two runs/day, each after a groom's worst-case completion
-# (groom hard-ceiling 360 min + slack). Per-trigger windows + S3 dedup make the
-# exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
-#   06:30 daily   cron(30 6 * * ? *)   # after the 23:00 groom matures (~05:45)
-#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45; the
-#                                      #   07:00 groom runs daily since 2026-07-02 —
-#                                      #   the old "Sun-Fri" framing is gone)
+# Cadence (UTC): twice daily, offset 15 min from the groom-liveness-probe's own
+# cadence (06:30/14:30) purely to avoid simultaneous invocation, not for any
+# functional reason — this is a config-drift check, not tied to any pipeline's
+# own schedule:
+#   06:45 daily   cron(45 6 * * ? *)
+#   14:45 daily   cron(45 14 * * ? *)
 #
-# Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
-# blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
-# fleet-wide policy after 4 IAM-clobber incidents — infrastructure/iam/README.md).
-#
-# CODE auto-deploys on merge to main via
-# `.github/workflows/deploy-groom-liveness-probe.yml` (path-filtered to this
-# directory), which runs this script with NO flags (the default/flagless run
-# is already code-only). A SCHED_CRONS change (this probe's OWN invocation
-# cadence) still needs an operator to run `--bootstrap` by hand — merging
-# alone has ZERO live effect on it.
+# Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers/probes
+# (narrow OIDC blast radius, operator-deployed only). Merging the PR has ZERO
+# live effect until an operator runs this with --bootstrap.
 #
 # Usage:
-#   bash .../groom-liveness-probe/deploy.sh             # update code only (same command CI runs)
-#   bash .../groom-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules
-#   bash .../groom-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
-#   bash .../groom-liveness-probe/deploy.sh --smoke     # invoke once (read-only check; pings only on a real miss)
+#   bash .../sf-watch-liveness-probe/deploy.sh             # update code only
+#   bash .../sf-watch-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules
+#   bash .../sf-watch-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
+#   bash .../sf-watch-liveness-probe/deploy.sh --smoke     # invoke once (read-only check; pings only on a real problem)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FUNCTION_NAME="alpha-engine-groom-liveness-probe"
-ROLE_NAME="alpha-engine-groom-liveness-probe-role"
-POLICY_NAME="alpha-engine-groom-liveness-probe-policy"
-SCHED_ROLE_NAME="alpha-engine-groom-liveness-probe-scheduler-role"
-SCHED_POLICY_NAME="invoke-groom-liveness-probe"
+FUNCTION_NAME="alpha-engine-sf-watch-liveness-probe"
+ROLE_NAME="alpha-engine-sf-watch-liveness-probe-role"
+POLICY_NAME="alpha-engine-sf-watch-liveness-probe-policy"
+SCHED_ROLE_NAME="alpha-engine-sf-watch-liveness-probe-scheduler-role"
+SCHED_POLICY_NAME="invoke-sf-watch-liveness-probe"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -57,14 +51,14 @@ FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 SCHED_NAMES=(
-  "alpha-engine-groom-liveness-0630-daily"
-  "alpha-engine-groom-liveness-1430-daily"
+  "alpha-engine-sf-watch-liveness-0645-daily"
+  "alpha-engine-sf-watch-liveness-1445-daily"
 )
 SCHED_CRONS=(
-  "cron(30 6 * * ? *)"
-  "cron(30 14 * * ? *)"
+  "cron(45 6 * * ? *)"
+  "cron(45 14 * * ? *)"
 )
-SCHED_PREFIX="alpha-engine-groom-liveness-"
+SCHED_PREFIX="alpha-engine-sf-watch-liveness-"
 
 DRY_RUN=false
 BOOTSTRAP=false
@@ -82,37 +76,19 @@ run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
-# ----- 0. Scratch dirs + validate handler syntax -----------------------------
-# PKG and TEST_DEPS are both created up front (mirrors freshness-monitor/
-# deploy.sh) so ONE trap covers both — a pytest-install failure below still
-# cleans up.
-
-PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+# ----- 0. Validate handler + run unit tests ----------------------------------
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
-# ----- 0b. Preflight handler unit tests --------------------------------------
-# Only alpha_engine_lib.telegram is stubbed in sys.modules (see
-# test_handler.py's header) — `index.py`'s `import boto3` is REAL, and
-# requirements.txt deliberately omits boto3 (provided by the Lambda runtime
-# at deploy time, per its own comment), so pytest's `import index` needs it
-# installed explicitly here. Installed into a scratch TEST_DEPS dir — NOT the
-# caller's global site-packages, not bundled into the Lambda zip (mirrors
-# freshness-monitor/deploy.sh). 2026-07-02: the CI auto-deploy workflow's
-# FIRST real run failed here with "No module named pytest" — this script had
-# only ever been run from an operator's laptop before, where pytest/boto3
-# happened to already be installed as dev/tooling dependencies; the gap was
-# invisible until CI actually exercised this path.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest + boto3 into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
   echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
+
+PKG=$(mktemp -d)
+trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (pip install -t)..."
 python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
@@ -217,11 +193,11 @@ fi
 
 echo "✓ Code deployed."
 
-# ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL miss) ----
+# ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL problem) -
 
 if $SMOKE; then
   echo ""
-  echo "Smoke-testing via direct invoke (read-only liveness check)..."
+  echo "Smoke-testing via direct invoke (read-only wiring check)..."
   RESP=$(mktemp)
   aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out \
     --payload '{}' --region "${REGION}" "${RESP}" >/dev/null
