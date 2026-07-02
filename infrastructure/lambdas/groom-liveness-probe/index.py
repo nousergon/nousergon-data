@@ -77,10 +77,12 @@ _PAT_TIMEOUT_SEC = 15
 # (scheduled-groom-dispatcher/deploy.sh SCHED_CRONS). `dows` are Python weekday
 # ordinals: Mon=0 … Sun=6. Override via the GROOM_SCHEDULE env (JSON list of
 # {hour, minute, dows}) if the dispatcher cadence changes — keep the two in sync.
-#   cron(0 7 ? * SUN-FRI *) → 07:00 on Sun(6),Mon(0)..Fri(4)
-#   cron(0 23 * * ? *)      → 23:00 daily
+# Uniform 3x/day, all 7 days, since 2026-07-02 (the 07:00 Sat-skip was dropped —
+# no real contention with the weekly SF; see scheduled-groom-dispatcher/README.md).
+#   cron(0 7 * * ? *)  → 07:00 daily
+#   cron(0 23 * * ? *) → 23:00 daily
 _DEFAULT_SCHEDULE = [
-    {"hour": 7, "minute": 0, "dows": [6, 0, 1, 2, 3, 4], "label": "07:00 Sun-Fri"},
+    {"hour": 7, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "07:00 daily"},
     {"hour": 23, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "23:00 daily"},
 ]
 
