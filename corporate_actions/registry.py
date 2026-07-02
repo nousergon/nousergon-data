@@ -268,18 +268,26 @@ class CorporateActionRegistry:
         close jump from ``prior`` to ``new`` on ``date`` for ``ticker``, or None.
 
         A match requires BOTH:
-          1. the observed multiplicative factor ``new/prior`` equals the action's
-             :func:`corporate_actions.expected_factor` within ``_SPLIT_RATIO_TOL``
-             (a split restates by the EXACT factor), and
+          1. the observed multiplicative factor ``new/prior`` equals the
+             action's :func:`corporate_actions.expected_factor` — OR its
+             INVERSE — within ``_SPLIT_RATIO_TOL`` (a split restates by the
+             EXACT factor; the inverse match covers a feed record published
+             with the from/to ratio inverted, observed live 2026-06/07 on
+             polygon's HON ``2:1`` and DD ``3:1`` records — the restatement
+             the overwrite performs is still that action's, so the ERROR
+             storm it caused was misclassification, not signal), and
           2. the action's ``ex_date`` is plausibly near ``date`` — on/after
              ``date`` (a split restates dates strictly before its ex date), with
              a few days of early leniency and a bounded look-ahead.
 
-        Only split actions are classified this PR. Matches against the splits
-        DETECTED THIS SESSION (``_session_actions``, recorded via
-        record_detected) — sufficient and authoritative for the live run, and
-        free of any S3 list. Returns the matching action (the first, by ex_date)
-        or None.
+        Only split actions are classified. Matches against the splits detected
+        THIS SESSION (``_session_actions``) first, then the PERSISTED registry
+        (``_ensure_loaded`` — one lazy S3 list per registry instance): a window
+        that re-touches a date restated days earlier must still classify the
+        overwrite as that action's expected restatement (2026-07-02: six
+        per-date ERROR emails for HON's already-registered separation because
+        only session-scope was consulted). Returns the matching action (the
+        first, by ex_date) or None.
         """
         from corporate_actions import expected_factor
 
@@ -291,9 +299,19 @@ class CorporateActionRegistry:
         except Exception:
             return None
 
+        known: dict = {}
+        try:
+            known.update(self._ensure_loaded())
+        except Exception as exc:  # noqa: BLE001 - degrade to session-only scope
+            log.warning(
+                "corporate_actions registry: persisted-action load failed (%s) "
+                "— explains_discrepancy degrades to session-detected scope",
+                exc,
+            )
+        known.update(self._session_actions)  # session wins on id collision
         candidates = [
             a
-            for a in self._session_actions.values()
+            for a in known.values()
             if a.type == "split" and a.ticker == str(ticker)
         ]
         # Evaluate by ex_date ascending so the earliest plausible action wins.
@@ -315,5 +333,8 @@ class CorporateActionRegistry:
             if expected <= 0:
                 continue
             if abs(observed - expected) / expected <= _SPLIT_RATIO_TOL:
+                return action
+            inverse = 1.0 / expected
+            if abs(observed - inverse) / inverse <= _SPLIT_RATIO_TOL:
                 return action
         return None

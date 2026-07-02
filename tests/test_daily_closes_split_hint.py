@@ -115,7 +115,7 @@ class TestRegistryReclassifiesConfirmedSplit:
         new_df = pd.DataFrame({"Close": [458.98]}, index=["HON"])
         reg = _registry_with_hon_reverse_split()
         with caplog.at_level(logging.DEBUG):
-            explained = daily_closes._log_close_discrepancies(
+            explained, _unexplained = daily_closes._log_close_discrepancies(
                 new_df, {"HON": 229.49}, "2026-06-25", registry=reg
             )
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -128,7 +128,7 @@ class TestRegistryReclassifiesConfirmedSplit:
     def test_registry_none_still_errors(self, caplog):
         new_df = pd.DataFrame({"Close": [458.98]}, index=["HON"])
         with caplog.at_level(logging.DEBUG):
-            explained = daily_closes._log_close_discrepancies(
+            explained, _unexplained = daily_closes._log_close_discrepancies(
                 new_df, {"HON": 229.49}, "2026-06-25", registry=None
             )
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -142,7 +142,7 @@ class TestRegistryReclassifiesConfirmedSplit:
         new_df = pd.DataFrame({"Close": [200.0]}, index=["MMM"])
         reg = _registry_with_hon_reverse_split()
         with caplog.at_level(logging.DEBUG):
-            explained = daily_closes._log_close_discrepancies(
+            explained, _unexplained = daily_closes._log_close_discrepancies(
                 new_df, {"MMM": 100.0}, "2026-06-25", registry=reg
             )
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]

@@ -78,6 +78,53 @@ class PolygonForbiddenError(Exception):
     """
 
 
+def _split_ratio_num(value):
+    """Parse one polygon split-ratio field, preserving fractional factors.
+
+    Polygon publishes FRACTIONAL ``split_from``/``split_to`` for spinoff-style
+    adjustments (``1000:1061``, ``1:1.0517…``; live 2026-06: CCBC ``1:1.2``,
+    NRWRF ``20.625:21.625``). The pre-2026-07-02 ``int()`` cast silently
+    truncated those (``1.2 → 1``, corrupting the registry's expected factor)
+    and raised on numeric strings, degrading the WHOLE window's split
+    detection to empty. Integral values normalize to ``int`` so the
+    content-addressed action id derivation is unchanged for the (dominant)
+    integer-ratio case. Returns ``None`` for a malformed/non-positive value.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (f > 0) or f != f or f in (float("inf"), float("-inf")):
+        return None
+    return int(f) if float(f).is_integer() else f
+
+
+def _parse_split_row(r: dict, *, require_ticker: bool = False):
+    """Parse one ``/v3/reference/splits`` result row; ``None`` + WARN if
+    malformed (per-row skip — one bad row must not degrade the whole window's
+    split detection to empty, which is what a raised cast did before
+    2026-07-02)."""
+    exec_date = r.get("execution_date")
+    sf = _split_ratio_num(r.get("split_from"))
+    st = _split_ratio_num(r.get("split_to"))
+    ticker = r.get("ticker")
+    if not exec_date or sf is None or st is None or (require_ticker and not ticker):
+        logger.warning(
+            "polygon splits: skipping malformed record (execution_date=%r, "
+            "split_from=%r, split_to=%r, ticker=%r)",
+            exec_date, r.get("split_from"), r.get("split_to"), ticker,
+        )
+        return None
+    row = {
+        "execution_date": str(exec_date),
+        "split_from": sf,
+        "split_to": st,
+    }
+    if ticker:
+        row["ticker"] = str(ticker)
+    return row
+
+
 class PolygonClient:
     """Rate-limited polygon.io REST client with dividend adjustment."""
 
@@ -284,12 +331,17 @@ class PolygonClient:
         split lands.
 
         Returns a list of ``{"execution_date": "YYYY-MM-DD",
-        "split_from": int, "split_to": int}`` sorted ascending by date. A
-        forward N-for-1 split is ``split_from=1, split_to=N`` (one old share
-        becomes N new shares → adjusted price divides by N); a reverse 1-for-N
-        split is ``split_from=N, split_to=1``. The per-event multiplicative
-        factor applied to prices BEFORE the execution date is
-        ``split_from / split_to``.
+        "split_from": int|float, "split_to": int|float}`` sorted ascending by
+        date. A forward N-for-1 split is ``split_from=1, split_to=N`` (one old
+        share becomes N new shares → adjusted price divides by N); a reverse
+        1-for-N split is ``split_from=N, split_to=1``. The per-event
+        multiplicative factor applied to prices BEFORE the execution date is
+        ``split_from / split_to``. Ratio fields are FRACTIONAL when polygon
+        publishes them so (spinoff-style records like ``1000:1061`` or
+        ``1:1.0517…``; live examples 2026-06: CCBC ``1:1.2``, NRWRF
+        ``20.625:21.625``) — ``int()`` truncation silently corrupted those
+        factors before 2026-07-02. Integral values normalize to ``int`` so
+        content-addressed action ids stay stable.
         """
         results: list[dict] = []
         try:
@@ -300,18 +352,11 @@ class PolygonClient:
         except PolygonForbiddenError:
             return []
         for r in data.get("results", []) or []:
-            exec_date = r.get("execution_date")
-            sf = r.get("split_from")
-            st = r.get("split_to")
-            if not exec_date or not sf or not st:
-                continue
-            results.append(
-                {
-                    "execution_date": str(exec_date),
-                    "split_from": int(sf),
-                    "split_to": int(st),
-                }
-            )
+            row = _parse_split_row(r)
+            if row is not None:
+                results.append(
+                    {k: row[k] for k in ("execution_date", "split_from", "split_to")}
+                )
         results.sort(key=lambda r: r["execution_date"])
         return results
 
@@ -349,20 +394,9 @@ class PolygonClient:
         except PolygonForbiddenError:
             return []
         for r in data.get("results", []) or []:
-            exec_date = r.get("execution_date")
-            sf = r.get("split_from")
-            st = r.get("split_to")
-            ticker = r.get("ticker")
-            if not exec_date or not sf or not st or not ticker:
-                continue
-            results.append(
-                {
-                    "ticker": str(ticker),
-                    "execution_date": str(exec_date),
-                    "split_from": int(sf),
-                    "split_to": int(st),
-                }
-            )
+            row = _parse_split_row(r, require_ticker=True)
+            if row is not None:
+                results.append(row)
         results.sort(key=lambda r: r["execution_date"])
         return results
 

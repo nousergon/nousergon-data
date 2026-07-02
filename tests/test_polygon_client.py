@@ -339,3 +339,60 @@ def test_get_ticker_events_empty_results_object():
     client = _make_client()
     with patch.object(client, "_get", return_value={"status": "OK"}):
         assert client.get_ticker_events("FB") == []
+
+
+# ── fractional split-ratio fields (2026-07-02 incident class) ────────────────
+#
+# Polygon publishes FRACTIONAL split_from/split_to for spinoff-style records
+# (live 2026-06: CCBC 1:1.2, NRWRF 20.625:21.625, CFRLF 1:1.0517…). The old
+# int() cast silently truncated them (1.2 → 1: a corrupted no-op factor) and
+# raised on malformed rows, degrading the WHOLE window's split detection to
+# empty. Rows now parse fractionally; malformed rows skip per-row with a WARN.
+
+
+def test_get_recent_splits_preserves_fractional_ratios():
+    client = _make_client()
+    resp = {
+        "results": [
+            {"ticker": "CCBC", "execution_date": "2026-06-18",
+             "split_from": 1, "split_to": 1.2},
+            {"ticker": "NRWRF", "execution_date": "2026-06-18",
+             "split_from": 20.625, "split_to": 21.625},
+        ]
+    }
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_recent_splits("2026-06-15", "2026-06-20")
+    assert out[0]["split_to"] == pytest.approx(1.2)
+    assert out[1]["split_from"] == pytest.approx(20.625)
+    # Integral values stay int (content-addressed action-id stability).
+    assert isinstance(out[0]["split_from"], int)
+
+
+def test_get_recent_splits_skips_malformed_row_keeps_rest():
+    client = _make_client()
+    resp = {
+        "results": [
+            {"ticker": "BAD", "execution_date": "2026-06-18",
+             "split_from": "not-a-number", "split_to": 1},
+            {"ticker": "GOOD", "execution_date": "2026-06-18",
+             "split_from": 1, "split_to": 2},
+        ]
+    }
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_recent_splits("2026-06-15", "2026-06-20")
+    assert [r["ticker"] for r in out] == ["GOOD"]
+
+
+def test_get_splits_preserves_fractional_ratios():
+    client = _make_client()
+    resp = {
+        "results": [
+            {"ticker": "HON", "execution_date": "2025-10-30",
+             "split_from": 1000, "split_to": 1061},
+        ]
+    }
+    with patch.object(client, "_get", return_value=resp):
+        out = client.get_splits("HON")
+    assert out == [
+        {"execution_date": "2025-10-30", "split_from": 1000, "split_to": 1061},
+    ]
