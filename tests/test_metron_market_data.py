@@ -16,10 +16,14 @@ from unittest.mock import MagicMock
 from collectors import metron_market_data as mmd
 
 
-def _universe_s3(universe: dict | None, heartbeat_ts: str | None = None) -> MagicMock:
-    """A MagicMock S3 whose get_object dispatches per key: the Metron universe JSON
-    (raises if None) and, when ``heartbeat_ts`` is given, a fresh UI-heartbeat object
-    (the intraday demand gate); any other key raises NoSuchKey."""
+def _universe_s3(
+    universe: dict | None, heartbeat_ts: str | None = None, watchlist: dict | None = None
+) -> MagicMock:
+    """A MagicMock S3 whose get_object dispatches per key: the Metron held-universe JSON
+    (raises if None), the Metron watchlist-universe JSON (raises if None — most tests don't
+    exercise the watchlist union, matching the artifact simply not existing yet) and, when
+    ``heartbeat_ts`` is given, a fresh UI-heartbeat object (the intraday demand gate); any
+    other key raises NoSuchKey."""
     s3 = MagicMock()
 
     def _get(Bucket, Key):
@@ -31,9 +35,15 @@ def _universe_s3(universe: dict | None, heartbeat_ts: str | None = None) -> Magi
             if heartbeat_ts is None:
                 raise Exception("NoSuchKey")
             return _body({"ts": heartbeat_ts})
-        if universe is None:
-            raise Exception("NoSuchKey")
-        return _body(universe)
+        if Key == mmd.WATCHLIST_UNIVERSE_KEY:
+            if watchlist is None:
+                raise Exception("NoSuchKey")
+            return _body(watchlist)
+        if Key == mmd.HOLDINGS_UNIVERSE_KEY:
+            if universe is None:
+                raise Exception("NoSuchKey")
+            return _body(universe)
+        raise Exception("NoSuchKey")
 
     s3.get_object.side_effect = _get
     return s3
@@ -127,6 +137,49 @@ def test_load_universe_parses_holdings_and_currencies():
     holdings, currencies = mmd.load_metron_universe("b", s3)
     assert {h["yf_symbol"] for h in holdings} == {"AAPL", "1299.HK"}
     assert currencies == ["HKD"]
+
+
+class TestWatchlistUniverseUnion:
+    """metron-ops#131b: a watchlist-only ticker (tracked but never bought) must get the
+    SAME per-ticker collector coverage a held position does — load_metron_universe unions
+    metron/holdings_universe.json with metron/watchlist_universe.json."""
+
+    def test_watchlist_only_symbol_is_unioned_in(self):
+        s3 = _universe_s3(_UNIVERSE, watchlist={
+            "schema_version": 1, "as_of": "2026-07-02", "source": "metron",
+            "holdings": [{"yf_symbol": "MU", "currency": "USD"}],
+            "currencies": [],
+        })
+        holdings, currencies = mmd.load_metron_universe("b", s3)
+        assert {h["yf_symbol"] for h in holdings} == {"AAPL", "1299.HK", "MU"}
+        assert currencies == ["HKD"]
+
+    def test_held_universe_currency_wins_on_conflict(self):
+        # AAPL watchlisted with a (bogus) non-USD currency — the held universe's USD must
+        # win, since that's the economically authoritative currency for a real position.
+        s3 = _universe_s3(_UNIVERSE, watchlist={
+            "holdings": [{"yf_symbol": "AAPL", "currency": "EUR"}], "currencies": ["EUR"],
+        })
+        holdings, currencies = mmd.load_metron_universe("b", s3)
+        aapl = next(h for h in holdings if h["yf_symbol"] == "AAPL")
+        assert aapl["currency"] == "USD"
+
+    def test_missing_watchlist_artifact_fails_soft_to_held_only(self):
+        # No watchlist artifact published yet (or the read fails) → the held universe alone,
+        # unchanged from the pre-union behavior — never aborts the run.
+        s3 = _universe_s3(_UNIVERSE)  # watchlist=None → NoSuchKey
+        holdings, currencies = mmd.load_metron_universe("b", s3)
+        assert {h["yf_symbol"] for h in holdings} == {"AAPL", "1299.HK"}
+        assert currencies == ["HKD"]
+
+    def test_missing_held_artifact_still_surfaces_watchlist_only_symbols(self):
+        # The held-universe read failing (e.g. transient S3 error) must not also blank out
+        # watchlist coverage — the two artifacts fail independently.
+        s3 = _universe_s3(None, watchlist={
+            "holdings": [{"yf_symbol": "MU", "currency": "USD"}], "currencies": [],
+        })
+        holdings, currencies = mmd.load_metron_universe("b", s3)
+        assert {h["yf_symbol"] for h in holdings} == {"MU"}
 
 
 class TestHistory:
