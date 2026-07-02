@@ -82,22 +82,33 @@ run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Validate handler syntax --------------------------------------------
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
-
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
 PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
 echo "Installing deps into ${PKG} (pip install -t)..."
 python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
+
+# ----- 1a. Preflight handler unit tests with runtime deps available ---------
+# Mirrors freshness-monitor/deploy.sh: runs AFTER step 1's pip install so the
+# test's imports resolve against the exact deps being shipped, and pytest is
+# never assumed on the caller's bare python (a bare setup-python in CI has no
+# pytest — the 2026-07-02 first-run failure of the auto-deploy workflows).
+# pytest installs into $TEST_DEPS, separate from $PKG, so it doesn't get
+# bundled into the Lambda zip.
+
+if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  echo "Installing pytest into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
+  echo "Running handler unit tests (PYTHONPATH=${PKG}:${TEST_DEPS})..."
+  PYTHONPATH="${PKG}:${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+fi
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 ZIP="${PKG}/function.zip"
