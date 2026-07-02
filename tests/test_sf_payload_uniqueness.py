@@ -526,7 +526,12 @@ class TestEODSFTopLevelFieldsClosed:
 # ItemProcessor, which _flatten_states does NOT descend into) → ModelZooSelect
 # (the one flat-level spot launcher that takes ModelZooRotation's slot). Net
 # flat-level spot count is unchanged at 11.
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
+# 11 → 10 on config#902 (2026-07-02): the standalone DriftDetection spot state
+# was COLLAPSED — drift is now bundled onto the PredictorTraining spot
+# (crucible-predictor spot_train.sh runs monitoring.drift_detector non-blocking
+# after training succeeds, on the same instance), so it no longer launches its
+# own spot. DriftDetection dropped out of the flat-level spot set.
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 10
 
 
 def _saturday_spot_states() -> list[str]:
