@@ -1081,6 +1081,23 @@ def _daily_append_impl(
         from dates import default_run_date  # config#1014: trading-day axis
 
         date_str = default_run_date()
+
+    # NYSE-calendar gate (config#1572): appending a row for a non-trading day
+    # plants a phantom session in the ArcticDB training store (2026-06-19
+    # Juneteenth entered universe-wide via a fabricated daily-closes parquet).
+    # A non-trading date_str is always a caller error — fail loud, same
+    # calendar source of truth as the Step Function's CheckTradingDay gate.
+    from datetime import date as _date
+
+    from alpha_engine_lib.trading_calendar import is_trading_day as _is_td
+
+    if not _is_td(_date.fromisoformat(date_str)):
+        raise ValueError(
+            f"daily_append: date_str={date_str} is not an NYSE trading day — "
+            f"refusing to append a phantom session to the universe "
+            f"(config#1572)."
+        )
+
     today_ts = pd.Timestamp(date_str)
     t0 = time.time()
 

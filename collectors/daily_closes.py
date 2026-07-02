@@ -317,8 +317,8 @@ def _polygon_symbol(store_ticker: str) -> str:
 
 
 def _previous_business_days(run_date: str, n: int) -> list[str]:
-    """Return ``n`` business days ending on ``run_date`` (inclusive),
-    newest first. ``n=1`` returns the most-recent business day at or
+    """Return ``n`` NYSE TRADING days ending at-or-before ``run_date``,
+    newest first. ``n=1`` returns the most-recent trading day at or
     before ``run_date``.
 
     Used by :func:`collect` in window-scan mode to enumerate the dates
@@ -326,23 +326,47 @@ def _previous_business_days(run_date: str, n: int) -> list[str]:
     by the caller — one ``grouped-daily`` call per date in the returned
     list, total ``n`` polygon calls regardless of universe size.
 
-    Saturday / Sunday ``run_date`` walks back to the prior Friday before
-    starting the window, so a Sat SF firing at 02:00 PT doesn't burn a
-    slot on a non-trading day. NYSE holiday handling lives downstream —
-    holidays return zero rows from polygon and an empty yfinance batch,
-    which the per-date skip logic handles gracefully.
+    HOLIDAY-AWARE since 2026-07-02 (config#1572): this helper was
+    weekday-only, on the documented assumption that "holidays return zero
+    rows from polygon and an empty yfinance batch" downstream. That
+    assumption was FALSE in practice — the first post-Juneteenth
+    yfinance-mode window enumerated 2026-06-19, the batch fetch returned
+    data anyway, and a fabricated 924-row parquet for a closed market day
+    entered the archive (and, via the Saturday backfill delta, the
+    ArcticDB training store universe-wide). Non-trading days must never be
+    enumerated for collection; ``alpha_engine_lib.trading_calendar`` is
+    the same source of truth the Step Function's CheckTradingDay gate uses.
     """
+    from alpha_engine_lib.trading_calendar import is_trading_day
+
     if n < 1:
         raise ValueError(f"window n must be >= 1, got {n}")
     cur = datetime.strptime(run_date, "%Y-%m-%d").date()
-    # Normalize the starting point to a business day.
-    while cur.weekday() >= 5:  # Sat=5, Sun=6
+    # Runaway guard: a broken calendar must fail loud, not spin backwards.
+    max_steps = n * 3 + 30
+    steps = 0
+    # Normalize the starting point to a trading day.
+    while not is_trading_day(cur):
         cur = cur - timedelta(days=1)
+        steps += 1
+        if steps > max_steps:
+            raise RuntimeError(
+                f"_previous_business_days: no trading day within {max_steps} "
+                f"calendar days before {run_date} — trading_calendar appears broken"
+            )
     dates: list[str] = [cur.isoformat()]
     for _ in range(n - 1):
         cur = cur - timedelta(days=1)
-        while cur.weekday() >= 5:
+        steps += 1
+        while not is_trading_day(cur):
             cur = cur - timedelta(days=1)
+            steps += 1
+            if steps > max_steps:
+                raise RuntimeError(
+                    f"_previous_business_days: exhausted {max_steps} steps "
+                    f"walking {n} trading days back from {run_date} — "
+                    f"trading_calendar appears broken"
+                )
         dates.append(cur.isoformat())
     return dates
 
@@ -765,6 +789,26 @@ def collect(
         from dates import default_run_date  # config#1014: trading-day axis
 
         run_date = default_run_date()
+
+    # NYSE-calendar gate (config#1572): a daily-closes parquet for a
+    # non-trading day is fabricated data by definition — polygon and yfinance
+    # have no session to serve, and whatever a batch fetch returns anyway gets
+    # persisted as a phantom day (2026-06-19 Juneteenth: 924 fabricated
+    # yfinance rows entered the archive and, via the Saturday backfill delta,
+    # the ArcticDB training store universe-wide). Window mode normalizes its
+    # anchor to a trading day (weekend/holiday SF fire-times are legitimate);
+    # a SINGLE-date call for a non-trading day is always a caller error and
+    # fails loud.
+    from alpha_engine_lib.trading_calendar import is_trading_day as _is_td
+
+    _run_dt = datetime.strptime(run_date, "%Y-%m-%d").date()
+    if window_days == 1 and not _is_td(_run_dt):
+        raise ValueError(
+            f"collect: run_date={run_date} is not an NYSE trading day — "
+            f"refusing to write a phantom daily-closes parquet (config#1572). "
+            f"If polygon/NYSE calendars diverged, fix "
+            f"alpha_engine_lib.trading_calendar, not this guard."
+        )
 
     if window_days > 1:
         return _collect_window(
