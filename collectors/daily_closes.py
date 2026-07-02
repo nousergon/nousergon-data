@@ -656,6 +656,7 @@ def collect(
     fallback_source: str = "yfinance",
     registry=_REGISTRY_UNSET,
     _emit_ca_email: bool = True,
+    _defer_unexplained_errors: bool = False,
 ) -> dict:
     """
     Fetch OHLCV for all tickers and write to S3.
@@ -1192,9 +1193,11 @@ def collect(
 
     # Discrepancy logging (polygon_only mode, when overwriting an existing parquet)
     explained_actions: list = []
+    unexplained_discrepancies: list = []
     if existing_close_for_discrepancy and polygon_count > 0:
-        explained_actions = _log_close_discrepancies(
+        explained_actions, unexplained_discrepancies = _log_close_discrepancies(
             closes_df, existing_close_for_discrepancy, run_date, registry=registry,
+            defer_unexplained=_defer_unexplained_errors,
         )
 
     # ONE informational email per run for confirmed corporate-action
@@ -1214,6 +1217,7 @@ def collect(
             "yfinance": yfinance_count,
             "source": source,
             "corporate_actions": explained_actions,
+            "unexplained_discrepancies": unexplained_discrepancies,
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1239,6 +1243,7 @@ def collect(
             "yfinance": yfinance_count,
             "source": source,
             "corporate_actions": explained_actions,
+            "unexplained_discrepancies": unexplained_discrepancies,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1427,6 +1432,7 @@ def _collect_window(
         "skipped_dates": [],
         "backfill_failed_dates": [],
         "corporate_actions": [],
+        "unexplained_discrepancies": [],
     }
     # Iterate oldest → newest so the most recent date's parquet is the
     # last one written. Matches the operator mental model "the latest
@@ -1446,6 +1452,7 @@ def _collect_window(
                 split_touched_dates=split_touched_dates,  # config#717
                 registry=registry,  # config#1431: one registry per window
                 _emit_ca_email=False,  # email sent ONCE at window level below
+                _defer_unexplained_errors=True,  # aggregated ONCE below (2026-07-02)
                 equities_source=equities_source,
                 index_source=index_source,
                 fallback_source=fallback_source,
@@ -1475,12 +1482,26 @@ def _collect_window(
         # the window for the single informational email sent below.
         if result.get("corporate_actions"):
             aggregate["corporate_actions"].extend(result["corporate_actions"])
+        if result.get("unexplained_discrepancies"):
+            aggregate["unexplained_discrepancies"].extend(
+                result["unexplained_discrepancies"]
+            )
 
     # config#1431: ONE informational email per window run for confirmed
     # corporate-action restatements (deduped by action_id in the email layer).
     # Skipped in dry_run (registry is None → no explained actions accumulate).
     if not dry_run and aggregate["corporate_actions"]:
         _send_corporate_action_email(aggregate["corporate_actions"], target_date)
+
+    # 2026-07-02: window-level roll-up of the UNEXPLAINED >5% overwrites the
+    # per-date calls deferred. A corporate-action restatement touches every
+    # window date with ONE uniform ratio — six per-date ERROR emails for one
+    # HON event was misrouting. Uniform-ratio groups (≥2 dates, same ticker,
+    # ratio agreeing within tolerance) page ONCE with the inferred factor;
+    # singletons keep the original per-date ERROR semantics.
+    _emit_window_unexplained_discrepancies(
+        aggregate["unexplained_discrepancies"], target_date,
+    )
 
     # ── Fatality is TARGET-driven, not "any per-date error" ─────────────
     _target = aggregate["per_date"].get(target_date)
@@ -1691,13 +1712,65 @@ def _split_ratio_hint(prior: float, new: float) -> str:
     return ""
 
 
+# Two window dates' unexplained overwrite ratios "agree" (same corporate-action
+# restatement) when they differ by less than this relative tolerance.
+_UNIFORM_RATIO_REL_TOL = 0.02
+
+
+def _emit_window_unexplained_discrepancies(rows: list, target_date: str) -> None:
+    """Window-level roll-up of unexplained >5% overwrite discrepancies.
+
+    Groups rows by ticker; a group whose ratios all agree within
+    ``_UNIFORM_RATIO_REL_TOL`` across ≥2 dates is ONE event (a corporate-action
+    restatement sweeping the window — the 2026-07-02 HON case produced six
+    per-date ERROR emails for one 2:1 separation) and pages ONCE with the
+    inferred factor. Non-uniform groups and singletons page per row, preserving
+    the original per-date ERROR semantics.
+    """
+    if not rows:
+        return
+    by_ticker: dict[str, list] = {}
+    for r in rows:
+        by_ticker.setdefault(r["ticker"], []).append(r)
+    for ticker, group in sorted(by_ticker.items()):
+        ratios = [g["ratio"] for g in group]
+        mean_ratio = sum(ratios) / len(ratios)
+        uniform = len(group) >= 2 and all(
+            abs(r - mean_ratio) <= _UNIFORM_RATIO_REL_TOL * mean_ratio
+            for r in ratios
+        )
+        if uniform:
+            dates = ", ".join(sorted(g["date"] for g in group))
+            logger.error(
+                "polygon_only OVERWRITE %s: UNIFORM ×%.4f restatement across "
+                "%d window date(s) [%s]%s — one event, consistent with a "
+                "corporate action restating adjusted history that has NO "
+                "matching registry/feed record (or an inverted one); check "
+                "the split calendar and the corporate-action registry before "
+                "downstream consumers re-read",
+                ticker, mean_ratio, len(group), dates,
+                _split_ratio_hint(group[0]["prior"], group[0]["new"]),
+            )
+        else:
+            for g in group:
+                pct = abs(g["new"] - g["prior"]) / g["prior"] * 100
+                logger.error(
+                    "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f "
+                    "(%.2f%% diff vs prior parquet)%s — investigate before "
+                    "downstream consumers re-read",
+                    g["ticker"], g["date"], g["prior"], g["new"], pct,
+                    _split_ratio_hint(g["prior"], g["new"]),
+                )
+
+
 def _log_close_discrepancies(
     new_df: pd.DataFrame,
     prior_close: dict[str, float],
     run_date: str,
     *,
     registry=None,
-) -> list:
+    defer_unexplained: bool = False,
+) -> "tuple[list, list]":
     """Log per-ticker Close discrepancy when polygon overwrites yfinance.
 
     A small drift (<1%) is normal — different feeds, slight tick-time offsets,
@@ -1725,9 +1798,19 @@ def _log_close_discrepancies(
     ERROR filter (fixing the HON 1-for-2 reverse-split false-ERROR). The
     authoritative registry takes precedence over the secondary
     ``_split_ratio_hint`` text heuristic (which stays, now only annotating the
-    UNEXPLAINED ERROR branch). Returns the list of explained
-    ``CorporateAction``s seen this run (for the run's one informational email);
-    deduped at the email layer.
+    UNEXPLAINED ERROR branch).
+
+    2026-07-02 (six-ERROR-email incident): with ``defer_unexplained=True`` the
+    unexplained >5% rows are NOT logged at ERROR here — they are returned for
+    the WINDOW caller to aggregate (a corporate-action restatement touches
+    every window date with ONE uniform ratio; six per-date ERROR emails for
+    one event is misrouting, and a genuinely unexplained uniform-ratio group
+    should page ONCE with the inferred factor). Per-date WARN still records
+    each row (``feedback_no_silent_fails`` — the surface stays, severity moves
+    to the aggregate).
+
+    Returns ``(explained_actions, unexplained_rows)`` where each unexplained
+    row is ``{"ticker", "date", "prior", "new", "ratio"}``.
     """
     n_compared = 0
     n_warn = 0
@@ -1735,6 +1818,7 @@ def _log_close_discrepancies(
     n_restatement = 0
     n_corporate_action = 0
     explained_actions: list = []
+    unexplained_rows: list = []
     biggest: tuple[str, float] = ("", 0.0)
     for ticker in new_df.index:
         prior = prior_close.get(str(ticker))
@@ -1776,12 +1860,31 @@ def _log_close_discrepancies(
             n_corporate_action += 1
             explained_actions.append(action)
         elif pct_diff > _DISCREPANCY_ERROR_PCT:
-            logger.error(
-                "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)%s — "
-                "investigate before downstream consumers re-read",
-                ticker, run_date, prior, float(new_close), pct_diff * 100,
-                _split_ratio_hint(prior, float(new_close)),
-            )
+            unexplained_rows.append({
+                "ticker": str(ticker),
+                "date": run_date,
+                "prior": float(prior),
+                "new": float(new_close),
+                "ratio": float(new_close) / float(prior),
+            })
+            if defer_unexplained:
+                # Window caller aggregates uniform-ratio groups into ONE
+                # ERROR; the per-row surface stays at WARN so nothing is
+                # silently dropped (feedback_no_silent_fails).
+                logger.warning(
+                    "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f "
+                    "(%.2f%% diff vs prior parquet)%s — deferred to the "
+                    "window-level unexplained-discrepancy aggregation",
+                    ticker, run_date, prior, float(new_close), pct_diff * 100,
+                    _split_ratio_hint(prior, float(new_close)),
+                )
+            else:
+                logger.error(
+                    "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)%s — "
+                    "investigate before downstream consumers re-read",
+                    ticker, run_date, prior, float(new_close), pct_diff * 100,
+                    _split_ratio_hint(prior, float(new_close)),
+                )
             n_error += 1
         elif pct_diff > _DISCREPANCY_WARN_PCT:
             logger.warning(
@@ -1797,7 +1900,7 @@ def _log_close_discrepancies(
         run_date, n_compared, n_warn, n_error, n_restatement, n_corporate_action,
         biggest[0] or "n/a", biggest[1] * 100,
     )
-    return explained_actions
+    return explained_actions, unexplained_rows
 
 
 def _fred_record(store_ticker: str, date_str: str, close: float) -> dict:

@@ -348,18 +348,21 @@ class TestHasPriceEvidence:
         action = ca.CorporateAction.from_split("X", "2026-01-20", 1, 4)
         assert ca.has_price_evidence(close, action) is True
 
-    def test_no_window_coverage_degrades_to_true(self):
-        """A series that doesn't cover the ex_date window can't disprove the
-        action — degrades to trusting the feed (pre-existing behavior) rather
-        than blocking on missing data."""
+    def test_no_window_coverage_is_uncovered_not_trusted(self):
+        """A series that doesn't cover the ex_date window can neither confirm
+        nor refute the action. Semantics TIGHTENED 2026-07-02 (inverted-record
+        incident): a price-level mutation now requires positive market
+        corroboration, so uncovered -> not applied (with no pre-ex rows in
+        frame there is nothing to restate anyway - the safe answer is free)."""
         idx = pd.bdate_range("2020-01-01", "2020-01-10")
         close = pd.Series(100.0, index=idx)
         action = ca.CorporateAction.from_split("X", "2026-06-15", 1, 10)
-        assert ca.has_price_evidence(close, action) is True
+        assert ca.price_evidence_orientation(close, action) == "uncovered"
+        assert ca.has_price_evidence(close, action) is False
 
-    def test_empty_series_degrades_to_true(self):
+    def test_empty_series_is_uncovered_not_trusted(self):
         action = ca.CorporateAction.from_split("X", "2026-06-15", 1, 10)
-        assert ca.has_price_evidence(pd.Series(dtype="float64"), action) is True
+        assert ca.has_price_evidence(pd.Series(dtype="float64"), action) is False
 
     def test_dividend_and_rename_always_true(self):
         """Only splits mutate the price level; has_price_evidence is a no-op
