@@ -82,19 +82,37 @@ run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Scratch dirs + validate handler syntax -----------------------------
+# PKG and TEST_DEPS are both created up front (mirrors freshness-monitor/
+# deploy.sh) so ONE trap covers both — a pytest-install failure below still
+# cleans up.
+
+PKG=$(mktemp -d)
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# Only alpha_engine_lib.telegram is stubbed in sys.modules (see
+# test_handler.py's header) — `index.py`'s `import boto3` is REAL, and
+# requirements.txt deliberately omits boto3 (provided by the Lambda runtime
+# at deploy time, per its own comment), so pytest's `import index` needs it
+# installed explicitly here. Installed into a scratch TEST_DEPS dir — NOT the
+# caller's global site-packages, not bundled into the Lambda zip (mirrors
+# freshness-monitor/deploy.sh). 2026-07-02: the CI auto-deploy workflow's
+# FIRST real run failed here with "No module named pytest" — this script had
+# only ever been run from an operator's laptop before, where pytest/boto3
+# happened to already be installed as dev/tooling dependencies; the gap was
+# invisible until CI actually exercised this path.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  echo "Installing pytest + boto3 into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
   echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
-
-PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (pip install -t)..."
 python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
