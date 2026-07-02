@@ -21,14 +21,23 @@
 # (groom hard-ceiling 360 min + slack). Per-trigger windows + S3 dedup make the
 # exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
 #   06:30 daily   cron(30 6 * * ? *)   # after the 23:00 groom matures (~05:45)
-#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 Sun-Fri groom matures (~13:45)
+#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45; the
+#                                      #   07:00 groom runs daily since 2026-07-02 —
+#                                      #   the old "Sun-Fri" framing is gone)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
-# blast radius, operator-deployed only). Merging the PR has ZERO live effect
-# until an operator runs this with --bootstrap.
+# blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
+# fleet-wide policy after 4 IAM-clobber incidents — infrastructure/iam/README.md).
+#
+# CODE auto-deploys on merge to main via
+# `.github/workflows/deploy-groom-liveness-probe.yml` (path-filtered to this
+# directory), which runs this script with NO flags (the default/flagless run
+# is already code-only). A SCHED_CRONS change (this probe's OWN invocation
+# cadence) still needs an operator to run `--bootstrap` by hand — merging
+# alone has ZERO live effect on it.
 #
 # Usage:
-#   bash .../groom-liveness-probe/deploy.sh             # update code only
+#   bash .../groom-liveness-probe/deploy.sh             # update code only (same command CI runs)
 #   bash .../groom-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules
 #   bash .../groom-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../groom-liveness-probe/deploy.sh --smoke     # invoke once (read-only check; pings only on a real miss)

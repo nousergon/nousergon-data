@@ -23,13 +23,21 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
-# Cadence (UTC, mirrors the GHA crons exactly). Reduced 3->2/day on 2026-06-29
-# (the 15:00 UTC / 8am-PT run was dropped per usage pacing); a 3rd schedule was
-# re-added 2026-07-01 (config#1495 follow-up) at the SAME 15:00 UTC slot, now
-# running a DIFFERENT tier — Opus, complexity:high ONLY — not a reinstatement
-# of the old Sonnet drain-phase run:
-#   07:00 Sun-Fri   cron(0 7 ? * SUN-FRI *)   FULL   Sonnet, default queue   # 12am PT, skips Sat
-#   23:00 daily     cron(0 23 * * ? *)        FULL   Sonnet, default queue  # 4pm PT, every day incl. Sat
+# Cadence (UTC). Reduced 3->2/day on 2026-06-29 (the 15:00 UTC / 8am-PT run was
+# dropped per usage pacing); a 3rd schedule was re-added 2026-07-01 (config#1495
+# follow-up) at the SAME 15:00 UTC slot, now running a DIFFERENT tier — Opus,
+# complexity:high ONLY — not a reinstatement of the old Sonnet drain-phase run.
+# UNIFORM 3x/day, all 7 days, since 2026-07-02: the Sat-skip on the 07:00 slot
+# (originally "avoid colliding with the 09:00 UTC Saturday pipeline") was never
+# evidence-based — investigated and confirmed the groom and the weekly SF share
+# NEITHER the Claude Max quota (groom = Max-plan OAuth token; weekly SF Research/
+# Predictor = separate pay-as-you-go ANTHROPIC_API_KEY) NOR EC2 spot capacity
+# (disjoint instance families: groom t3/t3a/t2.medium vs weekly-SF c5/m5/c6i/c5a/
+# r5/r5a/r6i.large). No exceptions kept — the weekly SF can also now land on any
+# day (e.g. Friday, per the holiday-aware weekly-schedule-adjuster, #578) without
+# the groom cadence needing to track it.
+#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, default queue  # 12am PT, every day
+#   23:00 daily     cron(0 23 * * ? *)        FULL   Sonnet, default queue  # 4pm PT, every day
 #   15:00 daily     cron(0 15 * * ? *)        FULL   Opus,   high-only      # 8am PT, every day
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
@@ -37,16 +45,28 @@
 # (deleted) on deploy, so removing a cadence here removes it live too.
 #
 # Managed OUTSIDE CloudFormation — same rationale as the sibling dispatchers
-# (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow;
-# operator-deployed only). Merging the PR has ZERO live effect until an operator
-# runs this with --bootstrap. CUTOVER (config#1432): after a manual --smoke spot
-# run validates end-to-end, deploy this AND disable the GHA `schedule:` crons in
-# backlog-groom.yml together (so there is no double-groom and no gap). NOTE:
-# --smoke fires a REAL groom on a REAL spot box.
+# (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow: it
+# deliberately lacks iam:CreateRole/iam:PutRolePolicy, a fleet-wide policy
+# after 4 IAM-clobber incidents in 2 months — see infrastructure/iam/README.md).
+#
+# CODE auto-deploys on merge to main via
+# `.github/workflows/deploy-scheduled-groom-dispatcher.yml` (path-filtered to
+# `infrastructure/lambdas/scheduled-groom-dispatcher/**`), which runs this
+# script with NO flags (this script's default/flagless run is already
+# code-only — --bootstrap is what ADDS IAM-role-creation + EventBridge
+# Scheduler wiring on top, not the reverse) under the github-actions-lambda-
+# deploy OIDC role (LambdaUpdate grant on `alpha-engine-*`, no IAM-role-create).
+# A SCHED_NAMES/SCHED_CRONS/SCHED_INPUTS change (a schedule/cadence change,
+# e.g. this file's own 2026-07-02 Sat-skip removal) still needs an operator to
+# run `--bootstrap` by hand — merging alone has ZERO effect on the live
+# EventBridge Scheduler rule. CUTOVER (config#1432, historical): after a
+# manual --smoke spot run validates end-to-end, deploy this AND disable the
+# GHA `schedule:` crons in backlog-groom.yml together (so there is no
+# double-groom and no gap). NOTE: --smoke fires a REAL groom on a REAL spot box.
 #
 # Usage:
-#   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only
-#   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # first-time create + wire EventBridge Scheduler
+#   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
+#   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # operator-only: create/update IAM roles + wire EventBridge Scheduler
 #   bash .../scheduled-groom-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../scheduled-groom-dispatcher/deploy.sh --smoke     # invoke once with a synthetic schedule event (⚠ fires a REAL groom)
 
@@ -82,17 +102,17 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # claude-sonnet-5 / "default" (the pre-existing mid-tier queue), so this is not
 # a behavior change for them.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0700-sunfri"
+  "alpha-engine-scheduled-groom-0700-daily"
   "alpha-engine-scheduled-groom-2300-daily"
   "alpha-engine-scheduled-groom-1500-daily-opus-high"
 )
 SCHED_CRONS=(
-  "cron(0 7 ? * SUN-FRI *)"
+  "cron(0 7 * * ? *)"
   "cron(0 23 * * ? *)"
   "cron(0 15 * * ? *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","schedule":"0 7 * * 0-5"}'
+  '{"run_mode":"full","schedule":"0 7 * * *"}'
   '{"run_mode":"full","schedule":"0 23 * * *"}'
   '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","schedule":"0 15 * * *"}'
 )

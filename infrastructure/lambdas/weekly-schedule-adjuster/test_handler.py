@@ -1,34 +1,19 @@
 """Unit tests for weekly-schedule-adjuster index.handler.
 
-Stubs ``nousergon_lib.trading_calendar.is_trading_day`` with a small NYSE
-calendar (July 2026 incl. the Fri 7/3 July-4-observed holiday) and a fake
-EventBridge client, so tests assert the reconcile decision + the exact
-enable/disable/one-shot actions without AWS or the lib.
+The NYSE calendar is VENDORED into index.py (pure Python), so these tests run
+directly against it — no lib stub. A fake EventBridge client captures the
+enable/disable/one-shot actions without AWS. ``test_vendored_holidays_match_lib``
+drift-guards the vendored set against the canonical ``nousergon_lib`` (skipped
+where the lib isn't importable).
 """
 
 from __future__ import annotations
 
 import sys
-import types
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
-
-# NYSE calendar stub: 2026 weekdays are trading days EXCEPT the holidays below.
-_HOLIDAYS = {date(2026, 7, 3), date(2026, 12, 25), date(2026, 4, 3)}  # Jul4-obs, Xmas, Good Fri
-
-
-def _is_trading_day(d: date) -> bool:
-    return d.weekday() < 5 and d not in _HOLIDAYS
-
-
-_lib = types.ModuleType("nousergon_lib")
-_tc = types.ModuleType("nousergon_lib.trading_calendar")
-_tc.is_trading_day = _is_trading_day
-_lib.trading_calendar = _tc
-sys.modules.setdefault("nousergon_lib", _lib)
-sys.modules.setdefault("nousergon_lib.trading_calendar", _tc)
 
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
@@ -177,3 +162,16 @@ def test_weekly_input_shape_matches_cron():
     inp = index._weekly_input()
     assert '"pipeline_role": "weekly"' in inp
     assert '"ec2_instance_id": ["i-09b539c844515d549"]' in inp
+
+
+# --- drift guard: vendored calendar must match the canonical lib -------------
+
+def test_vendored_holidays_match_lib():
+    tc = pytest.importorskip("nousergon_lib.trading_calendar")
+    lib_hol = {d for d in tc.NYSE_HOLIDAYS if 2026 <= d.year <= 2030}
+    assert index._NYSE_HOLIDAYS == lib_hol, "vendored NYSE holidays diverged from nousergon_lib"
+    # and the session predicate agrees day-for-day across the vendored range
+    d = date(2026, 1, 1)
+    while d <= date(2030, 12, 31):
+        assert index.is_trading_day(d) == tc.is_trading_day(d), d.isoformat()
+        d += timedelta(days=1)
