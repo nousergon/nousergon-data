@@ -45,16 +45,28 @@
 # (deleted) on deploy, so removing a cadence here removes it live too.
 #
 # Managed OUTSIDE CloudFormation — same rationale as the sibling dispatchers
-# (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow;
-# operator-deployed only). Merging the PR has ZERO live effect until an operator
-# runs this with --bootstrap. CUTOVER (config#1432): after a manual --smoke spot
-# run validates end-to-end, deploy this AND disable the GHA `schedule:` crons in
-# backlog-groom.yml together (so there is no double-groom and no gap). NOTE:
-# --smoke fires a REAL groom on a REAL spot box.
+# (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow: it
+# deliberately lacks iam:CreateRole/iam:PutRolePolicy, a fleet-wide policy
+# after 4 IAM-clobber incidents in 2 months — see infrastructure/iam/README.md).
+#
+# CODE auto-deploys on merge to main via
+# `.github/workflows/deploy-scheduled-groom-dispatcher.yml` (path-filtered to
+# `infrastructure/lambdas/scheduled-groom-dispatcher/**`), which runs this
+# script with NO flags (this script's default/flagless run is already
+# code-only — --bootstrap is what ADDS IAM-role-creation + EventBridge
+# Scheduler wiring on top, not the reverse) under the github-actions-lambda-
+# deploy OIDC role (LambdaUpdate grant on `alpha-engine-*`, no IAM-role-create).
+# A SCHED_NAMES/SCHED_CRONS/SCHED_INPUTS change (a schedule/cadence change,
+# e.g. this file's own 2026-07-02 Sat-skip removal) still needs an operator to
+# run `--bootstrap` by hand — merging alone has ZERO effect on the live
+# EventBridge Scheduler rule. CUTOVER (config#1432, historical): after a
+# manual --smoke spot run validates end-to-end, deploy this AND disable the
+# GHA `schedule:` crons in backlog-groom.yml together (so there is no
+# double-groom and no gap). NOTE: --smoke fires a REAL groom on a REAL spot box.
 #
 # Usage:
-#   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only
-#   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # first-time create + wire EventBridge Scheduler
+#   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
+#   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # operator-only: create/update IAM roles + wire EventBridge Scheduler
 #   bash .../scheduled-groom-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../scheduled-groom-dispatcher/deploy.sh --smoke     # invoke once with a synthetic schedule event (⚠ fires a REAL groom)
 

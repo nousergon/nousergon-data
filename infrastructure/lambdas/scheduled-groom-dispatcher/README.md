@@ -13,9 +13,13 @@ then self-terminates (~$2/mo).
 > **Status: LIVE** (cutover 2026-06-30, config#1432). This is the sole scheduler
 > for the backlog groom — the GHA `schedule:` crons in `backlog-groom.yml` have
 > been REMOVED; that workflow now runs only on `workflow_dispatch` (manual
-> escape hatch). Any code change here needs `deploy.sh` (code-only, or
-> `--bootstrap` when a schedule/IAM changes) run by an operator with AWS creds
-> before it has live effect — merging the PR alone does not deploy it.
+> escape hatch). **CODE auto-deploys on merge to main** (2026-07-02) via
+> `.github/workflows/deploy-scheduled-groom-dispatcher.yml`. A **schedule or
+> IAM change** (`SCHED_NAMES`/`SCHED_CRONS`/`SCHED_INPUTS`, `iam-policy.json`,
+> `step_function_groom.json`, `sf-execution-iam-policy.json`) still has ZERO
+> live effect until an operator runs `deploy.sh --bootstrap` by hand — the CI
+> OIDC role deliberately cannot create/modify IAM roles (see `deploy.sh`'s
+> header comment).
 
 ## How it fits
 
@@ -112,19 +116,30 @@ but injection protection is cheap).
   group; the Scheduler execution role can `lambda:InvokeFunction` this function
   only.
 
-## Deploy (operator-managed, outside CloudFormation)
+## Deploy
+
+**Code: auto-deploys on merge to main** via
+`.github/workflows/deploy-scheduled-groom-dispatcher.yml` (path-filtered to
+this directory) — no operator action needed for a code-only PR.
+
+**Schedule / IAM: still operator-managed, outside CloudFormation** — the CI
+OIDC role deliberately cannot create/modify IAM roles (fleet-wide policy, see
+`deploy.sh`'s header). Run by hand:
 
 ```bash
 bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh --bootstrap  # roles + lambda + schedules (creates/updates from SCHED_NAMES; prunes orphaned rules)
-bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh              # update code only
+bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh              # update code only (same command CI runs)
 bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh --dry-run    # preview
 bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh --smoke      # ⚠ fires a REAL groom run
 ```
 
-Merging the PR has **zero live effect** until an operator runs `--bootstrap`.
-`--smoke` invokes the Lambda with a synthetic schedule event and (since
-`GROOM_DISPATCH_ENABLED` defaults on) **triggers an actual groom run** — use
-intentionally.
+A PR that touches `SCHED_NAMES`/`SCHED_CRONS`/`SCHED_INPUTS`, `iam-policy.json`,
+`step_function_groom.json`, or `sf-execution-iam-policy.json` has **zero live
+effect on the schedule/IAM** once merged until an operator runs `--bootstrap`
+— CI will still auto-deploy the CODE, but the cron/IAM change itself sits
+inert until then. `--smoke` invokes the Lambda with a synthetic schedule event
+and (since `GROOM_DISPATCH_ENABLED` defaults on) **triggers an actual groom
+run** — use intentionally.
 
 ## Validating a new/changed schedule
 
