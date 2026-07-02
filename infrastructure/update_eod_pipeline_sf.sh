@@ -18,6 +18,13 @@
 # Idempotent: re-running with the same definition is a no-op (AWS only
 # bumps the revision when the definition actually changes).
 #
+# config#1416: also ensures the EOD execution-log group exists (idempotent
+# create-log-group + put-retention-policy) and enables ERROR-level
+# LoggingConfiguration on the state machine, mirroring the weekly/preopen
+# pair (config#729/#537) so the same MutexConflict metric-filter + alarm
+# pattern has a log group to read. Unlike those two, this log group is NOT
+# a CloudFormation resource — see the CFN template comment for why.
+#
 # Usage:
 #   ./infrastructure/update_eod_pipeline_sf.sh
 
@@ -44,12 +51,20 @@ fi
 # Validate JSON before sending it to AWS.
 python3 -c "import json,sys; json.load(open(sys.argv[1])); print('  Definition: JSON valid')" "$DEFN_FILE"
 
+LOG_GROUP_NAME="/aws/stepfunctions/ne-postclose-trading-pipeline"
+LOG_GROUP_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}:*"
+
+echo "  Ensuring EOD log group exists (idempotent)..."
+aws logs create-log-group --log-group-name "$LOG_GROUP_NAME" --region "$REGION" 2>/dev/null || true
+aws logs put-retention-policy --log-group-name "$LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
+
 aws stepfunctions update-state-machine \
     --state-machine-arn "$SM_ARN" \
     --definition "file://$DEFN_FILE" \
+    --logging-configuration '{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$LOG_GROUP_ARN"'"}}]}' \
     --region "$REGION" > /dev/null
 
-echo "  State machine: definition updated"
+echo "  State machine: definition updated (execution logging: ERROR level, enabled)"
 echo ""
 echo "=== EOD Pipeline SF Update Complete ==="
 echo ""
