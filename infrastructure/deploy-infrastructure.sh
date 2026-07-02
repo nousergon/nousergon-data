@@ -163,21 +163,43 @@ update_or_defer_to_cfn() {
     fi
 }
 
-# Standalone SF (not in CFN — EOD): update if present, else create.
+# Standalone SF (not in CFN — EOD, groom): update if present, else create.
+# An optional 5th arg is a JSON LoggingConfiguration string — only EOD passes
+# one (config#1416); groom's call omits it, preserving its current
+# no-logging behavior exactly.
 update_or_create() {
-    local arn="$1" stamped="$2" name="$3" label="$4"
+    local arn="$1" stamped="$2" name="$3" label="$4" logging="${5:-}"
+    local logging_args=()
+    if [ -n "$logging" ]; then
+        logging_args=(--logging-configuration "$logging")
+    fi
     if sf_exists "$arn"; then
-        aws stepfunctions update-state-machine --state-machine-arn "$arn" --definition "file://$stamped" --query "updateDate" --output text
+        aws stepfunctions update-state-machine --state-machine-arn "$arn" --definition "file://$stamped" "${logging_args[@]}" --query "updateDate" --output text
         echo "  $label updated."
     else
-        aws stepfunctions create-state-machine --name "$name" --definition "file://$stamped" --role-arn "$SF_ROLE_ARN" --query "stateMachineArn" --output text
+        aws stepfunctions create-state-machine --name "$name" --definition "file://$stamped" --role-arn "$SF_ROLE_ARN" "${logging_args[@]}" --query "stateMachineArn" --output text
         echo "  $label created (was absent — rename cutover)."
     fi
 }
 
+# config#1416: EOD execution-log group + LoggingConfiguration, mirroring the
+# weekly/preopen pair (config#729/#537). Deliberately NOT a CFN-owned log
+# group — this script (and update_eod_pipeline_sf.sh) creates it idempotently
+# BEFORE this step's update_or_create() call, since this step (3) runs before
+# the CFN stack deploy (step 4) below; a CFN-owned log group would not exist
+# yet on the very first deploy after this change merges. CFN owns only the
+# metric-filter + alarm that read this log group by its literal name (see
+# alpha-engine-orchestration.yaml).
+EOD_LOG_GROUP_NAME="/aws/stepfunctions/ne-postclose-trading-pipeline"
+EOD_LOG_GROUP_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${EOD_LOG_GROUP_NAME}:*"
+echo "  Ensuring EOD log group exists (idempotent)..."
+aws logs create-log-group --log-group-name "$EOD_LOG_GROUP_NAME" --region "$REGION" 2>/dev/null || true
+aws logs put-retention-policy --log-group-name "$EOD_LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
+EOD_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$EOD_LOG_GROUP_ARN"'"}}]}'
+
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline"
-update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline"
+update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline" "$EOD_LOGGING_CONFIG"
 update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-pipeline" "Backlog groom pipeline"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
