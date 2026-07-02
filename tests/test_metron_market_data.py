@@ -140,7 +140,7 @@ def test_load_universe_parses_holdings_and_currencies():
 
 
 class TestWatchlistUniverseUnion:
-    """metron-ops#131b: a watchlist-only ticker (tracked but never bought) must get the
+    """metron-ops#132: a watchlist-only ticker (tracked but never bought) must get the
     SAME per-ticker collector coverage a held position does — load_metron_universe unions
     metron/holdings_universe.json with metron/watchlist_universe.json."""
 

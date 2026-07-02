@@ -4,7 +4,7 @@
 system. Metron publishes its held-ticker universe to
 ``s3://<bucket>/metron/holdings_universe.json`` (yf_symbols + the non-USD currencies it
 holds) and its watchlist-only-ticker universe (tracked but never bought,
-metron-ops#42/#121) to ``s3://<bucket>/metron/watchlist_universe.json`` (metron-ops#131b)
+metron-ops#42/#121) to ``s3://<bucket>/metron/watchlist_universe.json`` (metron-ops#132)
 — ``load_metron_universe()`` reads and UNIONS both, so every producer below (and every
 Metron per-ticker consumer: fundamentals/technicals/analyst/sentiment/tearsheet) treats a
 watched-but-not-held ticker identically to a held one. This producer writes two artifacts
@@ -57,7 +57,7 @@ HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
 # Metron also publishes a WATCHLIST-only-ticker universe (tracked but never bought,
 # metron-ops#42/#121) — unioned into load_metron_universe() below so a watchlist-only
 # ticker gets the SAME fundamentals/technicals/analyst/sentiment/price-history coverage a
-# held position does (metron-ops#131b: Brian added MU to his watchlist and it showed no
+# held position does (metron-ops#132: Brian added MU to his watchlist and it showed no
 # data — every per-ticker collector fetches strictly over the held union above, so a
 # never-held ticker was never in scope for any of them).
 WATCHLIST_UNIVERSE_KEY = "metron/watchlist_universe.json"
@@ -250,7 +250,7 @@ def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> lis
 
 def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[str]]:
     """Read Metron's published universe → ``(holdings, currencies)`` — the UNION of the
-    held-ticker universe and the watchlist-only-ticker universe (metron-ops#131b), so a
+    held-ticker universe and the watchlist-only-ticker universe (metron-ops#132), so a
     ticker Brian is only watching (never bought) gets the same per-ticker coverage a held
     position does everywhere this feeds: fundamentals/technicals/analyst/sentiment,
     close/FX history, and the valuation-medians benchmark set.
