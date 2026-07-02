@@ -157,14 +157,14 @@
     },
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online → CheckSkipPostMarketData (enter the per-task rerun gates). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails — the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile — an unreachable box fails the execution loud.",
+      "Comment": "PingStatus=Online → CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run — postmarket → arctic → snapshot → reconcile — executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails — the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile — an unreachable box fails the execution loud.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus", "IsPresent": true},
             {"Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus", "StringEquals": "Online"}
           ],
-          "Next": "CheckSkipPostMarketData"
+          "Next": "CheckSkipRefreshExecutorDeploy"
         },
         {
           "Variable": "$.ssm_poll.attempts",
@@ -581,13 +581,13 @@
     },
     "EODReconcile": {
       "Type": "Task",
-      "Comment": "Run EOD reconciliation on trading EC2 \u2014 reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Refreshes the executor checkout to origin/main via the canonical boot-pull.sh BEFORE running eod_reconcile.py: the trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD, so eod_reconcile.py's ExecutorPreflight deploy-drift guard hard-fails (2026-06-30 incident: 3 executor PRs merged 08:07\u201308:54 PT after the morning boot-pull; EOD refused on b7e52b1 vs main@8c3014e). Refreshing here makes reconcile run latest main by construction. boot-pull is run as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); the root-side eod_reconcile.py already reads HEAD via a safe.directory workaround. FAIL-LOUD PRESERVED: the drift guard remains the authoritative gate \u2014 if boot-pull fails (auth/network), the checkout stays stale and eod_reconcile.py hard-fails with its actionable message (the `|| echo` only surfaces a breadcrumb; it does not swallow \u2014 the guard downstream is loud).",
+      "Comment": "Run EOD reconciliation on trading EC2 \u2014 reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Deploy-freshness is guaranteed UPSTREAM by the top-of-pipeline RefreshExecutorDeploy chokepoint (config#1549) \u2014 the whole EOD run executes latest origin/main by construction, so nousergon-data#574's per-step boot-pull is no longer carried here. eod_reconcile.py's ExecutorPreflight deploy-drift guard remains the authoritative fail-loud gate. (executionTimeout left at 600s from #574 \u2014 a safe upper bound; harmless without the inline refresh.)",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1 || echo \"[eod-preflight] boot-pull deploy refresh returned non-zero; eod_reconcile deploy-drift guard will surface any staleness LOUD\"', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
           "executionTimeout": [
             "600"
           ]
@@ -774,6 +774,152 @@
       },
       "ResultPath": "$.substrate_check_poll",
       "Next": "StopTradingInstance"
+    },
+    "CheckSkipRefreshExecutorDeploy": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607) for the top-of-pipeline executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} routes past RefreshExecutorDeploy to the first work gate (CheckSkipPostMarketData); missing flag = run as normal. This is the FIRST gate the SSM-ready path enters \u2014 hoisting the refresh here (out of the per-step EODReconcile refresh added in nousergon-data#574) means the ENTIRE EOD run (PostMarketData \u2192 PostMarketArcticAppend \u2192 CaptureSnapshot \u2192 EODReconcile) executes latest origin/main by construction, closing the silent-stale-code exposure on the non-drift-guarded work steps. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_refresh_executor_deploy",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_refresh_executor_deploy",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPostMarketData"
+        }
+      ],
+      "Default": "RefreshExecutorDeploy"
+    },
+    "RefreshExecutorDeploy": {
+      "Type": "Task",
+      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07\u201308:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status \u2192 HandleFailure \u2192 ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -o pipefail",
+            "cd /home/ec2-user/alpha-engine",
+            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1"
+          ],
+          "executionTimeout": [
+            "600"
+          ]
+        },
+        "TimeoutSeconds": 600
+      },
+      "TimeoutSeconds": 660,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-loud: a failed executor-deploy refresh must halt EOD before any work step runs stale code. Don't paper over it \u2014 the whole point of the hoist is that non-guarded steps never run stale.",
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.refresh_executor_deploy_result",
+      "Next": "WaitForRefreshExecutorDeploy"
+    },
+    "WaitForRefreshExecutorDeploy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.refresh_executor_deploy_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
+      "ResultPath": "$.refresh_executor_deploy_poll",
+      "Next": "CheckRefreshExecutorDeployStatus"
+    },
+    "CheckRefreshExecutorDeployStatus": {
+      "Type": "Choice",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed \u2014 a stale checkout must never reach the work steps.",
+      "Choices": [
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipPostMarketData"
+        },
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "RefreshExecutorDeployWait"
+        },
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "RefreshExecutorDeployWait"
+        },
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "RefreshExecutorDeployWait"
+        }
+      ],
+      "Default": "RefreshExecutorDeployStatusError"
+    },
+    "RefreshExecutorDeployWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForRefreshExecutorDeploy"
+    },
+    "RefreshExecutorDeployStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Parameters": {
+        "source": "refresh_executor_deploy_status",
+        "status.$": "$.refresh_executor_deploy_poll.Status",
+        "status_details.$": "$.refresh_executor_deploy_poll.StatusDetails",
+        "response_code.$": "$.refresh_executor_deploy_poll.ResponseCode",
+        "command_id.$": "$.refresh_executor_deploy_poll.CommandId",
+        "instance_id.$": "$.refresh_executor_deploy_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
     "CheckSkipPostMarketData": {
       "Type": "Choice",

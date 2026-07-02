@@ -468,6 +468,16 @@ class TestEODSFTopLevelFieldsClosed:
             "ec2_start_result",
             "ssm_describe_result",
             "ssm_poll",
+            # config#1549 — top-of-pipeline executor-deploy refresh chokepoint.
+            # CheckSkipRefreshExecutorDeploy reads $.skip_refresh_executor_deploy
+            # (optional rerun flag); RefreshExecutorDeploy emits
+            # $.refresh_executor_deploy_result (sendCommand) and its poll emits
+            # $.refresh_executor_deploy_poll (getCommandInvocation, trimmed by
+            # ResultSelector). Hoists nousergon-data#574's per-step boot-pull to
+            # a single chokepoint so the whole EOD run executes latest main.
+            "skip_refresh_executor_deploy",
+            "refresh_executor_deploy_result",
+            "refresh_executor_deploy_poll",
         }
     )
 

@@ -99,7 +99,10 @@ class TestSSMReadyChoiceFailLoud:
         assert variables == {
             "$.ssm_describe_result.InstanceInformationList[0].PingStatus"
         }
-        assert cond["Next"] == "CheckSkipPostMarketData"
+        # config#1549: the first gate is now CheckSkipRefreshExecutorDeploy —
+        # the hoisted top-of-pipeline executor-deploy refresh — which converges
+        # on CheckSkipPostMarketData (the first work gate) on skip/success.
+        assert cond["Next"] == "CheckSkipRefreshExecutorDeploy"
 
     def test_budget_exhaustion_hard_fails(self, states):
         ch = states["SSMReadyChoice"]
@@ -154,5 +157,8 @@ class TestAllEntryPathsEnsureRunning:
         # The readiness gate is the ONLY edge from the start block into the work
         # chain; its Online target must be a non-sendCommand gate (the skip
         # gate), proving the box is confirmed ready before any sendCommand.
-        assert online_next == ["CheckSkipPostMarketData"]
-        assert "sendCommand" not in str(states["CheckSkipPostMarketData"].get("Resource", ""))
+        # config#1549: the readiness gate now lands on CheckSkipRefreshExecutorDeploy
+        # (the hoisted deploy-refresh gate), still a Choice gate — proving the box
+        # is confirmed SSM-Online before RefreshExecutorDeploy's sendCommand fires.
+        assert online_next == ["CheckSkipRefreshExecutorDeploy"]
+        assert "sendCommand" not in str(states["CheckSkipRefreshExecutorDeploy"].get("Resource", ""))
