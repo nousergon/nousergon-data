@@ -21,7 +21,7 @@ then self-terminates (~$2/mo).
 
 ```
 EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
-  alpha-engine-scheduled-groom-0700-sunfri          ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-0700-daily           ─┐      1. nousergon_lib.ec2_spot.launch()
   alpha-engine-scheduled-groom-2300-daily           ─┼───▶     (spot; on-demand fallback)
   alpha-engine-scheduled-groom-1500-daily-opus-high ─┘      2. wait instance running + SSM Online
                                                              3. async ssm send-command (detached):
@@ -45,8 +45,8 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
 | Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
 |---|---|---|---|---|---|---|
-| `…-0700-sunfri` | `cron(0 7 ? * SUN-FRI *)` | 12am | Sun–Fri (skips Sat) | full | claude-sonnet-5 | default |
-| `…-2300-daily` | `cron(0 23 * * ? *)` | 4pm | daily incl. Sat | full | claude-sonnet-5 | default |
+| `…-0700-daily` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | default |
+| `…-2300-daily` | `cron(0 23 * * ? *)` | 4pm | daily (all 7) | full | claude-sonnet-5 | default |
 | `…-1500-daily-opus-high` | `cron(0 15 * * ? *)` | 8am | daily (all 7) | full | claude-opus-4-8 | high-only |
 
 > **Reduced 3→2/day on 2026-06-29** (usage pacing): the former
@@ -64,14 +64,25 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 > difficulty) gets relabeled `complexity:ultra`, which permanently exits ALL
 > automated grooming (both this schedule and the two Sonnet ones).
 
-The Sat-skip rationale is carried verbatim from `backlog-groom.yml`: the
-`…-0700-sunfri` rule avoids colliding with the 09:00-UTC Crucible Saturday
-pipeline; the daily 23:00 rule runs every day (Brian wants the Sat 4pm-PT groom
-retained).
+> **Sat-skip removed 2026-07-02, uniform 3x/day/7-days, no exceptions.** The
+> former `…-0700-sunfri` rule (`cron(0 7 ? * SUN-FRI *)`) skipped Saturday to
+> "avoid colliding with the 09:00-UTC Crucible Saturday pipeline" — a rationale
+> carried verbatim from the original `backlog-groom.yml` GHA cron comment with
+> no incident or postmortem behind it. Investigated and found no real
+> contention: the groom draws from the Claude **Max-plan** OAuth token
+> (`CLAUDE_CODE_OAUTH_TOKEN`); the weekly SF's Research/Predictor agents call
+> the Anthropic API directly via a separate pay-as-you-go `ANTHROPIC_API_KEY` —
+> disjoint quota pools. EC2 spot capacity is also disjoint: the groom uses
+> `t3/t3a/t2.medium`; the weekly SF's data/RAG/training stages use
+> `c5/m5/c6i/c5a.large` and `r5/r5a/r6i/m5.large`. Renamed `…-0700-sunfri` →
+> `…-0700-daily`; `deploy.sh --bootstrap` creates the new rule and PRUNES the
+> old one automatically (§ prune reconciliation). This also means the groom
+> cadence no longer needs to track which day the weekly SF lands on (e.g. the
+> holiday-aware Friday shift, `weekly-schedule-adjuster` #578) — it's simply
+> uniform every day now.
 
 EventBridge Scheduler cron uses 6 fields `cron(min hour day-of-month month
-day-of-week year)` with `?` for an unspecified day field and `SUN-FRI` for the
-day-of-week mask.
+day-of-week year)` with `?` for an unspecified day field.
 
 ## Schedule-input routing
 
