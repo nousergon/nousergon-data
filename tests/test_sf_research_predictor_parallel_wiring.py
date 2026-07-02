@@ -20,7 +20,10 @@ into an SF Parallel:
              ReplayConcordance -> Counterfactual
   Branch B = CheckSkipPredictorTraining -> PredictorTraining quartet
   join    -> AggregateBranchOutcomes -> CheckBranchOutcomes ->
-             CheckSkipDriftDetection (unchanged downstream)
+             CheckSkipBacktester (config#902: the standalone DriftDetection
+             state was collapsed — drift is now bundled onto the
+             PredictorTraining spot inside Branch B — so the join routes
+             straight to the backtester skip-gate)
 
 CORRECTNESS-CRITICAL: SF Parallel's default semantics cancel sibling
 branches when one branch errors. With strict-Research hard-failing and
@@ -461,9 +464,13 @@ class TestPerBranchErrorIsolation:
         self, parallel
     ):
         """The whole point: NO in-branch state may route to HandleFailure
-        / FailExecution / CheckSkipDriftDetection. Failures are recorded
+        / FailExecution / CheckSkipBacktester. Failures are recorded
         as data and the branch SUCCEEDS; the SF is failed AFTER the join.
-        A leak here re-introduces cross-branch cancellation."""
+        A leak here re-introduces cross-branch cancellation. (config#902:
+        the post-join continue target is now CheckSkipBacktester, since the
+        standalone DriftDetection state + its CheckSkipDriftDetection gate
+        were collapsed when drift was bundled onto the PredictorTraining
+        spot.)"""
         for bi, b in enumerate(parallel["Branches"]):
             names = set(b["States"])
             for n, st in b["States"].items():
@@ -471,7 +478,7 @@ class TestPerBranchErrorIsolation:
                     assert t not in (
                         "HandleFailure",
                         "FailExecution",
-                        "CheckSkipDriftDetection",
+                        "CheckSkipBacktester",
                     ), (
                         f"Branch{bi} {n} -> {t}: an in-branch state escapes "
                         f"to a top-level halt/continue target — this "
@@ -599,8 +606,11 @@ class TestPostJoinAggregationAndFailure:
         for cond in choice["Or"]:
             assert cond["StringEquals"] == "FAILED"
         assert choice["Next"] == "ExtractParallelBranchError"
-        # Both OK → continue to the unchanged downstream
-        assert c["Default"] == "CheckSkipDriftDetection"
+        # Both OK → continue downstream. config#902 collapsed the standalone
+        # DriftDetection state (drift is now bundled onto the PredictorTraining
+        # spot inside Branch B), so the join routes straight to the backtester
+        # skip-gate.
+        assert c["Default"] == "CheckSkipBacktester"
 
     def test_extract_parallel_branch_error_routes_to_handle_failure(
         self, states
@@ -700,11 +710,16 @@ class TestInboundRewireAndDownstreamUnchanged:
             == "BranchAFailed"
         )
 
-    def test_drift_to_backtester_chain_unchanged(self, states):
-        assert (
-            states["CheckSkipDriftDetection"]["Default"] == "DriftDetection"
-        )
-        assert states["DriftDetection"]["Next"] == "CheckSkipBacktester"
+    def test_drift_state_collapsed_join_routes_to_backtester(self, states):
+        """config#902: the standalone DriftDetection state (and its
+        CheckSkipDriftDetection skip-gate) were collapsed — drift is now
+        bundled onto the PredictorTraining spot (crucible-predictor
+        spot_train.sh), running non-blocking after training succeeds. So the
+        parallel join routes DIRECTLY to CheckSkipBacktester and neither drift
+        state remains."""
+        assert "DriftDetection" not in states
+        assert "CheckSkipDriftDetection" not in states
+        assert states["CheckBranchOutcomes"]["Default"] == "CheckSkipBacktester"
         assert states["CheckSkipBacktester"]["Default"] == "Backtester"
 
     def test_backtester_after_parallel_join_and_reachable(self, sf):

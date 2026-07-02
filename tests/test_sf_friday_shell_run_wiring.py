@@ -99,7 +99,9 @@ _EXPECTED_SKIPS = {
     # CheckSkipAggregateCosts comment.
     "skip_aggregate_costs",
     "skip_predictor_training",
-    "skip_drift_detection",
+    # config#902: skip_drift_detection was removed — the DriftDetection state
+    # (and its CheckSkipDriftDetection gate) were collapsed when drift was
+    # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
@@ -159,10 +161,11 @@ _SPOT_STATES = {
         "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
-    "DriftDetection": (
-        "bash infrastructure/spot_drift_detection.sh",
-        "/var/log/drift-detection.log",
-    ),
+    # config#902: DriftDetection was collapsed — drift is now bundled onto the
+    # PredictorTraining spot (crucible-predictor spot_train.sh runs
+    # monitoring.drift_detector after training succeeds). Its Friday
+    # --preflight-only dry path folds into spot_train.sh --preflight-only, so
+    # DriftDetection is no longer a standalone spot state here.
 }
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
@@ -565,8 +568,10 @@ class TestApplyShellRunDefaults:
             "skip_data_phase2",
             "skip_regime_substrate",
             "skip_regime_retrospective_eval",
-            # The 5 ex-keystone skip-exceptions — now run DRY, not skipped.
-            "skip_drift_detection",
+            # The ex-keystone skip-exceptions — now run DRY, not skipped.
+            # (config#902 removed skip_drift_detection entirely — the
+            # DriftDetection state was collapsed onto the PredictorTraining
+            # spot, so there is no drift state to run dry OR skip.)
             "skip_eval_judge",
             "skip_rationale_clustering",
             "skip_replay_concordance",
@@ -918,8 +923,10 @@ class TestHappyPathTraversal:
         assert "NotifyComplete" not in order
         # Skip-exception rewire: ZERO main-thread workload states are
         # skipped — every CheckSkip gate falls through so the (dry) state is
-        # VISITED. This now INCLUDES DriftDetection (flipped skip→dry via
-        # the spot --preflight-only mechanism). (Research/DataPhase2/eval
+        # VISITED. (config#902: DriftDetection is no longer on this trace — it
+        # was collapsed onto the PredictorTraining spot, which lives inside the
+        # Parallel; its dry path is now spot_train.sh --preflight-only.)
+        # (Research/DataPhase2/eval
         # chain/PredictorTraining live inside the Parallel and aren't on
         # this main-thread trace; their dry-routing is asserted by
         # TestByteIdenticalAbsentPath +
@@ -932,7 +939,6 @@ class TestHappyPathTraversal:
         for ran_dry in (
             "MorningEnrich",
             "DataPhase1",
-            "DriftDetection",
             "Backtester",
             "PredictorBacktest",
             "PortfolioOptimizerBacktest",

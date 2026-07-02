@@ -35,7 +35,7 @@
       "Type": "Pass",
       "Comment": "mode=backtest-eval ONLY (config#830). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training/drift-detection), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_drift_detection\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
@@ -216,7 +216,7 @@
     },
     "ApplyShellRunDefaults": {
       "Type": "Pass",
-      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire — every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob OVER the current state (States.JsonMerge($, shellDefaults, false) — second arg wins, so shellDefaults wins over $) so shell_run=true ACTUALLY enforces dry mode for every keystone control var. The prior arg order (States.JsonMerge(shellDefaults, $, false)) silently fell back to non-dry because InitializeInput unconditionally seeds preflight_args=\"\" + research_dry=false + data_phase2_dry=false + regime_action=\"produce\" into $ — so $ wins meant the seeded non-dry identities won over the dry shellDefaults, and the 2026-05-22 Friday-PM shell-run dry-pass (first execution past the prior trap break) ran full-fat instead of --preflight-only. Skip flags are unaffected (they're not in shellDefaults; the #258 Choice-gated skip_* mechanism handles {\"shell_run\": true, \"skip_backtester\": true} downstream regardless of merge order). The previously-documented user-override-from-input case ({\"shell_run\": true, \"preflight_args\": \"\"} runs spots full-fat) is now intentionally LOST: in practice nobody passes both flags together — passing shell_run=true means you want dry mode for ALL keystone control vars; the comment line saying otherwise was a footgun masking the actual semantic intent. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator, AND DriftDetection) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): Research + the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process — dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). The skip-exception rewire (this PR) flipped the prior 5 skip→dry: DriftDetection now uses the same commands.$/States.Format($.preflight_args) Option-C mechanism as the other spot states (data #261 exposed --preflight-only on spot_drift_detection.sh); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
+      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire — every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob OVER the current state (States.JsonMerge($, shellDefaults, false) — second arg wins, so shellDefaults wins over $) so shell_run=true ACTUALLY enforces dry mode for every keystone control var. The prior arg order (States.JsonMerge(shellDefaults, $, false)) silently fell back to non-dry because InitializeInput unconditionally seeds preflight_args=\"\" + research_dry=false + data_phase2_dry=false + regime_action=\"produce\" into $ — so $ wins meant the seeded non-dry identities won over the dry shellDefaults, and the 2026-05-22 Friday-PM shell-run dry-pass (first execution past the prior trap break) ran full-fat instead of --preflight-only. Skip flags are unaffected (they're not in shellDefaults; the #258 Choice-gated skip_* mechanism handles {\"shell_run\": true, \"skip_backtester\": true} downstream regardless of merge order). The previously-documented user-override-from-input case ({\"shell_run\": true, \"preflight_args\": \"\"} runs spots full-fat) is now intentionally LOST: in practice nobody passes both flags together — passing shell_run=true means you want dry mode for ALL keystone control vars; the comment line saying otherwise was a footgun masking the actual semantic intent. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): Research + the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process — dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). The skip-exception rewire flipped the prior 5 skip→dry via the commands.$/States.Format($.preflight_args) Option-C mechanism (config#902 later collapsed the standalone DriftDetection spot state — drift is now bundled onto the PredictorTraining spot, so its Friday --preflight-only dry path folds into spot_train.sh --preflight-only rather than a separate drift state); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
       "Parameters": {
         "merged.$": "States.JsonMerge($,States.StringToJson('{\"preflight_args\":\" --preflight-only\",\"research_dry\":true,\"data_phase2_dry\":true,\"regime_action\":\"dry_run\",\"pipeline_label\":\" Preflight\"}'),false)"
       },
@@ -1564,7 +1564,7 @@
           "States": {
             "CheckSkipPredictorTraining": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_predictor_training\": true} bypasses GBM retrain and jumps to DriftDetection's skip-gate.",
+              "Comment": "Skip-gate. {\"skip_predictor_training\": true} bypasses GBM retrain (and, per config#902, the now-bundled drift step that rides on the same spot) and converges to BranchBComplete.",
               "Choices": [
                 {
                   "And": [
@@ -2173,7 +2173,7 @@
     },
     "CheckBranchOutcomes": {
       "Type": "Choice",
-      "Comment": "Fail the SF AFTER the join if EITHER branch recorded FAILED — so the OTHER branch's completed work (Research signals.json / decision_artifacts, OR PredictorTraining's already-S3-promoted weights) persists and the recovery re-run's skip-set can skip whichever branch genuinely completed. Research-fail + Predictor-done → recovery re-run with {\"skip_predictor_training\": true}. Predictor-fail + Research-done → recovery re-run with {\"skip_research\": true, ... per the live-SF-derived skip-set practice}. Only when BOTH branches are OK does the pipeline continue to DriftDetection -> Backtester -> Parity -> Evaluator.",
+      "Comment": "Fail the SF AFTER the join if EITHER branch recorded FAILED — so the OTHER branch's completed work (Research signals.json / decision_artifacts, OR PredictorTraining's already-S3-promoted weights) persists and the recovery re-run's skip-set can skip whichever branch genuinely completed. Research-fail + Predictor-done → recovery re-run with {\"skip_predictor_training\": true}. Predictor-fail + Research-done → recovery re-run with {\"skip_research\": true, ... per the live-SF-derived skip-set practice}. Only when BOTH branches are OK does the pipeline continue to CheckSkipBacktester -> Backtester -> Parity -> Evaluator. (config#902: the standalone DriftDetection state was collapsed — drift is now bundled onto the PredictorTraining spot inside Branch B's spot_train.sh, running non-blocking after training succeeds — so the join routes straight to the backtester skip-gate.)",
       "Choices": [
         {
           "Or": [
@@ -2189,7 +2189,7 @@
           "Next": "ExtractParallelBranchError"
         }
       ],
-      "Default": "CheckSkipDriftDetection"
+      "Default": "CheckSkipBacktester"
     },
     "ExtractParallelBranchError": {
       "Type": "Pass",
@@ -2204,55 +2204,6 @@
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
-    },
-    "CheckSkipDriftDetection": {
-      "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_drift_detection\": true} bypasses drift detection and jumps to Backtester's skip-gate.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_drift_detection",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_drift_detection",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipBacktester"
-        }
-      ],
-      "Default": "DriftDetection"
-    },
-    "DriftDetection": {
-      "Type": "Task",
-      "Comment": "Feature + prediction drift check on spot EC2 (non-blocking). Micro is the dispatcher; launcher clones data + predictor on a fresh spot, runs monitoring.drift_detector, terminates.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug drift-detection --log /var/log/drift-detection.log -- bash infrastructure/spot_drift_detection.sh{}',$.preflight_args))",
-          "executionTimeout": [
-            "1200"
-          ]
-        },
-        "TimeoutSeconds": 1200
-      },
-      "TimeoutSeconds": 1260,
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "Drift detection is non-blocking — continue to backtester",
-          "Next": "CheckSkipBacktester",
-          "ResultPath": "$.drift_error"
-        }
-      ],
-      "ResultPath": "$.drift_result",
-      "Next": "CheckSkipBacktester"
     },
     "CheckSkipBacktester": {
       "Type": "Choice",
@@ -2276,7 +2227,7 @@
     },
     "Backtester": {
       "Type": "Task",
-      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn — preserves DriftDetection's Next/Catch edges + skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn — preserves the skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). config#902 collapsed the standalone DriftDetection state that used to precede this one; the parallel join + CheckSkipDriftDetection-skip both now route directly to CheckSkipBacktester, so this state is entered straight from the join / its skip-gate. Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
