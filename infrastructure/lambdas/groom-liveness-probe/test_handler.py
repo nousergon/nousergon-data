@@ -63,6 +63,36 @@ def test_saturday_0700_included(monkeypatch):
     assert _dt(2026, 6, 27, 7, 0) in {t["at"] for t in trigs}
 
 
+def test_1500_opus_schedule_included(monkeypatch):
+    """config#1571: the 15:00 UTC Opus/complexity:high schedule must be tracked
+    too, not just the two Sonnet schedules — its silent death was previously
+    invisible to this probe (the schedule existed since 2026-07-01, config#1495
+    follow-up, but was never added here)."""
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    # Wed 2026-07-01 22:00 UTC -> 15:00 Wed matured (7h ago).
+    now = _dt(2026, 7, 1, 22, 0)
+    trigs = index._expected_triggers(now)
+    assert _dt(2026, 7, 1, 15, 0) in {t["at"] for t in trigs}
+
+
+def test_three_daily_triggers_dont_overlap_in_one_day(monkeypatch):
+    """The three windows [T, T+CEILING+MARGIN] must stay disjoint so per-trigger
+    attribution remains 1:1 (see _missed's docstring) now that a 3rd schedule
+    shares the day with the original two."""
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 24)
+    now = _dt(2026, 7, 2, 6, 0)
+    trigs = index._expected_triggers(now)
+    ats = sorted(t["at"] for t in trigs)
+    assert len(ats) == 3
+    window = timedelta(minutes=360 + 45)
+    for a, b in zip(ats, ats[1:]):
+        assert a + window <= b, f"{a} window overlaps {b}"
+
+
 # ---- _missed ---------------------------------------------------------------
 
 
