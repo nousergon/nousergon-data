@@ -689,7 +689,12 @@ def collect(
                 ``source ∈ {"yfinance", "polygon"}`` AND ``Close`` is not
                 null), and skips fetching those tickers from yfinance.
                 Existing canonical rows are then merged into the output
-                parquet. Implements the source-precedence-ladder skip-set
+                parquet via ``_coalesce_by_source_priority`` (config#720 —
+                the same source-priority-waterfall primitive every mode
+                uses; a fresh yfinance/auto fetch is equal-or-higher
+                priority than a canonical prior row of the same tier, so it
+                always wins the merge, matching the pre-#720 behavior).
+                Implements the source-precedence-ladder skip-set
                 semantic from the windowed-data-reconciliation arc:
 
                   - ``yfinance_only`` mode: skips canonical tickers (any
@@ -823,17 +828,22 @@ def collect(
     # Skip-on-exists short-circuit (yfinance_only + auto only) returns inside
     # the live branch since dry_run by definition isn't going to write.
     existing_close_for_discrepancy: dict[str, float] | None = None
-    # Full prior-parquet rows (with ``source``), used by the polygon_only
-    # source-priority coalesce so a transient live-fetch gap retains the prior
+    # Full prior-parquet rows (with ``source``) fed to the single
+    # ``_coalesce_by_source_priority`` merge (config#720: the one preservation
+    # primitive for every mode) so a transient live-fetch gap retains the prior
     # value instead of blanking it. Empty unless an existing parquet is read.
+    #
+    # ``polygon_only`` populates this with EVERY prior row (any source) — the
+    # coalesce's own priority waterfall decides retain/overwrite/downgrade-block.
+    # ``yfinance_only``/``auto`` + ``skip_if_canonical=True`` populate it with
+    # only the rows already carrying an authoritative source (yfinance/polygon)
+    # and a non-null Close — mirrors the pre-config#720 ``canonical_existing_rows``
+    # filter exactly, so those modes' coalesce input (and therefore output) is
+    # unchanged; yfinance/auto's own fresh fetch is equal-or-higher priority
+    # than a canonical prior row of the same tier, so it naturally lands in the
+    # coalesce's "restatement wins"/"new_only" branches — the "equal-priority
+    # case" the consolidation issue (config#720) describes.
     existing_rows_for_merge: list[dict] = []
-    # When skip_if_canonical=True, ``canonical_existing_rows`` carries
-    # the records dicts for tickers in the existing parquet that already
-    # have an authoritative source (yfinance / polygon) and a non-null
-    # Close. They get merged into the output records before write so
-    # the parquet preserves prior canonical state across the window
-    # scan. Empty when skip_if_canonical=False (legacy overwrite path).
-    canonical_existing_rows: list[dict] = []
     canonical_skip_set: set[str] = set()
     from botocore.exceptions import ClientError
     head = None
@@ -915,11 +925,13 @@ def collect(
                     exc,
                 )
         elif skip_if_canonical:
-            # yfinance_only / auto + skip_if_canonical=True: read the
-            # full parquet, extract canonical rows so they survive into
-            # the merged output. Bypass the post-close-skip short-circuit
-            # below — the whole point of windowed reconciliation is to
-            # fill NaN cells in older dates that legacy logic would skip.
+            # yfinance_only / auto + skip_if_canonical=True: read the full
+            # parquet, extract canonical rows so they survive into the merged
+            # output via the shared ``_coalesce_by_source_priority`` step
+            # below (config#720 — same primitive polygon_only uses). Bypass
+            # the post-close-skip short-circuit below — the whole point of
+            # windowed reconciliation is to fill NaN cells in older dates
+            # that legacy logic would skip.
             try:
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 existing_df = pd.read_parquet(
@@ -937,7 +949,7 @@ def collect(
                             canonical_skip_set.add(str(t))
                             preserved = {"ticker": str(t)}
                             preserved.update(row.to_dict())
-                            canonical_existing_rows.append(preserved)
+                            existing_rows_for_merge.append(preserved)
                 logger.info(
                     "[skip_if_canonical] %s: %d existing canonical "
                     "tickers will be preserved; yfinance fetch reduced "
@@ -956,7 +968,7 @@ def collect(
                     run_date, exc,
                 )
                 canonical_skip_set = set()
-                canonical_existing_rows = []
+                existing_rows_for_merge = []
         elif not dry_run and _is_post_close_write(last_modified, run_date):
             logger.info(
                 "Daily closes already exist for %s (post-close at %s, source=%s) — skipping",
@@ -1051,8 +1063,8 @@ def collect(
     missing = [t for t in tickers if t.lstrip("^") not in captured_tickers]
     # When skip_if_canonical=True (yfinance_only / auto window mode), drop
     # tickers that already have an authoritative source in the existing
-    # parquet — those rows will be merged from ``canonical_existing_rows``
-    # before write, so refetching them would just churn API budget.
+    # parquet — those rows will be merged back via the source-priority
+    # coalesce below, so refetching them would just churn API budget.
     if canonical_skip_set:
         before = len(missing)
         missing = [t for t in missing if t.lstrip("^") not in canonical_skip_set]
@@ -1082,22 +1094,37 @@ def collect(
                 records, missing, run_date,
             )
 
+    # ── Source-priority coalesce (yfinance_only / auto) — config#720 ─────────
     # Merge preserved canonical rows from the existing parquet into the
-    # records list. These are tickers we deliberately skipped fetching
-    # — they survive into the output unchanged. Polygon-only mode has
-    # ``canonical_existing_rows`` empty by construction (skip flag
-    # ignored per option (a)), so the legacy overwrite path is preserved.
-    if canonical_existing_rows:
-        already_captured = {r["ticker"] for r in records}
-        merged_in = 0
-        for row in canonical_existing_rows:
-            if row["ticker"] not in already_captured:
-                records.append(row)
-                merged_in += 1
+    # records list via the SAME ``_coalesce_by_source_priority`` primitive
+    # ``polygon_only`` uses below (config#720: unify the two preservation
+    # mechanisms). ``existing_rows_for_merge`` here holds only the rows
+    # already carrying an authoritative source (yfinance/polygon) + non-null
+    # Close (populated above, identical filter to the pre-#720
+    # ``canonical_existing_rows``), and yfinance/auto's own fresh fetch is
+    # equal-or-higher priority than a canonical prior row of the same
+    # tier — so this fresh fetch always lands in the coalesce's
+    # "restatement wins" / "new_only" branches, the "equal-priority case"
+    # the consolidation subsumes; a ticker this run couldn't (re)capture
+    # retains its prior canonical row exactly as before.
+    #
+    # Deliberately runs BEFORE the coverage gate below (unlike the
+    # polygon_only coalesce, which runs after) — preserved canonical rows
+    # must count toward the coverage denominator here, matching the
+    # documented ``skip_if_canonical`` contract ("coverage gate evaluates
+    # the merged-output denominator"). polygon_only has
+    # ``existing_rows_for_merge`` empty at this point (only populated in its
+    # own branch above), so this is a no-op for that mode.
+    if source != "polygon_only" and existing_rows_for_merge:
+        records, canon_merge_stats = _coalesce_by_source_priority(
+            records, existing_rows_for_merge, run_date,
+        )
         logger.info(
-            "[skip_if_canonical] %s: merged %d preserved canonical rows "
-            "into output records",
-            run_date, merged_in,
+            "[skip_if_canonical] %s: coalesce retained %d preserved canonical "
+            "row(s), overwrote %d, new %d (total %d)",
+            run_date, canon_merge_stats["retained"],
+            canon_merge_stats["overwritten"], canon_merge_stats["new_only"],
+            len(records),
         )
 
     # ── Coverage gates — per-mode hard-fails ─────────────────────────────────
@@ -1134,8 +1161,10 @@ def collect(
     # while polygon restatements still win and a lower-tier fresh value can't
     # downgrade a higher-tier existing cell. Runs AFTER the coverage gate, so a
     # genuine polygon outage still hard-fails on the FRESH fetch before any
-    # retained rows could mask it. (yfinance_only / auto preserve prior state
-    # via ``canonical_existing_rows`` above, so the coalesce is polygon_only.)
+    # retained rows could mask it. (yfinance_only / auto already ran the SAME
+    # ``_coalesce_by_source_priority`` primitive above, before the coverage
+    # gate — config#720 unified both modes onto this one function; only the
+    # gate-ordering and the existing-rows population differ per mode.)
     if source == "polygon_only" and existing_rows_for_merge:
         records, merge_stats = _coalesce_by_source_priority(
             records, existing_rows_for_merge, run_date,
