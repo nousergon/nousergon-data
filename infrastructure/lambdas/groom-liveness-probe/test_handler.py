@@ -50,14 +50,47 @@ def test_only_mature_triggers_returned(monkeypatch):
     assert all(t["at"] <= now - timedelta(minutes=405) for t in trigs)
 
 
-def test_saturday_0700_excluded(monkeypatch):
-    """The 07:00 schedule is Sun-Fri — Saturday must not produce a 07:00 trigger."""
+def test_saturday_0700_included(monkeypatch):
+    """Uniform 3x/day, all 7 days (2026-07-02, no exceptions) — Saturday MUST
+    produce a 07:00 trigger like every other day (the old Sun-Fri Sat-skip was
+    removed; see scheduled-groom-dispatcher/README.md)."""
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 12)
-    # Sat 2026-06-27 18:00 UTC → the only mature trigger in 12h is... 07:00 Sat is
-    # excluded; 23:00 Fri is >12h before. So expect no 07:00-Sat trigger.
+    # Sat 2026-06-27 18:00 UTC → 07:00 Sat matured (11h ago, > CEILING+MARGIN).
     now = _dt(2026, 6, 27, 18, 0)  # Saturday
     trigs = index._expected_triggers(now)
-    assert _dt(2026, 6, 27, 7, 0) not in {t["at"] for t in trigs}
+    assert _dt(2026, 6, 27, 7, 0) in {t["at"] for t in trigs}
+
+
+def test_1500_opus_schedule_included(monkeypatch):
+    """config#1571: the 15:00 UTC Opus/complexity:high schedule must be tracked
+    too, not just the two Sonnet schedules — its silent death was previously
+    invisible to this probe (the schedule existed since 2026-07-01, config#1495
+    follow-up, but was never added here)."""
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    # Wed 2026-07-01 22:00 UTC -> 15:00 Wed matured (7h ago).
+    now = _dt(2026, 7, 1, 22, 0)
+    trigs = index._expected_triggers(now)
+    assert _dt(2026, 7, 1, 15, 0) in {t["at"] for t in trigs}
+
+
+def test_three_daily_triggers_dont_overlap_in_one_day(monkeypatch):
+    """The three windows [T, T+CEILING+MARGIN] must stay disjoint so per-trigger
+    attribution remains 1:1 (see _missed's docstring) now that a 3rd schedule
+    shares the day with the original two."""
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 24)
+    now = _dt(2026, 7, 2, 6, 0)
+    trigs = index._expected_triggers(now)
+    ats = sorted(t["at"] for t in trigs)
+    assert len(ats) == 3
+    window = timedelta(minutes=360 + 45)
+    for a, b in zip(ats, ats[1:]):
+        assert a + window <= b, f"{a} window overlaps {b}"
 
 
 # ---- _missed ---------------------------------------------------------------
@@ -87,7 +120,7 @@ def test_single_silent_death_not_masked_by_later_success(monkeypatch):
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     t_dead = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
-    t_ok = {"at": _dt(2026, 6, 30, 7, 0), "label": "07:00 Sun-Fri"}
+    t_ok = {"at": _dt(2026, 6, 30, 7, 0), "label": "07:00 daily"}
     stamps = [_dt(2026, 6, 30, 7, 8)]  # only the 07:00 run reported
     misses = index._missed([t_dead, t_ok], stamps)
     assert [m["at"] for m in misses] == [t_dead["at"]]
@@ -111,7 +144,16 @@ class _FakeS3:
         self.put_calls.append(index.json.loads(Body))
 
 
-def _wire(monkeypatch, *, triggers, stamps, s3, sent=True):
+def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 0, 0)):
+    # Freeze _now() — handler()'s _load_alerted() prunes the alerted-set to
+    # [now - LOOKBACK_HOURS, now], so leaving _now() on the REAL wall clock while
+    # every test hardcodes a 2026-06-29-ish trigger date makes the suite flaky-by
+    # -design: it silently breaks the moment real time drifts far enough past the
+    # hardcoded dates to prune them out of the lookback window (caught 2026-07-02
+    # — test_handler_suppresses_already_alerted_miss started failing with no code
+    # change, purely from elapsed wall-clock time). Default `now` sits ~1h after
+    # the trigger dates the other tests share.
+    monkeypatch.setattr(index, "_now", lambda: now)
     monkeypatch.setattr(index, "_expected_triggers", lambda now: triggers)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "pat")
     monkeypatch.setattr(index, "_fetch_digest_timestamps", lambda pat: stamps)

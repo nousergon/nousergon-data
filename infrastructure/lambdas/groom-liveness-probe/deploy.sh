@@ -21,14 +21,23 @@
 # (groom hard-ceiling 360 min + slack). Per-trigger windows + S3 dedup make the
 # exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
 #   06:30 daily   cron(30 6 * * ? *)   # after the 23:00 groom matures (~05:45)
-#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 Sun-Fri groom matures (~13:45)
+#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45; the
+#                                      #   07:00 groom runs daily since 2026-07-02 —
+#                                      #   the old "Sun-Fri" framing is gone)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
-# blast radius, operator-deployed only). Merging the PR has ZERO live effect
-# until an operator runs this with --bootstrap.
+# blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
+# fleet-wide policy after 4 IAM-clobber incidents — infrastructure/iam/README.md).
+#
+# CODE auto-deploys on merge to main via
+# `.github/workflows/deploy-groom-liveness-probe.yml` (path-filtered to this
+# directory), which runs this script with NO flags (the default/flagless run
+# is already code-only). A SCHED_CRONS change (this probe's OWN invocation
+# cadence) still needs an operator to run `--bootstrap` by hand — merging
+# alone has ZERO live effect on it.
 #
 # Usage:
-#   bash .../groom-liveness-probe/deploy.sh             # update code only
+#   bash .../groom-liveness-probe/deploy.sh             # update code only (same command CI runs)
 #   bash .../groom-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules
 #   bash .../groom-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../groom-liveness-probe/deploy.sh --smoke     # invoke once (read-only check; pings only on a real miss)
@@ -73,19 +82,37 @@ run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Scratch dirs + validate handler syntax -----------------------------
+# PKG and TEST_DEPS are both created up front (mirrors freshness-monitor/
+# deploy.sh) so ONE trap covers both — a pytest-install failure below still
+# cleans up.
+
+PKG=$(mktemp -d)
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# Only alpha_engine_lib.telegram is stubbed in sys.modules (see
+# test_handler.py's header) — `index.py`'s `import boto3` is REAL, and
+# requirements.txt deliberately omits boto3 (provided by the Lambda runtime
+# at deploy time, per its own comment), so pytest's `import index` needs it
+# installed explicitly here. Installed into a scratch TEST_DEPS dir — NOT the
+# caller's global site-packages, not bundled into the Lambda zip (mirrors
+# freshness-monitor/deploy.sh). 2026-07-02: the CI auto-deploy workflow's
+# FIRST real run failed here with "No module named pytest" — this script had
+# only ever been run from an operator's laptop before, where pytest/boto3
+# happened to already be installed as dev/tooling dependencies; the gap was
+# invisible until CI actually exercised this path.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  echo "Installing pytest + boto3 into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
   echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
-
-PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (pip install -t)..."
 python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"

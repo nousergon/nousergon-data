@@ -1,0 +1,86 @@
+name: Deploy groom-liveness-probe
+
+# Auto-deploy the alpha-engine-groom-liveness-probe Lambda CODE on merge to
+# main. Same pattern as deploy-scheduled-groom-dispatcher.yml /
+# deploy-freshness-monitor.yml: this script's default/flagless run is already
+# code-only (no aws iam/scheduler writes happen unless --bootstrap is passed),
+# so no new script flag was needed to make this safe.
+#
+# A change to SCHED_NAMES/SCHED_CRONS (the two liveness-check cadences, or a
+# future 3rd entry) still requires an operator to run `deploy.sh --bootstrap`
+# by hand, for the same reason as the dispatcher: the github-actions-lambda-
+# deploy OIDC role deliberately lacks iam:CreateRole / iam:PutRolePolicy
+# (fleet-wide policy, infrastructure/iam/README.md). A code change to
+# GROOM_SCHEDULE's _DEFAULT_SCHEDULE (e.g. config#1571's 15:00 entry) IS a
+# code-only change — it auto-deploys via this workflow — but the underlying
+# EventBridge Scheduler cadence for the PROBE ITSELF (when it invokes, not
+# what it checks for) only changes via SCHED_CRONS + --bootstrap.
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# deploy.json), which already includes this function.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/groom-liveness-probe/**'
+      - '.github/workflows/deploy-groom-liveness-probe.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-groom-liveness-probe-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy groom-liveness-probe Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Deploy groom-liveness-probe (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/groom-liveness-probe/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-groom-liveness-probe \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-groom-liveness-probe.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
