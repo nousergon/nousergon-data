@@ -40,7 +40,40 @@ from datetime import date, datetime, timedelta, timezone
 
 import boto3
 
-from nousergon_lib.trading_calendar import is_trading_day
+# Vendored NYSE trading calendar. The Lambda needs ONLY "is this date an NYSE
+# session?", and the canonical ``nousergon_lib`` is now mypyc/pydantic-compiled
+# (platform-specific ``.so``), so it cannot be bundled into a Lambda zip from a
+# dev Mac (linux/py3.12 mismatch — the built wheels are darwin/py3.14). We vendor
+# the static NYSE holiday set (through 2030, verbatim from
+# ``nousergon_lib.trading_calendar.NYSE_HOLIDAYS``) + a pure-Python session check.
+# test_handler.py::test_vendored_holidays_match_lib asserts this stays in
+# lockstep with the lib (drift guard), so the copy can't silently diverge.
+_NYSE_HOLIDAYS = frozenset({
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+    date(2026, 11, 26), date(2026, 12, 25),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
+    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
+    date(2027, 11, 25), date(2027, 12, 24),
+    date(2028, 1, 17), date(2028, 2, 21), date(2028, 4, 14), date(2028, 5, 29),
+    date(2028, 6, 19), date(2028, 7, 4), date(2028, 9, 4), date(2028, 11, 23),
+    date(2028, 12, 25),
+    date(2029, 1, 1), date(2029, 1, 15), date(2029, 2, 19), date(2029, 3, 30),
+    date(2029, 5, 28), date(2029, 6, 19), date(2029, 7, 4), date(2029, 9, 3),
+    date(2029, 11, 22), date(2029, 12, 25),
+    date(2030, 1, 1), date(2030, 1, 21), date(2030, 2, 18), date(2030, 4, 19),
+    date(2030, 5, 27), date(2030, 6, 19), date(2030, 7, 4), date(2030, 9, 2),
+    date(2030, 11, 28), date(2030, 12, 25),
+})
+
+
+def is_trading_day(d: date) -> bool:
+    """NYSE session? A weekday that is not a holiday. (Early-close half-days
+    count as sessions — correct for 'last trading day of the week'.) The holiday
+    set covers through 2030; extend it (and the drift-guard test) before then.
+    """
+    return d.weekday() < 5 and d not in _NYSE_HOLIDAYS
+
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
