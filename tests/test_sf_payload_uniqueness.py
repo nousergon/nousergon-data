@@ -79,10 +79,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "Research": frozenset({"dry_run_llm.$", "force", "weekly_run", "skip_dry_run_gate"}),
     "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
     "EvalJudgeSubmitWeekly": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
     "EvalJudgePoll": frozenset(
         {"batch_id.$", "dry_run_llm.$", "max_wait_seconds", "submit_iso.$"}
