@@ -262,7 +262,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only{}',$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only{}',$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -423,7 +423,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only{}',$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only{}',$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -627,7 +627,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$.preflight_args))",
                   "executionTimeout": [
                     "3600"
                   ]
@@ -1601,7 +1601,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -1869,7 +1869,7 @@
                       "DocumentName": "AWS-RunShellScript",
                       "InstanceIds.$": "$.ec2_instance_id",
                       "Parameters": {
-                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train.sh --model-zoo-spec {}{}',$.spec_id,$.preflight_args))",
+                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train.sh --model-zoo-spec {}{}',$.spec_id,$.preflight_args))",
                         "executionTimeout": [
                           "5400"
                         ]
@@ -2008,7 +2008,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_train.sh --model-zoo-select{}',$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_train.sh --model-zoo-select{}',$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -2247,7 +2247,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -2370,7 +2370,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -2493,7 +2493,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -2616,7 +2616,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -2739,7 +2739,7 @@
           "executionTimeout": [
             "3600"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m nousergon_lib.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{}',$.preflight_args))"
         },
         "TimeoutSeconds": 3600
       },
