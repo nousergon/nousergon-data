@@ -67,7 +67,7 @@ class TestTrapInstalledBeforeLaunch:
         covers an all-combinations-exhausted launch (rc 64), not only a
         mid-run reclamation."""
         trap_at = text.index("trap on_exit EXIT")
-        launch_at = text.index("nousergon_lib.ec2_spot launch")
+        launch_at = text.index("krepis.ec2_spot launch")
         assert trap_at < launch_at, (
             "trap on_exit EXIT must be installed before the spot launch."
         )
