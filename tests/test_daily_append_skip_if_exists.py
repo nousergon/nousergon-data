@@ -53,6 +53,27 @@ def _disable_factor_momentum_daily(monkeypatch):
     monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
 
 
+def _recent_trading_day_str() -> str:
+    """Most recent NYSE trading day as of now, ISO ``YYYY-MM-DD``.
+
+    These tests feed the resolved date straight into ``daily_append`` as
+    ``date_str``, which enforces an NYSE-trading-day gate (config#1572) —
+    a raw ``datetime.now()`` detonates every weekend and market holiday
+    (surfaced 2026-07-03, the observed Independence Day holiday: 7 tests
+    red on ``main`` with "is not an NYSE trading day"). Anchoring to the
+    most recent *trading* day keeps the date a valid session (passes the
+    gate) AND within the freshness threshold (staleness is 0 trading days
+    — the last row IS this date), so it neither rots (the 2026-05-04
+    hardcoded-date failure) nor trips the phantom-session guard.
+    """
+    from nousergon_lib.trading_calendar import is_trading_day, previous_trading_day
+
+    d = datetime.now(timezone.utc).date()
+    if not is_trading_day(d):
+        d = previous_trading_day(d)
+    return d.isoformat()
+
+
 def _stub_closes(tickers: list[str]) -> dict:
     """Minimal daily_closes shape: per-ticker {Open,High,Low,Close,Volume,VWAP}."""
     return {
@@ -173,11 +194,11 @@ def test_skip_if_exists_true_skips_when_today_in_hist(monkeypatch):
     spend, just a microsecond ``today_ts in hist.index`` check."""
     from builders.daily_append import daily_append
 
-    # Use real "now" so the daily_append freshness scan (5d threshold
-    # against datetime.now(timezone.utc)) doesn't trip as the calendar
-    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
-    # surfaced because "2026-04-28" had aged 6d past the threshold.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor to the most recent NYSE *trading* day (see
+    # _recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # and detonates the config#1572 phantom-session gate on weekends and
+    # market holidays (2026-07-03). The trading-day anchor dodges both.
+    today_str = _recent_trading_day_str()
     universe = ["AAPL", "MSFT", "GOOGL"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -208,11 +229,11 @@ def test_skip_if_exists_true_writes_when_today_missing(monkeypatch):
     silent-skip bug for tickers with genuinely-missing today rows."""
     from builders.daily_append import daily_append
 
-    # Use real "now" so the daily_append freshness scan (5d threshold
-    # against datetime.now(timezone.utc)) doesn't trip as the calendar
-    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
-    # surfaced because "2026-04-28" had aged 6d past the threshold.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor to the most recent NYSE *trading* day (see
+    # _recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # and detonates the config#1572 phantom-session gate on weekends and
+    # market holidays (2026-07-03). The trading-day anchor dodges both.
+    today_str = _recent_trading_day_str()
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -238,11 +259,11 @@ def test_skip_if_exists_false_writes_even_when_today_in_hist(monkeypatch):
     that the 2026-04-18 commit introduced for the polygon-label incident."""
     from builders.daily_append import daily_append
 
-    # Use real "now" so the daily_append freshness scan (5d threshold
-    # against datetime.now(timezone.utc)) doesn't trip as the calendar
-    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
-    # surfaced because "2026-04-28" had aged 6d past the threshold.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor to the most recent NYSE *trading* day (see
+    # _recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # and detonates the config#1572 phantom-session gate on weekends and
+    # market holidays (2026-07-03). The trading-day anchor dodges both.
+    today_str = _recent_trading_day_str()
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
