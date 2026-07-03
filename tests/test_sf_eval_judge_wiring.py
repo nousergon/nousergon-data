@@ -576,7 +576,13 @@ class TestRationaleClustering:
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
 
     def test_timeout_matches_lambda_cap(self, states):
-        assert states["RationaleClustering"]["TimeoutSeconds"] == 600
+        # Clustering Lambda is configured with timeout=900s (the AWS
+        # Lambda ceiling — alpha-engine-research infrastructure/deploy.sh,
+        # bumped 600s -> 900s to absorb corpus growth) — SF state
+        # TimeoutSeconds must equal that ceiling, else the SF kills the
+        # lambda:invoke wait independently of (and before) the Lambda's
+        # own configured timeout (config#1650).
+        assert states["RationaleClustering"]["TimeoutSeconds"] == 900
 
     def test_success_continues_to_concordance_gate(self, states):
         # Clustering converges to CheckSkipReplayConcordance (the gate
