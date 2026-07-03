@@ -32,12 +32,18 @@ These tests lock the contract:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+
+# Shared "today" anchor (config#1630): promoted out of this module into
+# tests/conftest.py so every date-driven daily_append test — not just the
+# two originally cross-importing this file — has one discoverable
+# chokepoint. See conftest.recent_trading_day_str's docstring for the
+# incident history (2026-05-04, 2026-06-22, 2026-07-03).
+from tests.conftest import recent_trading_day_str
 
 
 _DAILY_APPEND = Path(__file__).parent.parent / "builders" / "daily_append.py"
@@ -51,27 +57,6 @@ def _disable_factor_momentum_daily(monkeypatch):
     # assertions here. The pass has its own tests (test_factor_momentum.py +
     # test_daily_append_factor_momentum.py).
     monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
-
-
-def _recent_trading_day_str() -> str:
-    """Most recent NYSE trading day as of now, ISO ``YYYY-MM-DD``.
-
-    These tests feed the resolved date straight into ``daily_append`` as
-    ``date_str``, which enforces an NYSE-trading-day gate (config#1572) —
-    a raw ``datetime.now()`` detonates every weekend and market holiday
-    (surfaced 2026-07-03, the observed Independence Day holiday: 7 tests
-    red on ``main`` with "is not an NYSE trading day"). Anchoring to the
-    most recent *trading* day keeps the date a valid session (passes the
-    gate) AND within the freshness threshold (staleness is 0 trading days
-    — the last row IS this date), so it neither rots (the 2026-05-04
-    hardcoded-date failure) nor trips the phantom-session guard.
-    """
-    from nousergon_lib.trading_calendar import is_trading_day, previous_trading_day
-
-    d = datetime.now(timezone.utc).date()
-    if not is_trading_day(d):
-        d = previous_trading_day(d)
-    return d.isoformat()
 
 
 def _stub_closes(tickers: list[str]) -> dict:
@@ -195,10 +180,10 @@ def test_skip_if_exists_true_skips_when_today_in_hist(monkeypatch):
     from builders.daily_append import daily_append
 
     # Anchor to the most recent NYSE *trading* day (see
-    # _recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # conftest.recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
     # and detonates the config#1572 phantom-session gate on weekends and
     # market holidays (2026-07-03). The trading-day anchor dodges both.
-    today_str = _recent_trading_day_str()
+    today_str = recent_trading_day_str()
     universe = ["AAPL", "MSFT", "GOOGL"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -230,10 +215,10 @@ def test_skip_if_exists_true_writes_when_today_missing(monkeypatch):
     from builders.daily_append import daily_append
 
     # Anchor to the most recent NYSE *trading* day (see
-    # _recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # conftest.recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
     # and detonates the config#1572 phantom-session gate on weekends and
     # market holidays (2026-07-03). The trading-day anchor dodges both.
-    today_str = _recent_trading_day_str()
+    today_str = recent_trading_day_str()
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -260,10 +245,10 @@ def test_skip_if_exists_false_writes_even_when_today_in_hist(monkeypatch):
     from builders.daily_append import daily_append
 
     # Anchor to the most recent NYSE *trading* day (see
-    # _recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # conftest.recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
     # and detonates the config#1572 phantom-session gate on weekends and
     # market holidays (2026-07-03). The trading-day anchor dodges both.
-    today_str = _recent_trading_day_str()
+    today_str = recent_trading_day_str()
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
