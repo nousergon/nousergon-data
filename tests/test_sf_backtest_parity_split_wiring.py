@@ -342,7 +342,7 @@ class TestSsmCommandShape:
         """
         cmds = self._commands(states, "Parity")
         work = next(
-            c for c in cmds if "nousergon_lib.ssm_log_capture run" in c
+            c for c in cmds if "krepis.ssm_log_capture run" in c
         )
         assert "--slug parity" in work
         assert "--log /var/log/parity.log" in work

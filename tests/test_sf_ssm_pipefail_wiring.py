@@ -27,8 +27,8 @@ Three rules pinned here:
        "s3://..." --only-show-errors || true' EXIT` BEFORE a
        `| tee /var/log/X.log` work line. Used by states whose
        `commands` is a plain JSON array.
-   (b) **`nousergon_lib.ssm_log_capture` CLI** — a single
-       `python -m nousergon_lib.ssm_log_capture run --slug X
+   (b) **`krepis.ssm_log_capture` CLI** — a single
+       `python -m krepis.ssm_log_capture run --slug X
        --log /var/log/X.log -- bash <launcher> ...` invocation that
        internalizes both the trap and the tee. Used by states whose
        `commands.$` is a `States.Array(...)` (the ASL escape surface
@@ -177,7 +177,7 @@ def test_weekday_sf_ssm_blocks_export_flow_doctor_enabled() -> None:
 
 _TEE_WORK_RE = re.compile(r"\| tee (?:-a )?(/var/log/[\w.-]+\.log)")
 # Accepts all three historical/current import names for the same module:
-# alpha_engine_lib.ssm_log_capture (original) -> nousergon_lib.ssm_log_capture
+# alpha_engine_lib.ssm_log_capture (original) -> krepis.ssm_log_capture
 # (rename shim) -> krepis.ssm_log_capture (v0.66.0 MIT lift, the current
 # canonical path). This regex was stale at only the FIRST name until
 # 2026-07-01 (config#1552-adjacent EOD date-thread fix) — genuinely never
@@ -203,8 +203,8 @@ def test_long_ssm_steps_ship_log_to_s3(sf_path: Path) -> None:
 
     (a) **Inline bash trap** before `| tee /var/log/X.log` work line —
         original form, plain `commands` JSON arrays only.
-    (b) **`nousergon_lib.ssm_log_capture` CLI** — single
-        `python -m nousergon_lib.ssm_log_capture run --slug X
+    (b) **`krepis.ssm_log_capture` CLI** — single
+        `python -m krepis.ssm_log_capture run --slug X
         --log /var/log/X.log -- bash <launcher>` line; internalizes the
         trap. Required form for `commands.$ States.Array(...)` states
         (ASL doesn't unescape `\\'` in arg strings; the inline-trap
@@ -275,7 +275,7 @@ def test_long_ssm_steps_ship_log_to_s3(sf_path: Path) -> None:
         "\\\"s3://alpha-engine-research/_ssm_logs/<slug>/...\\\" "
         "--only-show-errors || true' EXIT\"` immediately before the "
         "`| tee` work line (only works in plain `commands` arrays), "
-        "OR switch the work line to `python -m nousergon_lib.ssm_log_capture "
+        "OR switch the work line to `python -m krepis.ssm_log_capture "
         "run --slug X --log /var/log/X.log -- bash <launcher>` (required "
         "for `commands.$ States.Array(...)` states). See 2026-05-22 "
         "Friday-PM dry-pass + alpha-engine-lib PR #57."
