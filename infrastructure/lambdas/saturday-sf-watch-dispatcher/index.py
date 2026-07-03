@@ -340,10 +340,10 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
         f"{label}: {record['status']}",
     ]
     if record.get("failed_state"):
-        lines.append(f"Failed state: {record['failed_state']}")
+        lines.append(f"Failed state: `{record['failed_state']}`")
     if record.get("cause"):
-        lines.append(f"Cause: {record['cause']}")
-    lines.append(f"Watch log: s3://{WATCH_BUCKET}/{key}")
+        lines.append(f"Cause: `{record['cause']}`")
+    lines.append(f"Watch log: `s3://{WATCH_BUCKET}/{key}`")
     if will_dispatch:
         footer = "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
     elif AGENT_DISPATCH_ENABLED and not has_listener:
