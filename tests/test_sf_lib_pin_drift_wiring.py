@@ -83,9 +83,60 @@ def test_gate_halts_only_on_confirmed_drift(states):
     c = gate["Choices"][0]
     assert c["Variable"] == "$.libpin_drift_result.Payload.has_drift"
     assert c["BooleanEquals"] is True
-    assert c["Next"] == "HandleFailure"
+    # Confirmed drift halts, but routes through the $.error normalizer FIRST
+    # (not straight to HandleFailure) — see test_drift_halt_normalizes_error.
+    assert c["Next"] == "ExtractLibPinDriftError"
     # No drift → proceed into the pipeline.
     assert gate["Default"] == "CheckMutexRole"
+
+
+def test_drift_halt_normalizes_error_before_handle_failure(states):
+    """The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) —
+    its transition does NOT populate $.error. HandleFailure's Message calls
+    States.JsonToString($.error), so a direct Choice→HandleFailure jump killed
+    the SF with an opaque States.Runtime ('$.error could not be found') that
+    swallowed the drift reason (2026-07-03 offcycle-shell). The drift path must
+    first hit an Extract*Error normalizer that writes $.error, matching every
+    other HandleFailure entry."""
+    norm = states["ExtractLibPinDriftError"]
+    assert norm["Type"] == "Pass"
+    assert norm["ResultPath"] == "$.error"
+    assert norm["Next"] == "HandleFailure"
+    # References only the whole probe Payload — guaranteed present because the
+    # gate already dereferenced Payload.has_drift to route here — so the
+    # normalizer cannot itself raise a missing-field States.Runtime.
+    assert norm["Parameters"]["drift.$"] == "$.libpin_drift_result.Payload"
+
+
+def test_every_handle_failure_entry_populates_error(states):
+    """CHOKEPOINT for the whole failure class (2026-07-03): HandleFailure's
+    Message template hard-requires $.error via States.JsonToString($.error), so
+    EVERY transition that lands on HandleFailure must guarantee $.error is set —
+    either a Task Catch with ResultPath '$.error', or a Pass normalizer with
+    ResultPath '$.error'. A future soft-path/Choice that jumps straight to
+    HandleFailure (as LibPinDriftGate once did) would re-introduce the opaque
+    States.Runtime meta-crash; this test fails loudly if any such path appears."""
+    offenders = []
+    for name, st in states.items():
+        # Catch-based entries.
+        for cat in st.get("Catch", []):
+            if cat.get("Next") == "HandleFailure" and cat.get("ResultPath") != "$.error":
+                offenders.append(f"{name} Catch ResultPath={cat.get('ResultPath')!r}")
+        # State-transition entries (Next / Default / Choice).
+        transitions = [st.get("Next"), st.get("Default")]
+        transitions += [c.get("Next") for c in st.get("Choices", [])]
+        if "HandleFailure" in transitions:
+            # The source state must itself write $.error before handing off —
+            # i.e. be a Pass normalizer with ResultPath '$.error'.
+            if not (st.get("Type") == "Pass" and st.get("ResultPath") == "$.error"):
+                offenders.append(
+                    f"{name} (Type={st.get('Type')}) transitions to HandleFailure "
+                    f"without setting $.error (ResultPath={st.get('ResultPath')!r})"
+                )
+    assert not offenders, (
+        "State(s) reach HandleFailure without populating $.error — "
+        "HandleFailure will die with States.Runtime: " + "; ".join(offenders)
+    )
 
 
 def test_gate_runs_before_any_spot_launch(sf, states):
