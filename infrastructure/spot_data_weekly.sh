@@ -128,6 +128,14 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 # in lockstep — otherwise the extra attempts are dead budget.
 MAX_SPOT_ATTEMPTS="${MAX_SPOT_ATTEMPTS:-2}"
 SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
+# alpha-engine-config#883 — MAX_SPOT_ATTEMPTS ↔ SF executionTimeout coupling
+# guard. Passed to the lib chokepoint's --sf-execution-timeout/
+# --per-attempt-seconds flags (see _spot_failure_reason below); when set, the
+# lib refuses to advise a relaunch the outer SF budget cannot absorb. Empty by
+# default (the SF sets a per-STATE executionTimeout, not one this script reads
+# directly) — the bound is MAX_SPOT_ATTEMPTS only unless an operator threads
+# the actual state's executionTimeout through explicitly.
+SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 # Backoff before a relaunch so a transient regional capacity dip has a
 # moment to clear (the launcher rotates AZ/type anyway, but a brief pause
 # materially raises the odds the next attempt lands).
@@ -275,38 +283,47 @@ cleanup() {
 # Echoes a non-empty reason string + returns 0 when the just-failed run
 # was a CONFIRMED spot interruption — either the launcher exhausted every
 # instance_type × subnet (ec2_spot rc 64) or AWS reclaimed the running
-# spot (no-capacity / by-price / capacity-oversubscribed). A GENUINE
-# inner-workload failure leaves the instance fulfilled/running and
-# returns 1 → NOT retryable, fails loud per the fail-fast posture (blind
-# retry would mask a real collector/prune bug).
+# spot (no-capacity / by-price / capacity-oversubscribed / budget still
+# available). A GENUINE inner-workload failure leaves the instance
+# fulfilled/running and returns 1 → NOT retryable, fails loud per the
+# fail-fast posture (blind retry would mask a real collector/prune bug).
+#
+# alpha-engine-config#883 — the mid-run reclaim DECISION below is the lib
+# chokepoint `python -m krepis.ec2_spot relaunch-decision` (nousergon-lib
+# v0.65.0+; the module physically lives in krepis, invoked directly per
+# config#1649 — same convention already used for `krepis.ec2_spot launch`
+# and `krepis.ssm_dispatcher run` above). This file was the ORIGINAL
+# reference implementation (PR #349) that #883 is named after; its own
+# inline `describe-spot-instance-requests` + instance-StateReason grep had
+# grown a subtly different counter/threshold convention than the
+# backtester's and predictor's copies. The lib now owns the classify
+# (describe-instances, run while the instance still exists) + the
+# MAX_SPOT_ATTEMPTS/SF_EXECUTION_TIMEOUT-bounded decision (exit 0 =
+# relaunch; NO_RELAUNCH_EXIT_CODE 75 = hold) so all three launchers share
+# one convention instead of three divergent ones.
 _spot_failure_reason() {
     local rc="$1"
-    # Launch-time exhaustion across all combinations (ec2_spot exit 64).
+    # Launch-time exhaustion across all combinations (ec2_spot exit 64) —
+    # no instance was ever created, so there is nothing for the lib to
+    # describe-instances; the launcher's own exit code IS the
+    # classification. Retained as-is: this is a launch-time-capacity
+    # feature the backtester/predictor siblings don't have, not part of
+    # the mid-run reclaim classifier #883 lifts to the lib.
     if [ "$rc" -eq 64 ]; then echo "launch-capacity-exhausted"; return 0; fi
     # Nothing launched and not a clean exit → unclassifiable, treat hard.
     [ -z "$INSTANCE_ID" ] && return 1
-    # Authoritative signal: the spot REQUEST status code.
-    local sir_code
-    sir_code=$(aws ec2 describe-spot-instance-requests \
-        --filters "Name=instance-id,Values=$INSTANCE_ID" \
-        --query 'SpotInstanceRequests[0].Status.Code' \
-        --output text --region "$AWS_REGION" 2>/dev/null || echo "")
-    case "$sir_code" in
-        instance-terminated-no-capacity|instance-terminated-by-price|instance-terminated-capacity-oversubscribed|instance-stopped-no-capacity|instance-stopped-by-price|instance-stopped-capacity-oversubscribed|marked-for-termination)
-            echo "$sir_code"; return 0 ;;
-    esac
-    # Fallback: the instance's own StateReason (spot reclamation surfaces
-    # as Server.SpotInstanceTermination; capacity events as
-    # Server.InsufficientInstanceCapacity).
-    local state_reason
-    state_reason=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-        --query 'Reservations[].Instances[].StateReason.Code' \
-        --output text --region "$AWS_REGION" 2>/dev/null || echo "")
-    case "$state_reason" in
-        Server.SpotInstanceTermination|Server.InsufficientInstanceCapacity)
-            echo "$state_reason"; return 0 ;;
-    esac
-    return 1
+    local _decide_out _decide_rc
+    _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+        --instance-id "$INSTANCE_ID" \
+        --region "$AWS_REGION" \
+        --attempt "$SPOT_ATTEMPT" \
+        --max-attempts "$MAX_SPOT_ATTEMPTS" \
+        ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+        2>/dev/null)"
+    _decide_rc=$?
+    echo "  spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}" >&2
+    [ "$_decide_rc" -eq 0 ] || return 1
+    echo "confirmed-reclaim${_decide_out:+ ($_decide_out)}"
 }
 
 on_exit() {
