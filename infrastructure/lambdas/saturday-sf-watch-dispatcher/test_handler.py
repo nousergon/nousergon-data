@@ -137,9 +137,21 @@ def test_telegram_is_silent_and_records_artifact_location():
     assert kwargs["disable_notification"] is True  # notifier already buzzed loud
     assert "Fleet-SF Watch — OBSERVE" in text
     assert "Weekly Freshness SF: FAILED" in text  # pipeline-aware label
-    assert "Failed state: RAGIngestion" in text
+    assert "Failed state: `RAGIngestion`" in text
     assert "consolidated/saturday_sf_watch/2023-11-14.json" in text
     assert "observe-only" in text
+
+
+def test_watch_log_path_is_code_fenced():
+    """config#1584: underscored S3 keys must survive Telegram legacy Markdown
+    (which treats bare ``_`` as italic delimiters) — wrap in backticks."""
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED"), None)
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "`s3://alpha-engine-research/consolidated/saturday_sf_watch/2023-11-14.json`" in text
+    assert "Failed state: `RAGIngestion`" in text
+    assert "Cause: `States.TaskFailed: RAGIngestion failed`" in text
 
 
 def test_run_date_prefers_input_run_date():
