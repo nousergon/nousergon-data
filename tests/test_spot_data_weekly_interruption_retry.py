@@ -187,8 +187,13 @@ class TestLibChokepointAdoption:
 
     def test_classifier_calls_lib_before_terminate(self, text):
         """Classification must happen while the instance still exists —
-        BEFORE cleanup() terminates it. on_exit computes `reason` (which
-        calls the lib chokepoint) before calling cleanup."""
+        BEFORE cleanup() terminates it. on_exit CALLS `_spot_failure_reason`
+        (which invokes the lib chokepoint) before calling `cleanup`
+        (which terminates the instance). Note: this must be checked on
+        on_exit()'s CALL order, not the functions' textual definition
+        order — cleanup() and _spot_failure_reason() are declared as
+        separate top-level functions, so a raw whole-file string search
+        would just reflect definition order, not execution order."""
         on_exit = text[text.index("on_exit() {"):]
         reason_at = on_exit.index("_spot_failure_reason")
         cleanup_at = on_exit.index("\n    cleanup")
@@ -196,12 +201,6 @@ class TestLibChokepointAdoption:
             "Failure must be classified (via the lib chokepoint) BEFORE "
             "cleanup() terminates the instance — the lib's describe-"
             "instances call requires a live instance."
-        )
-        decide_idx = text.index("krepis.ec2_spot relaunch-decision")
-        term_idx = text.index("aws ec2 terminate-instances")
-        assert decide_idx < term_idx, (
-            "the lib relaunch-decision call must appear before "
-            "terminate-instances in the script."
         )
 
 

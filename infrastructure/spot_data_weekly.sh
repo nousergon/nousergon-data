@@ -289,15 +289,16 @@ cleanup() {
 # fail-fast posture (blind retry would mask a real collector/prune bug).
 #
 # alpha-engine-config#883 — the mid-run reclaim DECISION below is the lib
-# chokepoint `python -m krepis.ec2_spot relaunch-decision` (nousergon-lib
-# v0.65.0+; the module physically lives in krepis, invoked directly per
-# config#1649 — same convention already used for `krepis.ec2_spot launch`
-# and `krepis.ssm_dispatcher run` above). This file was the ORIGINAL
-# reference implementation (PR #349) that #883 is named after; its own
-# inline `describe-spot-instance-requests` + instance-StateReason grep had
-# grown a subtly different counter/threshold convention than the
-# backtester's and predictor's copies. The lib now owns the classify
-# (describe-instances, run while the instance still exists) + the
+# chokepoint (nousergon-lib v0.65.0+; the ec2_spot module physically lives
+# in the MIT krepis package now, invoked directly per config#1649 — the
+# same $LIB_PYTHON venv-path + direct-krepis-module convention this file
+# already uses for its capacity-resilient spot launch and its SSM
+# dispatch further below). This file was the ORIGINAL reference
+# implementation (PR #349) that #883 is named after; its own inline
+# describe-spot-instance-requests + instance-StateReason grep had grown a
+# subtly different counter/threshold convention than the backtester's and
+# predictor's copies. The lib now owns the classify (describe-instances,
+# run while the instance still exists) + the
 # MAX_SPOT_ATTEMPTS/SF_EXECUTION_TIMEOUT-bounded decision (exit 0 =
 # relaunch; NO_RELAUNCH_EXIT_CODE 75 = hold) so all three launchers share
 # one convention instead of three divergent ones.
