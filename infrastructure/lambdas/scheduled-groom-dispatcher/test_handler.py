@@ -244,6 +244,57 @@ def test_launch_failure_raises(monkeypatch):
         idx.handler({"run_mode": "full"}, None)
 
 
+def test_run_token_generated_and_exported_and_returned(monkeypatch):
+    # config#1645: the dispatch Step Function's completion-marker check needs a
+    # per-attempt token that reaches the box (as GROOM_RUN_TOKEN) AND comes back
+    # in the Lambda's own response (so the SF can build the S3 key to check).
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    g = out["groom"]
+    assert "run_token" in g and g["run_token"], "run_token missing from the Lambda's response"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert f"export GROOM_RUN_TOKEN={g['run_token']}" in cmd
+    assert cmd.index("export GROOM_RUN_TOKEN") < cmd.index("groom_spot_bootstrap.sh")
+
+
+def test_run_token_differs_across_invocations(monkeypatch):
+    # Each SF relaunch attempt calls the Lambda again — a stale token reused
+    # across attempts would let a dead attempt's (absent) marker be confused
+    # with a fresh attempt's, defeating the whole relaunch-detection mechanism.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out1 = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    out2 = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out1["groom"]["run_token"] != out2["groom"]["run_token"]
+
+
+def test_force_on_demand_skips_spot_entirely(monkeypatch):
+    # config#1645: the SF's final bounded relaunch attempt after repeated
+    # mid-run spot interruption sets force_on_demand — must go straight to
+    # on-demand, not attempt (and possibly lose to) spot a third time.
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-forced"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "force_on_demand": True}, None)
+    assert out["groom"]["market"] == "on-demand"
+    assert seen == [False], "force_on_demand must skip the spot attempt outright"
+
+
+def test_force_on_demand_absent_by_default(monkeypatch):
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-normal"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"run_mode": "full"}, None)
+    assert seen == [True], "the 2 pre-existing schedules' behavior must be unchanged"
+
+
 def test_post_launch_failure_terminates_instance_no_orphan(monkeypatch):
     # If the box launches but a later step (SSM-online / SendCommand) fails, the
     # box would orphan (no bootstrap → no watchdog/trap). The dispatcher must

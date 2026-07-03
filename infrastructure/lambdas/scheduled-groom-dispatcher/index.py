@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import time
+import uuid
 
 import boto3
 from nousergon_lib import ec2_spot
@@ -124,6 +125,16 @@ def _resolve_model(event: dict) -> str:
     return m
 
 
+def _resolve_force_on_demand(event: dict) -> bool:
+    """config#1645: set by the dispatch Step Function's relaunch loop on the
+    final bounded retry after repeated spot-interruption (mid-run box death,
+    not a launch-time capacity error — see _launch_instance) — forces this
+    attempt onto on-demand so a bad spot-capacity window still guarantees
+    completion rather than retrying on the same flaky market indefinitely.
+    Not set by any of the 3 live schedules' own EventBridge Scheduler input."""
+    return bool(event.get("force_on_demand", False))
+
+
 def _resolve_soft_limit_min(event: dict) -> int | None:
     """Optional bounded-test override — NOT set by any of the 3 live schedules
     (their SCHED_INPUTS carry no such key), only by a manual `aws lambda invoke`
@@ -144,7 +155,7 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
 
 
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
-                       soft_limit_min: int | None = None) -> str:
+                       run_token: str, soft_limit_min: int | None = None) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -174,12 +185,16 @@ git clone --depth 1 --branch {GROOM_BRANCH} \
 cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
+export GROOM_RUN_TOKEN={run_token}
 exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
-def _launch_instance() -> tuple[str, str]:
-    """Launch the groom box; spot first, on-demand fallback on capacity exhaustion."""
+def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+    """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
+    OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
+    attempt after repeated mid-run spot interruption — skip straight to on-demand
+    rather than trying the same flaky spot market a third time)."""
     common = dict(
         image_id=AMI_ID,
         key_name=KEY_NAME,
@@ -190,6 +205,10 @@ def _launch_instance() -> tuple[str, str]:
         tag_name="alpha-engine-groom-spot",
         region=REGION,
     )
+    if force_on_demand:
+        logger.warning("force_on_demand set (config#1645 relaunch escalation) — launching ON-DEMAND")
+        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
+        return iid, "on-demand"
     try:
         iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=True, **common)
         return iid, "spot"
@@ -223,15 +242,15 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
-                    soft_limit_min: int | None = None) -> str:
+                    run_token: str, soft_limit_min: int | None = None) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
-        Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495",
+        Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         Parameters={
-            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter, soft_limit_min)],
+            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter, run_token, soft_limit_min)],
             # Execution timeout (NOT the start timeout) — without this SSM kills the
             # command at the 3600s default, guillotining a multi-hour groom.
             "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
@@ -262,13 +281,18 @@ def _terminate_instance(instance_id: str) -> None:
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
-                       soft_limit_min: int | None = None) -> dict:
+                       soft_limit_min: int | None = None, force_on_demand: bool = False) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
 
-    instance_id, market = _launch_instance()
+    # config#1645: a fresh token per launch ATTEMPT (not per schedule) — the
+    # dispatch Step Function's relaunch loop calls this Lambda again with a new
+    # execution, so each attempt gets its own S3 completion-marker key. A dead
+    # box's stale marker (if any) can never be mistaken for THIS attempt's.
+    run_token = uuid.uuid4().hex
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     logger.info("launched groom box %s (%s)", instance_id, market)
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
@@ -285,12 +309,15 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}"
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
-        command_id = _send_bootstrap(instance_id, run_mode, run_url, model, issue_filter, soft_limit_min)
+        command_id = _send_bootstrap(
+            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min
+        )
     except Exception:
         _terminate_instance(instance_id)
         raise
     logger.info(
-        "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s schedule=%s",
+        "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s "
+        "schedule=%s run_token=%s",
         instance_id,
         market,
         command_id,
@@ -298,6 +325,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         model,
         issue_filter,
         schedule_label,
+        run_token,
     )
     return {
         "launched": True,
@@ -307,6 +335,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "run_mode": run_mode,
         "model": model,
         "issue_filter": issue_filter,
+        "run_token": run_token,
     }
 
 
@@ -318,14 +347,20 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
     (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
+    `force_on_demand` (config#1645) is set only by the dispatch Step Function's
+    own relaunch loop on its final bounded retry — no live schedule sets it.
     """
     event = event or {}
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
     soft_limit_min = _resolve_soft_limit_min(event)
+    force_on_demand = _resolve_force_on_demand(event)
     schedule_label = str(event.get("schedule") or "unknown")
-    logger.info("scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s schedule=%s",
-                run_mode, model, issue_filter, soft_limit_min, schedule_label)
-    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min)
+    logger.info(
+        "scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s "
+        "force_on_demand=%s schedule=%s",
+        run_mode, model, issue_filter, soft_limit_min, force_on_demand, schedule_label,
+    )
+    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min, force_on_demand)
     return {"groom": result}
