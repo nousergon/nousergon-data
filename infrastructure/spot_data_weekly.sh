@@ -23,7 +23,9 @@
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 2).**
 # Communication with the spot is now via `aws ssm send-command`
 # (IAM-authenticated, CloudTrail-audited) wrapped at the lib chokepoint
-# `python -m nousergon_lib.ssm_dispatcher run`. No port-22 inbound on
+# `python -m krepis.ssm_dispatcher run` (invoked directly via krepis per
+# config#1649 — the nousergon_lib re-export shim is guard-less under
+# `python -m` on lib >=0.81.0 and silently no-ops). No port-22 inbound on
 # the spot SG; no ssh / scp / ssh-keyscan. The private config.yaml is
 # staged to a temporary S3 prefix the dispatcher controls and pulled
 # down by the spot via its existing `alpha-engine-executor-profile` IAM
@@ -219,7 +221,7 @@ echo "  Run mode      : $RUN_MODE"
 echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (relaunch on confirmed spot interruption)"
 echo "  Preflight-only: $PREFLIGHT_ONLY  (1 = boot + preflight + exit 0, NO fetch/write)"
 echo "  S3 bucket     : $S3_BUCKET"
-echo "  Transport     : SSM via lib chokepoint (python -m nousergon_lib.ssm_dispatcher)"
+echo "  Transport     : SSM via lib chokepoint (python -m krepis.ssm_dispatcher)"
 echo ""
 
 # ── Preflight ───────────────────────────────────────────────────────────────
@@ -340,7 +342,7 @@ trap on_exit EXIT
 
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
-INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
+INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
     --types "$INSTANCE_TYPES" \
     --subnets "$SUBNETS" \
     --image-id "$AMI_ID" \
@@ -357,7 +359,8 @@ if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
     if [ "$ec2_spot_rc" -eq 0 ]; then
       # rc=0 with an EMPTY instance id = the launch layer produced nothing
       # (e.g. the guard-less `-m nousergon_lib.ec2_spot` shim no-op,
-      # config#1646). `${ec2_spot_rc:-1}` defaults only when UNSET — a
+      # config#1646 — closed at this launcher's transport by the krepis
+      # migration, config#1649). `${ec2_spot_rc:-1}` defaults only when UNSET — a
       # captured 0 passed through and the SF recorded a silent success
       # on 2026-07-03. An empty id must always fail loud.
       echo "ERROR: ec2_spot launch exited 0 without an instance id — failing loud (config#1646)" >&2
@@ -409,9 +412,12 @@ done
 # ── SSM dispatch primitive (lib chokepoint) ──────────────────────────────────
 # run_ssm "<description>" [timeout_seconds] <<HEREDOC ... HEREDOC
 #
-# Thin wrapper around `python -m nousergon_lib.ssm_dispatcher run` (lib
-# v0.35.0+). The lib base64-wraps the script body (read from stdin via the
-# `--script-stdin` flag) for AWS-RunShellScript transport, polls
+# Thin wrapper around `python -m krepis.ssm_dispatcher run` (lib
+# v0.35.0+ as nousergon_lib.ssm_dispatcher; invoked directly via krepis
+# per config#1649 — the nousergon_lib re-export shim is guard-less under
+# `python -m` on lib >=0.81.0 and silently no-ops). The lib base64-wraps
+# the script body (read from stdin via the `--script-stdin` flag) for
+# AWS-RunShellScript transport, polls
 # get-command-invocation, streams StandardOutputContent delta to this
 # process's stdout, and propagates the inner script's exit status (0 on
 # Success; 1 on Failed/TimedOut/Cancelled). Full stdout/stderr beyond
@@ -446,7 +452,7 @@ done
 # (substrate is failure-only).
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
-    "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
+    "$LIB_PYTHON" -m krepis.ssm_dispatcher run \
         --instance-id "$INSTANCE_ID" \
         --description "data-weekly: $description" \
         --timeout "$timeout_s" \
