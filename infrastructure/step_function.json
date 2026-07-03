@@ -97,15 +97,26 @@
     },
     "LibPinDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch.",
+      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention.",
       "Choices": [
         {
           "Variable": "$.libpin_drift_result.Payload.has_drift",
           "BooleanEquals": true,
-          "Next": "HandleFailure"
+          "Next": "ExtractLibPinDriftError"
         }
       ],
       "Default": "CheckMutexRole"
+    },
+    "ExtractLibPinDriftError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed lib-pin drift (LibPinDriftGate has_drift==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the drift offenders (2026-07-03 offcycle-shell). Carries the whole probe Payload (reason/offenders/pins/parity_ok/floor_ok/min_lib_version) so the FAILED SNS alert names the exact cross-repo pin mismatch a human must resolve. References only $.libpin_drift_result.Payload — guaranteed present because the gate already dereferenced Payload.has_drift to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors the existing Extract*Error → HandleFailure convention; no new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on real drift by design).",
+      "Parameters": {
+        "phase": "LibPinDriftGate",
+        "source": "LibPinDriftGate.has_drift",
+        "drift.$": "$.libpin_drift_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
     "CheckMutexRole": {
       "Type": "Choice",
