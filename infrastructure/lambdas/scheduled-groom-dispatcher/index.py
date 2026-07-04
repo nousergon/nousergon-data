@@ -71,15 +71,22 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import boto3
-from krepis.telegram import send_message
+from flow_doctor_telegram import notify_via_flow_doctor
 from krepis.usage_pacing import pace_check, reset_window
 from nousergon_lib import ec2_spot
 from nousergon_lib.ec2_spot import SpotCapacityExhausted
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+_FLOW_NAME = "scheduled-groom-dispatcher"
+_DB_BASENAME = "flow_doctor_scheduled_groom_dispatcher"
+_OPS_TOPICS = (
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
@@ -446,6 +453,31 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     }
 
 
+def _notify_pace_skip(pace: dict, schedule_label: str, run_mode: str) -> None:
+    """Best-effort loud ping for a pre-boot pace skip — never raises."""
+    text = (
+        "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
+        f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
+        f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
+        f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
+        "cost incurred. Resumes automatically on the next scheduled run "
+        "(or after the weekly reset)."
+    )
+    try:
+        notify_via_flow_doctor(
+            text,
+            silent=False,
+            severity="warning",
+            dedup_key=f"{_FLOW_NAME}:pace_skip:{schedule_label}",
+            flow_name=_FLOW_NAME,
+            topics=_OPS_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "run_mode": run_mode, **pace},
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("pace-gate skip Telegram failed (non-fatal): %s", exc)
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
@@ -487,14 +519,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "wet=%.0f) — groom spot NOT launched, resumes next schedule/reset",
                 pace["used_frac"], pace["elapsed_frac"], pace["overrun"], pace["wet"],
             )
-            send_message(
-                "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
-                f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
-                f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
-                f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
-                "cost incurred. Resumes automatically on the next scheduled run "
-                "(or after the weekly reset)."
-            )
+            _notify_pace_skip(pace, schedule_label, run_mode)
             return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
 
     result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min, force_on_demand)
