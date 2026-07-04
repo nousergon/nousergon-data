@@ -11,8 +11,8 @@
 #   - EOD SF:     24h window, watch-day = today is a NYSE trading day
 #   - Saturday SF: 7d window, watch-day = today is Sunday
 # Alerts fire via alpha_engine_lib.alerts.publish to a DISTINCT SNS topic
-# (alpha-engine-watchdog-alerts) + Telegram in parallel — channel
-# independence preserved per plan doc §3.5.
+# (alpha-engine-watchdog-alerts) + flow-doctor forum topics for Telegram
+# (config#1742 T2) — channel independence preserved per plan doc §3.5.
 #
 # Managed outside CloudFormation — same rationale as
 # sf-telegram-notifier / eod-success-friday-shell-trigger /
@@ -70,19 +70,18 @@ if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
 
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install \
-  --quiet \
-  --target "${PKG}" \
-  --upgrade \
-  -r "${SCRIPT_DIR}/requirements.txt"
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -133,7 +132,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO}' \
+      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -184,6 +183,18 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic empty event — exercises the full handler) --------
 
