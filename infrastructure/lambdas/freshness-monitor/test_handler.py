@@ -6,8 +6,8 @@ contract: registry loading, per-spec exception isolation, heartbeat
 + check_results emission, OBSERVE-mode alert suppression, dedup-key
 threading, severity routing for probe_failed.
 
-Tests mock both ``boto3.client`` AND ``alpha_engine_lib.alerts.publish``
-so no live AWS or Telegram calls fire. The lib substrate
+Tests mock ``boto3.client``, ``krepis.alerts.publish``, and
+``notify_via_flow_doctor`` so no live AWS or Telegram calls fire. The lib substrate
 (``check_freshness`` itself) is exercised through real code — only
 the S3 client is mocked, mirroring the substrate's own test pattern.
 
@@ -30,6 +30,7 @@ import pytest
 
 # Make the Lambda handler importable.
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -314,12 +315,15 @@ def test_handler_alerts_enabled_fires_with_dedup_key(
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
 
     publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
 
     result = index.handler({}, None)
 
     assert result["alerts_enabled"] is True
     assert publish_mock.called
+    assert notify_mock.called
 
     # Inspect the publish calls — dedup keys should be unique per-artifact
     # and reflect the cycle window.
@@ -367,7 +371,9 @@ def test_handler_probe_failed_routes_to_critical(
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
 
     publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
 
     index.handler({}, None)
 
@@ -523,13 +529,18 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
         canonical_key="k/2026-05-30", reason="absent",
     )
     publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
     assert index._maybe_alert(spec, result, fixed_now) is True
     publish_mock.assert_called_once()
     call = publish_mock.call_args
     assert "artifact_id=x" in call.args[0]
     assert call.kwargs["severity"] == "warning"  # spec severity, not bumped
+    assert call.kwargs["telegram"] is False
     assert call.kwargs["dedup_key"] == "freshness_x_2026-W22"
+    notify_mock.assert_called_once()
+    assert notify_mock.call_args.kwargs["dedup_key"] == "freshness_x_2026-W22"
 
 
 def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now):
@@ -548,10 +559,15 @@ def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now)
     )
     result = CheckResult(state="probe_failed", reason="403")
     publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
     assert index._maybe_alert(spec, result, fixed_now) is True
     publish_mock.assert_called_once()
     assert publish_mock.call_args.kwargs["severity"] == "critical"
+    assert publish_mock.call_args.kwargs["telegram"] is False
+    notify_mock.assert_called_once()
+    assert notify_mock.call_args.kwargs["severity"] == "critical"
 
 
 # ── Historical-mode tests ────────────────────────────────────────────────────
@@ -1193,7 +1209,9 @@ def test_recovery_mode_dispatch_suppresses_page(monkeypatch, fake_s3, fixed_now)
     factory, sf, lam = _make_clients(fake_s3)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
     publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
 
     result = index.handler({}, None)
 

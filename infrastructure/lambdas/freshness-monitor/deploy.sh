@@ -106,14 +106,22 @@ fi
 
 # ----- 1. Package: pip install runtime deps into $PKG ----------------------
 
-PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-echo "Installing runtime deps into ${PKG} (pip install -t)..."
+PKG=$(mktemp -d)
+TEST_PKG=$(mktemp -d)
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_PKG' '$TEST_DEPS'" EXIT
+
+echo "Installing runtime deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
+
+# Host-side pytest imports the handler against real lib code — must use
+# macOS wheels. Docker pip targets linux/amd64 for Lambda only (#621).
+echo "Installing host test deps into ${TEST_PKG} (macOS pip for pytest gate)..."
 python3 -m pip install \
   --quiet \
-  --target "${PKG}" \
+  --target "${TEST_PKG}" \
   --upgrade \
   -r "${SCRIPT_DIR}/requirements.txt"
 
@@ -137,13 +145,14 @@ fi
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   echo "Installing pytest into ${TEST_DEPS}..."
   python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
-  echo "Running handler unit tests (PYTHONPATH=${PKG}:${TEST_DEPS})..."
-  PYTHONPATH="${PKG}:${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  echo "Running handler unit tests (PYTHONPATH=${TEST_PKG}:${TEST_DEPS})..."
+  PYTHONPATH="${TEST_PKG}:${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1c. Copy handler + zip Lambda package -------------------------------
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -294,6 +303,18 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration; preserve alert flags)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
 
 # ----- 4. Upload registry to S3 ---------------------------------------------
 # Skipped under --code-only: alpha-engine-config's sync-artifact-registry.yml

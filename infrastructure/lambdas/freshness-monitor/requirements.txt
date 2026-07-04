@@ -1,16 +1,6 @@
-# Pinned to nousergon-lib v0.73.0 — adds the continuous `run_calendar` enum
-# (trading_days / all_days / market_hours): the single source of truth for a
-# continuous artifact's calendar-awareness, driving BOTH the idle
-# short-circuit AND a trading-day-aware freshness floor. Fixes the
-# Monday-morning false positive that the v0.63.0 active-window gate left
-# unfixed (the wall-clock `now - interval - sla` floor reaches back across
-# the weekend and flags a daily trading-day producer stale before its run;
-# the trading-day floor counts only session days). v0.63.0 added the
-# active-window gate (open_orders overnight storm); v0.62.0 the RECENCY
-# redesign (PR #128). active_trading_days_only is now DEPRECATED (subsumed
-# by run_calendar="trading_days"); honored as a fallback during migration.
-# Name changed alpha-engine-lib -> nousergon-lib at the 0.60 rename; index.py's
-# alpha_engine_lib imports keep working via the compat shim (lib >=0.60.2).
+# config#1747 — flow-doctor forum-topic routing for SLA-miss alerts.
+# Substrate bumped to v0.82.0 for flow_doctor_fleet + compat with sibling Lambdas.
 # Bumping this is a substrate-change PR — not a code-only refresh.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.73.0
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0
+krepis>=0.10.2
 pyyaml>=6.0

@@ -24,9 +24,10 @@ invocation:
      — the monitor monitors itself; substrate-health-check daily
      watches the heartbeat.
   5. For misses past SLA (``state ∈ {missing, stale, probe_failed}``),
-     route to :func:`krepis.alerts.publish` with
-     ``dedup_key=resolve_dedup_key(spec, now)`` — dedup collapses
-     4×/hour retries to one alert per cycle per artifact.
+     route SNS via :func:`krepis.alerts.publish` (``telegram=False``) and
+     Telegram via flow-doctor forum topics (config#1742 T2 /
+     config#1747) with ``dedup_key=resolve_dedup_key(spec, now)`` — dedup
+     collapses 4×/hour retries to one alert per cycle per artifact.
   6. **OBSERVE-mode gate**: when env
      ``FRESHNESS_MONITOR_ENABLED`` is anything other than
      ``"true"`` (case-insensitive), alerts are suppressed but the
@@ -64,10 +65,18 @@ from alpha_engine_lib.artifact_freshness import (
     resolve_dedup_key,
 )
 from alpha_engine_lib.trading_calendar import previous_trading_day
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+_FLOW_NAME = "freshness-monitor"
+_DB_BASENAME = "flow_doctor_freshness_monitor"
+_FRESHNESS_TELEGRAM_TOPICS = (
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 
 # ── Configuration (env-driven so Phase 6 cutover is a single CLI flip) ──────
 
@@ -696,6 +705,21 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         source="freshness-monitor",
         dedup_key=dedup_key,
         dedup_window_min=None,  # one alert per cadence window — substrate handles cycle bucketing
+        telegram=False,
+    )
+    notify_via_flow_doctor(
+        body,
+        silent=False,
+        severity=severity,
+        dedup_key=dedup_key,
+        flow_name=_FLOW_NAME,
+        topics=_FRESHNESS_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        context={
+            "artifact_id": spec.artifact_id,
+            "state": result.state,
+            "owner_repo": spec.owner_repo,
+        },
     )
     return True
 
