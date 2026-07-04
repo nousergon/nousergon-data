@@ -156,18 +156,21 @@ print('index.py syntax OK')
 "
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
-# Hermetic (boto3/nousergon_lib are stubbed in sys.modules before `import
-# index` — see test_handler.py's header), so only pytest itself needs to be
-# resolvable here, not the runtime deps. Installed into a scratch TEST_DEPS
-# dir — NOT the caller's global site-packages, not bundled into the Lambda
-# zip — so this works on a bare CI runner (2026-07-02: the CI auto-deploy
-# workflow's FIRST real run failed here with "No module named pytest" — this
-# script had only ever been run from an operator's laptop before, where
-# pytest happened to already be installed as a dev dependency; the gap was
-# invisible until CI actually exercised this path).
+# Hermetic for AWS (boto3/nousergon_lib are stubbed in sys.modules before
+# `import index` — see test_handler.py's header): those need real AWS creds/
+# services to exercise for real, so tests fake them instead. krepis (2026-07-04,
+# the pre-boot pace gate's linear-pace math) is pure stdlib with no AWS/creds
+# dependency, so it's installed for real here rather than stubbed — the tests
+# exercise the ACTUAL pace_check arithmetic, not a faked stand-in. Both land in
+# a scratch TEST_DEPS dir — NOT the caller's global site-packages, not bundled
+# into the Lambda zip — so this works on a bare CI runner (2026-07-02: the CI
+# auto-deploy workflow's FIRST real run failed here with "No module named
+# pytest" — this script had only ever been run from an operator's laptop
+# before, where pytest happened to already be installed as a dev dependency;
+# the gap was invisible until CI actually exercised this path).
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
+  echo "Installing pytest + krepis into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "krepis==0.10.0"
   echo "Running handler unit tests..."
   PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
