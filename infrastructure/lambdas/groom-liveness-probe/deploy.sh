@@ -94,17 +94,20 @@ trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
-# Only alpha_engine_lib.telegram is stubbed in sys.modules (see
-# test_handler.py's header) — `index.py`'s `import boto3` is REAL, and
-# requirements.txt deliberately omits boto3 (provided by the Lambda runtime
-# at deploy time, per its own comment), so pytest's `import index` needs it
-# installed explicitly here. Installed into a scratch TEST_DEPS dir — NOT the
-# caller's global site-packages, not bundled into the Lambda zip (mirrors
-# freshness-monitor/deploy.sh). 2026-07-02: the CI auto-deploy workflow's
-# FIRST real run failed here with "No module named pytest" — this script had
-# only ever been run from an operator's laptop before, where pytest/boto3
-# happened to already be installed as dev/tooling dependencies; the gap was
-# invisible until CI actually exercised this path.
+# The git-only nousergon_lib submodules index.py imports at module scope
+# (flow_doctor_fleet.FleetTelegramTopic; telegram.send_message via
+# flow_doctor_telegram) are stubbed in sys.modules by test_handler.py BEFORE
+# `import index` (see its header) — so this gate stays hermetic on bare python.
+# `index.py`'s `import boto3` is REAL, and requirements.txt deliberately omits
+# boto3 (provided by the Lambda runtime at deploy time, per its own comment),
+# so pytest's `import index` needs it installed explicitly here. Installed into
+# a scratch TEST_DEPS dir — NOT the caller's global site-packages, not bundled
+# into the Lambda zip (mirrors freshness-monitor/deploy.sh). Two prior gaps
+# here, same class (the gate's dep/stub set drifting from index.py's real
+# module-level imports): 2026-07-02 "No module named pytest" (script had only
+# run on operator laptops where pytest/boto3 were ambient); 2026-07-04 "No
+# module named nousergon_lib" (config#1742 flow-doctor cutover moved the source
+# onto nousergon_lib but the sys.modules stub was not migrated in lockstep).
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   echo "Installing pytest + boto3 into ${TEST_DEPS}..."
   python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
