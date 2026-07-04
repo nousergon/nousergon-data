@@ -75,6 +75,7 @@ python3 -m pip install \
   -r "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
