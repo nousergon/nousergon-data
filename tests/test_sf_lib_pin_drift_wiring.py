@@ -53,8 +53,10 @@ def test_skip_gate_default_runs_check_and_skip_bypasses(states):
     skip = states["CheckSkipLibPinDriftCheck"]
     assert skip["Default"] == "LibPinDriftCheck"
     c = skip["Choices"][0]
-    # skip_lib_pin_drift_check == true bypasses straight into the pipeline
-    assert c["Next"] == "CheckMutexRole"
+    # skip_lib_pin_drift_check == true bypasses ONLY the lib-pin check; it
+    # still routes into CheckPipelineContract (L4595), the next preflight
+    # gate, rather than skipping straight past it into the pipeline.
+    assert c["Next"] == "CheckPipelineContract"
     variables = {x["Variable"] for x in c["And"]}
     assert variables == {"$.skip_lib_pin_drift_check"}
 
@@ -71,10 +73,11 @@ def test_check_invokes_predictor_lambda_with_action(states):
 
 def test_check_fails_open_via_catch(states):
     # The probe's own failure (incl. an unknown action pre-PR-A-deploy) must
-    # proceed into the pipeline, NOT halt the weekly run.
+    # proceed into the NEXT preflight gate (CheckPipelineContract, L4595), not
+    # skip it, and must NOT halt the weekly run.
     catch = states["LibPinDriftCheck"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "CheckMutexRole"  # the pipeline, not HandleFailure
+    assert catch["Next"] == "CheckPipelineContract"
 
 
 def test_gate_halts_only_on_confirmed_drift(states):
@@ -86,8 +89,9 @@ def test_gate_halts_only_on_confirmed_drift(states):
     # Confirmed drift halts, but routes through the $.error normalizer FIRST
     # (not straight to HandleFailure) — see test_drift_halt_normalizes_error.
     assert c["Next"] == "ExtractLibPinDriftError"
-    # No drift → proceed into the pipeline.
-    assert gate["Default"] == "CheckMutexRole"
+    # No drift → proceed into the next preflight gate (CheckPipelineContract,
+    # L4595), which sits before CheckMutexRole in the pipeline.
+    assert gate["Default"] == "CheckPipelineContract"
 
 
 def test_drift_halt_normalizes_error_before_handle_failure(states):

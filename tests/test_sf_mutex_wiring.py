@@ -174,11 +174,13 @@ class TestMutexWiring:
         # CheckSkipLibPinDriftCheck so the chain is unchanged for non-preset input.
         # 2026-06-08 (L4517): the preventive lib-pin drift gate is the first
         # workload gate; its skip-default + gate-default converge on
-        # CheckMutexRole — the mutex still sits between entry and the
-        # former-first-state, one gate further down.
+        # CheckPipelineContract (L4595, added 2026-07-04) — the mutex still
+        # sits between entry and the former-first-state, two gates further
+        # down now.
         assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckRunMode"
         assert saturday_sf["States"]["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
-        assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "CheckMutexRole"
+        assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "CheckPipelineContract"
+        assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"

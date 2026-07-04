@@ -981,17 +981,22 @@ class TestHappyPathTraversal:
         assert not skipped, "nothing skipped when shell_run absent"
         # 2026-06-08 (L4517): the lib-pin drift gate is now the first hop after
         # InitializeInput; with no skip flag + no drift, its skip/check/gate
-        # Defaults converge on CheckMutexRole — same downstream chain, three
-        # extra states in the visited order.
+        # Defaults converge on CheckPipelineContract (L4595, added afterward)
+        # — same downstream chain, extra states in the visited order.
         # config#830: CheckRunMode (cadence preset) sits between InitializeInput
         # and the lib-pin gate; with no `mode` on the input it takes its Default
         # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
+        # 2026-07-04 (L4595/L4520(b)): CheckPipelineContract + PipelineContractGate
+        # inserted between LibPinDriftGate and CheckMutexRole — the pipeline-
+        # contract preflight gate, converging on CheckMutexRole in turn.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckRunMode",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",
+            "CheckPipelineContract",
+            "PipelineContractGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
