@@ -1,31 +1,19 @@
 """Unit tests for sf-watch-dispatcher index.handler (Fleet-SF Watch).
 
-Stubs ``alpha_engine_lib.telegram.send_message`` (no live Telegram) and mocks
-boto3 stepfunctions + s3 clients. Asserts: watch-log artifact written (append +
-fresh-skeleton), failed-state extraction from history, fail-loud on the S3 write,
-best-effort enrichment + Telegram, per-pipeline routing (saturday/weekday prefix
-+ dispatch event type), the unregistered-SF guard, and the dispatch seam.
+Mocks flow-doctor notify (no live Telegram) and boto3 stepfunctions + s3 clients.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Stub the lib before importing the handler (CI runners pre-pip-install).
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_telegram_mod = types.ModuleType("alpha_engine_lib.telegram")
-_telegram_mod.send_message = MagicMock(return_value=True)
-_lib_pkg.telegram = _telegram_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
-
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import index  # noqa: E402
 
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
@@ -96,10 +84,10 @@ def _make_clients(*, describe=None, history=None, existing=None, put=None):
 
 
 @pytest.fixture(autouse=True)
-def reset_telegram():
-    _telegram_mod.send_message.reset_mock()
-    _telegram_mod.send_message.return_value = True
-    yield
+def reset_notify(monkeypatch):
+    mock = MagicMock(return_value=True)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock)
+    yield mock
 
 
 def test_failed_writes_watch_log_and_returns_state():
@@ -131,10 +119,10 @@ def test_telegram_is_silent_and_records_artifact_location():
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED"), None)
-    _telegram_mod.send_message.assert_called_once()
-    text = _telegram_mod.send_message.call_args.args[0]
-    kwargs = _telegram_mod.send_message.call_args.kwargs
-    assert kwargs["disable_notification"] is True  # notifier already buzzed loud
+    index.notify_via_flow_doctor.assert_called_once()
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert kwargs["silent"] is True  # notifier already buzzed loud
     assert "Fleet-SF Watch — OBSERVE" in text
     assert "Weekly Freshness SF: FAILED" in text  # pipeline-aware label
     assert "Failed state: `RAGIngestion`" in text
@@ -148,7 +136,7 @@ def test_watch_log_path_is_code_fenced():
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED"), None)
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "`s3://alpha-engine-research/consolidated/saturday_sf_watch/2023-11-14.json`" in text
     assert "Failed state: `RAGIngestion`" in text
     assert "Cause: `States.TaskFailed: RAGIngestion failed`" in text
@@ -206,7 +194,7 @@ def test_describe_error_still_writes_artifact():
 
 
 def test_telegram_failure_is_non_fatal():
-    _telegram_mod.send_message.side_effect = RuntimeError("bot down")
+    index.notify_via_flow_doctor.side_effect = RuntimeError("bot down")
     factory, _, s3 = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
@@ -222,7 +210,7 @@ def test_preflight_shell_run_marks_record():
         index.handler(_event("FAILED"), None)
     written = json.loads(s3.put_object.call_args.kwargs["Body"])
     assert written["events"][0]["is_preflight"] is True
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Weekly Freshness Preflight SF" in text
 
 
@@ -241,7 +229,7 @@ def test_weekday_sf_routes_to_weekday_prefix_and_label():
     assert result["state_machine"] == "ne-preopen-trading-pipeline"
     assert result["watch_log_key"] == "consolidated/weekday_sf_watch/2023-11-14.json"
     assert s3.put_object.call_args.kwargs["Key"].startswith("consolidated/weekday_sf_watch/")
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Pre-open Trading SF: FAILED" in text
 
 
@@ -250,7 +238,7 @@ def test_eod_sf_routes_to_eod_prefix():
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", sm_arn=EOD_ARN), None)
     assert result["watch_log_key"] == "consolidated/eod_sf_watch/2023-11-14.json"
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Post-close Trading SF: FAILED" in text
 
 
@@ -411,7 +399,7 @@ def test_groom_telegram_claims_autonomous_fix_when_dispatched(monkeypatch):
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Fleet-SF Watch — AUTO-FIX" in text
     assert "Backlog Groom SF: FAILED" in text
     assert "autonomous fix ACTIVE" in text
@@ -461,7 +449,7 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
     assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
     assert result["action"] == "observe"
     assert fired["called"] is False
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Fleet-SF Watch — OBSERVE" in text
     assert "autonomous fix ACTIVE" not in text
     assert "observe-only for this pipeline" in text

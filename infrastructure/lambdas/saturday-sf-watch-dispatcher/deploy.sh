@@ -71,17 +71,15 @@ fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
 
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install \
-  --quiet \
-  --target "${PKG}" \
-  --upgrade \
-  -r "${SCRIPT_DIR}/requirements.txt"
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -124,7 +122,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -191,6 +189,18 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic FAILED event) ------------------------------------
 

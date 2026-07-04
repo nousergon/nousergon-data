@@ -40,13 +40,19 @@ from datetime import date, datetime, timezone
 
 import boto3
 
-from alpha_engine_lib.telegram import send_message
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import (
+    FleetTelegramTopic,
+    PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+)
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
+_FLOW_NAME = "saturday-sf-watch-dispatcher"
+_DB_BASENAME = "flow_doctor_saturday_sf_watch_dispatcher"
 # M2 gate — default OFF. When true, a failure also fires a repository_dispatch
 # that triggers the autonomous resilience agent (which diagnoses → fixes →
 # merges → reruns from the failed step). The watch-log is written FIRST (so the
@@ -351,8 +357,24 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     else:
         footer = "_autonomous fix DISABLED (observe-only)_"
     lines.append(footer)
+    text = "\n".join(lines)
+    dedup_key = f"{_FLOW_NAME}:{pipeline_name}:{record.get('execution_arn', key)}"
     try:
-        return bool(send_message("\n".join(lines), disable_notification=True))
+        return notify_via_flow_doctor(
+            text,
+            silent=True,
+            severity="info",
+            dedup_key=dedup_key,
+            flow_name=_FLOW_NAME,
+            topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={
+                "pipeline": pipeline_name,
+                "status": record.get("status"),
+                "failed_state": record.get("failed_state"),
+            },
+            silent_topic=FleetTelegramTopic.OPS_HEALTH,
+        )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("watch Telegram record failed (non-fatal): %s", exc)
         return False

@@ -19,6 +19,7 @@ import types
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ── Stub nousergon_lib.ec2_spot + boto3 before importing index ─────────────────
@@ -37,8 +38,21 @@ def _install_stubs(launch_impl, boto_clients):
     ec2_spot_mod.launch = launch_impl
     pkg = types.ModuleType("nousergon_lib")
     pkg.ec2_spot = ec2_spot_mod
+    fleet_mod = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+
+    class _FleetTelegramTopic:
+        CRITICAL = "critical"
+        OPS_HEALTH = "ops_health"
+
+    fleet_mod.FleetTelegramTopic = _FleetTelegramTopic
+    pkg.flow_doctor_fleet = fleet_mod
     sys.modules["nousergon_lib"] = pkg
     sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
+    sys.modules["nousergon_lib.flow_doctor_fleet"] = fleet_mod
+
+    fdt_mod = types.ModuleType("flow_doctor_telegram")
+    fdt_mod.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+    sys.modules["flow_doctor_telegram"] = fdt_mod
 
     boto3_mod = types.ModuleType("boto3")
     boto3_mod.client = lambda name, **kw: boto_clients[name]
@@ -215,14 +229,14 @@ def _wet_doc(wet: float) -> bytes:
     return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
 
 
-def _spy_send_message(monkeypatch, idx):
-    """Replace krepis.telegram.send_message (imported into index as
-    `send_message`) with a recorder — avoids exercising the real secret
-    resolution / HTTP path (this test harness's fake SSM client doesn't
-    implement get_parameter, so the real krepis.secrets code path would blow
-    up on an AttributeError it isn't built to catch)."""
+def _spy_notify(monkeypatch, idx):
+    """Replace notify_via_flow_doctor with a recorder."""
     calls = []
-    monkeypatch.setattr(idx, "send_message", lambda text, **kw: calls.append(text) or True)
+    monkeypatch.setattr(
+        idx,
+        "notify_via_flow_doctor",
+        lambda text, **kw: calls.append((text, kw)) or True,
+    )
     return calls
 
 
@@ -235,7 +249,7 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
 
     def _launch(types_, subnets, **kw):
         raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
@@ -250,9 +264,10 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     # The pre-boot skip must notify — it's the ONLY place this outcome is ever
     # visible (a run that never boots has no on-box groom_run.sh to ping).
     assert len(notified) == 1
-    assert "SKIPPED" in notified[0]
-    assert "soft budget threshold passed before boot" in notified[0]
-    assert "never launched" in notified[0]
+    assert notified[0][1]["silent"] is False
+    assert "SKIPPED" in notified[0][0]
+    assert "soft budget threshold passed before boot" in notified[0][0]
+    assert "never launched" in notified[0][0]
 
 
 def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
@@ -263,7 +278,7 @@ def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
@@ -278,7 +293,7 @@ def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert notified == []  # kill-switch disables the ping too — the gate never ran
@@ -286,7 +301,7 @@ def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
 
 def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
 
     def _boom(**kw):
         raise RuntimeError("S3 unreachable")
