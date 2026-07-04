@@ -53,13 +53,20 @@ from datetime import datetime, timezone
 
 import boto3
 
-from alpha_engine_lib.telegram import send_message
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
+_FLOW_NAME = "sf-watch-liveness-probe"
+_DB_BASENAME = "flow_doctor_sf_watch_liveness_probe"
+_OPS_TOPICS = (
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 
 RULE_NAME = os.environ.get("SF_WATCH_RULE_NAME", "alpha-engine-saturday-sf-watch-failed")
 EXPECTED_TARGET_FUNCTION = os.environ.get(
@@ -218,8 +225,18 @@ def _alert(problems: list[str]) -> bool:
         "_Fleet-SF Watch may not catch a real pipeline failure right now. "
         "Check the EventBridge rule + saturday-sf-watch-dispatcher Lambda._"
     )
+    text = "\n".join(lines)
     try:
-        return bool(send_message("\n".join(lines), disable_notification=False))
+        return notify_via_flow_doctor(
+            text,
+            silent=False,
+            severity="error",
+            dedup_key=f"{_FLOW_NAME}:wiring:{_problem_fingerprint(problems)}",
+            flow_name=_FLOW_NAME,
+            topics=_OPS_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"problems": len(problems)},
+        )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still returned
         logger.warning("sf-watch liveness alert Telegram send failed (non-fatal): %s", exc)
         return False

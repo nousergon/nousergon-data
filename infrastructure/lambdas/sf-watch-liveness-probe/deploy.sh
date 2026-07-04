@@ -87,13 +87,15 @@ fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
 
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -124,7 +126,7 @@ if $BOOTSTRAP; then
     run aws lambda create-function --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 --role "${ROLE_ARN}" --handler index.handler \
       --zip-file "fileb://${ZIP}" --timeout 30 --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO}' --region "${REGION}" \
+      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,ACCOUNT_ID='"${ACCOUNT_ID}"'}' --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
     echo "  Lambda exists, code will be updated in step 3"
@@ -192,6 +194,16 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,ACCOUNT_ID='"${ACCOUNT_ID}"'}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+  aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL problem) -
 
