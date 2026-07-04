@@ -1,30 +1,22 @@
 """Unit tests for sf-watch-liveness-probe index.handler.
 
-Stubs alpha_engine_lib.telegram.send_message (no live Telegram) and mocks
-boto3 events/stepfunctions/lambda/s3 clients. Asserts: a clean environment
-alerts nothing, each individual wiring problem is detected, problems are
-deduplicated by content (not re-alerted every run), and the dedup state
-clears once the environment goes clean again.
+Mocks flow-doctor notify (no live Telegram) and boto3 events/stepfunctions/lambda/s3
+clients. Asserts: a clean environment alerts nothing, each individual wiring problem is
+detected, problems are deduplicated by content (not re-alerted every run), and the dedup
+state clears once the environment goes clean again.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_telegram_mod = types.ModuleType("alpha_engine_lib.telegram")
-_telegram_mod.send_message = MagicMock(return_value=True)
-_lib_pkg.telegram = _telegram_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
-
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import index  # noqa: E402
 
 REGION = "us-east-1"
@@ -108,10 +100,10 @@ def _clients_factory(events, sfn, lam, s3):
 
 
 @pytest.fixture(autouse=True)
-def reset_telegram():
-    _telegram_mod.send_message.reset_mock()
-    _telegram_mod.send_message.return_value = True
-    yield
+def reset_notify(monkeypatch):
+    mock = MagicMock(return_value=True)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock)
+    yield mock
 
 
 def test_all_clean_alerts_nothing():
@@ -122,7 +114,7 @@ def test_all_clean_alerts_nothing():
     with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
         result = index.handler({}, None)
     assert result == {"problems": [], "alerted": False, "clean": True}
-    _telegram_mod.send_message.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 def test_dead_rule_alerts():
@@ -134,7 +126,7 @@ def test_dead_rule_alerts():
         result = index.handler({}, None)
     assert any("does NOT EXIST" in p for p in result["problems"])
     assert result["alerted"] is True
-    _telegram_mod.send_message.assert_called_once()
+    index.notify_via_flow_doctor.assert_called_once()
 
 
 def test_disabled_rule_alerts():
@@ -209,7 +201,7 @@ def test_repeat_problem_is_suppressed_not_realerted():
     with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
         result = index.handler({}, None)
     assert result["alerted"] is False  # same problem as last time — suppressed
-    _telegram_mod.send_message.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 def test_dedup_state_cleared_once_healthy_again():

@@ -8,20 +8,13 @@ suppression, and the fail-loud contract on the PRIMARY input.
 from __future__ import annotations
 
 import sys
-import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-# Stub alpha_engine_lib.telegram before importing index (the real lib isn't on the
-# test path; the probe only uses send_message).
-_ael = types.ModuleType("alpha_engine_lib")
-_tg = types.ModuleType("alpha_engine_lib.telegram")
-_tg.send_message = lambda *a, **k: True  # type: ignore[attr-defined]
-_ael.telegram = _tg  # type: ignore[attr-defined]
-sys.modules.setdefault("alpha_engine_lib", _ael)
-sys.modules.setdefault("alpha_engine_lib.telegram", _tg)
-
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import index  # noqa: E402
 
 UTC = timezone.utc
@@ -159,7 +152,11 @@ def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 
     monkeypatch.setattr(index, "_fetch_digest_timestamps", lambda pat: stamps)
     monkeypatch.setattr(index, "_s3_client", lambda: s3)
     sends = []
-    monkeypatch.setattr(index, "send_message", lambda *a, **k: sends.append(a) or sent)
+    monkeypatch.setattr(
+        index,
+        "notify_via_flow_doctor",
+        lambda text, **kwargs: sends.append(text) or sent,
+    )
     return sends
 
 
