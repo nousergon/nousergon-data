@@ -117,7 +117,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 30 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO}' \
+      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -188,6 +188,19 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic SUCCEEDED event) ---------------------------------
 

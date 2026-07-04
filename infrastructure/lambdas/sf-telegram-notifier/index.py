@@ -2,27 +2,14 @@
 
 Subscribes to EventBridge `Step Functions Execution Status Change` events for
 the three Alpha Engine Step Functions (saturday / weekday / eod) and forwards
-a human-readable summary to the alpha-engine Telegram bot via the canonical
-``alpha_engine_lib.telegram.send_message`` primitive.
+a human-readable summary to the fleet alerts forum via flow-doctor
+(``notify_event`` / forum topic ``#pipeline``).
 
-The existing SNS → email path is unaffected: this Lambda subscribes to a new
-EventBridge rule (``alpha-engine-sf-status-change``) and does not touch any
-SF definition. Adding/removing Telegram coverage is a single-resource flip
-with zero blast radius on the trade-decision pipeline.
+Migration arc: config#1742 (fleet Telegram consolidation T2). Falls back to
+``alpha_engine_lib.telegram.send_message`` when flow-doctor is unavailable
+(local tests / init failure).
 
-Event source: ``aws.states`` / ``Step Functions Execution Status Change``
-covers all five terminal-or-transition statuses in one rule:
-RUNNING, SUCCEEDED, FAILED, TIMED_OUT, ABORTED. RUNNING fires once at
-execution start; the four terminal statuses fire once each at end. RUNNING
-notifications go out silent (in-channel awareness without a phone buzz) so
-the weekday SF's daily 5:45 AM PT start does not buzz on every trading day;
-all terminal statuses push.
-
-On FAILED, the handler best-effort calls ``states:DescribeExecution`` to
-surface the failure cause string. The Telegram primitive never raises, so a
-misconfigured bot or transient network error returns ``False`` from
-``send_message`` and is logged at WARNING — the EventBridge invocation still
-returns success and is not retried.
+The existing SNS → email path is unaffected.
 """
 
 from __future__ import annotations
@@ -30,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 
 import boto3
 
@@ -40,33 +28,158 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 
+_flow_doctor = None
+_flow_doctor_init_attempted = False
+
 _SF_LABELS: dict[str, str] = {
     "ne-weekly-freshness-pipeline": "Weekly Freshness SF",
     "ne-preopen-trading-pipeline": "Pre-open Trading SF",
     "ne-postclose-trading-pipeline": "Post-close Trading SF",
 }
 
-# 2026-05-23 Preflight Pipeline rename: when the weekly-freshness SF runs as
-# the Friday-PM preflight dry-pass (input ``shell_run=true``), surface a
-# distinct ``Weekly Freshness Preflight SF`` label in the Telegram message so
-# the operator can tell the two flavors apart in the channel at a
-# glance. The state machine name is the same (the dry-pass IS the
-# weekly-freshness SF with dry inputs per CLAUDE.md "don't add redundant paths
-# around load-bearing scheduled infra"); we differentiate via the
-# execution input flag, not via a separate SF.
 _PREFLIGHT_LABEL_OVERRIDE: dict[str, str] = {
     "ne-weekly-freshness-pipeline": "Weekly Freshness Preflight SF",
 }
 
 _STATUS_EMOJI: dict[str, str] = {
     "RUNNING": "\U0001f680",    # 🚀
-    "SUCCEEDED": "✅",       # ✅
-    "FAILED": "\U0001f534",      # 🔴
-    "TIMED_OUT": "⏰",       # ⏰
-    "ABORTED": "⛔",         # ⛔
+    "SUCCEEDED": "✅",
+    "FAILED": "\U0001f534",
+    "TIMED_OUT": "⏰",
+    "ABORTED": "⛔",
 }
 
 _CAUSE_MAX_CHARS = 280
+
+
+def build_flow_doctor_config() -> dict:
+    """Build lambda flow-doctor config from fleet canonical topic layout."""
+    from nousergon_lib.flow_doctor_fleet import (
+        PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        fleet_telegram_notifier_dicts,
+    )
+
+    return {
+        "flow_name": "sf-telegram-notifier",
+        "repo": "nousergon/nousergon-data",
+        "owner": "@brianmcmahon",
+        "notify": fleet_telegram_notifier_dicts(
+            PIPELINE_OBSERVER_TELEGRAM_TOPICS
+        ),
+        "store": {
+            "type": "sqlite",
+            "path": "/tmp/flow_doctor_sf_telegram_notifier.db",
+        },
+        "dedup_cooldown_minutes": 1,
+        "rate_limits": {"max_alerts_per_day": 100},
+    }
+
+
+def _materialize_flow_doctor_yaml() -> str:
+    import yaml
+
+    path = Path("/tmp/flow_doctor_sf_telegram_notifier.yaml")
+    path.write_text(
+        yaml.safe_dump(build_flow_doctor_config(), sort_keys=False),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def _get_flow_doctor():
+    """Lazy-init shared FlowDoctor (forum routing). Returns None on fallback path."""
+    global _flow_doctor, _flow_doctor_init_attempted
+    if _flow_doctor is not None:
+        return _flow_doctor
+    if _flow_doctor_init_attempted:
+        return None
+    _flow_doctor_init_attempted = True
+    if os.environ.get("FLOW_DOCTOR_ENABLED", "1") != "1":
+        return None
+    try:
+        from nousergon_lib.logging import get_flow_doctor, setup_logging
+
+        setup_logging(
+            "sf-telegram-notifier",
+            flow_doctor_yaml=_materialize_flow_doctor_yaml(),
+        )
+        _flow_doctor = get_flow_doctor()
+    except Exception as exc:  # noqa: BLE001 — fall back to send_message
+        logger.warning(
+            "flow-doctor init failed — falling back to send_message: %s", exc
+        )
+    return _flow_doctor
+
+
+def _pipeline_telegram_notifier(fd):
+    """Return the ``#pipeline`` TelegramNotifier, if configured."""
+    from flow_doctor.notify.telegram import TelegramNotifier
+    from nousergon_lib.flow_doctor_fleet import (
+        FleetTelegramTopic,
+        fleet_telegram_thread_id_env,
+    )
+
+    want = os.environ.get(
+        fleet_telegram_thread_id_env(FleetTelegramTopic.PIPELINE)
+    )
+    for notifier in fd._notifiers:
+        if not isinstance(notifier, TelegramNotifier):
+            continue
+        thread_id = getattr(notifier, "message_thread_id", None)
+        if thread_id is not None and str(thread_id) == str(want):
+            return notifier
+    return None
+
+
+def _severity_for_status(status: str) -> str:
+    if status in ("FAILED", "TIMED_OUT", "ABORTED"):
+        return "warning"
+    return "info"
+
+
+def _dedup_key(detail: dict) -> str:
+    return ":".join(
+        [
+            "sf-telegram-notifier",
+            detail.get("executionArn") or detail.get("name") or "unknown",
+            detail.get("status") or "UNKNOWN",
+        ]
+    )
+
+
+def _notify_via_flow_doctor(
+    text: str,
+    *,
+    detail: dict,
+    silent: bool,
+) -> bool:
+    fd = _get_flow_doctor()
+    if fd is None:
+        return send_message(text, disable_notification=silent)
+
+    status = detail.get("status", "UNKNOWN")
+    subject = text.split("\n", 1)[0].replace("*", "")
+
+    if silent:
+        pipeline = _pipeline_telegram_notifier(fd)
+        if pipeline is not None:
+            return pipeline.send_raw(text, disable_notification=True) is not None
+        logger.warning(
+            "pipeline Telegram notifier missing — RUNNING ping via notify_event"
+        )
+
+    report_id = fd.notify_event(
+        subject,
+        body=text,
+        severity=_severity_for_status(status),
+        context={
+            "state_machine": (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1],
+            "execution": detail.get("name"),
+            "status": status,
+        },
+        dedup_key=_dedup_key(detail),
+    )
+    return report_id is not None
 
 
 def _label_for_arn(sm_arn: str, *, is_preflight: bool = False) -> str:
@@ -88,13 +201,6 @@ def _format_duration(started_ms: int | None, stopped_ms: int | None) -> str:
 
 
 def _describe_execution(execution_arn: str) -> dict | None:
-    """Best-effort DescribeExecution. Returns the response dict on success,
-    ``None`` on any error. Single source for both the failure-cause
-    extraction and the preflight-input classification — combining the
-    two callers into one API call cuts the per-event boto3 cost in half
-    and keeps the test mock surface simple (one ``describe_execution``
-    call per handler invocation).
-    """
     if not execution_arn:
         return None
     try:
@@ -106,12 +212,6 @@ def _describe_execution(execution_arn: str) -> dict | None:
 
 
 def _is_preflight_execution(describe_resp: dict | None) -> bool:
-    """True iff the execution's input has ``shell_run=true``.
-
-    The Saturday SF runs as either the real Saturday firing (no
-    ``shell_run`` input, $.pipeline_label="") or the Friday-PM Preflight
-    Pipeline dry-pass (``shell_run=true``, $.pipeline_label=" Preflight").
-    """
     if not describe_resp:
         return False
     try:
@@ -137,19 +237,14 @@ def _failure_cause_from(describe_resp: dict | None) -> str:
 
 
 def _build_message(detail: dict) -> tuple[str, bool]:
-    """Return (text, disable_notification) for the given event detail."""
+    """Return (text, silent) for the given event detail."""
     status = detail.get("status", "UNKNOWN")
-    # Single DescribeExecution call serving both the preflight-input
-    # classification (label override) and the FAILED-path cause
-    # enrichment. RUNNING events also benefit from the label override
-    # — knowing 'Saturday Preflight SF RUNNING' vs 'Saturday SF RUNNING'
-    # at-a-glance is the operator's main use case for the rename.
     describe_resp = _describe_execution(detail.get("executionArn", ""))
     is_preflight = _is_preflight_execution(describe_resp)
     label = _label_for_arn(
         detail.get("stateMachineArn", ""), is_preflight=is_preflight
     )
-    emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")  # 📨 fallback
+    emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")
     exec_name = detail.get("name", "") or "(unknown execution)"
 
     lines = [f"{emoji} *{label} — {status}*"]
@@ -172,23 +267,13 @@ def _build_message(detail: dict) -> tuple[str, bool]:
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """EventBridge handler for SF execution status changes.
-
-    Expected event shape (CloudWatch Events / EventBridge from aws.states):
-      detail.status:           RUNNING | SUCCEEDED | FAILED | TIMED_OUT | ABORTED
-      detail.stateMachineArn:  SF arn
-      detail.executionArn:     execution arn
-      detail.name:             execution id
-      detail.startDate:        epoch ms
-      detail.stopDate:         epoch ms (null while RUNNING)
-    """
     detail = event.get("detail") or {}
     status = detail.get("status", "UNKNOWN")
     sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
     logger.info("SF status change: sf=%s status=%s", sm_name, status)
 
     text, silent = _build_message(detail)
-    ok = send_message(text, disable_notification=silent)
+    ok = _notify_via_flow_doctor(text, detail=detail, silent=silent)
 
     return {
         "status": status,
