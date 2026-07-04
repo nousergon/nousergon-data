@@ -20,14 +20,39 @@ fleet chokepoints — no lib change):
      (InstanceInitiatedShutdownBehavior=terminate + a watchdog). The Lambda
      returns immediately — it does NOT babysit the multi-hour run.
 
-The box reads ALL secrets itself from SSM via its instance profile
+The box reads its OWN run secrets (PAT, etc.) from SSM via its instance profile
 (alpha-engine-executor-profile → alpha-engine-executor-role, which already has
-ssm:GetParameter on /alpha-engine/*), so this Lambda needs NO secret access — it
-only needs ec2:RunInstances, iam:PassRole (the executor role), and ssm:SendCommand.
+ssm:GetParameter on /alpha-engine/*) — this Lambda needs none of those. It DOES
+(2026-07-04) read the two Telegram secrets itself, scoped narrowly (see the
+pre-boot pace gate note below), for the one notification only IT can send (a
+pre-boot skip never boots a box, so there's no on-box groom_run.sh to ping).
 
 Fail-loud (a scheduled groom IS the deliverable): a launch/SSM failure RAISES so
 EventBridge retries + the Lambda error metric + a CloudWatch alarm surface the
 miss, rather than silently dropping a pass.
+
+**Pre-boot pace gate (Brian-ratified 2026-07-04).** Before launching the spot
+box at all, this handler compares the reset-aligned weekly WET (interactive +
+groom, same S3 source `alpha-engine-config/scripts/groom_budget.py` reads) to
+how much of the current weekly reset window has already elapsed. If usage is
+running ahead of a straight-line pace through the window (the same
+``krepis.usage_pacing.pace_check`` gate `groom_budget.py` runs on-box), the
+launch is skipped entirely — no spot cost at all, not even the ~2-5 min boot.
+This REPLACES the box-side static 85%/95% floor/taper (config#1348) as the
+short-circuit's first line; `groom_budget.py`'s on-box gate (same pace check,
+different vantage point — sees this run's own live consumption too) remains
+as the second line for the GHA path and as a belt for this one. Fail-safe:
+ANY error reading S3/computing the gate → launch proceeds, never blocked by a
+pace-gate infra hiccup (mirrors `groom_budget.py`'s own fail-safe posture).
+A pace-gate skip returns ``launched: False`` — the dispatch Step Function's
+existing `CheckLaunched` → `GroomSkipped` branch (already used for the
+`GROOM_DISPATCH_ENABLED=false` kill-switch) handles it with no SF changes. A
+skip also sends its own Telegram ping — best-effort via `krepis.telegram
+.send_message` (never raises), scoped IAM to read just the two Telegram SSM
+params (see iam-policy.json). Distinct from the on-box budget gate's own
+Telegram ping (`groom_budget.py` skip, or `groom_driver.py`'s mid-run
+recheck via `groom_run.sh`'s "WOUND DOWN" message) — a pre-boot skip never
+reaches the box, so this Lambda is the ONLY place that can notify for it.
 
 Managed OUTSIDE CloudFormation (same as before): operator-deployed via
 `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until the new code +
@@ -36,13 +61,18 @@ IAM are deployed AND the GHA `schedule:` crons are disabled (the gated cutover).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
 import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import boto3
+from krepis.telegram import send_message
+from krepis.usage_pacing import pace_check, reset_window
 from nousergon_lib import ec2_spot
 from nousergon_lib.ec2_spot import SpotCapacityExhausted
 
@@ -53,6 +83,21 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
+
+# ── Pre-boot pace gate (mirrors alpha-engine-config/scripts/groom_budget.py) ───
+# Kill-switch independent of GROOM_DISPATCH_ENABLED — lets ops disable JUST the
+# pace gate (e.g. during a known burst) without touching the dispatch trigger.
+PACE_GATE_ENABLED = os.environ.get("GROOM_PACE_GATE_ENABLED", "true").lower() == "true"
+# Calibrated 2026-06-28 — MUST track alpha-engine-config/scripts/groom_budget.py's
+# WEEKLY_WET_CEILING; refine both together against /usage (config#1347).
+WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "1140000000"))
+_PT = ZoneInfo("America/Los_Angeles")
+# MUST match groom_budget.py's WEEKLY_RESET_ANCHOR/WEEKLY_PERIOD exactly — both
+# derive the SAME reset-aligned window from one observed reset instant.
+WEEKLY_RESET_ANCHOR = datetime(2026, 6, 28, 20, 59)   # PT, naive — one observed reset
+WEEKLY_PERIOD = timedelta(days=7)
+CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
+CCUSAGE_PREFIX = "claude_code_usage/"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
 # t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
@@ -96,6 +141,68 @@ _DEFAULT_MODEL = "claude-sonnet-5"
 # shell command below) — model ids are Lambda-config-controlled, not raw user
 # input, but this is cheap and rules out shell-metacharacter injection outright.
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _parse_ccusage_key(key: str) -> "str | None":
+    """Date string from either layout: {source}/{date}.json or {source}/{date}/{run}.json.
+
+    Boto3 mirror of alpha-engine-config/scripts/groom_budget.py::_parse_key —
+    duplicated (not imported) because that script is a different repo and this
+    Lambda needs a boto3, not subprocess-`aws`-CLI, S3 client."""
+    p = key[len(CCUSAGE_PREFIX):].split("/")
+    if len(p) == 2 and p[1].endswith(".json"):
+        return p[1][:-5]
+    if len(p) == 3 and p[2].endswith(".json"):
+        return p[1]
+    return None
+
+
+def _read_weekly_wet(window_start: datetime) -> float:
+    """Sum WET (all sources) at/after the PT datetime ``window_start``, hour-precise.
+
+    Boto3 mirror of groom_budget.py::read_weekly_wet (same S3 layout, same
+    hour-boundary trim on the window's start day)."""
+    s3 = boto3.client("s3", region_name=REGION)
+    total = 0.0
+    start_date = window_start.date().isoformat()
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=CCUSAGE_BUCKET, Prefix=CCUSAGE_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            d = _parse_ccusage_key(key)
+            if not d or d < start_date:
+                continue
+            body = s3.get_object(Bucket=CCUSAGE_BUCKET, Key=key)["Body"].read()
+            doc = json.loads(body or b"{}")
+            for hr, models in (doc.get("by_hour") or {}).items():
+                if d == start_date and int(hr) < window_start.hour:
+                    continue
+                total += sum(r.get("wet", 0) for r in models.values())
+    return total
+
+
+def _pace_gate_status() -> dict:
+    """Compute the pre-boot pace-gate decision. Fail-safe: ANY error (S3 read,
+    parse, credentials) returns ``exceeded: False`` with the error recorded —
+    a pace-gate infra hiccup must never block a scheduled groom, mirroring
+    groom_budget.py's own fail-safe posture."""
+    try:
+        now_pt = datetime.now(_PT).replace(tzinfo=None)
+        window_start, _next_reset = reset_window(now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
+        wet = _read_weekly_wet(window_start)
+        used_frac = wet / WEEKLY_WET_CEILING if WEEKLY_WET_CEILING else 0.0
+        status = pace_check(used_frac, now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
+        return {
+            "exceeded": status.exceeded,
+            "used_frac": round(status.used_frac, 4),
+            "elapsed_frac": round(status.elapsed_frac, 4),
+            "overrun": round(status.overrun, 4),
+            "wet": round(wet, 1),
+        }
+    except Exception as e:  # noqa: BLE001 — fail-safe: never block a scheduled groom
+        logger.warning("pace gate check failed (non-fatal, launching anyway): %s: %s",
+                       type(e).__name__, e)
+        return {"exceeded": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _resolve_run_mode(event: dict) -> str:
@@ -349,6 +456,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
+
+    Pre-boot pace gate (2026-07-04): if weekly Claude usage is running ahead
+    of a linear pace through the current reset window, the launch is skipped
+    entirely — before any spot cost is incurred — rather than deferring the
+    decision to the on-box `groom_budget.py` gate. See module docstring. A
+    skip here sends its own Telegram ping (best-effort — `krepis.telegram
+    .send_message` never raises) since this is the ONLY place a pre-boot skip
+    is ever visible; a run that never boots has no on-box `groom_run.sh` to
+    fire its own notification the way the on-box budget-gate skip does.
     """
     event = event or {}
     run_mode = _resolve_run_mode(event)
@@ -362,5 +478,24 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "force_on_demand=%s schedule=%s",
         run_mode, model, issue_filter, soft_limit_min, force_on_demand, schedule_label,
     )
+
+    if PACE_GATE_ENABLED:
+        pace = _pace_gate_status()
+        if pace.get("exceeded"):
+            logger.warning(
+                "pace gate SKIP — used_frac=%.4f > elapsed_frac=%.4f (overrun=%+.4f, "
+                "wet=%.0f) — groom spot NOT launched, resumes next schedule/reset",
+                pace["used_frac"], pace["elapsed_frac"], pace["overrun"], pace["wet"],
+            )
+            send_message(
+                "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
+                f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
+                f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
+                f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
+                "cost incurred. Resumes automatically on the next scheduled run "
+                "(or after the weekly reset)."
+            )
+            return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
+
     result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min, force_on_demand)
     return {"groom": result}

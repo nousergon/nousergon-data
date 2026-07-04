@@ -34,7 +34,7 @@ market_data:
 # Universe returns (Phase 1) — polygon.io forward return computation
 universe_returns:
   signals_prefix: signals           # S3 prefix for signal dates
-  sector_map_key: predictor/price_cache/sector_map.json
+  sector_map_key: reference/price_cache/sector_map.json
   # db_path: /tmp/research.db       # optional: override local DB path (auto-downloaded from S3)
 
 # Signal returns (Phase 1) — score_performance + predictor_outcomes backfill
