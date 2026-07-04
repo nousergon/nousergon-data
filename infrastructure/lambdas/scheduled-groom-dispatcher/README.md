@@ -112,8 +112,22 @@ but injection protection is cheap).
   `Errors` metric during bootstrap-ops to page on it.)
 - **Kill-switch**: set the Lambda env `GROOM_DISPATCH_ENABLED=false` to disable
   without deleting the Scheduler rules.
-- **Narrow IAM**: the Lambda role reads only the one SSM PAT + its own log
-  group; the Scheduler execution role can `lambda:InvokeFunction` this function
+- **Pre-boot pace gate (2026-07-04)**: before launching the spot box, compares
+  reset-aligned weekly Claude usage (WET) against how much of the current
+  weekly window has elapsed (`krepis.usage_pacing.pace_check` — same gate
+  `alpha-engine-config/scripts/groom_budget.py` runs on-box); a launch running
+  ahead of pace is skipped entirely (`launched: false, reason: "pace_gate_skip"`,
+  routed through the existing `CheckLaunched`→`GroomSkipped` Step Function
+  branch, no SF changes needed). Fail-safe on any S3/read error — never blocks
+  a scheduled groom. `GROOM_PACE_GATE_ENABLED=false` disables just this gate
+  (independent of `GROOM_DISPATCH_ENABLED`); `GROOM_WEEKLY_WET_CEILING` /
+  `CCUSAGE_BUCKET` override the calibrated defaults.
+- **Narrow IAM**: the Lambda role needs no secret access (the box reads all
+  secrets itself from SSM via its own instance profile) — its own IAM grants
+  are EC2 launch/terminate, `iam:PassRole` for the executor role, SSM
+  send-command/describe, its own log group, and (2026-07-04) read-only S3
+  access to `claude_code_usage/*` in `alpha-engine-research` for the pace
+  gate. The Scheduler execution role can `lambda:InvokeFunction` this function
   only.
 
 ## Deploy
