@@ -50,6 +50,8 @@ def _event(status: str, sm_arn: str = SATURDAY_ARN, **detail_overrides) -> dict:
 def reset_send_message():
     _telegram_mod.send_message.reset_mock()
     _telegram_mod.send_message.return_value = True
+    index._flow_doctor = None
+    index._flow_doctor_init_attempted = False
     yield
 
 
