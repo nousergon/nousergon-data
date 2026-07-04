@@ -1,19 +1,23 @@
-"""Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
+"""Metron market-data producer — EOD closes + FX for Metron's held + watchlist universe.
 
 `alpha-engine-data` is the single market-data ground truth for the whole Nous Ergon
 system. Metron publishes its held-ticker universe to
 ``s3://<bucket>/metron/holdings_universe.json`` (yf_symbols + the non-USD currencies it
-holds); this producer reads it and writes two artifacts the Metron app consumes — so
-Metron makes NO direct market-data API calls of its own:
+holds) and its watchlist-only-ticker universe (tracked but never bought,
+metron-ops#42/#121) to ``s3://<bucket>/metron/watchlist_universe.json`` (metron-ops#132)
+— ``load_metron_universe()`` reads and UNIONS both, so every producer below (and every
+Metron per-ticker consumer: fundamentals/technicals/analyst/sentiment/tearsheet) treats a
+watched-but-not-held ticker identically to a held one. This producer writes two artifacts
+the Metron app consumes — so Metron makes NO direct market-data API calls of its own:
 
     market_data/eod_closes/{date}.json   + market_data/eod_closes/latest.json
     market_data/fx/{date}.json           + market_data/fx/latest.json
     market_data/fundamentals/latest.json   (daily — tearsheet multiples/ratios)
     market_data/intraday/latest.json       (every 5 min while NYSE open AND Metron in use)
 
-Closes cover the held union — including foreign listings (``1299.HK``, ``RMS.PA``), OTC
-(``GTBIF``), and funds (``FNILX``) that the ~903-name SP1500 constituent cache refuses.
-FX covers the held non-USD currencies (``{CCY}USD=X``).
+Closes cover the held+watchlist union — including foreign listings (``1299.HK``,
+``RMS.PA``), OTC (``GTBIF``), and funds (``FNILX``) that the ~903-name SP1500 constituent
+cache refuses. FX covers the held+watchlist non-USD currencies (``{CCY}USD=X``).
 
 Artifact schemas (versioned — Metron's consumer pins on ``schema_version``):
 
@@ -50,6 +54,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_BUCKET = "alpha-engine-research"
 # Metron publishes its held universe here (see metron api/services/data_spine.py).
 HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
+# Metron also publishes a WATCHLIST-only-ticker universe (tracked but never bought,
+# metron-ops#42/#121) — unioned into load_metron_universe() below so a watchlist-only
+# ticker gets the SAME fundamentals/technicals/analyst/sentiment/price-history coverage a
+# held position does (metron-ops#132: Brian added MU to his watchlist and it showed no
+# data — every per-ticker collector fetches strictly over the held union above, so a
+# never-held ticker was never in scope for any of them).
+WATCHLIST_UNIVERSE_KEY = "metron/watchlist_universe.json"
 CLOSES_PREFIX = "market_data/eod_closes/"
 FX_PREFIX = "market_data/fx/"
 # History artifacts (per-symbol / per-currency) — power Metron's Performance NAV
@@ -220,27 +231,47 @@ MediansUniverseSource = Callable[[], list[str]]
 # ── Universe read ───────────────────────────────────────────────────────────
 
 
-def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[str]]:
-    """Read Metron's published held universe → ``(holdings, currencies)``.
-
-    ``holdings`` = ``[{"yf_symbol", "currency"}, …]``; ``currencies`` = distinct non-USD
-    currencies held. Fail-soft: a missing object / no creds / parse error → ``([], [])``
-    (logged) so the daily run proceeds rather than aborting."""
+def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> list[dict]:
+    """Read one Metron universe artifact's ``holdings`` list. Fail-soft per artifact: a
+    missing object / no creds / parse error contributes nothing (logged) rather than
+    aborting the caller's union."""
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=HOLDINGS_UNIVERSE_KEY)
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
         data = json.loads(obj["Body"].read())
-        holdings = [
+        return [
             {"yf_symbol": str(h["yf_symbol"]).strip(), "currency": str(h.get("currency", "USD")).strip()}
             for h in data.get("holdings", [])
             if str(h.get("yf_symbol", "")).strip()
         ]
-        currencies = [str(c).strip().upper() for c in data.get("currencies", []) if str(c).strip()]
-        logger.info("[metron_market_data] universe: %d instruments, %d non-USD currencies",
-                    len(holdings), len(currencies))
-        return holdings, currencies
     except Exception as e:  # missing object, no creds, parse error, etc.
-        logger.warning("[metron_market_data] metron universe unavailable (%s) — empty pull", e)
-        return [], []
+        logger.warning("[metron_market_data] %s unavailable (%s) — no contribution", key, e)
+        return []
+
+
+def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[str]]:
+    """Read Metron's published universe → ``(holdings, currencies)`` — the UNION of the
+    held-ticker universe and the watchlist-only-ticker universe (metron-ops#132), so a
+    ticker Brian is only watching (never bought) gets the same per-ticker coverage a held
+    position does everywhere this feeds: fundamentals/technicals/analyst/sentiment,
+    close/FX history, and the valuation-medians benchmark set.
+
+    ``holdings`` = ``[{"yf_symbol", "currency"}, …]``, deduped by yf_symbol — a symbol in
+    BOTH universes keeps the held-universe currency (it's the economically authoritative
+    one for a real position). ``currencies`` = distinct non-USD currencies across both.
+    Fail-soft per artifact (see ``_read_metron_universe_holdings``): either missing / no
+    creds / parse error contributes nothing rather than aborting the daily run."""
+    watched = _read_metron_universe_holdings(bucket, s3_client, WATCHLIST_UNIVERSE_KEY)
+    held = _read_metron_universe_holdings(bucket, s3_client, HOLDINGS_UNIVERSE_KEY)
+    by_yf: dict[str, str] = {h["yf_symbol"]: h["currency"] for h in watched}
+    by_yf.update({h["yf_symbol"]: h["currency"] for h in held})  # held wins on conflict
+    holdings = [{"yf_symbol": yf, "currency": ccy} for yf, ccy in sorted(by_yf.items())]
+    currencies = sorted({ccy for ccy in by_yf.values() if ccy and ccy != "USD"})
+    watchlist_only = {h["yf_symbol"] for h in watched} - {h["yf_symbol"] for h in held}
+    logger.info(
+        "[metron_market_data] universe: %d instruments (%d held, %d watchlist-only), %d non-USD currencies",
+        len(holdings), len(held), len(watchlist_only), len(currencies),
+    )
+    return holdings, currencies
 
 
 # ── yfinance fetchers (default sources) ─────────────────────────────────────

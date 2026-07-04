@@ -20,6 +20,12 @@
       "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
     },
     {
+      "Sid": "CheckGroomRunCompletionMarker",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/completed/*"
+    },
+    {
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": [

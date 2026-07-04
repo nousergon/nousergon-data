@@ -41,7 +41,6 @@ Centralized data collection — price universe, macro, alternative data, feature
 | RAG ingestion pipelines | [`rag/pipelines/`](rag/pipelines/) |
 | Per-step completion emails | [`emailer.py`](emailer.py) |
 | Step Function preflight | [`sf_preflight.py`](sf_preflight.py) |
-| SSM secret loader | [`ssm_secrets.py`](ssm_secrets.py) |
 
 ## Inputs / outputs
 

@@ -91,14 +91,16 @@
     },
     "StartTradingInstance": {
       "Type": "Task",
-      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it — so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand → 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 → SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it \u2014 so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand \u2192 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 \u2192 SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
           "MaxAttempts": 2,
           "IntervalSeconds": 30,
           "BackoffRate": 1.0
@@ -106,7 +108,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -116,14 +120,16 @@
     },
     "WaitForInstanceReady": {
       "Type": "Wait",
-      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped\u2192running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
       "Seconds": 15,
       "Next": "InitSSMPollCounter"
     },
     "InitSSMPollCounter": {
       "Type": "Pass",
       "Comment": "Initialize attempts counter for the SSM-readiness poll loop.",
-      "Result": {"attempts": 0},
+      "Result": {
+        "attempts": 0
+      },
       "ResultPath": "$.ssm_poll",
       "Next": "DescribeInstanceInfo"
     },
@@ -133,13 +139,19 @@
       "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
       "Parameters": {
         "Filters": [
-          {"Key": "InstanceIds", "Values.$": "$.trading_instance_id"}
+          {
+            "Key": "InstanceIds",
+            "Values.$": "$.trading_instance_id"
+          }
         ]
       },
       "TimeoutSeconds": 15,
       "Retry": [
         {
-          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
           "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5
@@ -147,7 +159,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -157,12 +171,18 @@
     },
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online → CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run — postmarket → arctic → snapshot → reconcile — executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails — the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile — an unreachable box fails the execution loud.",
+      "Comment": "PingStatus=Online \u2192 CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run \u2014 postmarket \u2192 arctic \u2192 snapshot \u2192 reconcile \u2014 executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails \u2014 the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile \u2014 an unreachable box fails the execution loud.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus", "IsPresent": true},
-            {"Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus", "StringEquals": "Online"}
+            {
+              "Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus",
+              "StringEquals": "Online"
+            }
           ],
           "Next": "CheckSkipRefreshExecutorDeploy"
         },
@@ -181,7 +201,9 @@
     },
     "IncrementSSMPoll": {
       "Type": "Pass",
-      "Parameters": {"attempts.$": "States.MathAdd($.ssm_poll.attempts, 1)"},
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.ssm_poll.attempts, 1)"
+      },
       "ResultPath": "$.ssm_poll",
       "Next": "DescribeInstanceInfo"
     },
@@ -322,6 +344,14 @@
       "Choices": [
         {
           "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
             {
               "Variable": "$.skip_post_market_arctic_append",
               "IsPresent": true
@@ -782,6 +812,14 @@
         {
           "And": [
             {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
               "Variable": "$.skip_refresh_executor_deploy",
               "IsPresent": true
             },
@@ -928,6 +966,14 @@
         {
           "And": [
             {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
               "Variable": "$.skip_post_market_data",
               "IsPresent": true
             },
@@ -947,6 +993,14 @@
       "Choices": [
         {
           "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
             {
               "Variable": "$.skip_capture_snapshot",
               "IsPresent": true
@@ -968,6 +1022,14 @@
         {
           "And": [
             {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
               "Variable": "$.skip_eod_reconcile",
               "IsPresent": true
             },
@@ -987,6 +1049,14 @@
       "Choices": [
         {
           "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
             {
               "Variable": "$.skip_daily_substrate_health_check",
               "IsPresent": true

@@ -74,12 +74,48 @@ class _FakeSsm:
         return {"Command": {"CommandId": "cmd-123"}}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None):
+class _FakeS3Body:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakeS3Paginator:
+    def __init__(self, objects: dict):
+        self._objects = objects
+
+    def paginate(self, Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        keys = [k for k in self._objects if k.startswith(Prefix)]
+        yield {"Contents": [{"Key": k} for k in keys]}
+
+
+class _FakeS3:
+    """Fake S3 client for the pace gate's boto3-native WET reader.
+
+    ``objects`` maps a full S3 key to its raw JSON bytes content — mirrors the
+    real ``claude_code_usage/{source}/{date}[/{run}].json`` layout.
+    """
+
+    def __init__(self, objects: dict | None = None):
+        self._objects = objects or {}
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        return _FakeS3Paginator(self._objects)
+
+    def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
+        return {"Body": _FakeS3Body(self._objects[Key])}
+
+
+def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
     ec2 = _FakeEc2()
-    clients = {"ec2": ec2, "ssm": ssm}
+    s3 = _FakeS3(s3_objects)
+    clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
@@ -88,6 +124,7 @@ def _load(monkeypatch, *, launch_impl=None, env=None):
     importlib.reload(index)
     index._test_ssm = ssm  # expose for assertions
     index._test_ec2 = ec2
+    index._test_s3 = s3
     return index
 
 
@@ -172,6 +209,93 @@ def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
     assert cmd.index("export GROOM_MODEL") < cmd.index("groom_spot_bootstrap.sh")
 
 
+# ── Pre-boot pace gate (2026-07-04) ─────────────────────────────────────────
+def _wet_doc(wet: float) -> bytes:
+    import json
+    return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
+
+
+def _spy_send_message(monkeypatch, idx):
+    """Replace krepis.telegram.send_message (imported into index as
+    `send_message`) with a recorder — avoids exercising the real secret
+    resolution / HTTP path (this test harness's fake SSM client doesn't
+    implement get_parameter, so the real krepis.secrets code path would blow
+    up on an AttributeError it isn't built to catch)."""
+    calls = []
+    monkeypatch.setattr(idx, "send_message", lambda text, **kw: calls.append(text) or True)
+    return calls
+
+
+def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
+    # 1 day into the window (elapsed_frac ~= 1/7 ~= 0.143): 50% of the weekly
+    # ceiling already consumed is way ahead of pace -> skip BEFORE any launch.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-06-29.json":
+                            _wet_doc(0.5 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_send_message(monkeypatch, idx)
+
+    def _launch(types_, subnets, **kw):
+        raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
+
+    monkeypatch.setattr(idx.ec2_spot, "launch", _launch)
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "pace_gate_skip"
+    assert g["exceeded"] is True
+    assert idx._test_ssm.sent == []  # no bootstrap command ever sent
+    # The pre-boot skip must notify — it's the ONLY place this outcome is ever
+    # visible (a run that never boots has no on-box groom_run.sh to ping).
+    assert len(notified) == 1
+    assert "SKIPPED" in notified[0]
+    assert "soft budget threshold passed before boot" in notified[0]
+    assert "never launched" in notified[0]
+
+
+def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
+    # 50% elapsed, only 10% of the ceiling used -> well under pace -> launches.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-06-29.json":
+                            _wet_doc(0.1 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_send_message(monkeypatch, idx)
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is True
+    assert len(idx._test_ssm.sent) == 1
+    assert notified == []  # no ping when nothing was skipped
+
+
+def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                   "GROOM_PACE_GATE_ENABLED": "false"},
+                s3_objects={"claude_code_usage/groom/2026-06-29.json":
+                            _wet_doc(0.99 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_send_message(monkeypatch, idx)
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is True
+    assert notified == []  # kill-switch disables the ping too — the gate never ran
+
+
+def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    notified = _spy_send_message(monkeypatch, idx)
+
+    def _boom(**kw):
+        raise RuntimeError("S3 unreachable")
+    monkeypatch.setattr(idx._test_s3, "get_paginator", _boom)
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is True
+    assert notified == []  # fail-safe path never trips (exceeded=False), no ping
+
+
 def test_missing_model_and_issue_filter_default_to_sonnet_queue(monkeypatch):
     # The 2 pre-existing Sonnet schedules don't set model/issue_filter — must
     # default exactly like before this feature (no behavior change for them).
@@ -242,6 +366,57 @@ def test_launch_failure_raises(monkeypatch):
     idx = _load(monkeypatch, launch_impl=_boom, env={"GROOM_DISPATCH_ENABLED": "true"})
     with pytest.raises(_SpotLaunchError, match="RunInstances denied"):
         idx.handler({"run_mode": "full"}, None)
+
+
+def test_run_token_generated_and_exported_and_returned(monkeypatch):
+    # config#1645: the dispatch Step Function's completion-marker check needs a
+    # per-attempt token that reaches the box (as GROOM_RUN_TOKEN) AND comes back
+    # in the Lambda's own response (so the SF can build the S3 key to check).
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    g = out["groom"]
+    assert "run_token" in g and g["run_token"], "run_token missing from the Lambda's response"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert f"export GROOM_RUN_TOKEN={g['run_token']}" in cmd
+    assert cmd.index("export GROOM_RUN_TOKEN") < cmd.index("groom_spot_bootstrap.sh")
+
+
+def test_run_token_differs_across_invocations(monkeypatch):
+    # Each SF relaunch attempt calls the Lambda again — a stale token reused
+    # across attempts would let a dead attempt's (absent) marker be confused
+    # with a fresh attempt's, defeating the whole relaunch-detection mechanism.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out1 = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    out2 = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out1["groom"]["run_token"] != out2["groom"]["run_token"]
+
+
+def test_force_on_demand_skips_spot_entirely(monkeypatch):
+    # config#1645: the SF's final bounded relaunch attempt after repeated
+    # mid-run spot interruption sets force_on_demand — must go straight to
+    # on-demand, not attempt (and possibly lose to) spot a third time.
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-forced"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "force_on_demand": True}, None)
+    assert out["groom"]["market"] == "on-demand"
+    assert seen == [False], "force_on_demand must skip the spot attempt outright"
+
+
+def test_force_on_demand_absent_by_default(monkeypatch):
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-normal"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"run_mode": "full"}, None)
+    assert seen == [True], "the 2 pre-existing schedules' behavior must be unchanged"
 
 
 def test_post_launch_failure_terminates_instance_no_orphan(monkeypatch):

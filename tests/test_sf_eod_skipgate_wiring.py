@@ -7,6 +7,14 @@ CaptureSnapshot from scratch. This adds a skip-gate before each EOD work task
 so an operator rerun passing `{"skip_<task>": true}` resumes at the first
 incomplete task. Mirrors the weekday SF gates (L4606) and the Saturday SF.
 
+config#1614 (2026-07-02): skip flags are honored ONLY when the execution
+input carries `pipeline_role == "operator-replay"`. On any other role (the
+daemon's `eod`, `daily`, absent, etc.) the flags are structurally INERT and
+every task runs — closing the 2026-06-30 forced-green vector where a
+recovery rerun passed `skip_capture_snapshot=true` on a live-role input and
+silently bypassed the CaptureSnapshot axis guard (config#1610). Skips are
+ignored, not fatal: the downstream fail-loud guards stay the enforcement.
+
 The final cost-guard `StopTradingInstance` is intentionally NOT skip-gated — it
 must always run to release the trading EC2.
 """
@@ -48,9 +56,16 @@ class TestGatePresenceAndShape:
     def test_gate_exists_and_shaped(self, states, gate, task, flag, nxt):
         assert gate in states and states[gate]["Type"] == "Choice"
         c = states[gate]["Choices"][0]
-        assert {cond["Variable"] for cond in c["And"]} == {f"$.{flag}"}
-        assert any(cond.get("IsPresent") is True for cond in c["And"])
-        assert any(cond.get("BooleanEquals") is True for cond in c["And"])
+        # config#1614: every skip gate requires BOTH the flag AND the
+        # operator-replay pipeline_role — a skip flag on a live-role input
+        # is inert.
+        assert {cond["Variable"] for cond in c["And"]} == {f"$.{flag}", "$.pipeline_role"}
+        flag_conds = [x for x in c["And"] if x["Variable"] == f"$.{flag}"]
+        role_conds = [x for x in c["And"] if x["Variable"] == "$.pipeline_role"]
+        assert any(x.get("IsPresent") is True for x in flag_conds)
+        assert any(x.get("BooleanEquals") is True for x in flag_conds)
+        assert any(x.get("IsPresent") is True for x in role_conds)
+        assert any(x.get("StringEquals") == "operator-replay" for x in role_conds)
         assert c["Next"] == nxt
         assert states[gate]["Default"] == task
 
@@ -103,7 +118,10 @@ class TestEntryEdgesRouteThroughGates:
 
 
 class TestPaths:
-    def _walk(self, states, skip_flags):
+    def _walk(self, states, skip_flags, pipeline_role="operator-replay"):
+        """Simulate the gate chain. Mirrors ASL Choice semantics: the skip
+        branch is taken only when the flag is set AND pipeline_role ==
+        "operator-replay" (config#1614)."""
         gates = {c[0] for c in _CHAIN}
         order, seen, cur = [], set(), "CheckSkipRefreshExecutorDeploy"
         while cur and cur in states and cur not in seen:
@@ -111,7 +129,8 @@ class TestPaths:
             st = states[cur]
             if cur in gates:
                 flag = next(c[2] for c in _CHAIN if c[0] == cur)
-                cur = st["Choices"][0]["Next"] if flag in skip_flags else st["Default"]
+                skip_taken = flag in skip_flags and pipeline_role == "operator-replay"
+                cur = st["Choices"][0]["Next"] if skip_taken else st["Default"]
                 continue
             order.append(cur)
             if st.get("End") or st["Type"] in ("Succeed", "Fail"):
@@ -159,3 +178,30 @@ class TestPaths:
         assert "PostMarketArcticAppend" not in order
         assert order[0] == "CaptureSnapshot"
         assert order[-1] == "StopTradingInstance"
+
+
+class TestSkipFlagsInertOutsideOperatorReplay:
+    """config#1614 closes-when: a skip flag on a non-operator-replay input is
+    structurally ignored — the 2026-06-30 skip_capture_snapshot forced-green
+    vector no longer exists for live/daemon/watch-initiated runs."""
+
+    def test_all_skips_inert_on_live_eod_role(self, states):
+        order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role="eod")
+        for task in (c[1] for c in _CHAIN):
+            assert task in order, f"{task} was skipped despite non-replay role"
+        assert order[-1] == "StopTradingInstance"
+
+    def test_all_skips_inert_when_role_absent(self, states):
+        order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role=None)
+        for task in (c[1] for c in _CHAIN):
+            assert task in order, f"{task} was skipped despite absent role"
+
+    def test_operator_replay_still_honors_skips(self, states):
+        order = self._walk(
+            states,
+            skip_flags={c[2] for c in _CHAIN},
+            pipeline_role="operator-replay",
+        )
+        assert order == ["StopTradingInstance"]
+
+    _walk = TestPaths._walk
