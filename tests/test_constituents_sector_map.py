@@ -450,17 +450,18 @@ def test_collect_returns_tickers_in_dict() -> None:
     assert set(result["tickers"]) == {"AAPL", "MSFT", "JHG", "WSO"}
 
 
-def test_sector_map_writes_to_all_three_paths() -> None:
-    """Wave-3 PR3 (ROADMAP L1401): sector_map.json must be written to:
+def test_sector_map_writes_to_canonical_paths_only() -> None:
+    """PR4 cutover (config#780): sector_map.json must be written to:
 
       1. ``data/sector_map.json`` — canonical \"new\" data path.
-      2. ``predictor/price_cache/sector_map.json`` — legacy path (retired
-         in PR4).
-      3. ``reference/price_cache/sector_map.json`` — Wave-3 new home for
-         the predictor/price_cache/ migration. PR1 #270 missed this
-         write (it scoped only the ticker-parquet writes); without it,
-         readers that hit ``reference/`` first see a stale snapshot
-         after PR4 deletes legacy.
+      2. ``reference/price_cache/sector_map.json`` — Wave-3 home for
+         the predictor/price_cache/ migration.
+
+    The legacy ``predictor/price_cache/sector_map.json`` write is gone —
+    it was the one straggler still recreating the deleted legacy prefix
+    on every weekly run after the ticker-parquet side (via
+    ``_price_cache_write_prefixes()``) had already cut over to
+    ``reference/`` only.
     """
     from unittest.mock import MagicMock
 
@@ -489,7 +490,6 @@ def test_sector_map_writes_to_all_three_paths() -> None:
     written_keys = {c["Key"] for c in sector_map_writes}
     assert written_keys == {
         "data/sector_map.json",
-        "predictor/price_cache/sector_map.json",
         "reference/price_cache/sector_map.json",
     }, written_keys
     # Bodies must be byte-equal — readers can pick any path safely.

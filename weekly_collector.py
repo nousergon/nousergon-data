@@ -463,7 +463,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     db_path=db_path,
                     signals_prefix=ur_cfg.get("signals_prefix", "signals"),
                     sector_map_key=ur_cfg.get(
-                        "sector_map_key", "predictor/price_cache/sector_map.json"
+                        "sector_map_key", "reference/price_cache/sector_map.json"
                     ),
                     dry_run=dry_run,
                 ),
