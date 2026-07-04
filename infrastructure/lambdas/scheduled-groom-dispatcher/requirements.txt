@@ -8,3 +8,7 @@ boto3>=1.34.0
 # just boto3, which the runtime provides; base deps (pydantic/pyyaml/requests) are
 # light and well under the Lambda size limit.
 nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
+# usage_pacing (linear-pace short-circuit math) for the pre-boot pace gate
+# (2026-07-04) — mirrors alpha-engine-config/scripts/groom_budget.py's on-box
+# gate. Pure-stdlib module, published to PyPI (nousergon/krepis).
+krepis==0.10.0
