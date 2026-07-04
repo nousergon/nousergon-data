@@ -35,7 +35,7 @@
       "Type": "Pass",
       "Comment": "mode=backtest-eval ONLY (config#830). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training/drift-detection), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_pipeline_contract_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
@@ -105,7 +105,7 @@
           "Next": "ExtractLibPinDriftError"
         }
       ],
-      "Default": "CheckMutexRole"
+      "Default": "CheckSkipPipelineContractCheck"
     },
     "ExtractLibPinDriftError": {
       "Type": "Pass",
@@ -114,6 +114,84 @@
         "phase": "LibPinDriftGate",
         "source": "LibPinDriftGate.has_drift",
         "drift.$": "$.libpin_drift_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "CheckSkipPipelineContractCheck": {
+      "Type": "Choice",
+      "Comment": "Skip-gate (L4595 / config#693). {\"skip_pipeline_contract_check\": true} bypasses the pre-spend PIPELINE_CONTRACT.yaml preflight — e.g. an operator rerun where the contract is known-good. Mirrors CheckSkipLibPinDriftCheck.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_pipeline_contract_check",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_pipeline_contract_check",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Default": "CheckPipelineContract"
+    },
+    "CheckPipelineContract": {
+      "Type": "Task",
+      "Comment": "Preventive pre-spend PIPELINE_CONTRACT.yaml preflight gate (L4595 / config#693). Runs right after LibPinDriftCheck, before any spot launch: fetches PIPELINE_CONTRACT.yaml + ARTIFACT_REGISTRY.yaml from GitHub raw and asserts self-consistency (every boundary's required keys present, every artifact_id present in ARTIFACT_REGISTRY.yaml). The CI validator + per-repo contract tests (L4520(a)) catch a producer/consumer field drift at PR time, but a config/SF-definition change made outside those repos' CI can still spend a Saturday spot before failing — this closes that gap. has_violation=true halts in seconds with the named violation(s) instead of failing mid-pipeline. FAIL-OPEN: a GitHub-fetch/parse miss sets has_violation=false (the probe's own degraded mode, reason=fetch_failed), and the Catch routes any Lambda failure straight to the pipeline — so the checker NEVER false-halts the weekly run.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_pipeline_contract"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
+          "Next": "CheckMutexRole",
+          "ResultPath": "$.pipeline_contract_error"
+        }
+      ],
+      "ResultPath": "$.pipeline_contract_result",
+      "Next": "PipelineContractGate"
+    },
+    "PipelineContractGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency break or a dangling artifact_id not in ARTIFACT_REGISTRY.yaml). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure) — mirrors LibPinDriftGate's normalizer convention (a bare Choice→HandleFailure jump does not populate $.error, and HandleFailure's Message template hard-requires it via States.JsonToString($.error)).",
+      "Choices": [
+        {
+          "Variable": "$.pipeline_contract_result.Payload.has_violation",
+          "BooleanEquals": true,
+          "Next": "ExtractPipelineContractError"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "ExtractPipelineContractError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. Mirrors ExtractLibPinDriftError — the gate is a Choice so it does not itself populate $.error; without this normalizer HandleFailure would die with States.Runtime instead of surfacing the violation(s). Carries the whole probe Payload (reason/violations/boundary_count) so the FAILED SNS alert names the exact contract break a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime.",
+      "Parameters": {
+        "phase": "PipelineContractGate",
+        "source": "PipelineContractGate.has_violation",
+        "violation.$": "$.pipeline_contract_result.Payload"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"

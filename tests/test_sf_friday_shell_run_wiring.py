@@ -83,6 +83,9 @@ _EXPECTED_SKIPS = {
     # Added 2026-06-08 (L4517 — preventive cross-repo lib-pin drift gate,
     # the first state after InitializeInput).
     "skip_lib_pin_drift_check",
+    # Added 2026-07-04 (L4595 / config#693 — pre-spend PIPELINE_CONTRACT.yaml
+    # preflight gate, right after the lib-pin drift gate).
+    "skip_pipeline_contract_check",
     "skip_morning_enrich",
     "skip_data_phase1",
     "skip_rag_ingestion",
@@ -986,12 +989,19 @@ class TestHappyPathTraversal:
         # config#830: CheckRunMode (cadence preset) sits between InitializeInput
         # and the lib-pin gate; with no `mode` on the input it takes its Default
         # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
+        # config#693 (L4595): the pipeline-contract preflight gate sits between
+        # LibPinDriftGate and CheckMutexRole — three extra states (skip-gate,
+        # check, gate) in the visited order, converging on CheckMutexRole with
+        # no drift/violation on the input.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckRunMode",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",
+            "CheckSkipPipelineContractCheck",
+            "CheckPipelineContract",
+            "PipelineContractGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
