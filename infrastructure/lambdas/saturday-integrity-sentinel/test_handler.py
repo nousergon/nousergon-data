@@ -24,7 +24,10 @@ sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
 sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import index  # noqa: E402
+import flow_doctor_telegram  # noqa: E402
+from flow_doctor_telegram import reset_flow_doctor_cache  # noqa: E402
 
 
 class FakeClientError(Exception):
@@ -59,9 +62,12 @@ def _s3(doc=None, missing=False, put=None):
 
 
 @pytest.fixture(autouse=True)
-def reset_telegram():
+def reset_telegram(monkeypatch):
+    monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "0")
     _telegram_mod.send_message.reset_mock()
     _telegram_mod.send_message.return_value = True
+    monkeypatch.setattr(flow_doctor_telegram, "send_message", _telegram_mod.send_message)
+    reset_flow_doctor_cache()
     yield
 
 
