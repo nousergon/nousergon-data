@@ -63,6 +63,15 @@
       "Effect": "Allow",
       "Action": ["s3:GetObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/claude_code_usage/*"
+    },
+    {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+      ]
     }
   ]
 }

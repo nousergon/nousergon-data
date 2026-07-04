@@ -20,10 +20,12 @@ fleet chokepoints — no lib change):
      (InstanceInitiatedShutdownBehavior=terminate + a watchdog). The Lambda
      returns immediately — it does NOT babysit the multi-hour run.
 
-The box reads ALL secrets itself from SSM via its instance profile
+The box reads its OWN run secrets (PAT, etc.) from SSM via its instance profile
 (alpha-engine-executor-profile → alpha-engine-executor-role, which already has
-ssm:GetParameter on /alpha-engine/*), so this Lambda needs NO secret access — it
-only needs ec2:RunInstances, iam:PassRole (the executor role), and ssm:SendCommand.
+ssm:GetParameter on /alpha-engine/*) — this Lambda needs none of those. It DOES
+(2026-07-04) read the two Telegram secrets itself, scoped narrowly (see the
+pre-boot pace gate note below), for the one notification only IT can send (a
+pre-boot skip never boots a box, so there's no on-box groom_run.sh to ping).
 
 Fail-loud (a scheduled groom IS the deliverable): a launch/SSM failure RAISES so
 EventBridge retries + the Lambda error metric + a CloudWatch alarm surface the
@@ -44,7 +46,13 @@ ANY error reading S3/computing the gate → launch proceeds, never blocked by a
 pace-gate infra hiccup (mirrors `groom_budget.py`'s own fail-safe posture).
 A pace-gate skip returns ``launched: False`` — the dispatch Step Function's
 existing `CheckLaunched` → `GroomSkipped` branch (already used for the
-`GROOM_DISPATCH_ENABLED=false` kill-switch) handles it with no SF changes.
+`GROOM_DISPATCH_ENABLED=false` kill-switch) handles it with no SF changes. A
+skip also sends its own Telegram ping — best-effort via `krepis.telegram
+.send_message` (never raises), scoped IAM to read just the two Telegram SSM
+params (see iam-policy.json). Distinct from the on-box budget gate's own
+Telegram ping (`groom_budget.py` skip, or `groom_driver.py`'s mid-run
+recheck via `groom_run.sh`'s "WOUND DOWN" message) — a pre-boot skip never
+reaches the box, so this Lambda is the ONLY place that can notify for it.
 
 Managed OUTSIDE CloudFormation (same as before): operator-deployed via
 `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until the new code +
@@ -63,6 +71,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import boto3
+from krepis.telegram import send_message
 from krepis.usage_pacing import pace_check, reset_window
 from nousergon_lib import ec2_spot
 from nousergon_lib.ec2_spot import SpotCapacityExhausted
@@ -451,7 +460,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     Pre-boot pace gate (2026-07-04): if weekly Claude usage is running ahead
     of a linear pace through the current reset window, the launch is skipped
     entirely — before any spot cost is incurred — rather than deferring the
-    decision to the on-box `groom_budget.py` gate. See module docstring.
+    decision to the on-box `groom_budget.py` gate. See module docstring. A
+    skip here sends its own Telegram ping (best-effort — `krepis.telegram
+    .send_message` never raises) since this is the ONLY place a pre-boot skip
+    is ever visible; a run that never boots has no on-box `groom_run.sh` to
+    fire its own notification the way the on-box budget-gate skip does.
     """
     event = event or {}
     run_mode = _resolve_run_mode(event)
@@ -473,6 +486,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "pace gate SKIP — used_frac=%.4f > elapsed_frac=%.4f (overrun=%+.4f, "
                 "wet=%.0f) — groom spot NOT launched, resumes next schedule/reset",
                 pace["used_frac"], pace["elapsed_frac"], pace["overrun"], pace["wet"],
+            )
+            send_message(
+                "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
+                f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
+                f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
+                f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
+                "cost incurred. Resumes automatically on the next scheduled run "
+                "(or after the weekly reset)."
             )
             return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
 

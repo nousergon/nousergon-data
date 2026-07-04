@@ -215,6 +215,17 @@ def _wet_doc(wet: float) -> bytes:
     return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
 
 
+def _spy_send_message(monkeypatch, idx):
+    """Replace krepis.telegram.send_message (imported into index as
+    `send_message`) with a recorder — avoids exercising the real secret
+    resolution / HTTP path (this test harness's fake SSM client doesn't
+    implement get_parameter, so the real krepis.secrets code path would blow
+    up on an AttributeError it isn't built to catch)."""
+    calls = []
+    monkeypatch.setattr(idx, "send_message", lambda text, **kw: calls.append(text) or True)
+    return calls
+
+
 def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     # 1 day into the window (elapsed_frac ~= 1/7 ~= 0.143): 50% of the weekly
     # ceiling already consumed is way ahead of pace -> skip BEFORE any launch.
@@ -224,6 +235,7 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_send_message(monkeypatch, idx)
 
     def _launch(types_, subnets, **kw):
         raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
@@ -235,6 +247,12 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     assert g["reason"] == "pace_gate_skip"
     assert g["exceeded"] is True
     assert idx._test_ssm.sent == []  # no bootstrap command ever sent
+    # The pre-boot skip must notify — it's the ONLY place this outcome is ever
+    # visible (a run that never boots has no on-box groom_run.sh to ping).
+    assert len(notified) == 1
+    assert "SKIPPED" in notified[0]
+    assert "soft budget threshold passed before boot" in notified[0]
+    assert "never launched" in notified[0]
 
 
 def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
@@ -245,9 +263,11 @@ def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_send_message(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
+    assert notified == []  # no ping when nothing was skipped
 
 
 def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
@@ -258,18 +278,22 @@ def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_send_message(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
+    assert notified == []  # kill-switch disables the ping too — the gate never ran
 
 
 def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    notified = _spy_send_message(monkeypatch, idx)
 
     def _boom(**kw):
         raise RuntimeError("S3 unreachable")
     monkeypatch.setattr(idx._test_s3, "get_paginator", _boom)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
+    assert notified == []  # fail-safe path never trips (exceeded=False), no ping
 
 
 def test_missing_model_and_issue_filter_default_to_sonnet_queue(monkeypatch):
