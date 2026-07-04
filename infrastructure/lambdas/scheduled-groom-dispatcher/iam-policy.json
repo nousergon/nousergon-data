@@ -48,6 +48,21 @@
       "Condition": {
         "StringEquals": { "ec2:ResourceTag/Name": "alpha-engine-groom-spot" }
       }
+    },
+    {
+      "Sid": "ReadClaudeCodeUsageForPaceGate",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": { "s3:prefix": "claude_code_usage/*" }
+      }
+    },
+    {
+      "Sid": "ReadClaudeCodeUsageObjectsForPaceGate",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/claude_code_usage/*"
     }
   ]
 }
