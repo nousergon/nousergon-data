@@ -48,11 +48,13 @@ if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # ----- 1. Package -----------------------------------------------------------
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
