@@ -1,6 +1,6 @@
 # config#1747 — flow-doctor forum-topic routing for SLA-miss alerts.
-# Substrate bumped to v0.82.0 for flow_doctor_fleet + compat with sibling Lambdas.
+# Substrate bumped to v0.83.0 for flow_doctor_fleet + compat with sibling Lambdas.
 # Bumping this is a substrate-change PR — not a code-only refresh.
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
 krepis>=0.10.2
 pyyaml>=6.0

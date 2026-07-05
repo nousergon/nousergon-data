@@ -1,12 +1,13 @@
 """Unit tests for the EventBridge-Scheduler → groom-spot dispatcher (config#1432).
 
-Hermetic: `nousergon_lib.ec2_spot` and `boto3` are stubbed in sys.modules BEFORE
-importing index, so the tests run without either installed (matching how
-deploy.sh runs them with bare python3). Validates: a schedule event launches a
-spot box and fires an async SSM command carrying the run_mode; the on-demand
-fallback on spot capacity exhaustion; run_mode normalisation; the kill-switch
-short-circuit; and fail-loud (a launch failure RAISES so EventBridge retries +
-the error metric surface the miss).
+Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
+BEFORE importing index; ``nousergon_lib.flow_doctor_fleet`` is the REAL pinned
+enum installed by deploy.sh's preflight gate (config#1772 — no hand-maintained
+FleetTelegramTopic fake). Validates: a schedule event launches a spot box and
+fires an async SSM command carrying the run_mode; the on-demand fallback on spot
+capacity exhaustion; run_mode normalisation; the kill-switch short-circuit; and
+fail-loud (a launch failure RAISES so EventBridge retries + the error metric
+surface the miss).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import importlib
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -32,31 +34,13 @@ class _SpotCapacityExhausted(_SpotLaunchError):
 
 
 def _install_stubs(launch_impl, boto_clients):
+    # Real nousergon_lib.flow_doctor_fleet (FleetTelegramTopic enum) is installed
+    # into TEST_DEPS by deploy.sh — do NOT hand-roll it here (config#1772).
     ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
     ec2_spot_mod.SpotLaunchError = _SpotLaunchError
     ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
     ec2_spot_mod.launch = launch_impl
-    pkg = types.ModuleType("nousergon_lib")
-    pkg.ec2_spot = ec2_spot_mod
-    fleet_mod = types.ModuleType("nousergon_lib.flow_doctor_fleet")
-
-    # Mirror the members of the real nousergon_lib.flow_doctor_fleet
-    # .FleetTelegramTopic that index.py references at IMPORT time (module-level
-    # _OPS_TOPICS / _GROOM_LIFECYCLE_TOPICS tuples). A member missing here fails
-    # `import index` at load and takes the WHOLE suite down — not just the test
-    # that exercises it (2026-07-05: GROOM was added to index.py + the real enum
-    # in nousergon-lib v0.82.0, but this hermetic stub was not kept in lockstep;
-    # config#1748).
-    class _FleetTelegramTopic:
-        CRITICAL = "critical"
-        OPS_HEALTH = "ops_health"
-        GROOM = "groom"
-
-    fleet_mod.FleetTelegramTopic = _FleetTelegramTopic
-    pkg.flow_doctor_fleet = fleet_mod
-    sys.modules["nousergon_lib"] = pkg
     sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
-    sys.modules["nousergon_lib.flow_doctor_fleet"] = fleet_mod
 
     fdt_mod = types.ModuleType("flow_doctor_telegram")
     fdt_mod.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
@@ -141,6 +125,12 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None):
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
+    # Derive the stub requirement from index.py's live import graph and fail
+    # loud on drift here, rather than as a ModuleNotFoundError at deploy time
+    # (config#1746 — this stub has drifted three times: config#1742/#1748).
+    from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
+
+    assert_hermetic_imports_satisfied(__file__)
     import index
 
     importlib.reload(index)
@@ -229,6 +219,36 @@ def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
     assert "export GROOM_MODEL=claude-opus-4-8" in cmd
     assert "export GROOM_ISSUE_FILTER=high-only" in cmd
     assert cmd.index("export GROOM_MODEL") < cmd.index("groom_spot_bootstrap.sh")
+
+
+def test_high_only_schedule_forwards_pr_budget(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {
+            "run_mode": "full",
+            "model": "claude-opus-4-8",
+            "issue_filter": "high-only",
+            "schedule": "0 15 * * *",
+            "pr_budget": 100,
+        },
+        None,
+    )
+    assert out["groom"]["pr_budget"] == 100
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_PR_BUDGET=100" in cmd
+
+
+def test_deploy_schedule_high_only_carries_pr_budget():
+    deploy_sh = (
+        Path(__file__).resolve().parent / "deploy.sh"
+    ).read_text()
+    assert '"pr_budget":100' in deploy_sh or '"pr_budget": 100' in deploy_sh
+    # Haiku/Sonnet schedules must NOT inherit the Opus override.
+    low_line = next(
+        line for line in deploy_sh.splitlines()
+        if "low-only" in line and "SCHED_INPUTS" not in line
+    )
+    assert "pr_budget" not in low_line
 
 
 # ── Pre-boot pace gate (2026-07-04) ─────────────────────────────────────────
