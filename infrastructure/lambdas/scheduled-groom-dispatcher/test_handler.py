@@ -311,23 +311,37 @@ def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     assert notified == []  # fail-safe path never trips (exceeded=False), no ping
 
 
-def test_missing_model_and_issue_filter_default_to_sonnet_queue(monkeypatch):
-    # The 2 pre-existing Sonnet schedules don't set model/issue_filter — must
-    # default exactly like before this feature (no behavior change for them).
+def test_missing_model_and_issue_filter_default_to_mid_queue(monkeypatch):
+    # Schedules with no model/issue_filter must default to Sonnet / mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     g = out["groom"]
     assert g["model"] == "claude-sonnet-5"
-    assert g["issue_filter"] == "default"
+    assert g["issue_filter"] == "mid-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "export GROOM_MODEL=claude-sonnet-5" in cmd
-    assert "export GROOM_ISSUE_FILTER=default" in cmd
+    assert "export GROOM_ISSUE_FILTER=mid-only" in cmd
 
 
-def test_unknown_issue_filter_falls_back_to_default(monkeypatch):
+def test_low_only_schedule_forwards_haiku_model_and_filter(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {"run_mode": "full", "model": "claude-haiku-4-5", "issue_filter": "low-only",
+         "schedule": "0 7 * * *"},
+        None,
+    )
+    g = out["groom"]
+    assert g["model"] == "claude-haiku-4-5"
+    assert g["issue_filter"] == "low-only"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+    assert "export GROOM_ISSUE_FILTER=low-only" in cmd
+
+
+def test_unknown_issue_filter_falls_back_to_mid_only(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "issue_filter": "bogus"}, None)
-    assert out["groom"]["issue_filter"] == "default"
+    assert out["groom"]["issue_filter"] == "mid-only"
 
 
 def test_malformed_model_falls_back_to_default(monkeypatch):

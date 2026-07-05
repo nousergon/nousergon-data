@@ -141,8 +141,8 @@ CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
 _VALID_RUN_MODES = {"full", "sweep"}
 _DEFAULT_RUN_MODE = "full"
-_VALID_ISSUE_FILTERS = {"default", "high-only"}
-_DEFAULT_ISSUE_FILTER = "default"
+_VALID_ISSUE_FILTERS = {"default", "mid-only", "low-only", "high-only"}
+_DEFAULT_ISSUE_FILTER = "mid-only"
 _DEFAULT_MODEL = "claude-sonnet-5"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
 # shell command below) — model ids are Lambda-config-controlled, not raw user
@@ -222,8 +222,10 @@ def _resolve_run_mode(event: dict) -> str:
 
 
 def _resolve_issue_filter(event: dict) -> str:
-    """Pull issue_filter from the schedule input; unknown/missing → default (Sonnet queue)."""
+    """Pull issue_filter from the schedule input; unknown/missing → mid-only (Sonnet queue)."""
     f = str(event.get("issue_filter") or _DEFAULT_ISSUE_FILTER).strip().lower()
+    if f == "default":
+        f = "mid-only"
     if f not in _VALID_ISSUE_FILTERS:
         logger.warning("unknown issue_filter %r — defaulting to %s", f, _DEFAULT_ISSUE_FILTER)
         f = _DEFAULT_ISSUE_FILTER
