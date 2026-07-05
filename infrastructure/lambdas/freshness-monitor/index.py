@@ -178,6 +178,9 @@ _SPEC_FIELDS = frozenset(
         # S3-contract-safe migration window.
         "active_trading_days_only",
         "active_hours_utc",
+        "produces",
+        "depends_on",
+        "liveness_via",
     }
 )
 
