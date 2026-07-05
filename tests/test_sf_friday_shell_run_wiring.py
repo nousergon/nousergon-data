@@ -452,14 +452,16 @@ class TestStrictSuperset:
         assert choices[0]["Next"] == "ApplyShellRunDefaults"
 
     def test_notify_complete_is_byte_identical(self, states):
-        """The real Saturday SUCCESS email must not change."""
+        """The real Saturday SUCCESS email — now deep-links to the console
+        pipeline-status page (config#856 push-on-transition revamp)."""
         nc = states["NotifyComplete"]
         assert nc["Resource"] == "arn:aws:states:::sns:publish"
         assert nc["Parameters"]["Subject"] == (
             "Alpha Engine Saturday Pipeline — SUCCESS"
         )
         assert nc["Parameters"]["Message"] == (
-            "All steps completed successfully. Check dashboard for results."
+            "All steps completed successfully. "
+            "View pipeline status: https://console.nousergon.ai/pipeline-status"
         )
         assert nc["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
         assert nc["ResultPath"] == "$.notify_result"
