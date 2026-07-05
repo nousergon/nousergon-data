@@ -332,6 +332,60 @@ def test_handler_alerts_enabled_fires_with_dedup_key(
     assert "freshness_probe_missing_2026-W22" in dedup_keys
 
 
+def test_handler_warning_severity_console_only_no_alert(
+    monkeypatch, fake_s3, fixed_now
+):
+    """severity=warning misses surface in check_results but do NOT page
+    (no SNS / flow-doctor) — console-only per ARTIFACT_REGISTRY convention."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 0
+  calendar_aware: true
+artifacts:
+  - artifact_id: probe_stale_warning
+    s3_key_template: "path/{date}/stale.json"
+    cadence: saturday_sf
+    sla_minutes_after_cron: 60
+    severity: warning
+    owner_repo: alpha-engine-test
+    created_at: 2025-01-01
+"""
+    # Object exists but is older than SLA floor → stale + sla_violated > 0
+    cycle_tick = datetime(2026, 5, 30, 9, 0, tzinfo=timezone.utc)
+    fake_s3._head_returns["path/2026-05-30/stale.json"] = {
+        "LastModified": cycle_tick.replace(hour=9, minute=30),
+    }
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+
+    publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+
+    result = index.handler({}, None)
+
+    assert result["alerts_enabled"] is True
+    assert result["counts"].get("stale", 0) >= 1
+    publish_mock.assert_not_called()
+    notify_mock.assert_not_called()
+
+    check_body = next(
+        body for (_, k, body) in fake_s3._put_calls
+        if k == "_freshness_monitor/check_results.json"
+    )
+    check = json.loads(check_body)
+    row = next(r for r in check["results"] if r["artifact_id"] == "probe_stale_warning")
+    assert row["state"] == "stale"
+
+
 def test_handler_probe_failed_routes_to_critical(
     monkeypatch, yaml_registry_body, fake_s3, fixed_now
 ):

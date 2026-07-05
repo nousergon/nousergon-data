@@ -28,6 +28,9 @@ invocation:
      Telegram via flow-doctor forum topics (config#1742 T2 /
      config#1747) with ``dedup_key=resolve_dedup_key(spec, now)`` — dedup
      collapses 4×/hour retries to one alert per cycle per artifact.
+     **``severity=warning`` registry rows are console-only** (written to
+     ``check_results.json``; no SNS/Telegram — see ARTIFACT_REGISTRY
+     "dashboard-only" convention).
   6. **OBSERVE-mode gate**: when env
      ``FRESHNESS_MONITOR_ENABLED`` is anything other than
      ``"true"`` (case-insensitive), alerts are suppressed but the
@@ -662,6 +665,8 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         the SLA grace window), OR ``probe_failed`` (no grace for
         broken probes — operator needs to know immediately)
       - :data:`ALERTS_ENABLED` is True
+      - resolved severity is ``critical`` (``severity=warning`` rows are
+        console-only via ``check_results.json`` — no SNS/Telegram)
 
     Dedup-key resolution via
     :func:`alpha_engine_lib.artifact_freshness.resolve_dedup_key` ⇒
@@ -684,6 +689,23 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         )
         return False
 
+    # Probe failures route to critical (the monitor itself is broken);
+    # missing/stale respect the spec's severity. Plan §3 invariant 6.
+    severity = "critical" if result.state == "probe_failed" else spec.severity
+
+    # Registry convention: severity=warning means dashboard/console-only —
+    # the operator surface is check_results.json + this page, not ops-health
+    # Telegram. Critical (and probe_failed, coerced above) pages via SNS +
+    # flow-doctor. Aligns with ARTIFACT_REGISTRY comments ("dashboard-only")
+    # and the fleet notification consolidation arc (config#1740 / #1724).
+    if severity == "warning":
+        logger.info(
+            "console-only (severity=warning): %s state=%s — surfaced in "
+            "check_results.json, no SNS/Telegram",
+            spec.artifact_id, result.state,
+        )
+        return False
+
     # Compose the alert body.
     body = (
         f"artifact_id={spec.artifact_id} "
@@ -694,10 +716,6 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         f"reason={result.reason}"
     )
     dedup_key = resolve_dedup_key(spec, now)
-
-    # Probe failures route to critical (the monitor itself is broken);
-    # missing/stale respect the spec's severity. Plan §3 invariant 6.
-    severity = "critical" if result.state == "probe_failed" else spec.severity
 
     publish(
         body,
