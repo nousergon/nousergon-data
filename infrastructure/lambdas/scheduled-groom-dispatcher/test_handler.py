@@ -45,7 +45,7 @@ def _install_stubs(launch_impl, boto_clients):
     # _OPS_TOPICS / _GROOM_LIFECYCLE_TOPICS tuples). A member missing here fails
     # `import index` at load and takes the WHOLE suite down — not just the test
     # that exercises it (2026-07-05: GROOM was added to index.py + the real enum
-    # in nousergon-lib v0.82.0, but this hermetic stub was not kept in lockstep;
+    # in nousergon-lib v0.83.0, but this hermetic stub was not kept in lockstep;
     # config#1748).
     class _FleetTelegramTopic:
         CRITICAL = "critical"
