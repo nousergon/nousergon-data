@@ -91,7 +91,7 @@ aws iam update-assume-role-policy --role-name github-actions-lambda-deploy --pol
 ```
 
 When a new repo needs to auto-deploy, add its
-`repo:cipher813/<repo>:ref:refs/heads/main` (+ `:pull_request`) entry to
+`repo:nousergon/<repo>:ref:refs/heads/main` (+ `:pull_request`) entry to
 the trust JSON AND add its resource ARNs to the permission JSON, then
 apply both.
 
