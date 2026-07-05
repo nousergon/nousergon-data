@@ -190,6 +190,16 @@ class TestFlowDoctorYamlSchema:
         for key in ("max_alerts_per_day", "max_issues_per_day", "max_diagnosed_per_day"):
             assert key in rl, f"rate_limits.{key} required (Anthropic-cost cap)"
 
+    def test_yaml_github_notifier_category_gated_same_repo(self):
+        """config#1696 — narrow auto_fix_pr eligibility; keep repo local."""
+        import yaml
+        with open(REPO_ROOT / "flow-doctor.yaml") as f:
+            cfg = yaml.safe_load(f)
+        github = next(n for n in cfg["notify"] if n.get("type") == "github")
+        assert github["repo"] == "nousergon/nousergon-data"
+        assert github.get("notify_on_category") == ["CODE", "CONFIG"]
+        assert github.get("auto_fix_pr") is True
+
 
 @flow_doctor_required
 class TestSetupLoggingAttach:

@@ -12,7 +12,7 @@ rebase). Both older names are now shims, and invoking a shim under runpy
     pin < v0.81.1 it fell off its end with exit 0 before the target's
     ``__main__`` guard fired, i.e. a SILENT no-op (the config#1646 incident: a
     weekly Step Function reported SUCCESS while running zero workloads). This
-    repo pins nousergon-lib v0.77.0, so that path no-ops here today.
+    repo pins nousergon-lib v0.82.0, so that path no-ops here today.
 
 The robust, pin-independent entrypoint is ``python -m krepis.alerts`` — ``krepis``
 is a hard transitive dep (``requirements.txt`` floors ``krepis>=0.6.0``), so the
