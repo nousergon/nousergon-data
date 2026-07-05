@@ -121,7 +121,9 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "rag/pipelines/emit_manifest.py": 2,
     "rag/pipelines/filing_change_detection.py": 2,
     "rag/pipelines/ingest_form4.py": 2,
-    "weekly_collector.py": 6,
+    # config#1727: _write_module_health delegates to nousergon_lib.health (1 fewer
+    # local put_object); health/{module}.json still written via lib.
+    "weekly_collector.py": 5,
 }
 
 
