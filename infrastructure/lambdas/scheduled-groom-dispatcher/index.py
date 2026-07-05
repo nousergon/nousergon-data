@@ -275,8 +275,31 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
+def _resolve_pr_budget(event: dict) -> int | None:
+    """Optional per-schedule PR budget override (config#1769).
+
+    Only the Opus high-only schedule sets this today; missing/invalid → None
+    (groom_spot_bootstrap.sh's GROOM_PR_BUDGET default of 50 applies).
+    """
+    raw = event.get("pr_budget")
+    if raw is None:
+        raw = event.get("GROOM_PR_BUDGET")
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("malformed pr_budget %r — ignoring (default 50 applies)", raw)
+        return None
+    if n <= 0:
+        logger.warning("non-positive pr_budget %r — ignoring (default 50 applies)", raw)
+        return None
+    return n
+
+
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
-                       run_token: str, soft_limit_min: int | None = None) -> str:
+                       run_token: str, soft_limit_min: int | None = None,
+                       pr_budget: int | None = None) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -285,6 +308,7 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     Any prelude failure shuts the box down so a botched launch never idles.
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
+    pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -307,7 +331,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -363,7 +387,8 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
-                    run_token: str, soft_limit_min: int | None = None) -> str:
+                    run_token: str, soft_limit_min: int | None = None,
+                    pr_budget: int | None = None) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
@@ -371,7 +396,9 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
         DocumentName="AWS-RunShellScript",
         Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         Parameters={
-            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter, run_token, soft_limit_min)],
+            "commands": [_bootstrap_command(
+                run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
+            )],
             # Execution timeout (NOT the start timeout) — without this SSM kills the
             # command at the 3600s default, guillotining a multi-hour groom.
             "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
@@ -402,7 +429,8 @@ def _terminate_instance(instance_id: str) -> None:
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
-                       soft_limit_min: int | None = None, force_on_demand: bool = False) -> dict:
+                       soft_limit_min: int | None = None, pr_budget: int | None = None,
+                       force_on_demand: bool = False) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -431,7 +459,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
         command_id = _send_bootstrap(
-            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min
+            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -457,6 +485,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "model": model,
         "issue_filter": issue_filter,
         "run_token": run_token,
+        **({"pr_budget": pr_budget} if pr_budget is not None else {}),
     }
 
 
@@ -494,6 +523,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
     (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
+    `pr_budget` is set only on the Opus high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
 
@@ -511,12 +541,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
     soft_limit_min = _resolve_soft_limit_min(event)
+    pr_budget = _resolve_pr_budget(event)
     force_on_demand = _resolve_force_on_demand(event)
     schedule_label = str(event.get("schedule") or "unknown")
     logger.info(
         "scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s "
-        "force_on_demand=%s schedule=%s",
-        run_mode, model, issue_filter, soft_limit_min, force_on_demand, schedule_label,
+        "pr_budget=%s force_on_demand=%s schedule=%s",
+        run_mode, model, issue_filter, soft_limit_min, pr_budget, force_on_demand, schedule_label,
     )
 
     if PACE_GATE_ENABLED:
@@ -530,5 +561,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             _notify_pace_skip(pace, schedule_label, run_mode)
             return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
 
-    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min, force_on_demand)
+    result = _launch_groom_spot(
+        run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
+    )
     return {"groom": result}
