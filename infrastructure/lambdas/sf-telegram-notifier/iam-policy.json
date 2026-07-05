@@ -26,8 +26,18 @@
     {
       "Sid": "DescribeExecutionForFailureCause",
       "Effect": "Allow",
-      "Action": ["states:DescribeExecution"],
+      "Action": ["states:DescribeExecution", "states:GetExecutionHistory"],
       "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-*:*"
+    },
+    {
+      "Sid": "ArtifactAttestationRead",
+      "Effect": "Allow",
+      "Action": ["s3:HeadObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research",
+        "arn:aws:s3:::alpha-engine-research/predictor/metrics/*",
+        "arn:aws:s3:::alpha-engine-research/backtest/*"
+      ]
     }
   ]
 }

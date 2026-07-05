@@ -20,6 +20,7 @@ import os
 
 import boto3
 
+from execution_digest import build_execution_digest, parse_run_date_from_input
 from flow_doctor_telegram import build_flow_doctor_config, notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import (
     FleetTelegramTopic,
@@ -52,6 +53,7 @@ _STATUS_EMOJI: dict[str, str] = {
 }
 
 _CAUSE_MAX_CHARS = 280
+_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
 
 
 def build_flow_doctor_config_for_tests() -> dict:
@@ -133,25 +135,54 @@ def _failure_cause_from(describe_resp: dict | None) -> str:
     return snippet
 
 
-def _build_message(detail: dict) -> tuple[str, bool]:
+def _build_message(
+    detail: dict,
+    describe_resp: dict | None = None,
+    *,
+    sf_client=None,
+    s3_client=None,
+) -> tuple[str, bool, bool]:
+    """Return ``(text, silent, hollow_suspect)``."""
     status = detail.get("status", "UNKNOWN")
-    describe_resp = _describe_execution(detail.get("executionArn", ""))
+    execution_arn = detail.get("executionArn", "")
+    if describe_resp is None:
+        describe_resp = _describe_execution(execution_arn)
     is_preflight = _is_preflight_execution(describe_resp)
     label = _label_for_arn(
         detail.get("stateMachineArn", ""), is_preflight=is_preflight
     )
     emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")
     exec_name = detail.get("name", "") or "(unknown execution)"
+    hollow_suspect = False
 
     lines = [f"{emoji} *{label} — {status}*"]
 
     if status == "RUNNING":
         lines.append(f"Execution: {exec_name}")
-        return "\n".join(lines), True
+        return "\n".join(lines), True, False
 
     duration = _format_duration(detail.get("startDate"), detail.get("stopDate"))
     if duration:
         lines.append(f"Duration: {duration}")
+
+    if status in _TERMINAL_STATUSES and execution_arn:
+        if sf_client is None:
+            sf_client = boto3.client("stepfunctions", region_name=REGION)
+        if s3_client is None and not is_preflight:
+            s3_client = boto3.client("s3", region_name=REGION)
+        run_date = parse_run_date_from_input((describe_resp or {}).get("input"))
+        digest_lines, hollow_suspect = build_execution_digest(
+            execution_arn=execution_arn,
+            is_preflight=is_preflight,
+            execution_start_ms=detail.get("startDate"),
+            run_date=run_date,
+            sf_client=sf_client,
+            s3_client=None if is_preflight else s3_client,
+        )
+        if hollow_suspect and status == "SUCCEEDED":
+            lines.append("⚠️ *HOLLOW-SUSPECT* — workload state(s) completed implausibly fast")
+        lines.append("*States:*")
+        lines.extend(digest_lines)
 
     if status == "FAILED":
         cause = _failure_cause_from(describe_resp)
@@ -159,7 +190,10 @@ def _build_message(detail: dict) -> tuple[str, bool]:
             lines.append(f"Cause: {cause}")
 
     lines.append(f"Execution: {exec_name}")
-    return "\n".join(lines), False
+    silent = False
+    if status == "SUCCEEDED" and hollow_suspect:
+        silent = False
+    return "\n".join(lines), silent, hollow_suspect
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001
@@ -168,11 +202,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
     sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
     logger.info("SF status change: sf=%s status=%s", sm_name, status)
 
-    text, silent = _build_message(detail)
+    text, silent, hollow_suspect = _build_message(detail)
     ok = notify_via_flow_doctor(
         text,
         silent=silent,
-        severity=_severity_for_status(status),
+        severity="warning" if hollow_suspect and status == "SUCCEEDED" else _severity_for_status(status),
         dedup_key=_dedup_key(detail),
         flow_name=_FLOW_NAME,
         topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
@@ -191,4 +225,5 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
         "execution": detail.get("name", ""),
         "telegram_sent": ok,
         "silent": silent,
+        "hollow_suspect": hollow_suspect,
     }
