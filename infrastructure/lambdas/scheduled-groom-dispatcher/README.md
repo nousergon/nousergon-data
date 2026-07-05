@@ -81,7 +81,9 @@ day-of-week year)` with `?` for an unspecified day field.
 ## Schedule-input routing
 
 Each schedule passes a JSON input, e.g. `{"run_mode": "full", "model":
-"claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 15 * * *"}`.
+"claude-opus-4-8", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 15 * * *"}`.
+The Opus schedule alone carries `pr_budget: 100` (config#1769) — forwarded as
+`GROOM_PR_BUDGET` on the spot box; Haiku/Sonnet stay at the bootstrap default (50).
 The Lambda resolves each field (unknown/missing values degrade to a safe
 default — `full` / `claude-sonnet-5` / `default`) and exports `GROOM_MODEL` +
 `GROOM_ISSUE_FILTER` in the SSM bootstrap prelude ahead of invoking
