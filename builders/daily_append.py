@@ -2104,6 +2104,28 @@ def _daily_append_impl(
             except Exception as exc:  # belt-and-suspenders — never fail the daily pipeline
                 log.warning("Factor-momentum daily update FAILED (OBSERVE, non-fatal): %s", exc)
 
+        # ── C.1: factor-loading z-score daily go-forward second pass ─────────
+        # The 9 *_zscore Barra loadings (C.3 / predictor risk_model_persist)
+        # are cross-sectional — same structural gap as factor_momentum_ratio.
+        # S3 feature store already runs apply_factor_zscores in compute.py;
+        # this pass keeps ArcticDB (predictor training + C.2b F+D persistence)
+        # in sync. Best-effort + gated; never fails the daily pipeline.
+        if os.environ.get("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "true").lower() != "false":
+            try:
+                from features.cross_sectional import update_factor_loading_zscores_latest
+                flz_result = update_factor_loading_zscores_latest(
+                    universe_lib, stock_tickers, today_ts,
+                    canonical_fn=to_arctic_canonical,
+                )
+                log.info(
+                    "Factor-loading z-score daily update: %s",
+                    json.dumps(flz_result, default=str),
+                )
+            except Exception as exc:
+                log.warning(
+                    "Factor-loading z-score daily update FAILED (non-fatal): %s", exc,
+                )
+
         # Producer-side post-write validation. Catches the partial-write
         # class (2026-04-21 ASGN/MOH) that the per-ticker error-rate gate
         # above misses — symbols not in today's batch but stale from
