@@ -30,16 +30,20 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 
 # (gate, task, skip_flag, next_after_skip) in pipeline order.
-# PostMarketArcticAppend was split out of PostMarketData 2026-06-16 (the slow
-# daily_append, mirroring the weekday MorningArcticAppend split L4608) — it gets
-# its own skip-gate so a recovery rerun can skip whichever half already completed.
+#
+# config#1767 (Phase 2): the EOD data phase (PostMarketData + PostMarketArcticAppend)
+# was relocated OFF the always-on ae-trading box onto an ephemeral spot box.
+# CheckSkipPostMarketData now gates the whole spot data phase (LaunchPostMarketDataSpot)
+# and its skip edge jumps to CheckSkipCaptureSnapshot (the old
+# CheckSkipPostMarketArcticAppend gate was removed with the on-trading append state).
+# The spot data-phase wiring is pinned separately in
+# test_sf_data_spot_relocation_wiring.py.
 _CHAIN = [
     # config#1549 — the hoisted top-of-pipeline executor-deploy refresh gate runs
     # FIRST (right after the SSM-readiness gate), so the entire EOD run executes
     # latest origin/main by construction. Skipping it resumes at the first work gate.
     ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipPostMarketData"),
-    ("CheckSkipPostMarketData", "PostMarketData", "skip_post_market_data", "CheckSkipPostMarketArcticAppend"),
-    ("CheckSkipPostMarketArcticAppend", "PostMarketArcticAppend", "skip_post_market_arctic_append", "CheckSkipCaptureSnapshot"),
+    ("CheckSkipPostMarketData", "LaunchPostMarketDataSpot", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
     ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "CheckSkipEODReconcile"),
     ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckSkipDailySubstrateHealthCheck"),
     ("CheckSkipDailySubstrateHealthCheck", "DailySubstrateHealthCheck", "skip_daily_substrate_health_check", "StopTradingInstance"),
@@ -96,15 +100,26 @@ class TestEntryEdgesRouteThroughGates:
                 if c.get("StringEquals") == "Success"]
         assert succ == ["CheckSkipPostMarketData"]
 
-    def test_post_market_success_enters_arctic_append_gate(self, states):
-        succ = [c["Next"] for c in states["CheckPostMarketStatus"]["Choices"]
+    def test_post_market_spot_success_enters_arctic_append_spot(self, states):
+        # config#1767: the post-market fetch now runs on spot; its poll Success
+        # enters the Arctic-append spot launch (both run on spot).
+        succ = [c["Next"] for c in states["CheckPostMarketDataSpotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckSkipPostMarketArcticAppend"]
+        assert succ == ["LaunchPostMarketArcticAppendSpot"]
 
-    def test_arctic_append_success_enters_snapshot_gate(self, states):
-        succ = [c["Next"] for c in states["CheckPostMarketArcticAppendStatus"]["Choices"]
+    def test_arctic_append_spot_success_enters_snapshot_gate(self, states):
+        # config#1767: the EOD Arctic append also runs on spot; its Success
+        # rejoins the reconcile/snapshot path at CheckSkipCaptureSnapshot.
+        succ = [c["Next"] for c in states["CheckPostMarketArcticAppendSpotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
         assert succ == ["CheckSkipCaptureSnapshot"]
+
+    def test_data_phase_no_longer_on_trading_box(self, states):
+        # config#1767 deliverable #2: the EOD path retains NO data-phase SSM
+        # states — reconcile/snapshot/stop stays, the data fetch/append moved.
+        for gone in ("PostMarketData", "PostMarketArcticAppend", "CheckPostMarketStatus",
+                     "CheckPostMarketArcticAppendStatus", "CheckSkipPostMarketArcticAppend"):
+            assert gone not in states, f"{gone} should have moved to the spot dispatcher"
 
     def test_snapshot_success_enters_reconcile_gate(self, states):
         succ = [c["Next"] for c in states["CheckSnapshotStatus"]["Choices"]
@@ -137,7 +152,13 @@ class TestPaths:
                 break
             if st["Type"] == "Choice":
                 succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
-                cur = succ[0] if succ else st.get("Default")
+                # config#1767: the spot launched-gate states branch on
+                # launched:true (BooleanEquals) — follow that on the happy path.
+                launched = (
+                    [c["Next"] for c in st.get("Choices", []) if c.get("BooleanEquals") is True]
+                    if cur.endswith("SpotLaunched") else []
+                )
+                cur = (succ or launched or [st.get("Default")])[0]
             else:
                 cur = st.get("Next")
         return order
@@ -156,28 +177,33 @@ class TestPaths:
         # Cost-guard cleanup must ALWAYS run.
         assert order == ["StopTradingInstance"]
 
-    def test_skip_refresh_resumes_at_post_market_data(self, states):
+    def test_skip_refresh_resumes_at_data_spot(self, states):
         # config#1549: skipping only the deploy refresh (e.g. an operator rerun
-        # on a box already known fresh) resumes at the first work task.
+        # on a box already known fresh) resumes at the first work task, which is
+        # now the spot data-phase launch (config#1767).
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
         assert "RefreshExecutorDeploy" not in order
-        assert order[0] == "PostMarketData"
+        assert order[0] == "LaunchPostMarketDataSpot"
         assert order[-1] == "StopTradingInstance"
 
-    def test_skip_post_market_resumes_at_arctic_append(self, states):
-        # Also skip the leading refresh gate so the walk starts cleanly at the
-        # PostMarket portion under test (config#1549 added the refresh gate first).
+    def test_skip_data_phase_resumes_at_snapshot(self, states):
+        # config#1767: skip_post_market_data now skips the ENTIRE spot data phase
+        # (fetch + append both on spot) and resumes at the snapshot gate — the
+        # old separate skip_post_market_arctic_append gate is gone.
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
-        assert "PostMarketData" not in order
-        assert order[0] == "PostMarketArcticAppend"
-        assert order[-1] == "StopTradingInstance"
-
-    def test_skip_post_market_and_arctic_append_resumes_at_snapshot(self, states):
-        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data", "skip_post_market_arctic_append"})
-        assert "PostMarketData" not in order
-        assert "PostMarketArcticAppend" not in order
+        assert "LaunchPostMarketDataSpot" not in order
+        assert "LaunchPostMarketArcticAppendSpot" not in order
         assert order[0] == "CaptureSnapshot"
         assert order[-1] == "StopTradingInstance"
+
+    def test_happy_path_runs_data_phase_on_spot(self, states):
+        # config#1767: the EOD data phase runs as spot-launch states, in order,
+        # before the snapshot.
+        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
+        assert "LaunchPostMarketDataSpot" in order
+        assert "LaunchPostMarketArcticAppendSpot" in order
+        assert order.index("LaunchPostMarketDataSpot") < order.index("LaunchPostMarketArcticAppendSpot")
+        assert order.index("LaunchPostMarketArcticAppendSpot") < order.index("CaptureSnapshot")
 
 
 class TestSkipFlagsInertOutsideOperatorReplay:

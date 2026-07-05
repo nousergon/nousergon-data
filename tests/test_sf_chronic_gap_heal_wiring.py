@@ -63,26 +63,21 @@ class TestChainOrdering:
     """CheckMorningEnrichStatus(Success) → ChronicGapSelfHeal →
     WaitForChronicGap → CheckChronicGapStatus(terminal) → PredictorInference."""
 
-    def test_heal_runs_after_morning_enrich_and_append(self, states):
-        # Since L4608 the load-bearing daily_append (CheckSkipMorningArcticAppend
-        # → MorningArcticAppend) sits between MorningEnrich and the heal. The
-        # heal still runs (behind its skip-gate) AFTER both, before predictions.
-        success = [
-            c["Next"]
-            for c in states["CheckMorningEnrichStatus"]["Choices"]
-            if c.get("StringEquals") == "Success"
-        ]
-        assert success == ["CheckSkipMorningArcticAppend"], (
-            "MorningEnrich success must hand off to the arctic-append gate"
-        )
-        # Append success → the chronic-gap skip-gate → (no flag) the heal.
+    def test_heal_runs_after_data_spot_phase(self, states):
+        # config#1767 (Phase 2): the enrich + daily_append were relocated OFF the
+        # trading box onto an ephemeral spot box. The heal still runs (behind its
+        # skip-gate) AFTER the spot data phase, before predictions. The Arctic
+        # append spot's Success rejoins the trading path at CheckSkipChronicGapHeal.
         append_success = [
             c["Next"]
-            for c in states["CheckMorningArcticAppendStatus"]["Choices"]
+            for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
         assert append_success == ["CheckSkipChronicGapHeal"]
         assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL
+        # The old on-trading enrich/append states are gone.
+        assert "MorningEnrich" not in states
+        assert "MorningArcticAppend" not in states
 
     def test_heal_routes_to_poll(self, states):
         assert states[_HEAL]["Next"] == _POLL
@@ -207,10 +202,20 @@ class TestSsmCommandShape:
         )
 
     def test_weekday_morning_enrich_skips_inline_heal(self, states):
-        cmds = extract_commands(states["MorningEnrich"])
-        joined = "\n".join(cmds)
-        assert "--morning-enrich --skip-chronic-heal" in joined, (
-            "The weekday MorningEnrich must pass --skip-chronic-heal so the "
-            "inline heal is not double-run alongside the ChronicGapSelfHeal "
-            "state (and MorningEnrich stays fully isolated from the heal)."
+        # config#1767: the enrich command moved from an on-trading SSM state into
+        # the data-spot dispatcher Lambda's workload map. It must STILL pass
+        # --skip-chronic-heal so the inline heal is not double-run alongside the
+        # on-trading ChronicGapSelfHeal state (which stays on the trading box).
+        disp = (
+            Path(__file__).resolve().parent.parent
+            / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+        ).read_text()
+        assert '"--morning-enrich "' in disp or "--morning-enrich " in disp
+        assert "--skip-chronic-heal" in disp, (
+            "The data-spot morning-enrich workload must pass --skip-chronic-heal "
+            "so the inline heal is not double-run with the on-trading heal state."
+        )
+        assert "--skip-arctic-append" in disp, (
+            "The morning-enrich workload must also pass --skip-arctic-append — "
+            "the Arctic append is its own separate spot workload."
         )

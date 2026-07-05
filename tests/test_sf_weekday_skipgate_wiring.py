@@ -30,9 +30,16 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 
 # (gate, task, skip_flag, next_gate) in pipeline order.
+#
+# config#1767 (Phase 2): the data phase (MorningEnrich + MorningArcticAppend)
+# was relocated OFF the always-on ae-trading box onto an ephemeral spot box.
+# CheckSkipMorningEnrich now gates the whole spot data phase (LaunchMorningEnrichSpot)
+# and its skip edge jumps to CheckSkipChronicGapHeal (the old
+# CheckSkipMorningArcticAppend gate was removed with the on-trading append state).
+# The spot data-phase wiring is pinned separately in
+# test_sf_data_spot_relocation_wiring.py.
 _CHAIN = [
-    ("CheckSkipMorningEnrich", "MorningEnrich", "skip_morning_enrich", "CheckSkipMorningArcticAppend"),
-    ("CheckSkipMorningArcticAppend", "MorningArcticAppend", "skip_morning_arctic_append", "CheckSkipChronicGapHeal"),
+    ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipChronicGapHeal"),
     ("CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "skip_chronic_gap_heal", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
@@ -100,31 +107,26 @@ class TestEntryEdgesRouteThroughGates:
     def test_trading_day_gate_failed_proceeds_as_trading_day(self, states):
         assert states["TradingDayGateFailed"]["Next"] == "StartExecutorEC2"
 
-    def test_morning_enrich_success_enters_append_gate(self, states):
-        # L4608: the slow daily_append is now its own load-bearing state behind
-        # CheckSkipMorningArcticAppend, after the fast MorningEnrich fetch.
-        success = [c["Next"] for c in states["CheckMorningEnrichStatus"]["Choices"]
+    def test_morning_enrich_spot_success_enters_append_spot(self, states):
+        # config#1767: the enrich fetch now runs on the spot box. Its poll-status
+        # Success enters the Arctic-append spot launch (both run on spot).
+        success = [c["Next"] for c in states["CheckMorningEnrichSpotStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
-        assert success == ["CheckSkipMorningArcticAppend"]
+        assert success == ["LaunchMorningArcticAppendSpot"]
 
-    def test_arctic_append_success_enters_heal_gate(self, states):
-        success = [c["Next"] for c in states["CheckMorningArcticAppendStatus"]["Choices"]
+    def test_arctic_append_spot_success_enters_heal_gate(self, states):
+        # config#1767: the Arctic append also runs on spot; its Success rejoins
+        # the trading path at CheckSkipChronicGapHeal.
+        success = [c["Next"] for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
         assert success == ["CheckSkipChronicGapHeal"]
 
-    def test_arctic_append_is_load_bearing(self, states):
-        # Unlike the fail-soft heal, daily_append must halt the pipeline on
-        # failure — predictor reads the ArcticDB universe right after.
-        assert states["CheckMorningArcticAppendStatus"]["Default"] == "HandleFailure"
-        assert states["MorningArcticAppend"]["Catch"][0]["Next"] == "HandleFailure"
-        assert states["WaitForMorningArcticAppend"]["Catch"][0]["Next"] == "HandleFailure"
-        # Its SSM command runs the standalone append entrypoint, with a longer
-        # timeout than MorningEnrich's 1800s.
-        from tests.sf_command_utils import extract_commands
-        cmds = "\n".join(extract_commands(states["MorningArcticAppend"]))
-        assert "weekly_collector.py --morning-arctic-append" in cmds
-        et = states["MorningArcticAppend"]["Parameters"]["Parameters"]["executionTimeout"]
-        assert int(et[0] if isinstance(et, list) else et) > 1800
+    def test_data_phase_no_longer_on_trading_box(self, states):
+        # config#1767 deliverable #2: the trading path retains NO data-phase SSM
+        # states — the relocated on-trading states are gone.
+        for gone in ("MorningEnrich", "MorningArcticAppend", "CheckMorningEnrichStatus",
+                     "CheckMorningArcticAppendStatus", "CheckSkipMorningArcticAppend"):
+            assert gone not in states, f"{gone} should have moved to the spot dispatcher"
 
     def test_chronic_gap_terminal_enters_predictor_gate(self, states):
         # CheckChronicGapStatus Default + both heal Catches.
@@ -164,8 +166,14 @@ class TestPaths:
             if st["Type"] == "Succeed":
                 break
             if st["Type"] == "Choice":
+                # Follow a Success poll-status edge; for the spot launched-gate
+                # states follow the launched:true edge; else Default (happy path).
                 succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
-                cur = succ[0] if succ else st.get("Default")
+                launched = (
+                    [c["Next"] for c in st.get("Choices", []) if c.get("BooleanEquals") is True]
+                    if cur.endswith("SpotLaunched") else []
+                )
+                cur = (succ or launched or [st.get("Default")])[0]
             else:
                 cur = st.get("Next")
         return order
@@ -185,20 +193,21 @@ class TestPaths:
             assert task not in order, f"{task} ran despite its skip flag"
         assert order == ["PipelineComplete"]
 
-    def test_skip_fetch_only_resumes_at_append(self, states):
-        """MorningEnrich fetch already done → skip it, run the append onward."""
+    def test_skip_data_phase_resumes_at_heal(self, states):
+        """config#1767: skip_morning_enrich now skips the ENTIRE spot data phase
+        (enrich + append both on spot) and resumes at the chronic-gap heal —
+        the old separate skip_morning_arctic_append gate is gone."""
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags={"skip_morning_enrich"})
-        assert "MorningEnrich" not in order
-        assert order[0] == "MorningArcticAppend"
-        assert "PredictorInference" in order and order[-1] == "PipelineComplete"
-
-    def test_skip_fetch_and_append_resumes_at_heal(self, states):
-        """The exact 6/11 recovery case: fetch + append both done → skip both,
-        resume at the heal → predictions."""
-        order = self._walk(
-            states, "CheckSkipMorningEnrich",
-            skip_flags={"skip_morning_enrich", "skip_morning_arctic_append"},
-        )
-        assert "MorningEnrich" not in order and "MorningArcticAppend" not in order
+        assert "LaunchMorningEnrichSpot" not in order
+        assert "LaunchMorningArcticAppendSpot" not in order
         assert order[0] == "ChronicGapSelfHeal"
         assert "PredictorInference" in order and order[-1] == "PipelineComplete"
+
+    def test_happy_path_runs_data_phase_on_spot(self, states):
+        """The data phase runs as spot-launch states, not on-trading SSM."""
+        order = self._walk(states, "CheckSkipMorningEnrich", skip_flags=set())
+        assert "LaunchMorningEnrichSpot" in order
+        assert "LaunchMorningArcticAppendSpot" in order
+        # Enrich spot precedes append spot precedes the heal.
+        assert order.index("LaunchMorningEnrichSpot") < order.index("LaunchMorningArcticAppendSpot")
+        assert order.index("LaunchMorningArcticAppendSpot") < order.index("ChronicGapSelfHeal")

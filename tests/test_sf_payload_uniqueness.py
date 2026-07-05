@@ -128,6 +128,12 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),
     "RecheckCoverage": frozenset({"action"}),
     "PredictorHealthCheck": frozenset({"action"}),
+    # config#1767 (Phase 2): the data phase (enrich + Arctic append) was relocated
+    # onto an ephemeral spot box via the alpha-engine-data-spot-dispatcher Lambda.
+    # Each launch state passes a single {"workload": <key>} selecting the collector
+    # invocation; the dispatcher returns {data_spot:{launched,instance_id,...}}.
+    "LaunchMorningEnrichSpot": frozenset({"workload"}),
+    "LaunchMorningArcticAppendSpot": frozenset({"workload"}),
 }
 
 
@@ -429,12 +435,20 @@ class TestEODSFTopLevelFieldsClosed:
             "failure_notify_error",
             "force_stop_result",
             "postmarket_poll",
-            "postmarket_result",
             # PostMarketArcticAppend (2026-06-16) — slow daily_append split out
             # of PostMarketData into its own state (mirrors MorningArcticAppend
-            # L4608); emits its own send/poll ResultPaths.
+            # L4608); emits its own poll ResultPath.
             "postmarket_arctic_poll",
-            "postmarket_arctic_result",
+            # config#1767 (Phase 2): the EOD data phase (PostMarketData +
+            # PostMarketArcticAppend) was relocated OFF the on-trading SSM path
+            # onto an ephemeral spot box. The old on-trading send ResultPaths
+            # ($.postmarket_result, $.postmarket_arctic_result) are gone; each
+            # spot launch emits its dispatcher-Lambda ResultPath and a fail-open
+            # error path. The poll ResultPaths above are reused by the spot poll.
+            "postmarket_launch",
+            "postmarket_arctic_launch",
+            "data_spot_error",
+            "data_spot_failure_notify",
             "snapshot_poll",
             "snapshot_result",
             "stop_result",
@@ -454,7 +468,9 @@ class TestEODSFTopLevelFieldsClosed:
             # optional boolean skip flag from the execution input so an
             # operator recovery rerun can resume at the first incomplete task.
             "skip_post_market_data",
-            "skip_post_market_arctic_append",
+            # config#1767: skip_post_market_arctic_append removed — its gate
+            # (CheckSkipPostMarketArcticAppend) moved with the on-trading append
+            # state; skip_post_market_data now skips the whole spot data phase.
             "skip_capture_snapshot",
             "skip_eod_reconcile",
             "skip_daily_substrate_health_check",

@@ -51,10 +51,19 @@ def _data_repo_entrypoints() -> dict[str, list[str]]:
 def test_known_data_entrypoints_in_scope():
     # RunDailyNews removed (alpha-engine-config#1089) — the standalone 04:00
     # daily-news chain now produces the artifact, so it is no longer a weekday-SF
-    # data-repo entrypoint. MorningEnrich + MorningArcticAppend + ChronicGapSelfHeal
-    # remain (they pull alpha-engine-data and run from its venv).
+    # data-repo entrypoint.
+    #
+    # config#1767 (Phase 2): MorningEnrich + MorningArcticAppend were relocated OFF
+    # the on-trading SSM path onto the ephemeral data spot (the spot bootstrap in
+    # infrastructure/lambdas/data-spot-dispatcher/index.py clones + venvs the data
+    # repo there). They are therefore no longer on-trading ssm:sendCommand
+    # entrypoints in this SF. ChronicGapSelfHeal remains on the trading box (it is
+    # a fail-soft best-effort heal, kept on the always-on box).
     eps = set(_data_repo_entrypoints())
-    assert {"MorningEnrich", "MorningArcticAppend", "ChronicGapSelfHeal"} <= eps, sorted(eps)
+    assert {"ChronicGapSelfHeal"} <= eps, sorted(eps)
+    # Guard the relocation: the moved states must NOT be on-trading entrypoints.
+    assert "MorningEnrich" not in eps
+    assert "MorningArcticAppend" not in eps
 
 
 @pytest.mark.parametrize("name", sorted(_data_repo_entrypoints()))
