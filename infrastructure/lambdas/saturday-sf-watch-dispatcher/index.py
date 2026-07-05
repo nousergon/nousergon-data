@@ -72,6 +72,65 @@ GITHUB_PAT_SSM_PARAM = os.environ.get(
 )
 _DISPATCH_TIMEOUT_SEC = 15
 
+# Per-pipeline autonomous-merge KILL-SWITCH (config#1375, SAFETY-CRITICAL). The
+# global AGENT_DISPATCH_ENABLED gate decides *whether an agent is dispatched at
+# all*; this SSM boolean decides *whether that agent is permitted to auto-merge*
+# for THIS pipeline. It is read at dispatch time (per-pipeline, from
+# `/alpha-engine/<cadence_slug>_sf_watch/autonomous_merge_enabled`) and threaded
+# into the repository_dispatch payload as `autonomous_merge`, so the charter's
+# executor-merge gate reads it off the event instead of re-deriving it.
+#
+# DEFAULTS encode the ratification state per cadence (the fallback when the SSM
+# param is absent/unreadable): Saturday is already ratified autonomous → default
+# TRUE (preserves current behavior); weekday PLACES paper orders + EOD
+# RECONCILES NAV, so both start PROPOSE-ONLY → default FALSE and soak before the
+# flag is flipped; groom touches no live capital → default TRUE (parity with its
+# existing kill-switch, config#1535). A missing/garbled param FAILS CLOSED to
+# this default (a trading pipeline never silently escalates to auto-merge).
+_AUTONOMOUS_MERGE_DEFAULTS: dict[str, bool] = {
+    "saturday": True,
+    "weekday": False,
+    "eod": False,
+    "groom": True,
+}
+
+
+def _autonomous_merge_ssm_param(cadence_slug: str) -> str:
+    return f"/alpha-engine/{cadence_slug}_sf_watch/autonomous_merge_enabled"
+
+
+def _autonomous_merge_enabled(cadence_slug: str) -> bool:
+    """Resolve the per-pipeline autonomous-merge kill-switch for ``cadence_slug``.
+
+    Reads the SSM boolean and FAILS CLOSED to the cadence default on any
+    absence/error (a trading pipeline must never silently escalate to auto-merge
+    because SSM hiccuped). Best-effort — never raises; the dispatch payload
+    always carries a concrete bool.
+    """
+    default = _AUTONOMOUS_MERGE_DEFAULTS.get(cadence_slug, False)
+    try:
+        resp = boto3.client("ssm", region_name=REGION).get_parameter(
+            Name=_autonomous_merge_ssm_param(cadence_slug)
+        )
+        raw = (resp["Parameter"]["Value"] or "").strip().lower()
+        if raw in {"true", "1", "yes", "on"}:
+            return True
+        if raw in {"false", "0", "no", "off"}:
+            return False
+        logger.warning(
+            "autonomous_merge kill-switch for %s has unparseable value %r; "
+            "failing closed to default %s",
+            cadence_slug, raw, default,
+        )
+        return default
+    except Exception as exc:  # noqa: BLE001 — fail closed to the cadence default
+        logger.warning(
+            "could not read autonomous_merge kill-switch for %s (%s); "
+            "failing closed to default %s",
+            cadence_slug, exc, default,
+        )
+        return default
+
 # --- Per-pipeline registry -------------------------------------------------
 # Fan-out is ADDITIVE: register a pipeline here, add its ARN to the single
 # EventBridge rule (deploy.sh), widen the IAM ARNs. Everything below — the
@@ -277,6 +336,13 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
     # not the global flag alone (that was the bug: claiming "dispatch" for a
     # pipeline no workflow listens for).
     will_dispatch = AGENT_DISPATCH_ENABLED and bool(cfg.get("has_listener", True))
+    # SAFETY-CRITICAL (config#1375): record the per-pipeline autonomous-merge
+    # mode at write time so the watch-log/dashboard shows PROPOSE-ONLY vs
+    # AUTO-MERGE per cadence. Resolved only when a dispatch will actually fire
+    # (no SSM read on the pure-observe path). weekday/EOD default PROPOSE-ONLY.
+    autonomous_merge = (
+        _autonomous_merge_enabled(cfg["cadence_slug"]) if will_dispatch else False
+    )
     return {
         "detected_at": now_iso,
         "status": detail.get("status", "UNKNOWN"),
@@ -295,6 +361,9 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
         "action": "dispatch" if will_dispatch else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
         "has_listener": bool(cfg.get("has_listener", True)),
+        # PROPOSE-ONLY (False) unless this pipeline's kill-switch is on; the
+        # agent still never auto-merges executor/risk/strategy (charter gate).
+        "autonomous_merge": autonomous_merge,
     }
 
 
@@ -350,8 +419,13 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     if record.get("cause"):
         lines.append(f"Cause: `{record['cause']}`")
     lines.append(f"Watch log: `s3://{WATCH_BUCKET}/{key}`")
-    if will_dispatch:
+    if will_dispatch and record.get("autonomous_merge"):
         footer = "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
+    elif will_dispatch:
+        # Dispatched but this pipeline's autonomous-merge kill-switch is OFF —
+        # PROPOSE-ONLY soak (weekday/EOD default, config#1375): the agent
+        # diagnoses + opens a PR for a human to merge, never auto-merges.
+        footer = "_PROPOSE-ONLY — resilience agent dispatched (diagnose→propose PR, human merges)_"
     elif AGENT_DISPATCH_ENABLED and not has_listener:
         footer = "_observe-only for this pipeline — no autonomous remediation wired yet (needs Brian)_"
     else:
@@ -409,6 +483,11 @@ def _maybe_dispatch_agent(
         # pipeline (see _notify).
         return {"dispatched": False, "reason": "no_listener"}
     event_type = cfg["dispatch_event_type"]
+    # SAFETY-CRITICAL (config#1375): thread this pipeline's autonomous-merge
+    # kill-switch into the payload so the charter's executor-merge gate reads it
+    # off the event. Resolved once in `_build_event_record` (recorded in the
+    # watch-log) — reuse it here, don't re-read SSM. weekday/EOD → PROPOSE-ONLY.
+    autonomous_merge = bool(record.get("autonomous_merge", False))
     try:
         pat = _get_github_pat()
         payload = {
@@ -424,6 +503,10 @@ def _maybe_dispatch_agent(
                 "status": record.get("status"),
                 "watch_log_key": key,
                 "is_preflight": record.get("is_preflight", False),
+                # PROPOSE-ONLY unless this pipeline's kill-switch is explicitly
+                # on. The agent MUST NOT auto-merge executor/risk/strategy diffs
+                # regardless; this only gates the data/infra/lib-pin lanes.
+                "autonomous_merge": autonomous_merge,
             },
         }
         req = urllib.request.Request(
@@ -443,7 +526,12 @@ def _maybe_dispatch_agent(
             "agent repository_dispatch sent to %s (type=%s, http=%s)",
             DISPATCH_REPO, event_type, status_code,
         )
-        return {"dispatched": True, "status_code": status_code, "event_type": event_type}
+        return {
+            "dispatched": True,
+            "status_code": status_code,
+            "event_type": event_type,
+            "autonomous_merge": autonomous_merge,
+        }
     except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised
         logger.warning("agent repository_dispatch failed (non-fatal): %s", exc)
         return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -489,6 +577,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "telegram_sent": telegram_sent,
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
         "agent_dispatch": dispatch,
+        # Per-pipeline autonomous-merge mode (config#1375): False = PROPOSE-ONLY.
+        "autonomous_merge": bool(record.get("autonomous_merge", False)),
         # "observe" until the agent enriches the event with its lane/action;
         # when dispatch fires the agent owns the downstream action record.
         "action": "dispatched" if dispatch.get("dispatched") else "observe",

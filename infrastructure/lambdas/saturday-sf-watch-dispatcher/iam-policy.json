@@ -30,6 +30,17 @@
       "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
     },
     {
+      "Sid": "PerPipelineAutonomousMergeKillSwitch",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/autonomous_merge_enabled",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/weekday_sf_watch/autonomous_merge_enabled",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/eod_sf_watch/autonomous_merge_enabled",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom_sf_watch/autonomous_merge_enabled"
+      ]
+    },
+    {
       "Sid": "ReadFleetSFExecutions",
       "Effect": "Allow",
       "Action": [

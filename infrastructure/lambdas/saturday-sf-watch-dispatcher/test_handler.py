@@ -58,8 +58,15 @@ _DEFAULT_HISTORY = [
 ]
 
 
-def _make_clients(*, describe=None, history=None, existing=None, put=None):
-    """Return (factory, sf_mock, s3_mock). ``existing`` None → get_object 404."""
+def _make_clients(*, describe=None, history=None, existing=None, put=None, ssm_value=None):
+    """Return (factory, sf_mock, s3_mock). ``existing`` None → get_object 404.
+
+    ``ssm_value`` controls the per-pipeline autonomous-merge kill-switch:
+    - None (default): ssm.get_parameter RAISES → handler FAILS CLOSED to the
+      cadence default (saturday/groom True, weekday/eod False). This is the
+      common path the dispatch tests exercise.
+    - a string ("true"/"false"/…): ssm.get_parameter returns that Value.
+    """
     sf = MagicMock()
     sf.describe_execution.return_value = describe if describe is not None else {
         "input": "{}", "error": "States.TaskFailed", "cause": "RAGIngestion failed",
@@ -77,8 +84,18 @@ def _make_clients(*, describe=None, history=None, existing=None, put=None):
     if put is not None:
         s3.put_object.side_effect = put
 
+    ssm = MagicMock()
+    if ssm_value is None:
+        ssm.get_parameter.side_effect = FakeClientError("ParameterNotFound")
+    else:
+        ssm.get_parameter.return_value = {"Parameter": {"Value": ssm_value}}
+
     def factory(name, region_name=None):
-        return sf if name == "stepfunctions" else s3
+        if name == "stepfunctions":
+            return sf
+        if name == "ssm":
+            return ssm
+        return s3
 
     return factory, sf, s3
 
@@ -304,6 +321,7 @@ def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
 
     assert result["agent_dispatch"] == {
         "dispatched": True, "status_code": 204, "event_type": "saturday-sf-failure",
+        "autonomous_merge": True,  # saturday default (config#1375)
     }
     assert result["action"] == "dispatched"
     assert sent["url"].endswith("/repos/nousergon/alpha-engine-config/dispatches")
@@ -338,6 +356,9 @@ def test_dispatch_routes_weekday_event_type(monkeypatch):
     cp = sent["data"]["client_payload"]
     assert cp["pipeline_name"] == "ne-preopen-trading-pipeline"
     assert cp["state_machine_arn"] == WEEKDAY_ARN
+    # SAFETY-CRITICAL: weekday PLACES paper orders → PROPOSE-ONLY by default.
+    assert cp["autonomous_merge"] is False
+    assert result["agent_dispatch"]["autonomous_merge"] is False
 
 
 def test_dispatch_error_recorded_not_raised(monkeypatch):
@@ -386,10 +407,12 @@ def test_groom_failure_dispatches_when_enabled(monkeypatch):
         result = index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
     assert result["agent_dispatch"] == {
         "dispatched": True, "status_code": 204, "event_type": "groom-sf-failure",
+        "autonomous_merge": True,  # groom default (no live capital, config#1375)
     }
     assert result["action"] == "dispatched"
     assert sent["data"]["event_type"] == "groom-sf-failure"
     assert sent["data"]["client_payload"]["cadence_slug"] == "groom"
+    assert sent["data"]["client_payload"]["autonomous_merge"] is True
 
 
 def test_groom_telegram_claims_autonomous_fix_when_dispatched(monkeypatch):
@@ -417,6 +440,7 @@ def test_groom_watch_log_records_has_listener_true(monkeypatch):
     assert event["has_listener"] is True
     assert event["action"] == "dispatch"
     assert event["agent_dispatch_enabled"] is True
+    assert event["autonomous_merge"] is True  # groom default (config#1375)
 
 
 def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkeypatch):
@@ -466,6 +490,114 @@ def test_saturday_still_dispatches_normally_alongside_groom_fix(monkeypatch):
         result = index.handler(_event("FAILED", sm_arn=SATURDAY_ARN), None)
     assert result["agent_dispatch"]["dispatched"] is True
     assert result["action"] == "dispatched"
+
+
+# ── config#1375: per-pipeline autonomous-merge KILL-SWITCH (SAFETY-CRITICAL) ──
+#
+# The global AGENT_DISPATCH_ENABLED gate decides *whether an agent is
+# dispatched*; the per-cadence SSM boolean decides *whether that agent may
+# auto-merge*. weekday PLACES paper orders + EOD RECONCILES NAV, so both MUST
+# default to PROPOSE-ONLY (autonomous_merge=False) and never silently escalate.
+
+
+def _dispatch_and_capture(monkeypatch, sm_arn, *, ssm_value=None):
+    """Run the handler with dispatch enabled and return (result, sent_payload)."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    sent = {}
+
+    def fake_urlopen(req, timeout=None):
+        sent["data"] = json.loads(req.data)
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients(ssm_value=ssm_value)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=sm_arn), None)
+    return result, sent, s3
+
+
+@pytest.mark.parametrize(
+    "sm_arn, expected",
+    [
+        (SATURDAY_ARN, True),   # already-ratified autonomous → preserved
+        (WEEKDAY_ARN, False),   # PLACES paper orders → PROPOSE-ONLY
+        (EOD_ARN, False),       # RECONCILES NAV → PROPOSE-ONLY
+        (GROOM_ARN, True),      # no live capital → autonomous
+    ],
+)
+def test_autonomous_merge_defaults_per_cadence_when_param_absent(monkeypatch, sm_arn, expected):
+    """With the SSM param ABSENT the handler FAILS CLOSED to the cadence default:
+    saturday/groom True, weekday/EOD False. This is the ship-state default."""
+    result, sent, _ = _dispatch_and_capture(monkeypatch, sm_arn)  # ssm_value=None → raises
+    assert sent["data"]["client_payload"]["autonomous_merge"] is expected
+    assert result["agent_dispatch"]["autonomous_merge"] is expected
+    assert result["autonomous_merge"] is expected
+
+
+def test_weekday_kill_switch_can_be_flipped_on_via_ssm(monkeypatch):
+    """After the soak, flipping the weekday param to true escalates to auto-merge
+    (the flip is a deliberate, human-ratified operator action, not the default)."""
+    result, sent, _ = _dispatch_and_capture(monkeypatch, WEEKDAY_ARN, ssm_value="true")
+    assert sent["data"]["client_payload"]["autonomous_merge"] is True
+    assert result["autonomous_merge"] is True
+
+
+def test_saturday_kill_switch_off_via_ssm_downgrades_to_propose_only(monkeypatch):
+    """An operator can also turn Saturday OFF (kill-switch), forcing PROPOSE-ONLY
+    even for the ratified cadence — the SSM value wins over the default."""
+    result, sent, _ = _dispatch_and_capture(monkeypatch, SATURDAY_ARN, ssm_value="false")
+    assert sent["data"]["client_payload"]["autonomous_merge"] is False
+    assert result["autonomous_merge"] is False
+
+
+def test_unparseable_kill_switch_fails_closed_to_default(monkeypatch):
+    """A garbled SSM value FAILS CLOSED to the cadence default (weekday → False):
+    a trading pipeline must never auto-merge on an unreadable kill-switch."""
+    result, sent, _ = _dispatch_and_capture(monkeypatch, WEEKDAY_ARN, ssm_value="maybe")
+    assert sent["data"]["client_payload"]["autonomous_merge"] is False
+    assert result["autonomous_merge"] is False
+
+
+def test_weekday_watch_log_records_propose_only_by_default(monkeypatch):
+    """The watch-log event carries the resolved autonomous_merge mode so the
+    dashboard shows PROPOSE-ONLY vs AUTO-MERGE per cadence."""
+    _, _, s3 = _dispatch_and_capture(monkeypatch, WEEKDAY_ARN)
+    written = json.loads(s3.put_object.call_args.kwargs["Body"])
+    ev = written["events"][-1]
+    assert ev["autonomous_merge"] is False
+    assert ev["action"] == "dispatch"
+
+
+def test_weekday_telegram_footer_says_propose_only(monkeypatch):
+    """A dispatched-but-PROPOSE-ONLY pipeline must NOT claim 'autonomous fix
+    ACTIVE' — the receipt says PROPOSE-ONLY so the mode is visible in Telegram."""
+    _dispatch_and_capture(monkeypatch, WEEKDAY_ARN)
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "Fleet-SF Watch — AUTO-FIX" in text  # an agent IS dispatched
+    assert "PROPOSE-ONLY" in text
+    assert "autonomous fix ACTIVE" not in text  # but it may not auto-merge
+
+
+def test_observe_path_does_not_read_kill_switch(monkeypatch):
+    """When AGENT_DISPATCH_ENABLED is off there is no dispatch, so the handler
+    must NOT read the kill-switch SSM param (pure-observe path stays SSM-free)."""
+    # Default AGENT_DISPATCH_ENABLED is False; ssm_value would raise if read.
+    factory, _, _ = _make_clients(ssm_value="true")
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["action"] == "observe"
+    assert result["autonomous_merge"] is False
+
+
+def test_deploy_sh_creates_kill_switch_params_with_safe_defaults():
+    """REGRESSION GUARD (config#1375): deploy.sh must create the four per-cadence
+    kill-switch params, and weekday/EOD MUST default to false (PROPOSE-ONLY)."""
+    text = (Path(__file__).parent / "deploy.sh").read_text()
+    assert "autonomous_merge_enabled" in text
+    assert "--no-overwrite" in text  # a re-bootstrap must never stomp a flip
+    for pair in ("saturday=true", "weekday=false", "eod=false", "groom=true"):
+        assert pair in text, f"deploy.sh kill-switch default missing/wrong: {pair}"
 
 
 def _deploy_sh_rule_arns() -> set[str]:

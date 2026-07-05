@@ -171,6 +171,34 @@ EOF
     --principal events.amazonaws.com \
     --source-arn "${RULE_ARN}" \
     --region "${REGION}" 2>/dev/null || true
+
+  # ----- Per-pipeline autonomous-merge kill-switch SSM params ----------------
+  # SAFETY-CRITICAL (config#1375). One String param per cadence:
+  #   /alpha-engine/<cadence>_sf_watch/autonomous_merge_enabled
+  # read at dispatch time and threaded into repository_dispatch as
+  # `autonomous_merge`. DEFAULTS: saturday/groom = true (already ratified /
+  # no live capital); weekday PLACES paper ORDERS + eod RECONCILES NAV, so BOTH
+  # default FALSE (PROPOSE-ONLY soak) — do NOT flip these to true here; flipping
+  # is a separate, human-ratified change after the soak. Created with
+  # --no-overwrite so a re-bootstrap NEVER stomps an operator's later flip.
+  echo "  Creating per-pipeline autonomous-merge kill-switch SSM params..."
+  for kv in "saturday=true" "weekday=false" "eod=false" "groom=true"; do
+    cadence="${kv%%=*}"
+    default_val="${kv##*=}"
+    param="/alpha-engine/${cadence}_sf_watch/autonomous_merge_enabled"
+    if aws ssm get-parameter --name "${param}" --region "${REGION}" >/dev/null 2>&1; then
+      echo "    ${param} exists (leaving operator value untouched)"
+    else
+      echo "    ${param} = ${default_val} (default)"
+      run aws ssm put-parameter \
+        --name "${param}" \
+        --type String \
+        --value "${default_val}" \
+        --description "Fleet-SF Watch autonomous-merge kill-switch for the ${cadence} pipeline (config#1375). false = PROPOSE-ONLY." \
+        --no-overwrite \
+        --region "${REGION}"
+    fi
+  done
 fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
