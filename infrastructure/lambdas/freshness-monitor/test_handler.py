@@ -353,10 +353,13 @@ artifacts:
     owner_repo: alpha-engine-test
     created_at: 2025-01-01
 """
-    # Object exists but is older than SLA floor → stale + sla_violated > 0
-    cycle_tick = datetime(2026, 5, 30, 9, 0, tzinfo=timezone.utc)
-    fake_s3._head_returns["path/2026-05-30/stale.json"] = {
-        "LastModified": cycle_tick.replace(hour=9, minute=30),
+    # Newest instance is from a prior cycle that has aged out of the
+    # saturday_sf recency window → stale. fixed_now = Sat 2026-05-30 18:00
+    # UTC, so the freshness floor is now−10d = 2026-05-20 18:00 (config#1297).
+    # A 2026-05-16 instance is >10 calendar days old → state="stale",
+    # sla_violated_by_minutes = (floor − last_modified) > 0.
+    fake_s3._head_returns["path/2026-05-16/stale.json"] = {
+        "LastModified": datetime(2026, 5, 16, 9, 30, tzinfo=timezone.utc),
     }
 
     import importlib
@@ -566,6 +569,48 @@ def test_maybe_alert_skips_missing_within_sla_grace(monkeypatch, fixed_now):
 
 
 def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
+    """A missing-past-SLA artifact with severity=critical pages via SNS +
+    flow-doctor, carrying the spec's severity (not bumped). Warning-severity
+    is console-only (no page) — pinned separately by
+    test_maybe_alert_warning_missing_console_only; that routing split landed
+    in #630 (config#1724)."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    from alpha_engine_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(
+        state="missing", sla_violated_by_minutes=120,
+        canonical_key="k/2026-05-30", reason="absent",
+    )
+    publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+    assert index._maybe_alert(spec, result, fixed_now) is True
+    publish_mock.assert_called_once()
+    call = publish_mock.call_args
+    assert "artifact_id=x" in call.args[0]
+    assert call.kwargs["severity"] == "critical"  # spec severity, not bumped
+    assert call.kwargs["telegram"] is False
+    assert call.kwargs["dedup_key"] == "freshness_x_2026-W22"
+    notify_mock.assert_called_once()
+    assert notify_mock.call_args.kwargs["dedup_key"] == "freshness_x_2026-W22"
+
+
+def test_maybe_alert_warning_missing_console_only(monkeypatch, fixed_now):
+    """severity=warning missing-past-SLA is console-only: _maybe_alert
+    returns False and NEITHER SNS publish NOR flow-doctor fires — the miss
+    surfaces only in check_results.json. Pins the routing contract from #630
+    (config#1724) at the unit level (handler-level surface:
+    test_handler_warning_severity_console_only_no_alert)."""
     monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
     import importlib
     import index
@@ -586,15 +631,9 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is True
-    publish_mock.assert_called_once()
-    call = publish_mock.call_args
-    assert "artifact_id=x" in call.args[0]
-    assert call.kwargs["severity"] == "warning"  # spec severity, not bumped
-    assert call.kwargs["telegram"] is False
-    assert call.kwargs["dedup_key"] == "freshness_x_2026-W22"
-    notify_mock.assert_called_once()
-    assert notify_mock.call_args.kwargs["dedup_key"] == "freshness_x_2026-W22"
+    assert index._maybe_alert(spec, result, fixed_now) is False
+    publish_mock.assert_not_called()
+    notify_mock.assert_not_called()
 
 
 def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now):
