@@ -40,11 +40,17 @@ def _install_stubs(launch_impl, boto_clients):
     pkg.ec2_spot = ec2_spot_mod
     fleet_mod = types.ModuleType("nousergon_lib.flow_doctor_fleet")
 
+    # Mirror the members of the real nousergon_lib.flow_doctor_fleet
+    # .FleetTelegramTopic that index.py references at IMPORT time (module-level
+    # _OPS_TOPICS / _GROOM_LIFECYCLE_TOPICS tuples). A member missing here fails
+    # `import index` at load and takes the WHOLE suite down — not just the test
+    # that exercises it (2026-07-05: GROOM was added to index.py + the real enum
+    # in nousergon-lib v0.82.0, but this hermetic stub was not kept in lockstep;
+    # config#1748).
     class _FleetTelegramTopic:
         CRITICAL = "critical"
         OPS_HEALTH = "ops_health"
         GROOM = "groom"
-        PIPELINE = "pipeline"
 
     fleet_mod.FleetTelegramTopic = _FleetTelegramTopic
     pkg.flow_doctor_fleet = fleet_mod
