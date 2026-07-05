@@ -81,7 +81,6 @@ EXPECTED_PIPELINE_NAMES = [
     "ne-preopen-trading-pipeline",
     "ne-postclose-trading-pipeline",
     "alpha-engine-eod-pipeline",  # transitional alias, config#1408 / re-exam 2026-07-03
-    "alpha-engine-groom-dispatch",  # config#1472
 ]
 
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
