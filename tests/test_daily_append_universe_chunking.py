@@ -46,6 +46,7 @@ def _disable_factor_momentum_daily(monkeypatch):
     # second pass (its extra read_batch/update_batch calls would inflate the
     # per-chunk call counts pinned here). The pass has its own tests.
     monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
+    monkeypatch.setenv("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "false")
 
 
 def test_universe_pass_chunks_read_batch_calls(monkeypatch):
