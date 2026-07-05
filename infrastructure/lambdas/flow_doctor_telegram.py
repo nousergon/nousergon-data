@@ -103,7 +103,7 @@ def notify_via_flow_doctor(
     if fd is None:
         return send_message(text, disable_notification=silent)
 
-    subject = text.split("\n", 1)[0].replace("*", "")
+    subject = text.replace("*", "").strip()
 
     if silent and silent_topic is not None:
         notifier = topic_telegram_notifier(fd, silent_topic)
@@ -112,7 +112,7 @@ def notify_via_flow_doctor(
 
     report_id = fd.notify_event(
         subject,
-        body=text,
+        body=None,
         severity=severity,
         context=context or {},
         dedup_key=dedup_key,
