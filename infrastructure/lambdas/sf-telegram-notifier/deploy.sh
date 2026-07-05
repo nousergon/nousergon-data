@@ -48,7 +48,7 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Validate handler syntax -------------------------------------------
 
 python3 -c "
 import ast
@@ -56,11 +56,6 @@ src = open('${SCRIPT_DIR}/index.py').read()
 ast.parse(src)
 print('index.py syntax OK')
 "
-
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" "${SCRIPT_DIR}/test_execution_digest.py" -q
-fi
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -71,6 +66,16 @@ trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
+
+if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "Skipping unit tests on Darwin (Lambda deps are linux/amd64); CI runs them."
+  else
+    echo "Running handler unit tests..."
+    PYTHONPATH="${PKG}:${SCRIPT_DIR}:${LAMBDAS_DIR}" python3 -m pytest \
+      "${SCRIPT_DIR}/test_handler.py" "${SCRIPT_DIR}/test_execution_digest.py" -q
+  fi
+fi
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
