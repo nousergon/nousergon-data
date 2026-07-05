@@ -25,9 +25,9 @@ then self-terminates (~$2/mo).
 
 ```
 EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
-  alpha-engine-scheduled-groom-0700-daily           ─┐      1. nousergon_lib.ec2_spot.launch()
-  alpha-engine-scheduled-groom-2300-daily           ─┼───▶     (spot; on-demand fallback)
-  alpha-engine-scheduled-groom-1500-daily-opus-high ─┘      2. wait instance running + SSM Online
+  alpha-engine-scheduled-groom-0700-daily-low           ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-1500-daily-opus-high     ─┼───▶     (spot; on-demand fallback)
+  alpha-engine-scheduled-groom-2300-daily-mid           ─┘      2. wait instance running + SSM Online
                                                              3. async ssm send-command (detached):
                                                                    │
                                                                    ▼
@@ -49,24 +49,14 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
 | Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
 |---|---|---|---|---|---|---|
-| `…-0700-daily` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | default |
-| `…-2300-daily` | `cron(0 23 * * ? *)` | 4pm | daily (all 7) | full | claude-sonnet-5 | default |
+| `…-0700-daily-low` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-haiku-4-5 | low-only |
 | `…-1500-daily-opus-high` | `cron(0 15 * * ? *)` | 8am | daily (all 7) | full | claude-opus-4-8 | high-only |
+| `…-2300-daily-mid` | `cron(0 23 * * ? *)` | 4pm | daily (all 7) | full | claude-sonnet-5 | mid-only |
 
-> **Reduced 3→2/day on 2026-06-29** (usage pacing): the former
-> `…-1500-sunfri` rule (`cron(0 15 ? * SUN-FRI *)`, 8am PT, Sonnet/default) was
-> dropped. **Re-added 2026-07-01** at the same 15:00 UTC slot (config#1495
-> follow-up) as a DIFFERENT tier, not a reinstatement: `…-1500-daily-opus-high`
-> runs **Opus** against **`complexity:high` issues only** — the queue the two
-> Sonnet schedules above explicitly exclude. It shares the SAME weekly Max-quota
-> reserve-for-interactive budget gate (`scripts/groom_budget.py`) as the Sonnet
-> schedules — it competes for the same pool, not a separate one — and shuts
-> down immediately/cleanly if the `complexity:high` queue is empty (a
-> `total == 0` clean stop, never a floor-breach false-positive; see
-> `scripts/groom_driver.py`). An issue an Opus chunk judges to need Brian's own
-> judgment (a genuine, irreducible product/architecture fork — not mere
-> difficulty) gets relabeled `complexity:ultra`, which permanently exits ALL
-> automated grooming (both this schedule and the two Sonnet ones).
+> **Tier-split cadence (config#1760, 2026-07-05):** three disjoint queues — Haiku
+> on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled), Opus on
+> `complexity:high`. Requires `alpha-engine-config` driver filters (#1761) on
+> the box's cloned `main` before `--bootstrap` deploys these schedules live.
 
 > **Sat-skip removed 2026-07-02, uniform 3x/day/7-days, no exceptions.** The
 > former `…-0700-sunfri` rule (`cron(0 7 ? * SUN-FRI *)`) skipped Saturday to

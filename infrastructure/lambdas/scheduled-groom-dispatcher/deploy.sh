@@ -97,24 +97,22 @@ SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SF_ROLE_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 # Schedule definitions: name | cron expression (UTC) | JSON input (run_mode +
-# label, plus model/issue_filter for the Opus high-tier schedule). The two
-# Sonnet schedules omit model/issue_filter — the Lambda defaults them to
-# claude-sonnet-5 / "default" (the pre-existing mid-tier queue), so this is not
-# a behavior change for them.
+# schedule label, plus model/issue_filter per tier — config#1760 tier-split).
+# deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0700-daily"
-  "alpha-engine-scheduled-groom-2300-daily"
+  "alpha-engine-scheduled-groom-0700-daily-low"
   "alpha-engine-scheduled-groom-1500-daily-opus-high"
+  "alpha-engine-scheduled-groom-2300-daily-mid"
 )
 SCHED_CRONS=(
   "cron(0 7 * * ? *)"
-  "cron(0 23 * * ? *)"
   "cron(0 15 * * ? *)"
+  "cron(0 23 * * ? *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","schedule":"0 7 * * *"}'
-  '{"run_mode":"full","schedule":"0 23 * * *"}'
+  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 7 * * *"}'
   '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","schedule":"0 15 * * *"}'
+  '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 23 * * *"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
