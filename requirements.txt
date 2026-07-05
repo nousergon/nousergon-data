@@ -36,7 +36,7 @@ arcticdb>=6.11
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via alpha_engine_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
