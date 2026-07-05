@@ -2535,32 +2535,57 @@ def _write_module_health(
     """Write module-scoped health stamp consumed by the executor's
     check_upstream_health() (alpha-engine/executor/health_status.py:91).
 
-    Schema matches executor's write_health() — key pattern
-    `health/{module_name}.json` with `last_success` nulled on failure so
-    downstream staleness checks can distinguish "ran and failed today" from
-    "hasn't run in N hours". Called on both success AND failure paths so the
-    stamp reflects the actual last run outcome.
+    Delegates to ``nousergon_lib.health.write_health`` (config#1727 Phase C).
+    The legacy ``status`` string is mapped to :class:`Deliverable` objects;
+    status is derived by the lib (required-missing / error / warnings) so a
+    caller cannot stamp ``"ok"`` over a failed run. Key pattern remains
+    ``health/{module_name}.json`` with ``last_success`` nulled on failure.
     """
+    from nousergon_lib.health import Deliverable, write_health
+
+    warnings = warnings or []
+    if error:
+        deliverables = [
+            Deliverable(
+                name=module_name,
+                required=True,
+                produced=False,
+                detail=error,
+            ),
+        ]
+    elif status == "failed":
+        deliverables = [
+            Deliverable(name=module_name, required=True, produced=False),
+        ]
+    elif status == "degraded":
+        deliverables = [
+            Deliverable(name=module_name, required=True, produced=True),
+        ]
+        if not warnings:
+            deliverables.append(
+                Deliverable(
+                    name=f"{module_name}_optional",
+                    required=False,
+                    produced=False,
+                )
+            )
+    else:
+        deliverables = [
+            Deliverable(name=module_name, required=True, produced=True),
+        ]
+
     s3 = boto3.client("s3")
-    key = f"health/{module_name}.json"
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "module": module_name,
-        "status": status,
-        "last_success": now_iso if status != "failed" else None,
-        "run_date": run_date,
-        "duration_seconds": round(duration_seconds, 1),
-        "summary": summary or {},
-        "warnings": warnings or [],
-        "error": error,
-    }
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(payload, indent=2).encode("utf-8"),
-        ContentType="application/json",
+    write_health(
+        module_name=module_name,
+        deliverables=deliverables,
+        run_date=run_date,
+        duration_seconds=duration_seconds,
+        summary=summary,
+        warnings=warnings or None,
+        error=error,
+        bucket=bucket,
+        s3_client=s3,
     )
-    logger.info("Wrote module health: s3://%s/%s (%s)", bucket, key, status)
 
 
 def _parse_args() -> argparse.Namespace:
