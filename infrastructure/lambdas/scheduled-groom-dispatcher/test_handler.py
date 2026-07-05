@@ -141,6 +141,12 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None):
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
+    # Derive the stub requirement from index.py's live import graph and fail
+    # loud on drift here, rather than as a ModuleNotFoundError at deploy time
+    # (config#1746 — this stub has drifted three times: config#1742/#1748).
+    from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
+
+    assert_hermetic_imports_satisfied(__file__)
     import index
 
     importlib.reload(index)

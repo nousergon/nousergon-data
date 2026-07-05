@@ -48,6 +48,15 @@ sys.modules.setdefault("nousergon_lib", _ng)
 sys.modules.setdefault("nousergon_lib.telegram", _ng_telegram)
 sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
 
+# Derive the stub requirement from index.py's live (transitive) import graph and
+# fail loud here if it has drifted, rather than as a cryptic ModuleNotFoundError
+# at deploy time. See _shared/hermetic_import_guard.py (config#1746).
+from _shared.hermetic_import_guard import (  # noqa: E402
+    assert_hermetic_imports_satisfied,
+)
+
+assert_hermetic_imports_satisfied(__file__)
+
 import index  # noqa: E402
 
 UTC = timezone.utc
