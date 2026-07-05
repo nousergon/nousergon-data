@@ -264,7 +264,9 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     # The pre-boot skip must notify — it's the ONLY place this outcome is ever
     # visible (a run that never boots has no on-box groom_run.sh to ping).
     assert len(notified) == 1
-    assert notified[0][1]["silent"] is False
+    assert notified[0][1]["silent"] is True
+    assert notified[0][1]["severity"] == "info"
+    assert notified[0][1]["silent_topic"] is not None
     assert "SKIPPED" in notified[0][0]
     assert "soft budget threshold passed before boot" in notified[0][0]
     assert "never launched" in notified[0][0]

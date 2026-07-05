@@ -87,6 +87,11 @@ _OPS_TOPICS = (
     FleetTelegramTopic.CRITICAL,
     FleetTelegramTopic.OPS_HEALTH,
 )
+_GROOM_LIFECYCLE_TOPICS = (
+    FleetTelegramTopic.GROOM,
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
@@ -468,13 +473,14 @@ def _notify_pace_skip(pace: dict, schedule_label: str, run_mode: str) -> None:
     try:
         notify_via_flow_doctor(
             text,
-            silent=False,
-            severity="warning",
+            silent=True,
+            severity="info",
             dedup_key=f"{_FLOW_NAME}:pace_skip:{schedule_label}",
             flow_name=_FLOW_NAME,
-            topics=_OPS_TOPICS,
+            topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "run_mode": run_mode, **pace},
+            silent_topic=FleetTelegramTopic.GROOM,
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("pace-gate skip Telegram failed (non-fatal): %s", exc)
