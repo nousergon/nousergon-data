@@ -3100,7 +3100,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Preflight Pipeline — SUCCESS",
-        "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. Check dashboard / execution history for per-state detail."
+        "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "End": true
@@ -3112,7 +3112,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline — SUCCESS",
-        "Message": "All steps completed successfully. Check dashboard for results."
+        "Message": "All steps completed successfully. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "End": true
@@ -3201,7 +3201,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — FAILED', $.pipeline_label)",
-        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. Use Step Functions console to redrive from failed step.', $.pipeline_label, States.JsonToString($.error))"
+        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status  (Use the Step Functions console to redrive from the failed step.)', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"

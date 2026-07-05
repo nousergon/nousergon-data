@@ -1048,7 +1048,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekday Pipeline — FAILED",
-        "Message.$": "States.Format('Weekday pipeline failed. State: {}', States.JsonToString($))"
+        "Message.$": "States.Format('Weekday pipeline failed. State: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"
