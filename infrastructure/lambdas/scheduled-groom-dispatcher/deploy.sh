@@ -111,7 +111,7 @@ SCHED_CRONS=(
 )
 SCHED_INPUTS=(
   '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 7 * * *"}'
-  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","schedule":"0 15 * * *"}'
+  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 15 * * *"}'
   '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 23 * * *"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
@@ -154,21 +154,18 @@ print('index.py syntax OK')
 "
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
-# Hermetic for AWS (boto3/nousergon_lib are stubbed in sys.modules before
-# `import index` — see test_handler.py's header): those need real AWS creds/
-# services to exercise for real, so tests fake them instead. krepis (2026-07-04,
-# the pre-boot pace gate's linear-pace math) is pure stdlib with no AWS/creds
-# dependency, so it's installed for real here rather than stubbed — the tests
-# exercise the ACTUAL pace_check arithmetic, not a faked stand-in. Both land in
-# a scratch TEST_DEPS dir — NOT the caller's global site-packages, not bundled
-# into the Lambda zip — so this works on a bare CI runner (2026-07-02: the CI
-# auto-deploy workflow's FIRST real run failed here with "No module named
-# pytest" — this script had only ever been run from an operator's laptop
-# before, where pytest happened to already be installed as a dev dependency;
-# the gap was invisible until CI actually exercised this path).
+# Hermetic for AWS: boto3 + nousergon_lib.ec2_spot are stubbed in sys.modules
+# before `import index` (see test_handler.py). nousergon_lib.flow_doctor_fleet
+# is pure stdlib — install the REAL pinned enum from requirements.txt so the
+# hand-maintained FleetTelegramTopic fake cannot drift (config#1772). krepis
+# (pre-boot pace gate math) is also installed for real. Both land in a scratch
+# TEST_DEPS dir — NOT the caller's global site-packages, not bundled into the
+# Lambda zip.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest + krepis into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "krepis==0.10.0"
+  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  echo "Installing pytest + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
   echo "Running handler unit tests..."
   PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
