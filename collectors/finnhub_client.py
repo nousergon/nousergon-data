@@ -13,7 +13,7 @@ gives ~54 calls/min — leaves headroom for clock skew and HTTP latency.
 
 Resilience (2026-06-11): each call now retries the transient class
 (429 + 5xx + network errors) with bounded exponential backoff + full
-jitter via ``alpha_engine_lib.http_retry.request_with_retry`` (the
+jitter via ``nousergon_lib.http_retry.request_with_retry`` (the
 L4499 chokepoint). Previously this was a single attempt — a one-off 429
 or 5xx returned ``[]`` / raised immediately, so a Saturday rate-limit
 burst silently nulled whole alt-data sources. That is what zeroed the
@@ -41,7 +41,7 @@ Returns ``[]`` (or empty dict if upstream expects ``dict``) when the API
 key is missing or the call hit a 429 that survived all retries — callers
 must handle the empty response. Other non-2xx responses (4xx, or a 5xx
 that survived retries) propagate via ``requests.HTTPError``; an exhausted
-network error raises ``alpha_engine_lib.http_retry.HttpRetryError``.
+network error raises ``nousergon_lib.http_retry.HttpRetryError``.
 Callers decide whether to fall through or hard-fail per their
 no-silent-fails policy.
 """
@@ -54,8 +54,8 @@ import time
 
 import requests
 
-from alpha_engine_lib.http_retry import request_with_retry
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.http_retry import request_with_retry
+from nousergon_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 

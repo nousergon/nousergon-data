@@ -64,7 +64,7 @@ fi
 # adds the corresponding alarm. Removing a row leaves a stale alarm,
 # which surfaces as INSUFFICIENT_DATA — safer than silently deleting.
 ROW_IDS=$(python3 -c "
-from alpha_engine_lib.transparency import load_inventory
+from nousergon_lib.transparency import load_inventory
 print(' '.join(r['id'] for r in load_inventory()['inventory']))
 ")
 
@@ -86,7 +86,7 @@ for row_id in $ROW_IDS; do
   aws cloudwatch put-metric-alarm \
     --region "$REGION" \
     --alarm-name "$alarm_name" \
-    --alarm-description "Fires when the transparency-substrate row '$row_id' fails to emit a passing measurement. The check is row-driven (alpha_engine_lib.transparency); the SF Sat pipeline runs --cadence weekly which sweeps weekly + daily rows. This alarm decrements the Phase 2 → 3 observation gate denominator for this row when it fires. Period=3600 + EvalPeriods=24 + DatapointsToAlarm=1 keeps the trailing 24h evaluation window but evaluates hourly so alarm state reflects the most recent SF emission within ~1h instead of ~24h. treat-missing-data=notBreaching keeps weekly-cadence rows quiet between emissions." \
+    --alarm-description "Fires when the transparency-substrate row '$row_id' fails to emit a passing measurement. The check is row-driven (nousergon_lib.transparency); the SF Sat pipeline runs --cadence weekly which sweeps weekly + daily rows. This alarm decrements the Phase 2 → 3 observation gate denominator for this row when it fires. Period=3600 + EvalPeriods=24 + DatapointsToAlarm=1 keeps the trailing 24h evaluation window but evaluates hourly so alarm state reflects the most recent SF emission within ~1h instead of ~24h. treat-missing-data=notBreaching keeps weekly-cadence rows quiet between emissions." \
     --comparison-operator "LessThanThreshold" \
     --evaluation-periods 24 \
     --datapoints-to-alarm 1 \

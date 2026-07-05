@@ -2,7 +2,7 @@
 
 The setup_substrate_alarms.sh script is idempotent and run once per
 threshold change, but its alarms are useless if the namespace + metric
-name don't match what alpha_engine_lib.transparency.emit_cloudwatch_metrics
+name don't match what nousergon_lib.transparency.emit_cloudwatch_metrics
 publishes.
 
 These tests catch that drift class:
@@ -51,10 +51,10 @@ class TestNamespaceAlignmentWithLib:
     """The script's namespace + metric names must match what the lib emits."""
 
     def test_namespace_matches_lib_constant(self, script_text):
-        from alpha_engine_lib.transparency import DEFAULT_NAMESPACE_OUT
+        from nousergon_lib.transparency import DEFAULT_NAMESPACE_OUT
 
         assert f'NAMESPACE="{DEFAULT_NAMESPACE_OUT}"' in script_text, (
-            f"Script namespace must match alpha_engine_lib.transparency."
+            f"Script namespace must match nousergon_lib.transparency."
             f"DEFAULT_NAMESPACE_OUT={DEFAULT_NAMESPACE_OUT!r} — otherwise "
             f"alarms attach to a namespace nothing emits to."
         )
@@ -92,7 +92,7 @@ class TestRowEnumeration:
     """Row IDs come from the lib's inventory — no hardcoded list to drift."""
 
     def test_row_enumeration_uses_lib(self, script_text):
-        assert "from alpha_engine_lib.transparency import load_inventory" in script_text
+        assert "from nousergon_lib.transparency import load_inventory" in script_text
 
     def test_row_enumeration_iterates_inventory(self, script_text):
         # Sanity-check the comprehension still iterates the inventory key.

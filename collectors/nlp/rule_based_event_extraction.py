@@ -6,7 +6,7 @@ two zero-cost signals already on the wire:
 
 1. **Vendor tags** (``NewsArticle.tags``). Polygon emits keywords;
    GDELT emits structured event codes; Benzinga emits Channels. The
-   ``alpha_engine_lib.sources.protocols.NewsArticle`` docstring on
+   ``nousergon_lib.sources.protocols.NewsArticle`` docstring on
    ``tags`` explicitly names this as "a soft signal for downstream
    event-flag extraction" — this module is the consumer.
 

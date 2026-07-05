@@ -16,7 +16,7 @@ invocation:
   1. Load the registry from S3
      (``s3://{REGISTRY_BUCKET}/{REGISTRY_KEY}``, YAML).
   2. Walk every spec. For each, call
-     :func:`alpha_engine_lib.artifact_freshness.check_freshness`
+     :func:`nousergon_lib.artifact_freshness.check_freshness`
      against the current ``now`` (UTC).
   3. Aggregate results into a single ``check_results.json`` artifact
      under ``_freshness_monitor/`` (the dashboard surface reads this).
@@ -59,7 +59,7 @@ import boto3
 import yaml
 
 from krepis.alerts import publish
-from alpha_engine_lib.artifact_freshness import (
+from nousergon_lib.artifact_freshness import (
     ArtifactSpec,
     CheckResult,
     check_freshness,
@@ -67,7 +67,7 @@ from alpha_engine_lib.artifact_freshness import (
     resolve_current_cycle,
     resolve_dedup_key,
 )
-from alpha_engine_lib.trading_calendar import previous_trading_day
+from nousergon_lib.trading_calendar import previous_trading_day
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
@@ -669,7 +669,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         console-only via ``check_results.json`` — no SNS/Telegram)
 
     Dedup-key resolution via
-    :func:`alpha_engine_lib.artifact_freshness.resolve_dedup_key` ⇒
+    :func:`nousergon_lib.artifact_freshness.resolve_dedup_key` ⇒
     at most one alert per (artifact, cadence-window) regardless of
     how many 15min probes have already fired in this window.
     """
@@ -768,7 +768,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
 # NYSE holidays show up as false-positive "absent" days. Operators
 # interpret them in context (or filter via the page 26 surface). When
 # the holiday-aware backfill becomes worth the dependency lift, we
-# can route via alpha_engine_lib.dates.
+# can route via nousergon_lib.dates.
 
 
 def _iter_sf_firing_dates(cadence: str, now: datetime, count: int) -> list[date]:
@@ -823,7 +823,7 @@ def _resolve_axis_dates(
     alpha-engine-docs/private/DATE_CONVENTIONS.md.
 
     Calendar-naive at the SF-firing layer above, but trading_day
-    resolution uses ``alpha_engine_lib.trading_calendar.previous_trading_day``
+    resolution uses ``nousergon_lib.trading_calendar.previous_trading_day``
     which IS NYSE-holiday-aware. So holiday-skipped firings still
     surface as cleanly-absent cells, but their resolved trading_day
     skips the holiday correctly.

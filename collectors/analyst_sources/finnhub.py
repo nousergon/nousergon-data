@@ -30,7 +30,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from alpha_engine_lib.sources import AnalystSnapshot
+from nousergon_lib.sources import AnalystSnapshot
 
 logger = logging.getLogger(__name__)
 

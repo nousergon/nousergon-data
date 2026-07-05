@@ -66,12 +66,12 @@ _load_dotenv()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
-from alpha_engine_lib.phase_registry import PhaseRegistry
+from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.phase_registry import PhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
 # lift of the five inline _find_config / load_config / config_loader copies into
 # the shared-lib chokepoint. load_config below delegates to it.
-from alpha_engine_lib.config import resolve_experiment_config
+from nousergon_lib.config import resolve_experiment_config
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -598,7 +598,7 @@ def _previous_trading_day(reference: datetime | None = None) -> str:
     enrich the prior session. Walks back at most 10 calendar days as a
     runaway guard against a broken trading-calendar implementation.
     """
-    from alpha_engine_lib.trading_calendar import is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day
     from datetime import timedelta
 
     ref = reference or datetime.now(timezone.utc)
@@ -1506,7 +1506,7 @@ def _detect_missing_universe_days(
 
     import pandas as pd
 
-    from alpha_engine_lib.trading_calendar import previous_trading_day
+    from nousergon_lib.trading_calendar import previous_trading_day
 
     target = _date.fromisoformat(target_date)
     # Expected: the N trading sessions strictly before target_date.
@@ -2355,7 +2355,7 @@ def _finalize(
     # across every partial run, no diagnose-context error text. The helper
     # emits one logger.error per error-status entry with the collector name
     # + original message, restoring per-failure alert granularity.
-    from alpha_engine_lib.collector_results import report_collector_errors
+    from nousergon_lib.collector_results import report_collector_errors
     report_collector_errors(results["collectors"])
 
     if not dry_run and only is None:

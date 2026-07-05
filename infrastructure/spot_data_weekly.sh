@@ -67,7 +67,7 @@
 #     points at it) — provides both `ec2_spot` and `ssm_dispatcher` CLIs
 #
 # Secrets resolve from SSM at Python startup via
-# alpha_engine_lib.secrets.get_secret(); the spot's IAM profile
+# nousergon_lib.secrets.get_secret(); the spot's IAM profile
 # (alpha-engine-executor-profile) grants ssm:GetParameter on /alpha-engine/*.
 # No .env is sourced anywhere in this script post the 2026-05-14 .env-deprecation arc.
 
@@ -103,7 +103,7 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 # The Saturday SF DataPhase1 failed when this run's nested spot
 # (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-
 # workload* with spot-request status `instance-terminated-no-capacity`.
-# The lib launcher (alpha_engine_lib.ec2_spot) already rotates
+# The lib launcher (nousergon_lib.ec2_spot) already rotates
 # instance_type × subnet on *acquisition* InsufficientInstanceCapacity,
 # but nothing relaunched after a *mid-run* reclamation — the workload
 # SSM command returned ResponseCode -1 (lost instance), the orchestrator
@@ -141,7 +141,7 @@ SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 # materially raises the odds the next attempt lands).
 SPOT_RETRY_BACKOFF_SECONDS="${SPOT_RETRY_BACKOFF_SECONDS:-20}"
 # Key-pair name kept ONLY for compatibility with
-# alpha_engine_lib.ec2_spot's --key-name flag — the spot still launches
+# nousergon_lib.ec2_spot's --key-name flag — the spot still launches
 # with this key associated, but NOTHING in this script SSH's into the
 # instance. Communication is via SSM; the key remains as a manual
 # break-glass option (operator can `ssh -i ~/.ssh/...pem` only if the
@@ -150,7 +150,7 @@ SPOT_RETRY_BACKOFF_SECONDS="${SPOT_RETRY_BACKOFF_SECONDS:-20}"
 KEY_NAME="alpha-engine-key"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # All 6 default-VPC subnets across us-east-1{a,b,c,d,e,f}. The lib CLI
-# (alpha_engine_lib.ec2_spot) rotates across this list on capacity
+# (nousergon_lib.ec2_spot) rotates across this list on capacity
 # error. Verified 2026-05-22 — all 6 are public-IP-on-launch, all in
 # vpc-566f002e, all with ~4091 free IPs. If the VPC topology changes,
 # update via `aws ec2 describe-subnets --filters Name=vpc-id,Values=vpc-566f002e`.
@@ -252,7 +252,7 @@ if [ ! -f "$CONFIG_SRC" ]; then
 fi
 
 # ── Launch spot ──────────────────────────────────────────────────────────────
-# Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
+# Capacity-resilient launch via nousergon_lib.ec2_spot (lib v0.26.0+).
 # The CLI iterates (instance_type × subnet) on InsufficientInstanceCapacity /
 # InsufficientHostCapacity / Unsupported / InvalidAvailabilityZone /
 # SpotMaxPriceTooLow, returning the InstanceId of the first successful
@@ -484,7 +484,7 @@ run_ssm() {
 
 # Each run_ssm step is a fresh SSM shell with a minimal env. The
 # .env-deprecation arc deleted the sourced .env, so AWS_REGION /
-# AWS_DEFAULT_REGION (which boto3 + alpha_engine_lib.preflight.check_env_vars
+# AWS_DEFAULT_REGION (which boto3 + nousergon_lib.preflight.check_env_vars
 # require) are no longer set unless each step's export line sets them.
 # Same #247 regression as sibling spot scripts. System is single-region
 # us-east-1 (matches this file's own ${AWS_REGION:-us-east-1} defaults).

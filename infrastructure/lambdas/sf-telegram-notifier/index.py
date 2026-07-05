@@ -6,7 +6,7 @@ a human-readable summary to the fleet alerts forum via flow-doctor
 (``notify_event`` / forum topic ``#pipeline``).
 
 Migration arc: config#1742 (fleet Telegram consolidation T2). Falls back to
-``alpha_engine_lib.telegram.send_message`` when flow-doctor is unavailable
+``nousergon_lib.telegram.send_message`` when flow-doctor is unavailable
 (local tests / init failure).
 
 The existing SNS → email path is unaffected.

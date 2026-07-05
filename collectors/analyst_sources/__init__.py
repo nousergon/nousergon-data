@@ -1,6 +1,6 @@
 """Analyst-data adapter implementations.
 
-Concrete adapters implementing the ``alpha_engine_lib.sources.AnalystSource``
+Concrete adapters implementing the ``nousergon_lib.sources.AnalystSource``
 Protocol. Free-tier adapters wired today (yfinance, Finnhub); paid stubs
 (IBES, Visible Alpha) fail loud on construction so a future operator
 wiring them sees the gap immediately.

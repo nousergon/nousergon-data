@@ -104,8 +104,8 @@ def ingest_theses(
 
     Returns summary dict with counts.
     """
-    from alpha_engine_lib.rag.embeddings import embed_texts
-    from alpha_engine_lib.rag.retrieval import ingest_document, document_exists
+    from nousergon_lib.rag.embeddings import embed_texts
+    from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
     results = {"agent_reports": 0, "investment_theses": 0, "skipped_dedup": 0, "chunks_total": 0}
 
@@ -245,8 +245,8 @@ def ingest_signals_theses(
     Returns summary dict with counts.
     """
     import boto3
-    from alpha_engine_lib.rag.embeddings import embed_texts
-    from alpha_engine_lib.rag.retrieval import ingest_document, document_exists
+    from nousergon_lib.rag.embeddings import embed_texts
+    from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
     s3 = boto3.client("s3")
     results = {"signals_theses": 0, "skipped_dedup": 0, "chunks_total": 0}

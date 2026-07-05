@@ -5,7 +5,7 @@ of runtime get_secret() SSM lookups. That correctly handled *secrets*, but
 the same `.env` was also the only thing exporting AWS_REGION — a plain env
 var (not a secret) that:
 
-  - alpha_engine_lib.preflight.check_env_vars() hard-requires, and
+  - nousergon_lib.preflight.check_env_vars() hard-requires, and
   - boto3 needs as a default region with no .env / ~/.aws/config present.
 
 Result: 2026-05-16 Saturday SF DataPhase1 aborted at preflight with
