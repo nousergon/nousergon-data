@@ -43,6 +43,8 @@ def _install_stubs(launch_impl, boto_clients):
     class _FleetTelegramTopic:
         CRITICAL = "critical"
         OPS_HEALTH = "ops_health"
+        GROOM = "groom"
+        PIPELINE = "pipeline"
 
     fleet_mod.FleetTelegramTopic = _FleetTelegramTopic
     pkg.flow_doctor_fleet = fleet_mod

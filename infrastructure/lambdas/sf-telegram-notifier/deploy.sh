@@ -59,7 +59,7 @@ print('index.py syntax OK')
 
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" "${SCRIPT_DIR}/test_execution_digest.py" -q
 fi
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -73,6 +73,7 @@ echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
