@@ -11,6 +11,7 @@ notify:
   - type: github
     repo: nousergon/nousergon-data
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
+    notify_on_category: [CODE, CONFIG]
     # 0.6.0rc2 soak: file an issue on failure (default) AND auto-apply the
     # flow-doctor:fix label so the flow-doctor-fix workflow generates a fix
     # PR with no human step. Both bounded by max_issues_per_day below.
