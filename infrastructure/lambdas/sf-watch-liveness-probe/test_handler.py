@@ -157,7 +157,7 @@ def test_missing_pipeline_arn_in_rule_alerts():
             "stateMachineArn": [
                 f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{name}"
                 for name in index.EXPECTED_PIPELINE_NAMES
-                if name != "alpha-engine-groom-dispatch"
+                if name != "ne-weekly-freshness-pipeline"
             ]
         }
     })
@@ -167,7 +167,7 @@ def test_missing_pipeline_arn_in_rule_alerts():
     s3 = _make_s3_client()
     with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
         result = index.handler({}, None)
-    assert any("MISSING expected pipeline" in p and "alpha-engine-groom-dispatch" in p for p in result["problems"])
+    assert any("MISSING expected pipeline" in p and "ne-weekly-freshness-pipeline" in p for p in result["problems"])
 
 
 def test_dead_state_machine_arn_alerts():

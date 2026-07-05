@@ -38,7 +38,7 @@ arcticdb>=6.11
 # All additive surface — existing imports unchanged.
 nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
 # krepis floor: sf_preflight.py reads the operator pricing override
-# (cost/model_pricing.yaml) via alpha_engine_lib.cost -> krepis.cost.PriceCard,
+# (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
 # present only in krepis>=0.6.0 — an older krepis rejects the YAML. Pinned
 # directly (not via a nousergon-lib bump, which would drag the in-flight,

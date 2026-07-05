@@ -60,7 +60,7 @@ Two repositories read from the feature store today:
 A third consumer (executor for trade features? backtester for parity
 features?) appearing in the future triggers a per-`[[feedback_lift_invariants_to_chokepoint_after_second_recurrence]]`
 lift of this contract from alpha-engine-data into
-`alpha_engine_lib`. Filed as P3 follow-up.
+`nousergon_lib`. Filed as P3 follow-up.
 
 ---
 

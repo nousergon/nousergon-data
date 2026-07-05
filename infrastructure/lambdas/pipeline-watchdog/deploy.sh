@@ -10,7 +10,7 @@
 #   - Weekday SF: 24h window, watch-day = today is a NYSE trading day
 #   - EOD SF:     24h window, watch-day = today is a NYSE trading day
 #   - Saturday SF: 7d window, watch-day = today is Sunday
-# Alerts fire via alpha_engine_lib.alerts.publish to a DISTINCT SNS topic
+# Alerts fire via nousergon_lib.alerts.publish to a DISTINCT SNS topic
 # (alpha-engine-watchdog-alerts) + flow-doctor forum topics for Telegram
 # (config#1742 T2) — channel independence preserved per plan doc §3.5.
 #

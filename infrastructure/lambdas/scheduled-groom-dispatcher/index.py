@@ -83,15 +83,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 _FLOW_NAME = "scheduled-groom-dispatcher"
 _DB_BASENAME = "flow_doctor_scheduled_groom_dispatcher"
-_OPS_TOPICS = (
-    FleetTelegramTopic.CRITICAL,
-    FleetTelegramTopic.OPS_HEALTH,
-)
-_GROOM_LIFECYCLE_TOPICS = (
-    FleetTelegramTopic.GROOM,
-    FleetTelegramTopic.CRITICAL,
-    FleetTelegramTopic.OPS_HEALTH,
-)
+_GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"

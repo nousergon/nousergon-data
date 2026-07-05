@@ -54,7 +54,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 
 import boto3
 import pandas as pd

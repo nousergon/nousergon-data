@@ -275,13 +275,13 @@ def write_news_articles_parquet(
     run_id: str | None = None,
 ) -> str:
     """Write the per-article DataFrame to S3 as parquet using the canonical
-    ``alpha_engine_lib.eval_artifacts`` shape: flat layout + YYMMDDHHMM
+    ``nousergon_lib.eval_artifacts`` shape: flat layout + YYMMDDHHMM
     run_id + ``latest.json`` sidecar. Returns the artifact S3 key.
 
     Mirrors ``news_aggregates.write_news_aggregates_parquet`` so the
     dashboard reuses the same sidecar→artifact resolution.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
         new_eval_run_id,
@@ -329,7 +329,7 @@ def read_news_articles_parquet(
     """Consumer-side read. Resolves the canonical artifact via the
     ``latest.json`` sidecar. Returns an empty canonical-schema DataFrame
     when no artifact exists."""
-    from alpha_engine_lib.eval_artifacts import eval_latest_key
+    from nousergon_lib.eval_artifacts import eval_latest_key
 
     latest_key = eval_latest_key(prefix)
     try:

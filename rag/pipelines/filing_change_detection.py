@@ -31,7 +31,7 @@ def _load_filing_embeddings() -> dict[str, list[dict]]:
 
     Returns {ticker: [{filed_date, doc_type, embeddings: [np.array], sections: {label: [np.array]}}]}
     """
-    from alpha_engine_lib.rag.db import get_connection
+    from nousergon_lib.rag.db import get_connection
 
     sql = """
         SELECT d.ticker, d.doc_type, d.filed_date, c.section_label, c.embedding

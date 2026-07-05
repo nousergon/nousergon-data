@@ -2,7 +2,7 @@
 
 Fans EventBridge `Step Functions Execution Status Change` events for the
 three Alpha Engine Step Functions into Telegram via the canonical
-`alpha_engine_lib.telegram.send_message` primitive.
+`nousergon_lib.telegram.send_message` primitive.
 
 **Purely additive.** The existing SNS → email path on every SF
 (`NotifyComplete` success + `HandleFailure` failure branches) is unchanged.
@@ -39,7 +39,7 @@ EventBridge default bus
     filtered to the 3 alpha-engine SF ARNs)
        │
        ▼
-alpha-engine-sf-telegram-notifier  ──►  alpha_engine_lib.telegram.send_message
+alpha-engine-sf-telegram-notifier  ──►  nousergon_lib.telegram.send_message
                                                 │
                                                 ▼
                                        Telegram bot API

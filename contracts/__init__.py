@@ -2,7 +2,7 @@
 contracts/ — JSON Schema data contracts for inter-module communication.
 
 The SLOT boundary schemas (signals = Slot R, predictions = Slot M) live in
-``alpha_engine_lib.contracts`` (single source of truth since lib v0.59.x, M0 —
+``nousergon_lib.contracts`` (single source of truth since lib v0.59.x, M0 —
 config#989); this package DELEGATES to the lib for those and keeps only the
 ``executor_params`` schema local (backtester→executor tuned-config boundary,
 not a slot contract). Validation here is advisory — log warnings on mismatch,
@@ -33,7 +33,7 @@ _LIB_HOSTED = {"signals", "predictions"}
 def _load_schema(name: str) -> dict:
     if name in _LIB_HOSTED:
         # Slot contracts: single source of truth in alpha-engine-lib.
-        from alpha_engine_lib.contracts import load_schema
+        from nousergon_lib.contracts import load_schema
 
         return load_schema(name)
     path = _SCHEMA_DIR / f"{name}.schema.json"

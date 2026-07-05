@@ -1,6 +1,6 @@
 """Unit tests for sf-telegram-notifier index.handler.
 
-Mocks alpha_engine_lib.telegram.send_message so tests do not hit the live
+Mocks nousergon_lib.telegram.send_message so tests do not hit the live
 Telegram API. Each test asserts the exact (text, disable_notification) tuple
 the handler hands to the primitive, plus the return value shape.
 """
@@ -14,15 +14,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Stub `alpha_engine_lib.telegram` before importing the handler so test
+# Stub `nousergon_lib.telegram` before importing the handler so test
 # environments without the lib installed (CI runners pre-pip-install) still
 # pass — the handler only depends on this one import path from the lib.
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_telegram_mod = types.ModuleType("alpha_engine_lib.telegram")
+_lib_pkg = types.ModuleType("nousergon_lib")
+_telegram_mod = types.ModuleType("nousergon_lib.telegram")
 _telegram_mod.send_message = MagicMock(return_value=True)
 _lib_pkg.telegram = _telegram_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
+sys.modules.setdefault("nousergon_lib", _lib_pkg)
+sys.modules.setdefault("nousergon_lib.telegram", _telegram_mod)
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))

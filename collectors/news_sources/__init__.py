@@ -1,6 +1,6 @@
 """News-source adapter implementations.
 
-Concrete adapters implementing the ``alpha_engine_lib.sources.NewsSource``
+Concrete adapters implementing the ``nousergon_lib.sources.NewsSource``
 Protocol. Free-tier adapters wired today (Polygon / GDELT / Yahoo RSS);
 paid stubs (Benzinga / RavenPack / Bloomberg) fail loud on construction
 so a future operator wiring them sees the gap immediately.

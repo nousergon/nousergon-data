@@ -1,4 +1,4 @@
-"""Tests for the alpha_engine_lib.phase_registry adoption in weekly_collector
+"""Tests for the nousergon_lib.phase_registry adoption in weekly_collector
 (L4528 — data is the 2nd consumer of the lib phase framework, after the
 backtester).
 
@@ -25,7 +25,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 import weekly_collector
-from alpha_engine_lib.phase_registry import PhaseRegistry
+from nousergon_lib.phase_registry import PhaseRegistry
 
 
 # ── in-memory fake S3 ────────────────────────────────────────────────────────

@@ -51,7 +51,7 @@ import boto3
 import pandas as pd
 import requests
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -334,10 +334,10 @@ def _previous_business_days(run_date: str, n: int) -> list[str]:
     data anyway, and a fabricated 924-row parquet for a closed market day
     entered the archive (and, via the Saturday backfill delta, the
     ArcticDB training store universe-wide). Non-trading days must never be
-    enumerated for collection; ``alpha_engine_lib.trading_calendar`` is
+    enumerated for collection; ``nousergon_lib.trading_calendar`` is
     the same source of truth the Step Function's CheckTradingDay gate uses.
     """
-    from alpha_engine_lib.trading_calendar import is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day
 
     if n < 1:
         raise ValueError(f"window n must be >= 1, got {n}")
@@ -804,7 +804,7 @@ def collect(
     # anchor to a trading day (weekend/holiday SF fire-times are legitimate);
     # a SINGLE-date call for a non-trading day is always a caller error and
     # fails loud.
-    from alpha_engine_lib.trading_calendar import is_trading_day as _is_td
+    from nousergon_lib.trading_calendar import is_trading_day as _is_td
 
     _run_dt = datetime.strptime(run_date, "%Y-%m-%d").date()
     if window_days == 1 and not _is_td(_run_dt):
@@ -812,7 +812,7 @@ def collect(
             f"collect: run_date={run_date} is not an NYSE trading day — "
             f"refusing to write a phantom daily-closes parquet (config#1572). "
             f"If polygon/NYSE calendars diverged, fix "
-            f"alpha_engine_lib.trading_calendar, not this guard."
+            f"nousergon_lib.trading_calendar, not this guard."
         )
 
     if window_days > 1:

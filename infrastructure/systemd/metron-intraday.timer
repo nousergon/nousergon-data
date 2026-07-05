@@ -1,6 +1,6 @@
 # Every 5 minutes while the trading box is up. The box's lifecycle bounds the
 # day; the collector gates each tick on the NYSE session calendar (holidays +
-# half-days via alpha_engine_lib.trading_calendar) so off-session ticks cost one
+# half-days via nousergon_lib.trading_calendar) so off-session ticks cost one
 # S3 GET and exit. The Metron UI-heartbeat demand gate is OPT-IN (--require-heartbeat,
 # OFF on this single-tenant owner build so the strip never freezes after the app is
 # idle) — add it to the service ExecStart before a multi-tenant deployment.

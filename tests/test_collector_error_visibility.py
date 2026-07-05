@@ -8,7 +8,7 @@ every partial run and contains no actual error text for Flow Doctor's
 LLM diagnose pipeline to work with.
 
 Fix: ``_finalize`` now calls
-``alpha_engine_lib.collector_results.report_collector_errors(results["collectors"])``
+``nousergon_lib.collector_results.report_collector_errors(results["collectors"])``
 which emits one ``logger.error()`` per error-status entry with the
 collector name + original message. This wiring test pins that call site
 so a future refactor can't silently drop it.

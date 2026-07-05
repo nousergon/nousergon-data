@@ -13,12 +13,12 @@ Friday's ``2026-06-26/`` close). Producers and consumers currently *agree* on
 calendar keying, so this module is the single place the default is migrated to
 the trading-day axis — mirroring the predictor fix (crucible-predictor#289,
 config#1015) which routed ``train_handler``'s default through
-``alpha_engine_lib.dates.now_dual().trading_day``.
+``nousergon_lib.dates.now_dual().trading_day``.
 
 Root-cause, not band-aid: rather than 12 scattered ``now_dual()`` patches with
 12 copies of the try/except fallback, every default-date site calls
 ``default_run_date()`` here. The lib chokepoint (``now_dual``) lives in
-``alpha_engine_lib.dates`` and is reachable from this repo at the pinned
+``nousergon_lib.dates`` and is reachable from this repo at the pinned
 ``nousergon-lib@v0.59.4`` (requirements.txt) — so this is a clean import, no
 lib release/pin bump required.
 
@@ -41,7 +41,7 @@ def default_run_date(now: datetime | None = None) -> str:
     """Resolve the default artifact-keying date on the trading-day axis.
 
     Returns the last *closed* NYSE session as an ISO ``YYYY-MM-DD`` string via
-    the fleet-canonical ``alpha_engine_lib.dates.now_dual().trading_day``
+    the fleet-canonical ``nousergon_lib.dates.now_dual().trading_day``
     chokepoint. Falls back to the calendar UTC date only if the lib lookup
     raises — date defaulting must never block a collection run.
 
@@ -54,7 +54,7 @@ def default_run_date(now: datetime | None = None) -> str:
         session whose 4:00 PM ET close has occurred (e.g. Saturday -> Friday).
     """
     try:
-        from alpha_engine_lib.dates import now_dual
+        from nousergon_lib.dates import now_dual
 
         dd = now_dual(now=now) if now is not None else now_dual()
         log.info(
@@ -70,7 +70,7 @@ def default_run_date(now: datetime | None = None) -> str:
         fallback = ref.astimezone(timezone.utc).strftime("%Y-%m-%d")
         log.warning(
             "default_run_date: could not resolve trading_day via "
-            "alpha_engine_lib.dates.now_dual; fell back to calendar date %s",
+            "nousergon_lib.dates.now_dual; fell back to calendar date %s",
             fallback,
             exc_info=True,
         )

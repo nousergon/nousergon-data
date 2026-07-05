@@ -100,14 +100,14 @@ class TestSpotDriftDetectionPreflightOnly:
 
     def test_preflight_reuses_canonical_lib_base(self, spot_text):
         """The preflight must compose the canonical
-        alpha_engine_lib.preflight.BasePreflight (env-vars + S3 HEAD,
+        nousergon_lib.preflight.BasePreflight (env-vars + S3 HEAD,
         both read-only) — NO duplicated preflight scaffolding — plus an
         import-only smoke of the drift module (no scan invoked)."""
         i_guard = spot_text.index('if [ "$PREFLIGHT_ONLY" = "1" ]; then')
         i_drift = spot_text.index("# ── Full drift detection ────────────────────────────────────────────────────")
         block = spot_text[i_guard:i_drift]
 
-        assert "from alpha_engine_lib.preflight import BasePreflight" in block, (
+        assert "from nousergon_lib.preflight import BasePreflight" in block, (
             "must reuse the canonical lib BasePreflight, not bespoke scaffolding"
         )
         assert "pf.check_env_vars(" in block
