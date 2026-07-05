@@ -80,7 +80,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification
+from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
@@ -259,7 +259,7 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
 
 def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
-    """Phase 1: constituents, prices, macro, universe returns."""
+    """Phase 1: constituents, historical (PIT) constituents, prices, macro, universe returns."""
     bucket = config["bucket"]
     price_cfg = config.get("price_cache", {})
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
@@ -309,6 +309,37 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.info("Loaded %d tickers from existing constituents.json", len(tickers))
         except Exception as exc:
             logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
+
+    # ── 1b. Historical (point-in-time) constituents ──────────────────────────
+    # Replays the S&P 500 "Selected changes" table backward from today's roster
+    # to a {date: [tickers]} PIT membership map at
+    # market_data/historical_constituents.json — the survivorship-free universe
+    # substrate the backtester consumes (config#657, G12). Reuses `tickers` (the
+    # roster already collected/loaded above) so the two collectors' rosters stay
+    # consistent and it avoids a second live fetch. Runs in the default Phase-1
+    # sweep; without this wiring the collector was dead code and the S3 key was
+    # never written.
+    if only in (None, "historical_constituents"):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: historical constituents (point-in-time membership)")
+        logger.info("=" * 60)
+        if not tickers:
+            logger.warning(
+                "No tickers available — skipping historical constituents (PIT map "
+                "needs today's roster to replay changes from)"
+            )
+            results["collectors"]["historical_constituents"] = {
+                "status": "skipped", "reason": "no tickers",
+            }
+        else:
+            results["collectors"]["historical_constituents"] = _phase_collect(
+                reg, "historical_constituents",
+                lambda: historical_constituents.collect(
+                    bucket=bucket, current_tickers=tickers,
+                    s3_prefix=market_prefix, dry_run=dry_run,
+                ),
+                artifact_key=f"{market_prefix}historical_constituents.json",
+            )
 
     # ── 2. Price cache refresh ───────────────────────────────────────────────
     if only in (None, "prices"):
@@ -2654,7 +2685,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "macro", "short_interest", "universe_classification", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
+        choices=["constituents", "historical_constituents", "prices", "macro", "short_interest", "universe_classification", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
     )
     # Phase-registry recovery controls (L4528 — markers under data/{date}/.phases/).
