@@ -60,7 +60,7 @@ class TestDefaultOffRollout:
         through ``universe_writer_lock``; no boto3 S3 client is built
         for the lock."""
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             result = daily_append_module.daily_append(date_str="2026-05-27")
         assert result == {"ok": True}
@@ -77,7 +77,7 @@ class TestDefaultOffRollout:
             "ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED", falsy_value
         )
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             daily_append_module.daily_append(date_str="2026-05-27")
         mock_lock.assert_not_called()
@@ -100,7 +100,7 @@ class TestLockAcquisitionWhenEnabled:
         )
         monkeypatch.setenv("USER", "testop")
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             mock_lock.return_value.__enter__ = MagicMock(
                 return_value=MagicMock()
@@ -124,7 +124,7 @@ class TestLockAcquisitionWhenEnabled:
         )
         calls: list[str] = []
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             mock_lock.return_value.__enter__ = MagicMock(
                 side_effect=lambda: calls.append("enter") or MagicMock()
@@ -153,7 +153,7 @@ class TestDryRunBypassesLock:
             "ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED", "true"
         )
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             daily_append_module.daily_append(
                 date_str="2026-05-27", dry_run=True
@@ -175,7 +175,7 @@ class TestArgForwarding:
             "ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED", "true"
         )
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             mock_lock.return_value.__enter__ = MagicMock(
                 return_value=MagicMock()
@@ -228,7 +228,7 @@ class TestLockHeldPropagates:
         ``LockHeldByAnotherWriterError``, that exception MUST propagate
         unchanged — per ``~/Development/CLAUDE.md`` no-silent-fails
         rule. The wrapper does not catch / convert the exception."""
-        from alpha_engine_lib.locks import LockHeldByAnotherWriterError, LockHolder
+        from nousergon_lib.locks import LockHeldByAnotherWriterError, LockHolder
 
         monkeypatch.setenv(
             "ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED", "true"
@@ -241,7 +241,7 @@ class TestLockHeldPropagates:
             pid=999,
         )
         with patch(
-            "alpha_engine_lib.locks.universe_writer_lock"
+            "nousergon_lib.locks.universe_writer_lock"
         ) as mock_lock:
             mock_lock.side_effect = LockHeldByAnotherWriterError(
                 holder, "s3://alpha-engine-research/locks/universe-writer.lock"

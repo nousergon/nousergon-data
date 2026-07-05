@@ -29,7 +29,7 @@ from pathlib import Path
 
 import boto3
 import pandas as pd
-from alpha_engine_lib.trading_calendar import add_trading_days as _add_trading_days
+from nousergon_lib.trading_calendar import add_trading_days as _add_trading_days
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ def _trading_days_to_process(
     Returns ISO dates sorted chronologically. The trading-calendar module
     at the repo root handles holiday awareness (market closures through 2030).
     """
-    from alpha_engine_lib.trading_calendar import is_trading_day as nyse_is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day as nyse_is_trading_day
 
     out: list[str] = []
     d = today

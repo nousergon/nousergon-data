@@ -533,7 +533,7 @@ def test_maybe_alert_skips_fresh_state(monkeypatch, fixed_now):
     import index
     importlib.reload(index)
 
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec, CheckResult
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
 
     spec = ArtifactSpec(
         artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
@@ -553,7 +553,7 @@ def test_maybe_alert_skips_missing_within_sla_grace(monkeypatch, fixed_now):
     import index
     importlib.reload(index)
 
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec, CheckResult
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
 
     spec = ArtifactSpec(
         artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
@@ -579,7 +579,7 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
     import index
     importlib.reload(index)
 
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec, CheckResult
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
 
     spec = ArtifactSpec(
         artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
@@ -616,7 +616,7 @@ def test_maybe_alert_warning_missing_console_only(monkeypatch, fixed_now):
     import index
     importlib.reload(index)
 
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec, CheckResult
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
 
     spec = ArtifactSpec(
         artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
@@ -643,7 +643,7 @@ def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now)
     import index
     importlib.reload(index)
 
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec, CheckResult
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
 
     spec = ArtifactSpec(
         artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
@@ -1186,7 +1186,7 @@ def test_recovery_dedup_prevents_redispatch(monkeypatch, fake_s3, fixed_now):
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
 
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec
+    from nousergon_lib.artifact_freshness import ArtifactSpec
     spec = ArtifactSpec(
         artifact_id="closes_recoverable", s3_bucket="alpha-engine-research",
         s3_key_template="staging/daily_closes/{trading_day}.parquet",
@@ -1220,7 +1220,7 @@ def test_recovery_stale_marker_allows_redispatch(monkeypatch, fake_s3, fixed_now
     _patch_now(monkeypatch, fixed_now)
 
     from datetime import timedelta
-    from alpha_engine_lib.artifact_freshness import ArtifactSpec
+    from nousergon_lib.artifact_freshness import ArtifactSpec
     spec = ArtifactSpec(
         artifact_id="closes_recoverable", s3_bucket="alpha-engine-research",
         s3_key_template="staging/daily_closes/{trading_day}.parquet",

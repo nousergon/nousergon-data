@@ -421,7 +421,7 @@ class TestAnalyst:
             "collectors.analyst_sources.YfinanceAnalystAdapter", lambda: _FakeAdapter()
         )
         # No Finnhub key → no rating backfill (secrets via the lib, not os.environ).
-        monkeypatch.setattr("alpha_engine_lib.secrets.get_secret", lambda *a, **k: "")
+        monkeypatch.setattr("nousergon_lib.secrets.get_secret", lambda *a, **k: "")
         out = mmd._yfinance_analyst(["AAPL", "MSFT", "NOPE", "MISS"])
         assert set(out) == {"AAPL", "MSFT"}  # empty + miss omitted
         assert out["AAPL"]["rating_score"] == 1.0  # strongBuy

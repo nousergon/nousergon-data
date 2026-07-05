@@ -153,7 +153,7 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
 # (2y) is sufficient here — features only use the latest row and 2y gives
 # enough warmup for every indicator.
 from store.parquet_loader import load_parquet_from_s3 as _load_parquet_from_s3
-from alpha_engine_lib.arcticdb import (
+from nousergon_lib.arcticdb import (
     load_universe_ohlcv,
     load_macro_series,
     open_macro_lib,

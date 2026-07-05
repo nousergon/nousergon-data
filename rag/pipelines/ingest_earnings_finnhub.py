@@ -26,7 +26,7 @@ from datetime import date
 
 import requests
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +168,8 @@ def ingest_ticker(
 
     Returns number of transcripts ingested.
     """
-    from alpha_engine_lib.rag.embeddings import embed_texts
-    from alpha_engine_lib.rag.retrieval import ingest_document, document_exists
+    from nousergon_lib.rag.embeddings import embed_texts
+    from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
     available = _list_transcripts(ticker)
     if not available:

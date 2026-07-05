@@ -8,7 +8,7 @@ Phase 4 of the pipeline-reporting-revamp arc (ROADMAP L3050, plan doc
 14:00 UTC (≈ 07:00 PT, well after every SF's expected start time). For each
 of the 3 Step Functions, checks whether at least one execution started in
 the expected window. If a check fails, publishes an alert via
-``alpha_engine_lib.alerts.publish`` to a DISTINCT SNS topic
+``nousergon_lib.alerts.publish`` to a DISTINCT SNS topic
 (``alpha-engine-watchdog-alerts``, NOT the existing ``alpha-engine-alerts``
 topic) and routes Telegram through flow-doctor forum topics
 (``PIPELINE_OBSERVER_TELEGRAM_TOPICS`` — config#1742 T2) — channel
@@ -62,7 +62,7 @@ independence preserved per plan doc §3.5.
 ``AWS/States ExecutionsStarted`` alarm with a 24h window would
 false-positive every weekend for Weekday + EOD (alert hygiene defect:
 operator desensitization → silenced watchdog → defeats purpose). The
-``alpha_engine_lib.trading_calendar.last_closed_trading_day`` chokepoint
+``nousergon_lib.trading_calendar.last_closed_trading_day`` chokepoint
 encodes NYSE holiday + weekend awareness, so the Lambda fires cleanly
 only when there's genuinely a missing execution on an expected
 trading day.
@@ -84,8 +84,8 @@ from typing import Optional
 
 import boto3
 
-from alpha_engine_lib import alerts
-from alpha_engine_lib.trading_calendar import (
+from nousergon_lib import alerts
+from nousergon_lib.trading_calendar import (
     last_closed_trading_day,
     previous_trading_day,
 )
@@ -422,7 +422,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         is_watch_day=is_trading_today,
         skip_reason_if_not_watching=(
             "today is not a NYSE trading day (weekend / holiday) per "
-            "alpha_engine_lib.trading_calendar"
+            "nousergon_lib.trading_calendar"
         ),
         window_seconds=WINDOW_SECONDS_DAILY,
     )
@@ -432,7 +432,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         is_watch_day=is_trading_today,
         skip_reason_if_not_watching=(
             "today is not a NYSE trading day (weekend / holiday) per "
-            "alpha_engine_lib.trading_calendar"
+            "nousergon_lib.trading_calendar"
         ),
         # Trading-day-aware: previous_trading_day-based, NOT a 24h calendar
         # window. Today's EOD fires ~20:00 UTC (after market close + daemon

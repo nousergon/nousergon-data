@@ -32,7 +32,7 @@ from datetime import date as Date
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from alpha_engine_lib.sources import AnalystSnapshot, AnalystSource
+from nousergon_lib.sources import AnalystSnapshot, AnalystSource
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ def write_snapshot_document(
 
     Empty ``snapshots`` still writes a document — that's signal (no
     adapter covered the ticker that day)."""
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key, eval_latest_key, new_eval_run_id,
     )
 

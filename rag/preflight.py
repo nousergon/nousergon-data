@@ -17,8 +17,8 @@ import logging
 import os
 import sys
 
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
-from alpha_engine_lib.preflight import BasePreflight
+from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.preflight import BasePreflight
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
 # pattern across all 5 entrypoints; see executor/main.py for reference).
@@ -70,7 +70,7 @@ class RAGPreflight(BasePreflight):
 def main() -> int:
     """CLI entrypoint invoked by run_weekly_ingestion.sh."""
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import).
+    # nousergon_lib.logging import).
     bucket = os.environ.get("ALPHA_ENGINE_BUCKET", "alpha-engine-research")
     RAGPreflight(bucket).run()
     log.info("RAG pre-flight OK")

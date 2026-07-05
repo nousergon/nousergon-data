@@ -27,7 +27,7 @@ from collectors.news_aggregator import AggregatedNewsArticle, NewsAggregator
 from collectors.nlp.pipeline import NewsNLPOutput
 from collectors.nlp.protocols import SentimentScore
 
-from alpha_engine_lib.sources import NewsArticle
+from nousergon_lib.sources import NewsArticle
 
 
 # ── helpers (mirror tests/test_news_articles.py) ───────────────────────

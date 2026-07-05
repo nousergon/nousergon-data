@@ -2,7 +2,7 @@
 Data-module preflight: connectivity + freshness checks run at the top of
 ``weekly_collector.main()`` before any real collection work starts.
 
-Primitives live in ``alpha_engine_lib.preflight.BasePreflight``; this
+Primitives live in ``nousergon_lib.preflight.BasePreflight``; this
 module composes them with module-specific HTTP probes (polygon, FRED,
 FMP /stable) + an ArcticDB-libraries-present gate.
 
@@ -22,8 +22,8 @@ import time
 import uuid
 from typing import Any
 
-from alpha_engine_lib.preflight import BasePreflight
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.preflight import BasePreflight
+from nousergon_lib.secrets import get_secret
 
 log = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ class DataPreflight(BasePreflight):
             # macro/SPY freshness is a sufficient signal for the write
             # path being healthy end-to-end.
             #
-            # Trading-day-aware via alpha_engine_lib.dates: max_stale=1
+            # Trading-day-aware via nousergon_lib.dates: max_stale=1
             # tolerates polygon's T+1 publish latency (yesterday's close
             # may not have been written yet at this preflight's invocation
             # time). The earlier 4-calendar-day threshold was a workaround
@@ -179,13 +179,13 @@ class DataPreflight(BasePreflight):
 
         Bypasses the lib's calendar-day ``check_arcticdb_fresh`` (which is
         load-bearing for other helpers and will be retired separately) and
-        calls the new ``alpha_engine_lib.dates.is_fresh_in_trading_days``
+        calls the new ``nousergon_lib.dates.is_fresh_in_trading_days``
         chokepoint directly. Mirrors the postflight pattern so producer-
         and consumer-side checks agree on what "fresh" means.
         """
         import pandas as pd
         from datetime import datetime, timezone
-        from alpha_engine_lib.dates import (
+        from nousergon_lib.dates import (
             is_fresh_in_trading_days,
             trading_days_stale,
             expected_last_close,

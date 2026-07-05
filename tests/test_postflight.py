@@ -267,7 +267,7 @@ class TestMacroSpyFresh:
         """2026-05-24 incident regression: Sunday redrive of a Saturday SF
         where macro.SPY carries Friday's close. Friday → Sunday is +2 calendar
         days but 0 trading days; the migrated gate must pass via
-        ``alpha_engine_lib.dates.is_fresh_in_trading_days``.
+        ``nousergon_lib.dates.is_fresh_in_trading_days``.
         """
         pf = _make_postflight()
         pf.run_date = "2026-05-24"  # Sunday

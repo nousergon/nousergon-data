@@ -20,7 +20,7 @@ run by CI or any pipeline).
    policy mismatch). For dividend-paying tickers (e.g. EQIX REIT at $5+
    quarterly dividends) the per-cell delta is dividend-scale, NOT
    float-precision noise, and persists at any reasonable epsilon — the
-   `passed` flag in `alpha_engine_lib/reconcile.py:62-68` requires
+   `passed` flag in `nousergon_lib/reconcile.py:62-68` requires
    `n_cells_over_epsilon == 0`, which the divergence cannot satisfy.
    Both stores are correct representations under their own conventions;
    the canonical store going forward is ArcticDB's auto-adjusted.

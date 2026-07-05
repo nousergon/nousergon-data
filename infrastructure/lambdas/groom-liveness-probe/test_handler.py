@@ -12,7 +12,7 @@ only touches nousergon_lib at import time via the `_OPS_TOPICS` tuple
 (`flow_doctor_fleet.FleetTelegramTopic`) and, transitively through
 `flow_doctor_telegram`, `telegram.send_message`; the notify path itself is
 monkeypatched per-test (`index.notify_via_flow_doctor`). Migrated onto
-`nousergon_lib.*` from the old `alpha_engine_lib.telegram` stub by the
+`nousergon_lib.*` from the old `nousergon_lib.telegram` stub by the
 flow-doctor cutover (config#1742, #622) — keep this stub tracking `index.py`'s
 real module-level imports.
 """

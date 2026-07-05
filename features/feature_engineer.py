@@ -88,7 +88,7 @@ def _load_feature_cfg_overrides() -> dict:
     # data-specific repo-local tail (``<repo>/config.yaml``, subdir-flattened) is
     # preserved via repo_local_fallback; the per-key validation loop below is
     # unchanged (a present-but-unknown override key still fails loud).
-    from alpha_engine_lib.config import resolve_experiment_config
+    from nousergon_lib.config import resolve_experiment_config
 
     repo_root = Path(__file__).resolve().parent.parent
     candidates = resolve_experiment_config(

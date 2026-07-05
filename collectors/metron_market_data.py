@@ -564,9 +564,9 @@ def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
     fetched here. Fail-soft per symbol; a symbol with no resolvable snapshot is
     omitted (coverage gap, not zeros)."""
     from collectors.analyst_sources import YfinanceAnalystAdapter
-    from alpha_engine_lib.secrets import get_secret  # secrets via the lib, never os.environ
-    # (alpha_engine_lib, not nousergon_lib: this repo pins a pre-rename lib (<0.60.0)
-    # where only the alpha_engine_lib name exists — matches finnhub_client.py.)
+    from nousergon_lib.secrets import get_secret  # secrets via the lib, never os.environ
+    # (nousergon_lib, not nousergon_lib: this repo pins a pre-rename lib (<0.60.0)
+    # where only the nousergon_lib name exists — matches finnhub_client.py.)
 
     yf_adapter = YfinanceAnalystAdapter()
     finnhub_adapter = None
@@ -919,7 +919,7 @@ def collect_macro(
     series' next scheduled release date and the forward macro event calendar (FOMC +
     curated CPI/employment/claims releases) for the Macro "Next expected" column + the
     Calendar page (metron-ops#49/#13). Injectable source(s)/S3 for tests; FRED key from
-    ``alpha_engine_lib.secrets`` when not injected."""
+    ``nousergon_lib.secrets`` when not injected."""
     if run_date is None:
         from dates import default_run_date  # config#1014: trading-day axis
 
@@ -929,7 +929,7 @@ def collect_macro(
         s3_client = boto3.client("s3")
     if macro_source is None:
         if api_key is None:
-            from alpha_engine_lib.secrets import get_secret
+            from nousergon_lib.secrets import get_secret
             api_key = get_secret("FRED_API_KEY", required=False, default="")
         series = _fred_series_history(METRON_MACRO_SERIES, api_key)
     else:
@@ -1460,9 +1460,9 @@ def collect_valuation_medians(
 
 # NYSE early-close days (1:00 PM ET close): day after Thanksgiving, and Christmas
 # Eve / July 3 when they fall on a weekday. Source: nyse.com/markets/hours-calendars.
-# Holidays themselves come from alpha_engine_lib.trading_calendar.NYSE_HOLIDAYS (the
+# Holidays themselves come from nousergon_lib.trading_calendar.NYSE_HOLIDAYS (the
 # fleet-canonical set, maintained through 2030). Lift this early-close set into
-# alpha_engine_lib.trading_calendar on second adoption per the
+# nousergon_lib.trading_calendar on second adoption per the
 # lift-invariants-after-second-recurrence rule.
 NYSE_EARLY_CLOSES: set = {
     # 2026
@@ -1490,12 +1490,12 @@ def in_us_market_window(now: datetime | None = None) -> bool:
     """True inside the actual NYSE session (±5 min margin), in exchange time.
 
     Exchange-calendar gating: weekends and NYSE holidays via the fleet-canonical
-    ``alpha_engine_lib.trading_calendar.is_trading_day``; the session is 9:30 ET →
+    ``nousergon_lib.trading_calendar.is_trading_day``; the session is 9:30 ET →
     16:00 ET (13:00 ET on ``NYSE_EARLY_CLOSES`` half-days), evaluated in
     America/New_York so DST is handled exactly — no widened-UTC heuristic."""
     from zoneinfo import ZoneInfo
 
-    from alpha_engine_lib.trading_calendar import is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day
 
     now = now or datetime.now(timezone.utc)
     et = now.astimezone(ZoneInfo("America/New_York"))
