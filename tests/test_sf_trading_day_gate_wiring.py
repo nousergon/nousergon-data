@@ -75,7 +75,11 @@ class TestTradingDayGateChoice:
         assert false_branch == ["NotifyHolidaySkip"]
 
     def test_default_proceeds_to_start_box(self, states):
-        assert states["TradingDayGateChoice"]["Default"] == "StartExecutorEC2"
+        # config#1807: trading day confirmed -> dispatch the data-spot launch
+        # first (fire-and-forget), then boot the box.
+        assert states["TradingDayGateChoice"]["Default"] == "CheckSkipDataSpot"
+        assert states["CheckSkipDataSpot"]["Default"] == "LaunchDailyDataSpot"
+        assert states["LaunchDailyDataSpot"]["Next"] == "StartExecutorEC2"
 
     def test_choice_reads_is_trading_day_off_gate_payload(self, states):
         var = states["TradingDayGateChoice"]["Choices"][0]["Variable"]
@@ -86,7 +90,8 @@ class TestTradingDayGateFailed:
     def test_failed_proceeds_to_start_box(self, states):
         failed = states["TradingDayGateFailed"]
         assert failed["Resource"] == "arn:aws:states:::sns:publish"
-        assert failed["Next"] == "StartExecutorEC2"
+        # config#1807: fail-open path also routes through the spot-launch gate.
+        assert failed["Next"] == "CheckSkipDataSpot"
 
 
 class TestDeadStatesRemoved:
