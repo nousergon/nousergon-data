@@ -2175,6 +2175,15 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: metron_market_data.collect_technicals(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.TECHNICALS_PREFIX}latest.json",
     )
+    # Period returns + risk stats for Metron tearsheet / Holdings LTM — derived from
+    # close_history (no new fetch). Runs after history + technicals.
+    results["collectors"]["metron_security_performance_data"] = _phase_collect(
+        reg, "metron_security_performance_data",
+        lambda: metron_market_data.collect_security_performance(
+            bucket=bucket, run_date=run_date, dry_run=dry_run,
+        ),
+        artifact_key=f"{metron_market_data.SECURITY_PERFORMANCE_PREFIX}latest.json",
+    )
     # Consensus research (rating + price targets + #analysts) for Metron's Holdings
     # Sentiment/Consensus band + per-holding attractiveness score (metron-ops#105).
     # FREE sources only (yfinance + optional Finnhub rating buckets); forward consensus
