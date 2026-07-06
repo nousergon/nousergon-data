@@ -89,5 +89,15 @@
     "export HOME=/home/ec2-user",
     "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only"
+  ],
+  "Research": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-research pull --ff-only origin main",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-research",
+    "export HOME=/home/ec2-user",
+    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export ALPHA_ENGINE_EXPERIMENT_ID=reference",
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug research-weekly-launch --log /var/log/research-weekly-launch.log -- bash infrastructure/spot_research_weekly.sh --force"
   ]
 }

@@ -127,6 +127,11 @@ _EXPECTED_SKIPS = {
 # used for the other 7 spots.
 # Maps state name → (mode token the {} immediately follows, log file).
 _SPOT_STATES = {
+    # config#1687: the weekly Research heavy pass runs on its own spot.
+    "Research": (
+        "bash infrastructure/spot_research_weekly.sh --force",
+        "/var/log/research-weekly-launch.log",
+    ),
     "MorningEnrich": (
         "bash infrastructure/spot_data_weekly.sh --morning-enrich-only",
         "/var/log/morning-enrich.log",
@@ -181,7 +186,8 @@ _SPOT_STATES = {
 # _SPOT_STATES) routed dry via --preflight-only, not a Lambda dry flag.
 # state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
-    "Research": ("dry_run_llm.$", "$.research_dry"),
+    # Research moved to the SPOT set (config#1687) — dry path now routes via
+    # $.preflight_args like every other spot state.
     "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
     "RegimeSubstrate": ("action.$", "$.regime_action"),
     "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),
@@ -352,6 +358,11 @@ def orig_spot_cmds() -> dict:
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.
+    - **Extended 2026-07-06** with the Research entry (config#1687): the
+      weekly Research heavy pass migrated from the 900s-capped Lambda
+      invoke to its own spot (spot_research_weekly.sh --force via
+      krepis.ssm_log_capture) — a NEW baseline entry, not a change to an
+      existing absent-path command.
     """
     p = _REPO_ROOT / "tests" / "fixtures" / "sf_prekeystone_spot_commands.json"
     return json.loads(p.read_text())

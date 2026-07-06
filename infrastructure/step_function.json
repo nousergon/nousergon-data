@@ -989,36 +989,30 @@
             },
             "Research": {
               "Type": "Task",
-              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix. TIMEOUT RETRY = CHECKPOINT-RESUME (config#1650, 2026-07-06): the runner persists per-node state (archive/agent_runs + sector_team_runs) and RESUMEs completed nodes at near-zero LLM cost, so one retry on States.Timeout/Lambda.Unknown converts the manual watch-rerun into the automatic contract (the 7/3 timeout's rerun finished in ~5.9 min). IntervalSeconds=60 is LOAD-BEARING: it guarantees the first invocation is dead past its own 900s Lambda ceiling before the retry fires (runner has reserved-concurrency=1 — an overlapping invoke would throttle). Bridge until the config#1687 spot-EC2 migration removes the 900s ceiling entirely.",
-              "Resource": "arn:aws:states:::lambda:invoke",
+              "Comment": "Weekly Research run on its own spot EC2 (config#1687 — migrated 2026-07-06 off the 900s Lambda hard ceiling; the 2026-07-03 weekly used 874s/900 and a 26s tail overrun failed the primary execution, config#1650). Dispatcher (always-on micro) runs crucible-research infrastructure/spot_research_weekly.sh: capacity-rotating spot launch + private research-config staging (prompts/YAMLs tarball -> prompt_loader search path) + weekly_box_runner.py, which reuses the Lambda handler orchestration VERBATIM (PRIOR-population snapshot + FAIL-HARD challenger post-step preserved by construction, config#1683). --force mirrors the Lambda payload's force:true; the skip_dry_run_gate=true production optimization is the box runner's default. Shell-run routes --preflight-only via $.preflight_args exactly like the sibling spot states. The runner LAMBDA stays for intraday alerts + operator modes — only the weekly heavy pass moved. executionTimeout 12000s = launcher MAX_SPOT_ATTEMPTS(2) x MAX_RUNTIME_SECONDS(5400) + bootstrap headroom (config#883 lockstep — raise together).",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
-                "FunctionName": "alpha-engine-research-runner:live",
-                "Payload": {
-                  "weekly_run": true,
-                  "force": true,
-                  "skip_dry_run_gate": true,
-                  "dry_run_llm.$": "$.research_dry"
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-research pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-research','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug research-weekly-launch --log /var/log/research-weekly-launch.log -- bash infrastructure/spot_research_weekly.sh --force{}',$.preflight_args))",
+                  "executionTimeout": [
+                    "12000"
+                  ]
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 12060,
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "States.TaskFailed",
+                    "States.Timeout"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
-                },
-                {
-                  "ErrorEquals": [
-                    "States.Timeout",
-                    "Lambda.Unknown"
-                  ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -1026,29 +1020,103 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "BranchAFailed",
+                  "Next": "PublishResearchFailureImmediate",
                   "ResultPath": "$.error"
                 }
               ],
               "ResultPath": "$.research_result",
+              "Next": "WaitForResearch"
+            },
+            "WaitForResearch": {
+              "Type": "Task",
+              "Comment": "Poll the research spot dispatch until complete. ResultSelector deliberately DROPS StandardOutputContent (the 256KB States.DataLimitExceeded class, config#1163/#1232) — full logs ship to S3 via krepis.ssm_log_capture.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.research_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PublishResearchFailureImmediate",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.research_poll",
               "Next": "CheckResearchStatus"
+            },
+            "ResearchWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "WaitForResearch"
+            },
+            "ResearchRetryGate": {
+              "Type": "Choice",
+              "Comment": "SOTA bounded auto-retry (config#1059): re-issue the Research dispatch ONCE on a polled non-Success SSM status before giving up. Cheap on re-run: the runner's per-node checkpoint RESUME (config#1650 finding — persisted agent_runs/sector_team_runs in S3) skips completed nodes at near-zero LLM cost, the same mechanism the retired Lambda-path States.Timeout retry exploited.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.research_attempts",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_attempts",
+                      "NumericGreaterThanEquals": 1
+                    }
+                  ],
+                  "Next": "ExtractResearchError"
+                }
+              ],
+              "Default": "ResearchReissue"
+            },
+            "ResearchReissue": {
+              "Type": "Pass",
+              "Comment": "Mark one re-issue consumed (research_attempts=1) and loop back to Research.",
+              "Result": 1,
+              "ResultPath": "$.research_attempts",
+              "Next": "Research"
             },
             "CheckResearchStatus": {
               "Type": "Choice",
-              "Comment": "Verify research returned OK (not ERROR)",
+              "Comment": "SSM poll verdict for the research spot dispatch. Success covers both OK and SKIPPED/already_run — weekly_box_runner exits 0 for both, mirroring the retired Lambda contract.",
               "Choices": [
                 {
-                  "Variable": "$.research_result.Payload.status",
-                  "StringEquals": "OK",
+                  "Variable": "$.research_poll.Status",
+                  "StringEquals": "Success",
                   "Next": "CheckSkipDataPhase2"
                 },
                 {
-                  "Variable": "$.research_result.Payload.status",
-                  "StringEquals": "SKIPPED",
-                  "Next": "CheckSkipDataPhase2"
+                  "Variable": "$.research_poll.Status",
+                  "StringEquals": "InProgress",
+                  "Next": "ResearchWait"
+                },
+                {
+                  "Variable": "$.research_poll.Status",
+                  "StringEquals": "Pending",
+                  "Next": "ResearchWait"
                 }
               ],
-              "Default": "ExtractResearchError"
+              "Default": "ResearchRetryGate"
             },
             "CheckSkipDataPhase2": {
               "Type": "Choice",
@@ -1615,11 +1683,13 @@
             },
             "ExtractResearchError": {
               "Type": "Pass",
-              "Comment": "Normalize Research Lambda soft-failure payload (status != OK) into $.error. Research handler always returns {status, date, error} on the ERROR path so copying the whole Payload is safe and preserves the real traceback string.",
+              "Comment": "Normalize a terminal non-Success research spot dispatch into $.error (SSM status + details + stderr tail; stdout lives in the S3 log via ssm_log_capture).",
               "Parameters": {
                 "phase": "Research",
                 "source": "CheckResearchStatus.Default",
-                "payload.$": "$.research_result.Payload"
+                "ssm_status.$": "$.research_poll.Status",
+                "status_details.$": "$.research_poll.StatusDetails",
+                "stderr_tail.$": "$.research_poll.StandardErrorContent"
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"

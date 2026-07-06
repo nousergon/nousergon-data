@@ -234,12 +234,16 @@ class TestBranchAContents:
 
     def test_data_phase2_after_research_in_branch_a(self, branch_a):
         # Research success → CheckSkipDataPhase2 → DataPhase2
+        # config#1687: Research is an SSM spot dispatch — success is the
+        # polled SSM Status "Success" (box runner exits 0 for OK/SKIPPED).
         ok = [
             c["Next"]
             for c in branch_a["CheckResearchStatus"]["Choices"]
-            if c.get("StringEquals") == "OK"
+            if c.get("StringEquals") == "Success"
         ]
         assert ok == ["CheckSkipDataPhase2"]
+        assert branch_a["Research"]["Next"] == "WaitForResearch"
+        assert branch_a["WaitForResearch"]["Next"] == "CheckResearchStatus"
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
 
     def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
@@ -498,7 +502,10 @@ class TestPerBranchErrorIsolation:
         catch_targets = [
             c["Next"] for c in branch_a["Research"]["Catch"]
         ]
-        assert catch_targets == ["BranchAFailed"]
+        # config#1687: the hard-fail path now routes through the fast-SNS
+        # publisher first (mirroring the RAGIngestion loop); isolation is
+        # preserved because the publisher terminates at BranchAFailed.
+        assert catch_targets == ["PublishResearchFailureImmediate"]
         # ExtractError → PublishImmediate → BranchAFailed
         assert (
             branch_a["ExtractResearchError"]["Next"]
@@ -511,11 +518,15 @@ class TestPerBranchErrorIsolation:
         # SNS-publish-fails escape hatch also lands at BranchAFailed
         for c in publish.get("Catch", []):
             assert c["Next"] == "BranchAFailed"
-        # CheckResearchStatus non-OK/SKIPPED → ExtractResearchError
+        # config#1687: a terminal non-Success first passes the bounded
+        # one-reissue gate (config#1059 pattern), THEN extracts the error.
         assert (
             branch_a["CheckResearchStatus"]["Default"]
-            == "ExtractResearchError"
+            == "ResearchRetryGate"
         )
+        assert branch_a["ResearchRetryGate"]["Choices"][0]["Next"] == "ExtractResearchError"
+        assert branch_a["ResearchRetryGate"]["Default"] == "ResearchReissue"
+        assert branch_a["ResearchReissue"]["Next"] == "Research"
 
     def test_dataphase2_failure_routes_to_branch_a_failed(self, branch_a):
         assert [c["Next"] for c in branch_a["DataPhase2"]["Catch"]] == [

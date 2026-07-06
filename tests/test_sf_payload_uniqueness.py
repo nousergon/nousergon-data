@@ -78,7 +78,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
-    "Research": frozenset({"dry_run_llm.$", "force", "weekly_run", "skip_dry_run_gate"}),
+    # Research migrated to spot-EC2 SSM dispatch (config#1687) — no Lambda payload.
     "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
@@ -552,7 +552,9 @@ class TestEODSFTopLevelFieldsClosed:
 # (crucible-predictor spot_train.sh runs monitoring.drift_detector non-blocking
 # after training succeeds, on the same instance), so it no longer launches its
 # own spot. DriftDetection dropped out of the flat-level spot set.
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 10
+# 10 -> 11 on config#1687 (2026-07-06): the weekly Research heavy pass moved
+# off the 900s Lambda ceiling onto its own spot (spot_research_weekly.sh).
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
 
 
 def _saturday_spot_states() -> list[str]:

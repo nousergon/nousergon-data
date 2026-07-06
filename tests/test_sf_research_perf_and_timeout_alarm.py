@@ -1,15 +1,17 @@
 """L4464 — Research-stage perf cleanup + named timeout alarm.
 
-Pins:
-  1. The Saturday SF Research Lambda payload sets skip_dry_run_gate=true so
-     the scheduled production path skips the in-handler stub-LLM dry-run gate
-     (a full second graph pass + a redundant ~4-min fetch_data — ~8 min of
-     the 900s budget). The gate's wiring validation lives in CI + the Friday
-     shell-run preflight, not the hot path.
-  2. The research-runner timeout alarm script exists and alarms on the
-     Lambda Duration approaching the 900s ceiling (a timeout-specific signal
-     the existing -errors alarm misses, since a hard timeout doesn't hit the
-     Errors metric and runs no in-process code).
+config#1687 (2026-07-06): the weekly heavy pass migrated off the Lambda onto
+spot-EC2 (spot_research_weekly.sh -> weekly_box_runner.py). The two original
+pins survive in migrated form:
+  1. skip_dry_run_gate=true is now the BOX RUNNER's default (pinned in
+     crucible-research tests/test_weekly_box_runner.py) — here we pin that
+     the SF command invokes the launcher with --force and WITHOUT
+     --no-skip-dry-run-gate, and that the shell-run dry path routes via
+     $.preflight_args like every other spot state.
+  2. The research-runner timeout alarm script still exists and alarms on
+     Lambda Duration near the 900s ceiling — the runner Lambda STAYS for
+     intraday alerts + operator modes, so the alarm remains load-bearing
+     for those invokes.
 """
 
 from __future__ import annotations
@@ -38,24 +40,26 @@ def _find_state(states: dict, name: str) -> dict | None:
 
 
 @pytest.fixture(scope="module")
-def research_payload() -> dict:
+def research_command() -> str:
     sf = json.loads(_SF.read_text())
     research = _find_state(sf["States"], "Research")
     assert research is not None, "Research state not found in SF"
-    return research["Parameters"]["Payload"]
+    return research["Parameters"]["Parameters"]["commands.$"]
 
 
 class TestSkipDryRunGate:
-    def test_skip_dry_run_gate_present_and_true(self, research_payload):
-        assert research_payload.get("skip_dry_run_gate") is True, (
-            "Research payload must set skip_dry_run_gate=true so the scheduled "
-            "production path skips the redundant stub graph pass + double "
-            "fetch_data (L4464 perf)."
-        )
+    def test_launcher_invoked_with_production_defaults(self, research_command):
+        # --force mirrors the retired Lambda payload's force:true; the
+        # skip_dry_run_gate=true production optimization is the box runner's
+        # DEFAULT (crucible-research tests pin it) — asserting the override
+        # flag is ABSENT keeps the L4464 perf semantics.
+        assert "spot_research_weekly.sh --force" in research_command
+        assert "--no-skip-dry-run-gate" not in research_command
 
-    def test_research_dry_path_preserved(self, research_payload):
-        # The shell-run dry signal must still thread through (Friday preflight).
-        assert research_payload.get("dry_run_llm.$") == "$.research_dry"
+    def test_research_dry_path_preserved(self, research_command):
+        # The shell-run dry signal routes via $.preflight_args (Option-C spot
+        # mechanism) instead of the retired dry_run_llm Lambda payload ref.
+        assert "$.preflight_args" in research_command
 
 
 class TestTimeoutAlarm:
