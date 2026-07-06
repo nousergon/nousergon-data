@@ -276,6 +276,46 @@ def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[
     return holdings, currencies
 
 
+def _load_sp1500_symbols(bucket: str) -> set[str]:
+    """S&P 500 + 400 yf_symbols from the fleet constituents artifact. Fail-soft → ∅."""
+    symbols: set[str] = set()
+    try:
+        from collectors import constituents
+
+        art = constituents.load_from_s3(bucket)
+        for t in (art or {}).get("tickers", []) or []:
+            if str(t).strip():
+                symbols.add(str(t).strip())
+    except Exception as e:
+        logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
+    return symbols
+
+
+def load_price_derived_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[str]]:
+    """Universe for price-derived spine artifacts: **SP1500 ∪ Metron held ∪ watchlist**.
+
+    One daily pass covers the research scanner universe plus Metron's foreign/OTC/fund
+    delta so overlap tickers (AAPL, MU, …) share a single close_history + derived-metrics
+    spine. SP1500-only symbols default to USD; held-universe currency wins on conflict.
+    Fundamentals/analyst/sentiment stay on ``load_metron_universe()`` (held-scoped)."""
+    metron_holdings, _ = load_metron_universe(bucket, s3_client)
+    ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in metron_holdings}
+    sp1500 = _load_sp1500_symbols(bucket)
+    all_yf = sorted(sp1500 | set(ccy_by_yf))
+    if not all_yf:
+        return [], []
+    holdings = [{"yf_symbol": yf, "currency": ccy_by_yf.get(yf, "USD")} for yf in all_yf]
+    currencies = sorted({
+        ccy for yf in all_yf for ccy in [ccy_by_yf.get(yf, "USD")] if ccy and ccy != "USD"
+    })
+    metron_only = set(ccy_by_yf) - sp1500
+    logger.info(
+        "[metron_market_data] price-derived universe: %d symbols (%d SP1500, %d metron-only)",
+        len(holdings), len(sp1500), len(metron_only),
+    )
+    return holdings, currencies
+
+
 # ── yfinance fetchers (default sources) ─────────────────────────────────────
 #
 # The yfinance log-noise chokepoint (quiet_yfinance / yf_quiet / log_yf_coverage)
@@ -814,9 +854,9 @@ def collect_history(
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    holdings, currencies = load_metron_universe(bucket, s3_client)
+    holdings, currencies = load_price_derived_universe(bucket, s3_client)
     if not holdings:
-        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
     # Held symbols + the factor/sector ETFs Metron's risk/attribution need (metron-ops#43),
     # + the major-index ETF proxies (so the Overview markets strip resolves YTD/LTM for
@@ -1263,8 +1303,8 @@ def collect_technicals(
              ma_200, pct_to_ma_50, pct_to_ma_200, high_52w, low_52w, pct_in_52w_range,
              mom_20d, mom_60d}}}
 
-    Daily cadence (close_history refreshes daily). Fail-soft per symbol; a symbol with no
-    close_history / too short a series is omitted (coverage gap, never zeros)."""
+    Daily cadence (close_history refreshes daily). Universe = SP1500 ∪ Metron held/watchlist.
+    Fail-soft per symbol; a symbol with no close_history / too short a series is omitted."""
     if run_date is None:
         from dates import default_run_date
 
@@ -1272,9 +1312,9 @@ def collect_technicals(
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    holdings, _ = load_metron_universe(bucket, s3_client)
+    holdings, _ = load_price_derived_universe(bucket, s3_client)
     if not holdings:
-        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     technicals: dict[str, dict] = {}
     for yf_sym in yf_symbols:
@@ -1440,15 +1480,16 @@ def collect_security_performance(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None,
 ) -> dict:
-    """Write per-held-symbol performance metrics for Metron (tearsheet + Holdings LTM),
-    computed from ``close_history`` artifacts already on the spine — **no new fetch**:
+    """Write per-symbol performance metrics for Metron (tearsheet + Holdings LTM + markets
+    strip), computed from ``close_history`` artifacts already on the spine — **no new fetch**:
 
         market_data/security_performance/latest.json
             {schema_version, as_of, performance: {yf_symbol: {period_returns, ytd_pct,
              ltm_pct, volatility, sharpe, sortino, max_drawdown, beta_vs_spy,
              vs_spy_1y, vs_spy_window, n_bars, history_from}}}
 
-    Daily cadence; runs after ``collect_history``. Fail-soft per symbol."""
+    Daily cadence; runs after ``collect_history``. Universe = SP1500 ∪ Metron held/watchlist.
+    Fail-soft per symbol."""
     if run_date is None:
         from dates import default_run_date
 
@@ -1456,9 +1497,9 @@ def collect_security_performance(
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    holdings, _ = load_metron_universe(bucket, s3_client)
+    holdings, _ = load_price_derived_universe(bucket, s3_client)
     if not holdings:
-        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     as_of = date.fromisoformat(str(run_date)[:10])
     spy_hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{BENCHMARK}.json")
@@ -1547,22 +1588,9 @@ def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
 
 
 def _default_medians_universe(bucket: str, s3_client: Any) -> list[str]:
-    """The broad benchmark universe = SP1500 constituents ∪ Metron held symbols. SP1500
-    from the constituents artifact (the system universe the fleet already tracks); held
-    symbols add the foreign/OTC names so a foreign holding's country bucket isn't empty."""
-    symbols: set[str] = set()
-    try:
-        from collectors import constituents
-
-        art = constituents.load_from_s3(bucket)
-        for t in (art or {}).get("tickers", []) or []:
-            if str(t).strip():
-                symbols.add(str(t).strip())
-    except Exception as e:
-        logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
-    holdings, _ = load_metron_universe(bucket, s3_client)
-    symbols.update(h["yf_symbol"] for h in holdings)
-    return sorted(symbols)
+    """The broad benchmark universe = SP1500 ∪ Metron held/watchlist (``load_price_derived_universe``)."""
+    holdings, _ = load_price_derived_universe(bucket, s3_client)
+    return [h["yf_symbol"] for h in holdings]
 
 
 def _grouped_medians(rows: list[dict], group_key: str) -> dict[str, dict]:

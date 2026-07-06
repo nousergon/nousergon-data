@@ -156,6 +156,22 @@ def test_security_performance_omits_symbol_with_no_history():
     assert result["performance"] == 1
 
 
+def test_price_derived_universe_unions_sp1500_and_metron(monkeypatch):
+    """SP1500 ∪ held/watchlist — overlap deduped, metron-only foreign names kept."""
+    s3 = MagicMock()
+    s3.get_object.side_effect = lambda Bucket, Key: _body(_UNIVERSE) if Key == mmd.HOLDINGS_UNIVERSE_KEY else (
+        _body({"holdings": [{"yf_symbol": "RMS.PA", "currency": "EUR"}]})
+        if Key == mmd.WATCHLIST_UNIVERSE_KEY else (_ for _ in ()).throw(Exception("NoSuchKey"))
+    )
+    monkeypatch.setattr(mmd, "_load_sp1500_symbols", lambda bucket: {"AAPL", "MSFT", "NVDA"})
+    holdings, currencies = mmd.load_price_derived_universe("b", s3)
+    yf = {h["yf_symbol"] for h in holdings}
+    assert yf == {"AAPL", "MSFT", "NVDA", "RMS.PA"}
+    assert currencies == ["EUR"]
+    assert next(h for h in holdings if h["yf_symbol"] == "AAPL")["currency"] == "USD"
+    assert next(h for h in holdings if h["yf_symbol"] == "RMS.PA")["currency"] == "EUR"
+
+
 # ── Valuation medians: SP1500-broad sector & country benchmark ────────────────
 
 def test_valuation_medians_artifact_values():
