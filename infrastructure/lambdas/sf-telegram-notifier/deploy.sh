@@ -5,7 +5,7 @@
 # This Lambda subscribes to `aws.states` / "Step Functions Execution Status
 # Change" events for the three Alpha Engine SFs (saturday / weekday / eod)
 # and forwards human-readable summaries to Telegram via
-# `alpha_engine_lib.telegram.send_message`. Existing SNS → email path is
+# `nousergon_lib.telegram.send_message`. Existing SNS → email path is
 # unaffected.
 #
 # Managed outside CloudFormation — same rationale as spot-orphan-reaper +

@@ -179,25 +179,6 @@ PIPELINES: dict[str, dict[str, object]] = {
         "dispatch_event_type": "eod-sf-failure",
         "has_listener": True,
     },
-    # Backlog groom dispatch (config#1472) — wraps the EC2-spot-via-SSM groom
-    # dispatch in a Step Function purely for uniform observability (watch-log
-    # artifact + silent Telegram record), replacing the bespoke external
-    # liveness-probe Lambda (data#556). `has_listener=True` (2026-07-01 follow-
-    # up to config#1535): `groom-sf-failure` is now in sf-watch.yml's `types:`
-    # allowlist and the charter (.github/sf-watch-prompt.md) has a dedicated
-    # groom guardrail (STEP 2.5 case 4) — classify-first (most groom failures
-    # are transient infra, not a code defect), plain rerun (no skip-flags, the
-    # groom SF has no multi-stage idempotency concern). Its kill-switch
-    # (/alpha-engine/groom_sf_watch/autonomous_merge_enabled) defaults `true`
-    # from day one — lower stakes than any trading pipeline since it touches no
-    # live capital, unlike weekday/EOD which soak PROPOSE-ONLY (config#1408).
-    "alpha-engine-groom-dispatch": {
-        "cadence_slug": "groom",
-        "label": "Backlog Groom",
-        "watch_prefix": "consolidated/groom_sf_watch",
-        "dispatch_event_type": "groom-sf-failure",
-        "has_listener": True,
-    },
 }
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600

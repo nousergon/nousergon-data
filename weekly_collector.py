@@ -66,12 +66,12 @@ _load_dotenv()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
-from alpha_engine_lib.phase_registry import PhaseRegistry
+from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.phase_registry import PhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
 # lift of the five inline _find_config / load_config / config_loader copies into
 # the shared-lib chokepoint. load_config below delegates to it.
-from alpha_engine_lib.config import resolve_experiment_config
+from nousergon_lib.config import resolve_experiment_config
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -80,7 +80,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification
+from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
@@ -259,7 +259,7 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
 
 def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
-    """Phase 1: constituents, prices, macro, universe returns."""
+    """Phase 1: constituents, historical (PIT) constituents, prices, macro, universe returns."""
     bucket = config["bucket"]
     price_cfg = config.get("price_cache", {})
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
@@ -309,6 +309,37 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.info("Loaded %d tickers from existing constituents.json", len(tickers))
         except Exception as exc:
             logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
+
+    # ── 1b. Historical (point-in-time) constituents ──────────────────────────
+    # Replays the S&P 500 "Selected changes" table backward from today's roster
+    # to a {date: [tickers]} PIT membership map at
+    # market_data/historical_constituents.json — the survivorship-free universe
+    # substrate the backtester consumes (config#657, G12). Reuses `tickers` (the
+    # roster already collected/loaded above) so the two collectors' rosters stay
+    # consistent and it avoids a second live fetch. Runs in the default Phase-1
+    # sweep; without this wiring the collector was dead code and the S3 key was
+    # never written.
+    if only in (None, "historical_constituents"):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: historical constituents (point-in-time membership)")
+        logger.info("=" * 60)
+        if not tickers:
+            logger.warning(
+                "No tickers available — skipping historical constituents (PIT map "
+                "needs today's roster to replay changes from)"
+            )
+            results["collectors"]["historical_constituents"] = {
+                "status": "skipped", "reason": "no tickers",
+            }
+        else:
+            results["collectors"]["historical_constituents"] = _phase_collect(
+                reg, "historical_constituents",
+                lambda: historical_constituents.collect(
+                    bucket=bucket, current_tickers=tickers,
+                    s3_prefix=market_prefix, dry_run=dry_run,
+                ),
+                artifact_key=f"{market_prefix}historical_constituents.json",
+            )
 
     # ── 2. Price cache refresh ───────────────────────────────────────────────
     if only in (None, "prices"):
@@ -598,7 +629,7 @@ def _previous_trading_day(reference: datetime | None = None) -> str:
     enrich the prior session. Walks back at most 10 calendar days as a
     runaway guard against a broken trading-calendar implementation.
     """
-    from alpha_engine_lib.trading_calendar import is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day
     from datetime import timedelta
 
     ref = reference or datetime.now(timezone.utc)
@@ -1506,7 +1537,7 @@ def _detect_missing_universe_days(
 
     import pandas as pd
 
-    from alpha_engine_lib.trading_calendar import previous_trading_day
+    from nousergon_lib.trading_calendar import previous_trading_day
 
     target = _date.fromisoformat(target_date)
     # Expected: the N trading sessions strictly before target_date.
@@ -2355,7 +2386,7 @@ def _finalize(
     # across every partial run, no diagnose-context error text. The helper
     # emits one logger.error per error-status entry with the collector name
     # + original message, restoring per-failure alert granularity.
-    from alpha_engine_lib.collector_results import report_collector_errors
+    from nousergon_lib.collector_results import report_collector_errors
     report_collector_errors(results["collectors"])
 
     if not dry_run and only is None:
@@ -2535,32 +2566,57 @@ def _write_module_health(
     """Write module-scoped health stamp consumed by the executor's
     check_upstream_health() (alpha-engine/executor/health_status.py:91).
 
-    Schema matches executor's write_health() — key pattern
-    `health/{module_name}.json` with `last_success` nulled on failure so
-    downstream staleness checks can distinguish "ran and failed today" from
-    "hasn't run in N hours". Called on both success AND failure paths so the
-    stamp reflects the actual last run outcome.
+    Delegates to ``nousergon_lib.health.write_health`` (config#1727 Phase C).
+    The legacy ``status`` string is mapped to :class:`Deliverable` objects;
+    status is derived by the lib (required-missing / error / warnings) so a
+    caller cannot stamp ``"ok"`` over a failed run. Key pattern remains
+    ``health/{module_name}.json`` with ``last_success`` nulled on failure.
     """
+    from nousergon_lib.health import Deliverable, write_health
+
+    warnings = warnings or []
+    if error:
+        deliverables = [
+            Deliverable(
+                name=module_name,
+                required=True,
+                produced=False,
+                detail=error,
+            ),
+        ]
+    elif status == "failed":
+        deliverables = [
+            Deliverable(name=module_name, required=True, produced=False),
+        ]
+    elif status == "degraded":
+        deliverables = [
+            Deliverable(name=module_name, required=True, produced=True),
+        ]
+        if not warnings:
+            deliverables.append(
+                Deliverable(
+                    name=f"{module_name}_optional",
+                    required=False,
+                    produced=False,
+                )
+            )
+    else:
+        deliverables = [
+            Deliverable(name=module_name, required=True, produced=True),
+        ]
+
     s3 = boto3.client("s3")
-    key = f"health/{module_name}.json"
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "module": module_name,
-        "status": status,
-        "last_success": now_iso if status != "failed" else None,
-        "run_date": run_date,
-        "duration_seconds": round(duration_seconds, 1),
-        "summary": summary or {},
-        "warnings": warnings or [],
-        "error": error,
-    }
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(payload, indent=2).encode("utf-8"),
-        ContentType="application/json",
+    write_health(
+        module_name=module_name,
+        deliverables=deliverables,
+        run_date=run_date,
+        duration_seconds=duration_seconds,
+        summary=summary,
+        warnings=warnings or None,
+        error=error,
+        bucket=bucket,
+        s3_client=s3,
     )
-    logger.info("Wrote module health: s3://%s/%s (%s)", bucket, key, status)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -2629,7 +2685,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "macro", "short_interest", "universe_classification", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
+        choices=["constituents", "historical_constituents", "prices", "macro", "short_interest", "universe_classification", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
     )
     # Phase-registry recovery controls (L4528 — markers under data/{date}/.phases/).

@@ -3,7 +3,7 @@
 The new states ``WeeklySubstrateHealthCheck`` and
 ``WaitForWeeklySubstrateHealthCheck`` chain off the end of the existing
 ``WaitForSaturdayHealthCheck`` and run the row-driven
-``alpha_engine_lib.transparency`` checker on the dashboard EC2.
+``nousergon_lib.transparency`` checker on the dashboard EC2.
 
 Catches regressions like:
 - Someone reroutes ``WaitForSaturdayHealthCheck.Next`` back to

@@ -2,7 +2,7 @@
 
 (The dist was renamed ``alpha-engine-lib`` → ``nousergon-lib`` at v0.60.0;
 the historical incidents below predate the rename and reference the old
-``alpha_engine_lib`` import name accordingly — kept verbatim as the
+``nousergon_lib`` import name accordingly — kept verbatim as the
 drift-class record.)
 
 The Dockerfile strips nousergon-lib from ``requirements.txt`` before
@@ -19,14 +19,14 @@ This drift class has bitten production multiple times:
 
   - 2026-05-06 (research): requirements.txt bumped @v0.4.0 → @v0.5.1
     but Dockerfile kept v0.3.0; Research Lambda canary failed with
-    ``ModuleNotFoundError: alpha_engine_lib.agent_schemas``.
+    ``ModuleNotFoundError: nousergon_lib.agent_schemas``.
   - 2026-05-12 (predictor): requirements.txt → v0.12.0 but
     requirements-lambda.txt stayed v0.9.1; predictor canary failed
-    with ``ModuleNotFoundError: alpha_engine_lib.secrets``.
+    with ``ModuleNotFoundError: nousergon_lib.secrets``.
   - 2026-05-12 (data, this repo): requirements.txt → v0.12.0 in PR
     #221 but Dockerfile kept v0.3.0 (a 9-version-old pin); data
     Lambda canary failed at 17:22 UTC with the same
-    ``alpha_engine_lib.secrets`` ModuleNotFoundError.
+    ``nousergon_lib.secrets`` ModuleNotFoundError.
 
 This test re-greps all three files on every CI run so a future single-file
 bump fails here, not in a canary.

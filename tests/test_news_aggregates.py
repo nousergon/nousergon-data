@@ -20,7 +20,7 @@ from io import BytesIO
 import pandas as pd
 import pytest
 
-from alpha_engine_lib.sources import NewsArticle
+from nousergon_lib.sources import NewsArticle
 
 from collectors.news_aggregator import (
     AggregatedNewsArticle,
@@ -429,7 +429,7 @@ class TestS3ParquetRoundTrip:
         """Canonical shape after migration: YYMMDDHHMM-encoded
         artifact key + latest.json sidecar (both in eval_artifacts lib).
         """
-        from alpha_engine_lib.eval_artifacts import (
+        from nousergon_lib.eval_artifacts import (
             eval_artifact_key, eval_latest_key, new_eval_run_id,
         )
         run_id = new_eval_run_id()

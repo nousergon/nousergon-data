@@ -1,11 +1,11 @@
 """Unit tests for weekly_collector._write_module_health.
 
 Validates that the module-scoped health stamp consumed by the executor's
-upstream gate (alpha-engine/executor/health_status.py::check_upstream_health)
-is written with the correct schema and key pattern.
+upstream gate delegates to nousergon_lib.health.write_health with the correct
+schema, deliverables mapping, and key pattern.
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 from weekly_collector import _write_module_health
@@ -43,7 +43,14 @@ class TestWriteModuleHealth:
         assert payload["warnings"] == []
         assert payload["error"] is None
         assert payload["last_success"] is not None
-        # Parseable as ISO timestamp
+        assert payload["deliverables"] == [
+            {
+                "name": "daily_data",
+                "required": True,
+                "produced": True,
+                "detail": "",
+            }
+        ]
         datetime.fromisoformat(payload["last_success"])
 
     @patch("weekly_collector.boto3")
@@ -60,6 +67,7 @@ class TestWriteModuleHealth:
         assert payload["status"] == "failed"
         assert payload["last_success"] is None
         assert payload["error"] == "polygon 429 rate-limited"
+        assert payload["deliverables"][0]["produced"] is False
 
     @patch("weekly_collector.boto3")
     def test_degraded_status_populates_last_success(self, mock_boto3):

@@ -1,7 +1,7 @@
 """Test fixtures + sys.path setup.
 
 Pins ``ALPHA_ENGINE_SECRETS_SOURCE=env`` for every test so
-``alpha_engine_lib.secrets.get_secret()`` reads from monkeypatched
+``nousergon_lib.secrets.get_secret()`` reads from monkeypatched
 env vars only — never the real SSM Parameter Store. Without this,
 tests that simulate "missing API key" via ``monkeypatch.delenv``
 would be silently no-op'd by a live SSM read. See
@@ -36,7 +36,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
     """
     monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
     try:
-        from alpha_engine_lib.secrets import clear_cache
+        from nousergon_lib.secrets import clear_cache
     except ImportError:
         # Lib not installed (rare — tests that don't import secrets path).
         yield

@@ -50,7 +50,7 @@ def _invoke_with_collect_result(collect_result, dry_run: bool):
     with patch.dict(
         sys.modules,
         {"collectors": fake_collectors, "collectors.alternative": fake_alternative},
-    ), patch("alpha_engine_lib.secrets.get_secret", side_effect=_stub_get_secret):
+    ), patch("nousergon_lib.secrets.get_secret", side_effect=_stub_get_secret):
         handler = _load_handler()
         return handler({"phase": 2, "dry_run": dry_run}, None)
 

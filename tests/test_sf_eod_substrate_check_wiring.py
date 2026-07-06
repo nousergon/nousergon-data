@@ -4,7 +4,7 @@ Mirrors ``test_sf_substrate_check_wiring.py`` (the Saturday SF version).
 The new states ``DailySubstrateHealthCheck`` and
 ``WaitForDailySubstrateHealthCheck`` chain off the success path of
 ``CheckEODStatus`` and run the row-driven
-``alpha_engine_lib.transparency`` checker on the dashboard EC2 with
+``nousergon_lib.transparency`` checker on the dashboard EC2 with
 ``--cadence daily``.
 
 The Saturday SF runs ``--cadence weekly`` which sweeps weekly + daily

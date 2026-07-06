@@ -143,7 +143,7 @@ class TestUniverseFreshnessReceipt:
     def test_threshold_boundary_inclusive(self):
         """A symbol at-or-under the trading-day threshold counts as fresh
         (≤, not <). Comfortably above (calendar-day offset >> threshold)
-        fails. Trading-day arithmetic via alpha_engine_lib.dates."""
+        fails. Trading-day arithmetic via nousergon_lib.dates."""
         s3 = MagicMock()
         # 0 calendar days back = 0 trading days stale = passes
         lib = _mock_lib_with_dates({"EDGE": _today_str(0)})

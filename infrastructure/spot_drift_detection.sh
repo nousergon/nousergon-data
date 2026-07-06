@@ -53,7 +53,7 @@
 # its own; this repo's `preflight.py` DataPreflight modes are data-collection
 # scoped (daily / morning_enrich / phase1 / phase2) — none maps to drift. So
 # per the canonical-lib fallback the preflight here composes the canonical
-# `alpha_engine_lib.preflight.BasePreflight` directly (env-vars + S3-bucket
+# `nousergon_lib.preflight.BasePreflight` directly (env-vars + S3-bucket
 # HEAD — both strictly read-only) plus an import-only smoke of the drift
 # module under the same PYTHONPATH the real run uses. No bespoke preflight
 # scaffolding is duplicated. PREFLIGHT_ONLY is a MODIFIER, orthogonal to
@@ -64,7 +64,7 @@ set -euo pipefail
 export HOME="${HOME:-/home/ec2-user}"
 
 # Secrets resolve from SSM at Python startup via
-# alpha_engine_lib.secrets.get_secret(); the spot's IAM profile
+# nousergon_lib.secrets.get_secret(); the spot's IAM profile
 # (alpha-engine-executor-profile) grants ssm:GetParameter on /alpha-engine/*.
 # No .env is sourced anywhere in this script post the 2026-05-14 .env-deprecation arc.
 
@@ -262,7 +262,7 @@ run_ssm() {
 
 # Each run_ssm step is a fresh SSM shell with a minimal env. The
 # .env-deprecation arc deleted the sourced .env, so AWS_REGION /
-# AWS_DEFAULT_REGION (which boto3 + alpha_engine_lib.preflight.check_env_vars
+# AWS_DEFAULT_REGION (which boto3 + nousergon_lib.preflight.check_env_vars
 # require) are no longer set unless each step's export line sets them.
 # Same #247 regression as sibling spot scripts. System is single-region
 # us-east-1 (matches this file's own ${AWS_REGION:-us-east-1} defaults).
@@ -362,7 +362,7 @@ fi
 #
 # The preflight composes the canonical lib substrate directly — NO bespoke
 # scaffolding (Brian standing canonical-lib rule):
-#   * alpha_engine_lib.preflight.BasePreflight.check_env_vars("AWS_REGION")
+#   * nousergon_lib.preflight.BasePreflight.check_env_vars("AWS_REGION")
 #     — the same fail-fast gate the data path uses; AWS_REGION/.._DEFAULT_REGION
 #     are exported via ${ENV_SOURCE} below (the #241 .env-deprecation re-export).
 #   * BasePreflight.check_s3_bucket() — a HEAD-bucket probe ONLY (read-only;
@@ -398,7 +398,7 @@ echo "Starting read-only preflight at $(date)"
 if ! $PYTHON_BIN - <<'PYEOF'
 import sys
 
-from alpha_engine_lib.preflight import BasePreflight
+from nousergon_lib.preflight import BasePreflight
 
 # Read-only canonical preflight: env-vars fail-fast + S3 bucket HEAD.
 # "alpha-engine-research" mirrors monitoring.drift_detector.DEFAULT_BUCKET.

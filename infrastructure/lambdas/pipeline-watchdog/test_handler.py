@@ -1,7 +1,7 @@
 """Unit tests for alpha-engine-pipeline-watchdog index.handler.
 
-Stubs ``alpha_engine_lib.trading_calendar.last_closed_trading_day``,
-``alpha_engine_lib.alerts.publish``, ``flow_doctor_telegram.notify_via_flow_doctor``,
+Stubs ``nousergon_lib.trading_calendar.last_closed_trading_day``,
+``nousergon_lib.alerts.publish``, ``flow_doctor_telegram.notify_via_flow_doctor``,
 and ``boto3.client('stepfunctions')`` so tests do not hit AWS or the lib.
 Each test pins one decision branch (watch-day eligibility, alert-or-skip,
 dedup wiring, fail-loud) per the ``feedback_no_silent_fails`` discipline.
@@ -18,19 +18,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-# Stub `alpha_engine_lib.trading_calendar` + `alpha_engine_lib.alerts` BEFORE
+# Stub `nousergon_lib.trading_calendar` + `nousergon_lib.alerts` BEFORE
 # importing the handler so test envs without the lib installed still pass.
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_tc_mod = types.ModuleType("alpha_engine_lib.trading_calendar")
+_lib_pkg = types.ModuleType("nousergon_lib")
+_tc_mod = types.ModuleType("nousergon_lib.trading_calendar")
 _tc_mod.last_closed_trading_day = MagicMock()
 _tc_mod.previous_trading_day = MagicMock()
-_alerts_mod = types.ModuleType("alpha_engine_lib.alerts")
+_alerts_mod = types.ModuleType("nousergon_lib.alerts")
 _alerts_mod.publish = MagicMock()
 _lib_pkg.trading_calendar = _tc_mod
 _lib_pkg.alerts = _alerts_mod
-sys.modules["alpha_engine_lib"] = _lib_pkg
-sys.modules["alpha_engine_lib.trading_calendar"] = _tc_mod
-sys.modules["alpha_engine_lib.alerts"] = _alerts_mod
+sys.modules["nousergon_lib"] = _lib_pkg
+sys.modules["nousergon_lib.trading_calendar"] = _tc_mod
+sys.modules["nousergon_lib.alerts"] = _alerts_mod
 
 _ng_pkg = types.ModuleType("nousergon_lib")
 _ng_fleet_mod = types.ModuleType("nousergon_lib.flow_doctor_fleet")

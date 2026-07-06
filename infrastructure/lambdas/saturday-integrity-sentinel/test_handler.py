@@ -1,6 +1,6 @@
 """Unit tests for saturday-integrity-sentinel (M4).
 
-Stubs alpha_engine_lib.telegram.send_message and mocks the S3 client. Asserts
+Stubs nousergon_lib.telegram.send_message and mocks the S3 client. Asserts
 the GO/NO-GO evaluation computed from the freshness `check_results.json` rows
 (complete / incomplete / uncertain), loud-vs-silent Telegram, fail-loud marker
 write, and best-effort Telegram.
@@ -16,12 +16,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_telegram_mod = types.ModuleType("alpha_engine_lib.telegram")
+_lib_pkg = types.ModuleType("nousergon_lib")
+_telegram_mod = types.ModuleType("nousergon_lib.telegram")
 _telegram_mod.send_message = MagicMock(return_value=True)
 _lib_pkg.telegram = _telegram_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
+sys.modules.setdefault("nousergon_lib", _lib_pkg)
+sys.modules.setdefault("nousergon_lib.telegram", _telegram_mod)
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))

@@ -82,7 +82,7 @@ def classify_sns(subject: str, message: str = "") -> tuple[str, str, str, str | 
     Precedence (first match wins):
       1. CloudWatch alarm state transitions — subject prefix ``OK:`` /
          ``ALARM:`` / ``INSUFFICIENT_DATA``.
-      2. Explicit ``alpha_engine_lib.alerts`` severity tags —
+      2. Explicit ``nousergon_lib.alerts`` severity tags —
          ``[CRITICAL]`` / ``[ERROR]`` / ``[WARN]`` / ``[WARNING]`` / ``[INFO]``.
       3. Pipeline/job result suffixes — ``FAILED`` (real) vs ``SUCCESS`` /
          ``PASSED`` / ``SKIPPED`` (benign).
@@ -109,7 +109,7 @@ def classify_sns(subject: str, message: str = "") -> tuple[str, str, str, str | 
     if su.startswith("INSUFFICIENT_DATA"):
         return incident("low")
 
-    # 2. Explicit severity tags from alpha_engine_lib.alerts.
+    # 2. Explicit severity tags from nousergon_lib.alerts.
     if "[CRITICAL]" in su:
         return incident("critical")
     if "[ERROR]" in su:

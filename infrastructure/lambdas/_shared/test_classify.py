@@ -34,7 +34,7 @@ class ClassifyTests(unittest.TestCase):
         et, sev, _sub, _rcc = self._ev('INSUFFICIENT_DATA: "some-alarm"')
         self.assertEqual((et, sev), ("incident", "low"))
 
-    # ---- alpha_engine_lib.alerts severity tags -----------------------------
+    # ---- nousergon_lib.alerts severity tags -----------------------------
     def test_error_tag_is_incident_high(self):
         et, sev, _sub, _rcc = self._ev("Alpha Engine alert [ERROR] — alpha-engine-backtester/analysis")
         self.assertEqual((et, sev), ("incident", "high"))

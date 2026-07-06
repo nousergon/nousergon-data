@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 
 import boto3
 
-from alpha_engine_lib.trading_calendar import last_closed_trading_day
+from nousergon_lib.trading_calendar import last_closed_trading_day
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))

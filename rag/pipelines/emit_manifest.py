@@ -39,7 +39,7 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Any
 
-from alpha_engine_lib.rag.db import execute_query
+from nousergon_lib.rag.db import execute_query
 
 logger = logging.getLogger(__name__)
 

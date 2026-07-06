@@ -2,7 +2,7 @@
 
 Focus: the resilience + secret-hygiene wiring added 2026-06-11 to close the
 analyst_consensus gap (#397 / #399). The bounded-backoff retry math itself
-lives in (and is tested by) ``alpha_engine_lib.http_retry`` — here we assert
+lives in (and is tested by) ``nousergon_lib.http_retry`` — here we assert
 that ``finnhub_get`` *uses* that primitive correctly and handles its outputs:
 
   * missing key short-circuits to [] (no HTTP),

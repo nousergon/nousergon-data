@@ -70,7 +70,7 @@ def check_drift(
             from ArcticDB before firing the alert. Default 0 (strict — any
             missing ticker fires). Set higher to tolerate known
             churn-in delay (e.g. the 1-Saturday backfill lag).
-        alert: if True, fire an `alpha_engine_lib.alerts.publish` on drift.
+        alert: if True, fire an `nousergon_lib.alerts.publish` on drift.
             If False, return the diff without alerting (diagnostic mode).
         alert_severity: severity tag for the published alert.
 
@@ -143,10 +143,10 @@ def check_drift(
 
     if not within_threshold and alert:
         try:
-            from alpha_engine_lib import alerts  # noqa: PLC0415
+            from nousergon_lib import alerts  # noqa: PLC0415
         except ImportError as exc:
             logger.warning(
-                "alerts publish skipped — alpha_engine_lib.alerts unavailable: %s",
+                "alerts publish skipped — nousergon_lib.alerts unavailable: %s",
                 exc,
             )
             return result

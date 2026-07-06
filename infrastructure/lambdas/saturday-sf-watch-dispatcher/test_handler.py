@@ -19,7 +19,6 @@ import index  # noqa: E402
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
-GROOM_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch"
 UNREGISTERED_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:some-other-pipeline"
 
 
@@ -447,8 +446,7 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
     """Regression guard for the has_listener MECHANISM itself (config#1535):
     a pipeline registered with has_listener=False must never fire a
     repository_dispatch nor claim "autonomous fix ACTIVE", regardless of the
-    global kill-switch — exercised here via a synthetic entry now that groom
-    (the original motivating case) has flipped to True."""
+    global kill-switch."""
     fake_pipelines = dict(index.PIPELINES)
     fake_pipelines["some-other-pipeline"] = {
         "cadence_slug": "other",
@@ -479,7 +477,7 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
     assert "observe-only for this pipeline" in text
 
 
-def test_saturday_still_dispatches_normally_alongside_groom_fix(monkeypatch):
+def test_saturday_still_dispatches_when_enabled(monkeypatch):
     """Non-regression: the has_listener plumbing must not change behavior for
     the 3 trading pipelines, which all default has_listener=True."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)

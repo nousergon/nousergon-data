@@ -11,7 +11,7 @@ history) becomes the highest-trust analyst source.
 
 from __future__ import annotations
 
-from alpha_engine_lib.sources import AnalystSnapshot
+from nousergon_lib.sources import AnalystSnapshot
 
 
 class IbesAnalystAdapter:

@@ -12,7 +12,7 @@ session, so artifacts mis-keyed to Saturday instead of Friday's close
 
 This pins the root-cause fix: a single repo chokepoint, ``dates.default_run_date()``,
 which routes the default through the fleet-canonical
-``alpha_engine_lib.dates.now_dual().trading_day`` (mirroring the predictor
+``nousergon_lib.dates.now_dual().trading_day`` (mirroring the predictor
 fix crucible-predictor#289 / config#1015). The chokepoint is reached by every
 ``... or default_run_date()`` / ``if run_date is None`` default site.
 
@@ -64,7 +64,7 @@ def test_returns_iso_string():
 def test_fallback_to_calendar_on_lib_failure(monkeypatch):
     """Date defaulting must never block a run: if the lib lookup raises, fall
     back to the calendar UTC date (the prior behaviour) rather than crashing."""
-    import alpha_engine_lib.dates as lib_dates
+    import nousergon_lib.dates as lib_dates
 
     def _boom(*a, **k):
         raise RuntimeError("simulated trading-calendar outage")
