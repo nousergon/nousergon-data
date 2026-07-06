@@ -190,9 +190,23 @@ fi
 echo "✓ Code deployed."
 
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+# AGENT_DISPATCH_ENABLED is an OPERATOR-OWNED runtime flag (the M2 autonomous-
+# dispatch gate) — the update path must PRESERVE its live value, never reset
+# it to the bootstrap default. 2026-07-05 incident (config#1818): this line
+# hardcoded false; the routine groom-removal redeploy silently reverted the
+# operator-enabled flag, and the resilience agent dispatched NOTHING for the
+# 2026-07-06 preopen SF failures (dispatched=False on both) while the market
+# was open. Bootstrap (create-function above) still defaults false — safe
+# rollout posture for a NEW deployment only.
+CURRENT_DISPATCH=$(aws lambda get-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --region "${REGION}" \
+  --query 'Environment.Variables.AGENT_DISPATCH_ENABLED' --output text 2>/dev/null)
+case "${CURRENT_DISPATCH}" in true|false) ;; *) CURRENT_DISPATCH=false ;; esac
+echo "  preserving AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH} (operator-owned)"
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then
