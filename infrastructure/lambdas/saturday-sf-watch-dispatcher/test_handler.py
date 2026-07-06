@@ -451,3 +451,85 @@ def test_live_old_named_eod_is_registered_during_rename_transition():
     ARN is removed from the registry + rule at cutover."""
     assert "alpha-engine-eod-pipeline" in index.PIPELINES
     assert index.PIPELINES["alpha-engine-eod-pipeline"]["cadence_slug"] == "eod"
+
+
+# ── config#1827: operator-abort dispatch carve-out ──────────────────────────
+
+
+def test_operator_abort_suppresses_dispatch_but_still_records(monkeypatch):
+    """A deliberate operator abort (status ABORTED + error == "OperatorAbort")
+    must NOT auto-dispatch a recovery agent even when the flag + listener are on,
+    yet MUST still write the watch-log and fire the Telegram receipt (fail-loud
+    preserved — only the autonomous ACTION on a human decision is withheld)."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    describe = {
+        "input": json.dumps({"pipeline_role": "verify-1807"}),
+        "error": "OperatorAbort",
+        "cause": "Verification mistakenly started during market hours; rescheduling post-close",
+    }
+    factory, _, s3 = _make_clients(describe=describe)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("ABORTED", sm_arn=WEEKDAY_ARN), None)
+
+    # Dispatch suppressed — no repository_dispatch HTTP call fired.
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "operator_abort"}
+    assert result["action"] == "observe"
+    assert fired["called"] is False
+    # Watch-log STILL written (fail-loud) and carries the auditable reason.
+    s3.put_object.assert_called_once()
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["status"] == "ABORTED"
+    assert ev["dispatch_suppressed"] == "operator_abort"
+    assert ev["action"] == "observe"
+    # Telegram receipt STILL fired, labelled OBSERVE with the operator-abort note.
+    assert result["telegram_sent"] is True
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "Fleet-SF Watch — OBSERVE" in text
+    assert "autonomous fix ACTIVE" not in text
+    assert "operator abort" in text.lower()
+
+
+def test_genuine_failed_still_dispatches(monkeypatch):
+    """Over-suppression guard: a real FAILED (not an operator abort) must still
+    dispatch when the flag + listener are on."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients()  # default describe error = States.TaskFailed
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+def test_programmatic_abort_still_dispatches(monkeypatch):
+    """Over-suppression guard (the inverse fail-loud violation): an ABORTED whose
+    error is NOT the operator marker (e.g. a programmatic/self-abort) is a real
+    defect and must still dispatch — suppression is on the marker, not on bare
+    ABORTED."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    describe = {
+        "input": "{}",
+        "error": "States.Runtime",
+        "cause": "self-abort on invariant breach",
+    }
+    factory, _, s3 = _make_clients(describe=describe)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("ABORTED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
