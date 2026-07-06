@@ -102,6 +102,8 @@ WEEKLY_RESET_ANCHOR = datetime(2026, 6, 28, 20, 59)   # PT, naive — one observ
 WEEKLY_PERIOD = timedelta(days=7)
 CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
 CCUSAGE_PREFIX = "claude_code_usage/"
+# Self-expiring operator override — MUST track groom_budget.py::OVERRIDE_UNTIL_PARAM.
+OVERRIDE_UNTIL_PARAM = "/alpha-engine/groom/dynamic_budget_override_until"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
 # t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
@@ -185,6 +187,30 @@ def _read_weekly_wet(window_start: datetime) -> float:
     return total
 
 
+def _parse_override_until(raw: str) -> "datetime | None":
+    """PT-naive datetime from the SSM value; None if blank/unparseable."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_PT).replace(tzinfo=None)
+    return dt
+
+
+def _read_override_until() -> "datetime | None":
+    """Active override expiry from SSM; None when absent/unreadable."""
+    try:
+        ssm = boto3.client("ssm", region_name=REGION)
+        raw = ssm.get_parameter(Name=OVERRIDE_UNTIL_PARAM)["Parameter"]["Value"]
+    except Exception:  # noqa: BLE001 — absent override => normal policy
+        return None
+    return _parse_override_until(raw)
+
+
 def _pace_gate_status() -> dict:
     """Compute the pre-boot pace-gate decision. Fail-safe: ANY error (S3 read,
     parse, credentials) returns ``exceeded: False`` with the error recorded —
@@ -192,6 +218,13 @@ def _pace_gate_status() -> dict:
     groom_budget.py's own fail-safe posture."""
     try:
         now_pt = datetime.now(_PT).replace(tzinfo=None)
+        override_until = _read_override_until()
+        if override_until is not None and now_pt < override_until:
+            return {
+                "exceeded": False,
+                "override_until": override_until.isoformat(),
+                "reason": "operator override active — pace gate suspended",
+            }
         window_start, _next_reset = reset_window(now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
         wet = _read_weekly_wet(window_start)
         used_frac = wet / WEEKLY_WET_CEILING if WEEKLY_WET_CEILING else 0.0
