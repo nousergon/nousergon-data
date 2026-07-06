@@ -901,7 +901,7 @@
             },
             "Research": {
               "Type": "Task",
-              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix.",
+              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix. TIMEOUT RETRY = CHECKPOINT-RESUME (config#1650, 2026-07-06): the runner persists per-node state (archive/agent_runs + sector_team_runs) and RESUMEs completed nodes at near-zero LLM cost, so one retry on States.Timeout/Lambda.Unknown converts the manual watch-rerun into the automatic contract (the 7/3 timeout's rerun finished in ~5.9 min). IntervalSeconds=60 is LOAD-BEARING: it guarantees the first invocation is dead past its own 900s Lambda ceiling before the retry fires (runner has reserved-concurrency=1 — an overlapping invoke would throttle). Bridge until the config#1687 spot-EC2 migration removes the 900s ceiling entirely.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-runner:live",
@@ -918,6 +918,15 @@
                   "ErrorEquals": [
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                },
+                {
+                  "ErrorEquals": [
+                    "States.Timeout",
+                    "Lambda.Unknown"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
