@@ -73,6 +73,8 @@ def _flatten_states(sf_doc: dict) -> dict:
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # L4517: preventive cross-repo lib-pin drift gate (predictor-inference Lambda).
     "LibPinDriftCheck": frozenset({"action"}),
+    # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
+    "WeeklyRunDayGate": frozenset({"action"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
