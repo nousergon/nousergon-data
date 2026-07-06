@@ -123,11 +123,19 @@ def test_loop_wiring(states, step):
     assert states[wait]["Next"] == poll
     assert nexts["INSTANCE_UNRESPONSIVE"] == stamp
 
-    # Stamp carries the poller's detail into $.error, then force-stops.
+    # Stamp carries the poller's detail into $.error, then force-stops the
+    # wedged host. config#1807: the three DATA loops run on the daily data
+    # spot, so their remediation terminates the SPOT; the trading-box loops
+    # keep the force-stop.
     st_stamp = states[stamp]
     assert st_stamp["ResultPath"] == "$.error"
     assert st_stamp["Parameters"]["Cause.$"] == f"{slot}.detail"
-    assert st_stamp["Next"] == "ForceStopUnresponsiveInstance"
+    _data_spot_steps = ("morning-enrich", "morning-arctic-append", "chronic-gap-heal")
+    expected_force = (
+        "ForceTerminateUnresponsiveDataSpot" if step in _data_spot_steps
+        else "ForceStopUnresponsiveInstance"
+    )
+    assert st_stamp["Next"] == expected_force
 
 
 def test_force_stop_is_forceful_and_alerts(states):
@@ -170,5 +178,7 @@ def test_code_freshness_gate_front_loads_the_drift_check(states):
         c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
         if c.get("StringEquals") == "SUCCESS"
     ]
-    assert fresh == ["CheckSkipMorningEnrich"]
+    # config#1807: freshness success synchronizes with the data-spot launch
+    # (CheckDataSpotLaunched -> ReadDataSpotId) before the morning gates.
+    assert fresh == ["CheckDataSpotLaunched"]
     assert states["CheckCodeFreshnessStatus"]["Default"] == "HandleFailure"

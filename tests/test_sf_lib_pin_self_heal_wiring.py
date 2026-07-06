@@ -42,8 +42,15 @@ def _data_repo_entrypoints() -> dict[str, list[str]]:
             continue
         cmds = extract_commands(state)
         joined = "\n".join(cmds)
-        # In scope: pulls the data repo AND runs from the data-repo venv.
-        if _DATA_PULL in joined and _DATA_CD in joined:
+        # In scope: pulls the data repo AND runs from the data-repo VENV.
+        # config#1807 refinement: the venv-activate marker is load-bearing —
+        # the data states moved to the daily data spot, where deps are
+        # installed FRESH from requirements.txt at every bootstrap (the pin
+        # is satisfied by construction; there is no pull->stale-venv window),
+        # and LaunchDailyDataSpot pulls the data repo on ae-dashboard but
+        # only runs bash + the DASHBOARD venv (maintained by the dashboard
+        # deploy), never data-repo python.
+        if _DATA_PULL in joined and _DATA_CD in joined and _VENV_ACTIVATE in joined:
             out[name] = cmds
     return out
 
@@ -54,7 +61,12 @@ def test_known_data_entrypoints_in_scope():
     # data-repo entrypoint. MorningEnrich + MorningArcticAppend + ChronicGapSelfHeal
     # remain (they pull alpha-engine-data and run from its venv).
     eps = set(_data_repo_entrypoints())
-    assert {"MorningEnrich", "MorningArcticAppend", "ChronicGapSelfHeal"} <= eps, sorted(eps)
+    # config#1807: MorningEnrich / MorningArcticAppend / ChronicGapSelfHeal
+    # moved to the daily data spot (fresh clone + fresh deps per bootstrap
+    # — no pull->stale-venv window remains), so NO daily-SF state is a
+    # data-venv entrypoint today. The detector + parametrized heal test
+    # stay armed for any future re-addition.
+    assert eps == set(), sorted(eps)
 
 
 @pytest.mark.parametrize("name", sorted(_data_repo_entrypoints()))

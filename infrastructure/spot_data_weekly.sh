@@ -175,6 +175,14 @@ LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python
 #                          terminate (Saturday SF MorningEnrich state)
 #   phase1-only         — ONLY weekly_collector.py --phase 1 + prune, then
 #                          terminate (Saturday SF DataPhase1 state)
+#   launch-only         — launch + bootstrap + deps, write the instance-id
+#                          artifact to --id-artifact-key, then EXIT LEAVING
+#                          THE SPOT RUNNING (weekday LaunchDailyDataSpot
+#                          state, config#1807: the pre-open data phase runs
+#                          on this spot instead of the trading box; the SF
+#                          SSM-dispatches each data state to the spot
+#                          directly and terminates it afterwards; the
+#                          on-box systemd watchdog is the orphan backstop)
 #
 # The preflight-task-split (2026-05-16, plan
 # alpha-engine-docs/private/preflight-task-split-260516.md) introduced
@@ -204,12 +212,27 @@ while [[ $# -gt 0 ]]; do
         --data-only) RUN_MODE="data-only"; shift ;;
         --morning-enrich-only) RUN_MODE="morning-enrich-only"; shift ;;
         --phase1-only) RUN_MODE="phase1-only"; shift ;;
+        --launch-only) RUN_MODE="launch-only"; shift ;;
+        --id-artifact-key) ID_ARTIFACT_KEY="$2"; shift 2 ;;
+        --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;  # legacy: collapses INSTANCE_TYPES to single value
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# launch-only contract: the id artifact is how the weekday SF finds the
+# spot — launching without it would orphan the instance until the
+# watchdog fires. KEEP_INSTANCE stays 0 until the artifact is durably
+# written, so every failure before that point still terminates+retries
+# via the normal cleanup/on_exit path.
+ID_ARTIFACT_KEY="${ID_ARTIFACT_KEY:-}"
+KEEP_INSTANCE=0
+if [ "$RUN_MODE" = "launch-only" ] && [ -z "$ID_ARTIFACT_KEY" ]; then
+    echo "ERROR: --launch-only requires --id-artifact-key <s3-key>" >&2
+    exit 2
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Weekly Data Spot Run (Phase1 + RAG) — $(date +%Y-%m-%d)"
@@ -270,6 +293,14 @@ INSTANCE_ID=""
 S3_STAGING=""
 
 cleanup() {
+    if [ "$KEEP_INSTANCE" = "1" ]; then
+        # launch-only success: the spot is handed to the weekday SF (id
+        # artifact written); the SF's TerminateDailyDataSpot state + the
+        # on-box systemd watchdog own its lifecycle from here.
+        [ -n "$S3_STAGING" ] && aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
+        echo "  launch-only: instance $INSTANCE_ID left running (SF-owned); staging cleaned."
+        return 0
+    fi
     if [ -n "$INSTANCE_ID" ]; then
         echo ""
         echo "==> Terminating spot instance $INSTANCE_ID..."
@@ -367,7 +398,7 @@ INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
     --key-name "$KEY_NAME" \
     --security-group "$SECURITY_GROUP" \
     --iam-profile "$IAM_PROFILE" \
-    --name "alpha-engine-data-weekly-$(date +%Y%m%d)" \
+    --name "alpha-engine-data-$( [ "$RUN_MODE" = "launch-only" ] && echo daily || echo weekly )-$(date +%Y%m%d)" \
     --region "$AWS_REGION")
 ec2_spot_rc=$?
 if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
@@ -553,6 +584,29 @@ PIP="\$PYTHON_BIN -m pip"
 
 echo "Dependencies installed."
 DEPS
+
+# ── Launch-only: hand the bootstrapped spot to the weekday SF ────────────────
+# config#1807: the weekday pre-open data phase (MorningEnrich +
+# MorningArcticAppend + ChronicGapSelfHeal) runs on this spot instead of
+# the trading box, whose 2026-07-06 swap-thrash starved its own SSM agent
+# and blocked RunDaemon at market open. This mode ends at the exact point
+# the per-state workload dispatch would begin: the SF owns the workloads
+# (per-state granularity + liveness polling + skip flags preserved) and
+# the termination; the bootstrap watchdog above (MAX_RUNTIME_SECONDS,
+# pass --max-runtime-seconds 10800 from the SF) is the orphan backstop if
+# the SF dies without reaching TerminateDailyDataSpot.
+if [ "$RUN_MODE" = "launch-only" ]; then
+    echo "==> launch-only: writing instance-id artifact s3://${S3_BUCKET}/${ID_ARTIFACT_KEY}"
+    printf '{"instance_id": "%s", "launched_at": "%s", "mode": "launch-only", "max_runtime_seconds": %s}\n' \
+        "$INSTANCE_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MAX_RUNTIME_SECONDS" \
+        | aws s3 cp - "s3://${S3_BUCKET}/${ID_ARTIFACT_KEY}" --region "$AWS_REGION" --only-show-errors
+    # Verify the write landed before disarming termination — an unreadable
+    # artifact means the SF can never find the spot (fail loud + terminate).
+    aws s3api head-object --bucket "$S3_BUCKET" --key "$ID_ARTIFACT_KEY" --region "$AWS_REGION" > /dev/null
+    KEEP_INSTANCE=1
+    echo "==> launch-only complete: $INSTANCE_ID running, artifact written."
+    exit 0
+fi
 
 # ── Smoke-only: imports + --phase 1 --dry-run ────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then
