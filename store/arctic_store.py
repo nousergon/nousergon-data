@@ -23,6 +23,7 @@ from typing import Sequence
 
 import arcticdb as adb
 import pandas as pd
+from nousergon_lib.arcticdb import arctic_uri, open_macro_lib, open_universe_lib
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +73,11 @@ def _get_arctic(bucket: str | None = None) -> adb.Arctic:
 
     bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
     region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix={ARCTIC_PREFIX}&aws_auth=true"
+    # Single source of truth for the S3 URI — nousergon_lib.arcticdb.arctic_uri
+    # (path_prefix=arcticdb, aws_auth=true). Hand-rolling this f-string here was
+    # the SNDK-incident bug class (path_prefix collapsing under shell quoting,
+    # 2026-04-21); route it through the lib so it stays consistent everywhere.
+    uri = arctic_uri(bucket, region=region)
 
     log.info("Connecting to ArcticDB: s3://%s/%s (region=%s)", bucket, ARCTIC_PREFIX, region)
     _arctic_instance = adb.Arctic(uri)
@@ -80,15 +85,26 @@ def _get_arctic(bucket: str | None = None) -> adb.Arctic:
 
 
 def get_universe_lib(bucket: str | None = None) -> adb.library.Library:
-    """Get the universe library (per-ticker OHLCV + features)."""
-    arctic = _get_arctic(bucket)
-    return arctic.get_library("universe", create_if_missing=True)
+    """Get the universe library (per-ticker OHLCV + features).
+
+    Delegates to ``nousergon_lib.arcticdb.open_universe_lib`` — the shared
+    library-open chokepoint (uniform URI + uniform RuntimeError-with-bucket
+    error shape, config#804). This is a PRODUCER site, so ``create_if_missing``
+    stays ``True`` to preserve cold-start bootstrap on a fresh bucket.
+    """
+    bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
+    return open_universe_lib(bucket, create_if_missing=True)
 
 
 def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
-    """Get the macro library (market-wide time series)."""
-    arctic = _get_arctic(bucket)
-    return arctic.get_library("macro", create_if_missing=True)
+    """Get the macro library (market-wide time series).
+
+    Delegates to ``nousergon_lib.arcticdb.open_macro_lib`` (shared open
+    chokepoint, config#804); ``create_if_missing=True`` preserves the
+    producer cold-start bootstrap.
+    """
+    bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
+    return open_macro_lib(bucket, create_if_missing=True)
 
 
 def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
