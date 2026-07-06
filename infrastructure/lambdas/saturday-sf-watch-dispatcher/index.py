@@ -123,6 +123,13 @@ PIPELINES: dict[str, dict[str, object]] = {
 }
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600
+# config#1827 — human-abort carve-out. An `ABORTED` execution whose top-level
+# `error` is one of these markers is a DELIBERATE operator/human stop, not a
+# failure needing autonomous recovery: suppress the agent dispatch (still record
+# + Telegram loudly). Keep this set SMALL and EXPLICIT — do NOT suppress on bare
+# `ABORTED`, because a programmatic/self-abort can still be a real defect that
+# must dispatch. `OperatorAbort` is the marker the fleet's manual-stop path sets.
+OPERATOR_ABORT_ERRORS = frozenset({"OperatorAbort"})
 # Bound the history scan: fetch the newest N events (reverseOrder), reconstruct
 # chronological order locally to find the entered-but-not-exited state. The
 # failed state's enclosing StateEntered is always in the tail of the history.
@@ -157,6 +164,21 @@ def _failure_cause(describe_resp: dict | None) -> str:
     if len(snippet) > _CAUSE_MAX_CHARS:
         snippet = snippet[: _CAUSE_MAX_CHARS - 1] + "…"
     return snippet
+
+
+def _is_operator_abort(status: str, describe_resp: dict | None) -> bool:
+    """True iff this is a deliberate human stop — ``status == "ABORTED"`` AND the
+    execution's top-level ``error`` is an explicit operator-abort marker
+    (config#1827). Deliberately narrow: an ``ABORTED`` with any other error (or
+    no error) is NOT treated as operator-initiated, so a programmatic/self-abort
+    still dispatches a recovery agent (guards against over-suppression, the
+    fail-loud violation of the inverse kind)."""
+    if status != "ABORTED":
+        return False
+    if not describe_resp:
+        return False
+    error = (describe_resp.get("error") or "").strip()
+    return error in OPERATOR_ABORT_ERRORS
 
 
 def _is_preflight(describe_resp: dict | None) -> bool:
@@ -257,7 +279,16 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
     # global kill-switch AND this specific pipeline having a wired listener —
     # not the global flag alone (that was the bug: claiming "dispatch" for a
     # pipeline no workflow listens for).
-    will_dispatch = AGENT_DISPATCH_ENABLED and bool(cfg.get("has_listener", True))
+    # config#1827: a deliberate operator abort is recorded loudly but never
+    # auto-dispatches a recovery agent (would waste a cycle and, once weekday/EOD
+    # leave propose-only, risk an automated countermand of a human decision).
+    operator_abort = _is_operator_abort(detail.get("status", ""), describe_resp)
+    dispatch_suppressed = "operator_abort" if operator_abort else None
+    will_dispatch = (
+        AGENT_DISPATCH_ENABLED
+        and bool(cfg.get("has_listener", True))
+        and not operator_abort
+    )
     return {
         "detected_at": now_iso,
         "status": detail.get("status", "UNKNOWN"),
@@ -276,6 +307,10 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
         "action": "dispatch" if will_dispatch else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
         "has_listener": bool(cfg.get("has_listener", True)),
+        # config#1827: null unless the dispatch was withheld for a recorded
+        # reason; "operator_abort" makes the human-stop decision auditable in the
+        # watch-log and on the dashboard.
+        "dispatch_suppressed": dispatch_suppressed,
     }
 
 
@@ -320,7 +355,10 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     has_listener = bool(cfg.get("has_listener", True))
     cadence = _pipeline_label(pipeline_name)
     label = f"{cadence} Preflight SF" if record["is_preflight"] else f"{cadence} SF"
-    will_dispatch = AGENT_DISPATCH_ENABLED and has_listener
+    # config#1827: an operator-abort suppresses the dispatch even when the flag +
+    # listener are on — the receipt must read OBSERVE, not AUTO-FIX.
+    suppressed = record.get("dispatch_suppressed")
+    will_dispatch = AGENT_DISPATCH_ENABLED and has_listener and not suppressed
     mode = "AUTO-FIX" if will_dispatch else "OBSERVE"
     lines = [
         f"\U0001f6f0️ *Fleet-SF Watch — {mode}*",
@@ -333,6 +371,8 @@ def _notify(record: dict, key: str, pipeline_name: str) -> bool:
     lines.append(f"Watch log: `s3://{WATCH_BUCKET}/{key}`")
     if will_dispatch:
         footer = "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
+    elif suppressed == "operator_abort":
+        footer = "_operator abort — recorded loudly, no autonomous recovery (deliberate human stop)_"
     elif AGENT_DISPATCH_ENABLED and not has_listener:
         footer = "_observe-only for this pipeline — no autonomous remediation wired yet (needs Brian)_"
     else:
@@ -381,6 +421,12 @@ def _maybe_dispatch_agent(
     does NOT raise — the primary observe deliverable (watch-log) already landed.
     The watch-log is written BEFORE this call so the agent reads fresh context.
     """
+    if record.get("dispatch_suppressed"):
+        # config#1827: a deliberate operator abort (or any other recorded
+        # suppression reason) never auto-summons a recovery agent. The watch-log
+        # + Telegram receipt already fired, so nothing is silenced — only the
+        # autonomous ACTION on a human decision is withheld.
+        return {"dispatched": False, "reason": record["dispatch_suppressed"]}
     if not AGENT_DISPATCH_ENABLED:
         return {"dispatched": False, "reason": "disabled"}
     if not cfg.get("has_listener", True):
