@@ -108,6 +108,19 @@
         "s3:GetObject"
       ],
       "Resource": "arn:aws:s3:::alpha-engine-research/ops/daily_data_spot/*"
+    },
+    {
+      "Sid": "ListDailyDataSpotArtifactPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "ops/daily_data_spot/*"
+        }
+      }
     }
   ]
 }

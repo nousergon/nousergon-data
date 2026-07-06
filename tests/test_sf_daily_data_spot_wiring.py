@@ -35,6 +35,11 @@ class TestLaunch:
         assert "spot_data_weekly.sh" in cmds
         assert "--max-runtime-seconds 10800" in cmds, "dead-man watchdog budget"
         assert "export FLOW_DOCTOR_ENABLED=1" in cmds
+        # 2026-07-06 live-verify lesson: spot RunInstances/PassRole authorize
+        # via the box env credentials (the dashboard instance role has
+        # neither) — the env source is LOAD-BEARING, mirror of weekly
+        # DataPhase1.
+        assert "source /home/ec2-user/.alpha-engine.env" in cmds
         # Date-keyed artifact — a stale prior-day artifact can never be read.
         assert "ops/daily_data_spot/{}.json" in cmds
         assert "$$.Execution.StartTime" in cmds
@@ -144,7 +149,11 @@ class TestIamAndLauncher:
         )
         sids = {st.get("Sid") for st in policy["Statement"]}
         assert {"SendCommandDailyDataSpot", "TerminateDailyDataSpot",
-                "ReadDailyDataSpotArtifact"} <= sids
+                "ReadDailyDataSpotArtifact",
+                # 2026-07-06 live-verify lesson: without ListBucket, a
+                # missing artifact surfaces as AccessDenied (S3 masks 404 as
+                # 403) instead of the retryable NoSuchKey.
+                "ListDailyDataSpotArtifactPrefix"} <= sids
 
     def test_launcher_has_launch_only_mode(self):
         sh = (_INFRA / "spot_data_weekly.sh").read_text()
