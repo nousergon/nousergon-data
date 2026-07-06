@@ -6,9 +6,97 @@
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values — preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "CheckWeeklyRunDayGate"
+    },
+    "CheckWeeklyRunDayGate": {
+      "Type": "Choice",
+      "Comment": "config#1824 (Brian-ratified 2026-07-06): the weekly runs ONE DAY AFTER the week's last trading session, so the cron fires THU-SAT and this gate self-selects the single correct day. Applies ONLY to the scheduled weekly cadence (pipeline_role='weekly', set by the EventBridge CFN Input) — manual / recovery / watch-rerun / shell executions carry other roles (or none) and bypass automatically; skip_weekly_run_day_gate=true (defaulted false by InitializeInput) is the explicit operator bypass per the config#1617 skip-flag charter.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "weekly"
+            },
+            {
+              "Variable": "$.skip_weekly_run_day_gate",
+              "BooleanEquals": false
+            }
+          ],
+          "Next": "WeeklyRunDayGate"
+        }
+      ],
+      "Default": "CheckRunMode"
+    },
+    "WeeklyRunDayGate": {
+      "Type": "Task",
+      "Comment": "Run-day gate (config#1824) — mirrors the weekday TradingDayGate (config#1430): predictor Lambda action=check_weekly_run_day is pure NYSE-calendar math with zero infra dependency, returning before preflight. True iff yesterday was the week's LAST trading session (Sat on normal weeks; Fri/Thu on holiday-shortened weeks — real precedent Fri 2026-07-03).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_weekly_run_day"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "WeeklyRunDayGateFailed",
+          "ResultPath": "$.weekly_run_day_gate_error"
+        }
+      ],
+      "ResultPath": "$.weekly_run_day_gate",
+      "Next": "WeeklyRunDayGateChoice"
+    },
+    "WeeklyRunDayGateChoice": {
+      "Type": "Choice",
+      "Comment": "Not the run day -> clean Succeed skip BEFORE any spend (no mutex, no lib-pin check, no spot, no alert): on a normal week 2 of the 3 THU-SAT firings land here by design. Run day or any non-false result -> proceed. Fail-open mirrors the weekday gate posture: missing the weekly run is worse than a duplicate.",
+      "Choices": [
+        {
+          "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+          "BooleanEquals": false,
+          "Next": "WeeklyRunDaySkip"
+        }
+      ],
+      "Default": "CheckRunMode"
+    },
+    "WeeklyRunDaySkip": {
+      "Type": "Succeed",
+      "Comment": "Designed no-op: scheduled THU-SAT firing on a non-run day. Succeed (never Fail) so SF-success metrics, the SF-watch agent, and page-25 treat this exactly like the weekday NotifyHolidaySkip — a green skip, not a failure. Cycle health remains artifact-freshness-as-authority (config#1724); this state produces no artifacts on purpose."
+    },
+    "WeeklyRunDayGateFailed": {
+      "Type": "Task",
+      "Comment": "Gate Lambda failed for infrastructure reasons — alert and PROCEED as run day (fail-open, mirroring the weekday TradingDayGateFailed). Worst case a broken predictor Lambda all week yields up to 3 alerted duplicate runs (distinct run_dates, idempotent artifact keys) — accepted: the same Lambda gates every weekday morning, so a multi-day outage is already loudly visible. Message fields are all structurally guaranteed (sns_topic_arn defaulted by InitializeInput; error set by the Catch ResultPath) per the config#1819 notifier-totality lesson.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Run-Day Gate Failed (Proceeding)",
+        "Message.$": "States.Format('Weekly run-day gate Lambda failed (infra error, not a calendar decision). Pipeline proceeding as run day. Error: {}', States.JsonToString($.weekly_run_day_gate_error))"
+      },
+      "ResultPath": "$.weekly_run_day_gate_error_notify",
       "Next": "CheckRunMode"
     },
     "CheckRunMode": {

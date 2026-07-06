@@ -176,7 +176,9 @@ class TestMutexWiring:
         # workload gate; its skip-default + gate-default converge on
         # CheckMutexRole — the mutex still sits between entry and the
         # former-first-state, one gate further down.
-        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckRunMode"
+        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
+        assert saturday_sf["States"]["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
         assert saturday_sf["States"]["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "CheckMutexRole"
 
