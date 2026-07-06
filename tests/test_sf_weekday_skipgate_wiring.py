@@ -88,14 +88,21 @@ class TestEntryEdgesRouteThroughGates:
             if c.get("BooleanEquals") is False
         ]
         assert false_branch == ["NotifyHolidaySkip"]
-        # Once the box is up, the SSM-ready success branch enters the first morning
-        # work gate (CheckSkipMorningEnrich) — it no longer runs an on-box check.
+        # Once the box is up, the SSM-ready success branch enters the
+        # CodeFreshnessGate (config#1811: verify all 3 repo checkouts are on
+        # current main BEFORE any pipeline work — the 2026-07-06 incident
+        # burned ~40 min before the planner-time deploy-drift preflight
+        # refused), whose SUCCESS verdict then enters the first morning work
+        # gate (CheckSkipMorningEnrich).
         online = [
             c["Next"]
             for c in states["SSMReadyChoice"]["Choices"]
             if "And" in c
         ]
-        assert online == ["CheckSkipMorningEnrich"]
+        assert online == ["CodeFreshnessGate"]
+        fresh = [c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
+                 if c.get("StringEquals") == "SUCCESS"]
+        assert fresh == ["CheckSkipMorningEnrich"]
 
     def test_trading_day_gate_failed_proceeds_as_trading_day(self, states):
         assert states["TradingDayGateFailed"]["Next"] == "StartExecutorEC2"
@@ -104,12 +111,12 @@ class TestEntryEdgesRouteThroughGates:
         # L4608: the slow daily_append is now its own load-bearing state behind
         # CheckSkipMorningArcticAppend, after the fast MorningEnrich fetch.
         success = [c["Next"] for c in states["CheckMorningEnrichStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
+                   if c.get("StringEquals") == "SUCCESS"]
         assert success == ["CheckSkipMorningArcticAppend"]
 
     def test_arctic_append_success_enters_heal_gate(self, states):
         success = [c["Next"] for c in states["CheckMorningArcticAppendStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
+                   if c.get("StringEquals") == "SUCCESS"]
         assert success == ["CheckSkipChronicGapHeal"]
 
     def test_arctic_append_is_load_bearing(self, states):
@@ -138,7 +145,7 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_planner_success_enters_daemon_gate(self, states):
         success = [c["Next"] for c in states["CheckMorningPlannerStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
+                   if c.get("StringEquals") == "SUCCESS"]
         assert success == ["CheckSkipRunDaemon"]
 
     def test_daemon_is_last_step(self, states):
@@ -164,7 +171,8 @@ class TestPaths:
             if st["Type"] == "Succeed":
                 break
             if st["Type"] == "Choice":
-                succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
+                succ = [c["Next"] for c in st.get("Choices", [])
+                        if c.get("StringEquals") in ("Success", "SUCCESS")]
                 cur = succ[0] if succ else st.get("Default")
             else:
                 cur = st.get("Next")
