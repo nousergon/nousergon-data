@@ -25,9 +25,9 @@ then self-terminates (~$2/mo).
 
 ```
 EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
-  alpha-engine-scheduled-groom-0700-daily-low           ─┐      1. nousergon_lib.ec2_spot.launch()
-  alpha-engine-scheduled-groom-1500-daily-opus-high     ─┼───▶     (spot; on-demand fallback)
-  alpha-engine-scheduled-groom-2300-daily-mid           ─┘      2. wait instance running + SSM Online
+  alpha-engine-scheduled-groom-0100-daily-opus-high     ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-0700-daily-mid           ─┼───▶     (spot; on-demand fallback)
+  alpha-engine-scheduled-groom-1900-daily-low           ─┘      2. wait instance running + SSM Online
                                                              3. async ssm send-command (detached):
                                                                    │
                                                                    ▼
@@ -49,9 +49,9 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
 | Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
 |---|---|---|---|---|---|---|
-| `…-0700-daily-low` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-haiku-4-5 | low-only |
-| `…-1500-daily-opus-high` | `cron(0 15 * * ? *)` | 8am | daily (all 7) | full | claude-opus-4-8 | high-only |
-| `…-2300-daily-mid` | `cron(0 23 * * ? *)` | 4pm | daily (all 7) | full | claude-sonnet-5 | mid-only |
+| `…-0100-daily-opus-high` | `cron(0 1 * * ? *)` | 6pm | daily (all 7) | full | claude-opus-4-8 | high-only |
+| `…-0700-daily-mid` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | mid-only |
+| `…-1900-daily-low` | `cron(0 19 * * ? *)` | 12pm | daily (all 7) | full | claude-haiku-4-5 | low-only |
 
 > **Tier-split cadence (config#1760, 2026-07-05):** three disjoint queues — Haiku
 > on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled), Opus on
@@ -81,7 +81,7 @@ day-of-week year)` with `?` for an unspecified day field.
 ## Schedule-input routing
 
 Each schedule passes a JSON input, e.g. `{"run_mode": "full", "model":
-"claude-opus-4-8", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 15 * * *"}`.
+"claude-opus-4-8", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 1 * * *"}`.
 The Opus schedule alone carries `pr_budget: 100` (config#1769) — forwarded as
 `GROOM_PR_BUDGET` on the spot box; Haiku/Sonnet stay at the bootstrap default (50).
 The Lambda resolves each field (unknown/missing values degrade to a safe
