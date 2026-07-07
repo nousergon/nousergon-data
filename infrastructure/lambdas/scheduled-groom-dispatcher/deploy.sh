@@ -115,9 +115,9 @@ SCHED_CRONS=(
   "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 1 * * *"}'
-  '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 7 * * *"}'
-  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 19 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 1 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 7 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 19 * * *"}'
   '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
