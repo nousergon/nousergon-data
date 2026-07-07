@@ -1459,13 +1459,21 @@ def _compute_security_performance(
     if len(rets) >= _MIN_RISK_BARS:
         span_days = (series[-1][0] - series[0][0]).days or 1
         ppy = len(rets) / (span_days / 365.25)
-        out["volatility"] = round(volatility(rets, periods_per_year=ppy), 6)
-        out["sharpe"] = round(sharpe_ratio(rets, periods_per_year=ppy), 4)
-        out["sortino"] = round(sortino_ratio(rets, periods_per_year=ppy), 4)
+        vol = volatility(rets, periods_per_year=ppy)
+        if vol is not None:
+            out["volatility"] = round(vol, 6)
+        sharpe = sharpe_ratio(rets, periods_per_year=ppy)
+        if sharpe is not None:
+            out["sharpe"] = round(sharpe, 4)
+        sortino = sortino_ratio(rets, periods_per_year=ppy)
+        if sortino is not None:
+            out["sortino"] = round(sortino, 4)
         index = [1.0]
         for r in rets:
             index.append(index[-1] * (1.0 + r))
-        out["max_drawdown"] = round(max_drawdown(index), 6)
+        mdd = max_drawdown(index)
+        if mdd is not None:
+            out["max_drawdown"] = round(mdd, 6)
         beta, vs_window = _sp_beta_and_vs_spy(series, spy_series)
         out["beta_vs_spy"] = beta
         out["vs_spy_window"] = vs_window
