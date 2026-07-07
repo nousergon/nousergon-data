@@ -125,6 +125,23 @@ class TestReadArtifact:
             "$$.Execution.Name" in writer_cmds
         )
 
+        # An intrinsic-function value with unbalanced parentheses is a valid
+        # JSON string (so the wiring asserts above pass) but SFN rejects it at
+        # UpdateStateMachine time with SCHEMA_VALIDATION_FAILED — the deploy,
+        # not CI, is where it surfaces. This exact defect (one extra ')' on the
+        # writer's States.Format) broke the 2026-07-07 deploy. Balance the
+        # parens here so CI catches it. (No literal '(' or ')' appear inside
+        # the quoted command strings, so a net depth of 0 == balanced.)
+        for label, expr in (("writer", writer_cmds), ("reader", reader_key)):
+            depth = 0
+            for ch in expr:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                assert depth >= 0, f"{label} intrinsic closes a paren it never opened"
+            assert depth == 0, f"{label} intrinsic has unbalanced parentheses ({depth:+d})"
+
     def test_read_only_when_launch_dispatched(self, states):
         gate = states["CheckDataSpotLaunched"]
         (rule,) = gate["Choices"]
