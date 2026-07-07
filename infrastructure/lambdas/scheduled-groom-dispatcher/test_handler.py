@@ -363,6 +363,23 @@ def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     assert notified == []  # fail-safe path never trips (exceeded=False), no ping
 
 
+def test_gated_reverify_schedule_forwards_filter(monkeypatch):
+    # config#1891 Sunday lane: "gated-reverify" must pass validation — it was
+    # missing from _VALID_ISSUE_FILTERS (PR #681 added only the schedule), so
+    # the weekly lane would have silently run as mid-only.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {"run_mode": "full", "model": "claude-haiku-4-5",
+         "issue_filter": "gated-reverify", "schedule": "0 9 * * 0"},
+        None,
+    )
+    g = out["groom"]
+    assert g["issue_filter"] == "gated-reverify"
+    assert g["model"] == "claude-haiku-4-5"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_ISSUE_FILTER=gated-reverify" in cmd
+
+
 def test_missing_model_and_issue_filter_default_to_mid_queue(monkeypatch):
     # Schedules with no model/issue_filter must default to Sonnet / mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})

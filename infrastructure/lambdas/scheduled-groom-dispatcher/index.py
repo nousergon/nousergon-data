@@ -140,7 +140,10 @@ CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
 _VALID_RUN_MODES = {"full", "sweep"}
 _DEFAULT_RUN_MODE = "full"
-_VALID_ISSUE_FILTERS = {"default", "mid-only", "low-only", "high-only"}
+# config#1891: "gated-reverify" is the weekly Sunday stale-gate lane — missing
+# from this set until 2026-07-07, so the Sunday schedule would have silently
+# degraded to mid-only (caught by a manual dispatch before the first fire).
+_VALID_ISSUE_FILTERS = {"default", "mid-only", "low-only", "high-only", "gated-reverify"}
 _DEFAULT_ISSUE_FILTER = "mid-only"
 _DEFAULT_MODEL = "claude-sonnet-5"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
