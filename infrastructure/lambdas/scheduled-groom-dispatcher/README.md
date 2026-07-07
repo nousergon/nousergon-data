@@ -28,6 +28,7 @@ EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
   alpha-engine-scheduled-groom-0100-daily-opus-high     ─┐      1. nousergon_lib.ec2_spot.launch()
   alpha-engine-scheduled-groom-0700-daily-mid           ─┼───▶     (spot; on-demand fallback)
   alpha-engine-scheduled-groom-1900-daily-low           ─┘      2. wait instance running + SSM Online
+  alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify  (Sun 09:00 UTC, Haiku gated-reverify)
                                                              3. async ssm send-command (detached):
                                                                    │
                                                                    ▼
@@ -52,6 +53,7 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 | `…-0100-daily-opus-high` | `cron(0 1 * * ? *)` | 6pm | daily (all 7) | full | claude-opus-4-8 | high-only |
 | `…-0700-daily-mid` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | mid-only |
 | `…-1900-daily-low` | `cron(0 19 * * ? *)` | 12pm | daily (all 7) | full | claude-haiku-4-5 | low-only |
+| `…-sun0900-weekly-gated-reverify` | `cron(0 9 ? * SUN *)` | 2am | Sun only | full | claude-haiku-4-5 | gated-reverify |
 
 > **Tier-split cadence (config#1760, 2026-07-05):** three disjoint queues — Haiku
 > on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled), Opus on
