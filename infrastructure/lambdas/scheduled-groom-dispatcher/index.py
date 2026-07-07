@@ -347,7 +347,7 @@ def _resolve_pr_budget(event: dict) -> int | None:
 
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
                        run_token: str, soft_limit_min: int | None = None,
-                       pr_budget: int | None = None) -> str:
+                       pr_budget: int | None = None, no_sweep: bool = False) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -357,6 +357,7 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
     pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
+    no_sweep_export = "export GROOM_NO_SWEEP=1\n" if no_sweep else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -379,7 +380,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{no_sweep_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -436,7 +437,7 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
-                    pr_budget: int | None = None) -> str:
+                    pr_budget: int | None = None, no_sweep: bool = False) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
@@ -445,7 +446,7 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
         Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         Parameters={
             "commands": [_bootstrap_command(
-                run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
+                run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget, no_sweep,
             )],
             # Execution timeout (NOT the start timeout) — without this SSM kills the
             # command at the 3600s default, guillotining a multi-hour groom.
@@ -478,7 +479,8 @@ def _terminate_instance(instance_id: str) -> None:
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
-                       force_on_demand: bool = False) -> dict:
+                       force_on_demand: bool = False,
+                       no_sweep: bool = False) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -507,7 +509,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
         command_id = _send_bootstrap(
-            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
+            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget, no_sweep,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -678,6 +680,98 @@ def _demand_decision(issue_filter: str, schedule_label: str):
         return None
 
 
+def _load_recent_engagements() -> dict:
+    """(repo, number) -> engagement horizon epoch from the last 3 days' S3 run
+    artifacts (same schema the driver's config#1893 fresh-skip reads).
+    Fail-safe {} — a read error only means counting a few extra issues."""
+    out: dict = {}
+    try:
+        s3 = boto3.client("s3", region_name=REGION)
+        now = datetime.now(ZoneInfo("UTC"))
+        for d in range(3):
+            date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
+            resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
+            for obj in resp.get("Contents", []) or []:
+                if not obj["Key"].endswith(".json"):
+                    continue
+                art = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read())
+                run_start = art.get("run_start", "")
+                if not run_start:
+                    continue
+                horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
+                           + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
+                for rec in art.get("issues", []):
+                    if rec.get("disposition") in ("closed", "pr_opened", "commented", "labeled"):
+                        k = (rec.get("repo", ""), rec.get("number"))
+                        out[k] = max(out.get(k, 0.0), horizon)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("engagement load failed (non-fatal — skip nothing): %s", exc)
+    return out
+
+
+def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list]:
+    """Tier stats with config#1893 fresh-skip applied (P0 exempt).
+
+    Returns (counts, oldest_wait_hours, p0_tiers) for ge.decide_trigger().
+    """
+    engagements = _load_recent_engagements()
+    counts: dict[str, int] = {t: 0 for t in ge.TIERS}
+    oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
+    p0_tiers: set = set()
+    now = datetime.now(ZoneInfo("UTC"))
+    now_epoch = now.timestamp()
+    for repo in BACKLOG_REPOS:
+        page = 1
+        while True:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/issues"
+                f"?state=open&per_page=100&page={page}",
+                headers={"Authorization": f"token {token}",
+                         "Accept": "application/vnd.github+json",
+                         "User-Agent": "scheduled-groom-dispatcher"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                batch = json.loads(resp.read().decode())
+            for it in batch:
+                if "pull_request" in it:
+                    continue
+                labels = [lbl["name"] for lbl in it.get("labels", [])]
+                tier = ge.is_actionable(labels)
+                if tier is None:
+                    continue
+                is_p0 = "P0" in labels
+                updated_epoch = datetime.fromisoformat(
+                    str(it.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
+                engaged = engagements.get((repo, it["number"]))
+                if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
+                    continue
+                counts[tier] += 1
+                oldest[tier] = max(oldest[tier], (now_epoch - updated_epoch) / 3600.0)
+                if is_p0:
+                    p0_tiers.add(tier)
+            if len(batch) < 100:
+                break
+            page += 1
+    return counts, oldest, sorted(p0_tiers)
+
+
+def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> None:
+    """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json."""
+    now = datetime.now(ZoneInfo("UTC"))
+    key = f"groom/decisions/{now:%Y-%m-%d}/trigger-{now:%H%M}.json"
+    body = json.dumps({
+        "schema_version": 2, "trigger": "demand-all", "schedule": schedule_label,
+        "counts": counts, "decisions": [d.as_record() for d in launches],
+        "decided_at": now.isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("trigger record write failed (non-fatal): %s", exc)
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
@@ -723,6 +817,38 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             )
             _notify_pace_skip(pace, schedule_label, run_mode)
             return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
+
+    if run_mode == "full" and not force_on_demand and str(event.get("trigger", "")) == "demand-all":
+        # config#1933 SYMMETRIC triggers (Brian's ratified correction): every
+        # scheduled trigger evaluates the FULL backlog and launches 0..3 boxes
+        # — one per tier clearing the floor, thin tiers attached upward, the
+        # leftover-thin pool valve-gated. Only the FIRST box runs PR sweeps.
+        try:
+            counts, oldest, p0_tiers = _enumerate_tier_stats_fresh(_github_token())
+            launches = ge.decide_trigger(counts, oldest, p0_tiers)
+        except Exception as exc:  # noqa: BLE001 — fail-safe to legacy slot launch
+            logger.warning("demand trigger unavailable (%s) — legacy launch", exc)
+            launches = None
+        if launches is not None:
+            _write_trigger_record(schedule_label, launches, counts)
+            results = []
+            first = True
+            for d in launches:
+                if not d.launch:
+                    logger.info("demand trigger: %s", d.reason)
+                    _notify_demand_skip(d, counts, schedule_label)
+                    continue
+                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
+                            d.reason, d.issue_filter, d.model)
+                results.append(_launch_groom_spot(
+                    run_mode, schedule_label, d.model, d.issue_filter,
+                    soft_limit_min, pr_budget if "high" in d.tiers else None,
+                    force_on_demand, no_sweep=not first,
+                ))
+                first = False
+            return {"groom": {"trigger": "demand-all", "counts": counts,
+                              "decisions": [d.as_record() for d in launches],
+                              "launches": results}}
 
     if run_mode == "full" and not force_on_demand:
         decided = _demand_decision(issue_filter, schedule_label)

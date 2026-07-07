@@ -623,3 +623,76 @@ def test_demand_gate_kill_switch(monkeypatch):
                         lambda token: called.append(1) or ({}, {}, False))
     out = idx.handler({"run_mode": "full", "issue_filter": "low-only"}, None)
     assert out["groom"]["launched"] and not called
+
+
+# ── config#1933 SYMMETRIC triggers (Brian's ratified correction) ─────────────
+
+
+def _stub_fresh_stats(monkeypatch, idx, counts, oldest=None, p0=()):
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (counts, oldest or {}, list(p0)))
+    monkeypatch.setattr(idx, "_write_trigger_record", lambda *a, **k: None)
+    monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
+
+
+def _demand_event(sched="0 1 * * *"):
+    return {"run_mode": "full", "trigger": "demand-all", "schedule": sched}
+
+
+def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    g = out["groom"]
+    assert g["trigger"] == "demand-all"
+    launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
+    assert launched == {("high-only", "claude-opus-4-8"),
+                        ("mid-only", "claude-sonnet-5"),
+                        ("low-only", "claude-haiku-4-5")}
+    cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
+    assert len(cmds) == 3
+    # only the FIRST box runs PR sweeps
+    assert "GROOM_NO_SWEEP=1" not in cmds[0]
+    assert all("GROOM_NO_SWEEP=1" in c for c in cmds[1:])
+
+
+def test_symmetric_trigger_light_backlog_zero_boxes(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 2, "mid": 3, "high": 1})
+    out = idx.handler(_demand_event("0 7 * * *"), None)
+    assert out["groom"]["launches"] == []
+    assert not idx._test_ssm.sent
+
+
+def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
+    # 5 low + 6 mid + 0 high pooled -> ONE Sonnet box regardless of trigger time.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
+    out = idx.handler(_demand_event(), None)
+    ls = out["groom"]["launches"]
+    assert len(ls) == 1 and ls[0]["issue_filter"] == "mid+low"
+    assert ls[0]["model"] == "claude-sonnet-5"
+
+
+def test_symmetric_trigger_fail_safe_to_legacy(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def boom(token):
+        raise RuntimeError("github down")
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh", boom)
+    # legacy path also needs stubbing past the per-slot gate
+    monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["launched"]  # legacy unconditional launch
+
+
+def test_non_demand_events_keep_legacy_behavior(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    called = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: called.append(1) or ({}, {}, []))
+    monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "gated-reverify"}, None)
+    assert out["groom"]["launched"] and not called
