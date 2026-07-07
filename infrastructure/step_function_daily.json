@@ -1545,7 +1545,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','export FLOW_DOCTOR_ENABLED=1','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug data-daily-launch --log /var/log/data-daily-launch.log -- bash infrastructure/spot_data_weekly.sh --launch-only --id-artifact-key ops/daily_data_spot/{}/{}.json --max-runtime-seconds 10800', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0), $$.Execution.Name)))",
+          "commands.$": "States.Array('set -eo pipefail','export FLOW_DOCTOR_ENABLED=1','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug data-daily-launch --log /var/log/data-daily-launch.log -- bash infrastructure/spot_data_weekly.sh --launch-only --id-artifact-key ops/daily_data_spot/{}/{}.json --max-runtime-seconds 10800', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0), $$.Execution.Name))",
           "executionTimeout": [
             "1800"
           ]

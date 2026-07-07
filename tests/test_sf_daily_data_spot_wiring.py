@@ -215,3 +215,60 @@ class TestIamAndLauncher:
         assert 'KEEP_INSTANCE=1' in sh
         # The Name tag routes the IAM condition (alpha-engine-data-*).
         assert "alpha-engine-data-" in sh
+
+
+class TestIntrinsicsWellFormed:
+    """config#1897 (2026-07-07 deploy-red): every States.* intrinsic in the
+    definition must be a *well-formed* intrinsic, not merely contain the right
+    substrings.
+
+    The regression: PR #676 added a second arg ($$.Execution.Name) to
+    LaunchDailyDataSpot's inner States.Format but left the original single-arg
+    version's trailing ')))' — one paren too many. The wiring tests above
+    substring-match the key template + args, so they stayed green, but AWS
+    rejected the definition at UpdateStateMachine time
+    (SCHEMA_VALIDATION_FAILED: 'commands.$' must be a valid ... intrinsic
+    function call) and the "Deploy Infrastructure" workflow went red on main.
+
+    Parenthesis balance is the exact invariant that broke and the cheapest
+    offline proxy for "is this a parseable intrinsic call". This walks the
+    WHOLE definition so a malformed intrinsic anywhere — not just the two
+    fields the wiring tests happen to name — fails loud in CI, pre-merge,
+    instead of at deploy time (post-merge, partial-apply).
+    """
+
+    @staticmethod
+    def _intrinsic_fields(node, path=""):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k.endswith(".$") and isinstance(v, str) and v.lstrip().startswith("States."):
+                    yield f"{path}/{k}", v
+                yield from TestIntrinsicsWellFormed._intrinsic_fields(v, f"{path}/{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                yield from TestIntrinsicsWellFormed._intrinsic_fields(v, f"{path}[{i}]")
+
+    def test_all_states_intrinsics_have_balanced_parens(self):
+        defn = json.loads((_INFRA / "step_function_daily.json").read_text())
+        fields = list(self._intrinsic_fields(defn))
+        assert fields, "expected at least one States.* intrinsic to guard"
+        offenders = []
+        for path, expr in fields:
+            # Only count parens outside single-quoted literals — a bash command
+            # string embedded in States.Array may legitimately contain
+            # unbalanced parens inside its quotes; only the intrinsic-call
+            # structure between literals must balance.
+            depth, in_str, prev = 0, False, ""
+            for ch in expr:
+                if ch == "'" and prev != "\\":
+                    in_str = not in_str
+                elif not in_str and ch == "(":
+                    depth += 1
+                elif not in_str and ch == ")":
+                    depth -= 1
+                prev = ch
+                if depth < 0:
+                    break
+            if depth != 0:
+                offenders.append(f"{path}: paren balance {depth:+d} in {expr!r}")
+        assert not offenders, "malformed intrinsic(s):\n" + "\n".join(offenders)
