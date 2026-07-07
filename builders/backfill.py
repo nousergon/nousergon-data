@@ -37,6 +37,7 @@ from features.feature_engineer import (
     compute_features,
 )
 from features.factor_momentum import materialize_factor_momentum
+from features.cross_sectional import materialize_factor_loading_zscores
 from features.compute import (
     DEFAULT_BUCKET,
     SOURCE_CATEGORIES,
@@ -797,6 +798,23 @@ def backfill(
             canonical_fn=to_arctic_canonical,
         )
         log.info("Factor-momentum second pass: %s", json.dumps(fm_result, default=str))
+
+    # ── 5c. Factor-loading z-score second pass (C.1 / C.2b) ───────────────────
+    # The 9 *_zscore Barra loadings are cross-sectional (apply_factor_zscores).
+    # S3 feature-store compute.py already emits them; ArcticDB (predictor
+    # training cache + risk_model_persist) needs the same second pass so C.2b
+    # can build F + D from tmp_cache. Full-universe only — a ``--ticker X``
+    # patch can't reconstruct the cross-section.
+    if not dry_run and ticker_filter is None:
+        flz_result = materialize_factor_loading_zscores(
+            universe_lib,
+            universe_tickers,
+            canonical_fn=to_arctic_canonical,
+        )
+        log.info(
+            "Factor-loading z-score second pass: %s",
+            json.dumps(flz_result, default=str),
+        )
 
     # ── 6. Snapshot ──────────────────────────────────────────────────────────
     if not dry_run:

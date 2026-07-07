@@ -57,6 +57,7 @@ def _disable_factor_momentum_daily(monkeypatch):
     # assertions here. The pass has its own tests (test_factor_momentum.py +
     # test_daily_append_factor_momentum.py).
     monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
+    monkeypatch.setenv("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "false")
 
 
 def _stub_closes(tickers: list[str]) -> dict:

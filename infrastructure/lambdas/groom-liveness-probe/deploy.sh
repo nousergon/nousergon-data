@@ -94,17 +94,20 @@ trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
-# Only alpha_engine_lib.telegram is stubbed in sys.modules (see
-# test_handler.py's header) — `index.py`'s `import boto3` is REAL, and
-# requirements.txt deliberately omits boto3 (provided by the Lambda runtime
-# at deploy time, per its own comment), so pytest's `import index` needs it
-# installed explicitly here. Installed into a scratch TEST_DEPS dir — NOT the
-# caller's global site-packages, not bundled into the Lambda zip (mirrors
-# freshness-monitor/deploy.sh). 2026-07-02: the CI auto-deploy workflow's
-# FIRST real run failed here with "No module named pytest" — this script had
-# only ever been run from an operator's laptop before, where pytest/boto3
-# happened to already be installed as dev/tooling dependencies; the gap was
-# invisible until CI actually exercised this path.
+# The git-only nousergon_lib submodules index.py imports at module scope
+# (flow_doctor_fleet.FleetTelegramTopic; telegram.send_message via
+# flow_doctor_telegram) are stubbed in sys.modules by test_handler.py BEFORE
+# `import index` (see its header) — so this gate stays hermetic on bare python.
+# `index.py`'s `import boto3` is REAL, and requirements.txt deliberately omits
+# boto3 (provided by the Lambda runtime at deploy time, per its own comment),
+# so pytest's `import index` needs it installed explicitly here. Installed into
+# a scratch TEST_DEPS dir — NOT the caller's global site-packages, not bundled
+# into the Lambda zip (mirrors freshness-monitor/deploy.sh). Two prior gaps
+# here, same class (the gate's dep/stub set drifting from index.py's real
+# module-level imports): 2026-07-02 "No module named pytest" (script had only
+# run on operator laptops where pytest/boto3 were ambient); 2026-07-04 "No
+# module named nousergon_lib" (config#1742 flow-doctor cutover moved the source
+# onto nousergon_lib but the sys.modules stub was not migrated in lockstep).
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
   echo "Installing pytest + boto3 into ${TEST_DEPS}..."
   python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
@@ -114,10 +117,13 @@ fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -148,7 +154,7 @@ if $BOOTSTRAP; then
     run aws lambda create-function --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 --role "${ROLE_ARN}" --handler index.handler \
       --zip-file "fileb://${ZIP}" --timeout 30 --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO}' --region "${REGION}" \
+      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
     echo "  Lambda exists, code will be updated in step 3"
@@ -216,6 +222,16 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+  aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL miss) ----
 

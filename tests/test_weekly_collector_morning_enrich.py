@@ -54,7 +54,7 @@ def test_previous_trading_day_strict_inequality():
 
 def test_previous_trading_day_raises_on_runaway():
     """Defensive: if is_trading_day returns False for 10 days straight, raise."""
-    with patch("alpha_engine_lib.trading_calendar.is_trading_day", return_value=False):
+    with patch("nousergon_lib.trading_calendar.is_trading_day", return_value=False):
         with pytest.raises(RuntimeError, match="trading_calendar.is_trading_day appears broken"):
             weekly_collector._previous_trading_day(
                 reference=datetime(2026, 4, 23, 13, 0, 0, tzinfo=timezone.utc)

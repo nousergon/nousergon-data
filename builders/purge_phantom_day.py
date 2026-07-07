@@ -87,7 +87,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    from alpha_engine_lib.trading_calendar import is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day
 
     target = _date.fromisoformat(args.date)
     # Inverse sanity gate: purging a REAL session would destroy good data.

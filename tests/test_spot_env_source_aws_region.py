@@ -5,7 +5,7 @@ of runtime get_secret() SSM lookups. That correctly handled *secrets*, but
 the same `.env` was also the only thing exporting AWS_REGION — a plain env
 var (not a secret) that:
 
-  - alpha_engine_lib.preflight.check_env_vars() hard-requires, and
+  - nousergon_lib.preflight.check_env_vars() hard-requires, and
   - boto3 needs as a default region with no .env / ~/.aws/config present.
 
 Result: 2026-05-16 Saturday SF DataPhase1 aborted at preflight with
@@ -32,7 +32,6 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS = [
     _REPO_ROOT / "infrastructure" / "spot_data_weekly.sh",
-    _REPO_ROOT / "infrastructure" / "spot_drift_detection.sh",
 ]
 
 # Step Function definitions whose per-step SSM command blocks formerly sourced

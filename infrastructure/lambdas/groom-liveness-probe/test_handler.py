@@ -3,6 +3,18 @@
 Cover the load-bearing logic with no AWS/GitHub I/O: trigger enumeration
 (maturity + day-of-week filtering), per-trigger miss attribution, S3 dedup
 suppression, and the fail-loud contract on the PRIMARY input.
+
+Hermetic: `nousergon_lib` is a git-only dependency the deploy test gate does NOT
+install (deploy.sh runs pytest on bare python + boto3), so its two submodules
+that `index` imports at module scope are stubbed in sys.modules BEFORE
+`import index` — matching the sibling scheduled-groom-dispatcher test. `index`
+only touches nousergon_lib at import time via the `_OPS_TOPICS` tuple
+(`flow_doctor_fleet.FleetTelegramTopic`) and, transitively through
+`flow_doctor_telegram`, `telegram.send_message`; the notify path itself is
+monkeypatched per-test (`index.notify_via_flow_doctor`). Migrated onto
+`nousergon_lib.*` from the old `nousergon_lib.telegram` stub by the
+flow-doctor cutover (config#1742, #622) — keep this stub tracking `index.py`'s
+real module-level imports.
 """
 
 from __future__ import annotations
@@ -10,17 +22,40 @@ from __future__ import annotations
 import sys
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-# Stub alpha_engine_lib.telegram before importing index (the real lib isn't on the
-# test path; the probe only uses send_message).
-_ael = types.ModuleType("alpha_engine_lib")
-_tg = types.ModuleType("alpha_engine_lib.telegram")
-_tg.send_message = lambda *a, **k: True  # type: ignore[attr-defined]
-_ael.telegram = _tg  # type: ignore[attr-defined]
-sys.modules.setdefault("alpha_engine_lib", _ael)
-sys.modules.setdefault("alpha_engine_lib.telegram", _tg)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# ── Stub nousergon_lib submodules before importing index ──────────────────────
+_ng = types.ModuleType("nousergon_lib")
+_ng_telegram = types.ModuleType("nousergon_lib.telegram")
+_ng_telegram.send_message = lambda *a, **k: None
+_ng_fleet = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+
+
+class _FleetTelegramTopic:
+    CRITICAL = "CRITICAL"
+    OPS_HEALTH = "OPS_HEALTH"
+
+
+_ng_fleet.FleetTelegramTopic = _FleetTelegramTopic
+_ng.telegram = _ng_telegram
+_ng.flow_doctor_fleet = _ng_fleet
+sys.modules.setdefault("nousergon_lib", _ng)
+sys.modules.setdefault("nousergon_lib.telegram", _ng_telegram)
+sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
+
+# Derive the stub requirement from index.py's live (transitive) import graph and
+# fail loud here if it has drifted, rather than as a cryptic ModuleNotFoundError
+# at deploy time. See _shared/hermetic_import_guard.py (config#1746).
+from _shared.hermetic_import_guard import (  # noqa: E402
+    assert_hermetic_imports_satisfied,
+)
+
+assert_hermetic_imports_satisfied(__file__)
 
 import index  # noqa: E402
 
@@ -159,7 +194,11 @@ def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 
     monkeypatch.setattr(index, "_fetch_digest_timestamps", lambda pat: stamps)
     monkeypatch.setattr(index, "_s3_client", lambda: s3)
     sends = []
-    monkeypatch.setattr(index, "send_message", lambda *a, **k: sends.append(a) or sent)
+    monkeypatch.setattr(
+        index,
+        "notify_via_flow_doctor",
+        lambda text, **kwargs: sends.append(text) or sent,
+    )
     return sends
 
 

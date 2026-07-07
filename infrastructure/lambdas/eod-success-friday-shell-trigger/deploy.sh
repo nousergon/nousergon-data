@@ -5,7 +5,7 @@
 # This Lambda subscribes to `aws.states` / "Step Functions Execution Status
 # Change" events for `ne-postclose-trading-pipeline` SUCCEEDED transitions only.
 # On every EOD success it derives trading_day via the canonical
-# `alpha_engine_lib.trading_calendar.last_closed_trading_day` (handles UTC
+# `nousergon_lib.trading_calendar.last_closed_trading_day` (handles UTC
 # rollover) and, if trading_day.weekday()==4 (Friday), invokes the Saturday
 # Step Function with `shell_run: true`.
 #

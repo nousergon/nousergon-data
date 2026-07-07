@@ -172,7 +172,7 @@ def check_arctic_connectivity(ctx: PreflightContext) -> CheckResult:
     t0 = time.time()
     try:
         import arcticdb as adb
-        from alpha_engine_lib.arcticdb import open_arctic
+        from nousergon_lib.arcticdb import open_arctic
         arctic = open_arctic(ctx.bucket, region="us-east-1")
         libs = set(arctic.list_libraries())
         if "universe" not in libs or "macro" not in libs:
@@ -261,10 +261,10 @@ def check_universe_drift(ctx: PreflightContext) -> CheckResult:
         if last_ts is None:
             will_skip.append({"ticker": ticker, "reason": "unreadable"})
             continue
-        # Trading-day staleness via alpha_engine_lib.dates — the prune
+        # Trading-day staleness via nousergon_lib.dates — the prune
         # decision is "has this ticker missed N+ NYSE sessions since its
         # last write?", which is independent of calendar weekends/holidays.
-        from alpha_engine_lib.dates import trading_days_stale
+        from nousergon_lib.dates import trading_days_stale
         days_stale = trading_days_stale(last_ts.date(), today_ts.date().isoformat())
         entry = {"ticker": ticker, "last_date": last_ts.date().isoformat(), "days_stale": days_stale}
         # PR #134 uses absent_days=5 calendar; under trading-day arithmetic
@@ -365,7 +365,7 @@ def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
         if last_ts is None:
             stale.append({"ticker": ticker, "reason": "unreadable"})
             continue
-        from alpha_engine_lib.dates import trading_days_stale
+        from nousergon_lib.dates import trading_days_stale
         days_stale = trading_days_stale(last_ts.date(), today.date().isoformat())
         if days_stale > _UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS:
             stale.append({
@@ -412,7 +412,7 @@ def check_polygon_grouped_coverage(ctx: PreflightContext) -> CheckResult:
             elapsed_seconds=time.time() - t0,
         )
 
-    from alpha_engine_lib.secrets import get_secret
+    from nousergon_lib.secrets import get_secret
     if not get_secret("POLYGON_API_KEY", required=False):
         # Local-laptop preflight — polygon key lives in .env on the spot
         # and on EC2. Skip without failing so the rest of the report is
@@ -952,7 +952,7 @@ def _previous_trading_day_str() -> str:
     conflict crashes on macOS, see CHECKS docstring.
     """
     from datetime import timedelta
-    from alpha_engine_lib.trading_calendar import is_trading_day
+    from nousergon_lib.trading_calendar import is_trading_day
     today = datetime.now(timezone.utc).date()
     candidate = today - timedelta(days=1)
     for _ in range(10):

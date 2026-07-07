@@ -88,7 +88,7 @@ def _load_feature_cfg_overrides() -> dict:
     # data-specific repo-local tail (``<repo>/config.yaml``, subdir-flattened) is
     # preserved via repo_local_fallback; the per-key validation loop below is
     # unchanged (a present-but-unknown override key still fails loud).
-    from alpha_engine_lib.config import resolve_experiment_config
+    from nousergon_lib.config import resolve_experiment_config
 
     repo_root = Path(__file__).resolve().parent.parent
     candidates = resolve_experiment_config(
@@ -420,11 +420,19 @@ def compute_features(
     _vol_slow = _FC["volume_slow"]
     avg_vol_20d_raw = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
     df["avg_volume_20d_raw"] = avg_vol_20d_raw
-    volume_global_mean = volume.mean()
-    if volume_global_mean > 0:
-        df["avg_volume_20d"] = avg_vol_20d_raw / volume_global_mean
-    else:
-        df["avg_volume_20d"] = 1.0
+    # Point-in-time discipline (config#833 / L3293): normalize by a BACKWARD-ONLY
+    # per-ticker mean (expanding through T), NOT a full-sample volume.mean(). The
+    # backtest replay path computes features once over each ticker's ENTIRE history
+    # and then slices by decision date, so a whole-series mean here injected volume
+    # from T+1..T+N into every historical row's avg_volume_20d — a genuine (if mild)
+    # look-ahead. An expanding mean at row T sees only volume observed through T, so
+    # the value is identical whether features are computed on df[:T] or the full df.
+    # Warmup rows stay NaN (raw itself is NaN there); a degenerate all-zero-volume
+    # window maps to the neutral 1.0 the old scalar else-branch produced.
+    volume_expanding_mean = volume.expanding(min_periods=_vol_slow).mean()
+    df["avg_volume_20d"] = (
+        (avg_vol_20d_raw / volume_expanding_mean).replace([np.inf, -np.inf], 1.0)
+    )
 
     # ── Distance from 52-week high ─────────────────────────────────────────────
     _52w = _FC["weeks_52_days"]
@@ -801,6 +809,13 @@ def compute_features(
         df["put_call_ratio"] = _safe_float(options_data.get("put_call_ratio"), 0.0)
         df["iv_rank"] = _safe_float(options_data.get("iv_rank"), 0.5)
         atm_iv = _safe_float(options_data.get("atm_iv"), 0.0)
+        # NOT a look-ahead: this whole O12 options block is an as-of-SNAPSHOT
+        # broadcast — `options_data` (atm_iv etc.) is the current, time-axis-less
+        # options state, written as one scalar to every row. Pairing the scalar
+        # atm_iv with the TERMINAL realized_vol (`.iloc[-1]`, i.e. "now") is the
+        # correct current-state reference; it is never sliced per-decision-date in
+        # the PIT replay (config#833). Do NOT "PIT-fix" this to a per-row
+        # realized_vol — that would pair a single snapshot IV with historical RV.
         realized_vol = df["realized_vol_20d"].iloc[-1] if "realized_vol_20d" in df.columns else 0.0
         if realized_vol > 0 and atm_iv > 0:
             df["iv_vs_rv"] = atm_iv / realized_vol

@@ -32,7 +32,7 @@ modes the event-driven design eliminates:
 ## trading_day binding (not wall-clock)
 
 The handler derives `trading_day` via the canonical
-`alpha_engine_lib.trading_calendar.last_closed_trading_day` helper,
+`nousergon_lib.trading_calendar.last_closed_trading_day` helper,
 passing `event.detail.stopDate` (epoch ms, UTC) as a tz-aware UTC
 datetime. The lib converts to NYSE local time and walks back to the most
 recent closed session.

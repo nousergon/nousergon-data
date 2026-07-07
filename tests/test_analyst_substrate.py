@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from alpha_engine_lib.sources import AnalystSnapshot, AnalystSource
+from nousergon_lib.sources import AnalystSnapshot, AnalystSource
 
 from collectors.analyst_sources.finnhub import FinnhubAnalystAdapter
 from collectors.analyst_sources.ibes import IbesAnalystAdapter
@@ -538,8 +538,8 @@ class TestComputeAndWriteRevisions:
 
 def test_canonical_artifact_key_shape():
     """Canonical key shape (post-PR-1 migration) — YYMMDDHHMM run_id
-    + flat layout per the alpha_engine_lib.eval_artifacts module."""
-    from alpha_engine_lib.eval_artifacts import (
+    + flat layout per the nousergon_lib.eval_artifacts module."""
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key, eval_latest_key, new_eval_run_id,
     )
     run_id = new_eval_run_id()

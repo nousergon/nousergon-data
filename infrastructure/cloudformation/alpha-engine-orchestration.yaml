@@ -179,11 +179,18 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-saturday
-      # Schedule chosen so polygon's Friday daily aggregate has settled
-      # (T+1 lag) before MorningEnrich + DataPhase1 fetch it.
-      # 09:00 UTC = 02:00 AM PT Sat (PDT) / 01:00 AM PT Sat (PST).
-      Description: Saturday 09:00 UTC (02:00 AM PT) — triggers full Alpha Engine pipeline after polygon T+1 settle
-      ScheduleExpression: 'cron(0 9 ? * SAT *)'
+      # 09:00 UTC chosen so polygon's prior-session daily aggregate has
+      # settled (T+1 lag) before MorningEnrich + DataPhase1 fetch it.
+      # THU-SAT (config#1824, Brian-ratified 2026-07-06): the weekly runs
+      # ONE DAY AFTER the week's LAST trading session — Saturday normally,
+      # Friday when Friday is an NYSE holiday, Thursday on a Thu+Fri double
+      # holiday. The cron fires all three days; the SF's WeeklyRunDayGate
+      # (predictor Lambda action=check_weekly_run_day, pure calendar math)
+      # self-selects the single correct firing and Succeed-skips the rest.
+      # Replaces the hand-built one-shot shift used for the 2026-07-03
+      # holiday week.
+      Description: Thu-Sat 09:00 UTC — weekly pipeline fires day after last trading session (WeeklyRunDayGate self-selects; config#1824)
+      ScheduleExpression: 'cron(0 9 ? * THU-SAT *)'
       State: ENABLED
       Targets:
         # SINGLE TARGET PER RULE. EventBridge dispatches the cron event

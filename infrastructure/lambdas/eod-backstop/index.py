@@ -47,7 +47,7 @@ from typing import Optional
 
 import boto3
 
-from alpha_engine_lib.trading_calendar import is_trading_day, last_closed_trading_day
+from nousergon_lib.trading_calendar import is_trading_day, last_closed_trading_day
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))

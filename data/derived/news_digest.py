@@ -179,12 +179,12 @@ def write_digest(
     (``{prefix}/{run_id}.json``) AND ``{prefix}/latest.json`` (the FULL
     digest — consumers read it directly in one GET).
 
-    Uses the canonical ``alpha_engine_lib.eval_artifacts`` run_id +
+    Uses the canonical ``nousergon_lib.eval_artifacts`` run_id +
     artifact/latest key helpers so the digest history shares the listing
     conventions of the sibling daily artifacts. Returns the dated artifact
     key.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
         new_eval_run_id,
@@ -220,7 +220,7 @@ def read_digest(
 ) -> dict[str, Any]:
     """Consumer-side read of the latest digest (one GET on ``latest.json``).
     Returns an empty-schema digest dict when no artifact exists."""
-    from alpha_engine_lib.eval_artifacts import eval_latest_key
+    from nousergon_lib.eval_artifacts import eval_latest_key
 
     latest_key = eval_latest_key(prefix)
     try:

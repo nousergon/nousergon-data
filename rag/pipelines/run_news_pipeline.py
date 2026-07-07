@@ -9,7 +9,7 @@ Runs the full Wave 1 news producer chain on Saturday SF:
   3. Write structured aggregates parquet to
      s3://alpha-engine-research/data/news_aggregates/{date}.parquet
   4. Ingest article narrative into the RAG corpus via
-     alpha_engine_lib.rag.ingest_document (one document per
+     nousergon_lib.rag.ingest_document (one document per
      (ticker, article); idempotent via document_exists)
 
 All inputs are sized by --hours; default 168 (7 days) so the Saturday

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from alpha_engine_lib.trading_calendar import previous_trading_day
+from nousergon_lib.trading_calendar import previous_trading_day
 
 from weekly_collector import (
     _detect_missing_universe_days,

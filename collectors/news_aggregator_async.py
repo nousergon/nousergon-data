@@ -55,7 +55,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from alpha_engine_lib.sources import NewsArticle, NewsSource
+from nousergon_lib.sources import NewsArticle, NewsSource
 
 from collectors.news_aggregator import (
     AggregatedNewsArticle,

@@ -33,7 +33,8 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 _CHAIN = [
     ("CheckSkipMorningEnrich", "MorningEnrich", "skip_morning_enrich", "CheckSkipMorningArcticAppend"),
     ("CheckSkipMorningArcticAppend", "MorningArcticAppend", "skip_morning_arctic_append", "CheckSkipChronicGapHeal"),
-    ("CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "skip_chronic_gap_heal", "CheckSkipPredictorInference"),
+    # config#1807: the data phase exits through the spot-terminate hook.
+    ("CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "skip_chronic_gap_heal", "CheckDataSpotToTerminate"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
     ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "PipelineComplete"),
@@ -81,35 +82,52 @@ class TestEntryEdgesRouteThroughGates:
         # config#1430: the NYSE holiday check moved OFF the box into the predictor
         # Lambda and now gates BEFORE StartExecutorEC2.
         assert states["DeployDriftGate"]["Default"] == "TradingDayGate"
-        assert states["TradingDayGateChoice"]["Default"] == "StartExecutorEC2"
+        # config#1807: a confirmed trading day first dispatches the daily data
+        # spot launch (fire-and-forget on ae-dashboard), THEN boots the box.
+        assert states["TradingDayGateChoice"]["Default"] == "CheckSkipDataSpot"
+        assert states["CheckSkipDataSpot"]["Default"] == "LaunchDailyDataSpot"
+        assert states["LaunchDailyDataSpot"]["Next"] == "StartExecutorEC2"
+        assert states["CheckSkipDataSpot"]["Choices"][0]["Next"] == "StartExecutorEC2"
         false_branch = [
             c["Next"]
             for c in states["TradingDayGateChoice"]["Choices"]
             if c.get("BooleanEquals") is False
         ]
         assert false_branch == ["NotifyHolidaySkip"]
-        # Once the box is up, the SSM-ready success branch enters the first morning
-        # work gate (CheckSkipMorningEnrich) — it no longer runs an on-box check.
+        # Once the box is up, the SSM-ready success branch enters the
+        # CodeFreshnessGate (config#1811: verify all 3 repo checkouts are on
+        # current main BEFORE any pipeline work — the 2026-07-06 incident
+        # burned ~40 min before the planner-time deploy-drift preflight
+        # refused), whose SUCCESS verdict then enters the first morning work
+        # gate (CheckSkipMorningEnrich).
         online = [
             c["Next"]
             for c in states["SSMReadyChoice"]["Choices"]
             if "And" in c
         ]
-        assert online == ["CheckSkipMorningEnrich"]
+        assert online == ["CodeFreshnessGate"]
+        fresh = [c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
+                 if c.get("StringEquals") == "SUCCESS"]
+        # config#1807: boot-chain success synchronizes with the spot launch
+        # (ReadDataSpotId) before entering the morning gates.
+        assert fresh == ["CheckDataSpotLaunched"]
+        assert states["CheckDataSpotLaunched"]["Default"] == "CheckSkipMorningEnrich"
+        assert states["CheckDataSpotLaunched"]["Choices"][0]["Next"] == "ReadDataSpotId"
 
     def test_trading_day_gate_failed_proceeds_as_trading_day(self, states):
-        assert states["TradingDayGateFailed"]["Next"] == "StartExecutorEC2"
+        # config#1807: fail-open path also routes through the spot-launch gate.
+        assert states["TradingDayGateFailed"]["Next"] == "CheckSkipDataSpot"
 
     def test_morning_enrich_success_enters_append_gate(self, states):
         # L4608: the slow daily_append is now its own load-bearing state behind
         # CheckSkipMorningArcticAppend, after the fast MorningEnrich fetch.
         success = [c["Next"] for c in states["CheckMorningEnrichStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
+                   if c.get("StringEquals") == "SUCCESS"]
         assert success == ["CheckSkipMorningArcticAppend"]
 
     def test_arctic_append_success_enters_heal_gate(self, states):
         success = [c["Next"] for c in states["CheckMorningArcticAppendStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
+                   if c.get("StringEquals") == "SUCCESS"]
         assert success == ["CheckSkipChronicGapHeal"]
 
     def test_arctic_append_is_load_bearing(self, states):
@@ -127,10 +145,15 @@ class TestEntryEdgesRouteThroughGates:
         assert int(et[0] if isinstance(et, list) else et) > 1800
 
     def test_chronic_gap_terminal_enters_predictor_gate(self, states):
-        # CheckChronicGapStatus Default + both heal Catches.
-        assert states["CheckChronicGapStatus"]["Default"] == "CheckSkipPredictorInference"
-        assert states["ChronicGapSelfHeal"]["Catch"][0]["Next"] == "CheckSkipPredictorInference"
-        assert states["WaitForChronicGap"]["Catch"][0]["Next"] == "CheckSkipPredictorInference"
+        # CheckChronicGapStatus Default + both heal Catches. config#1807: all
+        # three converge on the spot-terminate hook, whose Default proceeds to
+        # the predictor gate — fail-soft posture preserved, spot never leaked.
+        assert states["CheckChronicGapStatus"]["Default"] == "CheckDataSpotToTerminate"
+        assert states["ChronicGapSelfHeal"]["Catch"][0]["Next"] == "CheckDataSpotToTerminate"
+        assert states["WaitForChronicGap"]["Catch"][0]["Next"] == "CheckDataSpotToTerminate"
+        assert states["CheckDataSpotToTerminate"]["Default"] == "CheckSkipPredictorInference"
+        assert states["TerminateDailyDataSpot"]["Next"] == "CheckSkipPredictorInference"
+        assert states["TerminateDailyDataSpot"]["Catch"][0]["Next"] == "CheckSkipPredictorInference"
 
     def test_predictor_health_enters_planner_gate(self, states):
         assert states["PredictorHealthCheck"]["Next"] == "CheckSkipMorningPlanner"
@@ -138,7 +161,7 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_planner_success_enters_daemon_gate(self, states):
         success = [c["Next"] for c in states["CheckMorningPlannerStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
+                   if c.get("StringEquals") == "SUCCESS"]
         assert success == ["CheckSkipRunDaemon"]
 
     def test_daemon_is_last_step(self, states):
@@ -164,7 +187,8 @@ class TestPaths:
             if st["Type"] == "Succeed":
                 break
             if st["Type"] == "Choice":
-                succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
+                succ = [c["Next"] for c in st.get("Choices", [])
+                        if c.get("StringEquals") in ("Success", "SUCCESS")]
                 cur = succ[0] if succ else st.get("Default")
             else:
                 cur = st.get("Next")
@@ -183,7 +207,9 @@ class TestPaths:
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags=all_flags)
         for task in (c[1] for c in _CHAIN):
             assert task not in order, f"{task} ran despite its skip flag"
-        assert order == ["PipelineComplete"]
+        # config#1807: the all-skip walk passes through the (no-op) terminate
+        # hook — no spot was launched, so its Default falls straight through.
+        assert order == ["CheckDataSpotToTerminate", "PipelineComplete"]
 
     def test_skip_fetch_only_resumes_at_append(self, states):
         """MorningEnrich fetch already done → skip it, run the append onward."""

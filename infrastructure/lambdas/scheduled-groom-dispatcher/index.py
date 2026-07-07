@@ -71,15 +71,19 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import boto3
-from krepis.telegram import send_message
+from flow_doctor_telegram import notify_via_flow_doctor
 from krepis.usage_pacing import pace_check, reset_window
 from nousergon_lib import ec2_spot
 from nousergon_lib.ec2_spot import SpotCapacityExhausted
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+_FLOW_NAME = "scheduled-groom-dispatcher"
+_DB_BASENAME = "flow_doctor_scheduled_groom_dispatcher"
+_GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
@@ -88,9 +92,9 @@ DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "
 # Kill-switch independent of GROOM_DISPATCH_ENABLED — lets ops disable JUST the
 # pace gate (e.g. during a known burst) without touching the dispatch trigger.
 PACE_GATE_ENABLED = os.environ.get("GROOM_PACE_GATE_ENABLED", "true").lower() == "true"
-# Calibrated 2026-06-28 — MUST track alpha-engine-config/scripts/groom_budget.py's
-# WEEKLY_WET_CEILING; refine both together against /usage (config#1347).
-WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "1140000000"))
+# Calibrated 2026-07-06 — MUST track alpha-engine-config/scripts/groom_budget.py's
+# WEEKLY_WET_CEILING; re-calibrate both together against /usage every few days.
+WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "674000000"))
 _PT = ZoneInfo("America/Los_Angeles")
 # MUST match groom_budget.py's WEEKLY_RESET_ANCHOR/WEEKLY_PERIOD exactly — both
 # derive the SAME reset-aligned window from one observed reset instant.
@@ -98,6 +102,8 @@ WEEKLY_RESET_ANCHOR = datetime(2026, 6, 28, 20, 59)   # PT, naive — one observ
 WEEKLY_PERIOD = timedelta(days=7)
 CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
 CCUSAGE_PREFIX = "claude_code_usage/"
+# Self-expiring operator override — MUST track groom_budget.py::OVERRIDE_UNTIL_PARAM.
+OVERRIDE_UNTIL_PARAM = "/alpha-engine/groom/dynamic_budget_override_until"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
 # t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
@@ -134,8 +140,8 @@ CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
 _VALID_RUN_MODES = {"full", "sweep"}
 _DEFAULT_RUN_MODE = "full"
-_VALID_ISSUE_FILTERS = {"default", "high-only"}
-_DEFAULT_ISSUE_FILTER = "default"
+_VALID_ISSUE_FILTERS = {"default", "mid-only", "low-only", "high-only"}
+_DEFAULT_ISSUE_FILTER = "mid-only"
 _DEFAULT_MODEL = "claude-sonnet-5"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
 # shell command below) — model ids are Lambda-config-controlled, not raw user
@@ -181,6 +187,30 @@ def _read_weekly_wet(window_start: datetime) -> float:
     return total
 
 
+def _parse_override_until(raw: str) -> "datetime | None":
+    """PT-naive datetime from the SSM value; None if blank/unparseable."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_PT).replace(tzinfo=None)
+    return dt
+
+
+def _read_override_until() -> "datetime | None":
+    """Active override expiry from SSM; None when absent/unreadable."""
+    try:
+        ssm = boto3.client("ssm", region_name=REGION)
+        raw = ssm.get_parameter(Name=OVERRIDE_UNTIL_PARAM)["Parameter"]["Value"]
+    except Exception:  # noqa: BLE001 — absent override => normal policy
+        return None
+    return _parse_override_until(raw)
+
+
 def _pace_gate_status() -> dict:
     """Compute the pre-boot pace-gate decision. Fail-safe: ANY error (S3 read,
     parse, credentials) returns ``exceeded: False`` with the error recorded —
@@ -188,6 +218,13 @@ def _pace_gate_status() -> dict:
     groom_budget.py's own fail-safe posture."""
     try:
         now_pt = datetime.now(_PT).replace(tzinfo=None)
+        override_until = _read_override_until()
+        if override_until is not None and now_pt < override_until:
+            return {
+                "exceeded": False,
+                "override_until": override_until.isoformat(),
+                "reason": "operator override active — pace gate suspended",
+            }
         window_start, _next_reset = reset_window(now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
         wet = _read_weekly_wet(window_start)
         used_frac = wet / WEEKLY_WET_CEILING if WEEKLY_WET_CEILING else 0.0
@@ -215,8 +252,10 @@ def _resolve_run_mode(event: dict) -> str:
 
 
 def _resolve_issue_filter(event: dict) -> str:
-    """Pull issue_filter from the schedule input; unknown/missing → default (Sonnet queue)."""
+    """Pull issue_filter from the schedule input; unknown/missing → mid-only (Sonnet queue)."""
     f = str(event.get("issue_filter") or _DEFAULT_ISSUE_FILTER).strip().lower()
+    if f == "default":
+        f = "mid-only"
     if f not in _VALID_ISSUE_FILTERS:
         logger.warning("unknown issue_filter %r — defaulting to %s", f, _DEFAULT_ISSUE_FILTER)
         f = _DEFAULT_ISSUE_FILTER
@@ -261,8 +300,31 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
+def _resolve_pr_budget(event: dict) -> int | None:
+    """Optional per-schedule PR budget override (config#1769).
+
+    Only the Opus high-only schedule sets this today; missing/invalid → None
+    (groom_spot_bootstrap.sh's GROOM_PR_BUDGET default of 50 applies).
+    """
+    raw = event.get("pr_budget")
+    if raw is None:
+        raw = event.get("GROOM_PR_BUDGET")
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("malformed pr_budget %r — ignoring (default 50 applies)", raw)
+        return None
+    if n <= 0:
+        logger.warning("non-positive pr_budget %r — ignoring (default 50 applies)", raw)
+        return None
+    return n
+
+
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
-                       run_token: str, soft_limit_min: int | None = None) -> str:
+                       run_token: str, soft_limit_min: int | None = None,
+                       pr_budget: int | None = None) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -271,6 +333,7 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     Any prelude failure shuts the box down so a botched launch never idles.
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
+    pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -293,7 +356,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -349,7 +412,8 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
-                    run_token: str, soft_limit_min: int | None = None) -> str:
+                    run_token: str, soft_limit_min: int | None = None,
+                    pr_budget: int | None = None) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
@@ -357,7 +421,9 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
         DocumentName="AWS-RunShellScript",
         Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         Parameters={
-            "commands": [_bootstrap_command(run_mode, run_url, model, issue_filter, run_token, soft_limit_min)],
+            "commands": [_bootstrap_command(
+                run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
+            )],
             # Execution timeout (NOT the start timeout) — without this SSM kills the
             # command at the 3600s default, guillotining a multi-hour groom.
             "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
@@ -388,7 +454,8 @@ def _terminate_instance(instance_id: str) -> None:
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
-                       soft_limit_min: int | None = None, force_on_demand: bool = False) -> dict:
+                       soft_limit_min: int | None = None, pr_budget: int | None = None,
+                       force_on_demand: bool = False) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -417,7 +484,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
         command_id = _send_bootstrap(
-            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min
+            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -443,7 +510,34 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "model": model,
         "issue_filter": issue_filter,
         "run_token": run_token,
+        **({"pr_budget": pr_budget} if pr_budget is not None else {}),
     }
+
+
+def _notify_pace_skip(pace: dict, schedule_label: str, run_mode: str) -> None:
+    """Best-effort loud ping for a pre-boot pace skip — never raises."""
+    text = (
+        "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
+        f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
+        f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
+        f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
+        "cost incurred. Resumes automatically on the next scheduled run "
+        "(or after the weekly reset)."
+    )
+    try:
+        notify_via_flow_doctor(
+            text,
+            silent=True,
+            severity="info",
+            dedup_key=f"{_FLOW_NAME}:pace_skip:{schedule_label}",
+            flow_name=_FLOW_NAME,
+            topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "run_mode": run_mode, **pace},
+            silent_topic=FleetTelegramTopic.GROOM,
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("pace-gate skip Telegram failed (non-fatal): %s", exc)
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
@@ -454,6 +548,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
     (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
+    `pr_budget` is set only on the Opus high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
 
@@ -471,12 +566,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
     soft_limit_min = _resolve_soft_limit_min(event)
+    pr_budget = _resolve_pr_budget(event)
     force_on_demand = _resolve_force_on_demand(event)
     schedule_label = str(event.get("schedule") or "unknown")
     logger.info(
         "scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s "
-        "force_on_demand=%s schedule=%s",
-        run_mode, model, issue_filter, soft_limit_min, force_on_demand, schedule_label,
+        "pr_budget=%s force_on_demand=%s schedule=%s",
+        run_mode, model, issue_filter, soft_limit_min, pr_budget, force_on_demand, schedule_label,
     )
 
     if PACE_GATE_ENABLED:
@@ -487,15 +583,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "wet=%.0f) — groom spot NOT launched, resumes next schedule/reset",
                 pace["used_frac"], pace["elapsed_frac"], pace["overrun"], pace["wet"],
             )
-            send_message(
-                "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
-                f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
-                f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
-                f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
-                "cost incurred. Resumes automatically on the next scheduled run "
-                "(or after the weekly reset)."
-            )
+            _notify_pace_skip(pace, schedule_label, run_mode)
             return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
 
-    result = _launch_groom_spot(run_mode, schedule_label, model, issue_filter, soft_limit_min, force_on_demand)
+    result = _launch_groom_spot(
+        run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
+    )
     return {"groom": result}

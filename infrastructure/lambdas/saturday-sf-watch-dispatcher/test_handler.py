@@ -1,37 +1,24 @@
 """Unit tests for sf-watch-dispatcher index.handler (Fleet-SF Watch).
 
-Stubs ``alpha_engine_lib.telegram.send_message`` (no live Telegram) and mocks
-boto3 stepfunctions + s3 clients. Asserts: watch-log artifact written (append +
-fresh-skeleton), failed-state extraction from history, fail-loud on the S3 write,
-best-effort enrichment + Telegram, per-pipeline routing (saturday/weekday prefix
-+ dispatch event type), the unregistered-SF guard, and the dispatch seam.
+Mocks flow-doctor notify (no live Telegram) and boto3 stepfunctions + s3 clients.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Stub the lib before importing the handler (CI runners pre-pip-install).
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_telegram_mod = types.ModuleType("alpha_engine_lib.telegram")
-_telegram_mod.send_message = MagicMock(return_value=True)
-_lib_pkg.telegram = _telegram_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
-
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import index  # noqa: E402
 
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
-GROOM_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch"
 UNREGISTERED_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:some-other-pipeline"
 
 
@@ -96,10 +83,10 @@ def _make_clients(*, describe=None, history=None, existing=None, put=None):
 
 
 @pytest.fixture(autouse=True)
-def reset_telegram():
-    _telegram_mod.send_message.reset_mock()
-    _telegram_mod.send_message.return_value = True
-    yield
+def reset_notify(monkeypatch):
+    mock = MagicMock(return_value=True)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock)
+    yield mock
 
 
 def test_failed_writes_watch_log_and_returns_state():
@@ -131,10 +118,10 @@ def test_telegram_is_silent_and_records_artifact_location():
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED"), None)
-    _telegram_mod.send_message.assert_called_once()
-    text = _telegram_mod.send_message.call_args.args[0]
-    kwargs = _telegram_mod.send_message.call_args.kwargs
-    assert kwargs["disable_notification"] is True  # notifier already buzzed loud
+    index.notify_via_flow_doctor.assert_called_once()
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert kwargs["silent"] is True  # notifier already buzzed loud
     assert "Fleet-SF Watch — OBSERVE" in text
     assert "Weekly Freshness SF: FAILED" in text  # pipeline-aware label
     assert "Failed state: `RAGIngestion`" in text
@@ -148,7 +135,7 @@ def test_watch_log_path_is_code_fenced():
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED"), None)
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "`s3://alpha-engine-research/consolidated/saturday_sf_watch/2023-11-14.json`" in text
     assert "Failed state: `RAGIngestion`" in text
     assert "Cause: `States.TaskFailed: RAGIngestion failed`" in text
@@ -206,7 +193,7 @@ def test_describe_error_still_writes_artifact():
 
 
 def test_telegram_failure_is_non_fatal():
-    _telegram_mod.send_message.side_effect = RuntimeError("bot down")
+    index.notify_via_flow_doctor.side_effect = RuntimeError("bot down")
     factory, _, s3 = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
@@ -222,7 +209,7 @@ def test_preflight_shell_run_marks_record():
         index.handler(_event("FAILED"), None)
     written = json.loads(s3.put_object.call_args.kwargs["Body"])
     assert written["events"][0]["is_preflight"] is True
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Weekly Freshness Preflight SF" in text
 
 
@@ -241,7 +228,7 @@ def test_weekday_sf_routes_to_weekday_prefix_and_label():
     assert result["state_machine"] == "ne-preopen-trading-pipeline"
     assert result["watch_log_key"] == "consolidated/weekday_sf_watch/2023-11-14.json"
     assert s3.put_object.call_args.kwargs["Key"].startswith("consolidated/weekday_sf_watch/")
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Pre-open Trading SF: FAILED" in text
 
 
@@ -250,7 +237,7 @@ def test_eod_sf_routes_to_eod_prefix():
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", sm_arn=EOD_ARN), None)
     assert result["watch_log_key"] == "consolidated/eod_sf_watch/2023-11-14.json"
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Post-close Trading SF: FAILED" in text
 
 
@@ -379,64 +366,11 @@ def test_pat_never_appears_in_result(monkeypatch):
     assert "ghp_SECRET_TOKEN" not in json.dumps(result)
 
 
-def test_groom_failure_dispatches_when_enabled(monkeypatch):
-    """2026-07-01 (config#1535 follow-up): groom flipped to has_listener=True
-    once `groom-sf-failure` was added to sf-watch.yml's `types:` allowlist and
-    the charter gained a dedicated groom guardrail — it now dispatches exactly
-    like the trading pipelines when the global flag is on."""
-    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
-    sent = {}
-
-    def fake_urlopen(req, timeout=None):
-        sent["data"] = json.loads(req.data)
-        return _FakeResp()
-
-    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
-    factory, _, _ = _make_clients()
-    with patch("index.boto3.client", side_effect=factory):
-        result = index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
-    assert result["agent_dispatch"] == {
-        "dispatched": True, "status_code": 204, "event_type": "groom-sf-failure",
-    }
-    assert result["action"] == "dispatched"
-    assert sent["data"]["event_type"] == "groom-sf-failure"
-    assert sent["data"]["client_payload"]["cadence_slug"] == "groom"
-
-
-def test_groom_telegram_claims_autonomous_fix_when_dispatched(monkeypatch):
-    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
-    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
-    factory, _, _ = _make_clients()
-    with patch("index.boto3.client", side_effect=factory):
-        index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
-    text = _telegram_mod.send_message.call_args.args[0]
-    assert "Fleet-SF Watch — AUTO-FIX" in text
-    assert "Backlog Groom SF: FAILED" in text
-    assert "autonomous fix ACTIVE" in text
-
-
-def test_groom_watch_log_records_has_listener_true(monkeypatch):
-    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
-    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
-    factory, _, s3 = _make_clients()
-    with patch("index.boto3.client", side_effect=factory):
-        index.handler(_event("FAILED", sm_arn=GROOM_ARN), None)
-    written = json.loads(s3.put_object.call_args.kwargs["Body"])
-    event = written["events"][-1]
-    assert event["has_listener"] is True
-    assert event["action"] == "dispatch"
-    assert event["agent_dispatch_enabled"] is True
-
-
 def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkeypatch):
     """Regression guard for the has_listener MECHANISM itself (config#1535):
     a pipeline registered with has_listener=False must never fire a
     repository_dispatch nor claim "autonomous fix ACTIVE", regardless of the
-    global kill-switch — exercised here via a synthetic entry now that groom
-    (the original motivating case) has flipped to True."""
+    global kill-switch."""
     fake_pipelines = dict(index.PIPELINES)
     fake_pipelines["some-other-pipeline"] = {
         "cadence_slug": "other",
@@ -461,13 +395,13 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
     assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
     assert result["action"] == "observe"
     assert fired["called"] is False
-    text = _telegram_mod.send_message.call_args.args[0]
+    text = index.notify_via_flow_doctor.call_args.args[0]
     assert "Fleet-SF Watch — OBSERVE" in text
     assert "autonomous fix ACTIVE" not in text
     assert "observe-only for this pipeline" in text
 
 
-def test_saturday_still_dispatches_normally_alongside_groom_fix(monkeypatch):
+def test_saturday_still_dispatches_when_enabled(monkeypatch):
     """Non-regression: the has_listener plumbing must not change behavior for
     the 3 trading pipelines, which all default has_listener=True."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
@@ -517,3 +451,302 @@ def test_live_old_named_eod_is_registered_during_rename_transition():
     ARN is removed from the registry + rule at cutover."""
     assert "alpha-engine-eod-pipeline" in index.PIPELINES
     assert index.PIPELINES["alpha-engine-eod-pipeline"]["cadence_slug"] == "eod"
+
+
+# ── config#1827: operator-abort dispatch carve-out ──────────────────────────
+
+
+def test_operator_abort_suppresses_dispatch_but_still_records(monkeypatch):
+    """A deliberate operator abort (status ABORTED + error == "OperatorAbort")
+    must NOT auto-dispatch a recovery agent even when the flag + listener are on,
+    yet MUST still write the watch-log and fire the Telegram receipt (fail-loud
+    preserved — only the autonomous ACTION on a human decision is withheld)."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    describe = {
+        "input": json.dumps({"pipeline_role": "verify-1807"}),
+        "error": "OperatorAbort",
+        "cause": "Verification mistakenly started during market hours; rescheduling post-close",
+    }
+    factory, _, s3 = _make_clients(describe=describe)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("ABORTED", sm_arn=WEEKDAY_ARN), None)
+
+    # Dispatch suppressed — no repository_dispatch HTTP call fired.
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "operator_abort"}
+    assert result["action"] == "observe"
+    assert fired["called"] is False
+    # Watch-log STILL written (fail-loud) and carries the auditable reason.
+    s3.put_object.assert_called_once()
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["status"] == "ABORTED"
+    assert ev["dispatch_suppressed"] == "operator_abort"
+    assert ev["action"] == "observe"
+    # Telegram receipt STILL fired, labelled OBSERVE with the operator-abort note.
+    assert result["telegram_sent"] is True
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "Fleet-SF Watch — OBSERVE" in text
+    assert "autonomous fix ACTIVE" not in text
+    assert "operator abort" in text.lower()
+
+
+def test_genuine_failed_still_dispatches(monkeypatch):
+    """Over-suppression guard: a real FAILED (not an operator abort) must still
+    dispatch when the flag + listener are on."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients()  # default describe error = States.TaskFailed
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+def test_programmatic_abort_still_dispatches(monkeypatch):
+    """Over-suppression guard (the inverse fail-loud violation): an ABORTED whose
+    error is NOT the operator marker (e.g. a programmatic/self-abort) is a real
+    defect and must still dispatch — suppression is on the marker, not on bare
+    ABORTED."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    describe = {
+        "input": "{}",
+        "error": "States.Runtime",
+        "cause": "self-abort on invariant breach",
+    }
+    factory, _, s3 = _make_clients(describe=describe)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("ABORTED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+# ── config#1900: deterministic zero-token fast path ──────────────────────────
+# A weekday failure whose history EXACTLY matches a known-transient signature
+# (data-spot host death / SendCommand invalid-instance) is recovered by a plain
+# StartExecution from the dispatcher itself — no agent dispatch. Everything
+# else falls through to the normal dispatch path with a recorded reason.
+
+WEEKDAY_INPUT = json.dumps({"pipeline_role": "daily", "trading_instance_id": ["i-018eb3307a21329bf"]})
+
+
+def _poll_output(payload: dict) -> str:
+    return json.dumps({"ExecutedVersion": "$LATEST", "Payload": payload})
+
+
+_HOST_DEATH_PAYLOAD = {
+    "attempts": 67,
+    "ping_misses": 0,
+    "status": "Failed",
+    "response_code": -1,
+    "status_details": "Undeliverable",
+    "ping_status": "NotRegistered",
+    "step": "morning-arctic-append",
+    "verdict": "COMMAND_FAILED",
+}
+
+
+def _weekday_history(payload=None, *, veto=False, task_failed_error=None, poll=True):
+    """Chronological weekday history ending in HandleFailure→FailExecution."""
+    h = [
+        {"type": "ExecutionStarted"},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "MorningEnrich"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "MorningEnrich"}},
+    ]
+    if veto:
+        h += [
+            {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "RunDaemon"}},
+            {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "RunDaemon"}},
+        ]
+    if task_failed_error is not None:
+        h += [
+            {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "MorningEnrich"}},
+            {"type": "TaskFailed", "taskFailedEventDetails": {"error": task_failed_error}},
+        ]
+    if poll:
+        h += [
+            {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "WaitForMorningArcticAppend"}},
+            {"type": "TaskSucceeded", "taskSucceededEventDetails": {
+                "output": _poll_output(payload if payload is not None else _HOST_DEATH_PAYLOAD)}},
+            {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "WaitForMorningArcticAppend"}},
+        ]
+    h += [
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "HandleFailure"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "HandleFailure"}},
+        {"type": "FailStateEntered", "stateEnteredEventDetails": {"name": "FailExecution"}},
+        {"type": "ExecutionFailed"},
+    ]
+    return h
+
+
+def _fast_path_clients(*, history=None, existing=None, describe_input=WEEKDAY_INPUT,
+                       running=None, start_error=None):
+    factory, sf, s3 = _make_clients(
+        describe={"input": describe_input, "error": "DailyPipelineFailure",
+                  "cause": "One or more weekday pipeline steps failed."},
+        history=history if history is not None else _weekday_history(),
+        existing=existing,
+    )
+    sf.list_executions.return_value = {"executions": running or []}
+    if start_error is not None:
+        sf.start_execution.side_effect = start_error
+    else:
+        sf.start_execution.return_value = {
+            "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:fast-path-rerun-x"
+        }
+    return factory, sf, s3
+
+
+@pytest.fixture()
+def fast_path_on(monkeypatch):
+    monkeypatch.setattr(index, "FAST_PATH_ENABLED", True)
+
+
+def _put_body(s3) -> dict:
+    return json.loads(s3.put_object.call_args.kwargs["Body"])
+
+
+def test_fast_path_reruns_on_host_death_signature(fast_path_on):
+    factory, sf, s3 = _fast_path_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_called_once()
+    kwargs = sf.start_execution.call_args.kwargs
+    assert kwargs["stateMachineArn"] == WEEKDAY_ARN
+    assert kwargs["input"] == WEEKDAY_INPUT  # plain rerun: ORIGINAL input, no skips
+    assert kwargs["name"].startswith("fast-path-rerun-")
+    assert result["fast_path"]["fast_path"] is True
+    assert result["fast_path"]["signature"] == "data_spot_host_death"
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "fast_path_rerun"}
+    ev = _put_body(s3)["events"][-1]
+    assert ev["action"] == "fast_path_rerun"
+    assert ev["lane"] == "A"
+    assert ev["agent_attempt"] == 1  # consumes the SAME budget the charter counts
+    assert ev["fast_path_signature"] == "data_spot_host_death"
+    assert ev["rerun_execution_arn"].endswith("fast-path-rerun-x")
+
+
+def test_fast_path_invalid_instance_signature(fast_path_on):
+    history = _weekday_history(poll=False, task_failed_error="Ssm.InvalidInstanceIdException")
+    factory, sf, s3 = _fast_path_clients(history=history)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    assert result["fast_path"]["fast_path"] is True
+    assert result["fast_path"]["signature"] == "data_spot_invalid_instance"
+    sf.start_execution.assert_called_once()
+
+
+def test_fast_path_vetoed_when_order_state_ran(fast_path_on):
+    factory, sf, s3 = _fast_path_clients(history=_weekday_history(veto=True))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"] == {"fast_path": False, "reason": "order_emitting_state_ran"}
+
+
+def test_fast_path_skipped_on_prior_attempt(fast_path_on):
+    existing = {"schema_version": 1, "events": [{"agent_attempt": 1, "action": "escalated"}]}
+    factory, sf, s3 = _fast_path_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "prior_attempt_exists"
+
+
+def test_fast_path_skipped_on_repeat_failure_day(fast_path_on):
+    existing = {"schema_version": 1, "events": [{"action": "observe"}, {"action": "observe"}]}
+    factory, sf, s3 = _fast_path_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "repeat_failure_day"
+
+
+def test_fast_path_signature_miss_falls_through(fast_path_on):
+    benign = dict(_HOST_DEATH_PAYLOAD, status_details="CommandFailed",
+                  response_code=1, ping_status="Online")
+    factory, sf, s3 = _fast_path_clients(history=_weekday_history(payload=benign))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "no_signature_match"
+
+
+def test_fast_path_start_execution_error_falls_back_to_dispatch(fast_path_on, monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "fake-pat")
+    factory, sf, s3 = _fast_path_clients(start_error=RuntimeError("boom"))
+
+    class _FakeResp:
+        status = 204
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    with patch("index.boto3.client", side_effect=factory), \
+         patch("index.urllib.request.urlopen", return_value=_FakeResp()) as urlopen:
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    assert result["fast_path"]["reason"] == "start_execution_error"
+    ev = _put_body(s3)["events"][-1]
+    assert "RuntimeError" in ev["fast_path_error"]
+    assert result["agent_dispatch"]["dispatched"] is True  # agent takes over
+    urlopen.assert_called_once()
+
+
+def test_fast_path_disabled_by_default():
+    factory, sf, s3 = _fast_path_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "disabled"
+    assert result["fast_path_enabled"] is False
+
+
+def test_fast_path_blocked_by_running_execution(fast_path_on):
+    factory, sf, s3 = _fast_path_clients(running=[{"name": "concurrent"}])
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "execution_already_running"
+
+
+def test_fast_path_not_configured_for_saturday(fast_path_on):
+    factory, sf, s3 = _fast_path_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", SATURDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "no_fast_path_config"
+
+
+def test_fast_path_preflight_excluded(fast_path_on):
+    factory, sf, s3 = _fast_path_clients(
+        describe_input=json.dumps({"shell_run": True, "pipeline_role": "daily"})
+    )
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
+
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"]["reason"] == "preflight"

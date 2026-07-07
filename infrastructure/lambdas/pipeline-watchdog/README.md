@@ -8,13 +8,13 @@ NYSE-trading-day-aware watchdog for the 3 Alpha Engine Step Functions.
 Cron-fires daily at 14:00 UTC (≈ 07:00 PT, well after every SF's expected
 start time). For each of the 3 Step Functions, checks whether at least one
 execution started in the expected window. If a check fails, publishes an
-alert via `alpha_engine_lib.alerts.publish` to a DISTINCT SNS topic
+alert via `nousergon_lib.alerts.publish` to a DISTINCT SNS topic
 (`alpha-engine-watchdog-alerts`, NOT `alpha-engine-alerts`) AND to Telegram
 in parallel — channel independence preserved per plan doc §3.5.
 
 | SF | Window | Watch-day condition |
 |---|---|---|
-| Weekday SF | 24h | TODAY is a NYSE trading day (via `alpha_engine_lib.trading_calendar`) |
+| Weekday SF | 24h | TODAY is a NYSE trading day (via `nousergon_lib.trading_calendar`) |
 | EOD SF     | 24h | TODAY is a NYSE trading day |
 | Saturday SF | 7d  | TODAY is Sunday (Saturday SF fires Sat 09:00 UTC; by Sun 14:00 UTC any missed firing is 24+h overdue) |
 
@@ -24,7 +24,7 @@ Per Phase 0 Q2 SOTA-lock, a naive `AWS/States ExecutionsStarted` alarm with
 a 24h window would false-positive every weekend for Weekday + EOD. Alert
 hygiene is load-bearing: a watchdog that false-positives twice every weekend
 trains the operator to silence it, defeating its purpose. The
-`alpha_engine_lib.trading_calendar` chokepoint encodes NYSE
+`nousergon_lib.trading_calendar` chokepoint encodes NYSE
 holiday + weekend awareness so the Lambda fires cleanly only on genuine
 missed executions on expected trading days.
 
@@ -85,8 +85,8 @@ aws sns subscribe \
 
 ## Composes with
 
-- `alpha_engine_lib.alerts` v0.24.0+ (dual-channel publish + dedup)
-- `alpha_engine_lib.trading_calendar` v0.27.0+ (NYSE-holiday-aware gate)
+- `nousergon_lib.alerts` v0.24.0+ (dual-channel publish + dedup)
+- `nousergon_lib.trading_calendar` v0.27.0+ (NYSE-holiday-aware gate)
 - `sf-telegram-notifier` (data #275) — sibling Lambda using same
   EventBridge → Telegram delivery pattern (this Lambda uses the
   lib chokepoint instead of duplicating the Telegram code)

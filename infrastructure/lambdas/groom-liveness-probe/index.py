@@ -41,12 +41,19 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
-from alpha_engine_lib.telegram import send_message
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+_FLOW_NAME = "groom-liveness-probe"
+_DB_BASENAME = "flow_doctor_groom_liveness_probe"
+_OPS_TOPICS = (
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 # De-dup state: ISO timestamps of trigger windows already alerted, so a standing
 # miss isn't re-pinged on every probe run. S3 (not in-Lambda) because the probe is
 # stateless across invocations. Generous lookback + this state = tolerant to
@@ -247,8 +254,19 @@ def _alert(misses: list[dict]) -> bool:
         "never dispatched (schedule/dispatcher broken). Check the "
         "scheduled-groom-dispatcher logs + SSM command history._"
     )
+    text = "\n".join(lines)
+    dedup_key = f"{_FLOW_NAME}:miss:" + "|".join(m["at"].isoformat() for m in misses)
     try:
-        return bool(send_message("\n".join(lines), disable_notification=False))
+        return notify_via_flow_doctor(
+            text,
+            silent=False,
+            severity="error",
+            dedup_key=dedup_key,
+            flow_name=_FLOW_NAME,
+            topics=_OPS_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"misses": len(misses)},
+        )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still returned
         logger.warning("liveness alert Telegram send failed (non-fatal): %s", exc)
         return False

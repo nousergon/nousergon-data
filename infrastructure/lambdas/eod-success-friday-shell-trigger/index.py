@@ -20,7 +20,7 @@ event-driven design has three guarantees the cron lacked:
      handler still sees a SUCCEEDED transition and trading_day is still
      Friday — the shell-run starts at the fix-time, not on a stale clock.
   3. **trading_day-bound, not wall-clock.** trading_day is derived via
-     ``alpha_engine_lib.trading_calendar.last_closed_trading_day`` from
+     ``nousergon_lib.trading_calendar.last_closed_trading_day`` from
      ``detail.stopDate`` (epoch ms UTC), so a Friday EOD re-run that
      succeeds at 02:00 UTC Saturday (= Friday evening PT) correctly stamps
      trading_day=Fri and fires. Pure ``datetime.now()`` would have read
@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 
 import boto3
 
-from alpha_engine_lib.trading_calendar import last_closed_trading_day
+from nousergon_lib.trading_calendar import last_closed_trading_day
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))

@@ -45,7 +45,9 @@ def test_runs_first_off_initialize_input(sf, states):
     # this gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the lib-pin
     # gate still runs first for any non-preset input.
     assert sf["StartAt"] == "InitializeInput"
-    assert states["InitializeInput"]["Next"] == "CheckRunMode"
+    assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+    # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
+    assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
     assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
 
 
@@ -86,8 +88,9 @@ def test_gate_halts_only_on_confirmed_drift(states):
     # Confirmed drift halts, but routes through the $.error normalizer FIRST
     # (not straight to HandleFailure) — see test_drift_halt_normalizes_error.
     assert c["Next"] == "ExtractLibPinDriftError"
-    # No drift → proceed into the pipeline.
-    assert gate["Default"] == "CheckMutexRole"
+    # No drift → proceed into the pipeline-contract preflight gate (config#693),
+    # composed directly after this gate's pass-through.
+    assert gate["Default"] == "PipelineContractCheck"
 
 
 def test_drift_halt_normalizes_error_before_handle_failure(states):

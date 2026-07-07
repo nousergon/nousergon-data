@@ -67,7 +67,7 @@
 #     points at it) — provides both `ec2_spot` and `ssm_dispatcher` CLIs
 #
 # Secrets resolve from SSM at Python startup via
-# alpha_engine_lib.secrets.get_secret(); the spot's IAM profile
+# nousergon_lib.secrets.get_secret(); the spot's IAM profile
 # (alpha-engine-executor-profile) grants ssm:GetParameter on /alpha-engine/*.
 # No .env is sourced anywhere in this script post the 2026-05-14 .env-deprecation arc.
 
@@ -103,7 +103,7 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 # The Saturday SF DataPhase1 failed when this run's nested spot
 # (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-
 # workload* with spot-request status `instance-terminated-no-capacity`.
-# The lib launcher (alpha_engine_lib.ec2_spot) already rotates
+# The lib launcher (nousergon_lib.ec2_spot) already rotates
 # instance_type × subnet on *acquisition* InsufficientInstanceCapacity,
 # but nothing relaunched after a *mid-run* reclamation — the workload
 # SSM command returned ResponseCode -1 (lost instance), the orchestrator
@@ -141,7 +141,7 @@ SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 # materially raises the odds the next attempt lands).
 SPOT_RETRY_BACKOFF_SECONDS="${SPOT_RETRY_BACKOFF_SECONDS:-20}"
 # Key-pair name kept ONLY for compatibility with
-# alpha_engine_lib.ec2_spot's --key-name flag — the spot still launches
+# nousergon_lib.ec2_spot's --key-name flag — the spot still launches
 # with this key associated, but NOTHING in this script SSH's into the
 # instance. Communication is via SSM; the key remains as a manual
 # break-glass option (operator can `ssh -i ~/.ssh/...pem` only if the
@@ -150,7 +150,7 @@ SPOT_RETRY_BACKOFF_SECONDS="${SPOT_RETRY_BACKOFF_SECONDS:-20}"
 KEY_NAME="alpha-engine-key"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # All 6 default-VPC subnets across us-east-1{a,b,c,d,e,f}. The lib CLI
-# (alpha_engine_lib.ec2_spot) rotates across this list on capacity
+# (nousergon_lib.ec2_spot) rotates across this list on capacity
 # error. Verified 2026-05-22 — all 6 are public-IP-on-launch, all in
 # vpc-566f002e, all with ~4091 free IPs. If the VPC topology changes,
 # update via `aws ec2 describe-subnets --filters Name=vpc-id,Values=vpc-566f002e`.
@@ -175,6 +175,14 @@ LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python
 #                          terminate (Saturday SF MorningEnrich state)
 #   phase1-only         — ONLY weekly_collector.py --phase 1 + prune, then
 #                          terminate (Saturday SF DataPhase1 state)
+#   launch-only         — launch + bootstrap + deps, write the instance-id
+#                          artifact to --id-artifact-key, then EXIT LEAVING
+#                          THE SPOT RUNNING (weekday LaunchDailyDataSpot
+#                          state, config#1807: the pre-open data phase runs
+#                          on this spot instead of the trading box; the SF
+#                          SSM-dispatches each data state to the spot
+#                          directly and terminates it afterwards; the
+#                          on-box systemd watchdog is the orphan backstop)
 #
 # The preflight-task-split (2026-05-16, plan
 # alpha-engine-docs/private/preflight-task-split-260516.md) introduced
@@ -204,12 +212,27 @@ while [[ $# -gt 0 ]]; do
         --data-only) RUN_MODE="data-only"; shift ;;
         --morning-enrich-only) RUN_MODE="morning-enrich-only"; shift ;;
         --phase1-only) RUN_MODE="phase1-only"; shift ;;
+        --launch-only) RUN_MODE="launch-only"; shift ;;
+        --id-artifact-key) ID_ARTIFACT_KEY="$2"; shift 2 ;;
+        --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;  # legacy: collapses INSTANCE_TYPES to single value
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# launch-only contract: the id artifact is how the weekday SF finds the
+# spot — launching without it would orphan the instance until the
+# watchdog fires. KEEP_INSTANCE stays 0 until the artifact is durably
+# written, so every failure before that point still terminates+retries
+# via the normal cleanup/on_exit path.
+ID_ARTIFACT_KEY="${ID_ARTIFACT_KEY:-}"
+KEEP_INSTANCE=0
+if [ "$RUN_MODE" = "launch-only" ] && [ -z "$ID_ARTIFACT_KEY" ]; then
+    echo "ERROR: --launch-only requires --id-artifact-key <s3-key>" >&2
+    exit 2
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Weekly Data Spot Run (Phase1 + RAG) — $(date +%Y-%m-%d)"
@@ -252,7 +275,7 @@ if [ ! -f "$CONFIG_SRC" ]; then
 fi
 
 # ── Launch spot ──────────────────────────────────────────────────────────────
-# Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
+# Capacity-resilient launch via nousergon_lib.ec2_spot (lib v0.26.0+).
 # The CLI iterates (instance_type × subnet) on InsufficientInstanceCapacity /
 # InsufficientHostCapacity / Unsupported / InvalidAvailabilityZone /
 # SpotMaxPriceTooLow, returning the InstanceId of the first successful
@@ -270,6 +293,14 @@ INSTANCE_ID=""
 S3_STAGING=""
 
 cleanup() {
+    if [ "$KEEP_INSTANCE" = "1" ]; then
+        # launch-only success: the spot is handed to the weekday SF (id
+        # artifact written); the SF's TerminateDailyDataSpot state + the
+        # on-box systemd watchdog own its lifecycle from here.
+        [ -n "$S3_STAGING" ] && aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
+        echo "  launch-only: instance $INSTANCE_ID left running (SF-owned); staging cleaned."
+        return 0
+    fi
     if [ -n "$INSTANCE_ID" ]; then
         echo ""
         echo "==> Terminating spot instance $INSTANCE_ID..."
@@ -367,7 +398,7 @@ INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
     --key-name "$KEY_NAME" \
     --security-group "$SECURITY_GROUP" \
     --iam-profile "$IAM_PROFILE" \
-    --name "alpha-engine-data-weekly-$(date +%Y%m%d)" \
+    --name "alpha-engine-data-$( [ "$RUN_MODE" = "launch-only" ] && echo daily || echo weekly )-$(date +%Y%m%d)" \
     --region "$AWS_REGION")
 ec2_spot_rc=$?
 if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
@@ -484,7 +515,7 @@ run_ssm() {
 
 # Each run_ssm step is a fresh SSM shell with a minimal env. The
 # .env-deprecation arc deleted the sourced .env, so AWS_REGION /
-# AWS_DEFAULT_REGION (which boto3 + alpha_engine_lib.preflight.check_env_vars
+# AWS_DEFAULT_REGION (which boto3 + nousergon_lib.preflight.check_env_vars
 # require) are no longer set unless each step's export line sets them.
 # Same #247 regression as sibling spot scripts. System is single-region
 # us-east-1 (matches this file's own ${AWS_REGION:-us-east-1} defaults).
@@ -553,6 +584,29 @@ PIP="\$PYTHON_BIN -m pip"
 
 echo "Dependencies installed."
 DEPS
+
+# ── Launch-only: hand the bootstrapped spot to the weekday SF ────────────────
+# config#1807: the weekday pre-open data phase (MorningEnrich +
+# MorningArcticAppend + ChronicGapSelfHeal) runs on this spot instead of
+# the trading box, whose 2026-07-06 swap-thrash starved its own SSM agent
+# and blocked RunDaemon at market open. This mode ends at the exact point
+# the per-state workload dispatch would begin: the SF owns the workloads
+# (per-state granularity + liveness polling + skip flags preserved) and
+# the termination; the bootstrap watchdog above (MAX_RUNTIME_SECONDS,
+# pass --max-runtime-seconds 10800 from the SF) is the orphan backstop if
+# the SF dies without reaching TerminateDailyDataSpot.
+if [ "$RUN_MODE" = "launch-only" ]; then
+    echo "==> launch-only: writing instance-id artifact s3://${S3_BUCKET}/${ID_ARTIFACT_KEY}"
+    printf '{"instance_id": "%s", "launched_at": "%s", "mode": "launch-only", "max_runtime_seconds": %s}\n' \
+        "$INSTANCE_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MAX_RUNTIME_SECONDS" \
+        | aws s3 cp - "s3://${S3_BUCKET}/${ID_ARTIFACT_KEY}" --region "$AWS_REGION" --only-show-errors
+    # Verify the write landed before disarming termination — an unreadable
+    # artifact means the SF can never find the spot (fail loud + terminate).
+    aws s3api head-object --bucket "$S3_BUCKET" --key "$ID_ARTIFACT_KEY" --region "$AWS_REGION" > /dev/null
+    KEEP_INSTANCE=1
+    echo "==> launch-only complete: $INSTANCE_ID running, artifact written."
+    exit 0
+fi
 
 # ── Smoke-only: imports + --phase 1 --dry-run ────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then

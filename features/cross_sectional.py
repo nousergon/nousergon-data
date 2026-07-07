@@ -5,8 +5,8 @@ C.1 of the optimizer-sota-upgrades-260526 arc (factor-risk decomposition).
 The executor's risk decomposition Σ = B·F·Bᵀ + D (workstream C.3) consumes
 a (N × K) factor-loading matrix B where columns are CROSS-SECTIONALLY
 z-scored style factors (mean 0, std 1 across the universe at each date).
-This module adds those columns to the feature-store panel after the
-per-ticker feature computation completes.
+This module adds those columns to the feature-store panel and the ArcticDB
+universe library after the per-ticker feature computation completes.
 
 Convention: Barra USE4 / AQR / BlackRock Aladdin — winsorize at ±3σ then
 re-standardize. The winsorization prevents a single ticker's outlier from
@@ -173,3 +173,246 @@ def apply_factor_zscores(
             col = transform(col)
         out[dst] = _winsorize_and_zscore(col)
     return out
+
+
+def factor_loading_source_columns() -> list[str]:
+    """Raw per-ticker columns that feed the cross-sectional z-score pass."""
+    return list(FACTOR_LOADING_SOURCES.keys())
+
+
+def materialize_factor_loading_zscores(
+    universe_lib,
+    tickers,
+    *,
+    write: bool = True,
+    canonical_fn=None,
+) -> dict:
+    """Second-pass library builder: materialize C.1 ``*_zscore`` loadings in ArcticDB.
+
+    Factor-loading z-scores are cross-sectional — each date's values depend on
+    the WHOLE universe's raw loadings at that date. Per-ticker streaming writes
+    in ``builders/backfill.py`` / ``builders/daily_append.py`` cannot compute
+    them inline, so this runs as a separate pass (mirrors
+    ``factor_momentum.materialize_factor_momentum``):
+
+      * Pass 1 — read back the slim ``(source loadings)`` panel per ticker,
+        group by date, call :func:`apply_factor_zscores` per cross-section.
+      * Pass 2 — read-modify-write the ``*_zscore`` columns per ticker.
+
+    Best-effort per ticker on read/write failures; all-NaN z-score counts are
+    logged LOUD. Never raises into the caller pipeline.
+    """
+    src_cols = factor_loading_source_columns()
+    dst_cols = factor_loading_columns()
+
+    frames: list[pd.DataFrame] = []
+    read_fail = 0
+    for t in tickers:
+        try:
+            df = universe_lib.read(t).data
+        except Exception as exc:
+            log.warning(
+                "factor-loading-zscores: read failed for %s (skipped): %s", t, exc,
+            )
+            read_fail += 1
+            continue
+        if df is None or df.empty:
+            continue
+        sub = pd.DataFrame({"ticker": t, "date": df.index})
+        for c in src_cols:
+            if c in df.columns:
+                # .to_numpy() — sub uses RangeIndex; df[c] is DatetimeIndex-aligned
+                # and would otherwise assign all-NaN via index mismatch.
+                sub[c] = df[c].astype(float).to_numpy()
+        frames.append(sub.reset_index(drop=True))
+
+    if not frames:
+        log.warning(
+            "factor-loading-zscores: no readable tickers (read_fail=%d) — "
+            "nothing materialized",
+            read_fail,
+        )
+        return {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
+
+    panel = pd.concat(frames, ignore_index=True)
+    zscore_parts: list[pd.DataFrame] = []
+    for date, grp in panel.groupby("date", sort=True):
+        cross = grp.drop(columns=["date"]).copy()
+        z = apply_factor_zscores(cross)
+        part = z[["ticker", *dst_cols]].copy()
+        part["date"] = date
+        zscore_parts.append(part)
+
+    zpanel = pd.concat(zscore_parts, ignore_index=True)
+
+    n_written = 0
+    n_all_nan = 0
+    write_fail = 0
+    n_tickers = zpanel["ticker"].nunique()
+    for t, grp in zpanel.groupby("ticker", sort=False):
+        z_by_date = grp.set_index("date")[dst_cols].astype(float)
+        if not np.isfinite(z_by_date.to_numpy()).any():
+            n_all_nan += 1
+        if not write:
+            continue
+        try:
+            df = universe_lib.read(t).data
+            for col in dst_cols:
+                df[col] = z_by_date[col].reindex(df.index).astype("float32")
+            out = canonical_fn(df) if canonical_fn is not None else df
+            universe_lib.write(t, out)
+            n_written += 1
+        except Exception as exc:
+            log.warning(
+                "factor-loading-zscores: write failed for %s (skipped): %s", t, exc,
+            )
+            write_fail += 1
+
+    if n_all_nan:
+        log.warning(
+            "factor-loading-zscores: %d/%d tickers have all-NaN z-score loadings "
+            "(missing source columns / degenerate cross-section → excluded from "
+            "risk-model B matrix downstream, NOT a silent zero).",
+            n_all_nan, n_tickers,
+        )
+    log.info(
+        "factor-loading-zscores materialized: %d written, %d all-NaN, "
+        "%d read-fail, %d write-fail (of %d panel tickers)",
+        n_written, n_all_nan, read_fail, write_fail, n_tickers,
+    )
+    return {
+        "status": "ok",
+        "tickers_written": n_written,
+        "tickers_all_nan": n_all_nan,
+        "read_fail": read_fail,
+        "write_fail": write_fail,
+    }
+
+
+def update_factor_loading_zscores_latest(
+    universe_lib,
+    tickers,
+    as_of_ts,
+    *,
+    write: bool = True,
+    canonical_fn=None,
+) -> dict:
+    """Daily go-forward update of C.1 ``*_zscore`` loadings (ArcticDB second pass).
+
+    Runs AFTER ``builders/daily_append`` has written today's per-ticker raw
+    loading columns so the cross-section is complete. Reads today's rows,
+    applies :func:`apply_factor_zscores`, and updates ONLY ``as_of_ts`` via
+    ``update_batch``. Best-effort — never raises into the daily pipeline.
+    """
+    from arcticdb.version_store.library import ReadRequest, UpdatePayload
+
+    src_cols = factor_loading_source_columns()
+    dst_cols = factor_loading_columns()
+    as_of_ts = pd.Timestamp(as_of_ts)
+    tickers = list(tickers)
+
+    rows: list[dict] = []
+    read_fail = 0
+    try:
+        src_results = universe_lib.read_batch([
+            ReadRequest(symbol=t, date_range=(as_of_ts, as_of_ts), columns=src_cols)
+            for t in tickers
+        ])
+    except Exception as exc:
+        log.warning(
+            "factor-loading-zscores daily: source read_batch failed (skipped): %s", exc,
+        )
+        return {"status": "read_error", "error": str(exc), "tickers_written": 0}
+
+    for t, res in zip(tickers, src_results):
+        data = getattr(res, "data", None)
+        if data is None or data.empty or as_of_ts not in data.index:
+            read_fail += 1
+            continue
+        row = {"ticker": t}
+        for c in src_cols:
+            row[c] = float(data.loc[as_of_ts, c]) if c in data.columns else np.nan
+        rows.append(row)
+
+    if not rows:
+        log.warning(
+            "factor-loading-zscores daily: no readable tickers @ %s (read_fail=%d)",
+            as_of_ts.date(), read_fail,
+        )
+        return {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
+
+    zscored = apply_factor_zscores(pd.DataFrame(rows))
+    z_by_ticker = {
+        r["ticker"]: {c: float(r[c]) for c in dst_cols}
+        for _, r in zscored.iterrows()
+    }
+    n_all_nan = sum(
+        1 for vals in z_by_ticker.values()
+        if not any(np.isfinite(v) for v in vals.values())
+    )
+    if not write:
+        return {
+            "status": "ok",
+            "tickers_written": 0,
+            "tickers_all_nan": n_all_nan,
+            "read_fail": read_fail,
+            "n_computed": len(z_by_ticker),
+        }
+
+    write_tickers = list(z_by_ticker)
+    try:
+        today_results = universe_lib.read_batch(
+            [ReadRequest(symbol=t, date_range=(as_of_ts, as_of_ts)) for t in write_tickers]
+        )
+    except Exception as exc:
+        log.warning(
+            "factor-loading-zscores daily: today read_batch failed (skipped): %s", exc,
+        )
+        return {
+            "status": "read_error",
+            "error": str(exc),
+            "tickers_written": 0,
+            "read_fail": read_fail,
+        }
+
+    payloads = []
+    for t, res in zip(write_tickers, today_results):
+        data = getattr(res, "data", None)
+        if data is None or data.empty or as_of_ts not in data.index:
+            continue
+        row = data.copy()
+        for col in dst_cols:
+            row.loc[as_of_ts, col] = np.float32(z_by_ticker[t][col])
+        out = canonical_fn(row) if canonical_fn is not None else row
+        payloads.append(UpdatePayload(symbol=t, data=out))
+
+    n_written = 0
+    write_fail = 0
+    if payloads:
+        try:
+            universe_lib.update_batch(payloads)
+            n_written = len(payloads)
+        except Exception as exc:
+            log.warning(
+                "factor-loading-zscores daily: update_batch failed (skipped): %s", exc,
+            )
+            write_fail = len(payloads)
+
+    if n_all_nan:
+        log.warning(
+            "factor-loading-zscores daily: %d/%d tickers all-NaN @ %s",
+            n_all_nan, len(z_by_ticker), as_of_ts.date(),
+        )
+    log.info(
+        "factor-loading-zscores daily update @ %s: %d written, %d all-NaN, "
+        "%d read-fail, %d write-fail (of %d computed)",
+        as_of_ts.date(), n_written, n_all_nan, read_fail, write_fail, len(z_by_ticker),
+    )
+    return {
+        "status": "ok",
+        "tickers_written": n_written,
+        "tickers_all_nan": n_all_nan,
+        "read_fail": read_fail,
+        "write_fail": write_fail,
+        "n_computed": len(z_by_ticker),
+    }

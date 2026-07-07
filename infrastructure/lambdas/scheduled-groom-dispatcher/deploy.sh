@@ -97,24 +97,22 @@ SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SF_ROLE_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 # Schedule definitions: name | cron expression (UTC) | JSON input (run_mode +
-# label, plus model/issue_filter for the Opus high-tier schedule). The two
-# Sonnet schedules omit model/issue_filter — the Lambda defaults them to
-# claude-sonnet-5 / "default" (the pre-existing mid-tier queue), so this is not
-# a behavior change for them.
+# schedule label, plus model/issue_filter per tier — config#1760 tier-split).
+# deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0700-daily"
-  "alpha-engine-scheduled-groom-2300-daily"
+  "alpha-engine-scheduled-groom-0700-daily-low"
   "alpha-engine-scheduled-groom-1500-daily-opus-high"
+  "alpha-engine-scheduled-groom-2300-daily-mid"
 )
 SCHED_CRONS=(
   "cron(0 7 * * ? *)"
-  "cron(0 23 * * ? *)"
   "cron(0 15 * * ? *)"
+  "cron(0 23 * * ? *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","schedule":"0 7 * * *"}'
-  '{"run_mode":"full","schedule":"0 23 * * *"}'
-  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","schedule":"0 15 * * *"}'
+  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 7 * * *"}'
+  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 15 * * *"}'
+  '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 23 * * *"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
@@ -156,35 +154,31 @@ print('index.py syntax OK')
 "
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
-# Hermetic for AWS (boto3/nousergon_lib are stubbed in sys.modules before
-# `import index` — see test_handler.py's header): those need real AWS creds/
-# services to exercise for real, so tests fake them instead. krepis (2026-07-04,
-# the pre-boot pace gate's linear-pace math) is pure stdlib with no AWS/creds
-# dependency, so it's installed for real here rather than stubbed — the tests
-# exercise the ACTUAL pace_check arithmetic, not a faked stand-in. Both land in
-# a scratch TEST_DEPS dir — NOT the caller's global site-packages, not bundled
-# into the Lambda zip — so this works on a bare CI runner (2026-07-02: the CI
-# auto-deploy workflow's FIRST real run failed here with "No module named
-# pytest" — this script had only ever been run from an operator's laptop
-# before, where pytest happened to already be installed as a dev dependency;
-# the gap was invisible until CI actually exercised this path).
+# Hermetic for AWS: boto3 + nousergon_lib.ec2_spot are stubbed in sys.modules
+# before `import index` (see test_handler.py). nousergon_lib.flow_doctor_fleet
+# is pure stdlib — install the REAL pinned enum from requirements.txt so the
+# hand-maintained FleetTelegramTopic fake cannot drift (config#1772). krepis
+# (pre-boot pace gate math) is also installed for real. Both land in a scratch
+# TEST_DEPS dir — NOT the caller's global site-packages, not bundled into the
+# Lambda zip.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest + krepis into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "krepis==0.10.0"
+  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  echo "Installing pytest + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
   echo "Running handler unit tests..."
   PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install \
-  --quiet \
-  --target "${PKG}" \
-  --upgrade \
-  -r "${SCRIPT_DIR}/requirements.txt"
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -229,7 +223,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -386,6 +380,18 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic schedule event, via the SF — the real live path) --
 

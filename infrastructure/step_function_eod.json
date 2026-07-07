@@ -1107,7 +1107,7 @@
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Pipeline \u2014 FAILED",
-        "Message.$": "States.Format('EOD pipeline failed. Error: {}', States.JsonToString($.error))"
+        "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Catch": [

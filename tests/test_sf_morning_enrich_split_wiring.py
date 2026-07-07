@@ -83,8 +83,9 @@ class TestChainOrdering:
         # downstream mutex→CheckShellRun→CheckSkipMorningEnrich chain is unchanged.
         # config#830: a cadence-preset gate (CheckRunMode) now precedes the lib-pin
         # gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the chain holds.
-        assert states["InitializeInput"]["Next"] == "CheckRunMode", (
-            "InitializeInput now hands off to the config#830 cadence-preset gate; "
+        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate", (
+            "InitializeInput hands off to the config#1824 run-day gate, whose "
+            "bypass Default -> CheckRunMode (config#830 cadence preset); "
             "CheckRunMode.Default → CheckSkipLibPinDriftCheck (the L4517 lib-pin "
             "gate); see tests/test_sf_lib_pin_drift_wiring.py for the gate→mutex chain"
         )

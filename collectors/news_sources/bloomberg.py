@@ -10,7 +10,7 @@ expect significant subscription cost in Phase 4 budget planning.
 
 from __future__ import annotations
 
-from alpha_engine_lib.sources import NewsArticle
+from nousergon_lib.sources import NewsArticle
 
 
 class BloombergNewsAdapter:

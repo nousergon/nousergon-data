@@ -2,7 +2,7 @@
 emailer.py — Completion email for data pipeline steps.
 
 Builds subject/body/HTML and delegates the SMTP+SES dispatch to
-``alpha_engine_lib.email_sender.send_email`` (the L4356 chokepoint).
+``nousergon_lib.email_sender.send_email`` (the L4356 chokepoint).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from alpha_engine_lib.email_sender import send_email
+from nousergon_lib.email_sender import send_email
 
 log = logging.getLogger(__name__)
 

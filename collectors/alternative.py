@@ -55,7 +55,7 @@ from typing import Optional
 
 import boto3
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 import requests
 
 from validators.price_validator import (
@@ -961,7 +961,7 @@ from .finnhub_client import finnhub_get as _finnhub_get  # noqa: E402
 # (collectors/finnhub_client.py, #397 / #399) — a one-off Yahoo throttle or
 # 5xx must not silently null the ``target_price`` half of analyst_consensus —
 # without inventing a second retry mechanism.
-from alpha_engine_lib.http_retry import backoff_delay  # noqa: E402
+from nousergon_lib.http_retry import backoff_delay  # noqa: E402
 
 # Tight attempt cap (issue L4611): yfinance ``.info`` is slow and heavily
 # Yahoo-throttled, and target_price is NOT the gating field for the

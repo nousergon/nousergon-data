@@ -17,7 +17,10 @@
       "Action": ["ssm:GetParameter"],
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
-        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_PIPELINE",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH"
       ]
     },
     {
@@ -37,8 +40,7 @@
         "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-groom-dispatch:*"
+        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:*"
       ]
     },
     {
@@ -46,6 +48,20 @@
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
+    },
+    {
+      "Sid": "FastPathRerun",
+      "Effect": "Allow",
+      "Action": [
+        "states:StartExecution",
+        "states:ListExecutions"
+      ],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+      ]
     }
   ]
 }

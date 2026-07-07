@@ -5,7 +5,7 @@
 # This Lambda subscribes to `aws.states` / "Step Functions Execution Status
 # Change" events for the three Alpha Engine SFs (saturday / weekday / eod)
 # and forwards human-readable summaries to Telegram via
-# `alpha_engine_lib.telegram.send_message`. Existing SNS → email path is
+# `nousergon_lib.telegram.send_message`. Existing SNS → email path is
 # unaffected.
 #
 # Managed outside CloudFormation — same rationale as spot-orphan-reaper +
@@ -48,7 +48,7 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Validate handler syntax -------------------------------------------
 
 python3 -c "
 import ast
@@ -57,24 +57,29 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
 
-echo "Installing deps into ${PKG} (pip install -t)..."
-python3 -m pip install \
-  --quiet \
-  --target "${PKG}" \
-  --upgrade \
-  -r "${SCRIPT_DIR}/requirements.txt"
+echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
+
+if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "Skipping unit tests on Darwin (Lambda deps are linux/amd64); CI runs them."
+  else
+    echo "Running handler unit tests..."
+    PYTHONPATH="${PKG}:${SCRIPT_DIR}:${LAMBDAS_DIR}" python3 -m pytest \
+      "${SCRIPT_DIR}/test_handler.py" "${SCRIPT_DIR}/test_execution_digest.py" -q
+  fi
+fi
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -117,7 +122,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 30 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO}' \
+      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -188,6 +193,19 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+echo "Updating Lambda environment (flow-doctor SSM hydration)..."
+run aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
 
 # ----- 4. Smoke (synthetic SUCCEEDED event) ---------------------------------
 

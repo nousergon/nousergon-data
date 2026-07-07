@@ -143,18 +143,18 @@ def ingest_articles(
             skip sector tagging.
         embed_texts_fn / document_exists_fn / ingest_document_fn:
             injectable for testing. Production callers pass None and
-            we lazy-import from ``alpha_engine_lib.rag``.
+            we lazy-import from ``nousergon_lib.rag``.
         dry_run: log the would-be ingest without calling the embedder
             or the DB writer. Useful for new-batch sanity checks.
     """
     if embed_texts_fn is None:
-        from alpha_engine_lib.rag import embed_texts
+        from nousergon_lib.rag import embed_texts
         embed_texts_fn = embed_texts
     if document_exists_fn is None:
-        from alpha_engine_lib.rag import document_exists
+        from nousergon_lib.rag import document_exists
         document_exists_fn = document_exists
     if ingest_document_fn is None:
-        from alpha_engine_lib.rag import ingest_document
+        from nousergon_lib.rag import ingest_document
         ingest_document_fn = ingest_document
     ticker_to_sector = ticker_to_sector or {}
 

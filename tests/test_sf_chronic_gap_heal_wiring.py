@@ -70,7 +70,7 @@ class TestChainOrdering:
         success = [
             c["Next"]
             for c in states["CheckMorningEnrichStatus"]["Choices"]
-            if c.get("StringEquals") == "Success"
+            if c.get("StringEquals") == "SUCCESS"
         ]
         assert success == ["CheckSkipMorningArcticAppend"], (
             "MorningEnrich success must hand off to the arctic-append gate"
@@ -79,25 +79,46 @@ class TestChainOrdering:
         append_success = [
             c["Next"]
             for c in states["CheckMorningArcticAppendStatus"]["Choices"]
-            if c.get("StringEquals") == "Success"
+            if c.get("StringEquals") == "SUCCESS"
         ]
         assert append_success == ["CheckSkipChronicGapHeal"]
         assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL
 
     def test_heal_routes_to_poll(self, states):
-        assert states[_HEAL]["Next"] == _POLL
+        # config#1811: an Init pass seeds the liveness-poll counters first.
+        assert states[_HEAL]["Next"] == "InitChronicGapPoll"
+        assert states["InitChronicGapPoll"]["Next"] == _POLL
 
     def test_poll_routes_to_status_check(self, states):
         assert states[_POLL]["Next"] == _CHECK
 
     def test_status_inprogress_and_pending_loop_via_wait(self, states):
+        # config#1811: the poller folds Pending/Delayed/registering into a
+        # single IN_PROGRESS verdict; only that verdict keeps polling.
         nexts = {
             c["StringEquals"]: c["Next"]
             for c in states[_CHECK]["Choices"]
         }
-        assert nexts["InProgress"] == _WAIT
-        assert nexts["Pending"] == _WAIT
+        assert nexts["IN_PROGRESS"] == _WAIT
         assert states[_WAIT]["Next"] == _POLL
+
+    def test_unresponsive_host_is_not_fail_soft(self, states):
+        """config#1811 carve-out: INSTANCE_UNRESPONSIVE is a HOST failure,
+        not a heal failure — the same wedged box every later step (planner,
+        daemon) needs. Proceeding fail-soft would just fail at
+        RunMorningPlanner after burning PredictorInference. It must route
+        to the stamp → force-stop → HandleFailure chain instead."""
+        nexts = {
+            c["StringEquals"]: c["Next"]
+            for c in states[_CHECK]["Choices"]
+        }
+        assert nexts["INSTANCE_UNRESPONSIVE"] == "StampChronicGapUnresponsive"
+        assert (
+            # config#1807: the heal runs on the daily data spot — an
+            # unresponsive host terminates the SPOT, not the trading box.
+            states["StampChronicGapUnresponsive"]["Next"]
+            == "ForceTerminateUnresponsiveDataSpot"
+        )
 
     def test_heal_precedes_predictor_inference(self, sf, states):
         """Walk the happy path from MorningEnrich success and assert
@@ -132,13 +153,18 @@ class TestFailSoft:
     # directly — still fail-soft: it proceeds toward predictions, never to
     # HandleFailure.
     _FWD = "CheckSkipPredictorInference"
+    # config#1807: data-phase exits route through the spot-terminate hook
+    # first; its Default (and TerminateDailyDataSpot both ways) proceed to
+    # _FWD, so the fail-soft guarantee is unchanged.
+    _HOOK = "CheckDataSpotToTerminate"
 
     def test_check_default_proceeds_toward_predictions_not_handlefailure(self, states):
         # Inverse of CheckMorningEnrichStatus, whose Default is HandleFailure.
-        assert states[_CHECK]["Default"] == self._FWD, (
+        assert states[_CHECK]["Default"] == self._HOOK, (
             "Chronic-gap heal is best-effort: any terminal status (incl. "
             "failure) must proceed toward PredictorInference, not HandleFailure."
         )
+        assert states[self._HOOK]["Default"] == self._FWD
         # And the gate it hands to must actually run PredictorInference.
         assert states[self._FWD]["Default"] == "PredictorInference"
 
@@ -146,16 +172,16 @@ class TestFailSoft:
         catches = states[_HEAL].get("Catch", [])
         assert catches, f"{_HEAL} must have a fail-soft Catch"
         for c in catches:
-            assert c["Next"] == self._FWD, (
+            assert c["Next"] == self._HOOK, (
                 f"{_HEAL} Catch must proceed toward PredictorInference via "
-                f"{self._FWD} (fail-soft), got {c['Next']}"
+                f"{self._HOOK} (fail-soft through the spot-terminate hook), got {c['Next']}"
             )
 
     def test_poll_catch_proceeds_toward_predictions(self, states):
         catches = states[_POLL].get("Catch", [])
         assert catches, f"{_POLL} must have a fail-soft Catch"
         for c in catches:
-            assert c["Next"] == self._FWD
+            assert c["Next"] == self._HOOK
 
     def test_no_heal_state_routes_to_handlefailure(self, states):
         """No Next/Default/Catch target across the heal quartet may be

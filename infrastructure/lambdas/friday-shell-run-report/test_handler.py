@@ -1,6 +1,6 @@
 """Unit tests for the friday-shell-run-report handler.
 
-The lib (``alpha_engine_lib.trading_calendar``) and boto3 are stubbed so tests
+The lib (``nousergon_lib.trading_calendar``) and boto3 are stubbed so tests
 do not hit AWS or require the lib install. The handler resolves trading_day from
 the execution NAME in the happy path, so the lib stub is only the fallback.
 """
@@ -16,13 +16,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Stub alpha_engine_lib.trading_calendar before importing the handler.
-_ael = types.ModuleType("alpha_engine_lib")
-_tc = types.ModuleType("alpha_engine_lib.trading_calendar")
+# Stub nousergon_lib.trading_calendar before importing the handler.
+_ael = types.ModuleType("nousergon_lib")
+_tc = types.ModuleType("nousergon_lib.trading_calendar")
 _tc.last_closed_trading_day = lambda dt: dt.date()  # fallback only
 _ael.trading_calendar = _tc
-sys.modules.setdefault("alpha_engine_lib", _ael)
-sys.modules.setdefault("alpha_engine_lib.trading_calendar", _tc)
+sys.modules.setdefault("nousergon_lib", _ael)
+sys.modules.setdefault("nousergon_lib.trading_calendar", _tc)
 
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402

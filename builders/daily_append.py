@@ -253,7 +253,7 @@ UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 # Trading-day-aware staleness threshold. 3 trading days ≈ the prior
 # 5-calendar-day threshold (which was Fri→Wed under weekend buffer);
 # trading-day arithmetic handles weekends + holidays natively via
-# alpha_engine_lib.dates.trading_days_stale.
+# nousergon_lib.dates.trading_days_stale.
 UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
 
@@ -451,7 +451,7 @@ def _scan_universe_and_emit_freshness_receipt(
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
     last-row date must be within ``max_stale_trading_days`` NYSE sessions
-    of today. Trading-day-aware via ``alpha_engine_lib.dates`` so weekend
+    of today. Trading-day-aware via ``nousergon_lib.dates`` so weekend
     runs don't false-fail on calendar-day weekend gaps.
 
     On all-fresh: writes ``s3://{bucket}/health/universe_freshness.json``
@@ -512,7 +512,7 @@ def _scan_universe_and_emit_freshness_receipt(
     else:
         syms = all_syms
 
-    from alpha_engine_lib.dates import trading_days_stale
+    from nousergon_lib.dates import trading_days_stale
     today = datetime.now(timezone.utc).date()
     today_iso = today.isoformat()
 
@@ -987,7 +987,7 @@ def daily_append(
     **Producer-side write-coordination lock.** When
     ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED=true`` is in the
     environment, this function acquires the
-    :func:`alpha_engine_lib.locks.universe_writer_lock` at the top of
+    :func:`nousergon_lib.locks.universe_writer_lock` at the top of
     the call and releases it on exit. The lock closes the
     manual-invocation half of the single-writer-per-resource invariant
     (forensic / backfill / dev shells running ``python -m
@@ -997,7 +997,7 @@ def daily_append(
     one clean weekday + Saturday cycle. ``dry_run=True`` always bypasses
     the lock (read-only path, no race surface).
 
-    On lock contention, :exc:`alpha_engine_lib.locks.LockHeldByAnotherWriterError`
+    On lock contention, :exc:`nousergon_lib.locks.LockHeldByAnotherWriterError`
     propagates to the caller — fail-loud per
     ``~/Development/CLAUDE.md``'s no-silent-fails rule.
 
@@ -1041,7 +1041,7 @@ def daily_append(
     Returns summary dict.
     """
     if _writer_lock_enabled(dry_run):
-        from alpha_engine_lib.locks import universe_writer_lock
+        from nousergon_lib.locks import universe_writer_lock
 
         with universe_writer_lock(writer_id=_build_writer_id()):
             return _daily_append_impl(
@@ -1089,7 +1089,7 @@ def _daily_append_impl(
     # calendar source of truth as the Step Function's CheckTradingDay gate.
     from datetime import date as _date
 
-    from alpha_engine_lib.trading_calendar import is_trading_day as _is_td
+    from nousergon_lib.trading_calendar import is_trading_day as _is_td
 
     if not _is_td(_date.fromisoformat(date_str)):
         raise ValueError(
@@ -2103,6 +2103,28 @@ def _daily_append_impl(
                 log.info("Factor-momentum daily update: %s", json.dumps(fm_result, default=str))
             except Exception as exc:  # belt-and-suspenders — never fail the daily pipeline
                 log.warning("Factor-momentum daily update FAILED (OBSERVE, non-fatal): %s", exc)
+
+        # ── C.1: factor-loading z-score daily go-forward second pass ─────────
+        # The 9 *_zscore Barra loadings (C.3 / predictor risk_model_persist)
+        # are cross-sectional — same structural gap as factor_momentum_ratio.
+        # S3 feature store already runs apply_factor_zscores in compute.py;
+        # this pass keeps ArcticDB (predictor training + C.2b F+D persistence)
+        # in sync. Best-effort + gated; never fails the daily pipeline.
+        if os.environ.get("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "true").lower() != "false":
+            try:
+                from features.cross_sectional import update_factor_loading_zscores_latest
+                flz_result = update_factor_loading_zscores_latest(
+                    universe_lib, stock_tickers, today_ts,
+                    canonical_fn=to_arctic_canonical,
+                )
+                log.info(
+                    "Factor-loading z-score daily update: %s",
+                    json.dumps(flz_result, default=str),
+                )
+            except Exception as exc:
+                log.warning(
+                    "Factor-loading z-score daily update FAILED (non-fatal): %s", exc,
+                )
 
         # Producer-side post-write validation. Catches the partial-write
         # class (2026-04-21 ASGN/MOH) that the per-ticker error-rate gate

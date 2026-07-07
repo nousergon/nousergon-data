@@ -39,7 +39,19 @@
         }
       ],
       "ResultPath": "$.groomLaunch",
-      "Next": "CheckLaunched"
+      "Next": "RelaunchNotifyGate"
+    },
+    "RelaunchNotifyGate": {
+      "Type": "Choice",
+      "Comment": "Relaunch-first, notify-second (2026-07-06): only ping SNS after a successful re-launch (retry_count>0). First launch (retry_count==0) skips straight to polling. NotifyRelaunch failures must not block polling — its Catch routes to CheckLaunched.",
+      "Choices": [
+        {
+          "Variable": "$.retry_count",
+          "NumericGreaterThan": 0,
+          "Next": "NotifyRelaunch"
+        }
+      ],
+      "Default": "CheckLaunched"
     },
     "CheckLaunched": {
       "Type": "Choice",
@@ -135,12 +147,14 @@
     },
     "PrepRelaunch": {
       "Type": "Pass",
-      "Comment": "config#1645: bump the counter for the next attempt (each relaunch calls the Lambda fresh, which mints its own new run_token — the old attempt's absent marker is never confused with the new attempt's).",
+      "Comment": "config#1645: bump the counter for the next attempt (each relaunch calls the Lambda fresh, which mints its own new run_token — the old attempt's absent marker is never confused with the new attempt's). MUST preserve groomPoll/groomLaunch through the relaunch path — NotifyRelaunch (best-effort) and audit trails reference them; dropping them caused States.Runtime on States.Format (2026-07-06 live failure: Opus groom never relaunched after spot death).",
       "Parameters": {
         "schedInput.$": "$.schedInput",
         "retry_count.$": "States.MathAdd($.retry_count, 1)",
         "max_retries.$": "$.max_retries",
-        "fod.$": "$.fod"
+        "fod.$": "$.fod",
+        "groomPoll.$": "$.groomPoll",
+        "groomLaunch.$": "$.groomLaunch"
       },
       "Next": "CheckForceOnDemand"
     },
@@ -154,36 +168,39 @@
           "Next": "SetForceOnDemand"
         }
       ],
-      "Default": "NotifyRelaunch"
+      "Default": "LaunchGroomSpot"
     },
     "SetForceOnDemand": {
       "Type": "Pass",
+      "Comment": "Final relaunch attempt — escalate to on-demand. Preserves groomPoll/groomLaunch for downstream visibility.",
       "Parameters": {
         "schedInput.$": "$.schedInput",
         "retry_count.$": "$.retry_count",
         "max_retries.$": "$.max_retries",
-        "fod": {"force_on_demand": true}
+        "fod": {"force_on_demand": true},
+        "groomPoll.$": "$.groomPoll",
+        "groomLaunch.$": "$.groomLaunch"
       },
-      "Next": "NotifyRelaunch"
+      "Next": "LaunchGroomSpot"
     },
     "NotifyRelaunch": {
       "Type": "Task",
-      "Comment": "config#1645: best-effort WARNING-level ping (distinct from HandleFailure's FAILED alert) so a spot interruption is visible in real time instead of only discoverable after the fact via CloudWatch log archaeology. Never blocks the relaunch on a publish failure.",
+      "Comment": "config#1645: best-effort WARNING-level ping AFTER the relaunch box is already launching (LaunchGroomSpot -> RelaunchNotifyGate -> here). A States.Format intrinsic error in Parameters is NOT catchable (States.Runtime) — groomPoll is preserved through PrepRelaunch/SetForceOnDemand for this message. SNS publish failures ARE catchable and route to CheckLaunched so a notify hiccup never blocks polling the new run.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine Backlog Groom — spot interrupted, auto-relaunching",
-        "Message.$": "States.Format('Backlog groom box appears to have been reclaimed mid-run (SSM status={}, no completion marker). Relaunching automatically: attempt {} of {}, force_on_demand={}.', $.groomPoll.Status, $.retry_count, $.max_retries, $.fod.force_on_demand)"
+        "Message.$": "States.Format('Backlog groom box died mid-run (SSM status={}, no completion marker). Relaunched automatically: attempt {} of {} (force_on_demand={}).', $.groomPoll.Status, $.retry_count, $.max_retries, States.JsonToString($.fod.force_on_demand))"
       },
       "ResultPath": "$.relaunch_notify",
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "LaunchGroomSpot",
+          "Next": "CheckLaunched",
           "ResultPath": "$.relaunch_notify_error"
         }
       ],
-      "Next": "LaunchGroomSpot"
+      "Next": "CheckLaunched"
     },
     "GroomStatusError": {
       "Type": "Pass",

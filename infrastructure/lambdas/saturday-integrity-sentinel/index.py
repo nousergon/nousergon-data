@@ -37,7 +37,8 @@ from datetime import datetime, timezone
 
 import boto3
 
-from alpha_engine_lib.telegram import send_message
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -58,6 +59,12 @@ MARKER_PREFIX = os.environ.get(
 )
 TARGET_CADENCE = "saturday_sf"
 TARGET_SEVERITY = "critical"
+_FLOW_NAME = "saturday-integrity-sentinel"
+_DB_BASENAME = "flow_doctor_saturday_integrity_sentinel"
+_OPS_HEALTH_TOPICS = (
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 # Per-spec states that count as "present + safe to trade on" (mirrors the
 # freshness substrate's cycle_completion, which filters to severity=critical).
 _OK_STATES = frozenset({"fresh", "grace_period"})
@@ -152,9 +159,10 @@ def _write_marker(s3, run_date: str, verdict: dict) -> str:
     return key
 
 
-def _notify(verdict: dict, key: str) -> bool:
+def _notify(verdict: dict, key: str, run_date: str) -> bool:
     """LOUD on NO-GO; silent heartbeat on GO. Best-effort — never raises."""
     go = verdict["go"]
+    uncertain = verdict.get("uncertain", False)
     if go:
         text = (
             "🟢 *Saturday Integrity — GO*\n"
@@ -162,8 +170,9 @@ def _notify(verdict: dict, key: str) -> bool:
             "_safe to trade on Saturday's outputs_"
         )
         silent = True
+        severity = "info"
     else:
-        flag = "⚠️ UNCERTAIN" if verdict.get("uncertain") else "🔴 NO-GO"
+        flag = "⚠️ UNCERTAIN" if uncertain else "🔴 NO-GO"
         lines = [f"{flag} *Saturday Integrity — NO-GO*", verdict["reason"]]
         if verdict.get("missing"):
             lines.append(f"Missing: {', '.join(verdict['missing'])}")
@@ -173,8 +182,19 @@ def _notify(verdict: dict, key: str) -> bool:
         lines.append("_independent of the watch agent — a swallow can't hide here_")
         text = "\n".join(lines)
         silent = False
+        severity = "warning" if uncertain else "error"
     try:
-        return bool(send_message(text, disable_notification=silent))
+        return notify_via_flow_doctor(
+            text,
+            silent=silent,
+            severity=severity,
+            dedup_key=f"{_FLOW_NAME}:{run_date}:go={go}:uncertain={uncertain}",
+            flow_name=_FLOW_NAME,
+            topics=_OPS_HEALTH_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"run_date": run_date, "go": go, "uncertain": uncertain},
+            silent_topic=FleetTelegramTopic.OPS_HEALTH,
+        )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("integrity Telegram failed (non-fatal): %s", exc)
         return False
@@ -192,7 +212,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     verdict["checked_at"] = now.isoformat()
 
     key = _write_marker(s3, run_date, verdict)  # PRIMARY — fail-loud
-    telegram_sent = _notify(verdict, key)       # secondary — best-effort
+    telegram_sent = _notify(verdict, key, run_date)       # secondary — best-effort
 
     logger.info(
         "Saturday integrity %s: %s (marker=%s telegram=%s)",

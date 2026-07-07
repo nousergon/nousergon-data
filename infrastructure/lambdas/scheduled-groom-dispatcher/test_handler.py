@@ -1,12 +1,13 @@
 """Unit tests for the EventBridge-Scheduler → groom-spot dispatcher (config#1432).
 
-Hermetic: `nousergon_lib.ec2_spot` and `boto3` are stubbed in sys.modules BEFORE
-importing index, so the tests run without either installed (matching how
-deploy.sh runs them with bare python3). Validates: a schedule event launches a
-spot box and fires an async SSM command carrying the run_mode; the on-demand
-fallback on spot capacity exhaustion; run_mode normalisation; the kill-switch
-short-circuit; and fail-loud (a launch failure RAISES so EventBridge retries +
-the error metric surface the miss).
+Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
+BEFORE importing index; ``nousergon_lib.flow_doctor_fleet`` is the REAL pinned
+enum installed by deploy.sh's preflight gate (config#1772 — no hand-maintained
+FleetTelegramTopic fake). Validates: a schedule event launches a spot box and
+fires an async SSM command carrying the run_mode; the on-demand fallback on spot
+capacity exhaustion; run_mode normalisation; the kill-switch short-circuit; and
+fail-loud (a launch failure RAISES so EventBridge retries + the error metric
+surface the miss).
 """
 
 from __future__ import annotations
@@ -15,10 +16,12 @@ import importlib
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ── Stub nousergon_lib.ec2_spot + boto3 before importing index ─────────────────
@@ -31,14 +34,17 @@ class _SpotCapacityExhausted(_SpotLaunchError):
 
 
 def _install_stubs(launch_impl, boto_clients):
+    # Real nousergon_lib.flow_doctor_fleet (FleetTelegramTopic enum) is installed
+    # into TEST_DEPS by deploy.sh — do NOT hand-roll it here (config#1772).
     ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
     ec2_spot_mod.SpotLaunchError = _SpotLaunchError
     ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
     ec2_spot_mod.launch = launch_impl
-    pkg = types.ModuleType("nousergon_lib")
-    pkg.ec2_spot = ec2_spot_mod
-    sys.modules["nousergon_lib"] = pkg
     sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
+
+    fdt_mod = types.ModuleType("flow_doctor_telegram")
+    fdt_mod.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+    sys.modules["flow_doctor_telegram"] = fdt_mod
 
     boto3_mod = types.ModuleType("boto3")
     boto3_mod.client = lambda name, **kw: boto_clients[name]
@@ -63,8 +69,9 @@ class _FakeEc2:
 
 
 class _FakeSsm:
-    def __init__(self):
+    def __init__(self, parameters=None):
         self.sent = []
+        self.parameters = dict(parameters or {})
 
     def describe_instance_information(self, **kw):
         return {"InstanceInformationList": [{"PingStatus": "Online"}]}
@@ -72,6 +79,11 @@ class _FakeSsm:
     def send_command(self, **kw):
         self.sent.append(kw)
         return {"Command": {"CommandId": "cmd-123"}}
+
+    def get_parameter(self, Name):  # noqa: N803 — boto3 API
+        if Name not in self.parameters:
+            raise RuntimeError(f"Parameter {Name} not found")
+        return {"Parameter": {"Value": self.parameters[Name]}}
 
 
 class _FakeS3Body:
@@ -109,16 +121,22 @@ class _FakeS3:
         return {"Body": _FakeS3Body(self._objects[Key])}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None):
+def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
-    ssm = _FakeSsm()
+    ssm = _FakeSsm(ssm_parameters)
     ec2 = _FakeEc2()
     s3 = _FakeS3(s3_objects)
     clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
+    # Derive the stub requirement from index.py's live import graph and fail
+    # loud on drift here, rather than as a ModuleNotFoundError at deploy time
+    # (config#1746 — this stub has drifted three times: config#1742/#1748).
+    from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
+
+    assert_hermetic_imports_satisfied(__file__)
     import index
 
     importlib.reload(index)
@@ -209,20 +227,50 @@ def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
     assert cmd.index("export GROOM_MODEL") < cmd.index("groom_spot_bootstrap.sh")
 
 
+def test_high_only_schedule_forwards_pr_budget(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {
+            "run_mode": "full",
+            "model": "claude-opus-4-8",
+            "issue_filter": "high-only",
+            "schedule": "0 15 * * *",
+            "pr_budget": 100,
+        },
+        None,
+    )
+    assert out["groom"]["pr_budget"] == 100
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_PR_BUDGET=100" in cmd
+
+
+def test_deploy_schedule_high_only_carries_pr_budget():
+    deploy_sh = (
+        Path(__file__).resolve().parent / "deploy.sh"
+    ).read_text()
+    assert '"pr_budget":100' in deploy_sh or '"pr_budget": 100' in deploy_sh
+    # Haiku/Sonnet schedules must NOT inherit the Opus override.
+    low_line = next(
+        line for line in deploy_sh.splitlines()
+        if "low-only" in line and "SCHED_INPUTS" not in line
+    )
+    assert "pr_budget" not in low_line
+
+
 # ── Pre-boot pace gate (2026-07-04) ─────────────────────────────────────────
 def _wet_doc(wet: float) -> bytes:
     import json
     return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
 
 
-def _spy_send_message(monkeypatch, idx):
-    """Replace krepis.telegram.send_message (imported into index as
-    `send_message`) with a recorder — avoids exercising the real secret
-    resolution / HTTP path (this test harness's fake SSM client doesn't
-    implement get_parameter, so the real krepis.secrets code path would blow
-    up on an AttributeError it isn't built to catch)."""
+def _spy_notify(monkeypatch, idx):
+    """Replace notify_via_flow_doctor with a recorder."""
     calls = []
-    monkeypatch.setattr(idx, "send_message", lambda text, **kw: calls.append(text) or True)
+    monkeypatch.setattr(
+        idx,
+        "notify_via_flow_doctor",
+        lambda text, **kw: calls.append((text, kw)) or True,
+    )
     return calls
 
 
@@ -235,7 +283,7 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
 
     def _launch(types_, subnets, **kw):
         raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
@@ -250,9 +298,12 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     # The pre-boot skip must notify — it's the ONLY place this outcome is ever
     # visible (a run that never boots has no on-box groom_run.sh to ping).
     assert len(notified) == 1
-    assert "SKIPPED" in notified[0]
-    assert "soft budget threshold passed before boot" in notified[0]
-    assert "never launched" in notified[0]
+    assert notified[0][1]["silent"] is True
+    assert notified[0][1]["severity"] == "info"
+    assert notified[0][1]["silent_topic"] is not None
+    assert "SKIPPED" in notified[0][0]
+    assert "soft budget threshold passed before boot" in notified[0][0]
+    assert "never launched" in notified[0][0]
 
 
 def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
@@ -263,11 +314,27 @@ def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
     assert notified == []  # no ping when nothing was skipped
+
+
+def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
+    # Way over pace, but SSM override is active -> still launch.
+    idx = _load(
+        monkeypatch,
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        s3_objects={"claude_code_usage/groom/2026-06-29.json":
+                    _wet_doc(0.9 * 1_140_000_000)},
+        ssm_parameters={"/alpha-engine/groom/dynamic_budget_override_until": "2099-01-01T00:00"},
+    )
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is True
 
 
 def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
@@ -278,7 +345,7 @@ def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert notified == []  # kill-switch disables the ping too — the gate never ran
@@ -286,7 +353,7 @@ def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
 
 def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    notified = _spy_send_message(monkeypatch, idx)
+    notified = _spy_notify(monkeypatch, idx)
 
     def _boom(**kw):
         raise RuntimeError("S3 unreachable")
@@ -296,23 +363,37 @@ def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     assert notified == []  # fail-safe path never trips (exceeded=False), no ping
 
 
-def test_missing_model_and_issue_filter_default_to_sonnet_queue(monkeypatch):
-    # The 2 pre-existing Sonnet schedules don't set model/issue_filter — must
-    # default exactly like before this feature (no behavior change for them).
+def test_missing_model_and_issue_filter_default_to_mid_queue(monkeypatch):
+    # Schedules with no model/issue_filter must default to Sonnet / mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     g = out["groom"]
     assert g["model"] == "claude-sonnet-5"
-    assert g["issue_filter"] == "default"
+    assert g["issue_filter"] == "mid-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "export GROOM_MODEL=claude-sonnet-5" in cmd
-    assert "export GROOM_ISSUE_FILTER=default" in cmd
+    assert "export GROOM_ISSUE_FILTER=mid-only" in cmd
 
 
-def test_unknown_issue_filter_falls_back_to_default(monkeypatch):
+def test_low_only_schedule_forwards_haiku_model_and_filter(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {"run_mode": "full", "model": "claude-haiku-4-5", "issue_filter": "low-only",
+         "schedule": "0 7 * * *"},
+        None,
+    )
+    g = out["groom"]
+    assert g["model"] == "claude-haiku-4-5"
+    assert g["issue_filter"] == "low-only"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+    assert "export GROOM_ISSUE_FILTER=low-only" in cmd
+
+
+def test_unknown_issue_filter_falls_back_to_mid_only(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "issue_filter": "bogus"}, None)
-    assert out["groom"]["issue_filter"] == "default"
+    assert out["groom"]["issue_filter"] == "mid-only"
 
 
 def test_malformed_model_falls_back_to_default(monkeypatch):

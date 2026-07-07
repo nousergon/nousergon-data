@@ -58,12 +58,12 @@ _UNIVERSE_SAMPLE_SIZE = 20
 # Max staleness of a sampled universe ticker relative to SPY's last row, in
 # *trading days*. >0 tolerates a single missing session (e.g. one ticker
 # caught in a partial-write race); >2 starts looking like systematic write
-# failure. Trading-day-aware via alpha_engine_lib.dates so post-Saturday
+# failure. Trading-day-aware via nousergon_lib.dates so post-Saturday
 # redrives don't trip on calendar-day weekend artifacts.
 _UNIVERSE_MAX_STALE_VS_SPY_TRADING_DAYS = 2
 
 # Minimum macro.SPY freshness in *trading days*: must carry the most recent
-# NYSE close that exists as of run_date. Holiday-aware via alpha_engine_lib.
+# NYSE close that exists as of run_date. Holiday-aware via nousergon_lib.
 # dates.is_fresh_in_trading_days — replaces the calendar-day arithmetic that
 # broke every post-Saturday redrive (2026-05-24 incident). Threshold is 0 (the
 # producer just wrote; must carry the latest close, no T+1 tolerance).
@@ -119,7 +119,7 @@ class DataPostflight:
 
     def _open_arctic_libs(self) -> "tuple[Any, Any]":
         if self._universe_lib is None or self._macro_lib is None:
-            from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
+            from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
             try:
                 self._universe_lib = open_universe_lib(self.bucket, region=self.region)
                 self._macro_lib = open_macro_lib(self.bucket, region=self.region)
@@ -134,13 +134,13 @@ class DataPostflight:
 
         SPY lives in the ArcticDB macro library. Its last row must carry the
         most recent NYSE close that exists as of ``run_date``. Trading-day-
-        aware via ``alpha_engine_lib.dates.is_fresh_in_trading_days``:
+        aware via ``nousergon_lib.dates.is_fresh_in_trading_days``:
         Friday's close passes on Saturday/Sunday/Memorial-Day-Monday runs
         because zero NYSE sessions have closed in between. The earlier
         calendar-day formulation (``(run_date - last_date).days > 1``) broke
         every post-Saturday redrive (2026-05-24 incident).
         """
-        from alpha_engine_lib.dates import (
+        from nousergon_lib.dates import (
             is_fresh_in_trading_days,
             trading_days_stale,
             expected_last_close,
@@ -194,7 +194,7 @@ class DataPostflight:
         per-ticker error rate in research's ``PriceFetchError`` check at
         Lambda runtime.
         """
-        from alpha_engine_lib.dates import trading_days_stale
+        from nousergon_lib.dates import trading_days_stale
 
         universe_lib, macro_lib = self._open_arctic_libs()
 
