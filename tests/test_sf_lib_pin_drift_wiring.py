@@ -88,8 +88,9 @@ def test_gate_halts_only_on_confirmed_drift(states):
     # Confirmed drift halts, but routes through the $.error normalizer FIRST
     # (not straight to HandleFailure) — see test_drift_halt_normalizes_error.
     assert c["Next"] == "ExtractLibPinDriftError"
-    # No drift → proceed into the pipeline.
-    assert gate["Default"] == "CheckMutexRole"
+    # No drift → proceed into the pipeline-contract preflight gate (config#693),
+    # composed directly after this gate's pass-through.
+    assert gate["Default"] == "PipelineContractCheck"
 
 
 def test_drift_halt_normalizes_error_before_handle_failure(states):

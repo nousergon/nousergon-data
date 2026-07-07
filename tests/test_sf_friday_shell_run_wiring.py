@@ -994,6 +994,10 @@ class TestHappyPathTraversal:
         # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
         # config#1824: the run-day gate is the first hop; a role-less input
         # takes its Default straight to CheckRunMode — one extra Choice.
+        # config#693 (L4595): the pipeline-contract preflight gate is now
+        # composed directly after LibPinDriftGate's pass-through (no drift ->
+        # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
+        # violation) — two extra states in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1001,6 +1005,8 @@ class TestHappyPathTraversal:
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",
+            "PipelineContractCheck",
+            "PipelineContractGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
