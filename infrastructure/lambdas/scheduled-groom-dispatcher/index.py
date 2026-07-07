@@ -73,7 +73,11 @@ from zoneinfo import ZoneInfo
 import boto3
 from flow_doctor_telegram import notify_via_flow_doctor
 from krepis.usage_pacing import pace_check, reset_window
+import urllib.error
+import urllib.request
+
 from nousergon_lib import ec2_spot
+from nousergon_lib import groom_eligibility as ge
 from nousergon_lib.ec2_spot import SpotCapacityExhausted
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
@@ -87,6 +91,18 @@ _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
+
+# config#1933 demand-driven dispatch: enumerate actionable issues per tier
+# BEFORE any spot spend and launch only when the slot's queue (own tier +
+# starving lower tiers) clears the floor or an escape valve fires. Kill-switch
+# independent of GROOM_DISPATCH_ENABLED — flipping this off restores the
+# legacy unconditional slot launches without touching schedules.
+DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower() == "true"
+BACKLOG_REPOS = (
+    "nousergon/alpha-engine-config", "nousergon/metron-ops",
+    "nousergon/vires-ops", "nousergon/telos-ops",
+)
+_RESEARCH_BUCKET = "alpha-engine-research"
 
 # ── Pre-boot pace gate (mirrors alpha-engine-config/scripts/groom_budget.py) ───
 # Kill-switch independent of GROOM_DISPATCH_ENABLED — lets ops disable JUST the
@@ -143,7 +159,11 @@ _DEFAULT_RUN_MODE = "full"
 # config#1891: "gated-reverify" is the weekly Sunday stale-gate lane — missing
 # from this set until 2026-07-07, so the Sunday schedule would have silently
 # degraded to mid-only (caught by a manual dispatch before the first fire).
-_VALID_ISSUE_FILTERS = {"default", "mid-only", "low-only", "high-only", "gated-reverify"}
+# config#1933: the filter set now comes from nousergon_lib.groom_eligibility —
+# ONE source shared with the config groom driver (contract-tested there), so
+# the PR683 silent-drift class (this set diverging from the driver's) is
+# structurally closed.
+_VALID_ISSUE_FILTERS = set(ge.VALID_ISSUE_FILTERS)
 _DEFAULT_ISSUE_FILTER = "mid-only"
 _DEFAULT_MODEL = "claude-sonnet-5"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
@@ -543,6 +563,121 @@ def _notify_pace_skip(pace: dict, schedule_label: str, run_mode: str) -> None:
         logger.warning("pace-gate skip Telegram failed (non-fatal): %s", exc)
 
 
+def _github_token() -> str:
+    """PAT for pre-boot enumeration, read from SSM (same param the box uses)."""
+    ssm = boto3.client("ssm", region_name=REGION)
+    resp = ssm.get_parameter(Name=GROOM_GH_PAT_SSM, WithDecryption=True)
+    return resp["Parameter"]["Value"].strip()
+
+
+def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
+    """(counts per tier, oldest wait-hours per tier, has actionable P0).
+
+    Wait = hours since the issue's last activity (updatedAt) — the operative
+    "sitting untouched" signal for the ARCH §66 escape valve. Freshness-skip
+    is NOT applied here (the on-box driver enumeration stays authoritative);
+    the slight overcount only ever biases toward launching.
+    """
+    counts: dict[str, int] = {t: 0 for t in ge.TIERS}
+    oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
+    has_p0 = False
+    now = datetime.now(ZoneInfo("UTC"))
+    for repo in BACKLOG_REPOS:
+        page = 1
+        while True:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/issues"
+                f"?state=open&per_page=100&page={page}",
+                headers={"Authorization": f"token {token}",
+                         "Accept": "application/vnd.github+json",
+                         "User-Agent": "scheduled-groom-dispatcher"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                batch = json.loads(resp.read().decode())
+            for it in batch:
+                if "pull_request" in it:
+                    continue
+                labels = [lbl["name"] for lbl in it.get("labels", [])]
+                tier = ge.is_actionable(labels)
+                if tier is None:
+                    continue
+                counts[tier] += 1
+                updated = datetime.fromisoformat(
+                    str(it.get("updated_at", "")).replace("Z", "+00:00"))
+                waited = max(0.0, (now - updated).total_seconds() / 3600.0)
+                oldest[tier] = max(oldest[tier], waited)
+                if "P0" in labels:
+                    has_p0 = True
+            if len(batch) < 100:
+                break
+            page += 1
+    return counts, oldest, has_p0
+
+
+def _write_decision_record(slot_tier: str, decision, counts: dict,
+                           schedule_label: str) -> None:
+    """groom/decisions/{date}/{slot}.json — a skipped slot must be
+    distinguishable from a broken scheduler (no-silent-caps). Best-effort."""
+    date = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    key = f"groom/decisions/{date}/{slot_tier}.json"
+    body = json.dumps({
+        "schema_version": 1, "slot_tier": slot_tier, "schedule": schedule_label,
+        "counts": counts, **decision.as_record(),
+        "decided_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — observability, never blocks dispatch
+        logger.warning("decision record write failed (non-fatal): %s", exc)
+
+
+def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
+    """Best-effort ping for a demand-gate skip — never raises."""
+    text = (
+        "⚪ Backlog groom slot SKIPPED — light queue (config#1933). "
+        f"schedule={schedule_label}: {decision.reason}. Counts {counts}. "
+        "Zero spot/WET spend; issues defer upward or ride the next slot."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=True, severity="info",
+            dedup_key=f"{_FLOW_NAME}:demand_skip:{schedule_label}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, **decision.as_record()},
+            silent_topic=FleetTelegramTopic.GROOM,
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("demand-skip Telegram failed (non-fatal): %s", exc)
+
+
+def _demand_decision(issue_filter: str, schedule_label: str):
+    """config#1933 enumerate-then-decide. Returns a SlotDecision, or None to
+    proceed with the legacy unconditional launch (gate off / non-slot run /
+    enumeration failure — the gate is an optimization, NEVER a correctness
+    gate, so any error here fail-safes to launching). Counts are passed to
+    the record writer via the decision closure below."""
+    if not DEMAND_GATE_ENABLED:
+        return None
+    try:
+        slot_tiers = ge.filter_tiers(issue_filter)
+    except ValueError:
+        return None
+    if len(slot_tiers) != 1:
+        return None  # gated-reverify / already-bundled manual invokes bypass
+    try:
+        counts, oldest, has_p0 = _enumerate_tier_stats(_github_token())
+        decision = ge.decide_slot(slot_tiers[0], counts, oldest, has_p0)
+        _write_decision_record(slot_tiers[0], decision, counts, schedule_label)
+        return decision, counts
+    except Exception as exc:  # noqa: BLE001 — fail-safe to legacy launch
+        logger.warning("demand gate unavailable (%s) — legacy unconditional "
+                       "launch", exc)
+        return None
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
@@ -588,6 +723,23 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             )
             _notify_pace_skip(pace, schedule_label, run_mode)
             return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
+
+    if run_mode == "full" and not force_on_demand:
+        decided = _demand_decision(issue_filter, schedule_label)
+        if decided is not None:
+            decision, counts = decided
+            if not decision.launch:
+                logger.info("demand gate SKIP — %s", decision.reason)
+                _notify_demand_skip(decision, counts, schedule_label)
+                return {"groom": {"launched": False, "reason": "demand_gate_skip",
+                                  "decision": decision.as_record(), "counts": counts}}
+            # Launch with the DECIDED bundle + cheapest adequate model — the
+            # schedule's model is only the slot default; high never runs
+            # below Opus, and a bundle without high never pays for it.
+            issue_filter = decision.issue_filter
+            model = decision.model
+            logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",
+                        decision.reason, issue_filter, model)
 
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
