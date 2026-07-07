@@ -147,6 +147,9 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),
     "RecheckCoverage": frozenset({"action"}),
     "PredictorHealthCheck": frozenset({"action"}),
+    # config#1853: daily prediction-health producer — writes
+    # predictor/metrics/drift_{trading_day}.json every weekday.
+    "PredictorDriftCheck": frozenset({"action", "date.$"}),
     "WaitForCodeFreshness": _LIVENESS_POLLER_KEYS,
     "WaitForMorningEnrich": _LIVENESS_POLLER_KEYS,
     "WaitForMorningArcticAppend": _LIVENESS_POLLER_KEYS,
