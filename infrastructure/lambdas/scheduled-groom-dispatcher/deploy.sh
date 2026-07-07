@@ -41,6 +41,7 @@
 #   01:00 daily     cron(0 1 * * ? *)         FULL   Opus,   high-only      # 6pm PT, every day
 #   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
 #   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
+#   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -105,16 +106,19 @@ SCHED_NAMES=(
   "alpha-engine-scheduled-groom-0100-daily-opus-high"
   "alpha-engine-scheduled-groom-0700-daily-mid"
   "alpha-engine-scheduled-groom-1900-daily-low"
+  "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
 )
 SCHED_CRONS=(
   "cron(0 1 * * ? *)"
   "cron(0 7 * * ? *)"
   "cron(0 19 * * ? *)"
+  "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
   '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 1 * * *"}'
   '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 7 * * *"}'
   '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 19 * * *"}'
+  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
