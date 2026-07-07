@@ -535,3 +535,91 @@ def test_post_launch_failure_terminates_instance_no_orphan(monkeypatch):
         idx.handler({"run_mode": "full"}, None)
     # The just-launched box was terminated (not orphaned) before the re-raise.
     assert idx._test_ec2.terminated == ["i-orphan"]
+
+
+# ── config#1933: demand-driven dispatch (enumerate-then-decide) ──────────────
+# groom_eligibility is PURE (no boto3), so these tests use the REAL module —
+# the decision math itself is covered in nousergon-lib; here we test the
+# Lambda wiring: skip path, bundle/model override, bypasses, and fail-safe.
+
+
+def _stub_stats(monkeypatch, idx, counts, oldest=None, has_p0=False):
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: (counts, oldest or {}, has_p0))
+    monkeypatch.setattr(idx, "_write_decision_record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
+
+
+def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 3, "mid": 40, "high": 2})
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "low-only", "schedule": "0 19 * * *"}, None)
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "demand_gate_skip"
+    assert not idx._test_ssm.sent  # no box, no SSM command
+
+
+def test_demand_gate_bundles_and_downgrades_model(monkeypatch):
+    # Opus slot, no high issues, starving low+mid -> ONE Sonnet run.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
+    out = idx.handler({"run_mode": "full", "model": "claude-opus-4-8",
+                       "issue_filter": "high-only", "schedule": "0 1 * * *"}, None)
+    g = out["groom"]
+    assert g["launched"] and g["issue_filter"] == "mid+low"
+    assert g["model"] == "claude-sonnet-5"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_ISSUE_FILTER=mid+low" in cmd
+    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+
+
+def test_demand_gate_full_queues_run_own_tier(monkeypatch):
+    # Brian's 8/9/10: the mid slot runs mid-only on Sonnet, nothing bundles.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                       "issue_filter": "mid-only", "schedule": "0 7 * * *"}, None)
+    assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "mid-only"
+
+
+def test_demand_gate_bypassed_for_reverify_force_and_sweep(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    called = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: called.append(1) or ({}, {}, False))
+    # gated-reverify: no tier queue -> gate bypassed, launch proceeds
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "gated-reverify"}, None)
+    assert out["groom"]["launched"]
+    # force_on_demand (relaunch SF final retry): must never be blocked
+    out = idx.handler({"run_mode": "full", "issue_filter": "low-only",
+                       "force_on_demand": True}, None)
+    assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "low-only"
+    # sweep mode untouched
+    out = idx.handler({"run_mode": "sweep"}, None)
+    assert out["groom"]["launched"]
+    assert not called  # enumeration never ran for any bypass
+
+
+def test_demand_gate_fail_safe_launches_legacy_on_enumeration_error(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def boom(token):
+        raise RuntimeError("github down")
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats", boom)
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "low-only"}, None)
+    assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "low-only"
+
+
+def test_demand_gate_kill_switch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_DEMAND_GATE_ENABLED": "false"})
+    called = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: called.append(1) or ({}, {}, False))
+    out = idx.handler({"run_mode": "full", "issue_filter": "low-only"}, None)
+    assert out["groom"]["launched"] and not called
