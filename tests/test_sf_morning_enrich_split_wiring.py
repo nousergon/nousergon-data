@@ -270,9 +270,11 @@ class TestSsmCommandShape:
 
 
 class TestCatchSemantics:
-    """Both new Task states must Catch States.ALL → HandleFailure with
-    ResultPath $.error, exactly like the DataPhase1 / RAGIngestion
-    quartets (the SF halts on infra failure of these states)."""
+    """Both new Task states must Catch States.ALL → NormalizeFailureContext
+    (config#1819: the single chokepoint in front of HandleFailure, was
+    HandleFailure directly pre-fix) with ResultPath $.error, exactly like the
+    DataPhase1 / RAGIngestion quartets (the SF halts on infra failure of
+    these states)."""
 
     @pytest.mark.parametrize("name", ["MorningEnrich", "WaitForMorningEnrich"])
     def test_catch_routes_to_handle_failure(self, states, name):
@@ -280,14 +282,14 @@ class TestCatchSemantics:
         assert len(catches) >= 1
         for c in catches:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "HandleFailure"
+            assert c["Next"] == "NormalizeFailureContext"
             assert c["ResultPath"] == "$.error"
 
     def test_extract_error_routes_to_handle_failure(self, states):
         st = states["ExtractMorningEnrichError"]
         assert st["Type"] == "Pass"
         assert st["ResultPath"] == "$.error"
-        assert st["Next"] == "HandleFailure"
+        assert st["Next"] == "NormalizeFailureContext"
         assert st["Parameters"]["phase"] == "MorningEnrich"
 
 

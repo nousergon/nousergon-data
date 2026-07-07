@@ -615,20 +615,23 @@ class TestPostJoinAggregationAndFailure:
     def test_extract_parallel_branch_error_routes_to_handle_failure(
         self, states
     ):
+        # config#1819: routes through NormalizeFailureContext, not
+        # HandleFailure directly (was HandleFailure pre-fix).
         e = states["ExtractParallelBranchError"]
         assert e["Type"] == "Pass"
         assert e["ResultPath"] == "$.error"
-        assert e["Next"] == "HandleFailure"
+        assert e["Next"] == "NormalizeFailureContext"
         assert e["Parameters"]["phase"] == "ResearchPredictorParallel"
 
     def test_parallel_catch_is_backstop_to_handle_failure(self, parallel):
         """A Parallel-level Catch must exist as defense-in-depth for a
         genuine SF-engine Parallel error, routing to the EXISTING shared
-        HandleFailure (no new error channel)."""
+        HandleFailure via NormalizeFailureContext (config#1819: the single
+        chokepoint in front of HandleFailure) — no new error channel."""
         catches = parallel["Catch"]
         assert any(
             c["ErrorEquals"] == ["States.ALL"]
-            and c["Next"] == "HandleFailure"
+            and c["Next"] == "NormalizeFailureContext"
             and c["ResultPath"] == "$.error"
             for c in catches
         )
@@ -733,6 +736,7 @@ class TestInboundRewireAndDownstreamUnchanged:
             return (
                 name is None
                 or name.startswith("Extract")
+                or name.startswith("NormalizeFailureContext")
                 or name.endswith("Wait")
                 or name.endswith("RetryGate")
                 or name.endswith("Reissue")

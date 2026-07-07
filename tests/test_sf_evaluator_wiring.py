@@ -158,10 +158,12 @@ class TestEvaluatorTask:
         # Evaluator failure halts the pipeline (unlike eval-judge which
         # is observability-only). The optimizer auto-apply contract
         # means a silent evaluator failure could leave stale configs in
-        # production — fail loud.
+        # production — fail loud. config#1819: routes through
+        # NormalizeFailureContext (the single chokepoint in front of
+        # HandleFailure) rather than HandleFailure directly.
         catch = states["Evaluator"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "HandleFailure"
+        assert catch["Next"] == "NormalizeFailureContext"
 
 
 # ── Poll loop ─────────────────────────────────────────────────────────────
@@ -218,4 +220,6 @@ class TestExtractEvaluatorError:
         assert params["poll.$"] == "$.evaluator_poll"
 
     def test_routes_to_handle_failure(self, states):
-        assert states["ExtractEvaluatorError"]["Next"] == "HandleFailure"
+        # config#1819: routes through NormalizeFailureContext, not HandleFailure
+        # directly (was HandleFailure pre-fix).
+        assert states["ExtractEvaluatorError"]["Next"] == "NormalizeFailureContext"
