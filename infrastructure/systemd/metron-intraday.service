@@ -17,5 +17,5 @@ Wants=network-online.target
 Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine-data
-ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python -m collectors.metron_market_data --only-intraday
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python -m collectors.metron_market_data --only-intraday --require-heartbeat
 TimeoutStartSec=300
