@@ -36,9 +36,11 @@
 # r5/r5a/r6i.large). No exceptions kept — the weekly SF can also now land on any
 # day (e.g. Friday, per the holiday-aware weekly-schedule-adjuster, #578) without
 # the groom cadence needing to track it.
-#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, default queue  # 12am PT, every day
-#   23:00 daily     cron(0 23 * * ? *)        FULL   Sonnet, default queue  # 4pm PT, every day
-#   15:00 daily     cron(0 15 * * ? *)        FULL   Opus,   high-only      # 8am PT, every day
+# Off-peak tier-split cadence (2026-07-07): avoid Anthropic Max weekday peak
+# (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
+#   01:00 daily     cron(0 1 * * ? *)         FULL   Opus,   high-only      # 6pm PT, every day
+#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
+#   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -100,19 +102,19 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0700-daily-low"
-  "alpha-engine-scheduled-groom-1500-daily-opus-high"
-  "alpha-engine-scheduled-groom-2300-daily-mid"
+  "alpha-engine-scheduled-groom-0100-daily-opus-high"
+  "alpha-engine-scheduled-groom-0700-daily-mid"
+  "alpha-engine-scheduled-groom-1900-daily-low"
 )
 SCHED_CRONS=(
+  "cron(0 1 * * ? *)"
   "cron(0 7 * * ? *)"
-  "cron(0 15 * * ? *)"
-  "cron(0 23 * * ? *)"
+  "cron(0 19 * * ? *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 7 * * *"}'
-  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 15 * * *"}'
-  '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 23 * * *"}'
+  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 1 * * *"}'
+  '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 7 * * *"}'
+  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 19 * * *"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
