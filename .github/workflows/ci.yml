@@ -54,6 +54,18 @@ jobs:
       # another's stubbed-boto3-in-sys.modules test process. The changelog pair
       # above is intentionally excluded here (zero deps, already covered).
       - name: Run ALL lambda handler tests (glob-derived, per-lambda deps)
+        env:
+          # ssm-liveness-poller/index.py (and any future handler) calls
+          # boto3.client(...) at MODULE SCOPE with no explicit region. Lambdas
+          # with a deploy-*.yml get a region for free from that workflow's
+          # configure-aws-credentials step (aws-region: us-east-1); lambdas
+          # with none (like ssm-liveness-poller — never gated anywhere before
+          # this PR) hit botocore's NoRegionError on a bare `ubuntu-latest`
+          # runner with zero AWS env. No real AWS calls are made (clients are
+          # mocked/monkeypatched in-test) — this only satisfies SDK client
+          # construction. Matches the region used fleet-wide (REGION default
+          # in every lambda's deploy.sh).
+          AWS_DEFAULT_REGION: us-east-1
         run: |
           set -uo pipefail
           shopt -s nullglob
