@@ -40,9 +40,15 @@ class TestLaunch:
         # neither) — the env source is LOAD-BEARING, mirror of weekly
         # DataPhase1.
         assert "source /home/ec2-user/.alpha-engine.env" in cmds
-        # Date-keyed artifact — a stale prior-day artifact can never be read.
-        assert "ops/daily_data_spot/{}.json" in cmds
+        # config#1897 (2026-07-07): execution-scoped id artifact
+        # (ops/daily_data_spot/{date}/{$$.Execution.Name}.json). Date-scoping
+        # alone let a same-day recovery rerun read the PRIOR attempt's
+        # now-terminated spot id; the execution name (unique per
+        # StartExecution) makes ReadDataSpotId's NoSuchKey-until-present loop
+        # block on THIS launch, never a prior attempt's.
+        assert "ops/daily_data_spot/{}/{}.json" in cmds
         assert "$$.Execution.StartTime" in cmds
+        assert "$$.Execution.Name" in cmds
         # Fire-and-forget: proceeds to the box boot, no poll loop.
         assert st["Next"] == "StartExecutorEC2"
 
@@ -64,13 +70,60 @@ class TestReadArtifact:
         st = states["ReadDataSpotId"]
         assert st["Resource"] == "arn:aws:states:::aws-sdk:s3:getObject"
         assert st["Parameters"]["Bucket"] == "alpha-engine-research"
-        assert "ops/daily_data_spot/{}.json" in st["Parameters"]["Key.$"]
+        assert "ops/daily_data_spot/{}/{}.json" in st["Parameters"]["Key.$"]
         (retry,) = st["Retry"]
         # Retry-until-present covers the overlapped spot bootstrap; exhaustion
         # fails loud (a failed/capacity-starved launch surfaces HERE).
         assert retry["MaxAttempts"] * retry["IntervalSeconds"] >= 300
         assert st["Catch"][0]["Next"] == "HandleFailure"
         assert st["Next"] == "ParseDataSpotId"
+
+    def test_id_artifact_key_is_execution_scoped_and_reader_matches_writer(self, states):
+        """config#1897 regression: writer and reader must build the SAME
+        execution-scoped key.
+
+        The 2026-07-07 failure: the id artifact was keyed by DATE only.
+        MorningArcticAppend lost its spot to a spot reclaim; the recovery
+        rerun (same run_date) launched a fresh spot, but ReadDataSpotId's
+        S3.NoSuchKey retry-until-present found the PRIOR attempt's date-key
+        already present and returned instantly with the reclaimed
+        (terminated) spot id -> MorningEnrich sendCommand hit
+        Ssm.InvalidInstanceIdException on a dead box. Keying by
+        $$.Execution.Name (unique per StartExecution) makes the sync loop
+        block on THIS execution's launch. Writer and reader must stay in
+        lockstep or the reader would wait forever / read the wrong key.
+        """
+        reader_key = states["ReadDataSpotId"]["Parameters"]["Key.$"]
+        writer_cmds = states["LaunchDailyDataSpot"]["Parameters"]["Parameters"]["commands.$"]
+
+        # Both build the identical two-segment {date}/{execution-name} key.
+        assert "ops/daily_data_spot/{}/{}.json" in reader_key
+        assert "ops/daily_data_spot/{}/{}.json" in writer_cmds
+
+        # Execution-scoped, not merely date-scoped: the execution name is the
+        # per-attempt discriminator that defends same-day reruns.
+        assert "$$.Execution.Name" in reader_key
+        assert "$$.Execution.Name" in writer_cmds
+
+        # And still date-grouped for ops legibility.
+        assert "$$.Execution.StartTime" in reader_key
+        assert "$$.Execution.StartTime" in writer_cmds
+
+        # Lockstep: the reader's key template + its two format args must be a
+        # substring of the writer's command (identical construction), so a
+        # future edit to one that forgets the other is caught here.
+        template = (
+            "States.Format('ops/daily_data_spot/{}/{}.json', "
+            "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0), "
+            "$$.Execution.Name)"
+        )
+        assert template in reader_key
+        # writer embeds the same key + args inside its --id-artifact-key arg
+        assert "--id-artifact-key ops/daily_data_spot/{}/{}.json" in writer_cmds
+        assert (
+            "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0), "
+            "$$.Execution.Name" in writer_cmds
+        )
 
     def test_read_only_when_launch_dispatched(self, states):
         gate = states["CheckDataSpotLaunched"]
