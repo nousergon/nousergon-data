@@ -121,6 +121,19 @@
           "s3:prefix": "ops/daily_data_spot/*"
         }
       }
+    },
+    {
+      "Sid": "AgentTelemetryMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine/Agents"
+        }
+      }
     }
   ]
 }
