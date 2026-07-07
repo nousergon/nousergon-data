@@ -43,9 +43,13 @@ Per ticker the script:
      ``to_arctic_canonical`` (+ a factor-momentum second pass).
 
 The reconciliation report is emitted to S3 (audit JSON) and summarised in the
-log. Both series are total-return and anchored at the latest split-adjusted
-price, so within tolerance they should be identical up to feed rounding; the
-NEW one is polygon-authoritative.
+log. Both series are total-return, but each is constructed on its own
+normalization epoch (polygon-authoritative back-adjustment vs yfinance's
+auto_adjust convention) — for split/spinoff names those epochs diverge even
+when the two feeds agree on every return. `reconcile_total_return` rebases
+both series to 1.0 at the first in-window date before diffing, so within
+tolerance they should be identical up to feed rounding regardless of their
+raw levels; the NEW one is polygon-authoritative (config#1455).
 
 Scoping the gate to the training window (``--reconcile-start``)
 ---------------------------------------------------------------
@@ -463,6 +467,42 @@ def reconcile_total_return(
 
     a = new_tr_close.reindex(in_window).to_numpy(dtype="float64")
     b = old_close.reindex(in_window).to_numpy(dtype="float64")
+
+    # Anchor-rebase both series to 1.0 at the first in-window date before
+    # comparing. `new_tr_close` and `old_close` are each internally-consistent
+    # total-return series, but their ABSOLUTE levels are constructed on
+    # different normalization epochs (polygon-authoritative split/dividend
+    # back-adjustment vs yfinance's own auto_adjust convention). For names
+    # with a stock split or spinoff those epochs diverge, and a raw-level
+    # comparison manufactures a false OUT-OF-TOL residual even when the two
+    # series agree on every actual return. Rebasing removes the epoch offset
+    # and leaves only genuine return disagreement (config#1455).
+    anchor_a, anchor_b = a[0], b[0]
+    if (
+        not np.isfinite(anchor_a) or abs(anchor_a) <= 1e-12
+        or not np.isfinite(anchor_b) or abs(anchor_b) <= 1e-12
+    ):
+        # Degenerate anchor (zero/NaN) — cannot rebase meaningfully; fail loud
+        # rather than silently falling back to an un-rebased comparison.
+        return ReconcileRecord(
+            ticker=ticker,
+            status="no_overlap",
+            n_common_dates=n_in_window,
+            max_rel_dev=float("inf"),
+            max_dev_date=None,
+            explained=False,
+            explanation=(
+                f"anchor date {pd.Timestamp(in_window[0]).strftime('%Y-%m-%d')} has a "
+                f"zero/non-finite price in one series — cannot anchor-rebase "
+                f"(fail-loud, not skipped)"
+            ),
+            reconcile_start=reconcile_start_str,
+            n_common_in_window=n_in_window,
+            n_common_excluded=n_excluded,
+        )
+    a = a / anchor_a
+    b = b / anchor_b
+
     denom = np.where(np.abs(b) > 1e-12, np.abs(b), np.nan)
     rel_dev = np.abs(a - b) / denom
     # NaN denom (old close ~0) → ignore that date rather than emit inf.
