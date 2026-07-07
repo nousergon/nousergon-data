@@ -544,7 +544,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 15 * * *"}.
+    "claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
     (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.

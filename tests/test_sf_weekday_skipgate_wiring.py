@@ -155,9 +155,15 @@ class TestEntryEdgesRouteThroughGates:
         assert states["TerminateDailyDataSpot"]["Next"] == "CheckSkipPredictorInference"
         assert states["TerminateDailyDataSpot"]["Catch"][0]["Next"] == "CheckSkipPredictorInference"
 
-    def test_predictor_health_enters_planner_gate(self, states):
-        assert states["PredictorHealthCheck"]["Next"] == "CheckSkipMorningPlanner"
-        assert states["PredictorHealthCheck"]["Catch"][0]["Next"] == "CheckSkipMorningPlanner"
+    def test_predictor_health_enters_drift_check(self, states):
+        # config#1853: PredictorHealthCheck now routes into the drift-check
+        # producer (fail-soft, both success and Catch) before the planner gate.
+        assert states["PredictorHealthCheck"]["Next"] == "PredictorDriftCheck"
+        assert states["PredictorHealthCheck"]["Catch"][0]["Next"] == "PredictorDriftCheck"
+
+    def test_drift_check_enters_planner_gate(self, states):
+        assert states["PredictorDriftCheck"]["Next"] == "CheckSkipMorningPlanner"
+        assert states["PredictorDriftCheck"]["Catch"][0]["Next"] == "CheckSkipMorningPlanner"
 
     def test_planner_success_enters_daemon_gate(self, states):
         success = [c["Next"] for c in states["CheckMorningPlannerStatus"]["Choices"]

@@ -996,12 +996,48 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Predictor health check is non-blocking — continue to morning planner. Executor's own upstream-health gate catches real data-freshness problems before placing orders.",
-          "Next": "CheckSkipMorningPlanner",
+          "Comment": "Predictor health check is non-blocking — continue to drift check. Executor's own upstream-health gate catches real data-freshness problems before placing orders.",
+          "Next": "PredictorDriftCheck",
           "ResultPath": "$.predictor_health_error"
         }
       ],
       "ResultPath": "$.predictor_health_result",
+      "Next": "PredictorDriftCheck"
+    },
+    "PredictorDriftCheck": {
+      "Type": "Task",
+      "Comment": "Daily prediction-health producer (config#1853, closing out config#1282/crucible-predictor#305): invokes action=check_drift so predictor/metrics/drift_{trading_day}.json (artifact_id predictor_drift_detection, cadence eod_sf) is produced every weekday. Runs AFTER PredictorHealthCheck so trading_day's predictions already exist to score for drift. Fail-soft — a drift-check failure must never block the morning planner / order placement; it is an observability producer, not a trading gate.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_drift",
+          "date.$": "$.trading_day_gate.Payload.check_date"
+        }
+      },
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-soft — a drift-check producer failure must never block the morning planner. Missing one day's drift_{trading_day}.json is a monitoring gap, not a trading-path incident.",
+          "Next": "CheckSkipMorningPlanner",
+          "ResultPath": "$.predictor_drift_error"
+        }
+      ],
+      "ResultPath": "$.predictor_drift_result",
       "Next": "CheckSkipMorningPlanner"
     },
     "RunMorningPlanner": {

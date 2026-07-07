@@ -122,7 +122,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FAST_PATH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -203,10 +203,18 @@ CURRENT_DISPATCH=$(aws lambda get-function-configuration \
   --region "${REGION}" \
   --query 'Environment.Variables.AGENT_DISPATCH_ENABLED' --output text 2>/dev/null)
 case "${CURRENT_DISPATCH}" in true|false) ;; *) CURRENT_DISPATCH=false ;; esac
+# FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
+# AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
+CURRENT_FAST_PATH=$(aws lambda get-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --region "${REGION}" \
+  --query 'Environment.Variables.FAST_PATH_ENABLED' --output text 2>/dev/null)
+case "${CURRENT_FAST_PATH}" in true|false) ;; *) CURRENT_FAST_PATH=false ;; esac
 echo "  preserving AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH} (operator-owned)"
+echo "  preserving FAST_PATH_ENABLED=${CURRENT_FAST_PATH} (operator-owned)"
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
+  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

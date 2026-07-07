@@ -210,12 +210,12 @@ def test_sweep_run_mode_is_forwarded(monkeypatch):
 
 
 def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
-    # The 3rd (Opus, 8am PT) schedule's event carries model + issue_filter —
+    # The Opus (6pm PT) schedule's event carries model + issue_filter —
     # these must reach the box as exported env vars ahead of the bootstrap exec.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
         {"run_mode": "full", "model": "claude-opus-4-8", "issue_filter": "high-only",
-         "schedule": "0 15 * * *"},
+         "schedule": "0 1 * * *"},
         None,
     )
     g = out["groom"]
@@ -234,7 +234,7 @@ def test_high_only_schedule_forwards_pr_budget(monkeypatch):
             "run_mode": "full",
             "model": "claude-opus-4-8",
             "issue_filter": "high-only",
-            "schedule": "0 15 * * *",
+            "schedule": "0 1 * * *",
             "pr_budget": 100,
         },
         None,
@@ -379,7 +379,7 @@ def test_low_only_schedule_forwards_haiku_model_and_filter(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
         {"run_mode": "full", "model": "claude-haiku-4-5", "issue_filter": "low-only",
-         "schedule": "0 7 * * *"},
+         "schedule": "0 19 * * *"},
         None,
     )
     g = out["groom"]
