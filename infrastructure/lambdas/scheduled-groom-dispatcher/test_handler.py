@@ -69,8 +69,9 @@ class _FakeEc2:
 
 
 class _FakeSsm:
-    def __init__(self):
+    def __init__(self, parameters=None):
         self.sent = []
+        self.parameters = dict(parameters or {})
 
     def describe_instance_information(self, **kw):
         return {"InstanceInformationList": [{"PingStatus": "Online"}]}
@@ -78,6 +79,11 @@ class _FakeSsm:
     def send_command(self, **kw):
         self.sent.append(kw)
         return {"Command": {"CommandId": "cmd-123"}}
+
+    def get_parameter(self, Name):  # noqa: N803 — boto3 API
+        if Name not in self.parameters:
+            raise RuntimeError(f"Parameter {Name} not found")
+        return {"Parameter": {"Value": self.parameters[Name]}}
 
 
 class _FakeS3Body:
@@ -115,10 +121,10 @@ class _FakeS3:
         return {"Body": _FakeS3Body(self._objects[Key])}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None):
+def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
-    ssm = _FakeSsm()
+    ssm = _FakeSsm(ssm_parameters)
     ec2 = _FakeEc2()
     s3 = _FakeS3(s3_objects)
     clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
@@ -313,6 +319,22 @@ def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
     assert notified == []  # no ping when nothing was skipped
+
+
+def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
+    # Way over pace, but SSM override is active -> still launch.
+    idx = _load(
+        monkeypatch,
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        s3_objects={"claude_code_usage/groom/2026-06-29.json":
+                    _wet_doc(0.9 * 1_140_000_000)},
+        ssm_parameters={"/alpha-engine/groom/dynamic_budget_override_until": "2099-01-01T00:00"},
+    )
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is True
 
 
 def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):

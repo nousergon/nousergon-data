@@ -75,6 +75,12 @@
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_GROOM"
       ]
+    },
+    {
+      "Sid": "ReadGroomBudgetOverrideParam",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/dynamic_budget_override_until"
     }
   ]
 }

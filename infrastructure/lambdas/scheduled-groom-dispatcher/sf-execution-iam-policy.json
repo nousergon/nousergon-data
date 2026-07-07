@@ -22,7 +22,10 @@
     {
       "Sid": "CheckGroomRunCompletionMarker",
       "Effect": "Allow",
-      "Action": "s3:GetObject",
+      "Action": [
+        "s3:GetObject",
+        "s3:HeadObject"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/completed/*"
     },
     {

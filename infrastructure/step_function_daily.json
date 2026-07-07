@@ -2,7 +2,6 @@
   "Comment": "Alpha Engine Weekday Pipeline — morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it — fixes the 2026-04-17→2026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only.",
   "StartAt": "InitializeInput",
   "States": {
-
     "InitializeInput": {
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + trading_instance_id explicitly; manual reruns (which happened multiple times 2026-04-23) often omit sns_topic_arn, which caused HandleFailure to error on missing $.sns_topic_arn JSONPath. Mirrors the Saturday SF InitializeInput pattern — States.JsonMerge with user-input as the second arg lets explicit values win.",
@@ -12,20 +11,34 @@
       "OutputPath": "$.merged",
       "Next": "CheckMutexRole"
     },
-
     "CheckMutexRole": {
       "Type": "Choice",
       "Comment": "L274 SF MutualExclusionGuard — gate at SF entry point. Allowlist cadence-roles (daily / weekly / eod / shell-run) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations — that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell. Trigger of record: 2026-05-26 duplicate-EventBridge-target incident (PR #322 closed the SPECIFIC dup-target shape via CI; this mutex closes the broader class — operator double-paste / EB internal retry-on-throttle / cross-region replay / future shapes the CI chokepoint misses).",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.pipeline_role", "IsPresent": true},
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
             {
               "Or": [
-                {"Variable": "$.pipeline_role", "StringEquals": "daily"},
-                {"Variable": "$.pipeline_role", "StringEquals": "weekly"},
-                {"Variable": "$.pipeline_role", "StringEquals": "eod"},
-                {"Variable": "$.pipeline_role", "StringEquals": "shell-run"}
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "daily"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "weekly"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "eod"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "shell-run"
+                }
               ]
             }
           ],
@@ -34,7 +47,6 @@
       ],
       "Default": "DeployDriftCheck"
     },
-
     "AcquireMutex": {
       "Type": "Task",
       "Comment": "L274 — DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException → MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window — a successfully-acquired key is naturally single-use because no future execution can land in the same past minute-bucket. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
@@ -45,22 +57,34 @@
           "mutex_key": {
             "S.$": "States.Format('{}#{}#{}:{}', $$.StateMachine.Name, $.pipeline_role, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
           },
-          "execution_arn": {"S.$": "$$.Execution.Id"},
-          "started_at": {"S.$": "$$.Execution.StartTime"},
-          "state_machine": {"S.$": "$$.StateMachine.Name"},
-          "pipeline_role": {"S.$": "$.pipeline_role"}
+          "execution_arn": {
+            "S.$": "$$.Execution.Id"
+          },
+          "started_at": {
+            "S.$": "$$.Execution.StartTime"
+          },
+          "state_machine": {
+            "S.$": "$$.StateMachine.Name"
+          },
+          "pipeline_role": {
+            "S.$": "$.pipeline_role"
+          }
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
       },
       "Catch": [
         {
-          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
           "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert (HandleFailure picks it up via MutexConflict's terminal Fail).",
           "Next": "MutexConflict",
           "ResultPath": "$.mutex_conflict"
         },
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears).",
           "Next": "DeployDriftCheck",
           "ResultPath": "$.mutex_error"
@@ -69,13 +93,11 @@
       "ResultPath": "$.mutex_result",
       "Next": "DeployDriftCheck"
     },
-
     "MutexConflict": {
       "Type": "Fail",
       "Error": "MutexConflict",
       "Cause": "L274: another SF execution with the same state-machine + pipeline_role + start-minute already holds the mutex. Most likely cause: duplicate EventBridge target fan-out (PR #322 closes the specific CFN-vs-deploy-script shape; this Fail catches the broader class). Forensic: check execution history for the prior holder's executionArn via DynamoDB GetItem on the mutex_key in $.mutex_conflict."
     },
-
     "DeployDriftCheck": {
       "Type": "Task",
       "Comment": "Verify the deployed SF definition + CloudFormation stack SHAs match alpha-engine-data@main HEAD. Halts the pipeline when infrastructure code has merged but deploy-infrastructure.sh never ran. Degraded modes (missing stamps, GitHub outage) set has_drift=false so legacy artifacts and API outages do not block trading-hours runs.",
@@ -89,7 +111,10 @@
       "TimeoutSeconds": 60,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 15,
           "BackoffRate": 1.0
@@ -97,7 +122,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -105,7 +132,6 @@
       "ResultPath": "$.drift_result",
       "Next": "DeployDriftGate"
     },
-
     "DeployDriftGate": {
       "Type": "Choice",
       "Comment": "Hard-fail when the drift probe reports has_drift=true. Surfaces deploy lag loudly instead of silently running new SF definitions against stale Lambda images (or vice versa).",
@@ -118,39 +144,54 @@
       ],
       "Default": "TradingDayGate"
     },
-
     "TradingDayGate": {
       "Type": "Task",
       "Comment": "NYSE trading-day gate, run BEFORE StartExecutorEC2. Invokes the predictor Lambda (action=check_trading_day) — pure calendar math, no box dependency. Replaces the prior on-box SSM trading_calendar check whose stdout was unreliably captured on a just-cold-booted instance (2026-06-30 false trading-day-check failure alert; config#1430). On holiday the box is never booted.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
-        "Payload": { "action": "check_trading_day" }
+        "Payload": {
+          "action": "check_trading_day"
+        }
       },
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException","Lambda.TooManyRequestsException","States.TaskFailed"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
           "IntervalSeconds": 3,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "Next": "TradingDayGateFailed", "ResultPath": "$.trading_day_gate_error" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "TradingDayGateFailed",
+          "ResultPath": "$.trading_day_gate_error"
+        }
       ],
       "ResultPath": "$.trading_day_gate",
       "Next": "TradingDayGateChoice"
     },
-
     "TradingDayGateChoice": {
       "Type": "Choice",
       "Comment": "Holiday/weekend (is_trading_day=false) -> skip without ever booting the box. Trading day or any non-false result -> proceed. Fail-open to trading matches the prior fail-soft posture: missing a real trading day is worse than a wasted holiday boot.",
       "Choices": [
-        { "Variable": "$.trading_day_gate.Payload.is_trading_day", "BooleanEquals": false, "Next": "NotifyHolidaySkip" }
+        {
+          "Variable": "$.trading_day_gate.Payload.is_trading_day",
+          "BooleanEquals": false,
+          "Next": "NotifyHolidaySkip"
+        }
       ],
-      "Default": "StartExecutorEC2"
+      "Default": "CheckSkipDataSpot"
     },
-
     "TradingDayGateFailed": {
       "Type": "Task",
       "Comment": "Trading-day gate Lambda failed for infrastructure reasons — alert and proceed (assume trading day). Predictor inference + downstream remain gated on enrichment success.",
@@ -161,38 +202,41 @@
         "Message.$": "States.Format('Trading-day gate Lambda failed (infra error, not a holiday detection). Pipeline proceeding as trading day. Error: {}', States.JsonToString($.trading_day_gate_error))"
       },
       "ResultPath": "$.trading_day_gate_error_notify",
-      "Next": "StartExecutorEC2"
+      "Next": "CheckSkipDataSpot"
     },
-
     "MorningEnrich": {
       "Type": "Task",
-      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract. Timeout raised 1800→3000s (L4552b, 2026-06-14): the 2026-06-11 weekday run timed out against the EXACT 1800s ceiling — daily_closes+intraday collection is legitimately >30 min on the t3.small, not hung (the slow ArcticDB append was already split to MorningArcticAppend / #983, so this is the remaining fetch tail). 50 min absorbs that without masking a real hang; the CheckMorningEnrichStatus poll loop now also fails fast at a bounded attempt cap. Predictor still gated on Success status.",
+      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract. Timeout raised 1800→3000s (L4552b, 2026-06-14): the 2026-06-11 weekday run timed out against the EXACT 1800s ceiling — daily_closes+intraday collection is legitimately >30 min on the t3.small, not hung (the slow ArcticDB append was already split to MorningArcticAppend / #983, so this is the remaining fetch tail). 50 min absorbs that without masking a real hang; the CheckMorningEnrichStatus poll loop now also fails fast at a bounded attempt cap. Predictor still gated on Success status. | config#1807 (2026-07-06): RUNS ON THE DAILY DATA SPOT ($.data_spot.info.instance_id, launched by LaunchDailyDataSpot), not the trading box — the data phase can no longer starve the trading box's SSM agent/daemon path. Spot flavor: fresh clone at bootstrap (no git pull / no CodeFreshnessGate dependency), deps installed from requirements.txt at bootstrap (the lib pin — ensure_lib_pin.sh is venv-only and unneeded on a fresh install), secrets from SSM at python startup (no .alpha-engine.env), system python3.12 (no .venv), runs as root with HOME set (weekly-spot convention).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
+        "InstanceIds.$": "States.Array($.data_spot.info.instance_id)",
         "Parameters": {
           "commands": [
             "set -eo pipefail",
             "export FLOW_DOCTOR_ENABLED=1",
             "export ALPHA_ENGINE_DEPLOYED=1",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+            "export HOME=/home/ec2-user",
+            "export XDG_CACHE_HOME=/tmp",
+            "export AWS_REGION=us-east-1",
+            "export AWS_DEFAULT_REGION=us-east-1",
+            "command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3",
             "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/morning-enrich.log \"s3://alpha-engine-research/_ssm_logs/morning-enrich/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/morning-enrich.log",
-            "python weekly_collector.py --morning-enrich --skip-chronic-heal --skip-arctic-append 2>&1 | tee -a /var/log/morning-enrich.log"
+            "$PYTHON_BIN weekly_collector.py --morning-enrich --skip-chronic-heal --skip-arctic-append 2>&1 | tee -a /var/log/morning-enrich.log"
           ],
-          "executionTimeout": ["3000"]
+          "executionTimeout": [
+            "3000"
+          ]
         },
         "TimeoutSeconds": 3000
       },
       "TimeoutSeconds": 3060,
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -200,94 +244,113 @@
       "ResultPath": "$.morning_enrich_result",
       "Next": "InitMorningEnrichPoll"
     },
-
     "InitMorningEnrichPoll": {
       "Type": "Pass",
-      "Comment": "Initialize the bounded poll-iteration counter for the MorningEnrich SSM status loop (L4552b, 2026-06-14). Mirrors InitSSMPollCounter. The loop polls every ~15s; a stuck-InProgress (SSM agent stops reporting a terminal status past the command's executionTimeout — the 2026-06-11 weekday symptom in #970) would otherwise spin until the SF state TimeoutSeconds with no clear cause. The attempt cap fails fast into MorningEnrichPollTimeout with an explicit Cause instead.",
-      "Result": {"attempts": 0},
-      "ResultPath": "$.morning_enrich_poll_counter",
+      "Comment": "Seed the liveness-aware poll slot for the MorningEnrich loop (config#1811; supersedes the #970/L4552b counter-only pattern). attempts/ping_misses round-trip through the ssm-liveness-poller Lambda, which increments/reset them — no separate Increment state.",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.morning_enrich_poll",
       "Next": "WaitForMorningEnrich"
     },
-
     "WaitForMorningEnrich": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "Liveness-aware poll iteration (config#1811): command status + independent SSM-agent PingStatus in one Lambda call, OUTSIDE the box being watched. Replaces the bare getCommandInvocation poll — on 2026-07-06 (config#1807) the in-box executionTimeout could not fire while the box was wedged and the old loop read a frozen InProgress for 62 min; this detects that shape in ~3 polls.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.morning_enrich_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.data_spot.info.instance_id",
+          "command_id.$": "$.morning_enrich_result.Command.CommandId",
+          "attempts.$": "$.morning_enrich_poll.attempts",
+          "ping_misses.$": "$.morning_enrich_poll.ping_misses",
+          "max_attempts": 210,
+          "max_ping_misses": 3,
+          "step": "morning-enrich"
+        }
       },
+      "TimeoutSeconds": 65,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.morning_enrich_poll",
       "Next": "CheckMorningEnrichStatus"
     },
-
     "CheckMorningEnrichStatus": {
       "Type": "Choice",
-      "Comment": "Block predictor inference until polygon enrichment confirms the prior trading day's row is overwritten with authoritative VWAP. SSM Failed → HandleFailure (must not proceed to inference on uncorrected data per feedback_no_silent_fails). Success → ChronicGapSelfHeal (best-effort, fail-soft) → PredictorInference; the chronic-gap heal was split out of MorningEnrich 2026-06-11 so a yfinance hang in it can never SIGKILL the load-bearing enrich. The poll-iteration cap (≥210 attempts ≈ >57 min at ~15s/iter, just past the 3000s SSM executionTimeout) fails fast into MorningEnrichPollTimeout with a clear cause if the SSM command never reports a terminal status (L4552b / #970 — the 2026-06-11 stuck-InProgress shape).",
+      "Comment": "Block predictor inference until polygon enrichment confirms the prior trading day's row is overwritten with authoritative VWAP. Branches on the ssm-liveness-poller verdict (config#1811): COMMAND_FAILED (Default) → HandleFailure per feedback_no_silent_fails; INSTANCE_UNRESPONSIVE (≥3 consecutive PingStatus≠Online, the config#1807 wedged-box shape) → stamp error → force-stop the box → HandleFailure; POLL_BUDGET_EXHAUSTED (210 × ~15s ≈ >57 min, just past the 3000s executionTimeout — the #970 stuck-InProgress shape) → MorningEnrichPollTimeout.",
       "Choices": [
         {
-          "Variable": "$.morning_enrich_poll.Status",
-          "StringEquals": "Success",
+          "Variable": "$.morning_enrich_poll.verdict",
+          "StringEquals": "SUCCESS",
           "Next": "CheckSkipMorningArcticAppend"
         },
         {
-          "Variable": "$.morning_enrich_poll_counter.attempts",
-          "NumericGreaterThanEquals": 210,
+          "Variable": "$.morning_enrich_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
+          "Next": "MorningEnrichWait"
+        },
+        {
+          "Variable": "$.morning_enrich_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampMorningEnrichUnresponsive"
+        },
+        {
+          "Variable": "$.morning_enrich_poll.verdict",
+          "StringEquals": "POLL_BUDGET_EXHAUSTED",
           "Next": "MorningEnrichPollTimeout"
-        },
-        {
-          "Variable": "$.morning_enrich_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "MorningEnrichWait"
-        },
-        {
-          "Variable": "$.morning_enrich_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "MorningEnrichWait"
         }
       ],
       "Default": "HandleFailure"
     },
-
     "MorningEnrichWait": {
       "Type": "Wait",
       "Seconds": 15,
-      "Next": "IncrementMorningEnrichPoll"
-    },
-
-    "IncrementMorningEnrichPoll": {
-      "Type": "Pass",
-      "Comment": "Increment the MorningEnrich poll-iteration counter (L4552b). Mirrors IncrementSSMPoll.",
-      "Parameters": {
-        "attempts.$": "States.MathAdd($.morning_enrich_poll_counter.attempts, 1)"
-      },
-      "ResultPath": "$.morning_enrich_poll_counter",
       "Next": "WaitForMorningEnrich"
     },
-
+    "StampMorningEnrichUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive (SSM PingStatus≠Online for ≥3 consecutive polls) mid-MorningEnrich — the config#1807 wedged-box shape. Stamp the poller's detail into $.error, then terminate the DATA SPOT (config#1807 — the trading box is not involved in this state anymore) (the in-box executionTimeout cannot fire on a wedged box) and alert via HandleFailure.",
+      "Parameters": {
+        "Error": "MorningEnrichInstanceUnresponsive",
+        "Cause.$": "$.morning_enrich_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceTerminateUnresponsiveDataSpot"
+    },
     "MorningEnrichPollTimeout": {
       "Type": "Pass",
       "Comment": "Bounded poll-iteration cap exhausted on the MorningEnrich SSM status loop (L4552b / #970). The SSM command never reported a terminal status (Success/Failed) within the poll budget (~210 × 15s ≈ >57 min, past the 3000s executionTimeout) — i.e. it is genuinely stuck-InProgress, not slow. Stamp a clear cause into $.error then route through HandleFailure so the SNS failure alert carries it (a bare Fail would skip the alert). Distinct from a legitimately-long collection (which now has the raised 3000s ceiling). Operator action: inspect /var/log/morning-enrich.log on ae-trading + the SSM command invocation.",
@@ -298,27 +361,26 @@
       "ResultPath": "$.error",
       "Next": "HandleFailure"
     },
-
     "ChronicGapSelfHeal": {
       "Type": "Task",
-      "Comment": "Best-effort chronic-polygon-gap yfinance self-heal (BF-B/BRK-B/MOG-A/PSTG — polygon doesn't reliably serve them) + polygon-recovery / constituents-drift alarms. SPLIT OUT of MorningEnrich 2026-06-11: inline, an unbounded yf.download hang ran out MorningEnrich's SSM executionTimeout and SIGKILLed the whole command, discarding ~20 min of completed daily_append and failing the weekday pipeline (no predictions that day). Per the standing rule (a best-effort downstream step must never force re-running a completed upstream task — same rule that split MorningEnrich out of DataPhase1), this runs as its OWN FAIL-SOFT state: short executionTimeout, and the Catch + CheckChronicGapStatus Default both route to PredictorInference so a heal failure/hang can never block the trading path. Runs before PredictorInference so the healed chronic rows are fresh for inference; postflight remains the load-bearing freshness gate.",
+      "Comment": "Best-effort chronic-polygon-gap yfinance self-heal (BF-B/BRK-B/MOG-A/PSTG — polygon doesn't reliably serve them) + polygon-recovery / constituents-drift alarms. SPLIT OUT of MorningEnrich 2026-06-11: inline, an unbounded yf.download hang ran out MorningEnrich's SSM executionTimeout and SIGKILLed the whole command, discarding ~20 min of completed daily_append and failing the weekday pipeline (no predictions that day). Per the standing rule (a best-effort downstream step must never force re-running a completed upstream task — same rule that split MorningEnrich out of DataPhase1), this runs as its OWN FAIL-SOFT state: short executionTimeout, and the Catch + CheckChronicGapStatus Default both route to PredictorInference so a heal failure/hang can never block the trading path. Runs before PredictorInference so the healed chronic rows are fresh for inference; postflight remains the load-bearing freshness gate. | config#1807 (2026-07-06): RUNS ON THE DAILY DATA SPOT — see MorningEnrich.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
+        "InstanceIds.$": "States.Array($.data_spot.info.instance_id)",
         "Parameters": {
           "commands": [
             "set -eo pipefail",
             "export FLOW_DOCTOR_ENABLED=1",
             "export ALPHA_ENGINE_DEPLOYED=1",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+            "export HOME=/home/ec2-user",
+            "export XDG_CACHE_HOME=/tmp",
+            "export AWS_REGION=us-east-1",
+            "export AWS_DEFAULT_REGION=us-east-1",
+            "command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3",
             "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/chronic-gap-heal.log \"s3://alpha-engine-research/_ssm_logs/chronic-gap-heal/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/chronic-gap-heal.log",
-            "python weekly_collector.py --chronic-gap-heal 2>&1 | tee -a /var/log/chronic-gap-heal.log"
+            "$PYTHON_BIN weekly_collector.py --chronic-gap-heal 2>&1 | tee -a /var/log/chronic-gap-heal.log"
           ],
           "executionTimeout": [
             "300"
@@ -333,30 +395,53 @@
             "States.ALL"
           ],
           "Comment": "Fail-soft — a chronic-gap heal failure (incl. the SSM-timeout SIGKILL it used to cause) must never block predictions. Proceed to PredictorInference.",
-          "Next": "CheckSkipPredictorInference",
+          "Next": "CheckDataSpotToTerminate",
           "ResultPath": "$.chronic_gap_error"
         }
       ],
       "ResultPath": "$.chronic_gap_result",
+      "Next": "InitChronicGapPoll"
+    },
+    "InitChronicGapPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the fail-soft ChronicGapSelfHeal loop (config#1811).",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.chronic_gap_poll",
       "Next": "WaitForChronicGap"
     },
-
     "WaitForChronicGap": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 300s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.chronic_gap_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.data_spot.info.instance_id",
+          "command_id.$": "$.chronic_gap_result.Command.CommandId",
+          "attempts.$": "$.chronic_gap_poll.attempts",
+          "ping_misses.$": "$.chronic_gap_poll.ping_misses",
+          "max_attempts": 30,
+          "max_ping_misses": 3,
+          "step": "chronic-gap-heal"
+        }
       },
+      "TimeoutSeconds": 65,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -365,44 +450,56 @@
             "States.ALL"
           ],
           "Comment": "Fail-soft — a poll failure proceeds to PredictorInference, no heal that day.",
-          "Next": "CheckSkipPredictorInference",
+          "Next": "CheckDataSpotToTerminate",
           "ResultPath": "$.chronic_gap_error"
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.chronic_gap_poll",
       "Next": "CheckChronicGapStatus"
     },
-
     "CheckChronicGapStatus": {
       "Type": "Choice",
-      "Comment": "Chronic-gap heal is fail-soft: any TERMINAL status (Success OR failure OR timeout) proceeds to PredictorInference; only keep polling while InProgress/Pending. This is the inverse of CheckMorningEnrichStatus (which HandleFailures on non-success) — MorningEnrich is load-bearing, this best-effort heal is not.",
+      "Comment": "Chronic-gap heal is fail-soft for HEAL failures: COMMAND_FAILED and POLL_BUDGET_EXHAUSTED (Default) proceed to PredictorInference — a broken/stuck best-effort heal must never block predictions. EXCEPTION (config#1811): INSTANCE_UNRESPONSIVE is NOT a heal failure, it is a host failure — the same wedged box the daemon must run on later. Proceeding fail-soft would just fail at RunMorningPlanner after burning PredictorInference; stamp + force-stop + HandleFailure instead.",
       "Choices": [
         {
-          "Variable": "$.chronic_gap_poll.Status",
-          "StringEquals": "InProgress",
+          "Variable": "$.chronic_gap_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
           "Next": "ChronicGapWait"
         },
         {
-          "Variable": "$.chronic_gap_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "ChronicGapWait"
+          "Variable": "$.chronic_gap_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampChronicGapUnresponsive"
         }
       ],
-      "Default": "CheckSkipPredictorInference"
+      "Default": "CheckDataSpotToTerminate"
     },
-
+    "StampChronicGapUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive during the (otherwise fail-soft) chronic-gap heal — a host failure, not a heal failure. Stamp the poller's detail into $.error, force-stop, alert.",
+      "Parameters": {
+        "Error": "ChronicGapInstanceUnresponsive",
+        "Cause.$": "$.chronic_gap_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceTerminateUnresponsiveDataSpot"
+    },
     "ChronicGapWait": {
       "Type": "Wait",
       "Seconds": 15,
       "Next": "WaitForChronicGap"
     },
-
     "NotifyHolidaySkip": {
       "Type": "Task",
       "Comment": "Notify that the pipeline was skipped — TradingDayGate reported is_trading_day=false (NYSE holiday/weekend). The executor box was never started (gate runs before StartExecutorEC2).",
@@ -415,7 +512,6 @@
       "ResultPath": "$.holiday_notify",
       "End": true
     },
-
     "StartExecutorEC2": {
       "Type": "Task",
       "Comment": "Start ae-trading (t3.small) early — needed for both DailyData (data collection) and RunMorningPlanner (executor). No-op if already running.",
@@ -425,7 +521,9 @@
       },
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
           "MaxAttempts": 2,
           "IntervalSeconds": 30,
           "BackoffRate": 1.0
@@ -433,7 +531,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -441,22 +541,21 @@
       "ResultPath": "$.ec2_start_result",
       "Next": "WaitForInstanceReady"
     },
-
     "WaitForInstanceReady": {
       "Type": "Wait",
       "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
       "Seconds": 15,
       "Next": "InitSSMPollCounter"
     },
-
     "InitSSMPollCounter": {
       "Type": "Pass",
       "Comment": "Initialize attempts counter for the SSM-readiness poll loop.",
-      "Result": {"attempts": 0},
+      "Result": {
+        "attempts": 0
+      },
       "ResultPath": "$.ssm_poll",
       "Next": "DescribeInstanceInfo"
     },
-
     "DescribeInstanceInfo": {
       "Type": "Task",
       "Comment": "Poll SSM-agent registration on the trading instance. Replaces the prior fixed Wait 60s, which was insufficient on cold-boot t3.small (race observed 2026-05-05 morning — Ssm.InvalidInstanceIdException at the first SSM step because PingStatus had not yet flipped to Online when the SSM SendCommand fired). SSMReadyChoice routes to CheckSkipMorningEnrich (the first morning work gate; the NYSE holiday check now runs BEFORE the box boots via TradingDayGate, config#1430) when PingStatus=Online or HandleFailure when the bounded retry budget (~3 min) is exhausted.",
@@ -472,7 +571,10 @@
       "TimeoutSeconds": 15,
       "Retry": [
         {
-          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
           "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5
@@ -480,7 +582,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -488,10 +592,9 @@
       "ResultPath": "$.ssm_describe_result",
       "Next": "SSMReadyChoice"
     },
-
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online → CheckSkipMorningEnrich (the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
+      "Comment": "PingStatus=Online → CodeFreshnessGate (config#1811; the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
       "Choices": [
         {
           "And": [
@@ -504,7 +607,7 @@
               "StringEquals": "Online"
             }
           ],
-          "Next": "CheckSkipMorningEnrich"
+          "Next": "CodeFreshnessGate"
         },
         {
           "Variable": "$.ssm_poll.attempts",
@@ -514,13 +617,11 @@
       ],
       "Default": "WaitSSMPoll"
     },
-
     "WaitSSMPoll": {
       "Type": "Wait",
       "Seconds": 15,
       "Next": "IncrementSSMPoll"
     },
-
     "IncrementSSMPoll": {
       "Type": "Pass",
       "Parameters": {
@@ -529,7 +630,184 @@
       "ResultPath": "$.ssm_poll",
       "Next": "DescribeInstanceInfo"
     },
-
+    "CodeFreshnessGate": {
+      "Type": "Task",
+      "Comment": "config#1811 Part A — verify the three repo checkouts on ae-trading (alpha-engine, alpha-engine-data, alpha-engine-config) are on branch main at origin/main's SHA BEFORE any pipeline work runs, with one in-place self-heal (ownership reclaim + checkout -f main + reset --hard). Front-loads the check the executor's deploy-drift preflight only makes at RunMorningPlanner time — on 2026-07-06 a boot-pull failure (root-owned files in the checkout) left the box on a stray branch 4 commits stale, and the pipeline burned ~40 min of MorningEnrich/ArcticAppend/PredictorInference before that preflight refused. The executor-repo AST syntax gate mirrors boot-pull's deploy gate but FAILS the pipeline instead of rolling back: at pipeline time, neither stale nor broken code may proceed (fail-loud). Runs as root via SSM (bare chown), git as ec2-user. The executor's in-process check_deploy_drift stays as defense-in-depth.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "export FLOW_DOCTOR_ENABLED=1",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "REPOS='alpha-engine alpha-engine-data alpha-engine-config'",
+            "for r in $REPOS; do sudo -u ec2-user git -C /home/ec2-user/$r fetch --quiet origin main; done",
+            "drift=0",
+            "for r in $REPOS; do d=/home/ec2-user/$r; br=$(sudo -u ec2-user git -C $d rev-parse --abbrev-ref HEAD); h=$(sudo -u ec2-user git -C $d rev-parse HEAD); u=$(sudo -u ec2-user git -C $d rev-parse origin/main); if [ \"$br\" != \"main\" ] || [ \"$h\" != \"$u\" ]; then echo \"DRIFT $r branch=$br head=$h upstream=$u\"; drift=1; fi; done",
+            "if [ $drift -eq 1 ]; then echo 'SELF-HEAL: ownership reclaim + reset to origin/main'; for r in $REPOS; do d=/home/ec2-user/$r; chown -R ec2-user:ec2-user $d; sudo -u ec2-user git -C $d checkout -f main; sudo -u ec2-user git -C $d reset --hard origin/main; done; fi",
+            "for r in $REPOS; do d=/home/ec2-user/$r; br=$(sudo -u ec2-user git -C $d rev-parse --abbrev-ref HEAD); h=$(sudo -u ec2-user git -C $d rev-parse HEAD); u=$(sudo -u ec2-user git -C $d rev-parse origin/main); if [ \"$br\" != \"main\" ] || [ \"$h\" != \"$u\" ]; then echo \"CODE-STALE-AFTER-HEAL $r branch=$br head=$h upstream=$u\"; exit 1; fi; done",
+            "cd /home/ec2-user/alpha-engine && sudo -u ec2-user .venv/bin/python -c \"import ast; [ast.parse(open(f).read()) for f in ('executor/main.py','executor/daemon.py','executor/eod_reconcile.py')]\"",
+            "echo CODE_FRESH"
+          ],
+          "executionTimeout": [
+            "300"
+          ]
+        },
+        "TimeoutSeconds": 300
+      },
+      "TimeoutSeconds": 360,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.code_freshness_result",
+      "Next": "InitCodeFreshnessPoll"
+    },
+    "InitCodeFreshnessPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the CodeFreshnessGate loop (config#1811).",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.code_freshness_poll",
+      "Next": "WaitForCodeFreshness"
+    },
+    "WaitForCodeFreshness": {
+      "Type": "Task",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 36 × ~10s ≈ 6 min, past the 300s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.code_freshness_result.Command.CommandId",
+          "attempts.$": "$.code_freshness_poll.attempts",
+          "ping_misses.$": "$.code_freshness_poll.ping_misses",
+          "max_attempts": 36,
+          "max_ping_misses": 3,
+          "step": "code-freshness-gate"
+        }
+      },
+      "TimeoutSeconds": 65,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
+      },
+      "ResultPath": "$.code_freshness_poll",
+      "Next": "CheckCodeFreshnessStatus"
+    },
+    "CheckCodeFreshnessStatus": {
+      "Type": "Choice",
+      "Comment": "SUCCESS → the box is verified on current main across all 3 repos → CheckSkipMorningEnrich (the pipeline proper). COMMAND_FAILED (Default) → HandleFailure — code stale after self-heal, or broken syntax on main; either way NOTHING may run (~2 min into the pipeline, not 40). INSTANCE_UNRESPONSIVE → stamp → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → CodeFreshnessPollTimeout.",
+      "Choices": [
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "SUCCESS",
+          "Next": "CheckDataSpotLaunched"
+        },
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
+          "Next": "CodeFreshnessWait"
+        },
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampCodeFreshnessUnresponsive"
+        },
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "POLL_BUDGET_EXHAUSTED",
+          "Next": "CodeFreshnessPollTimeout"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+    "CodeFreshnessWait": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "WaitForCodeFreshness"
+    },
+    "StampCodeFreshnessUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive during the code-freshness gate (right after reporting PingStatus=Online — a fast wedge). Stamp, force-stop, alert.",
+      "Parameters": {
+        "Error": "CodeFreshnessInstanceUnresponsive",
+        "Cause.$": "$.code_freshness_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceStopUnresponsiveInstance"
+    },
+    "CodeFreshnessPollTimeout": {
+      "Type": "Pass",
+      "Comment": "Bounded poll budget exhausted on the CodeFreshnessGate loop with the box still responsive (#970 shape). Stamp + alert via HandleFailure.",
+      "Result": {
+        "Error": "CodeFreshnessPollTimeout",
+        "Cause": "CodeFreshnessGate SSM command did not reach a terminal status within the bounded poll budget (~36 iterations / ~6 min, past the 300s executionTimeout) while the SSM agent stayed Online."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "ForceStopUnresponsiveInstance": {
+      "Type": "Task",
+      "Comment": "config#1811 — deterministic remediation for INSTANCE_UNRESPONSIVE: the box is wedged (the 2026-07-06 config#1807 shape: memory-pressure stall, SSM agent dark, in-box executionTimeout unable to fire) and every remaining pipeline step needs this same host, so force-stop it NOW rather than leave it thrashing with IB Gateway credentials on it. Validated as the actual recovery action in the 2026-07-06 incident. $.error was stamped by the per-loop Stamp state before arriving here; this state's own result/error use separate ResultPaths so the stamped cause survives into HandleFailure's SNS alert. A stop failure still routes to HandleFailure — alerting is the priority, the stop is best-effort remediation.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id",
+        "Force": true
+      },
+      "TimeoutSeconds": 30,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.force_stop_error"
+        }
+      ],
+      "ResultPath": "$.force_stop_result",
+      "Next": "HandleFailure"
+    },
     "PredictorInference": {
       "Type": "Task",
       "Comment": "Run daily GBM predictions + morning briefing email",
@@ -543,7 +821,10 @@
       "TimeoutSeconds": 900,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 60,
           "BackoffRate": 1.0
@@ -551,7 +832,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -559,7 +842,6 @@
       "ResultPath": "$.predictor_result",
       "Next": "CheckPredictorCoverage"
     },
-
     "CheckPredictorCoverage": {
       "Type": "Task",
       "Comment": "Self-healing coverage gate: detect buy_candidates in signals.json that lack a prediction row. Primary guard against the 2026-04-20 silent-veto-bypass bug. If any are missing, ReinvokePredictor scores them and RecheckCoverage verifies before we proceed to executor.",
@@ -573,7 +855,10 @@
       "TimeoutSeconds": 60,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 15,
           "BackoffRate": 1.0
@@ -581,7 +866,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -589,7 +876,6 @@
       "ResultPath": "$.coverage_result",
       "Next": "CoverageGapChoice"
     },
-
     "CoverageGapChoice": {
       "Type": "Choice",
       "Comment": "If buy_candidates have unscored tickers, re-invoke the predictor with --tickers. Otherwise advance to PredictorHealthCheck.",
@@ -602,7 +888,6 @@
       ],
       "Default": "PredictorHealthCheck"
     },
-
     "ReinvokePredictor": {
       "Type": "Task",
       "Comment": "Supplemental-scoring re-invoke for the tickers CheckPredictorCoverage flagged as missing. Predictor merges the new predictions into predictions/{date}.json (re-ranks the union).",
@@ -617,7 +902,10 @@
       "TimeoutSeconds": 900,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 60,
           "BackoffRate": 1.0
@@ -625,7 +913,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -633,7 +923,6 @@
       "ResultPath": "$.reinvoke_result",
       "Next": "RecheckCoverage"
     },
-
     "RecheckCoverage": {
       "Type": "Task",
       "Comment": "Second coverage check after ReinvokePredictor. If the gap persists (e.g. some ticker genuinely cannot be scored), bail out instead of looping — HandleFailure fires the SNS alert.",
@@ -647,7 +936,10 @@
       "TimeoutSeconds": 60,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 15,
           "BackoffRate": 1.0
@@ -655,7 +947,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -663,7 +957,6 @@
       "ResultPath": "$.coverage_recheck_result",
       "Next": "FinalCoverageGate"
     },
-
     "FinalCoverageGate": {
       "Type": "Choice",
       "Comment": "After one re-invocation attempt, either coverage is complete (proceed) or we have a deeper problem (fail). No further retry loop — prevents runaway invocations if a ticker is un-scorable by the model.",
@@ -676,7 +969,6 @@
       ],
       "Default": "PredictorHealthCheck"
     },
-
     "PredictorHealthCheck": {
       "Type": "Task",
       "Comment": "Daily predictor model health — IC, hit rate, calibration, retrain triggers",
@@ -690,7 +982,10 @@
       "TimeoutSeconds": 180,
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 30,
           "BackoffRate": 1.0
@@ -698,7 +993,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Comment": "Predictor health check is non-blocking — continue to morning planner. Executor's own upstream-health gate catches real data-freshness problems before placing orders.",
           "Next": "CheckSkipMorningPlanner",
           "ResultPath": "$.predictor_health_error"
@@ -707,7 +1004,6 @@
       "ResultPath": "$.predictor_health_result",
       "Next": "CheckSkipMorningPlanner"
     },
-
     "RunMorningPlanner": {
       "Type": "Task",
       "Comment": "Run morning order-book planner via SSM",
@@ -727,14 +1023,18 @@
             "trap 'aws s3 cp /var/log/executor.log \"s3://alpha-engine-research/_ssm_logs/executor/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python executor/main.py 2>&1 | tee -a /var/log/executor.log"
           ],
-          "executionTimeout": ["300"]
+          "executionTimeout": [
+            "300"
+          ]
         },
         "TimeoutSeconds": 300
       },
       "TimeoutSeconds": 360,
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
           "MaxAttempts": 1,
           "IntervalSeconds": 60,
           "BackoffRate": 1.0
@@ -742,78 +1042,133 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
       ],
       "ResultPath": "$.planner_result",
+      "Next": "InitMorningPlannerPoll"
+    },
+    "InitMorningPlannerPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the RunMorningPlanner loop (config#1811).",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.planner_poll",
       "Next": "WaitForMorningPlanner"
     },
-
     "WaitForMorningPlanner": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 300s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.planner_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.planner_result.Command.CommandId",
+          "attempts.$": "$.planner_poll.attempts",
+          "ping_misses.$": "$.planner_poll.ping_misses",
+          "max_attempts": 30,
+          "max_ping_misses": 3,
+          "step": "morning-planner"
+        }
       },
+      "TimeoutSeconds": 65,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.planner_poll",
       "Next": "CheckMorningPlannerStatus"
     },
-
     "CheckMorningPlannerStatus": {
       "Type": "Choice",
+      "Comment": "Branches on the ssm-liveness-poller verdict (config#1811). COMMAND_FAILED (Default) → HandleFailure — the 2026-07-06 deploy-drift refusal surfaced here with rc=1. INSTANCE_UNRESPONSIVE → stamp → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → MorningPlannerPollTimeout.",
       "Choices": [
         {
-          "Variable": "$.planner_poll.Status",
-          "StringEquals": "Success",
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "SUCCESS",
           "Next": "CheckSkipRunDaemon"
         },
         {
-          "Variable": "$.planner_poll.Status",
-          "StringEquals": "InProgress",
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
           "Next": "MorningPlannerWait"
         },
         {
-          "Variable": "$.planner_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "MorningPlannerWait"
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampMorningPlannerUnresponsive"
+        },
+        {
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "POLL_BUDGET_EXHAUSTED",
+          "Next": "MorningPlannerPollTimeout"
         }
       ],
       "Default": "HandleFailure"
     },
-
+    "StampMorningPlannerUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive mid-planner. Stamp the poller's detail into $.error, force-stop, alert.",
+      "Parameters": {
+        "Error": "MorningPlannerInstanceUnresponsive",
+        "Cause.$": "$.planner_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceStopUnresponsiveInstance"
+    },
+    "MorningPlannerPollTimeout": {
+      "Type": "Pass",
+      "Comment": "Bounded poll budget exhausted on the RunMorningPlanner loop with the box still responsive (#970 shape). Stamp + alert via HandleFailure.",
+      "Result": {
+        "Error": "MorningPlannerPollTimeout",
+        "Cause": "RunMorningPlanner SSM command did not reach a terminal status within the bounded poll budget (~30 iterations / ~7.5 min, past the 300s executionTimeout) while the SSM agent stayed Online. See /var/log/executor.log on ae-trading."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
     "MorningPlannerWait": {
       "Type": "Wait",
       "Seconds": 15,
       "Next": "WaitForMorningPlanner"
     },
-
     "RunDaemon": {
       "Type": "Task",
       "Comment": "Restart the intraday daemon via SSM",
@@ -829,14 +1184,18 @@
             "sudo systemctl restart alpha-engine-daemon.service",
             "echo 'Daemon restarted'"
           ],
-          "executionTimeout": ["30"]
+          "executionTimeout": [
+            "30"
+          ]
         },
         "TimeoutSeconds": 30
       },
       "TimeoutSeconds": 60,
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Comment": "Daemon restart failure is non-fatal — systemd boot trigger is backup",
           "Next": "PipelineComplete",
           "ResultPath": "$.daemon_error"
@@ -845,202 +1204,286 @@
       "ResultPath": "$.daemon_result",
       "Next": "PipelineComplete"
     },
-
     "CheckSkipMorningEnrich": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_enrich\": true} routes past MorningEnrich (fetch: constituents + prune + polygon daily_closes) to the next gate (CheckSkipMorningArcticAppend); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the weekday pipeline is rerunnable task-by-task — an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_morning_enrich", "IsPresent": true},
-            {"Variable": "$.skip_morning_enrich", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_morning_enrich",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_morning_enrich",
+              "BooleanEquals": true
+            }
           ],
           "Next": "CheckSkipMorningArcticAppend"
         }
       ],
       "Default": "MorningEnrich"
     },
-
     "CheckSkipMorningArcticAppend": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4608). Input {\"skip_morning_arctic_append\": true} routes past MorningArcticAppend to the next gate (CheckSkipChronicGapHeal); missing flag = run as normal. The slow ArcticDB daily_append was split out of MorningEnrich 2026-06-11 — it ran ~20-38 min and a same-morning rerun exceeded MorningEnrich's 1800s SSM timeout and SIGKILLed it. As its own state it gets a longer timeout decoupled from the fast fetch, and a recovery rerun can skip whichever half already completed. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_morning_arctic_append", "IsPresent": true},
-            {"Variable": "$.skip_morning_arctic_append", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_morning_arctic_append",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_morning_arctic_append",
+              "BooleanEquals": true
+            }
           ],
           "Next": "CheckSkipChronicGapHeal"
         }
       ],
       "Default": "MorningArcticAppend"
     },
-
     "MorningArcticAppend": {
       "Type": "Task",
-      "Comment": "LOAD-BEARING: ArcticDB universe daily_append for the prior trading day — writes the polygon-corrected OHLCV row + recomputed features that predictor inference reads next. Split out of MorningEnrich (L4608, 2026-06-11): the append is the slow part (~20-38 min on the t3.small) and on 2026-06-11 a same-morning rerun's append exceeded MorningEnrich's 1800s executionTimeout and SIGKILLed the whole command. Own longer timeout (2400s) decoupled from the fast fetch; reads the constituents MorningEnrich just refreshed to S3. Failure → HandleFailure (predictor must not run on a stale ArcticDB).",
+      "Comment": "LOAD-BEARING: ArcticDB universe daily_append for the prior trading day — writes the polygon-corrected OHLCV row + recomputed features that predictor inference reads next. Split out of MorningEnrich (L4608, 2026-06-11): the append is the slow part (~20-38 min on the t3.small) and on 2026-06-11 a same-morning rerun's append exceeded MorningEnrich's 1800s executionTimeout and SIGKILLed the whole command. Own longer timeout (2400s) decoupled from the fast fetch; reads the constituents MorningEnrich just refreshed to S3. Failure → HandleFailure (predictor must not run on a stale ArcticDB). | config#1807 (2026-07-06): RUNS ON THE DAILY DATA SPOT — see MorningEnrich. The 2026-07-06 incident (this state swap-thrashing the t3.small into SSM darkness at market open) is the reason the whole data phase moved; the t3.large resize becomes revertible once this soaks.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
+        "InstanceIds.$": "States.Array($.data_spot.info.instance_id)",
         "Parameters": {
           "commands": [
             "set -eo pipefail",
             "export FLOW_DOCTOR_ENABLED=1",
             "export ALPHA_ENGINE_DEPLOYED=1",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+            "export HOME=/home/ec2-user",
+            "export XDG_CACHE_HOME=/tmp",
+            "export AWS_REGION=us-east-1",
+            "export AWS_DEFAULT_REGION=us-east-1",
+            "command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3",
             "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/morning-arctic-append.log \"s3://alpha-engine-research/_ssm_logs/morning-arctic-append/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/morning-arctic-append.log",
-            "python weekly_collector.py --morning-arctic-append 2>&1 | tee -a /var/log/morning-arctic-append.log"
+            "$PYTHON_BIN weekly_collector.py --morning-arctic-append 2>&1 | tee -a /var/log/morning-arctic-append.log"
           ],
-          "executionTimeout": ["2400"]
+          "executionTimeout": [
+            "2400"
+          ]
         },
         "TimeoutSeconds": 2400
       },
       "TimeoutSeconds": 2460,
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
       ],
       "ResultPath": "$.arctic_append_result",
+      "Next": "InitMorningArcticAppendPoll"
+    },
+    "InitMorningArcticAppendPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the MorningArcticAppend loop (config#1811). This loop previously had NO bounded-attempt cap (the #970 fix only ever landed on MorningEnrich — copy-drift) and no liveness check: on 2026-07-06 (config#1807) it polled a frozen InProgress for 62 minutes while the box was wedged.",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.arctic_append_poll",
       "Next": "WaitForMorningArcticAppend"
     },
-
     "WaitForMorningArcticAppend": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 150 × ~20s ≈ 50 min, just past the 2400s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.arctic_append_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.data_spot.info.instance_id",
+          "command_id.$": "$.arctic_append_result.Command.CommandId",
+          "attempts.$": "$.arctic_append_poll.attempts",
+          "ping_misses.$": "$.arctic_append_poll.ping_misses",
+          "max_attempts": 150,
+          "max_ping_misses": 3,
+          "step": "morning-arctic-append"
+        }
       },
+      "TimeoutSeconds": 65,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.arctic_append_poll",
       "Next": "CheckMorningArcticAppendStatus"
     },
-
     "CheckMorningArcticAppendStatus": {
       "Type": "Choice",
-      "Comment": "LOAD-BEARING like CheckMorningEnrichStatus: only Success proceeds (to the chronic-gap heal gate, then PredictorInference); any other terminal SSM status → HandleFailure (predictor must not run on a stale ArcticDB universe). Only InProgress/Pending keep polling.",
+      "Comment": "LOAD-BEARING like CheckMorningEnrichStatus: only SUCCESS proceeds (to the chronic-gap heal gate, then PredictorInference); COMMAND_FAILED (Default) → HandleFailure (predictor must not run on a stale ArcticDB universe). INSTANCE_UNRESPONSIVE (the config#1807 wedged-box shape — THIS loop's 2026-07-06 incident) → stamp error → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → MorningArcticAppendPollTimeout.",
       "Choices": [
         {
-          "Variable": "$.arctic_append_poll.Status",
-          "StringEquals": "Success",
+          "Variable": "$.arctic_append_poll.verdict",
+          "StringEquals": "SUCCESS",
           "Next": "CheckSkipChronicGapHeal"
         },
         {
-          "Variable": "$.arctic_append_poll.Status",
-          "StringEquals": "InProgress",
+          "Variable": "$.arctic_append_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
           "Next": "MorningArcticAppendWait"
         },
         {
-          "Variable": "$.arctic_append_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "MorningArcticAppendWait"
+          "Variable": "$.arctic_append_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampMorningArcticAppendUnresponsive"
+        },
+        {
+          "Variable": "$.arctic_append_poll.verdict",
+          "StringEquals": "POLL_BUDGET_EXHAUSTED",
+          "Next": "MorningArcticAppendPollTimeout"
         }
       ],
       "Default": "HandleFailure"
     },
-
     "MorningArcticAppendWait": {
       "Type": "Wait",
       "Seconds": 20,
       "Next": "WaitForMorningArcticAppend"
     },
-
+    "StampMorningArcticAppendUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive mid-ArcticDB-append — the exact 2026-07-06 config#1807 incident shape (memory-pressure wedge; SSM agent ConnectionLost; in-box executionTimeout unable to fire). Stamp the poller's detail into $.error, then terminate the DATA SPOT (config#1807 — the trading box is not involved in this state anymore) and alert via HandleFailure. Detection budget: ~3 polls ≈ 1 min (was: 62 min of blind polling).",
+      "Parameters": {
+        "Error": "MorningArcticAppendInstanceUnresponsive",
+        "Cause.$": "$.arctic_append_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceTerminateUnresponsiveDataSpot"
+    },
+    "MorningArcticAppendPollTimeout": {
+      "Type": "Pass",
+      "Comment": "Bounded poll budget exhausted on the MorningArcticAppend loop with the box still responsive (the #970 stuck-InProgress shape — distinct from INSTANCE_UNRESPONSIVE). Stamp a clear cause into $.error then route through HandleFailure so the SNS alert carries it. Operator action: inspect /var/log/morning-arctic-append.log on ae-trading + the SSM command invocation.",
+      "Result": {
+        "Error": "MorningArcticAppendPollTimeout",
+        "Cause": "MorningArcticAppend SSM command did not reach a terminal status within the bounded poll budget (~150 iterations / ~50 min, past the 2400s executionTimeout) while the SSM agent stayed Online. Stuck-InProgress, not slow. See /var/log/morning-arctic-append.log on ae-trading."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
     "CheckSkipChronicGapHeal": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4606). Input {\"skip_chronic_gap_heal\": true} routes past ChronicGapSelfHeal to the next gate (CheckSkipPredictorInference); missing flag = run as normal. The heal is already best-effort/fail-soft, so skipping it on a rerun is always safe. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_chronic_gap_heal", "IsPresent": true},
-            {"Variable": "$.skip_chronic_gap_heal", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_chronic_gap_heal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_chronic_gap_heal",
+              "BooleanEquals": true
+            }
           ],
-          "Next": "CheckSkipPredictorInference"
+          "Next": "CheckDataSpotToTerminate"
         }
       ],
       "Default": "ChronicGapSelfHeal"
     },
-
     "CheckSkipPredictorInference": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4606). Input {\"skip_predictor_inference\": true} routes past PredictorInference (and its coverage/health sub-chain) to the next gate (CheckSkipMorningPlanner); missing flag = run as normal. Skip only when predictions/{date}.json already exists from a prior run. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_predictor_inference", "IsPresent": true},
-            {"Variable": "$.skip_predictor_inference", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_predictor_inference",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_predictor_inference",
+              "BooleanEquals": true
+            }
           ],
           "Next": "CheckSkipMorningPlanner"
         }
       ],
       "Default": "PredictorInference"
     },
-
     "CheckSkipMorningPlanner": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_planner\": true} routes past RunMorningPlanner to the next gate (CheckSkipRunDaemon); missing flag = run as normal. The planner writes the order book but places no orders, so re-running it is normally safe; skip is for reruns where the book is already current. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_morning_planner", "IsPresent": true},
-            {"Variable": "$.skip_morning_planner", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_morning_planner",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_morning_planner",
+              "BooleanEquals": true
+            }
           ],
           "Next": "CheckSkipRunDaemon"
         }
       ],
       "Default": "RunMorningPlanner"
     },
-
     "CheckSkipRunDaemon": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) directly to PipelineComplete; missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
-            {"Variable": "$.skip_run_daemon", "IsPresent": true},
-            {"Variable": "$.skip_run_daemon", "BooleanEquals": true}
+            {
+              "Variable": "$.skip_run_daemon",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_run_daemon",
+              "BooleanEquals": true
+            }
           ],
           "Next": "PipelineComplete"
         }
       ],
       "Default": "RunDaemon"
     },
-
     "PipelineComplete": {
       "Type": "Succeed"
     },
-
     "HandleFailure": {
       "Type": "Task",
       "Comment": "Failure alert via SNS",
@@ -1053,11 +1496,218 @@
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"
     },
-
     "FailExecution": {
       "Type": "Fail",
       "Error": "DailyPipelineFailure",
       "Cause": "One or more weekday pipeline steps failed."
+    },
+    "CheckSkipDataSpot": {
+      "Type": "Choice",
+      "Comment": "config#1807: the pre-open data phase (MorningEnrich + MorningArcticAppend + ChronicGapSelfHeal) runs on a short-lived spot instead of the trading box, whose 2026-07-06 swap-thrash starved its own SSM agent and blocked RunDaemon at market open. Launch the spot ONLY if at least one data state will run — a recovery rerun that skips all three (the 2026-07-06 recovery2 shape) boots no spot at all.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_morning_enrich",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_morning_enrich",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.skip_morning_arctic_append",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_morning_arctic_append",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.skip_chronic_gap_heal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_chronic_gap_heal",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StartExecutorEC2"
+        }
+      ],
+      "Default": "LaunchDailyDataSpot"
+    },
+    "LaunchDailyDataSpot": {
+      "Type": "Task",
+      "Comment": "config#1807 — fire-and-forget: SSM ae-dashboard (the fleet spot dispatcher, $.ec2_instance_id — ALREADY carried by the WeekdayTrigger CFN Input as [MicroInstanceId]) to run spot_data_weekly.sh --launch-only, which launches + bootstraps the daily data spot (capacity rotation + interruption retry via krepis.ec2_spot, systemd dead-man watchdog armed at 10800s) and writes {instance_id} to ops/daily_data_spot/{date}/{execution-name}.json. The SF does NOT poll this command — the ~7-min spot bootstrap overlaps the trading-box boot + SSM-ready + CodeFreshnessGate chain, and ReadDataSpotId's retry-until-present loop is the synchronization point (a launch failure surfaces there as a loud timeout). | config#1897 (2026-07-07): the id-artifact key is EXECUTION-scoped ($$.Execution.Name), not merely date-scoped. Date-scoping only defended against a stale PRIOR-DAY artifact; a same-day recovery rerun found the previous attempt's key already present, so ReadDataSpotId's S3.NoSuchKey retry-until-present returned INSTANTLY with the prior (now-reclaimed, terminated) spot id and MorningEnrich hit Ssm.InvalidInstanceIdException on a dead box. Keying by execution name (unique per StartExecution) restores the invariant per-execution: the synchronization loop again blocks until THIS launch writes its own key. Writer and reader build the identical key — keep them in lockstep. Manual executions that run any data state must pass ec2_instance_id (ae-dashboard's instance id, as a 1-element list — same field the scheduled input carries) or set all three data skip_* flags. | 2026-07-06 live-verify fix: the dashboard-side launcher MUST source /home/ec2-user/.alpha-engine.env (byte-mirror of the weekly DataPhase1 command) — spot RunInstances+PassRole authorize via those env credentials, NOT the dashboard instance role (verified live: the role carries no ec2:RunInstances/iam:PassRole; the first verify run failed exactly there).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands.$": "States.Array('set -eo pipefail','export FLOW_DOCTOR_ENABLED=1','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug data-daily-launch --log /var/log/data-daily-launch.log -- bash infrastructure/spot_data_weekly.sh --launch-only --id-artifact-key ops/daily_data_spot/{}/{}.json --max-runtime-seconds 10800', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0), $$.Execution.Name))",
+          "executionTimeout": [
+            "1800"
+          ]
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist",
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.data_spot_launch",
+      "Next": "StartExecutorEC2"
+    },
+    "CheckDataSpotLaunched": {
+      "Type": "Choice",
+      "Comment": "config#1807 — only executions that dispatched a spot launch read the id artifact; the all-three-skips path (no launch) proceeds straight to the (all-skipping) data gates.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot_launch",
+          "IsPresent": true,
+          "Next": "ReadDataSpotId"
+        }
+      ],
+      "Default": "CheckSkipMorningEnrich"
+    },
+    "ReadDataSpotId": {
+      "Type": "Task",
+      "Comment": "config#1807 — synchronization point with the fire-and-forget launch: the id artifact appears once the spot is bootstrapped (~7 min, overlapped with the trading-box boot chain that just completed). config#1897 (2026-07-07): the key is EXECUTION-scoped (ops/daily_data_spot/{date}/{$$.Execution.Name}.json), built identically to LaunchDailyDataSpot's --id-artifact-key. Date-scoping alone was NOT safe: a same-day recovery rerun found the prior attempt's key already present and read its now-terminated spot id (S3.NoSuchKey returned instantly instead of waiting), so MorningEnrich sendCommand hit Ssm.InvalidInstanceIdException on a dead instance. Execution-scoping means the S3.NoSuchKey retry-until-present loop again blocks until THIS execution's launch writes ITS key — never a prior attempt's. Retry budget 24x20s = 8 min past the boot chain; exhaustion -> HandleFailure (loud), covering both a failed launch and a capacity-exhausted spot request.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('ops/daily_data_spot/{}/{}.json', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0), $$.Execution.Name)"
+      },
+      "ResultSelector": {
+        "Body.$": "$.Body"
+      },
+      "ResultPath": "$.data_spot_raw",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "S3.NoSuchKeyException",
+            "S3.NoSuchKey",
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 20,
+          "MaxAttempts": 24,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ParseDataSpotId"
+    },
+    "ParseDataSpotId": {
+      "Type": "Pass",
+      "Comment": "Lift the artifact JSON into $.data_spot.info — data states target $.data_spot.info.instance_id.",
+      "Parameters": {
+        "info.$": "States.StringToJson($.data_spot_raw.Body)"
+      },
+      "ResultPath": "$.data_spot",
+      "Next": "CheckSkipMorningEnrich"
+    },
+    "CheckDataSpotToTerminate": {
+      "Type": "Choice",
+      "Comment": "config#1807 — every data-phase exit (chronic-gap success, its fail-soft Catch, and the all-skip route) converges here so the spot is terminated exactly once, before PredictorInference. No spot launched (all-skips) -> pass through.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot",
+          "IsPresent": true,
+          "Next": "TerminateDailyDataSpot"
+        }
+      ],
+      "Default": "CheckSkipPredictorInference"
+    },
+    "TerminateDailyDataSpot": {
+      "Type": "Task",
+      "Comment": "config#1807 — best-effort cleanup: a terminate failure must not fail a pipeline whose data work already succeeded (Catch -> proceed; the failure is recorded in $.data_spot_terminate_error and the spot's own systemd watchdog (10800s, armed at bootstrap) is the named backstop that bounds an orphan to ~3h of spot cost). Success path removes the box ~2h before the watchdog would.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+      "Parameters": {
+        "InstanceIds.$": "States.Array($.data_spot.info.instance_id)"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CheckSkipPredictorInference",
+          "ResultPath": "$.data_spot_terminate_error"
+        }
+      ],
+      "ResultPath": "$.data_spot_terminate",
+      "Next": "CheckSkipPredictorInference"
+    },
+    "ForceTerminateUnresponsiveDataSpot": {
+      "Type": "Task",
+      "Comment": "config#1807/#1811 — the DATA SPOT went unresponsive mid data-state (PingStatus dark >=3 polls). Terminate the SPOT (not the trading box — it is healthy and holds no failed work) and fail loud. Mirrors ForceStopUnresponsiveInstance's posture; a terminate failure still routes to HandleFailure with the stamped cause intact, and the spot watchdog bounds any orphan.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+      "Parameters": {
+        "InstanceIds.$": "States.Array($.data_spot.info.instance_id)"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.data_spot_force_terminate_error"
+        }
+      ],
+      "ResultPath": "$.data_spot_force_terminate",
+      "Next": "HandleFailure"
     }
   }
 }

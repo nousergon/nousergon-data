@@ -11,21 +11,19 @@ output**. The 2026-05-27 wrapper-layer fix (this repo's #602) moved the SF's
 ``ssm_log_capture`` caller to the canonical ``krepis`` path (see
 ``test_ssm_log_capture_wrapper_executes.py``); this file is the
 LAUNCHER-layer instance of the exact same class for
-``infrastructure/spot_data_weekly.sh`` and
-``infrastructure/spot_drift_detection.sh`` (config#1649).
+``infrastructure/spot_data_weekly.sh`` (config#1649).
 
-String-pinning wiring tests (``test_spot_data_weekly_ssm_transport.py``,
-``test_spot_drift_detection_ssm_transport.py``) prove the launcher's
-source text NAMES the krepis module — they provably cannot prove the
-module is *executable* under ``python -m`` (importable-but-not-executable
-is exactly how the 2026-07-03 incident hid). This file mirrors
-``test_ssm_log_capture_wrapper_executes.py``'s chokepoint-extraction
-pattern: it collects the exact ``ec2_spot``/``ssm_dispatcher`` module
-paths BOTH launchers invoke and proves each one's CLI actually parses
-argv and dispatches — entirely offline (no AWS calls): a guard-less shim
-prints NOTHING and exits 0 for ``--help`` or a bare invocation; a real,
-executing CLI prints usage/errors and exits non-zero where argparse
-requires it. That divergence is the structural guard.
+String-pinning wiring tests (``test_spot_data_weekly_ssm_transport.py``)
+prove the launcher's source text NAMES the krepis module — they provably
+cannot prove the module is *executable* under ``python -m``
+(importable-but-not-executable is exactly how the 2026-07-03 incident hid).
+This file mirrors ``test_ssm_log_capture_wrapper_executes.py``'s
+chokepoint-extraction pattern: it collects the exact ``ec2_spot``/
+``ssm_dispatcher`` module paths the launcher invokes and proves each one's
+CLI actually parses argv and dispatches — entirely offline (no AWS calls):
+a guard-less shim prints NOTHING and exits 0 for ``--help`` or a bare
+invocation; a real, executing CLI prints usage/errors and exits non-zero
+where argparse requires it. That divergence is the structural guard.
 """
 
 from __future__ import annotations
@@ -40,7 +38,6 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = [
     _REPO_ROOT / "infrastructure" / "spot_data_weekly.sh",
-    _REPO_ROOT / "infrastructure" / "spot_drift_detection.sh",
 ]
 
 # `python -m <module>.{ec2_spot,ssm_dispatcher}` as invoked by a launcher

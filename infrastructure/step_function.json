@@ -6,9 +6,97 @@
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values — preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "CheckWeeklyRunDayGate"
+    },
+    "CheckWeeklyRunDayGate": {
+      "Type": "Choice",
+      "Comment": "config#1824 (Brian-ratified 2026-07-06): the weekly runs ONE DAY AFTER the week's last trading session, so the cron fires THU-SAT and this gate self-selects the single correct day. Applies ONLY to the scheduled weekly cadence (pipeline_role='weekly', set by the EventBridge CFN Input) — manual / recovery / watch-rerun / shell executions carry other roles (or none) and bypass automatically; skip_weekly_run_day_gate=true (defaulted false by InitializeInput) is the explicit operator bypass per the config#1617 skip-flag charter.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "weekly"
+            },
+            {
+              "Variable": "$.skip_weekly_run_day_gate",
+              "BooleanEquals": false
+            }
+          ],
+          "Next": "WeeklyRunDayGate"
+        }
+      ],
+      "Default": "CheckRunMode"
+    },
+    "WeeklyRunDayGate": {
+      "Type": "Task",
+      "Comment": "Run-day gate (config#1824) — mirrors the weekday TradingDayGate (config#1430): predictor Lambda action=check_weekly_run_day is pure NYSE-calendar math with zero infra dependency, returning before preflight. True iff yesterday was the week's LAST trading session (Sat on normal weeks; Fri/Thu on holiday-shortened weeks — real precedent Fri 2026-07-03).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_weekly_run_day"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "WeeklyRunDayGateFailed",
+          "ResultPath": "$.weekly_run_day_gate_error"
+        }
+      ],
+      "ResultPath": "$.weekly_run_day_gate",
+      "Next": "WeeklyRunDayGateChoice"
+    },
+    "WeeklyRunDayGateChoice": {
+      "Type": "Choice",
+      "Comment": "Not the run day -> clean Succeed skip BEFORE any spend (no mutex, no lib-pin check, no spot, no alert): on a normal week 2 of the 3 THU-SAT firings land here by design. Run day or any non-false result -> proceed. Fail-open mirrors the weekday gate posture: missing the weekly run is worse than a duplicate.",
+      "Choices": [
+        {
+          "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+          "BooleanEquals": false,
+          "Next": "WeeklyRunDaySkip"
+        }
+      ],
+      "Default": "CheckRunMode"
+    },
+    "WeeklyRunDaySkip": {
+      "Type": "Succeed",
+      "Comment": "Designed no-op: scheduled THU-SAT firing on a non-run day. Succeed (never Fail) so SF-success metrics, the SF-watch agent, and page-25 treat this exactly like the weekday NotifyHolidaySkip — a green skip, not a failure. Cycle health remains artifact-freshness-as-authority (config#1724); this state produces no artifacts on purpose."
+    },
+    "WeeklyRunDayGateFailed": {
+      "Type": "Task",
+      "Comment": "Gate Lambda failed for infrastructure reasons — alert and PROCEED as run day (fail-open, mirroring the weekday TradingDayGateFailed). Worst case a broken predictor Lambda all week yields up to 3 alerted duplicate runs (distinct run_dates, idempotent artifact keys) — accepted: the same Lambda gates every weekday morning, so a multi-day outage is already loudly visible. Message fields are all structurally guaranteed (sns_topic_arn defaulted by InitializeInput; error set by the Catch ResultPath) per the config#1819 notifier-totality lesson.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Run-Day Gate Failed (Proceeding)",
+        "Message.$": "States.Format('Weekly run-day gate Lambda failed (infra error, not a calendar decision). Pipeline proceeding as run day. Error: {}', States.JsonToString($.weekly_run_day_gate_error))"
+      },
+      "ResultPath": "$.weekly_run_day_gate_error_notify",
       "Next": "CheckRunMode"
     },
     "CheckRunMode": {
@@ -33,7 +121,7 @@
     },
     "ApplyBacktestEvalPreset": {
       "Type": "Pass",
-      "Comment": "mode=backtest-eval ONLY (config#830). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training/drift-detection), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
+      "Comment": "mode=backtest-eval ONLY (config#830). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
         "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
@@ -97,7 +185,7 @@
     },
     "LibPinDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention.",
+      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention. On pass, proceeds to PipelineContractCheck (L4595 / config#693) — the sibling pre-spend preflight gate — rather than straight to CheckMutexRole, composing both invariant probes into one preflight chain before any spot spend.",
       "Choices": [
         {
           "Variable": "$.libpin_drift_result.Payload.has_drift",
@@ -105,7 +193,7 @@
           "Next": "ExtractLibPinDriftError"
         }
       ],
-      "Default": "CheckMutexRole"
+      "Default": "PipelineContractCheck"
     },
     "ExtractLibPinDriftError": {
       "Type": "Pass",
@@ -114,6 +202,64 @@
         "phase": "LibPinDriftGate",
         "source": "LibPinDriftGate.has_drift",
         "drift.$": "$.libpin_drift_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "PipelineContractCheck": {
+      "Type": "Task",
+      "Comment": "Preventive pre-spend PIPELINE_CONTRACT.yaml preflight gate (L4595 / config#693). Sibling to LibPinDriftCheck: runs immediately after it, BEFORE any spot launch, and asserts PIPELINE_CONTRACT.yaml is internally self-consistent AND every artifact_id it references exists in ARTIFACT_REGISTRY.yaml. A CI validator (validate_pipeline_contract.py) already catches this at PR time, but a config/SF-definition change made outside that CI could still spend a Saturday spot before failing; this probe re-runs the same invariants at SF start so a contract break halts in seconds. FAIL-OPEN: a GitHub-fetch/parse miss sets has_violation=false (the probe's own degraded mode, reason=fetch_failed), and the Catch routes any Lambda failure straight to the pipeline — so the checker NEVER false-halts the weekly run, mirroring LibPinDriftCheck's fail-open semantics exactly.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_pipeline_contract"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
+          "Next": "CheckMutexRole",
+          "ResultPath": "$.pipeline_contract_error"
+        }
+      ],
+      "ResultPath": "$.pipeline_contract_result",
+      "Next": "PipelineContractGate"
+    },
+    "PipelineContractGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error.",
+      "Choices": [
+        {
+          "Variable": "$.pipeline_contract_result.Payload.has_violation",
+          "BooleanEquals": true,
+          "Next": "ExtractPipelineContractError"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "ExtractPipelineContractError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the violation list. Carries the whole probe Payload (has_violation/violations/boundary_count/reason) so the FAILED SNS alert names the exact contract breach a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors ExtractLibPinDriftError → HandleFailure convention; no new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on a real contract violation by design).",
+      "Parameters": {
+        "phase": "PipelineContractGate",
+        "source": "PipelineContractGate.has_violation",
+        "violation.$": "$.pipeline_contract_result.Payload"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -901,7 +1047,7 @@
             },
             "Research": {
               "Type": "Task",
-              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix.",
+              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix. TIMEOUT RETRY = CHECKPOINT-RESUME (config#1650, 2026-07-06): the runner persists per-node state (archive/agent_runs + sector_team_runs) and RESUMEs completed nodes at near-zero LLM cost, so one retry on States.Timeout/Lambda.Unknown converts the manual watch-rerun into the automatic contract (the 7/3 timeout's rerun finished in ~5.9 min). IntervalSeconds=60 is LOAD-BEARING: it guarantees the first invocation is dead past its own 900s Lambda ceiling before the retry fires (runner has reserved-concurrency=1 — an overlapping invoke would throttle). Bridge until the config#1687 spot-EC2 migration removes the 900s ceiling entirely.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-runner:live",
@@ -918,6 +1064,15 @@
                   "ErrorEquals": [
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                },
+                {
+                  "ErrorEquals": [
+                    "States.Timeout",
+                    "Lambda.Unknown"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
@@ -2238,7 +2393,7 @@
     },
     "Backtester": {
       "Type": "Task",
-      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn — preserves the skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). config#902 collapsed the standalone DriftDetection state that used to precede this one; the parallel join + CheckSkipDriftDetection-skip both now route directly to CheckSkipBacktester, so this state is entered straight from the join / its skip-gate. Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn — preserves the skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). config#902 collapsed the standalone DriftDetection state that used to precede this one; entry flows now from CheckSkipBacktester directly. Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",

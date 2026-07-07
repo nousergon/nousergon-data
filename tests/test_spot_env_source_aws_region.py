@@ -31,7 +31,6 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS = [
     _REPO_ROOT / "infrastructure" / "spot_data_weekly.sh",
-    _REPO_ROOT / "infrastructure" / "spot_drift_detection.sh",
 ]
 
 

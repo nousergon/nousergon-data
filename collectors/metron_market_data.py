@@ -173,7 +173,9 @@ EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
 FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow (balance sheet)
 INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
-TECHNICALS_SCHEMA_VERSION = 1
+TECHNICALS_SCHEMA_VERSION = 2  # v2: + pct_from_52wk_high (tearsheet parity with Holdings)
+SECURITY_PERFORMANCE_SCHEMA_VERSION = 1
+SECURITY_PERFORMANCE_PREFIX = "market_data/security_performance/"
 VALUATION_MEDIANS_SCHEMA_VERSION = 1
 ANALYST_SCHEMA_VERSION = 1  # consensus rating + price targets + #analysts (free sources)
 SENTIMENT_SCHEMA_VERSION = 1  # LM news sentiment + event rollup (held-universe latest slice)
@@ -270,6 +272,46 @@ def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[
     logger.info(
         "[metron_market_data] universe: %d instruments (%d held, %d watchlist-only), %d non-USD currencies",
         len(holdings), len(held), len(watchlist_only), len(currencies),
+    )
+    return holdings, currencies
+
+
+def _load_sp1500_symbols(bucket: str) -> set[str]:
+    """S&P 500 + 400 yf_symbols from the fleet constituents artifact. Fail-soft → ∅."""
+    symbols: set[str] = set()
+    try:
+        from collectors import constituents
+
+        art = constituents.load_from_s3(bucket)
+        for t in (art or {}).get("tickers", []) or []:
+            if str(t).strip():
+                symbols.add(str(t).strip())
+    except Exception as e:
+        logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
+    return symbols
+
+
+def load_price_derived_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[str]]:
+    """Universe for price-derived spine artifacts: **SP1500 ∪ Metron held ∪ watchlist**.
+
+    One daily pass covers the research scanner universe plus Metron's foreign/OTC/fund
+    delta so overlap tickers (AAPL, MU, …) share a single close_history + derived-metrics
+    spine. SP1500-only symbols default to USD; held-universe currency wins on conflict.
+    Fundamentals/analyst/sentiment stay on ``load_metron_universe()`` (held-scoped)."""
+    metron_holdings, _ = load_metron_universe(bucket, s3_client)
+    ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in metron_holdings}
+    sp1500 = _load_sp1500_symbols(bucket)
+    all_yf = sorted(sp1500 | set(ccy_by_yf))
+    if not all_yf:
+        return [], []
+    holdings = [{"yf_symbol": yf, "currency": ccy_by_yf.get(yf, "USD")} for yf in all_yf]
+    currencies = sorted({
+        ccy for yf in all_yf for ccy in [ccy_by_yf.get(yf, "USD")] if ccy and ccy != "USD"
+    })
+    metron_only = set(ccy_by_yf) - sp1500
+    logger.info(
+        "[metron_market_data] price-derived universe: %d symbols (%d SP1500, %d metron-only)",
+        len(holdings), len(sp1500), len(metron_only),
     )
     return holdings, currencies
 
@@ -812,9 +854,9 @@ def collect_history(
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    holdings, currencies = load_metron_universe(bucket, s3_client)
+    holdings, currencies = load_price_derived_universe(bucket, s3_client)
     if not holdings:
-        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
     # Held symbols + the factor/sector ETFs Metron's risk/attribution need (metron-ops#43),
     # + the major-index ETF proxies (so the Overview markets strip resolves YTD/LTM for
@@ -1240,6 +1282,7 @@ def _compute_technicals(closes: list[list]) -> dict | None:
         "high_52w": _round(high_52w, 4),
         "low_52w": _round(low_52w, 4),
         "pct_in_52w_range": _round((last - low_52w) / rng) if rng > 0 else None,
+        "pct_from_52wk_high": _round(last / high_52w - 1.0) if high_52w > 0 else None,
         "mom_20d": _round(last / float(s.iloc[-21]) - 1.0) if len(s) >= 21 else None,
         "mom_60d": _round(last / float(s.iloc[-61]) - 1.0) if len(s) >= 61 else None,
     }
@@ -1260,8 +1303,8 @@ def collect_technicals(
              ma_200, pct_to_ma_50, pct_to_ma_200, high_52w, low_52w, pct_in_52w_range,
              mom_20d, mom_60d}}}
 
-    Daily cadence (close_history refreshes daily). Fail-soft per symbol; a symbol with no
-    close_history / too short a series is omitted (coverage gap, never zeros)."""
+    Daily cadence (close_history refreshes daily). Universe = SP1500 ∪ Metron held/watchlist.
+    Fail-soft per symbol; a symbol with no close_history / too short a series is omitted."""
     if run_date is None:
         from dates import default_run_date
 
@@ -1269,9 +1312,9 @@ def collect_technicals(
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
-    holdings, _ = load_metron_universe(bucket, s3_client)
+    holdings, _ = load_price_derived_universe(bucket, s3_client)
     if not holdings:
-        return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     technicals: dict[str, dict] = {}
     for yf_sym in yf_symbols:
@@ -1300,6 +1343,209 @@ def collect_technicals(
         return {"status": "error", "error": str(e)}
     logger.info("[metron_market_data] wrote technicals for %d/%d symbols", len(technicals), len(yf_symbols))
     return {"status": "ok", "universe": len(yf_symbols), "technicals": len(technicals)}
+
+
+# ── Security performance (period returns + risk stats — derived from close_history) ──
+
+_MIN_RISK_BARS = 60  # ~3 months of daily closes before annualized risk stats mean anything
+
+
+def _closes_to_series(closes: list[list]) -> list[tuple[date, float]]:
+    """Ascending (bar_date, close) from artifact ``[[date_iso, close], …]`` rows."""
+    out: list[tuple[date, float]] = []
+    for row in closes:
+        if not isinstance(row, (list, tuple)) or len(row) != 2 or row[1] is None:
+            continue
+        try:
+            d, c = date.fromisoformat(str(row[0])), float(row[1])
+        except (TypeError, ValueError):
+            continue
+        if c > 0:
+            out.append((d, c))
+    return sorted(out, key=lambda t: t[0])
+
+
+def _sp_daily_returns(closes: list[float]) -> list[float]:
+    rets = []
+    for i in range(1, len(closes)):
+        if closes[i - 1] > 0:
+            rets.append(closes[i] / closes[i - 1] - 1.0)
+    return rets
+
+
+def _sp_period_returns(series: list[tuple[date, float]], as_of: date) -> dict[str, float]:
+    if len(series) < 2:
+        return {}
+    last_close = series[-1][1]
+    out: dict[str, float] = {}
+    for years, label in ((1, "1Y"), (3, "3Y"), (5, "5Y"), (10, "10Y")):
+        try:
+            start = as_of.replace(year=as_of.year - years)
+        except ValueError:
+            start = as_of.replace(year=as_of.year - years, day=28)
+        ref = next((c for d, c in series if d >= start), None)
+        if ref is not None and ref > 0 and series[0][0] <= start:
+            out[label] = round(last_close / ref - 1.0, 6)
+    return out
+
+
+def _sp_window_return(series: list[tuple[date, float]], start: date) -> float | None:
+    if len(series) < 2 or series[0][0] > start:
+        return None
+    ref = next((c for d, c in series if d >= start), None)
+    last = series[-1][1]
+    if ref is None or ref <= 0:
+        return None
+    return round(last / ref - 1.0, 6)
+
+
+def _sp_year_ago(as_of: date) -> date:
+    try:
+        return as_of.replace(year=as_of.year - 1)
+    except ValueError:
+        return as_of.replace(year=as_of.year - 1, day=28)
+
+
+def _sp_beta_and_vs_spy(
+    ticker_series: list[tuple[date, float]], spy_series: list[tuple[date, float]]
+) -> tuple[float | None, float | None]:
+    spy_by_date = dict(spy_series)
+    common = [(d, c, spy_by_date[d]) for d, c in ticker_series if d in spy_by_date]
+    if len(common) < _MIN_RISK_BARS:
+        return None, None
+    t_closes = [c for _, c, _ in common]
+    s_closes = [s for _, _, s in common]
+    t_rets, s_rets = _sp_daily_returns(t_closes), _sp_daily_returns(s_closes)
+    n = min(len(t_rets), len(s_rets))
+    if n < _MIN_RISK_BARS or not s_rets:
+        return None, None
+    t_rets, s_rets = t_rets[:n], s_rets[:n]
+    s_mean = sum(s_rets) / n
+    t_mean = sum(t_rets) / n
+    var = sum((s - s_mean) ** 2 for s in s_rets) / n
+    if var <= 0:
+        return None, None
+    cov = sum((t_rets[i] - t_mean) * (s_rets[i] - s_mean) for i in range(n)) / n
+    beta = round(cov / var, 4)
+    vs_window = round(
+        (t_closes[-1] / t_closes[0] - 1.0) - (s_closes[-1] / s_closes[0] - 1.0), 6
+    )
+    return beta, vs_window
+
+
+def _compute_security_performance(
+    closes: list[list], *, spy_closes: list[list] | None, as_of: date
+) -> dict | None:
+    """Period returns + risk stats + beta vs SPY from a close_history series.
+
+    Canonical producer for Metron tearsheet / Holdings LTM — consumers read
+    ``market_data/security_performance/latest.json`` and never recompute."""
+    from nousergon_lib.quant.riskstats import max_drawdown, sharpe_ratio, sortino_ratio, volatility
+
+    series = _closes_to_series(closes)
+    if len(series) < 2:
+        return None
+    spy_series = _closes_to_series(spy_closes or [])
+    period_returns = _sp_period_returns(series, as_of)
+    out: dict = {
+        "period_returns": period_returns,
+        "ytd_pct": _sp_window_return(series, date(as_of.year, 1, 1)),
+        "ltm_pct": _sp_window_return(series, _sp_year_ago(as_of)),
+        "n_bars": len(series),
+        "history_from": series[0][0].isoformat(),
+    }
+    closes_only = [c for _, c in series]
+    rets = _sp_daily_returns(closes_only)
+    if len(rets) >= _MIN_RISK_BARS:
+        span_days = (series[-1][0] - series[0][0]).days or 1
+        ppy = len(rets) / (span_days / 365.25)
+        vol = volatility(rets, periods_per_year=ppy)
+        if vol is not None:
+            out["volatility"] = round(vol, 6)
+        sharpe = sharpe_ratio(rets, periods_per_year=ppy)
+        if sharpe is not None:
+            out["sharpe"] = round(sharpe, 4)
+        sortino = sortino_ratio(rets, periods_per_year=ppy)
+        if sortino is not None:
+            out["sortino"] = round(sortino, 4)
+        index = [1.0]
+        for r in rets:
+            index.append(index[-1] * (1.0 + r))
+        mdd = max_drawdown(index)
+        if mdd is not None:
+            out["max_drawdown"] = round(mdd, 6)
+        beta, vs_window = _sp_beta_and_vs_spy(series, spy_series)
+        out["beta_vs_spy"] = beta
+        out["vs_spy_window"] = vs_window
+    if spy_series:
+        spy_periods = _sp_period_returns(spy_series, as_of)
+        if period_returns.get("1Y") is not None and spy_periods.get("1Y") is not None:
+            out["vs_spy_1y"] = round(period_returns["1Y"] - spy_periods["1Y"], 6)
+    return out
+
+
+def collect_security_performance(
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None,
+) -> dict:
+    """Write per-symbol performance metrics for Metron (tearsheet + Holdings LTM + markets
+    strip), computed from ``close_history`` artifacts already on the spine — **no new fetch**:
+
+        market_data/security_performance/latest.json
+            {schema_version, as_of, performance: {yf_symbol: {period_returns, ytd_pct,
+             ltm_pct, volatility, sharpe, sortino, max_drawdown, beta_vs_spy,
+             vs_spy_1y, vs_spy_window, n_bars, history_from}}}
+
+    Daily cadence; runs after ``collect_history``. Universe = SP1500 ∪ Metron held/watchlist.
+    Fail-soft per symbol."""
+    if run_date is None:
+        from dates import default_run_date
+
+        run_date = default_run_date()
+    if s3_client is None:
+        import boto3
+        s3_client = boto3.client("s3")
+    holdings, _ = load_price_derived_universe(bucket, s3_client)
+    if not holdings:
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    as_of = date.fromisoformat(str(run_date)[:10])
+    spy_hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{BENCHMARK}.json")
+    spy_closes = (spy_hist or {}).get("closes")
+    performance: dict[str, dict] = {}
+    for yf_sym in yf_symbols:
+        hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
+        if not hist or not hist.get("closes"):
+            continue
+        try:
+            perf = _compute_security_performance(hist["closes"], spy_closes=spy_closes, as_of=as_of)
+        except Exception as e:
+            logger.warning("[metron_market_data] security_performance compute failed for %s: %s", yf_sym, e)
+            continue
+        if perf is not None:
+            performance[yf_sym] = perf
+    artifact = {
+        "schema_version": SECURITY_PERFORMANCE_SCHEMA_VERSION,
+        "as_of": run_date,
+        "source": "computed",
+        "performance": dict(sorted(performance.items())),
+    }
+    if dry_run:
+        logger.info(
+            "[metron_market_data] DRY-RUN security_performance: %d/%d symbols (not written)",
+            len(performance), len(yf_symbols),
+        )
+        return {"status": "ok_dry_run", "performance": len(performance), "universe": len(yf_symbols)}
+    try:
+        _write_json(s3_client, bucket, f"{SECURITY_PERFORMANCE_PREFIX}latest.json", artifact)
+    except Exception as e:
+        logger.error("[metron_market_data] security_performance write failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    logger.info(
+        "[metron_market_data] wrote security_performance for %d/%d symbols",
+        len(performance), len(yf_symbols),
+    )
+    return {"status": "ok", "universe": len(yf_symbols), "performance": len(performance)}
 
 
 # ── Valuation medians (SP1500-broad sector & country peer benchmark) ──────────
@@ -1350,22 +1596,9 @@ def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
 
 
 def _default_medians_universe(bucket: str, s3_client: Any) -> list[str]:
-    """The broad benchmark universe = SP1500 constituents ∪ Metron held symbols. SP1500
-    from the constituents artifact (the system universe the fleet already tracks); held
-    symbols add the foreign/OTC names so a foreign holding's country bucket isn't empty."""
-    symbols: set[str] = set()
-    try:
-        from collectors import constituents
-
-        art = constituents.load_from_s3(bucket)
-        for t in (art or {}).get("tickers", []) or []:
-            if str(t).strip():
-                symbols.add(str(t).strip())
-    except Exception as e:
-        logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
-    holdings, _ = load_metron_universe(bucket, s3_client)
-    symbols.update(h["yf_symbol"] for h in holdings)
-    return sorted(symbols)
+    """The broad benchmark universe = SP1500 ∪ Metron held/watchlist (``load_price_derived_universe``)."""
+    holdings, _ = load_price_derived_universe(bucket, s3_client)
+    return [h["yf_symbol"] for h in holdings]
 
 
 def _grouped_medians(rows: list[dict], group_key: str) -> dict[str, dict]:
