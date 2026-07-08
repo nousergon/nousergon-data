@@ -104,3 +104,56 @@ def test_fetch_loop_goes_through_git_retry() -> None:
         "the fetch loop must go through git_retry so a concurrent boot-pull "
         "fetch can't fail the gate on a ref/pack lock."
     )
+
+
+# ── config#1944: shared flock chokepoint across trading-box git writers ──────
+# The lock-signature retry above defends the transition window; the durable
+# class fix is a shared advisory flock that all trading-box git writers
+# (boot-pull.service, CodeFreshnessGate, ChronicGapSelfHeal) acquire on the
+# SAME inode, so no two index-mutating git ops ever run concurrently.
+
+# Must match crucible-executor infrastructure/boot-pull.sh's GIT_SYNC_LOCK
+# default and the ChronicGapSelfHeal wrap. A guard test in each repo pins it.
+_SHARED_GIT_LOCK = "/home/ec2-user/.ae-git-sync.lock"
+
+
+def test_git_retry_acquires_shared_flock() -> None:
+    """git_retry must run its git op under the shared advisory flock so the
+    gate serializes against boot-pull.service window-free (config#1944), not
+    only via the lock-signature backoff."""
+    helper = next((c for c in _gate_commands() if "git_retry()" in c), None)
+    assert helper is not None
+    assert f"flock -w 150 {_SHARED_GIT_LOCK} git" in helper, (
+        "git_retry must acquire `flock -w 150 /home/ec2-user/.ae-git-sync.lock` "
+        "around each git op — the shared trading-box git-sync mutex."
+    )
+    # Fail-loud + transition fallback both survive: the lock-signature retry is
+    # retained (an older on-disk boot-pull may not yet be flock-aware).
+    assert "Another git process seems to be running" in helper
+
+
+def test_chronic_gap_self_heal_git_pulls_flock_wrapped() -> None:
+    """ChronicGapSelfHeal is the third trading-box git writer (its
+    `git -C ... pull --ff-only` runs on $.trading_instance_id). It must take
+    the SAME shared flock so it can't race boot-pull / the gate (config#1944)."""
+    doc = json.loads(_SF_PATH.read_text())
+    cmds = doc["States"]["ChronicGapSelfHeal"]["Parameters"]["Parameters"]["commands"]
+    pulls = [c for c in cmds if "pull --ff-only" in c]
+    assert pulls, "ChronicGapSelfHeal must still pull the checkouts."
+    for p in pulls:
+        assert f"flock -w 150 {_SHARED_GIT_LOCK} git" in p, (
+            "each ChronicGapSelfHeal git pull must run under the shared flock "
+            f"({_SHARED_GIT_LOCK})."
+        )
+
+
+def test_shared_git_lock_lives_in_home_not_var_lock() -> None:
+    """The lock MUST be in ec2-user's HOME, never /var/lock: /var/lock ->
+    /run/lock is root:root 0755, so boot-pull (runs as ec2-user) cannot create
+    a lock file there. Every actor flocks this path as ec2-user."""
+    helper = next((c for c in _gate_commands() if "git_retry()" in c), None)
+    assert "/var/lock/" not in helper, (
+        "do not put the git-sync lock in /var/lock (root-only-writable); "
+        "boot-pull runs as ec2-user and could not create it."
+    )
+    assert _SHARED_GIT_LOCK.startswith("/home/ec2-user/")
