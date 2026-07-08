@@ -461,6 +461,57 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
     return resp["Command"]["CommandId"]
 
 
+GROOM_TIER_TAG_KEY = "groom-issue-filter"
+
+
+def _running_tier_instance_ids(issue_filter: str) -> list[str]:
+    """Instance ids for a LIVE (pending/running) groom-spot box already working
+    THIS ``issue_filter`` tier (config#1979). Two concurrent boxes on the same
+    tier would race the identical GitHub issue queue and double-spend WET on
+    duplicate work — config#1969's adaptive re-queue now makes a full-coverage
+    run legitimately take longer (a run can now genuinely work its ENTIRE
+    queue rather than stopping early), raising the odds a prior trigger's box
+    for a tier is still running when the next trigger re-evaluates the same
+    tier. Fail-safe: any API error returns ``[]`` (never blocks a launch on a
+    broken check — this guard is an optimization, not a correctness gate,
+    mirroring every other pre-launch gate in this file)."""
+    try:
+        ec2 = boto3.client("ec2", region_name=REGION)
+        resp = ec2.describe_instances(Filters=[
+            {"Name": "tag:Name", "Values": ["alpha-engine-groom-spot"]},
+            {"Name": f"tag:{GROOM_TIER_TAG_KEY}", "Values": [issue_filter]},
+            {"Name": "instance-state-name", "Values": ["pending", "running"]},
+        ])
+        return [i["InstanceId"] for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
+    except Exception as exc:  # noqa: BLE001 — fail-safe: never block a launch
+        logger.warning("concurrent-tier check failed (non-fatal, launching anyway): %s: %s",
+                       type(exc).__name__, exc)
+        return []
+
+
+def _notify_concurrent_skip(issue_filter: str, existing_ids: list[str], schedule_label: str) -> None:
+    """Best-effort loud ping for a concurrent-same-tier skip — never raises."""
+    text = (
+        "⚪ Backlog groom slot SKIPPED — a box for this tier is already running "
+        f"(config#1979). issue_filter={issue_filter}, existing instance(s): "
+        f"{', '.join(existing_ids)}. schedule={schedule_label}. Zero spot/WET "
+        "spend; this slot's queue rides the next trigger once the running box "
+        "finishes."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=True, severity="info",
+            dedup_key=f"{_FLOW_NAME}:concurrent_tier_skip:{issue_filter}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "issue_filter": issue_filter,
+                     "existing_instance_ids": existing_ids},
+            silent_topic=FleetTelegramTopic.GROOM,
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("concurrent-tier skip Telegram failed (non-fatal): %s", exc)
+
+
 def _terminate_instance(instance_id: str) -> None:
     """Best-effort terminate of a just-launched box whose post-launch steps
     failed. Without this the box orphans: it received no bootstrap, so neither
@@ -486,6 +537,19 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
 
+    # config#1979: skip if a box for THIS SAME tier is already live — a prior
+    # trigger's run that's still working its queue (now more likely to run
+    # long thanks to config#1969's adaptive re-queue) must not get a second,
+    # concurrent box racing the identical GitHub issue queue.
+    existing = _running_tier_instance_ids(issue_filter)
+    if existing:
+        logger.warning(
+            "tier %s already has a live groom box (%s) — skipping launch to avoid "
+            "a concurrent same-tier run", issue_filter, existing)
+        _notify_concurrent_skip(issue_filter, existing, schedule_label)
+        return {"launched": False, "reason": "concurrent_tier_skip",
+                "issue_filter": issue_filter, "existing_instance_ids": existing}
+
     # config#1645: a fresh token per launch ATTEMPT (not per schedule) — the
     # dispatch Step Function's relaunch loop calls this Lambda again with a new
     # execution, so each attempt gets its own S3 completion-marker key. A dead
@@ -493,6 +557,15 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     run_token = uuid.uuid4().hex
     instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     logger.info("launched groom box %s (%s)", instance_id, market)
+    # config#1979: tag the box with its tier so the NEXT trigger's guard check
+    # (above) can find it. Best-effort — a tag-write failure must not abort an
+    # already-launched box (mirrors the fail-safe posture of the check itself).
+    try:
+        boto3.client("ec2", region_name=REGION).create_tags(
+            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": issue_filter}])
+    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
+        logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
+                       type(exc).__name__, exc)
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
