@@ -551,6 +551,7 @@ _MACRO_SLIM_KEYS = {
     "IRX": "IRX",
     "GLD": "GLD",
     "USO": "USO",
+    "HYOAS": "HYOAS", # config#939 — credit spreads; FRED-only index ticker
 }
 
 
@@ -818,6 +819,7 @@ def compute_and_write(
     gld_series = macro.get("GLD")
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
+    hyoas_series = macro.get("HYOAS")
 
     for ticker in universe_tickers:
         try:
@@ -842,6 +844,7 @@ def compute_and_write(
                 gld_series=gld_series,
                 uso_series=uso_series,
                 vix3m_series=vix3m_series,
+                hyoas_series=hyoas_series,
                 earnings_data=earnings_data,
                 revision_data=revision_data,
                 options_data=options_data,
