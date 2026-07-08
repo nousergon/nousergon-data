@@ -185,7 +185,7 @@
     },
     "LibPinDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention.",
+      "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention. On pass, proceeds to PipelineContractCheck (L4595 / config#693) — the sibling pre-spend preflight gate — rather than straight to CheckMutexRole, composing both invariant probes into one preflight chain before any spot spend.",
       "Choices": [
         {
           "Variable": "$.libpin_drift_result.Payload.has_drift",
@@ -193,7 +193,7 @@
           "Next": "ExtractLibPinDriftError"
         }
       ],
-      "Default": "CheckMutexRole"
+      "Default": "PipelineContractCheck"
     },
     "ExtractLibPinDriftError": {
       "Type": "Pass",
@@ -205,6 +205,64 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "PipelineContractCheck": {
+      "Type": "Task",
+      "Comment": "Preventive pre-spend PIPELINE_CONTRACT.yaml preflight gate (L4595 / config#693). Sibling to LibPinDriftCheck: runs immediately after it, BEFORE any spot launch, and asserts PIPELINE_CONTRACT.yaml is internally self-consistent AND every artifact_id it references exists in ARTIFACT_REGISTRY.yaml. A CI validator (validate_pipeline_contract.py) already catches this at PR time, but a config/SF-definition change made outside that CI could still spend a Saturday spot before failing; this probe re-runs the same invariants at SF start so a contract break halts in seconds. FAIL-OPEN: a GitHub-fetch/parse miss sets has_violation=false (the probe's own degraded mode, reason=fetch_failed), and the Catch routes any Lambda failure straight to the pipeline — so the checker NEVER false-halts the weekly run, mirroring LibPinDriftCheck's fail-open semantics exactly.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_pipeline_contract"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
+          "Next": "CheckMutexRole",
+          "ResultPath": "$.pipeline_contract_error"
+        }
+      ],
+      "ResultPath": "$.pipeline_contract_result",
+      "Next": "PipelineContractGate"
+    },
+    "PipelineContractGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error.",
+      "Choices": [
+        {
+          "Variable": "$.pipeline_contract_result.Payload.has_violation",
+          "BooleanEquals": true,
+          "Next": "ExtractPipelineContractError"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "ExtractPipelineContractError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the violation list. Carries the whole probe Payload (has_violation/violations/boundary_count/reason) so the FAILED SNS alert names the exact contract breach a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors ExtractLibPinDriftError → HandleFailure convention; no new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on a real contract violation by design).",
+      "Parameters": {
+        "phase": "PipelineContractGate",
+        "source": "PipelineContractGate.has_violation",
+        "violation.$": "$.pipeline_contract_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
     "CheckMutexRole": {
       "Type": "Choice",

@@ -37,6 +37,57 @@ jobs:
           python3 infrastructure/lambdas/changelog-incident-mirror/test_handler.py
           python3 infrastructure/lambdas/changelog-cloudwatch-mirror/test_handler.py
 
+      # config#1759: the two suites above were the ONLY lambda handler tests
+      # that ran pre-merge — every other infrastructure/lambdas/*/test_handler.py
+      # (groom-liveness-probe, freshness-monitor, scheduled-groom-dispatcher,
+      # etc.) executed for the first time inside each deploy-*.yml's deploy.sh
+      # pytest gate, which fires on push to main — POST-merge. A green PR check
+      # could still ship a broken handler and red main first (exactly what
+      # happened to nousergon-data#630 / freshness-monitor, healed by #631).
+      #
+      # Fix: discover every handler suite by GLOB (not hand-list), so a new
+      # lambda is covered automatically. Each suite runs in its own interpreter
+      # with ONLY that lambda's own requirements.txt installed (the same file
+      # deploy.sh's preflight pytest gate already uses as its deps source of
+      # truth — see e.g. freshness-monitor/deploy.sh step 1b), into an isolated
+      # --target dir so one lambda's deps can't leak into / collide with
+      # another's stubbed-boto3-in-sys.modules test process. The changelog pair
+      # above is intentionally excluded here (zero deps, already covered).
+      - name: Run ALL lambda handler tests (glob-derived, per-lambda deps)
+        env:
+          # ssm-liveness-poller/index.py (and any future handler) calls
+          # boto3.client(...) at MODULE SCOPE with no explicit region. Lambdas
+          # with a deploy-*.yml get a region for free from that workflow's
+          # configure-aws-credentials step (aws-region: us-east-1); lambdas
+          # with none (like ssm-liveness-poller — never gated anywhere before
+          # this PR) hit botocore's NoRegionError on a bare `ubuntu-latest`
+          # runner with zero AWS env. No real AWS calls are made (clients are
+          # mocked/monkeypatched in-test) — this only satisfies SDK client
+          # construction. Matches the region used fleet-wide (REGION default
+          # in every lambda's deploy.sh).
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          fail=0
+          for t in infrastructure/lambdas/*/test_handler.py; do
+            d="$(dirname "$t")"
+            case "$d" in
+              */changelog-incident-mirror|*/changelog-cloudwatch-mirror)
+                continue ;;
+            esac
+            deps="$(mktemp -d)"
+            echo "::group::$t"
+            pip install --quiet --target "$deps" pytest
+            if [ -f "$d/requirements.txt" ]; then
+              pip install --quiet --target "$deps" -r "$d/requirements.txt"
+            fi
+            PYTHONPATH="$deps" python3 -m pytest "$t" -q || fail=1
+            echo "::endgroup::"
+            rm -rf "$deps"
+          done
+          exit $fail
+
       - name: Security audit
         run: |
           pip install pip-audit
