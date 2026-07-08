@@ -57,8 +57,12 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
-    def __init__(self):
+    def __init__(self, running_tier_instances=None):
         self.terminated = []
+        self.tags_created = []
+        # config#1979: (issue_filter -> [instance_ids]) already "live" for the
+        # concurrent-tier guard's describe_instances check to find.
+        self._running_tier_instances = dict(running_tier_instances or {})
 
     def get_waiter(self, name):
         return _FakeWaiter()
@@ -66,6 +70,16 @@ class _FakeEc2:
     def terminate_instances(self, InstanceIds):  # noqa: N803 — boto3 kwarg name
         self.terminated.extend(InstanceIds)
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
+
+    def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
+        self.tags_created.append((Resources, Tags))
+        return {}
+
+    def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
+        by_name = {f["Name"]: f["Values"] for f in Filters}
+        issue_filter = by_name.get("tag:groom-issue-filter", [None])[0]
+        ids = self._running_tier_instances.get(issue_filter, [])
+        return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
 
 
 class _FakeSsm:
@@ -121,11 +135,12 @@ class _FakeS3:
         return {"Body": _FakeS3Body(self._objects[Key])}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None):
+def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None,
+         running_tier_instances=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm(ssm_parameters)
-    ec2 = _FakeEc2()
+    ec2 = _FakeEc2(running_tier_instances=running_tier_instances)
     s3 = _FakeS3(s3_objects)
     clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
     if launch_impl is None:
@@ -535,6 +550,64 @@ def test_post_launch_failure_terminates_instance_no_orphan(monkeypatch):
         idx.handler({"run_mode": "full"}, None)
     # The just-launched box was terminated (not orphaned) before the re-raise.
     assert idx._test_ec2.terminated == ["i-orphan"]
+
+
+# ── config#1979: concurrent-same-tier guard ───────────────────────────────────
+def test_concurrent_tier_skip_when_same_tier_already_running(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-new"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"mid-only": ["i-already-running"]},
+    )
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "concurrent_tier_skip"
+    assert g["existing_instance_ids"] == ["i-already-running"]
+    assert launched == []  # never even attempted a spot launch — zero spend
+
+
+def test_different_tier_running_does_not_block_launch(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"high-only": ["i-other-tier"]},
+    )
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+    assert out["groom"]["instance_id"] == "i-new"
+
+
+def test_launched_instance_gets_tagged_with_its_tier(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
+    idx.handler({"run_mode": "full", "issue_filter": "high-only", "schedule": "x"}, None)
+    assert idx._test_ec2.tags_created == [
+        (["i-new"], [{"Key": "groom-issue-filter", "Value": "high-only"}])
+    ]
+
+
+def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
+
+    def _boom(Filters):  # noqa: N803 — boto3 kwarg name
+        raise RuntimeError("EC2 API hiccup")
+
+    idx._test_ec2.describe_instances = _boom
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    # A broken check must never block a launch — it's an optimization, not a
+    # correctness gate (mirrors the pace gate / demand gate fail-safe posture).
+    assert out["groom"]["launched"] is True
 
 
 # ── config#1933: demand-driven dispatch (enumerate-then-decide) ──────────────
