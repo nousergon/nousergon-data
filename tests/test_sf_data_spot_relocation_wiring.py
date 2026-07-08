@@ -344,14 +344,28 @@ class TestDispatcherLambdaAndIam:
     def test_workload_map_preserves_collector_contract(self):
         # M0 contract: the spot workloads run the SAME weekly_collector.py entry
         # points the on-trading states ran — unchanged args = unchanged data paths.
+        # The workload KEYS are post-market-* (SF-facing); the VALUES must mirror
+        # the old on-trading SSM commands (--daily*, NOT invented --post-market-*).
         src = (_DISPATCHER / "index.py").read_text()
         for token in (
             "--morning-enrich",
             "--morning-arctic-append",
-            "--post-market-data",
-            "--post-market-arctic-append",
+            '"post-market-data"',
+            '"post-market-arctic-append"',
         ):
             assert token in src, f"dispatcher workload map missing {token}"
+        assert '"post-market-data":' in src
+        assert "python weekly_collector.py --daily --skip-arctic-append" in src
+        assert '"post-market-arctic-append":' in src
+        assert "python weekly_collector.py --daily-arctic-append" in src
+        # #643 shipped bogus --post-market-* CLI flags that weekly_collector.py
+        # never defined — broke the 2026-07-08 EOD run on first live spot path.
+        assert "--post-market-data" not in src.replace(
+            '"post-market-data"', ""
+        ).replace('"post-market-arctic-append"', "")
+        assert "--post-market-arctic-append" not in src.replace(
+            '"post-market-arctic-append"', ""
+        )
         # The enrich workload must still skip the inline heal + inline append.
         assert "--skip-chronic-heal" in src
         assert "--skip-arctic-append" in src

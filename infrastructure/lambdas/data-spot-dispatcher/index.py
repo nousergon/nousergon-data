@@ -125,10 +125,12 @@ _WORKLOADS: dict[str, str] = {
     # weekday pre-open (was step_function_daily.json MorningArcticAppend)
     "morning-arctic-append": "python weekly_collector.py --morning-arctic-append",
     # EOD post-close (was step_function_eod.json PostMarketData)
-    "post-market-data": "python weekly_collector.py --post-market-data",
+    "post-market-data": (
+        "python weekly_collector.py --daily --skip-arctic-append"
+    ),
     # EOD post-close (was step_function_eod.json PostMarketArcticAppend)
     "post-market-arctic-append": (
-        "python weekly_collector.py --post-market-arctic-append"
+        "python weekly_collector.py --daily-arctic-append"
     ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
