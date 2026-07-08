@@ -108,13 +108,13 @@ _RESEARCH_BUCKET = "alpha-engine-research"
 # Kill-switch independent of GROOM_DISPATCH_ENABLED — lets ops disable JUST the
 # pace gate (e.g. during a known burst) without touching the dispatch trigger.
 PACE_GATE_ENABLED = os.environ.get("GROOM_PACE_GATE_ENABLED", "true").lower() == "true"
-# Calibrated 2026-07-06 — MUST track alpha-engine-config/scripts/groom_budget.py's
+# Calibrated 2026-07-08 — MUST track alpha-engine-config/scripts/groom_budget.py's
 # WEEKLY_WET_CEILING; re-calibrate both together against /usage every few days.
-WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "674000000"))
+WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "850000000"))
 _PT = ZoneInfo("America/Los_Angeles")
 # MUST match groom_budget.py's WEEKLY_RESET_ANCHOR/WEEKLY_PERIOD exactly — both
 # derive the SAME reset-aligned window from one observed reset instant.
-WEEKLY_RESET_ANCHOR = datetime(2026, 6, 28, 20, 59)   # PT, naive — one observed reset
+WEEKLY_RESET_ANCHOR = datetime(2026, 7, 12, 21, 0)   # PT, naive — Sunday 9pm PT
 WEEKLY_PERIOD = timedelta(days=7)
 CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
 CCUSAGE_PREFIX = "claude_code_usage/"
