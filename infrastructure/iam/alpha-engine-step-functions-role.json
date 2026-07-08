@@ -19,7 +19,8 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-substrate*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator*",
-        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*"
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*"
       ]
     },
     {
@@ -134,6 +135,12 @@
           "cloudwatch:namespace": "AlphaEngine/Agents"
         }
       }
+    },
+    {
+      "Sid": "PollDataSpotSsmCommand",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
     }
   ]
 }
