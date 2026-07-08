@@ -174,6 +174,12 @@ INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
+# Additive per-artifact provenance field (config#1865) documenting close_history's price
+# basis now that it's primarily sourced from the dividend-adjusted price_cache rather than
+# an independent split-only-adjusted yfinance fetch — see _price_cache_close_history's
+# docstring for the full basis-change rationale. Old consumers pinned only on
+# schema_version/yf_symbol/currency/closes ignore the extra key (no shape break).
+CLOSE_HISTORY_ADJUSTMENT_BASIS = "dividend_adjusted"
 FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
@@ -441,10 +447,17 @@ def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, 
 
 
 @_yf_quiet
-def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY) -> dict[str, list[tuple[str, float]]]:
+def _yf_history(
+    symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY,
+    auto_adjust: bool = False,
+) -> dict[str, list[tuple[str, float]]]:
     """Daily close series per symbol via yfinance over ``period`` →
     ``{key: [(bar_date, close), …]}`` ascending. ``is_fx`` maps a currency to the
-    ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted."""
+    ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted.
+    ``auto_adjust`` selects the basis (config#1865): ``False`` (default) is split-adjusted-
+    only; ``True`` is dividend-adjusted, matching the price_cache basis (see
+    ``_yfinance_close_history_dividend_adjusted``, the gap-fill fallback used by
+    ``_price_cache_close_history``)."""
     try:
         import pandas as pd
         import yfinance as yf
@@ -463,7 +476,7 @@ def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: s
             time.sleep(_YFINANCE_BATCH_DELAY)
         try:
             raw = yf.download(tickers=batch[0] if len(batch) == 1 else batch, period=period,
-                              interval="1d", auto_adjust=False, progress=False, group_by="ticker", threads=True)
+                              interval="1d", auto_adjust=auto_adjust, progress=False, group_by="ticker", threads=True)
             is_multi = isinstance(raw.columns, pd.MultiIndex)
             for key in batch:
                 try:
@@ -483,7 +496,127 @@ def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: s
 
 
 def _yfinance_close_history(yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
+    """Legacy split-only-adjusted (``auto_adjust=False``) yfinance fetch. No longer
+    ``collect_history``'s default source (config#1865: superseded by
+    ``_price_cache_close_history``, which reads the dividend-adjusted price_cache and
+    gap-fills via ``_yfinance_close_history_dividend_adjusted``) — kept for direct callers/
+    tests that want the pre-#1865 split-only basis explicitly."""
     return _yf_history(yf_symbols, period, is_fx=False)
+
+
+def _yfinance_close_history_dividend_adjusted(
+    yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD,
+) -> dict[str, list[tuple[str, float]]]:
+    """Dividend-adjusted (``auto_adjust=True``) yfinance fetch — same basis as
+    ``reference/price_cache/`` (see ``collectors/prices.py``). Used by
+    ``_price_cache_close_history`` to gap-fill symbols price_cache doesn't cover, so a
+    published close_history series is never a split-only/dividend-adjusted chimera
+    (config#1865)."""
+    return _yf_history(yf_symbols, period, is_fx=False, auto_adjust=True)
+
+
+def _period_to_timedelta(period: str) -> Any:
+    """Best-effort ``"10y"``/``"5d"``/``"6mo"``-style yfinance period string → ``pd.Timedelta``.
+    Unrecognized shapes fall back to the ``DEFAULT_HISTORY_PERIOD`` (10y) window rather than
+    raising — a period-string typo should degrade to "trim less aggressively", never abort
+    the price_cache read."""
+    import pandas as pd
+
+    try:
+        if period.endswith("mo"):
+            return pd.Timedelta(days=30 * int(period[:-2]))
+        if period.endswith("y"):
+            return pd.Timedelta(days=365 * int(period[:-1]))
+        if period.endswith("d"):
+            return pd.Timedelta(days=int(period[:-1]))
+    except (ValueError, AttributeError):
+        pass
+    return pd.Timedelta(days=365 * 10)
+
+
+def _price_cache_close_series(
+    s3_client: Any, bucket: str, yf_symbol: str, period: str,
+) -> list[tuple[str, float]] | None:
+    """Read one symbol's dividend-adjusted close series from the price_cache parquet
+    (``reference/price_cache/{ticker}.parquet`` — ``builders/_price_cache_writeboth.py``
+    owns the read-prefix fallback chain), trimmed to ``period`` lookback. Returns ``None``
+    when the parquet is absent in every active read prefix (genuine no-coverage — e.g. a
+    foreign/OTC/fund symbol outside price_cache's SP1500-overlap universe) or unreadable/
+    malformed, so the caller gap-fills via yfinance rather than aborting the run (module
+    posture: best-effort, one symbol's irregularity never blocks the rest)."""
+    from botocore.exceptions import ClientError
+
+    from builders._price_cache_writeboth import PRICE_CACHE_LEGACY_PREFIX, price_cache_read_prefixes
+    from store.parquet_loader import load_parquet_from_s3
+
+    df = None
+    for prefix in price_cache_read_prefixes(PRICE_CACHE_LEGACY_PREFIX):
+        key = f"{prefix}{yf_symbol}.parquet"
+        try:
+            df = load_parquet_from_s3(s3_client, bucket, key)
+            break
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                continue
+            logger.warning("[metron_market_data] price_cache read failed for %s (%s): %s", yf_symbol, key, exc)
+            return None
+        except Exception as e:
+            logger.warning("[metron_market_data] price_cache parse failed for %s (%s): %s", yf_symbol, key, e)
+            return None
+
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+
+    import pandas as pd
+
+    cutoff = pd.Timestamp.now(tz="UTC").tz_localize(None) - _period_to_timedelta(period)
+    trimmed = df.loc[df.index >= cutoff, "Close"].dropna()
+    if trimmed.empty:
+        return None
+    return [(d.date().isoformat(), round(float(c), 6)) for d, c in trimmed.items()]
+
+
+def _price_cache_close_history(
+    s3_client: Any, bucket: str, period: str = DEFAULT_HISTORY_PERIOD,
+) -> "CloseHistorySource":
+    """Build ``collect_history``'s default ``close_history_source`` (config#1865): prefer
+    the already-refreshed ``reference/price_cache/`` parquet (``collectors/prices.py``'s
+    weekly ~903-symbol SP1500-overlap refresh) over an independent yfinance fetch, cutting
+    the duplicate yfinance fan-out ``collect_history`` used to make for every symbol
+    price_cache already covers. yfinance is only called for the gap (symbols price_cache
+    doesn't carry).
+
+    Basis change (Operator decision 2026-07-08, config#1865, resolving the ask in
+    https://github.com/nousergon/alpha-engine-config/issues/1865#issuecomment-4912376677):
+    price_cache is fetched ``auto_adjust=True`` (dividend-adjusted Close). Pre-#1865,
+    close_history was independently fetched ``auto_adjust=False`` (split-adjusted only,
+    NOT dividend-adjusted — see the now-superseded ``_yfinance_close_history``). Sourcing
+    from price_cache means close_history is now dividend-adjusted — a deliberate,
+    documented basis change, not a silent one: downstream consumers (security_performance /
+    risk / attribution) will see return/YTD/volatility/drawdown figures shift on
+    dividend-paying names. The gap-fill fallback uses
+    ``_yfinance_close_history_dividend_adjusted`` (``auto_adjust=True``) — the SAME basis —
+    so a published close_history series is never a split-only/dividend-adjusted chimera."""
+
+    def _source(yf_symbols: list[str]) -> dict[str, list[tuple[str, float]]]:
+        from_cache: dict[str, list[tuple[str, float]]] = {}
+        gaps: list[str] = []
+        for sym in yf_symbols:
+            series = _price_cache_close_series(s3_client, bucket, sym, period)
+            if series:
+                from_cache[sym] = series
+            else:
+                gaps.append(sym)
+        gap_filled = _yfinance_close_history_dividend_adjusted(gaps, period) if gaps else {}
+        logger.info(
+            "[metron_market_data] close_history: %d/%d symbols from price_cache, "
+            "%d yfinance gap-fill (dividend-adjusted basis, config#1865)",
+            len(from_cache), len(yf_symbols), len(gap_filled),
+        )
+        return {**from_cache, **gap_filled}
+
+    return _source
 
 
 def _yfinance_fx_history(currencies: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
@@ -854,8 +987,19 @@ def collect_history(
     """Write per-symbol close-history + per-currency FX-history artifacts for Metron's
     held universe (Performance NAV reconstruction + as-of-date realized/dividend FX):
 
-        market_data/close_history/{yf_symbol}.json  {schema_version, yf_symbol, currency, closes: [[date, close], …]}
+        market_data/close_history/{yf_symbol}.json  {schema_version, yf_symbol, currency,
+            adjustment_basis, closes: [[date, close], …]}
         market_data/fx_history/{CCY}.json           {schema_version, currency, base, rates: [[date, rate], …]}
+
+    close_history basis (config#1865): sourced primarily from ``reference/price_cache/``
+    (dividend-adjusted — ``auto_adjust=True``), gap-filled via yfinance for symbols
+    price_cache doesn't cover (same dividend-adjusted basis, so the series is never a
+    split-only/dividend-adjusted chimera). This dedups the independent yfinance fetch
+    ``collect_history`` used to make for every symbol against the SP1500-overlap universe
+    ``collectors/prices.py`` already refreshes weekly. Pre-#1865 this was an independent
+    yfinance fetch at ``auto_adjust=False`` (split-only) — see
+    ``_price_cache_close_history``'s docstring for the full basis-change rationale
+    (Operator decision 2026-07-08 on the issue).
 
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
     if s3_client is None:
@@ -873,7 +1017,7 @@ def collect_history(
     hist_symbols = sorted(
         set(ccy_by_yf) | set(RISK_FACTOR_ETFS) | set(INDEX_PROXY_SYMBOLS) | set(FUND_PROXY_ETFS)
     )
-    closes = (close_history_source or _yfinance_close_history)(hist_symbols)
+    closes = (close_history_source or _price_cache_close_history(s3_client, bucket, period))(hist_symbols)
     fx = (fx_history_source or _yfinance_fx_history)(currencies)
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))
@@ -882,7 +1026,9 @@ def collect_history(
         for yf_sym, series in sorted(closes.items()):
             _write_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json", {
                 "schema_version": CLOSE_HISTORY_SCHEMA_VERSION, "yf_symbol": yf_sym,
-                "currency": ccy_by_yf.get(yf_sym, "USD"), "closes": [list(p) for p in series]})
+                "currency": ccy_by_yf.get(yf_sym, "USD"),
+                "adjustment_basis": CLOSE_HISTORY_ADJUSTMENT_BASIS,
+                "closes": [list(p) for p in series]})
         for ccy, series in sorted(fx.items()):
             _write_json(s3_client, bucket, f"{FX_HISTORY_PREFIX}{ccy}.json", {
                 "schema_version": FX_HISTORY_SCHEMA_VERSION, "currency": ccy,

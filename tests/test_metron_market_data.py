@@ -237,6 +237,134 @@ class TestHistory:
         s3b = _universe_s3({"holdings": [], "currencies": []})
         assert mmd.collect_history(bucket="b", s3_client=s3b, close_history_source=lambda s: {}, fx_history_source=lambda c: {})["status"] == "skipped"
 
+    def test_close_history_artifact_carries_adjustment_basis(self):
+        # config#1865: the written artifact additively documents its price basis so a
+        # future reader can tell close_history is now dividend-adjusted (not the pre-#1865
+        # split-only basis) without needing to know the source-selection history.
+        s3 = _universe_s3(_UNIVERSE)
+        close_hist = lambda syms: {"AAPL": [("2026-06-11", 201.5)]}
+        mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=lambda c: {})
+        aapl = _puts(s3)["market_data/close_history/AAPL.json"]
+        assert aapl["adjustment_basis"] == mmd.CLOSE_HISTORY_ADJUSTMENT_BASIS == "dividend_adjusted"
+
+
+class TestCloseHistoryPriceCacheSource:
+    """config#1865: collect_history's default close_history_source now prefers the
+    already-refreshed reference/price_cache/ parquet (dividend-adjusted) over an
+    independent yfinance fetch, gap-filling only the symbols price_cache doesn't cover
+    (via the same dividend-adjusted basis, so a series is never a split-only/
+    dividend-adjusted chimera)."""
+
+    @staticmethod
+    def _parquet_bytes(closes: dict) -> bytes:
+        import io
+
+        import pandas as pd
+
+        df = pd.DataFrame({"Close": list(closes.values())}, index=pd.to_datetime(list(closes.keys())))
+        buf = io.BytesIO()
+        df.to_parquet(buf, engine="pyarrow")
+        return buf.getvalue()
+
+    def _price_cache_s3(self, parquet_by_ticker: dict) -> MagicMock:
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+
+        def _get(Bucket, Key):
+            ticker = Key.rsplit("/", 1)[-1].replace(".parquet", "")
+            if ticker not in parquet_by_ticker:
+                raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+            body = MagicMock()
+            body.read.return_value = parquet_by_ticker[ticker]
+            return {"Body": body}
+
+        s3.get_object.side_effect = _get
+        return s3
+
+    def test_prefers_price_cache_over_yfinance_when_covered(self, monkeypatch):
+        s3 = self._price_cache_s3({
+            "AAPL": self._parquet_bytes({"2026-06-10": 200.0, "2026-06-11": 201.5}),
+        })
+
+        def _fail_download(*_a, **_kw):
+            raise AssertionError("yfinance must not be called — AAPL is fully covered by price_cache")
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "download", _fail_download)
+
+        source = mmd._price_cache_close_history(s3, "b", period="10y")
+        out = source(["AAPL"])
+        assert out["AAPL"] == [("2026-06-10", 200.0), ("2026-06-11", 201.5)]
+
+    def test_gap_fills_uncovered_symbols_via_dividend_adjusted_yfinance(self, monkeypatch):
+        s3 = self._price_cache_s3({})  # price_cache has no coverage at all
+        seen = {}
+
+        def _fake_download(*_a, **kw):
+            import pandas as pd
+            seen["auto_adjust"] = kw.get("auto_adjust")
+            idx = pd.to_datetime(["2026-06-11"])
+            return pd.DataFrame({"Close": [55.0]}, index=idx)
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "download", _fake_download)
+
+        source = mmd._price_cache_close_history(s3, "b", period="10y")
+        out = source(["MU"])
+        assert out["MU"] == [("2026-06-11", 55.0)]
+        # Gap-fill must match price_cache's dividend-adjusted basis (auto_adjust=True) —
+        # never the pre-#1865 split-only (auto_adjust=False) fetch — or a single
+        # close_history series would silently mix bases across symbols.
+        assert seen["auto_adjust"] is True
+
+    def test_price_cache_read_error_degrades_to_yfinance_gap_fill(self, monkeypatch):
+        # A non-404 S3/parquet error for one symbol must not abort the run — it degrades
+        # to the yfinance gap-fill fallback (best-effort module posture).
+        s3 = MagicMock()
+        s3.get_object.side_effect = RuntimeError("boom")
+
+        def _fake_download(*_a, **_kw):
+            import pandas as pd
+            idx = pd.to_datetime(["2026-06-11"])
+            return pd.DataFrame({"Close": [10.0]}, index=idx)
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "download", _fake_download)
+
+        source = mmd._price_cache_close_history(s3, "b", period="10y")
+        out = source(["ZZZ"])
+        assert out["ZZZ"] == [("2026-06-11", 10.0)]
+
+    def test_collect_history_defaults_to_price_cache_source(self, monkeypatch):
+        # No close_history_source injected → collect_history must wire up the
+        # price_cache-preferring default rather than the legacy pure-yfinance fetch.
+        s3 = _universe_s3(_UNIVERSE)
+        s3.get_object.side_effect = None
+
+        def _get(Bucket, Key):
+            if Key in (mmd.HOLDINGS_UNIVERSE_KEY,):
+                body = MagicMock()
+                body.read.return_value = json.dumps(_UNIVERSE).encode()
+                return {"Body": body}
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+        s3.get_object.side_effect = _get
+
+        def _fake_download(*_a, **kw):
+            import pandas as pd
+            assert kw.get("auto_adjust") is True  # dividend-adjusted gap-fill, not split-only
+            idx = pd.to_datetime(["2026-06-11"])
+            return pd.DataFrame({"Close": [1.0]}, index=idx)
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "download", _fake_download)
+
+        result = mmd.collect_history(bucket="b", s3_client=s3, fx_history_source=lambda c: {})
+        assert result["status"] == "ok"
+        assert result["close_series"] > 0
+
 
 class TestMacro:
     def test_writes_macro_series_artifact(self):
