@@ -370,6 +370,16 @@ class TestDispatcherLambdaAndIam:
         assert "--skip-chronic-heal" in src
         assert "--skip-arctic-append" in src
 
+    def test_bootstrap_clones_private_config_package(self):
+        # weekly_collector.load_config resolves experiments/reference/data/config.yaml
+        # from a shallow alpha-engine-config clone (2026-07-08 EOD: missing clone →
+        # FileNotFoundError on the first live spot path after the CLI-flag fix).
+        src = (_DISPATCHER / "index.py").read_text()
+        assert "alpha-engine-config" in src
+        assert "ssm get-parameter" in src
+        assert "/alpha-engine/saturday_sf_watch/github_pat" in src
+        assert "ALPHA_ENGINE_EXPERIMENT_ID=reference" in src
+
     def test_dispatcher_uses_executor_profile_no_ib_exposure(self):
         # Deliverable #3: the spot reuses the Saturday spot's Arctic-write/S3
         # profile (alpha-engine-executor-profile) and the standard fleet SG (no
