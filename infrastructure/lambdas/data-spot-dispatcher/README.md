@@ -66,15 +66,21 @@ failure must NOT block daemon start (weekday) or reconcile + instance-stop (EOD)
 
 ## Deployment
 
-Managed **outside CloudFormation** (same as `scheduled-groom-dispatcher`) —
-operator-deployed. Merging this PR has **zero live effect** until:
+Managed **outside CloudFormation** (same as `scheduled-groom-dispatcher`).
+**Caution: the invoking SF definitions auto-deploy on merge**, so merging a
+change that touches `step_function_daily.json` / `step_function_eod.json`
+alongside this Lambda goes live immediately on the SF side — the Lambda + IAM
+halves must exist BEFORE such a merge, or the SFs 404 on the invoke (this
+exact ordering inversion broke the 2026-07-08 EOD run; the original PR #643
+wrongly claimed merging had "zero live effect").
 
-1. the Lambda + `iam-policy.json` are deployed (create the
-   `alpha-engine-data-spot-dispatcher` function with the packaged `index.py` +
-   `requirements.txt`, attach `iam-policy.json`);
-2. the `alpha-engine-step-functions-role` policy is re-applied
-   (`infrastructure/iam/apply.sh`) so the SF can invoke the new Lambda;
-3. the daily + EOD Step Functions are re-deployed from the updated
-   `step_function_daily.json` / `step_function_eod.json`.
+First-time bootstrap (operator-only — creates the exec role from
+`iam-policy.json` + the function):
 
-This is the **live validation gate** — see the PR body for the exact steps.
+1. `bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh --bootstrap`
+2. `bash infrastructure/iam/apply.sh --role alpha-engine-step-functions-role`
+   (applies the SF execution-role invoke grant)
+
+Code updates after bootstrap auto-deploy on merge via
+`.github/workflows/deploy-data-spot-dispatcher.yml` (path-filtered, flagless
+`deploy.sh` run — code-only, mirroring the groom-dispatcher twin).
