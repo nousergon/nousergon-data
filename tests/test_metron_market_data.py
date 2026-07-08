@@ -17,13 +17,16 @@ from collectors import metron_market_data as mmd
 
 
 def _universe_s3(
-    universe: dict | None, heartbeat_ts: str | None = None, watchlist: dict | None = None
+    universe: dict | None, heartbeat_ts: str | None = None, watchlist: dict | None = None,
+    eod_closes: dict | None = None,
 ) -> MagicMock:
     """A MagicMock S3 whose get_object dispatches per key: the Metron held-universe JSON
     (raises if None), the Metron watchlist-universe JSON (raises if None — most tests don't
-    exercise the watchlist union, matching the artifact simply not existing yet) and, when
-    ``heartbeat_ts`` is given, a fresh UI-heartbeat object (the intraday demand gate); any
-    other key raises NoSuchKey."""
+    exercise the watchlist union, matching the artifact simply not existing yet), when
+    ``heartbeat_ts`` is given a fresh UI-heartbeat object (the intraday demand gate), and
+    when ``eod_closes`` is given the settled-close artifact (the scale-coherence
+    cross-check, metron-ops#159 — raises NoSuchKey if None, matching a not-yet-run closes
+    collector); any other key raises NoSuchKey."""
     s3 = MagicMock()
 
     def _get(Bucket, Key):
@@ -43,6 +46,10 @@ def _universe_s3(
             if universe is None:
                 raise Exception("NoSuchKey")
             return _body(universe)
+        if Key == f"{mmd.CLOSES_PREFIX}latest.json":
+            if eod_closes is None:
+                raise Exception("NoSuchKey")
+            return _body(eod_closes)
         raise Exception("NoSuchKey")
 
     s3.get_object.side_effect = _get
@@ -520,12 +527,13 @@ class TestIntraday:
     # Friday 2026-06-12 15:00 UTC = 11:00 ET — mid-session (EDT).
     _RTH = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)
 
-    def _s3(self, *, heartbeat_offset_s: int | None = 60, universe: dict | None = _UNIVERSE):
+    def _s3(self, *, heartbeat_offset_s: int | None = 60, universe: dict | None = _UNIVERSE,
+            eod_closes: dict | None = None):
         """Fake S3 with a heartbeat ``offset_s`` seconds BEFORE the test's RTH now."""
         ts = None
         if heartbeat_offset_s is not None:
             ts = (self._RTH - timedelta(seconds=heartbeat_offset_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return _universe_s3(universe, heartbeat_ts=ts)
+        return _universe_s3(universe, heartbeat_ts=ts, eod_closes=eod_closes)
 
     def test_writes_quotes_with_currency_when_open_and_app_active(self):
         s3 = self._s3()
@@ -577,7 +585,60 @@ class TestIntraday:
         art = _puts(s3)["market_data/intraday/latest.json"]
         q = art["quotes"]["AAPL"]
         assert q["suspect"] is True
-        assert q["last"] == 350.0  # flagged, never clamped/dropped — no fabrication
+
+    def test_scale_incoherent_quote_flagged_suspect_even_when_prev_close_agrees(self):
+        """metron-ops#159 (MARUY): a quote whose `last` AND `prev_close` both silently
+        landed on a new scale (an ADR ratio change the live feed applied that the settled
+        close hasn't) passes the >40%-vs-prior-tick move guard — `last`/`prev_close` agree
+        with EACH OTHER. Only a cross-check against this producer's own settled
+        `eod_closes` artifact catches it."""
+        s3 = self._s3(eod_closes={
+            "schema_version": 1, "as_of": "2026-06-11", "source": "yfinance",
+            "closes": {"AAPL": {"close": 2015.0, "currency": "USD", "bar_date": "2026-06-11"}},
+        })
+        # last/prev_close ratio ~1.03 — well inside the 40% move guard — but ~10x below
+        # the settled close (mirrors the MARUY 30.17-vs-308.40 incident).
+        quotes = {"AAPL": {"last": 202.1, "open": 200.5, "prev_close": 196.4,
+                           "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+        )
+        assert result["status"] == "ok"
+        q = _puts(s3)["market_data/intraday/latest.json"]["quotes"]["AAPL"]
+        assert q["suspect"] is True
+        assert q["last"] == 202.1  # flagged, never clamped/dropped — no fabrication
+
+    def test_scale_coherent_quote_not_flagged_and_missing_settled_close_skipped(self):
+        s3 = self._s3(eod_closes={
+            "schema_version": 1, "as_of": "2026-06-11", "source": "yfinance",
+            "closes": {"AAPL": {"close": 201.0, "currency": "USD", "bar_date": "2026-06-11"}},
+            # No entry for 1299.HK — the cross-check must skip it (nothing to flag against).
+        })
+        quotes = {
+            "AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
+                     "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+            "1299.HK": {"last": 64.8, "open": 64.1, "prev_close": 64.2,
+                        "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
+        }
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+        )
+        assert result["status"] == "ok"
+        art_quotes = _puts(s3)["market_data/intraday/latest.json"]["quotes"]
+        assert "suspect" not in art_quotes["AAPL"]
+        assert "suspect" not in art_quotes["1299.HK"]
+
+    def test_no_eod_closes_artifact_skips_scale_check(self):
+        """No settled-close artifact on file yet (closes collector hasn't run) — the
+        cross-check fails soft to a no-op rather than erroring."""
+        s3 = self._s3()  # eod_closes=None → NoSuchKey
+        quotes = {"AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
+                           "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+        )
+        assert result["status"] == "ok"
+        assert "suspect" not in _puts(s3)["market_data/intraday/latest.json"]["quotes"]["AAPL"]
 
     def test_default_stays_warm_without_heartbeat(self):
         """Owner build (gate OFF): in-session ticks publish even with no/stale heartbeat,
