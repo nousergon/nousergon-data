@@ -83,8 +83,17 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("obv_slope_10d", "technical", "OBV linear regression slope over 10 days", source="yfinance", refresh="daily"),
     FeatureEntry("rsi_slope_5d", "technical", "5-day RSI slope", source="yfinance", refresh="daily"),
     FeatureEntry("volume_price_div", "technical", "sign(volume_trend-1) * sign(momentum_5d)", source="yfinance", refresh="daily"),
+    # config#939 — VWAP divergence: (Close - VWAP) / VWAP. VWAP is a
+    # first-class OHLCV column (Polygon `vw`); NaN for yfinance-fallback
+    # rows and during the documented 2026-04-17->23 Polygon outage.
+    FeatureEntry("vwap_divergence_pct", "technical", "(Close - VWAP) / VWAP, decimal pct — NaN when VWAP is unavailable (yfinance-fallback rows, Polygon outage windows)", source="polygon", refresh="daily"),
+    # config#939 — buying/selling pressure: Chaikin Money Flow (CMF-20).
+    # Chosen over MFI-14 / Chaikin A/D: bounded ~[-1,1] range (fewest edge
+    # cases vs. A/D's unbounded cumulative line), uses only OHLCV already
+    # in the feature store (no new data source).
+    FeatureEntry("cmf_20_ratio", "technical", "Chaikin Money Flow (20d): rolling_sum(money_flow_multiplier * Volume, 20) / rolling_sum(Volume, 20). Bounded ~[-1, 1] dimensionless ratio; High==Low guarded to NaN.", source="yfinance", refresh="daily"),
 
-    # ── Macro (7) — identical across all tickers on a given day ───────────────
+    # ── Macro (8) — identical across all tickers on a given day ───────────────
     FeatureEntry("vix_level", "macro", "VIX / 20 (normalized around long-run avg)", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("yield_10y", "macro", "10Y Treasury yield normalized to 0-1", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("yield_curve_slope", "macro", "10Y - 2Y spread, normalized", source="yfinance", refresh="daily", per_ticker=False),
@@ -92,6 +101,16 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("oil_mom_5d", "macro", "5-day oil (USO) momentum", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("vix_term_slope", "macro", "VIX spot vs VIX3M term structure slope, normalized", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("xsect_dispersion", "macro", "Cross-sectional std dev of daily returns across universe", source="computed", refresh="daily", per_ticker=False),
+    # config#939 — credit spreads. ICE BofA US HY Index OAS (FRED
+    # BAMLH0A0HYM2), percent. License-gated to 2023+ on FRED; pre-2023 /
+    # missing rows fall back to the neutral default 0.0 (same pattern as
+    # gold_mom_5d / oil_mom_5d), never hard-fail. Deliberately named
+    # DISTINCT from crucible-predictor's regime_predictor.py
+    # `hy_oas_level` / `hy_oas_change_21d` (a separate market-wide
+    # regime-substrate feature family, sourced independently via its own
+    # HYOAS.parquet cache and consumed only through cfg.MACRO_NORM_FEATURES
+    # — not this feature-store namespace).
+    FeatureEntry("hy_oas_credit_spread_pct", "macro", "ICE BofA US HY Index OAS (FRED BAMLH0A0HYM2), percent. License-gated to 2023+ on FRED; falls back to neutral 0.0 when unavailable.", source="fred", refresh="daily", per_ticker=False),
 
     # ── Regime interactions (5) — macro x ticker-specific signals ─────────────
     FeatureEntry("mom5d_x_vix", "interaction", "momentum_5d * VIX regime indicator", source="computed", refresh="daily"),
