@@ -135,6 +135,12 @@
           "cloudwatch:namespace": "AlphaEngine/Agents"
         }
       }
+    },
+    {
+      "Sid": "PollDataSpotSsmCommand",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
     }
   ]
 }
