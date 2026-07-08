@@ -204,7 +204,7 @@
         "drift.$": "$.libpin_drift_result.Payload"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "PipelineContractCheck": {
       "Type": "Task",
@@ -243,7 +243,7 @@
     },
     "PipelineContractGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error.",
+      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error. config#1819: ExtractPipelineContractError itself hands off to NormalizeFailureContext (the single Catch/Next chokepoint), not HandleFailure directly.",
       "Choices": [
         {
           "Variable": "$.pipeline_contract_result.Payload.has_violation",
@@ -255,14 +255,14 @@
     },
     "ExtractPipelineContractError": {
       "Type": "Pass",
-      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the violation list. Carries the whole probe Payload (has_violation/violations/boundary_count/reason) so the FAILED SNS alert names the exact contract breach a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors ExtractLibPinDriftError → HandleFailure convention; no new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on a real contract violation by design).",
+      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the violation list. Carries the whole probe Payload (has_violation/violations/boundary_count/reason) so the FAILED SNS alert names the exact contract breach a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors ExtractLibPinDriftError's convention, INCLUDING config#1819's chokepoint: this Pass already sets $.error itself, so it hands off to NormalizeFailureContext (the SOLE Catch/Next target for the whole failure path) rather than jumping straight to HandleFailure — that chokepoint still floor-defaults $.sns_topic_arn/$.pipeline_label and re-pins pipeline_label from $.shell_run, none of which this normalizer supplies. No new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on a real contract violation by design).",
       "Parameters": {
         "phase": "PipelineContractGate",
         "source": "PipelineContractGate.has_violation",
         "violation.$": "$.pipeline_contract_result.Payload"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "CheckMutexRole": {
       "Type": "Choice",
@@ -444,7 +444,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -475,7 +475,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -605,7 +605,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -636,7 +636,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2320,7 +2320,7 @@
             "States.ALL"
           ],
           "Comment": "Backstop ONLY for a genuine SF-engine Parallel error (branches never throw — they end success with status data). Routes to the shared HandleFailure, mirroring the existing per-state Catch->HandleFailure convention; does NOT introduce a new error channel.",
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2369,7 +2369,7 @@
         "branch_b.$": "$.parallel_result[1].branch_b"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "CheckSkipBacktester": {
       "Type": "Choice",
@@ -2424,7 +2424,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2455,7 +2455,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2547,7 +2547,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2578,7 +2578,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2670,7 +2670,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2701,7 +2701,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2793,7 +2793,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2824,7 +2824,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2916,7 +2916,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -2947,7 +2947,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
@@ -3250,7 +3250,7 @@
     },
     "NotifyShellRunComplete": {
       "Type": "Task",
-      "Comment": "Friday-PM Preflight Pipeline success notification via SNS. Mirrors NotifyComplete exactly (same topic, Resource, ResultPath, End) with a 'Saturday Preflight Pipeline' Subject so a green Friday dry-pass is distinguishable from a real Saturday SUCCESS in the operator inbox. The 'Preflight' label is the consumer-facing rename of what was internally called 'shell run' (2026-05-23 rename per Brian directive: the operational meaning is preflight validation of the Saturday SF; 'shell run' was internal mechanism-language that obscured the intent in alerts). A FAILED Preflight run still routes through HandleFailure, which now also surfaces 'Saturday Preflight Pipeline — FAILED' Subject via States.Format($.pipeline_label) — see HandleFailure's parameterized Subject.",
+      "Comment": "Friday-PM Preflight Pipeline success notification via SNS. Mirrors NotifyComplete exactly (same topic, Resource, ResultPath, End) with a 'Saturday Preflight Pipeline' Subject so a green Friday dry-pass is distinguishable from a real Saturday SUCCESS in the operator inbox. The 'Preflight' label is the consumer-facing rename of what was internally called 'shell run' (2026-05-23 rename per Brian directive: the operational meaning is preflight validation of the Saturday SF; 'shell run' was internal mechanism-language that obscured the intent in alerts). A FAILED Preflight run still routes through HandleFailure, which now also surfaces 'Saturday Preflight Pipeline — FAILED' Subject via States.Format($.pipeline_label) — see HandleFailure's parameterized Subject. config#1819 (2026-06-12 incident class): Subject/Message here are both hardcoded constants (never States.Format against user input), so they can never violate the SNS Subject <=100-char/no-newline contract — but the sns:publish call itself can still throw for infra reasons (SNS throttling/IAM drift/transient outage), and a SUCCESS-path notifier failing an otherwise-succeeded pipeline is exactly the 2026-06-12 NotifyComplete incident shape. Catch below makes this best-effort: a publish failure is caught and the execution still ends SUCCEEDED (mirrors the existing PublishResearchFailureImmediate/PublishPredictorFailureImmediate/PublishModelZooFailureImmediate best-effort-notify idiom already used in ResearchPredictorParallel). The caught TaskFailed history event is still logged at the SF's existing Level:ERROR LoggingConfiguration (AWS logs TaskFailed at ERROR regardless of whether a Catch handles it) and picked up by the SnsPublishFailedMetricFilter/SnsPublishFailedAlarm CloudWatch alarm below — see that alarm's comment for the exact (repo-precedent, string-match) scoping and its known limitation.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
@@ -3258,11 +3258,32 @@
         "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must NEVER fail an otherwise-succeeded pipeline (2026-06-12 NotifyComplete SNS.InvalidParameterException incident). Record the error as data and still Succeed; the underlying TaskFailed is independently visible via CloudWatch Logs (see SnsPublishFailedAlarm) regardless of this Catch.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyShellRunCompleteDegraded"
+        }
+      ],
+      "End": true
+    },
+    "NotifyShellRunCompleteDegraded": {
+      "Type": "Pass",
+      "Comment": "config#1819 — records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost — see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyShellRunComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter.",
+      "Parameters": {
+        "degraded": true,
+        "source": "NotifyShellRunComplete",
+        "error.$": "$.notify_error"
+      },
+      "ResultPath": "$.notify_degraded",
       "End": true
     },
     "NotifyComplete": {
       "Type": "Task",
-      "Comment": "Success notification via SNS",
+      "Comment": "Success notification via SNS. config#1819 (2026-06-12 incident class): Subject/Message here are both hardcoded constants (never States.Format against user input), so they can never violate the SNS Subject <=100-char/no-newline contract — but the sns:publish call itself can still throw for infra reasons (SNS throttling/IAM drift/transient outage/a future edit that parameterizes Subject and reintroduces the exact 2026-06-12 SNS.InvalidParameterException shape). A SUCCESS-path notifier failing an otherwise-succeeded pipeline is precisely that incident. Catch below makes this best-effort: a publish failure is caught and the execution still ends SUCCEEDED (mirrors the existing PublishResearchFailureImmediate/PublishPredictorFailureImmediate/PublishModelZooFailureImmediate best-effort-notify idiom already used in ResearchPredictorParallel). The caught TaskFailed history event is still logged at the SF's existing Level:ERROR LoggingConfiguration (AWS logs TaskFailed at ERROR regardless of whether a Catch handles it) and picked up by the SnsPublishFailedMetricFilter/SnsPublishFailedAlarm CloudWatch alarm below — see that alarm's comment for the exact (repo-precedent, string-match) scoping and its known limitation.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
@@ -3270,6 +3291,27 @@
         "Message": "All steps completed successfully. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must NEVER fail an otherwise-succeeded pipeline (2026-06-12 NotifyComplete SNS.InvalidParameterException incident that motivated this fix). Record the error as data and still Succeed; the underlying TaskFailed is independently visible via CloudWatch Logs (see SnsPublishFailedAlarm) regardless of this Catch.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "End": true
+    },
+    "NotifyCompleteDegraded": {
+      "Type": "Pass",
+      "Comment": "config#1819 — records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost — see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter.",
+      "Parameters": {
+        "degraded": true,
+        "source": "NotifyComplete",
+        "error.$": "$.notify_error"
+      },
+      "ResultPath": "$.notify_degraded",
       "End": true
     },
     "ExtractMorningEnrichError": {
@@ -3281,7 +3323,7 @@
         "poll.$": "$.morning_enrich_poll"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "ExtractDataPhase1Error": {
       "Type": "Pass",
@@ -3292,7 +3334,7 @@
         "poll.$": "$.data_phase1_poll"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "ExtractBacktesterError": {
       "Type": "Pass",
@@ -3303,7 +3345,7 @@
         "poll.$": "$.backtester_poll"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "ExtractParityError": {
       "Type": "Pass",
@@ -3314,7 +3356,7 @@
         "poll.$": "$.parity_poll"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "ExtractPredictorBacktestError": {
       "Type": "Pass",
@@ -3325,7 +3367,7 @@
         "poll.$": "$.predictor_backtest_poll"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "ExtractPortfolioOptimizerBacktestError": {
       "Type": "Pass",
@@ -3336,7 +3378,7 @@
         "poll.$": "$.portfolio_optimizer_poll"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "ExtractEvaluatorError": {
       "Type": "Pass",
@@ -3347,11 +3389,54 @@
         "poll.$": "$.evaluator_poll"
       },
       "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "NormalizeFailureContext": {
+      "Type": "Pass",
+      "Comment": "config#1819 notifier-totality fix. Single Catch/Next target for EVERY failure path before HandleFailure — structurally guarantees the fields HandleFailure's States.Format/JsonToString template consumes ($.error, $.pipeline_label, $.sns_topic_arn) are present, regardless of what any upstream Catch, Extract*Error normalizer, or manual Execution.Input supplied. Mirrors the InitializeInput JsonMerge-defaults idiom (defaults as the base/first-arg, current state $ as the override/second-arg — second-arg wins — so a real $.error from a Catch's ResultPath always survives). 2026-07-02 incident (offcycle-shell-20260703-005835): a manual-trigger input omitted pipeline_label and HandleFailure's States.Format('Saturday{} Pipeline failed...', $.pipeline_label, ...) threw States.Runtime, masking the true underlying error — this state closes that CLASS (not just this instance). error/sns_topic_arn get a floor default here for defense-in-depth against any FUTURE Catch that forgets its own ResultPath: $.error (every CURRENT path already sets $.error via a Task Catch ResultPath or an Extract*Error Pass, so this is a backstop, not a behavior change for today's paths). pipeline_label is ALSO re-pinned by NormalizeFailureContextRepin (next state) from $.shell_run rather than trusted verbatim — closes the Subject-injection shape (an arbitrary/oversized/newline-bearing manual pipeline_label reaching HandleFailure's States.Format Subject; SNS Subject must be <=100 chars with no newlines) at the root, the same class of bug as the 2026-06-12 NotifyComplete Subject crash (SNS.InvalidParameterException).",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"phase\":\"Unknown\",\"source\":\"NormalizeFailureContext\",\"detail\":\"no $.error was set by the upstream Catch/normalizer\"},\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"pipeline_label\":\"\"}'),$,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "NormalizeFailureContextRepin"
+    },
+    "NormalizeFailureContextRepin": {
+      "Type": "Choice",
+      "Comment": "Re-derive $.pipeline_label from $.shell_run (a boolean the SF itself controls) instead of trusting whatever string a manual Execution.Input supplied for pipeline_label — closes the SNS Subject-injection vector at HandleFailure's States.Format('Alpha Engine Saturday{} Pipeline — FAILED', $.pipeline_label): an arbitrary/oversized/newline-bearing manual pipeline_label can no longer reach the Subject regardless of what NormalizeFailureContext's floor-default merge left in place. IsPresent guards make this Choice total — it cannot itself raise a missing-$.shell_run States.Runtime, unlike a bare States.Format/JsonToString would. shell_run=true -> ' Preflight' (matches ApplyShellRunDefaults' identity so a Friday shell-run failure still reads 'Saturday Preflight Pipeline — FAILED'); anything else (absent, false, or a non-boolean) -> '' (the real Saturday identity).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.shell_run",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.shell_run",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NormalizeFailureContextPreflightLabel"
+        }
+      ],
+      "Default": "NormalizeFailureContextRealLabel"
+    },
+    "NormalizeFailureContextPreflightLabel": {
+      "Type": "Pass",
+      "Comment": "shell_run=true path: pin pipeline_label to ' Preflight' (leading space, same convention as ApplyShellRunDefaults/preflight_args) so a Friday shell-run failure still surfaces 'Saturday Preflight Pipeline — FAILED', matching the pre-fix labeling behavior exactly.",
+      "Result": " Preflight",
+      "ResultPath": "$.pipeline_label",
+      "Next": "HandleFailure"
+    },
+    "NormalizeFailureContextRealLabel": {
+      "Type": "Pass",
+      "Comment": "shell_run absent/false/non-boolean path (the real Saturday run, and any other cadence): pin pipeline_label to '' so HandleFailure surfaces the byte-identical pre-fix 'Alpha Engine Saturday Pipeline — FAILED' Subject. This OVERRIDES whatever pipeline_label value (if any) a manual Execution.Input or upstream state left in place — the label is now always SF-derived, never free-text passthrough, closing the Subject-injection vector structurally rather than by string-truncation (ASL has no substring/truncate intrinsic).",
+      "Result": "",
+      "ResultPath": "$.pipeline_label",
       "Next": "HandleFailure"
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS — pipeline halts. Subject + Message are parameterized via States.Format on $.pipeline_label so a Preflight Pipeline failure surfaces 'Saturday Preflight Pipeline — FAILED' (shell_run=true → ApplyShellRunDefaults sets $.pipeline_label=' Preflight') while a real Saturday SF failure surfaces 'Saturday Pipeline — FAILED' ($.pipeline_label='' from InitializeInput defaults). 2026-05-23 rename arc: 'shell_run' is internal mechanism-language; alerts surface the user-facing 'Preflight' label.",
+      "Comment": "Failure alert via SNS — pipeline halts. Subject + Message are parameterized via States.Format on $.pipeline_label so a Preflight Pipeline failure surfaces 'Saturday Preflight Pipeline — FAILED' (shell_run=true → ApplyShellRunDefaults sets $.pipeline_label=' Preflight') while a real Saturday SF failure surfaces 'Saturday Pipeline — FAILED' ($.pipeline_label='' from InitializeInput defaults). 2026-05-23 rename arc: 'shell_run' is internal mechanism-language; alerts surface the user-facing 'Preflight' label. config#1819 (2026-07-06): every path into this state now routes through NormalizeFailureContext -> NormalizeFailureContextRepin first (the ONLY Catch/Next target for the whole failure path), which structurally guarantees $.error/$.sns_topic_arn/$.pipeline_label are present AND re-pins pipeline_label from $.shell_run rather than trusting a manual Execution.Input's free-text value — so this Subject can never exceed the SNS 100-char/no-newline contract and this States.Format can never throw States.Runtime for a missing JSONPath, closing both the 2026-07-02 States.Runtime-masking incident and the Subject-injection shape of the 2026-06-12 NotifyComplete crash.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
