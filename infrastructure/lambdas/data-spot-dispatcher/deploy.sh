@@ -21,7 +21,7 @@
 # the FIRST-TIME `--bootstrap` (which mints the execution role + creates the
 # function) MUST be run by an operator with IAM rights. The flagless run is
 # code-only (`update-function-code` + env converge) and is the CI auto-deploy
-# path once a deploy-data-spot-dispatcher.yml workflow exists.
+# path (.github/workflows/deploy-data-spot-dispatcher.yml, path-filtered).
 #
 # WHY THIS SCRIPT EXISTS (2026-07-08 EOD incident): config#1767 Phase 2 (#643)
 # shipped this Lambda's source + IAM policy + SF wiring + the SF-role invoke
@@ -54,11 +54,15 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 # the handler's in-code default, so they are intentionally NOT set here.
 PROD_ENV='Variables={LOG_LEVEL=INFO,DATA_SPOT_DISPATCH_ENABLED=true}'
 
-# Timeout must cover the handler's worst case: launch a spot + wait for its SSM
-# agent to come Online (DATA_SPOT_SSM_ONLINE_BUDGET_SEC default 300s) before the
-# async detached SSM send-command + immediate return. 300s matches that budget;
-# memory is small (the box does the heavy lifting, not the Lambda).
-FN_TIMEOUT=300
+# Timeout must cover the handler's worst case: launch a spot (RunInstances +
+# state poll, tens of seconds; longer on the on-demand fallback after capacity
+# retries) PLUS the full SSM-online wait (DATA_SPOT_SSM_ONLINE_BUDGET_SEC
+# default 300s) before the async detached SSM send-command + return. 300s
+# equals the SSM budget alone with ZERO launch headroom — the Lambda would time
+# out right as a slow box comes online and false-fail the (fail-open) data
+# phase. 600s matches the live function as bootstrapped 2026-07-08; memory is
+# small (the box does the heavy lifting, not the Lambda).
+FN_TIMEOUT=600
 FN_MEMORY=256
 
 DRY_RUN=false
