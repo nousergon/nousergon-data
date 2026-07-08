@@ -107,6 +107,16 @@ VOLUME_SIZE_GB = int(os.environ.get("DATA_SPOT_VOLUME_SIZE_GB", "60"))
 
 DATA_REPO = os.environ.get("DATA_SPOT_REPO", "nousergon/nousergon-data")
 DATA_BRANCH = os.environ.get("DATA_SPOT_BRANCH", "main")
+# Private config package weekly_collector.py resolves via resolve_experiment_config
+# (experiments/reference/data/config.yaml). The spot box mirrors groom-dispatcher:
+# read the fleet PAT from SSM (executor role grants alpha-engine/* GetParameter)
+# and shallow-clone alpha-engine-config. spot_data_weekly.sh stages config via S3
+# from ae-dashboard instead — no dispatcher host with a local clone exists here.
+CONFIG_REPO = os.environ.get("DATA_SPOT_CONFIG_REPO", "nousergon/alpha-engine-config")
+CONFIG_BRANCH = os.environ.get("DATA_SPOT_CONFIG_BRANCH", "main")
+GH_PAT_SSM = os.environ.get(
+    "DATA_SPOT_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat"
+)
 # Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). Sized
 # above the observed ~50 min enrich + ~38 min append tail with headroom.
 MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"))
@@ -125,10 +135,12 @@ _WORKLOADS: dict[str, str] = {
     # weekday pre-open (was step_function_daily.json MorningArcticAppend)
     "morning-arctic-append": "python weekly_collector.py --morning-arctic-append",
     # EOD post-close (was step_function_eod.json PostMarketData)
-    "post-market-data": "python weekly_collector.py --post-market-data",
+    "post-market-data": (
+        "python weekly_collector.py --daily --skip-arctic-append"
+    ),
     # EOD post-close (was step_function_eod.json PostMarketArcticAppend)
     "post-market-arctic-append": (
-        "python weekly_collector.py --post-market-arctic-append"
+        "python weekly_collector.py --daily-arctic-append"
     ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
@@ -149,12 +161,13 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
 
 
 def _bootstrap_command(workload: str, collector_cmd: str, run_token: str) -> str:
-    """The async SSM RunShellScript body: install runtime, clone alpha-engine-data,
-    build the venv, run the collector, self-terminate.
+    """The async SSM RunShellScript body: install runtime, clone alpha-engine-data
+    + alpha-engine-config (private config.yaml), build the venv, run the collector,
+    self-terminate.
 
     Runs as root on the box. Mirrors spot_data_weekly.sh's bootstrap: a spot-side
     hard-timeout watchdog (so a dispatcher-side failure can never orphan the box),
-    python3.12 + git, a shallow clone, a requirements.txt venv with the numpy<2
+    python3.12 + git, shallow clones, a requirements.txt venv with the numpy<2
     pin the fleet's pyarrow is compiled against, then the collector. The box
     self-terminates on completion (InstanceInitiatedShutdownBehavior=terminate).
     """
@@ -170,6 +183,7 @@ export AWS_REGION={REGION}
 export AWS_DEFAULT_REGION={REGION}
 export FLOW_DOCTOR_ENABLED=1
 export ALPHA_ENGINE_DEPLOYED=1
+export ALPHA_ENGINE_EXPERIMENT_ID=reference
 fail() {{ echo "[data-spot-prelude] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
 # Spot-side hard-timeout watchdog: shuts the box down after MAX_RUNTIME_SECONDS
 # regardless of dispatcher state (mirrors spot_data_weekly.sh's watchdog). A
@@ -184,6 +198,13 @@ git config --global --add safe.directory '*' || true
 rm -rf /home/ec2-user/alpha-engine-data
 git clone --depth 1 --branch {DATA_BRANCH} \\
   https://github.com/{DATA_REPO}.git /home/ec2-user/alpha-engine-data || fail "clone failed"
+PAT=$(aws ssm get-parameter --name {GH_PAT_SSM} --with-decryption \\
+  --query Parameter.Value --output text --region {REGION}) || fail "PAT read failed"
+[ -n "$PAT" ] || fail "PAT empty"
+rm -rf /home/ec2-user/alpha-engine-config
+git clone --depth 1 --branch {CONFIG_BRANCH} \\
+  "https://x-access-token:${{PAT}}@github.com/{CONFIG_REPO}.git" \\
+  /home/ec2-user/alpha-engine-config || fail "config clone failed"
 cd /home/ec2-user/alpha-engine-data
 "$PYTHON_BIN" -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
