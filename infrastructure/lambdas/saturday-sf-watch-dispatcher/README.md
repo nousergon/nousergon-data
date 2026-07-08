@@ -14,9 +14,10 @@ Lambda:
    `s3://alpha-engine-research/consolidated/saturday_sf_watch/{run_date}.json`
    (the contract the M3 dashboard page reads; repeated failures in one Saturday
    accumulate).
-3. Sends a **distinct, SILENT** Telegram receipt naming the failed state + the
-   artifact location (the `sf-telegram-notifier` already pinged loud on the same
-   FAILED event — this is the additive watch record, not a duplicate alert).
+3. Sends a **distinct, SILENT** Telegram receipt **only when recovery work
+   actually starts** (agent dispatched or fast-path rerun). Observe-only paths
+   are recorded in the watch-log only — `sf-telegram-notifier` already alerted
+   on the failure; a Fleet-SF Watch ping with no action is noise.
 
 ## M2 — agent dispatch (behind a flag, default OFF)
 

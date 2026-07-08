@@ -114,24 +114,41 @@ def test_failed_writes_watch_log_and_returns_state():
     assert ev["agent_dispatch_enabled"] is False
 
 
-def test_telegram_is_silent_and_records_artifact_location():
+def test_observe_only_does_not_telegram():
+    """AGENT_DISPATCH_ENABLED=false → watch-log written, no Fleet-SF Watch ping."""
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
-        index.handler(_event("FAILED"), None)
+        result = index.handler(_event("FAILED"), None)
+    index.notify_via_flow_doctor.assert_not_called()
+    assert result["telegram_sent"] is False
+
+
+def test_telegram_fires_when_dispatch_enabled(monkeypatch):
+    """When the agent is actually dispatched, send the silent watch receipt."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
     index.notify_via_flow_doctor.assert_called_once()
     text = index.notify_via_flow_doctor.call_args.args[0]
     kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert result["telegram_sent"] is True
     assert kwargs["silent"] is True  # notifier already buzzed loud
-    assert "Fleet-SF Watch — OBSERVE" in text
+    assert "Fleet-SF Watch — AUTO-FIX" in text
     assert "Weekly Freshness SF: FAILED" in text  # pipeline-aware label
     assert "Failed state: `RAGIngestion`" in text
     assert "consolidated/saturday_sf_watch/2023-11-14.json" in text
-    assert "observe-only" in text
+    assert "autonomous fix ACTIVE" in text
 
 
-def test_watch_log_path_is_code_fenced():
+def test_watch_log_path_is_code_fenced(monkeypatch):
     """config#1584: underscored S3 keys must survive Telegram legacy Markdown
     (which treats bare ``_`` as italic delimiters) — wrap in backticks."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
     factory, _, _ = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED"), None)
@@ -192,7 +209,10 @@ def test_describe_error_still_writes_artifact():
     s3.put_object.assert_called_once()
 
 
-def test_telegram_failure_is_non_fatal():
+def test_telegram_failure_is_non_fatal(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
     index.notify_via_flow_doctor.side_effect = RuntimeError("bot down")
     factory, _, s3 = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
@@ -209,8 +229,7 @@ def test_preflight_shell_run_marks_record():
         index.handler(_event("FAILED"), None)
     written = json.loads(s3.put_object.call_args.kwargs["Body"])
     assert written["events"][0]["is_preflight"] is True
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "Weekly Freshness Preflight SF" in text
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 def test_unregistered_sf_is_ignored():
@@ -228,8 +247,7 @@ def test_weekday_sf_routes_to_weekday_prefix_and_label():
     assert result["state_machine"] == "ne-preopen-trading-pipeline"
     assert result["watch_log_key"] == "consolidated/weekday_sf_watch/2023-11-14.json"
     assert s3.put_object.call_args.kwargs["Key"].startswith("consolidated/weekday_sf_watch/")
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "Pre-open Trading SF: FAILED" in text
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 def test_eod_sf_routes_to_eod_prefix():
@@ -237,8 +255,7 @@ def test_eod_sf_routes_to_eod_prefix():
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", sm_arn=EOD_ARN), None)
     assert result["watch_log_key"] == "consolidated/eod_sf_watch/2023-11-14.json"
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "Post-close Trading SF: FAILED" in text
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 @pytest.mark.parametrize("status", ["TIMED_OUT", "ABORTED"])
@@ -395,10 +412,7 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
     assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
     assert result["action"] == "observe"
     assert fired["called"] is False
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "Fleet-SF Watch — OBSERVE" in text
-    assert "autonomous fix ACTIVE" not in text
-    assert "observe-only for this pipeline" in text
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 def test_saturday_still_dispatches_when_enabled(monkeypatch):
@@ -459,8 +473,8 @@ def test_live_old_named_eod_is_registered_during_rename_transition():
 def test_operator_abort_suppresses_dispatch_but_still_records(monkeypatch):
     """A deliberate operator abort (status ABORTED + error == "OperatorAbort")
     must NOT auto-dispatch a recovery agent even when the flag + listener are on,
-    yet MUST still write the watch-log and fire the Telegram receipt (fail-loud
-    preserved — only the autonomous ACTION on a human decision is withheld)."""
+    yet MUST still write the watch-log (fail-loud preserved — only the autonomous
+    ACTION on a human decision is withheld; no Fleet-SF Watch Telegram ping)."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     fired = {"called": False}
@@ -490,12 +504,8 @@ def test_operator_abort_suppresses_dispatch_but_still_records(monkeypatch):
     assert ev["status"] == "ABORTED"
     assert ev["dispatch_suppressed"] == "operator_abort"
     assert ev["action"] == "observe"
-    # Telegram receipt STILL fired, labelled OBSERVE with the operator-abort note.
-    assert result["telegram_sent"] is True
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "Fleet-SF Watch — OBSERVE" in text
-    assert "autonomous fix ACTIVE" not in text
-    assert "operator abort" in text.lower()
+    assert result["telegram_sent"] is False
+    index.notify_via_flow_doctor.assert_not_called()
 
 
 def test_genuine_failed_still_dispatches(monkeypatch):
@@ -633,6 +643,10 @@ def test_fast_path_reruns_on_host_death_signature(fast_path_on):
     assert result["fast_path"]["fast_path"] is True
     assert result["fast_path"]["signature"] == "data_spot_host_death"
     assert result["agent_dispatch"] == {"dispatched": False, "reason": "fast_path_rerun"}
+    assert result["telegram_sent"] is True
+    index.notify_via_flow_doctor.assert_called_once()
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "Fleet-SF Watch — AUTO-RERUN" in text
     ev = _put_body(s3)["events"][-1]
     assert ev["action"] == "fast_path_rerun"
     assert ev["lane"] == "A"
