@@ -90,11 +90,15 @@ def test_violation_halt_normalizes_error_before_handle_failure(states):
     kill the SF with an opaque States.Runtime ('$.error could not be found')
     that swallows the violation list. The violation path must first hit an
     Extract*Error normalizer that writes $.error, matching every other
-    HandleFailure entry (see ExtractLibPinDriftError)."""
+    HandleFailure entry (see ExtractLibPinDriftError). config#1819 (2026-07-08):
+    that normalizer itself now hands off to NormalizeFailureContext — the SOLE
+    Catch/Next chokepoint for the whole failure path — rather than jumping
+    straight to HandleFailure, matching ExtractLibPinDriftError's post-fix
+    wiring exactly."""
     norm = states["ExtractPipelineContractError"]
     assert norm["Type"] == "Pass"
     assert norm["ResultPath"] == "$.error"
-    assert norm["Next"] == "HandleFailure"
+    assert norm["Next"] == "NormalizeFailureContext"
     # References only the whole probe Payload — guaranteed present because the
     # gate already dereferenced Payload.has_violation to route here — so the
     # normalizer cannot itself raise a missing-field States.Runtime.
@@ -102,36 +106,77 @@ def test_violation_halt_normalizes_error_before_handle_failure(states):
 
 
 def test_every_handle_failure_entry_populates_error(states):
-    """CHOKEPOINT for the whole failure class (2026-07-03): HandleFailure's
-    Message template hard-requires $.error via States.JsonToString($.error), so
-    EVERY transition that lands on HandleFailure must guarantee $.error is set —
-    either a Task Catch with ResultPath '$.error', or a Pass normalizer with
-    ResultPath '$.error'. A future soft-path/Choice that jumps straight to
-    HandleFailure would re-introduce the opaque States.Runtime meta-crash; this
-    test fails loudly if any such path appears. Duplicated from
-    test_sf_lib_pin_drift_wiring.py so this file is a self-contained sibling
-    check for the pipeline-contract gate's own contribution to that
-    invariant."""
+    """CHOKEPOINT for the whole failure class (2026-07-03, widened 2026-07-07
+    by config#1819): HandleFailure's Message template hard-requires $.error via
+    States.JsonToString($.error), so EVERY transition that lands on
+    HandleFailure (directly, or via the NormalizeFailureContext chokepoint)
+    must guarantee $.error is set somewhere upstream — either a Task Catch
+    with ResultPath '$.error', a Pass normalizer with ResultPath '$.error', or
+    (config#1819) NormalizeFailureContext itself, which floor-defaults $.error
+    via JsonMerge so it is present even if a future Catch forgets its own
+    ResultPath. A future soft-path/Choice that jumps straight to HandleFailure
+    (bypassing NormalizeFailureContext entirely, as LibPinDriftGate/
+    PipelineContractGate once did) would re-introduce the opaque
+    States.Runtime meta-crash; this test fails loudly if any such path
+    appears. Duplicated from test_sf_lib_pin_drift_wiring.py (kept
+    byte-for-byte in sync there — config#1819 2026-07-08 drift fix) so this
+    file is a self-contained sibling check for the pipeline-contract gate's
+    own contribution to that invariant."""
     offenders = []
     for name, st in states.items():
-        # Catch-based entries.
+        # Catch-based entries — the ONLY way NormalizeFailureContext (or,
+        # pre-fix, HandleFailure) is actually reached in this SF today.
+        # Correlate the SPECIFIC Catch clause's own ResultPath — a Task
+        # having *some* Catch elsewhere (e.g. a distinct Catch clause
+        # routing to a different state) must NOT count as evidence that
+        # $.error is set on THIS clause's path.
         for cat in st.get("Catch", []):
-            if cat.get("Next") == "HandleFailure" and cat.get("ResultPath") != "$.error":
-                offenders.append(f"{name} Catch ResultPath={cat.get('ResultPath')!r}")
-        # State-transition entries (Next / Default / Choice).
-        transitions = [st.get("Next"), st.get("Default")]
-        transitions += [c.get("Next") for c in st.get("Choices", [])]
-        if "HandleFailure" in transitions:
-            # The source state must itself write $.error before handing off —
-            # i.e. be a Pass normalizer with ResultPath '$.error'.
-            if not (st.get("Type") == "Pass" and st.get("ResultPath") == "$.error"):
+            target = cat.get("Next")
+            if target in ("HandleFailure", "NormalizeFailureContext") and cat.get("ResultPath") != "$.error":
+                offenders.append(f"{name} Catch ResultPath={cat.get('ResultPath')!r} (Next={target})")
+        # Direct state-transition entries (Next / Default / Choice) — i.e.
+        # NOT via a Catch clause. A Pass normalizer transitioning via its
+        # own top-level "Next" (not a Catch) must set $.error itself via
+        # ResultPath; any other state type reaching HandleFailure/
+        # NormalizeFailureContext this way has no correlated $.error source
+        # and is an offender regardless of Type.
+        direct_transitions = {st.get("Next"), st.get("Default")}
+        direct_transitions |= {c.get("Next") for c in st.get("Choices", [])}
+        direct_transitions.discard(None)
+
+        if "HandleFailure" in direct_transitions:
+            # Only NormalizeFailureContextPreflightLabel/RealLabel may transition
+            # directly to HandleFailure post-fix — both are Pass states that set
+            # $.pipeline_label (not $.error, which NormalizeFailureContext already
+            # floor-defaulted upstream of them).
+            if name not in (
+                "NormalizeFailureContextPreflightLabel",
+                "NormalizeFailureContextRealLabel",
+            ):
                 offenders.append(
                     f"{name} (Type={st.get('Type')}) transitions to HandleFailure "
-                    f"without setting $.error (ResultPath={st.get('ResultPath')!r})"
+                    f"directly, bypassing the NormalizeFailureContext chokepoint"
+                )
+        if "NormalizeFailureContext" in direct_transitions:
+            # The source state must itself write $.error before handing off
+            # via its own top-level Next/Default/Choice (not a Catch, which
+            # is checked separately above) — i.e. be a Pass normalizer with
+            # ResultPath '$.error'. NormalizeFailureContext's own floor-default
+            # is a backstop for Catch-based entries only; a direct (non-Catch)
+            # transition bypasses that reasoning entirely and must set
+            # $.error itself.
+            is_pass_error_normalizer = (
+                st.get("Type") == "Pass" and st.get("ResultPath") == "$.error"
+            )
+            if not is_pass_error_normalizer:
+                offenders.append(
+                    f"{name} (Type={st.get('Type')}) transitions directly (not "
+                    f"via Catch) to NormalizeFailureContext without itself "
+                    f"setting $.error (ResultPath={st.get('ResultPath')!r})"
                 )
     assert not offenders, (
-        "State(s) reach HandleFailure without populating $.error — "
-        "HandleFailure will die with States.Runtime: " + "; ".join(offenders)
+        "State(s) reach HandleFailure without the guaranteed-$.error chokepoint — "
+        "HandleFailure could die with States.Runtime: " + "; ".join(offenders)
     )
 
 
