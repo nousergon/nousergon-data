@@ -243,7 +243,7 @@
     },
     "PipelineContractGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error.",
+      "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error. config#1819: ExtractPipelineContractError itself hands off to NormalizeFailureContext (the single Catch/Next chokepoint), not HandleFailure directly.",
       "Choices": [
         {
           "Variable": "$.pipeline_contract_result.Payload.has_violation",
@@ -255,14 +255,14 @@
     },
     "ExtractPipelineContractError": {
       "Type": "Pass",
-      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the violation list. Carries the whole probe Payload (has_violation/violations/boundary_count/reason) so the FAILED SNS alert names the exact contract breach a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors ExtractLibPinDriftError → HandleFailure convention; no new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on a real contract violation by design).",
+      "Comment": "Normalize a confirmed pipeline-contract violation (PipelineContractGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the violation list. Carries the whole probe Payload (has_violation/violations/boundary_count/reason) so the FAILED SNS alert names the exact contract breach a human must resolve. References only $.pipeline_contract_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here — so this normalizer cannot itself raise a missing-field States.Runtime. Mirrors ExtractLibPinDriftError's convention, INCLUDING config#1819's chokepoint: this Pass already sets $.error itself, so it hands off to NormalizeFailureContext (the SOLE Catch/Next target for the whole failure path) rather than jumping straight to HandleFailure — that chokepoint still floor-defaults $.sns_topic_arn/$.pipeline_label and re-pins pipeline_label from $.shell_run, none of which this normalizer supplies. No new error channel. FAIL-LOUD PRESERVED: still → HandleFailure → FailExecution (the pipeline still hard-fails on a real contract violation by design).",
       "Parameters": {
         "phase": "PipelineContractGate",
         "source": "PipelineContractGate.has_violation",
         "violation.$": "$.pipeline_contract_result.Payload"
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "NormalizeFailureContext"
     },
     "CheckMutexRole": {
       "Type": "Choice",
