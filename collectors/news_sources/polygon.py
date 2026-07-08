@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from alpha_engine_lib.sources import NewsArticle
+from nousergon_lib.sources import NewsArticle
 
 from polygon_client import polygon_client
 

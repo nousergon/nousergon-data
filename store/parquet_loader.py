@@ -5,7 +5,7 @@ Extracted from features/compute.py so that non-feature callers can reuse
 the same normalized DataFrame shape without importing private helpers out
 of features.*. The bulk slim-cache loader (load_slim_cache) was removed in
 the Wave-4 predictor/price_cache_slim deletion — all price reads now go
-through the ArcticDB universe/macro libs (alpha_engine_lib.arcticdb).
+through the ArcticDB universe/macro libs (nousergon_lib.arcticdb).
 """
 
 from __future__ import annotations

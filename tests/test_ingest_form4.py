@@ -339,7 +339,7 @@ class TestDataFrameConversion:
 
 class TestS3ParquetWriter:
     def test_canonical_artifact_key_shape(self):
-        from alpha_engine_lib.eval_artifacts import (
+        from nousergon_lib.eval_artifacts import (
             eval_artifact_key, eval_latest_key,
         )
         ak = eval_artifact_key(

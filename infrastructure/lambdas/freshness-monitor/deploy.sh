@@ -137,7 +137,7 @@ fi
 
 # ----- 1b. Preflight handler unit tests with runtime deps available --------
 # Runs AFTER step 1's pip install so the test's `import index` succeeds
-# (index imports yaml + boto3 + alpha_engine_lib.{alerts,artifact_freshness}
+# (index imports yaml + boto3 + nousergon_lib.{alerts,artifact_freshness}
 # — none of which are guaranteed in the caller's bare python). pytest +
 # its deps install into $TEST_DEPS (separate from $PKG) so they don't
 # get bundled into the Lambda zip.

@@ -243,24 +243,48 @@
         }
       ],
       "ResultPath": "$.chronic_gap_result",
+      "Next": "InitChronicGapPoll"
+    },
+    "InitChronicGapPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the fail-soft ChronicGapSelfHeal loop (config#1811).",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.chronic_gap_poll",
       "Next": "WaitForChronicGap"
     },
     "WaitForChronicGap": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 300s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.chronic_gap_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.chronic_gap_result.Command.CommandId",
+          "attempts.$": "$.chronic_gap_poll.attempts",
+          "ping_misses.$": "$.chronic_gap_poll.ping_misses",
+          "max_attempts": 30,
+          "max_ping_misses": 3,
+          "step": "chronic-gap-heal"
+        }
       },
+      "TimeoutSeconds": 65,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -274,30 +298,45 @@
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.chronic_gap_poll",
       "Next": "CheckChronicGapStatus"
     },
     "CheckChronicGapStatus": {
       "Type": "Choice",
-      "Comment": "Chronic-gap heal is fail-soft: any TERMINAL status (Success OR failure OR timeout) proceeds to PredictorInference; only keep polling while InProgress/Pending. This is the inverse of CheckMorningEnrichStatus (which HandleFailures on non-success) — MorningEnrich is load-bearing, this best-effort heal is not.",
+      "Comment": "Chronic-gap heal is fail-soft for HEAL failures: COMMAND_FAILED and POLL_BUDGET_EXHAUSTED (Default) proceed to PredictorInference — a broken/stuck best-effort heal must never block predictions. EXCEPTION (config#1811): INSTANCE_UNRESPONSIVE is NOT a heal failure, it is a host failure — the same wedged box the daemon must run on later. Proceeding fail-soft would just fail at RunMorningPlanner after burning PredictorInference; stamp + force-stop + HandleFailure instead.",
       "Choices": [
         {
-          "Variable": "$.chronic_gap_poll.Status",
-          "StringEquals": "InProgress",
+          "Variable": "$.chronic_gap_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
           "Next": "ChronicGapWait"
         },
         {
-          "Variable": "$.chronic_gap_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "ChronicGapWait"
+          "Variable": "$.chronic_gap_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampChronicGapUnresponsive"
         }
       ],
       "Default": "CheckSkipPredictorInference"
+    },
+    "StampChronicGapUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive during the (otherwise fail-soft) chronic-gap heal — a host failure, not a heal failure. Stamp the poller's detail into $.error, force-stop, alert.",
+      "Parameters": {
+        "Error": "ChronicGapInstanceUnresponsive",
+        "Cause.$": "$.chronic_gap_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceStopUnresponsiveInstance"
     },
     "ChronicGapWait": {
       "Type": "Wait",
@@ -398,7 +437,7 @@
     },
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online → CheckSkipMorningEnrich (the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
+      "Comment": "PingStatus=Online → CodeFreshnessGate (config#1811; the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
       "Choices": [
         {
           "And": [
@@ -411,7 +450,7 @@
               "StringEquals": "Online"
             }
           ],
-          "Next": "CheckSkipMorningEnrich"
+          "Next": "CodeFreshnessGate"
         },
         {
           "Variable": "$.ssm_poll.attempts",
@@ -433,6 +472,185 @@
       },
       "ResultPath": "$.ssm_poll",
       "Next": "DescribeInstanceInfo"
+    },
+    "CodeFreshnessGate": {
+      "Type": "Task",
+      "Comment": "config#1811 Part A — verify the three repo checkouts on ae-trading (alpha-engine, alpha-engine-data, alpha-engine-config) are on branch main at origin/main's SHA BEFORE any pipeline work runs, with one in-place self-heal (ownership reclaim + checkout -f main + reset --hard). Front-loads the check the executor's deploy-drift preflight only makes at RunMorningPlanner time — on 2026-07-06 a boot-pull failure (root-owned files in the checkout) left the box on a stray branch 4 commits stale, and the pipeline burned ~40 min of MorningEnrich/ArcticAppend/PredictorInference before that preflight refused. The executor-repo AST syntax gate mirrors boot-pull's deploy gate but FAILS the pipeline instead of rolling back: at pipeline time, neither stale nor broken code may proceed (fail-loud). Runs as root via SSM (bare chown), git as ec2-user. The executor's in-process check_deploy_drift stays as defense-in-depth. 2026-07-08 preopen failure: this gate and boot-pull.service (the systemd oneshot that runs the SAME `git fetch/checkout -f main/reset --hard` on the same 3 repos at every daily boot) are two concurrent git writers — the gate fires the instant SSM reports Online, which can be WHILE boot-pull's `git reset --hard` still holds alpha-engine-data/.git/index.lock, so the gate's checkout/reset died with 'Another git process seems to be running' (exit 128 -> COMMAND_FAILED, no orders placed). The fetch + self-heal git ops now go through git_retry(), which retries ONLY on git's lock-contention signature (up to 30x5s=150s > boot-pull's 120s TimeoutStartSec) and FAILS LOUD on any other error or if the lock persists past budget — serializing the gate behind boot-pull without swallowing a genuinely stale/broken box. Deeper class fix (a shared flock mutex across both git actors) tracked as a config follow-up.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "export FLOW_DOCTOR_ENABLED=1",
+            "export ALPHA_ENGINE_DEPLOYED=1",
+            "REPOS='alpha-engine alpha-engine-data alpha-engine-config'",
+            "git_retry() { __i=0; while :; do if __out=$(sudo -u ec2-user git \"$@\" 2>&1); then printf '%s\\n' \"$__out\"; return 0; fi; __i=$((__i+1)); if [ $__i -ge 30 ] || ! printf '%s' \"$__out\" | grep -q 'Another git process seems to be running'; then printf '%s\\n' \"$__out\" >&2; return 1; fi; echo \"[code-freshness-gate] git lock contention (boot-pull.service git in flight), retry $__i/30\"; sleep 5; done; }",
+            "for r in $REPOS; do git_retry -C /home/ec2-user/$r fetch --quiet origin main; done",
+            "drift=0",
+            "for r in $REPOS; do d=/home/ec2-user/$r; br=$(sudo -u ec2-user git -C $d rev-parse --abbrev-ref HEAD); h=$(sudo -u ec2-user git -C $d rev-parse HEAD); u=$(sudo -u ec2-user git -C $d rev-parse origin/main); if [ \"$br\" != \"main\" ] || [ \"$h\" != \"$u\" ]; then echo \"DRIFT $r branch=$br head=$h upstream=$u\"; drift=1; fi; done",
+            "if [ $drift -eq 1 ]; then echo 'SELF-HEAL: ownership reclaim + reset to origin/main'; for r in $REPOS; do d=/home/ec2-user/$r; chown -R ec2-user:ec2-user $d; git_retry -C $d checkout -f main; git_retry -C $d reset --hard origin/main; done; fi",
+            "for r in $REPOS; do d=/home/ec2-user/$r; br=$(sudo -u ec2-user git -C $d rev-parse --abbrev-ref HEAD); h=$(sudo -u ec2-user git -C $d rev-parse HEAD); u=$(sudo -u ec2-user git -C $d rev-parse origin/main); if [ \"$br\" != \"main\" ] || [ \"$h\" != \"$u\" ]; then echo \"CODE-STALE-AFTER-HEAL $r branch=$br head=$h upstream=$u\"; exit 1; fi; done",
+            "cd /home/ec2-user/alpha-engine && sudo -u ec2-user .venv/bin/python -c \"import ast; [ast.parse(open(f).read()) for f in ('executor/main.py','executor/daemon.py','executor/eod_reconcile.py')]\"",
+            "echo CODE_FRESH"
+          ],
+          "executionTimeout": [
+            "300"
+          ]
+        },
+        "TimeoutSeconds": 300
+      },
+      "TimeoutSeconds": 360,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.code_freshness_result",
+      "Next": "InitCodeFreshnessPoll"
+    },
+    "InitCodeFreshnessPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the CodeFreshnessGate loop (config#1811).",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.code_freshness_poll",
+      "Next": "WaitForCodeFreshness"
+    },
+    "WaitForCodeFreshness": {
+      "Type": "Task",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 36 × ~10s ≈ 6 min, past the 300s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.code_freshness_result.Command.CommandId",
+          "attempts.$": "$.code_freshness_poll.attempts",
+          "ping_misses.$": "$.code_freshness_poll.ping_misses",
+          "max_attempts": 36,
+          "max_ping_misses": 3,
+          "step": "code-freshness-gate"
+        }
+      },
+      "TimeoutSeconds": 65,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
+      },
+      "ResultPath": "$.code_freshness_poll",
+      "Next": "CheckCodeFreshnessStatus"
+    },
+    "CheckCodeFreshnessStatus": {
+      "Type": "Choice",
+      "Comment": "SUCCESS → the box is verified on current main across all 3 repos → CheckSkipMorningEnrich (the pipeline proper). COMMAND_FAILED (Default) → HandleFailure — code stale after self-heal, or broken syntax on main; either way NOTHING may run (~2 min into the pipeline, not 40). INSTANCE_UNRESPONSIVE → stamp → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → CodeFreshnessPollTimeout.",
+      "Choices": [
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "SUCCESS",
+          "Next": "CheckSkipMorningEnrich"
+        },
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
+          "Next": "CodeFreshnessWait"
+        },
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampCodeFreshnessUnresponsive"
+        },
+        {
+          "Variable": "$.code_freshness_poll.verdict",
+          "StringEquals": "POLL_BUDGET_EXHAUSTED",
+          "Next": "CodeFreshnessPollTimeout"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+    "CodeFreshnessWait": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "WaitForCodeFreshness"
+    },
+    "StampCodeFreshnessUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive during the code-freshness gate (right after reporting PingStatus=Online — a fast wedge). Stamp, force-stop, alert.",
+      "Parameters": {
+        "Error": "CodeFreshnessInstanceUnresponsive",
+        "Cause.$": "$.code_freshness_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceStopUnresponsiveInstance"
+    },
+    "CodeFreshnessPollTimeout": {
+      "Type": "Pass",
+      "Comment": "Bounded poll budget exhausted on the CodeFreshnessGate loop with the box still responsive (#970 shape). Stamp + alert via HandleFailure.",
+      "Result": {
+        "Error": "CodeFreshnessPollTimeout",
+        "Cause": "CodeFreshnessGate SSM command did not reach a terminal status within the bounded poll budget (~36 iterations / ~6 min, past the 300s executionTimeout) while the SSM agent stayed Online."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "ForceStopUnresponsiveInstance": {
+      "Type": "Task",
+      "Comment": "config#1811 — deterministic remediation for INSTANCE_UNRESPONSIVE: the box is wedged (the 2026-07-06 config#1807 shape: memory-pressure stall, SSM agent dark, in-box executionTimeout unable to fire) and every remaining pipeline step needs this same host, so force-stop it NOW rather than leave it thrashing with IB Gateway credentials on it. Validated as the actual recovery action in the 2026-07-06 incident. $.error was stamped by the per-loop Stamp state before arriving here; this state's own result/error use separate ResultPaths so the stamped cause survives into HandleFailure's SNS alert. A stop failure still routes to HandleFailure — alerting is the priority, the stop is best-effort remediation.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id",
+        "Force": true
+      },
+      "TimeoutSeconds": 30,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.force_stop_error"
+        }
+      ],
+      "ResultPath": "$.force_stop_result",
+      "Next": "HandleFailure"
     },
     "PredictorInference": {
       "Type": "Task",
@@ -622,12 +840,48 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Predictor health check is non-blocking — continue to morning planner. Executor's own upstream-health gate catches real data-freshness problems before placing orders.",
-          "Next": "CheckSkipMorningPlanner",
+          "Comment": "Predictor health check is non-blocking — continue to drift check. Executor's own upstream-health gate catches real data-freshness problems before placing orders.",
+          "Next": "PredictorDriftCheck",
           "ResultPath": "$.predictor_health_error"
         }
       ],
       "ResultPath": "$.predictor_health_result",
+      "Next": "PredictorDriftCheck"
+    },
+    "PredictorDriftCheck": {
+      "Type": "Task",
+      "Comment": "Daily prediction-health producer (config#1853, closing out config#1282/crucible-predictor#305): invokes action=check_drift so predictor/metrics/drift_{trading_day}.json (artifact_id predictor_drift_detection, cadence eod_sf) is produced every weekday. Runs AFTER PredictorHealthCheck so trading_day's predictions already exist to score for drift. Fail-soft — a drift-check failure must never block the morning planner / order placement; it is an observability producer, not a trading gate.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_drift",
+          "date.$": "$.trading_day_gate.Payload.check_date"
+        }
+      },
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-soft — a drift-check producer failure must never block the morning planner. Missing one day's drift_{trading_day}.json is a monitoring gap, not a trading-path incident.",
+          "Next": "CheckSkipMorningPlanner",
+          "ResultPath": "$.predictor_drift_error"
+        }
+      ],
+      "ResultPath": "$.predictor_drift_result",
       "Next": "CheckSkipMorningPlanner"
     },
     "RunMorningPlanner": {
@@ -676,24 +930,48 @@
         }
       ],
       "ResultPath": "$.planner_result",
+      "Next": "InitMorningPlannerPoll"
+    },
+    "InitMorningPlannerPoll": {
+      "Type": "Pass",
+      "Comment": "Seed the liveness-aware poll slot for the RunMorningPlanner loop (config#1811).",
+      "Result": {
+        "verdict": "INIT",
+        "attempts": 0,
+        "ping_misses": 0
+      },
+      "ResultPath": "$.planner_poll",
       "Next": "WaitForMorningPlanner"
     },
     "WaitForMorningPlanner": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 300s executionTimeout.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.planner_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.planner_result.Command.CommandId",
+          "attempts.$": "$.planner_poll.attempts",
+          "ping_misses.$": "$.planner_poll.ping_misses",
+          "max_attempts": 30,
+          "max_ping_misses": 3,
+          "step": "morning-planner"
+        }
       },
+      "TimeoutSeconds": 65,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
+          "MaxAttempts": 3,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -706,34 +984,65 @@
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.planner_poll",
       "Next": "CheckMorningPlannerStatus"
     },
     "CheckMorningPlannerStatus": {
       "Type": "Choice",
+      "Comment": "Branches on the ssm-liveness-poller verdict (config#1811). COMMAND_FAILED (Default) → HandleFailure — the 2026-07-06 deploy-drift refusal surfaced here with rc=1. INSTANCE_UNRESPONSIVE → stamp → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → MorningPlannerPollTimeout.",
       "Choices": [
         {
-          "Variable": "$.planner_poll.Status",
-          "StringEquals": "Success",
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "SUCCESS",
           "Next": "CheckSkipRunDaemon"
         },
         {
-          "Variable": "$.planner_poll.Status",
-          "StringEquals": "InProgress",
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "IN_PROGRESS",
           "Next": "MorningPlannerWait"
         },
         {
-          "Variable": "$.planner_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "MorningPlannerWait"
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "INSTANCE_UNRESPONSIVE",
+          "Next": "StampMorningPlannerUnresponsive"
+        },
+        {
+          "Variable": "$.planner_poll.verdict",
+          "StringEquals": "POLL_BUDGET_EXHAUSTED",
+          "Next": "MorningPlannerPollTimeout"
         }
       ],
       "Default": "HandleFailure"
+    },
+    "StampMorningPlannerUnresponsive": {
+      "Type": "Pass",
+      "Comment": "The trading box went unresponsive mid-planner. Stamp the poller's detail into $.error, force-stop, alert.",
+      "Parameters": {
+        "Error": "MorningPlannerInstanceUnresponsive",
+        "Cause.$": "$.planner_poll.detail"
+      },
+      "ResultPath": "$.error",
+      "Next": "ForceStopUnresponsiveInstance"
+    },
+    "MorningPlannerPollTimeout": {
+      "Type": "Pass",
+      "Comment": "Bounded poll budget exhausted on the RunMorningPlanner loop with the box still responsive (#970 shape). Stamp + alert via HandleFailure.",
+      "Result": {
+        "Error": "MorningPlannerPollTimeout",
+        "Cause": "RunMorningPlanner SSM command did not reach a terminal status within the bounded poll budget (~30 iterations / ~7.5 min, past the 300s executionTimeout) while the SSM agent stayed Online. See /var/log/executor.log on ae-trading."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
     "MorningPlannerWait": {
       "Type": "Wait",
@@ -794,6 +1103,106 @@
         }
       ],
       "Default": "LaunchMorningEnrichSpot"
+    },
+    "CheckSkipChronicGapHeal": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_chronic_gap_heal\": true} routes past ChronicGapSelfHeal to the next gate (CheckSkipPredictorInference); missing flag = run as normal. The heal is already best-effort/fail-soft, so skipping it on a rerun is always safe. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_chronic_gap_heal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_chronic_gap_heal",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPredictorInference"
+        }
+      ],
+      "Default": "ChronicGapSelfHeal"
+    },
+    "CheckSkipPredictorInference": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_predictor_inference\": true} routes past PredictorInference (and its coverage/health sub-chain) to the next gate (CheckSkipMorningPlanner); missing flag = run as normal. Skip only when predictions/{date}.json already exists from a prior run. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_predictor_inference",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_predictor_inference",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipMorningPlanner"
+        }
+      ],
+      "Default": "PredictorInference"
+    },
+    "CheckSkipMorningPlanner": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_planner\": true} routes past RunMorningPlanner to the next gate (CheckSkipRunDaemon); missing flag = run as normal. The planner writes the order book but places no orders, so re-running it is normally safe; skip is for reruns where the book is already current. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_morning_planner",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_morning_planner",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipRunDaemon"
+        }
+      ],
+      "Default": "RunMorningPlanner"
+    },
+    "CheckSkipRunDaemon": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) directly to PipelineComplete; missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_run_daemon",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_run_daemon",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "PipelineComplete"
+        }
+      ],
+      "Default": "RunDaemon"
+    },
+    "PipelineComplete": {
+      "Type": "Succeed"
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Comment": "Failure alert via SNS",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline — FAILED",
+        "Message.$": "States.Format('Weekday pipeline failed. State: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($))"
+      },
+      "ResultPath": "$.failure_notify",
+      "Next": "FailExecution"
+    },
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "DailyPipelineFailure",
+      "Cause": "One or more weekday pipeline steps failed."
     },
     "LaunchMorningEnrichSpot": {
       "Type": "Task",
@@ -1057,106 +1466,6 @@
         }
       ],
       "Next": "CheckSkipChronicGapHeal"
-    },
-    "CheckSkipChronicGapHeal": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_chronic_gap_heal\": true} routes past ChronicGapSelfHeal to the next gate (CheckSkipPredictorInference); missing flag = run as normal. The heal is already best-effort/fail-soft, so skipping it on a rerun is always safe. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_chronic_gap_heal",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_chronic_gap_heal",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipPredictorInference"
-        }
-      ],
-      "Default": "ChronicGapSelfHeal"
-    },
-    "CheckSkipPredictorInference": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_predictor_inference\": true} routes past PredictorInference (and its coverage/health sub-chain) to the next gate (CheckSkipMorningPlanner); missing flag = run as normal. Skip only when predictions/{date}.json already exists from a prior run. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_predictor_inference",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_predictor_inference",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipMorningPlanner"
-        }
-      ],
-      "Default": "PredictorInference"
-    },
-    "CheckSkipMorningPlanner": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_morning_planner\": true} routes past RunMorningPlanner to the next gate (CheckSkipRunDaemon); missing flag = run as normal. The planner writes the order book but places no orders, so re-running it is normally safe; skip is for reruns where the book is already current. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_morning_planner",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_morning_planner",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipRunDaemon"
-        }
-      ],
-      "Default": "RunMorningPlanner"
-    },
-    "CheckSkipRunDaemon": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) directly to PipelineComplete; missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_run_daemon",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_run_daemon",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "PipelineComplete"
-        }
-      ],
-      "Default": "RunDaemon"
-    },
-    "PipelineComplete": {
-      "Type": "Succeed"
-    },
-    "HandleFailure": {
-      "Type": "Task",
-      "Comment": "Failure alert via SNS",
-      "Resource": "arn:aws:states:::sns:publish",
-      "Parameters": {
-        "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — FAILED",
-        "Message.$": "States.Format('Weekday pipeline failed. State: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($))"
-      },
-      "ResultPath": "$.failure_notify",
-      "Next": "FailExecution"
-    },
-    "FailExecution": {
-      "Type": "Fail",
-      "Error": "DailyPipelineFailure",
-      "Cause": "One or more weekday pipeline steps failed."
     }
   }
 }

@@ -1,6 +1,6 @@
 """Unit tests for saturday-integrity-sentinel (M4).
 
-Stubs alpha_engine_lib.telegram.send_message and mocks the S3 client. Asserts
+Stubs nousergon_lib.telegram.send_message and mocks the S3 client. Asserts
 the GO/NO-GO evaluation computed from the freshness `check_results.json` rows
 (complete / incomplete / uncertain), loud-vs-silent Telegram, fail-loud marker
 write, and best-effort Telegram.
@@ -16,12 +16,31 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_telegram_mod = types.ModuleType("alpha_engine_lib.telegram")
+# Stub `nousergon_lib.telegram` + `nousergon_lib.flow_doctor_fleet` before
+# importing the handler so test environments without the lib installed (CI
+# runners pre-pip-install) still pass — the handler depends on both import
+# paths from the lib (config#1759: the flow_doctor_fleet stub was missing
+# here, which this hermetic pattern requires when a real `nousergon_lib` is
+# also on the path — matches the sibling pipeline-watchdog/test_handler.py
+# stub).
+_lib_pkg = types.ModuleType("nousergon_lib")
+_telegram_mod = types.ModuleType("nousergon_lib.telegram")
 _telegram_mod.send_message = MagicMock(return_value=True)
 _lib_pkg.telegram = _telegram_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.telegram", _telegram_mod)
+_fleet_mod = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+
+
+class _FleetTelegramTopic:
+    CRITICAL = "CRITICAL"
+    PIPELINE = "PIPELINE"
+    OPS_HEALTH = "OPS_HEALTH"
+
+
+_fleet_mod.FleetTelegramTopic = _FleetTelegramTopic
+_lib_pkg.flow_doctor_fleet = _fleet_mod
+sys.modules["nousergon_lib"] = _lib_pkg
+sys.modules["nousergon_lib.telegram"] = _telegram_mod
+sys.modules["nousergon_lib.flow_doctor_fleet"] = _fleet_mod
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))

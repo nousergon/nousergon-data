@@ -156,7 +156,7 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
   # Target is krepis.alerts (config#1339/config#1545): alerts relocated to
   # krepis at nousergon-lib v0.66.0, and the runner-side install this call
   # depends on had drifted to a stale alpha-engine-lib@v0.26.0 pin whose
-  # import name (alpha_engine_lib) never matched this nousergon_lib call —
+  # import name (nousergon_lib) never matched this nousergon_lib call —
   # the exact L221 alert this comment describes had been silently dead
   # (ModuleNotFoundError swallowed by || true) since that pin went stale.
   python3 -m krepis.alerts publish \

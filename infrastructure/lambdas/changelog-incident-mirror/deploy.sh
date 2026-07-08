@@ -163,7 +163,7 @@ echo "✓ Deployed."
 
 # Smoke test: publish a single SNS message and verify the entry lands.
 # Migrated 2026-05-20 (ROADMAP L146) from raw ``aws sns publish`` to the
-# canonical ``alpha_engine_lib.alerts`` primitive (v0.21.0, lib #52).
+# canonical ``nousergon_lib.alerts`` primitive (v0.21.0, lib #52).
 # Skips Telegram on purpose: this is a deliberate deploy smoke test, not
 # a real failure event, and a per-deploy operator ping would be noise.
 # SNS path stays identical (same default topic `alpha-engine-alerts`),
@@ -182,7 +182,7 @@ if [[ "${SMOKE_ARG}" == "--smoke" ]]; then
   # Invoke the alerts CLI via ``krepis.alerts`` (config#1339), matching this
   # repo's own infrastructure/deploy.sh. The alerts module relocated to
   # ``krepis`` (MIT) at nousergon-lib v0.66.0; ``nousergon_lib.alerts`` and
-  # ``alpha_engine_lib.alerts`` are now re-export/alias shims. Running a shim
+  # ``nousergon_lib.alerts`` are now re-export/alias shims. Running a shim
   # under runpy (``python -m <shim>.alerts``) was a SILENT exit-0 no-op on any
   # pin < v0.81.1 — the shim fell off its end before the target's __main__
   # guard fired (the config#1646 incident: a weekly SF reported SUCCESS while

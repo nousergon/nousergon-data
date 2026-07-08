@@ -1,6 +1,6 @@
 """Integration test: data contracts resolve + validate.
 
-Slot schemas (signals/predictions) are served from ``alpha_engine_lib.contracts``
+Slot schemas (signals/predictions) are served from ``nousergon_lib.contracts``
 (SoT since lib v0.59.x, M0 — config#989) via this repo's ``contracts`` package
 delegation; ``executor_params`` stays repo-local. Fixtures are contract-complete
 v1 payloads mirroring what the producers actually emit.
@@ -64,7 +64,7 @@ class TestSchemaResolution:
         for name in ("signals", "predictions"):
             schema = _load_schema(name)
             assert "nousergon.ai/schemas" in schema.get("$id", ""), (
-                f"{name} must be served from alpha_engine_lib.contracts (SoT)"
+                f"{name} must be served from nousergon_lib.contracts (SoT)"
             )
         # the stranded local copies must NOT come back
         for fname in ("signals.schema.json", "predictions.schema.json"):

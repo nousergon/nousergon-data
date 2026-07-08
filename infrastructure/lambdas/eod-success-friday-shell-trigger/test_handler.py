@@ -1,6 +1,6 @@
 """Unit tests for eod-success-friday-shell-trigger index.handler.
 
-Stubs ``alpha_engine_lib.trading_calendar.last_closed_trading_day`` and
+Stubs ``nousergon_lib.trading_calendar.last_closed_trading_day`` and
 ``boto3.client`` so tests do not hit AWS or the lib. Each test asserts the
 handler's invoke-or-skip decision plus the input shape passed to
 ``states:StartExecution``.
@@ -16,15 +16,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Stub `alpha_engine_lib.trading_calendar` before importing the handler so
+# Stub `nousergon_lib.trading_calendar` before importing the handler so
 # test environments without the lib installed (CI runners pre-pip-install)
 # still pass. The handler depends only on this one import path from the lib.
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_tc_mod = types.ModuleType("alpha_engine_lib.trading_calendar")
+_lib_pkg = types.ModuleType("nousergon_lib")
+_tc_mod = types.ModuleType("nousergon_lib.trading_calendar")
 _tc_mod.last_closed_trading_day = MagicMock()
 _lib_pkg.trading_calendar = _tc_mod
-sys.modules.setdefault("alpha_engine_lib", _lib_pkg)
-sys.modules.setdefault("alpha_engine_lib.trading_calendar", _tc_mod)
+sys.modules.setdefault("nousergon_lib", _lib_pkg)
+sys.modules.setdefault("nousergon_lib.trading_calendar", _tc_mod)
 
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402

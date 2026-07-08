@@ -45,5 +45,5 @@ bash infrastructure/lambdas/friday-shell-run-report/deploy.sh --dry-run    # sho
 ```
 
 `trading_day` is parsed from the execution name (`friday-shell-{YYYY-MM-DD}-…`),
-falling back to `alpha_engine_lib.trading_calendar.last_closed_trading_day` on
+falling back to `nousergon_lib.trading_calendar.last_closed_trading_day` on
 `detail.stopDate`.

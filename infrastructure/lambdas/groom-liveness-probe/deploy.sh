@@ -20,10 +20,10 @@
 # Cadence (UTC): two runs/day, each after a groom's worst-case completion
 # (groom hard-ceiling 360 min + slack). Per-trigger windows + S3 dedup make the
 # exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
-#   06:30 daily   cron(30 6 * * ? *)   # after the 23:00 groom matures (~05:45)
-#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45; the
-#                                      #   07:00 groom runs daily since 2026-07-02 —
-#                                      #   the old "Sun-Fri" framing is gone)
+#   06:30 daily   cron(30 6 * * ? *)   # after the 19:00 groom matures (~01:45)
+#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45)
+#                                      #   (the 01:00 Opus run matures ~07:45 —
+#                                      #   also covered by the 14:30 pass)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
 # blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,

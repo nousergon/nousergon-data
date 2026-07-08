@@ -69,8 +69,9 @@ class _FakeEc2:
 
 
 class _FakeSsm:
-    def __init__(self):
+    def __init__(self, parameters=None):
         self.sent = []
+        self.parameters = dict(parameters or {})
 
     def describe_instance_information(self, **kw):
         return {"InstanceInformationList": [{"PingStatus": "Online"}]}
@@ -78,6 +79,11 @@ class _FakeSsm:
     def send_command(self, **kw):
         self.sent.append(kw)
         return {"Command": {"CommandId": "cmd-123"}}
+
+    def get_parameter(self, Name):  # noqa: N803 — boto3 API
+        if Name not in self.parameters:
+            raise RuntimeError(f"Parameter {Name} not found")
+        return {"Parameter": {"Value": self.parameters[Name]}}
 
 
 class _FakeS3Body:
@@ -115,10 +121,10 @@ class _FakeS3:
         return {"Body": _FakeS3Body(self._objects[Key])}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None):
+def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
-    ssm = _FakeSsm()
+    ssm = _FakeSsm(ssm_parameters)
     ec2 = _FakeEc2()
     s3 = _FakeS3(s3_objects)
     clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
@@ -204,12 +210,12 @@ def test_sweep_run_mode_is_forwarded(monkeypatch):
 
 
 def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
-    # The 3rd (Opus, 8am PT) schedule's event carries model + issue_filter —
+    # The Opus (6pm PT) schedule's event carries model + issue_filter —
     # these must reach the box as exported env vars ahead of the bootstrap exec.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
         {"run_mode": "full", "model": "claude-opus-4-8", "issue_filter": "high-only",
-         "schedule": "0 15 * * *"},
+         "schedule": "0 1 * * *"},
         None,
     )
     g = out["groom"]
@@ -228,7 +234,7 @@ def test_high_only_schedule_forwards_pr_budget(monkeypatch):
             "run_mode": "full",
             "model": "claude-opus-4-8",
             "issue_filter": "high-only",
-            "schedule": "0 15 * * *",
+            "schedule": "0 1 * * *",
             "pr_budget": 100,
         },
         None,
@@ -315,6 +321,22 @@ def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
     assert notified == []  # no ping when nothing was skipped
 
 
+def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
+    # Way over pace, but SSM override is active -> still launch.
+    idx = _load(
+        monkeypatch,
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        s3_objects={"claude_code_usage/groom/2026-06-29.json":
+                    _wet_doc(0.9 * 1_140_000_000)},
+        ssm_parameters={"/alpha-engine/groom/dynamic_budget_override_until": "2099-01-01T00:00"},
+    )
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is True
+
+
 def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
                                    "GROOM_PACE_GATE_ENABLED": "false"},
@@ -341,6 +363,23 @@ def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     assert notified == []  # fail-safe path never trips (exceeded=False), no ping
 
 
+def test_gated_reverify_schedule_forwards_filter(monkeypatch):
+    # config#1891 Sunday lane: "gated-reverify" must pass validation — it was
+    # missing from _VALID_ISSUE_FILTERS (PR #681 added only the schedule), so
+    # the weekly lane would have silently run as mid-only.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(
+        {"run_mode": "full", "model": "claude-haiku-4-5",
+         "issue_filter": "gated-reverify", "schedule": "0 9 * * 0"},
+        None,
+    )
+    g = out["groom"]
+    assert g["issue_filter"] == "gated-reverify"
+    assert g["model"] == "claude-haiku-4-5"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_ISSUE_FILTER=gated-reverify" in cmd
+
+
 def test_missing_model_and_issue_filter_default_to_mid_queue(monkeypatch):
     # Schedules with no model/issue_filter must default to Sonnet / mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
@@ -357,7 +396,7 @@ def test_low_only_schedule_forwards_haiku_model_and_filter(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
         {"run_mode": "full", "model": "claude-haiku-4-5", "issue_filter": "low-only",
-         "schedule": "0 7 * * *"},
+         "schedule": "0 19 * * *"},
         None,
     )
     g = out["groom"]
@@ -496,3 +535,164 @@ def test_post_launch_failure_terminates_instance_no_orphan(monkeypatch):
         idx.handler({"run_mode": "full"}, None)
     # The just-launched box was terminated (not orphaned) before the re-raise.
     assert idx._test_ec2.terminated == ["i-orphan"]
+
+
+# ── config#1933: demand-driven dispatch (enumerate-then-decide) ──────────────
+# groom_eligibility is PURE (no boto3), so these tests use the REAL module —
+# the decision math itself is covered in nousergon-lib; here we test the
+# Lambda wiring: skip path, bundle/model override, bypasses, and fail-safe.
+
+
+def _stub_stats(monkeypatch, idx, counts, oldest=None, has_p0=False):
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: (counts, oldest or {}, has_p0))
+    monkeypatch.setattr(idx, "_write_decision_record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
+
+
+def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 3, "mid": 40, "high": 2})
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "low-only", "schedule": "0 19 * * *"}, None)
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "demand_gate_skip"
+    assert not idx._test_ssm.sent  # no box, no SSM command
+
+
+def test_demand_gate_bundles_and_downgrades_model(monkeypatch):
+    # Opus slot, no high issues, starving low+mid -> ONE Sonnet run.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
+    out = idx.handler({"run_mode": "full", "model": "claude-opus-4-8",
+                       "issue_filter": "high-only", "schedule": "0 1 * * *"}, None)
+    g = out["groom"]
+    assert g["launched"] and g["issue_filter"] == "mid+low"
+    assert g["model"] == "claude-sonnet-5"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_ISSUE_FILTER=mid+low" in cmd
+    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+
+
+def test_demand_gate_full_queues_run_own_tier(monkeypatch):
+    # Brian's 8/9/10: the mid slot runs mid-only on Sonnet, nothing bundles.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                       "issue_filter": "mid-only", "schedule": "0 7 * * *"}, None)
+    assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "mid-only"
+
+
+def test_demand_gate_bypassed_for_reverify_force_and_sweep(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    called = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: called.append(1) or ({}, {}, False))
+    # gated-reverify: no tier queue -> gate bypassed, launch proceeds
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "gated-reverify"}, None)
+    assert out["groom"]["launched"]
+    # force_on_demand (relaunch SF final retry): must never be blocked
+    out = idx.handler({"run_mode": "full", "issue_filter": "low-only",
+                       "force_on_demand": True}, None)
+    assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "low-only"
+    # sweep mode untouched
+    out = idx.handler({"run_mode": "sweep"}, None)
+    assert out["groom"]["launched"]
+    assert not called  # enumeration never ran for any bypass
+
+
+def test_demand_gate_fail_safe_launches_legacy_on_enumeration_error(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def boom(token):
+        raise RuntimeError("github down")
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats", boom)
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "low-only"}, None)
+    assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "low-only"
+
+
+def test_demand_gate_kill_switch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_DEMAND_GATE_ENABLED": "false"})
+    called = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: called.append(1) or ({}, {}, False))
+    out = idx.handler({"run_mode": "full", "issue_filter": "low-only"}, None)
+    assert out["groom"]["launched"] and not called
+
+
+# ── config#1933 SYMMETRIC triggers (Brian's ratified correction) ─────────────
+
+
+def _stub_fresh_stats(monkeypatch, idx, counts, oldest=None, p0=()):
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (counts, oldest or {}, list(p0)))
+    monkeypatch.setattr(idx, "_write_trigger_record", lambda *a, **k: None)
+    monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
+
+
+def _demand_event(sched="0 1 * * *"):
+    return {"run_mode": "full", "trigger": "demand-all", "schedule": sched}
+
+
+def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    g = out["groom"]
+    assert g["trigger"] == "demand-all"
+    launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
+    assert launched == {("high-only", "claude-opus-4-8"),
+                        ("mid-only", "claude-sonnet-5"),
+                        ("low-only", "claude-haiku-4-5")}
+    cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
+    assert len(cmds) == 3
+    # only the FIRST box runs PR sweeps
+    assert "GROOM_NO_SWEEP=1" not in cmds[0]
+    assert all("GROOM_NO_SWEEP=1" in c for c in cmds[1:])
+
+
+def test_symmetric_trigger_light_backlog_zero_boxes(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 2, "mid": 3, "high": 1})
+    out = idx.handler(_demand_event("0 7 * * *"), None)
+    assert out["groom"]["launches"] == []
+    assert not idx._test_ssm.sent
+
+
+def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
+    # 5 low + 6 mid + 0 high pooled -> ONE Sonnet box regardless of trigger time.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
+    out = idx.handler(_demand_event(), None)
+    ls = out["groom"]["launches"]
+    assert len(ls) == 1 and ls[0]["issue_filter"] == "mid+low"
+    assert ls[0]["model"] == "claude-sonnet-5"
+
+
+def test_symmetric_trigger_fail_safe_to_legacy(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def boom(token):
+        raise RuntimeError("github down")
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh", boom)
+    # legacy path also needs stubbing past the per-slot gate
+    monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["launched"]  # legacy unconditional launch
+
+
+def test_non_demand_events_keep_legacy_behavior(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    called = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: called.append(1) or ({}, {}, []))
+    monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "gated-reverify"}, None)
+    assert out["groom"]["launched"] and not called

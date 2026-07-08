@@ -80,6 +80,8 @@ _CFN_PATH = (
 # targeted operator skips) — this constant + test_skip_gates_still_intact
 # enforce that none were deleted.
 _EXPECTED_SKIPS = {
+    # config#1824: scheduled-weekly run-day gate operator bypass.
+    "skip_weekly_run_day_gate",
     # Added 2026-06-08 (L4517 — preventive cross-repo lib-pin drift gate,
     # the first state after InitializeInput).
     "skip_lib_pin_drift_check",
@@ -414,7 +416,9 @@ class TestStrictSuperset:
         # so the mutex→CheckShellRun superset property below is unchanged.
         # config#830: CheckRunMode (cadence preset) precedes the lib-pin gate;
         # its Default → CheckSkipLibPinDriftCheck, so the superset chain holds.
-        assert states["InitializeInput"]["Next"] == "CheckRunMode"
+        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
+        assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
         assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass path must route to CheckShellRun so the shell-run "
@@ -988,12 +992,21 @@ class TestHappyPathTraversal:
         # config#830: CheckRunMode (cadence preset) sits between InitializeInput
         # and the lib-pin gate; with no `mode` on the input it takes its Default
         # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
+        # config#1824: the run-day gate is the first hop; a role-less input
+        # takes its Default straight to CheckRunMode — one extra Choice.
+        # config#693 (L4595): the pipeline-contract preflight gate is now
+        # composed directly after LibPinDriftGate's pass-through (no drift ->
+        # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
+        # violation) — two extra states in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            "CheckWeeklyRunDayGate",
             "CheckRunMode",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",
+            "PipelineContractCheck",
+            "PipelineContractGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",

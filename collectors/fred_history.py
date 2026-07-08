@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 from typing import Optional
 
 import boto3

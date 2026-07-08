@@ -5,7 +5,7 @@
 Several Lambda handler unit tests run in a *hermetic* interpreter — the
 pre-deploy gate in each ``deploy.sh`` runs ``pytest`` on **bare python + boto3**
 and deliberately does NOT install the git-only ``nousergon_lib`` /
-``alpha_engine_lib`` packages the handler imports at module scope. Those imports
+``nousergon_lib`` packages the handler imports at module scope. Those imports
 are satisfied by a hand-written ``sys.modules`` stub block at the top of the
 test file, which MUST be kept in lockstep with ``index.py``'s (transitive)
 module-level import graph.
