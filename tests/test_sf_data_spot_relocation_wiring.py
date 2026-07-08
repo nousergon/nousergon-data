@@ -318,8 +318,28 @@ class TestEODFailureIsolation:
 # ══════════════════════════════════════════════════════════════════════════
 class TestDispatcherLambdaAndIam:
     def test_dispatcher_package_present(self):
-        for f in ("index.py", "iam-policy.json", "sf-execution-iam-policy.json", "requirements.txt"):
+        # deploy.sh is load-bearing, NOT optional: like every sibling dispatcher
+        # (scheduled-groom-dispatcher, spot-orphan-reaper), the function is
+        # operator-deployed OUTSIDE CloudFormation, so a runnable deploy script
+        # IS the deployment mechanism. #643 (config#1767 Phase 2) shipped this
+        # dispatcher's source + IAM + SF wiring but NO deploy.sh, so step 1 of
+        # the README rollout ("create the Lambda + role") had no tooling and was
+        # skipped — the live function was never created and the 2026-07-08 EOD
+        # LaunchPostMarketDataSpot got a 404 ResourceNotFoundException. This guard
+        # fails loud so a data-spot dispatcher can never again merge un-deployable.
+        for f in ("index.py", "iam-policy.json", "sf-execution-iam-policy.json",
+                  "requirements.txt", "deploy.sh"):
             assert (_DISPATCHER / f).exists(), f"data-spot-dispatcher/{f} missing"
+
+    def test_dispatcher_deploy_sh_creates_the_function(self):
+        # A deploy.sh that exists but doesn't actually create the Lambda would
+        # re-open the same gap. Pin the two commands that make it a real,
+        # first-time-capable deployer for THIS function.
+        deploy = (_DISPATCHER / "deploy.sh").read_text()
+        assert "alpha-engine-data-spot-dispatcher" in deploy, \
+            "deploy.sh must target the alpha-engine-data-spot-dispatcher function"
+        assert "aws lambda create-function" in deploy, \
+            "deploy.sh must be able to CREATE the function (first-time bootstrap), not only update it"
 
     def test_workload_map_preserves_collector_contract(self):
         # M0 contract: the spot workloads run the SAME weekly_collector.py entry
