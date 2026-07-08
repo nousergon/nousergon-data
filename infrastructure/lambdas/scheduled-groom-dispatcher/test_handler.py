@@ -293,7 +293,7 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     # 1 day into the window (elapsed_frac ~= 1/7 ~= 0.143): 50% of the weekly
     # ceiling already consumed is way ahead of pace -> skip BEFORE any launch.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-06.json":
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.5 * 1_140_000_000)})
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
@@ -324,7 +324,7 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
 def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
     # 50% elapsed, only 10% of the ceiling used -> well under pace -> launches.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-08.json":
+                s3_objects={"claude_code_usage/groom/2026-07-15.json":
                             _wet_doc(0.1 * 1_140_000_000)})
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
@@ -341,7 +341,7 @@ def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
     idx = _load(
         monkeypatch,
         env={"GROOM_DISPATCH_ENABLED": "true"},
-        s3_objects={"claude_code_usage/groom/2026-07-06.json":
+        s3_objects={"claude_code_usage/groom/2026-07-13.json":
                     _wet_doc(0.9 * 1_140_000_000)},
         ssm_parameters={"/alpha-engine/groom/dynamic_budget_override_until": "2099-01-01T00:00"},
     )
@@ -355,7 +355,7 @@ def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
 def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
                                    "GROOM_PACE_GATE_ENABLED": "false"},
-                s3_objects={"claude_code_usage/groom/2026-07-06.json":
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.99 * 1_140_000_000)})
     fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
     monkeypatch.setattr(idx, "datetime", type("D", (), {
