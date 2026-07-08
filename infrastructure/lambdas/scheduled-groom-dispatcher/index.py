@@ -114,7 +114,7 @@ WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "850000000")
 _PT = ZoneInfo("America/Los_Angeles")
 # MUST match groom_budget.py's WEEKLY_RESET_ANCHOR/WEEKLY_PERIOD exactly — both
 # derive the SAME reset-aligned window from one observed reset instant.
-WEEKLY_RESET_ANCHOR = datetime(2026, 7, 5, 21, 0)   # PT, naive — Sunday 9pm PT
+WEEKLY_RESET_ANCHOR = datetime(2026, 7, 12, 21, 0)   # PT, naive — Sunday 9pm PT
 WEEKLY_PERIOD = timedelta(days=7)
 CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
 CCUSAGE_PREFIX = "claude_code_usage/"
