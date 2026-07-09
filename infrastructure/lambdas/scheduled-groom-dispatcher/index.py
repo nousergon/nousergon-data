@@ -754,14 +754,24 @@ def _demand_decision(issue_filter: str, schedule_label: str):
 
 
 def _load_recent_engagements() -> dict:
-    """(repo, number) -> engagement horizon epoch from the last 3 days' S3 run
-    artifacts (same schema the driver's config#1893 fresh-skip reads).
-    Fail-safe {} — a read error only means counting a few extra issues."""
+    """(repo, number) -> engagement horizon epoch from the last
+    ``ge.ENGAGEMENT_LOOKBACK_DAYS`` days' S3 run artifacts (same schema the
+    driver's config#1893 fresh-skip reads).
+    Fail-safe {} — a read error only means counting a few extra issues.
+
+    config#2038: the lookback (was a hardcoded ``range(3)``) and the engaged-
+    disposition set (was a hardcoded tuple literal) had silently drifted from
+    groom_driver.py's own constants (4-day lookback, same 4 dispositions) —
+    this module already imports ``nousergon_lib.groom_eligibility`` as the
+    declared single source of truth for exactly this class of drift; the two
+    values just weren't pulled from it yet. Read them from ``ge`` so they
+    can't re-drift.
+    """
     out: dict = {}
     try:
         s3 = boto3.client("s3", region_name=REGION)
         now = datetime.now(ZoneInfo("UTC"))
-        for d in range(3):
+        for d in range(ge.ENGAGEMENT_LOOKBACK_DAYS):
             date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
             resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
             for obj in resp.get("Contents", []) or []:
@@ -774,7 +784,7 @@ def _load_recent_engagements() -> dict:
                 horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
                            + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
                 for rec in art.get("issues", []):
-                    if rec.get("disposition") in ("closed", "pr_opened", "commented", "labeled"):
+                    if rec.get("disposition") in ge.ENGAGED_DISPOSITIONS:
                         k = (rec.get("repo", ""), rec.get("number"))
                         out[k] = max(out.get(k, 0.0), horizon)
     except Exception as exc:  # noqa: BLE001

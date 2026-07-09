@@ -13,6 +13,7 @@ surface the miss).
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import types
@@ -130,6 +131,12 @@ class _FakeS3:
     def get_paginator(self, name):
         assert name == "list_objects_v2"
         return _FakeS3Paginator(self._objects)
+
+    def list_objects_v2(self, Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        # config#2038: _load_recent_engagements calls this directly (no
+        # paginator) — single-page return is sufficient for these tests.
+        keys = [k for k in self._objects if k.startswith(Prefix)]
+        return {"Contents": [{"Key": k} for k in keys]}
 
     def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
         return {"Body": _FakeS3Body(self._objects[Key])}
@@ -769,3 +776,51 @@ def test_non_demand_events_keep_legacy_behavior(monkeypatch):
     out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
                        "issue_filter": "gated-reverify"}, None)
     assert out["groom"]["launched"] and not called
+
+
+# ── config#2038: engagement lookback + disposition set must come from the lib ──
+
+
+def test_load_recent_engagements_uses_lib_lookback_window(monkeypatch):
+    """A run artifact just inside ge.ENGAGEMENT_LOOKBACK_DAYS ago must be
+    picked up — this would be dropped by the old hardcoded range(3) whenever
+    the lib's lookback is > 3 (config#2038's actual drift: 4 vs 3)."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import nousergon_lib.groom_eligibility as ge
+
+    now = datetime.now(ZoneInfo("UTC"))
+    farthest = now - timedelta(days=ge.ENGAGEMENT_LOOKBACK_DAYS - 1)
+    art = json.dumps({
+        "run_start": farthest.isoformat().replace("+00:00", "Z"),
+        "elapsed_min": 5,
+        "issues": [{"repo": "nousergon/alpha-engine-config", "number": 999,
+                    "disposition": "commented"}],
+    }).encode()
+    key = f"groom/{farthest.strftime('%Y-%m-%d')}/run1.json"
+    idx = _load(monkeypatch, s3_objects={key: art})
+    engagements = idx._load_recent_engagements()
+    assert ("nousergon/alpha-engine-config", 999) in engagements
+
+
+def test_load_recent_engagements_uses_lib_engaged_dispositions(monkeypatch):
+    """A "labeled" disposition (config#1928/#1890 — label-only edits are the
+    NORM for blocked dispositions) must count as engaged — this comes from
+    ge.ENGAGED_DISPOSITIONS, not a local hardcoded tuple that could drift."""
+    from datetime import datetime, timezone
+
+    import nousergon_lib.groom_eligibility as ge
+
+    assert "labeled" in ge.ENGAGED_DISPOSITIONS
+    now = datetime.now(timezone.utc)
+    art = json.dumps({
+        "run_start": now.isoformat().replace("+00:00", "Z"),
+        "elapsed_min": 5,
+        "issues": [{"repo": "nousergon/alpha-engine-config", "number": 998,
+                    "disposition": "labeled"}],
+    }).encode()
+    key = f"groom/{now.strftime('%Y-%m-%d')}/run1.json"
+    idx = _load(monkeypatch, s3_objects={key: art})
+    engagements = idx._load_recent_engagements()
+    assert ("nousergon/alpha-engine-config", 998) in engagements
