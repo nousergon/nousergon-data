@@ -38,10 +38,11 @@ def _body(obj: dict) -> dict:
 
 # ── Fundamentals v2: P/B + P/S are published ─────────────────────────────────
 
-def test_fundamentals_schema_v4_includes_multiples_balance_sheet_and_eps():
-    assert mmd.FUNDAMENTALS_SCHEMA_VERSION == 4
+def test_fundamentals_schema_v5_includes_multiples_balance_sheet_eps_and_valuation_inputs():
+    assert mmd.FUNDAMENTALS_SCHEMA_VERSION == 5
     for k in ("priceToBook", "priceToSalesTrailing12Months", "totalDebt", "totalCash",
-              "ebitda", "freeCashflow", "trailingEps", "forwardEps"):
+              "ebitda", "freeCashflow", "trailingEps", "forwardEps",
+              "bookValue", "revenuePerShare", "enterpriseValue"):
         assert k in mmd.FUNDAMENTALS_INFO_KEYS
 
     s3 = MagicMock()
@@ -53,7 +54,7 @@ def test_fundamentals_schema_v4_includes_multiples_balance_sheet_and_eps():
 
     assert result["status"] == "ok"
     art = _puts(s3)[f"{mmd.FUNDAMENTALS_PREFIX}latest.json"]
-    assert art["schema_version"] == 4
+    assert art["schema_version"] == 5
     aapl = art["fundamentals"]["AAPL"]
     assert aapl["priceToBook"] == 6.0 and aapl["priceToSalesTrailing12Months"] == 7.5
     assert aapl["totalDebt"] == 1.1e11 and aapl["totalCash"] == 6.0e10 and aapl["ebitda"] == 1.3e11
