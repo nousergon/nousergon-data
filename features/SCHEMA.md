@@ -271,7 +271,14 @@ Before opening a PR that adds a column to `compute_features`:
 5. If the field has a NEW consumer (e.g., backtester reads it for
    parity), add the consumer to §2 AND add a consumer-contract test in
    the consuming repo that pins the expected units.
-6. `pytest tests/test_schema_contract.py` must pass.
+6. **Name the universe-library restate step in the PR body** per the
+   column-add rollout contract in §6 — widening `FEATURES` does NOT
+   migrate the ~900 existing static-schema ArcticDB symbols on its own,
+   so the PR that widens the schema must also schedule the full-history
+   restate that lays down the new descriptor. Omitting it breaks the
+   next `daily_append` per-ticker (config#2006).
+7. `pytest tests/test_schema_contract.py
+   tests/test_daily_append_schema_evolution_2006.py` must pass.
 
 ### 4b. PR checklist for a NEW private-pack column (alpha-engine-config#1032)
 
@@ -306,3 +313,50 @@ Before landing a new alpha-bearing column through the private pack:
 | 2026-05-26 | C.1 of optimizer-sota-upgrades-260526 — 8 factor-loading `*_zscore` columns added (cross-sectional ±3σ-winsorized z-scores) as substrate for the executor's Σ = B·F·Bᵀ + D risk decomposition. |
 | 2026-07-01 | alpha-engine-config#1032 (private-edge divergence policy, config#1031) — private feature-pack loading mechanism (`features/private_pack.py`) + `compute=PRIVATE_PACK_COMPUTE` schema-contract sentinel (§3b) shipped. No alpha-bearing column has landed through it yet; only the throwaway fixture in `tests/fixtures/dummy_private_pack.py` exercises the mechanism. |
 | 2026-07-08 | alpha-engine-config#939 — 3 of the 7 originally-listed feature gaps shipped (the other 4 had already landed): `vwap_divergence_pct` (VWAP divergence), `cmf_20_ratio` (Chaikin Money Flow — buying/selling pressure, chosen over MFI-14 / Chaikin A/D for its bounded range and fewest edge cases), `hy_oas_credit_spread_pct` (credit spreads, FRED `BAMLH0A0HYM2` / `HYOAS`, deliberately named distinct from crucible-predictor's separate regime-substrate `hy_oas_level`). All 3 computed from already-ingested data; no new data source. |
+| 2026-07-08 | config#2006 — the config#939 widening (92→95 cols) shipped with no restate for the existing static-schema universe symbols; the first live `daily_append` failed per-ticker with `StreamDescriptorMismatch`. Fix: full-history restate + the §6 column-add rollout contract + the `test_daily_append_schema_evolution_2006.py` CI tripwire that reproduces the failure against a real old-schema library and pins the restate recovery. |
+
+---
+
+## 6. Column-add rollout contract (config#2006) — STANDING DIRECTIVE
+
+The universe ArcticDB library is **static-schema**: a symbol's column set
+is frozen at write time, and an `update_batch` / `write` whose descriptor
+adds a column is rejected with `StreamDescriptorMismatch` until that
+symbol is rewritten at the new schema. `to_arctic_canonical`
+(`store/arctic_store.py`) makes a `FEATURES` widening a safe *additive
+column-ORDER* change at the write chokepoint, **but it does not migrate
+already-stored symbols** — the ~900 existing universe symbols keep their
+old descriptor until a full-history rewrite lands the new one.
+
+**Contract (option A — chosen, the default going forward):** every PR
+that widens `features/feature_engineer.py::FEATURES` (or otherwise changes
+the persisted universe column set) MUST, in the same PR body, name the
+scheduled **full-history restate** that migrates the existing library to
+the new schema, and that restate MUST run before the next `daily_append`
+against the affected library. The restate is the existing
+`builders/backfill.py` full-symbol rewrite (it recomputes features and
+`write_batch`es full history — establishing the new descriptor);
+`builders/migrate_universe_crsp_basis.py` is the precedent for a scoped
+one-off universe migration. Run it on a data-spot box
+(`infrastructure/spot_data_weekly.sh` pattern), never multi-hour compute
+on the trading box.
+
+**Why not option B (`dynamic_schema=True`):** flipping the universe
+library to dynamic schema would make column additions absorb without a
+restate, but it is a **deliberate, non-casual** change — it alters
+read-path performance and type-inference behaviour across every consumer
+(predictor training + inference read the full panel), and would need its
+own shadow-read parity gate + benchmark before cutover. It is recorded
+here as the explicit alternative, NOT the current contract; do not flip it
+as a shortcut to skip a restate.
+
+**Enforcement.** `tests/test_daily_append_schema_evolution_2006.py` is the
+CI tripwire for the bug class: it reproduces the mismatch against a real
+old-schema LMDB library through the real `to_arctic_canonical` →
+`update_batch` path, asserts the failure is SURFACED (per-symbol
+`DataError` → `n_err`, never a silent success or silent column-drop), and
+pins that a full-history restate is what makes the append green again. A
+future change that routes universe appends through a schema-narrowing
+helper (dropping the new column to force a false-green write) turns that
+test red — that silent-partial-coverage regression is precisely what the
+contract forbids.
