@@ -48,6 +48,32 @@ and is never logged.
 4. Flip the flag:
    `aws lambda update-function-configuration --function-name alpha-engine-saturday-sf-watch-dispatcher --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=true}' --query LastUpdateStatus --output text`.
 
+## Dispatch suppression (config#2003)
+
+Two carve-outs stop a **second** agent from being dispatched for an incident
+already being handled. Both still write the watch-log event AND send the
+(SILENT) Telegram receipt — `mode: DISPATCH SUPPRESSED` — recording the
+decision in `dispatch_suppressed` (never a silent skip); only the
+`repository_dispatch` call itself is withheld.
+
+1. **Operator-recovery reruns.** An execution named after the watch's own
+   recommended recovery-rerun convention (`watch-rerun-<date>-<n>`) or this
+   Lambda's own fast-path rerun (`fast-path-rerun-<date>-<hms>`) is a recovery
+   attempt already in progress, not a fresh incident. Prefix-matched via
+   `RECOVERY_RERUN_NAME_PREFIXES` in `index.py`.
+   (Observed 2026-07-08, EOD incident config#1446/#1464: the watch escalated
+   the original failure, then dispatched two MORE agents for the operator's
+   own `watch-rerun-2026-07-08-1`/`-2` recovery reruns — the naming
+   convention the watch itself recommended.)
+2. **Same-day post-escalation repeats.** Once this pipeline's watch-log for
+   today already has an `action: escalated` event (human-gated, e.g. IAM), a
+   subsequent failure of the same pipeline that day suppresses by default —
+   the human is already engaged. Kill-switch:
+   `EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true` restores the old
+   dispatch-every-failure behavior.
+
+Neither carve-out suppresses the **first** failure of a pipeline/day.
+
 ## Why it's not a second notifier
 
 `alpha-engine-sf-telegram-notifier` already covers generic SF notification

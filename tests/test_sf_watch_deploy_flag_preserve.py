@@ -1,10 +1,24 @@
-"""config#1818 — the sf-watch dispatcher deploy script must preserve the
-operator-owned AGENT_DISPATCH_ENABLED flag across redeploys.
+"""config#1818 — the sf-watch dispatcher deploy script must preserve
+operator-owned runtime flags across redeploys.
 
 2026-07-05: the update path hardcoded false; a routine redeploy silently
 disarmed autonomous dispatch, and both 2026-07-06 preopen SF failures went
-un-dispatched (dispatched=False) with the market open.
+un-dispatched (dispatched=False) with the market open. config#2003 adds a
+second operator-owned flag (EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION) subject
+to the exact same class of bug — pinned here too so it can't silently repeat.
 """
+
+from pathlib import Path
+
+import pytest
+
+
+def _deploy_src() -> str:
+    return (
+        Path(__file__).parent.parent
+        / "infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh"
+    ).read_text()
+
 
 def test_deploy_update_path_preserves_operator_dispatch_flag():
     """config#1818: AGENT_DISPATCH_ENABLED is operator-owned — the deploy
@@ -13,11 +27,7 @@ def test_deploy_update_path_preserves_operator_dispatch_flag():
     update path silently disarmed autonomous dispatch during a routine
     redeploy; both 2026-07-06 preopen failures went un-dispatched with the
     market open."""
-    from pathlib import Path
-    src = (
-        Path(__file__).parent.parent
-        / "infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh"
-    ).read_text()
+    src = _deploy_src()
     # The update path reads the current live value...
     assert "CURRENT_DISPATCH=$(aws lambda get-function-configuration" in src
     assert "AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH}" in src
@@ -30,3 +40,29 @@ def test_deploy_update_path_preserves_operator_dispatch_flag():
     false_pos = src.index("AGENT_DISPATCH_ENABLED=false")
     update_pos = src.index("Updating Lambda environment")
     assert false_pos < update_pos, "hardcoded false may only exist pre-update (bootstrap)"
+
+
+@pytest.mark.parametrize(
+    "flag_name,var_name",
+    [
+        ("FAST_PATH_ENABLED", "CURRENT_FAST_PATH"),
+        ("EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION", "CURRENT_DISPATCH_AFTER_ESCALATION"),
+    ],
+)
+def test_deploy_update_path_preserves_other_operator_flags(flag_name, var_name):
+    """The config#1818 lesson generalizes: EVERY operator-owned runtime flag
+    in this Lambda (FAST_PATH_ENABLED, config#1900; and
+    EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION, config#2003) must be read from the
+    live function configuration and carried through the UPDATE path's single
+    `update-function-configuration --environment` call — never hardcoded —
+    because that call REPLACES the entire Variables map."""
+    src = _deploy_src()
+    assert f"{var_name}=$(aws lambda get-function-configuration" in src
+    assert f"{flag_name}=${{{var_name}}}" in src
+    # exactly one hardcoded false: the create-function bootstrap default.
+    assert src.count(f"{flag_name}=false") == 1
+    false_pos = src.index(f"{flag_name}=false")
+    update_pos = src.index("Updating Lambda environment")
+    assert false_pos < update_pos, (
+        f"hardcoded {flag_name}=false may only exist pre-update (bootstrap)"
+    )

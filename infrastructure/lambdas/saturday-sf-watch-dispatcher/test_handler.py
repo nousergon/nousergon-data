@@ -676,7 +676,11 @@ def test_fast_path_vetoed_when_order_state_ran(fast_path_on):
 
 
 def test_fast_path_skipped_on_prior_attempt(fast_path_on):
-    existing = {"schema_version": 1, "events": [{"agent_attempt": 1, "action": "escalated"}]}
+    # action="dispatched" (not "escalated") isolates this from the config#2003
+    # already-escalated-today suppression (see
+    # test_fast_path_skipped_when_already_escalated_today below) — this test
+    # pins the ORIGINAL prior-attempt-budget reason specifically.
+    existing = {"schema_version": 1, "events": [{"agent_attempt": 1, "action": "dispatched"}]}
     factory, sf, s3 = _fast_path_clients(existing=existing)
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", WEEKDAY_ARN), None)
@@ -764,3 +768,249 @@ def test_fast_path_preflight_excluded(fast_path_on):
 
     sf.start_execution.assert_not_called()
     assert result["fast_path"]["reason"] == "preflight"
+
+
+# ── config#2003: suppress agent dispatch for operator-recovery reruns and ───
+# ── post-escalation same-day repeats ─────────────────────────────────────────
+#
+# Observed 2026-07-08 (EOD incident, config#1446/#1464): the watch correctly
+# escalated the original eod-2026-07-08-* failure as human-gated (IAM), then
+# dispatched TWO MORE agent runs for the operator's own recovery reruns
+# `watch-rerun-2026-07-08-1`/`-2` — duplicating a recovery already in
+# progress. Both carve-outs below still write the watch-log + Telegram
+# receipt (observability stays); only the agent repository_dispatch is
+# suppressed.
+
+
+def test_watch_rerun_named_execution_suppresses_dispatch_but_still_records(monkeypatch):
+    """(a) An execution named after the watch's OWN recommended recovery-rerun
+    convention (`watch-rerun-<date>-<n>`) must NOT summon a second agent, but
+    the watch-log event AND the Telegram receipt still fire (unlike the
+    silent config#1827 operator-abort path — the operator needs confirmation
+    the watch recognized their recovery attempt, not silence)."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-1"), None
+        )
+
+    # No repository_dispatch HTTP call — the agent spin-up is suppressed.
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "operator_recovery_rerun",
+    }
+    assert result["action"] == "observe"
+    assert fired["called"] is False
+
+    # Watch-log STILL written (fail-loud) and carries the auditable reason.
+    s3.put_object.assert_called_once()
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["execution_name"] == "watch-rerun-2026-07-08-1"
+    assert ev["dispatch_suppressed"] == "operator_recovery_rerun"
+    assert ev["action"] == "observe"
+
+    # Telegram receipt STILL fires — observability stays, only dispatch is
+    # suppressed (distinct from the SILENT operator-abort path).
+    assert result["telegram_sent"] is True
+    index.notify_via_flow_doctor.assert_called_once()
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "DISPATCH SUPPRESSED" in text
+    assert "watch-rerun-2026-07-08-1" in text
+
+
+def test_second_watch_rerun_same_day_also_suppressed(monkeypatch):
+    """The exact 2026-07-08 incident shape: TWO operator recovery reruns the
+    same day both suppress — the second rerun attempt must not dispatch
+    either, regardless of how many prior events already exist."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    existing = {
+        "schema_version": 1,
+        "events": [
+            {"action": "escalated", "execution_name": "eod-2026-07-08-1"},
+            {
+                "action": "observe",
+                "execution_name": "watch-rerun-2026-07-08-1",
+                "dispatch_suppressed": "operator_recovery_rerun",
+            },
+        ],
+    }
+    factory, _, s3 = _make_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-2"), None
+        )
+
+    assert result["agent_dispatch"]["dispatched"] is False
+    assert result["agent_dispatch"]["reason"] in {
+        "operator_recovery_rerun", "already_escalated_today",
+    }
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] in {
+        "operator_recovery_rerun", "already_escalated_today",
+    }
+
+
+def test_fast_path_named_rerun_execution_also_suppresses_dispatch(monkeypatch):
+    """This Lambda's OWN fast-path-rerun-* naming (config#1900) is included in
+    the recovery-rerun prefix allowlist — a fast-path rerun that itself later
+    fails must not summon an agent either (it's already a recovery attempt)."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+    monkeypatch.setattr(
+        index.urllib.request, "urlopen",
+        lambda req, timeout=None: (fired.__setitem__("called", True), _FakeResp())[1],
+    )
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=WEEKDAY_ARN, name="fast-path-rerun-2026-07-08-093000"), None
+        )
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "operator_recovery_rerun",
+    }
+    assert fired["called"] is False
+
+
+def test_name_merely_containing_rerun_still_dispatches(monkeypatch):
+    """Over-suppression guard: an execution name that merely CONTAINS "rerun"
+    but does NOT match a documented prefix (e.g. a user-chosen name) is a
+    genuine new incident and must still dispatch — the allowlist is a prefix
+    match, not a substring heuristic."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="manual-eod-rerun-attempt"), None
+        )
+    assert result["agent_dispatch"]["dispatched"] is True
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+def test_second_failure_after_escalation_suppresses_dispatch_by_default(monkeypatch):
+    """(b) Same-day same-pipeline dedup for ESCALATED incidents: once today's
+    watch-log for this pipeline already has an `action: escalated` event
+    (human-gated, e.g. IAM), a SECOND failure of the SAME pipeline that day —
+    even with an ordinary execution name, not just a watch-rerun-* name —
+    gets watch-log + Telegram but NO agent dispatch by default."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    existing = {
+        "schema_version": 1,
+        "events": [
+            {
+                "action": "escalated",
+                "execution_name": "eod-2026-07-08-1",
+                "cause": "IAM: put-role-policy requires human approval",
+            }
+        ],
+    }
+    factory, _, s3 = _make_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="eod-2026-07-08-2"), None
+        )
+
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "already_escalated_today",
+    }
+    assert fired["called"] is False
+
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert len(written["events"]) == 2  # accumulated, not overwritten
+    ev = written["events"][-1]
+    assert ev["execution_name"] == "eod-2026-07-08-2"
+    assert ev["dispatch_suppressed"] == "already_escalated_today"
+
+    # Telegram receipt STILL fires (observability stays).
+    assert result["telegram_sent"] is True
+    index.notify_via_flow_doctor.assert_called_once()
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "DISPATCH SUPPRESSED" in text
+
+
+def test_escalation_kill_switch_restores_dispatch_when_set(monkeypatch):
+    """EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true opts back into the OLD
+    ask-forgiveness behavior: a second same-day failure dispatches normally
+    even after an escalated event, when the operator has explicitly set the
+    env override."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    existing = {
+        "schema_version": 1,
+        "events": [{"action": "escalated", "execution_name": "eod-2026-07-08-1"}],
+    }
+    factory, _, s3 = _make_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="eod-2026-07-08-2"), None
+        )
+    assert result["agent_dispatch"]["dispatched"] is True
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+def test_first_failure_of_pipeline_day_still_dispatches_normally(monkeypatch):
+    """Regression guard: neither config#2003 carve-out fires for the FIRST
+    failure of a pipeline/day with an ordinary execution name and an empty
+    watch-log — the issue explicitly requires the first failure is never
+    suppressed, only post-escalation repeats and operator-recovery-named
+    executions."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients()  # existing=None → empty watch-log, first failure
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="eod-2026-07-08-1"), None
+        )
+
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert len(written["events"]) == 1
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+def test_already_escalated_check_is_scoped_to_this_pipelines_watch_log(monkeypatch):
+    """The escalation check reads ONLY this pipeline's own watch-log doc (keyed
+    by cadence watch_prefix) — an escalated event for a DIFFERENT pipeline
+    (e.g. Saturday) must never suppress an EOD failure; each pipeline's log is
+    a separate S3 key, so this is really pinning that the dedup key stays
+    pipeline+date scoped, not global."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    # EOD's OWN watch-log is empty (no escalated event for EOD today) — the
+    # mock only ever returns one doc regardless of key, which is exactly the
+    # scoping this test relies on: an empty existing doc for the pipeline
+    # under test must never inherit an escalation from anywhere else.
+    factory, _, s3 = _make_clients(existing=None)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="eod-2026-07-08-1"), None
+        )
+    assert result["agent_dispatch"]["dispatched"] is True
