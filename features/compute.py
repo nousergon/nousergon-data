@@ -953,7 +953,7 @@ def compute_and_write(
         )
 
         # Metron-held/watchlisted tickers outside the S&P500+400 universe above
-        # (metron-ops#164) — a SEPARATE, additive snapshot crucible-research's
+        # (metron-ops#177) — a SEPARATE, additive snapshot crucible-research's
         # factor_scoring.py optionally reads for Attractiveness coverage. Runs
         # strictly AFTER the core snapshot write above, and is swallowed
         # (logged WARNING, not raised): (a) failure mode swallowed is a fetch/

@@ -1,5 +1,5 @@
 """features/metron_supplemental.py — Metron-held/watchlisted tickers outside the
-S&P500+400 factor-scoring universe (metron-ops#164). Covers: the uncovered-ticker
+S&P500+400 factor-scoring universe (metron-ops#177). Covers: the uncovered-ticker
 diff, the per-ticker compute loop (skip on missing OHLCV / insufficient history /
 compute error, sector-ETF resolution via the Yahoo->GICS bridge), and the
 supplemental snapshot writer (parquet split + sectors sidecar, empty no-op)."""

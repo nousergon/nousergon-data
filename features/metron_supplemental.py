@@ -1,6 +1,6 @@
 """features/metron_supplemental.py — supplemental factor-scoring inputs for
 Metron-held/watchlisted tickers outside the S&P500+400 factor-scoring universe
-(metron-ops#164).
+(metron-ops#177).
 
 crucible-research's weekly Attractiveness pipeline (``scoring/factor_scoring.py``)
 only scores tickers present in ``features/{date}/technical.parquet`` /
