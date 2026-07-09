@@ -76,7 +76,17 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     "collectors/alternative.py": 3,
-    "collectors/constituents.py": 2,
+    # data/sub_industry_map.json + reference/price_cache/sub_industry_map.json
+    # (config#934 narrow slice, 2026-07-09): additive GICS sub-industry capture
+    # alongside the existing sector_map.json dual-write (1 new put_object call
+    # site, textually — it writes both paths in a loop). No consumer exists yet
+    # (nothing downstream reads it — the cross-repo sub-sector-benchmark/
+    # crucible-predictor feature-wiring scope is unstarted, still gated on
+    # design Brian hasn't ruled on). No periodic freshness SLA to monitor until
+    # a consumer exists, so grandfathered out of ARTIFACT_REGISTRY.yaml (see
+    # alpha-engine-config private-docs/ARTIFACT_REGISTRY.yaml grandfathered_paths)
+    # rather than registered with a speculative cadence/SLA.
+    "collectors/constituents.py": 3,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering
