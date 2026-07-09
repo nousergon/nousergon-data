@@ -113,6 +113,9 @@ FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
 # need — cash balance, debt balance, net debt, and net-debt/EBITDA leverage.
 # v4 (metron-ops#163): added trailingEps/forwardEps so the Holdings Valuation band can
 # show raw EPS alongside P/E, not just the ratio.
+# v5 (metron-ops#178): added bookValue/revenuePerShare/enterpriseValue — every Valuation
+# multiple now has its raw input(s) in the same band (P/B -> book value/share, P/S ->
+# revenue/share, EV/EBITDA -> enterprise value).
 FUNDAMENTALS_INFO_KEYS = [
     "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
     "priceToBook", "priceToSalesTrailing12Months",
@@ -121,6 +124,7 @@ FUNDAMENTALS_INFO_KEYS = [
     "totalDebt", "totalCash", "ebitda", "freeCashflow",
     "beta", "dividendYield", "marketCap", "sector", "industry",
     "trailingEps", "forwardEps",
+    "bookValue", "revenuePerShare", "enterpriseValue",
 ]
 # Technicals — per-held-symbol indicators computed from the close_history this module
 # already publishes daily (zero new fetches). Slow-moving (RSI14 / 50d-200d MA / 52w
@@ -174,7 +178,7 @@ FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
-FUNDAMENTALS_SCHEMA_VERSION = 4  # v4: + trailingEps/forwardEps (metron-ops#163)
+FUNDAMENTALS_SCHEMA_VERSION = 5  # v5: + bookValue/revenuePerShare/enterpriseValue (metron-ops#178)
 INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
 TECHNICALS_SCHEMA_VERSION = 2  # v2: + pct_from_52wk_high (tearsheet parity with Holdings)
 SECURITY_PERFORMANCE_SCHEMA_VERSION = 1
