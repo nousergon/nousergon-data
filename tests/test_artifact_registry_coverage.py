@@ -63,7 +63,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/_price_cache_writeboth.py": 1,
-    "builders/daily_append.py": 2,  # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents, config#1150)
+    # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
+    # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
+    # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
+    # an ORDINARY S3 ArtifactSpec in ARTIFACT_REGISTRY.yaml, no changes to
+    # nousergon_lib.artifact_freshness or its probe machinery).
+    "builders/daily_append.py": 3,
     # builders/migrate_universe_crsp_basis_audit/{ts}.json — the per-ticker CRSP
     # reconciliation REPORT (corporate-actions PR7-7a, config#1434). Like the
     # other one-off migration-audit PUTs (feature_order / vwap below), this is an
