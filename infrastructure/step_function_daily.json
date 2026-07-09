@@ -219,7 +219,6 @@
             "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
             "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "trap 'aws s3 cp /var/log/chronic-gap-heal.log \"s3://alpha-engine-research/_ssm_logs/chronic-gap-heal/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "bash scripts/ensure_lib_pin.sh /home/ec2-user/alpha-engine-data 2>&1 | tee -a /var/log/chronic-gap-heal.log",
