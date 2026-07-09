@@ -748,16 +748,16 @@ def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
     assert ls[0]["model"] == "claude-sonnet-5"
 
 
-def test_symmetric_trigger_fail_safe_to_legacy(monkeypatch):
+def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
+    """demand-all enumeration failure now returns early — no legacy fallthrough."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     def boom(token):
         raise RuntimeError("github down")
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh", boom)
-    # legacy path also needs stubbing past the per-slot gate
-    monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
     out = idx.handler(_demand_event(), None)
-    assert out["groom"]["launched"]  # legacy unconditional launch
+    assert not out["groom"]["launched"]
+    assert out["groom"]["reason"] == "demand_all_failed"
 
 
 def test_non_demand_events_keep_legacy_behavior(monkeypatch):

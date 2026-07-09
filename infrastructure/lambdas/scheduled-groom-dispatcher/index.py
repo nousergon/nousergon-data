@@ -899,9 +899,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         try:
             counts, oldest, p0_tiers = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
-        except Exception as exc:  # noqa: BLE001 — fail-safe to legacy slot launch
-            logger.warning("demand trigger unavailable (%s) — legacy launch", exc)
-            launches = None
+        except Exception as exc:  # noqa: BLE001 — fail-safe: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts
+            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
+            return {"groom": {"launched": False, "reason": "demand_all_failed", "error": str(exc)}}
         if launches is not None:
             _write_trigger_record(schedule_label, launches, counts)
             results = []
