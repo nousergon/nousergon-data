@@ -63,6 +63,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/_price_cache_writeboth.py": 1,
+    # builders/backfill_delisted_audit/{date}-{ts}.json — the delisted-OHLCV
+    # backfill run summary (config#1943 Leg 3 backfill clause). Like the prune /
+    # migration audits below, this is an EVENT-DRIVEN operator-run artifact (a
+    # manual `--apply` spot backfill), NOT a periodic freshness-SLA artifact:
+    # there is no cadence to monitor, so it is grandfathered out of
+    # ARTIFACT_REGISTRY.yaml (no freshness row) — pinned here only to force
+    # operator review of the new PUT site.
+    "builders/backfill_delisted_history.py": 1,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
