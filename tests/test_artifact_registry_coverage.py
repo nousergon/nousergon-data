@@ -130,6 +130,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "data/snapshotter/analyst_daily.py": 2,
     "features/compute.py": 1,
     "features/registry.py": 1,
+    # features/metron_supplemental/{date}/sectors.json sidecar (metron-ops#164) —
+    # the module's parquet writes reuse features/writer.py's existing PUT site
+    # (already pinned above); this is the ONE new site, the sectors sidecar.
+    # Covered by the already-grandfathered "features/" path_prefix in
+    # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
+    # retired the S3 mirror) — no new registry row needed.
+    "features/metron_supplemental.py": 1,
     "features/writer.py": 1,
     "lambda/handler.py": 1,
     "preflight.py": 1,
