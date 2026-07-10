@@ -1,0 +1,8 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# ci-watch-dispatcher migration (new): nousergon_lib.telegram re-exports
+# krepis.telegram.send_message — a single best-effort Telegram ping for the
+# CI-watch incomplete-reap alert. No [flow-doctor] extra needed: this Lambda
+# sends exactly one alert shape, not the full multi-topic forum substrate
+# other Lambdas route through. Same pin as scheduled-groom-dispatcher.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.97.0

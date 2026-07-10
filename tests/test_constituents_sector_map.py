@@ -18,9 +18,19 @@ import pytest
 from collectors import constituents
 
 
-def _fake_html(tickers: list[str], sectors: list[str]) -> str:
-    """Build minimal Wikipedia-shaped HTML with Symbol + GICS Sector columns."""
-    df = pd.DataFrame({"Symbol": tickers, "GICS Sector": sectors})
+def _fake_html(
+    tickers: list[str], sectors: list[str], sub_industries: list[str] | None = None
+) -> str:
+    """Build minimal Wikipedia-shaped HTML with Symbol + GICS Sector columns.
+
+    ``sub_industries``, when given, adds a "GICS Sub-Industry" column
+    alongside "GICS Sector" — mirroring the real Wikipedia table shape
+    (config#934 narrow slice).
+    """
+    data = {"Symbol": tickers, "GICS Sector": sectors}
+    if sub_industries is not None:
+        data["GICS Sub-Industry"] = sub_industries
+    df = pd.DataFrame(data)
     return df.to_html(index=False)
 
 
@@ -45,7 +55,7 @@ def test_sector_map_covers_both_sp500_and_sp400() -> None:
         raise AssertionError(f"unexpected URL: {url}")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sp500_count, sp400_count = (
+        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
             constituents._fetch_constituents()
         )
 
@@ -59,6 +69,95 @@ def test_sector_map_covers_both_sp500_and_sp400() -> None:
     assert set(tickers) == {"AAPL", "MSFT", "JHG", "WSO"}
 
 
+def test_sub_industry_map_captured_alongside_sector_map() -> None:
+    """config#934 narrow slice: the collector must additionally capture the
+    GICS Sub-Industry column (one level finer than sector, e.g.
+    "Semiconductors" vs. the parent "Information Technology" sector) when
+    Wikipedia's table carries it — purely additive, sector_map/sector_etf_map
+    behavior must be unchanged."""
+    sp500_html = _fake_html(
+        ["AAPL", "MSFT"],
+        ["Information Technology", "Information Technology"],
+        ["Technology Hardware, Storage & Peripherals", "Systems Software"],
+    )
+    sp400_html = _fake_html(
+        ["JHG", "WSO"],
+        ["Financials", "Industrials"],
+        ["Asset Management & Custody Banks", "Building Products"],
+    )
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
+            constituents._fetch_constituents()
+        )
+
+    assert sub_industry_map["AAPL"] == "Technology Hardware, Storage & Peripherals"
+    assert sub_industry_map["MSFT"] == "Systems Software"
+    assert sub_industry_map["JHG"] == "Asset Management & Custody Banks"
+    assert sub_industry_map["WSO"] == "Building Products"
+    # sector_map/sector_etf_map are unaffected by sub-industry capture.
+    assert sector_map["AAPL"] == "Information Technology"
+    assert sector_etf_map["JHG"] == "XLF"
+
+
+def test_sub_industry_map_empty_when_column_absent_does_not_raise() -> None:
+    """A Wikipedia table without a GICS Sub-Industry column must NOT block
+    the fetch — sub_industry_map degrades to empty/partial rather than
+    raising, since nothing downstream depends on it yet (unlike the sector
+    column, which is a hard gate)."""
+    sp500_html = _fake_html(["AAPL"], ["Information Technology"])  # no sub-industry col
+    sp400_html = _fake_html(["JHG"], ["Financials"])
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        tickers, sector_map, _, sub_industry_map, _, _ = constituents._fetch_constituents()
+
+    assert set(tickers) == {"AAPL", "JHG"}
+    assert sector_map == {"AAPL": "Information Technology", "JHG": "Financials"}
+    assert sub_industry_map == {}
+
+
+def test_cache_persists_sub_industry_map() -> None:
+    """The local CSV cache must round-trip gics_sub_industry, so a future
+    Wikipedia outage's fallback still returns sub_industry_map (best-effort,
+    consistent with how gics_sector/sector_etf already round-trip)."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_path = Path(tmp) / "constituents_cache.csv"
+        with patch("collectors.constituents._CACHE_PATH", cache_path):
+            sp500_html = _fake_html(
+                ["AAPL"], ["Information Technology"], ["Systems Software"]
+            )
+            sp400_html = _fake_html(["JHG"], ["Financials"], ["Asset Management & Custody Banks"])
+
+            def fake_get(url, **kwargs):
+                return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+            with patch("collectors.constituents.requests.get", side_effect=fake_get):
+                constituents._fetch_constituents()
+
+            assert cache_path.exists()
+            cached = pd.read_csv(cache_path)
+            assert "gics_sub_industry" in cached.columns
+            row_by_ticker = {r["ticker"]: r for _, r in cached.iterrows()}
+            assert row_by_ticker["AAPL"]["gics_sub_industry"] == "Systems Software"
+            assert row_by_ticker["JHG"]["gics_sub_industry"] == "Asset Management & Custody Banks"
+
+            # Fallback from cache must also reconstruct sub_industry_map.
+            _, _, _, sub_industry_map, _, _ = constituents._load_from_cache()
+            assert sub_industry_map == {
+                "AAPL": "Systems Software",
+                "JHG": "Asset Management & Custody Banks",
+            }
+
+
 def test_collect_raises_when_sector_coverage_incomplete(tmp_path) -> None:
     """If a ticker lands in `tickers` without a sector entry, collect() must raise."""
     # Simulate the prior-bug condition: tickers list has 4 entries but
@@ -68,6 +167,7 @@ def test_collect_raises_when_sector_coverage_incomplete(tmp_path) -> None:
             ["AAPL", "MSFT", "JHG", "WSO"],
             {"AAPL": "Information Technology", "MSFT": "Information Technology"},
             {"AAPL": "XLK", "MSFT": "XLK"},
+            {},
             2,
             2,
         )
@@ -93,7 +193,7 @@ def test_fetch_raises_when_sector_column_missing(tmp_path, monkeypatch) -> None:
         return _FakeResp(sp500_html)
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, _, _, _ = constituents._fetch_constituents()
+        tickers, sector_map, _, _, _, _ = constituents._fetch_constituents()
 
     # No tables matched the schema → empty result, which collect() then
     # short-circuits with status=error before any S3 write.
@@ -146,7 +246,7 @@ def test_cache_fallback_returns_full_sector_map(tmp_path, monkeypatch) -> None:
         raise RuntimeError("simulated Wikipedia outage")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sp500_count, sp400_count = (
+        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
             constituents._fetch_constituents()
         )
 
@@ -172,7 +272,7 @@ def test_cache_fallback_handles_legacy_ticker_only_schema(tmp_path, monkeypatch)
         raise RuntimeError("simulated Wikipedia outage")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, _, _ = constituents._fetch_constituents()
+        tickers, sector_map, sector_etf_map, _, _, _ = constituents._fetch_constituents()
 
     assert tickers == ["AAPL", "MSFT"]
     assert sector_map == {}
@@ -190,7 +290,7 @@ def test_cache_fallback_missing_cache_returns_empty(tmp_path, monkeypatch) -> No
         raise RuntimeError("simulated Wikipedia outage")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, _, _ = constituents._fetch_constituents()
+        tickers, sector_map, sector_etf_map, _, _, _ = constituents._fetch_constituents()
 
     assert tickers == []
     assert sector_map == {} and sector_etf_map == {}
@@ -289,7 +389,7 @@ def test_fetch_constituents_handles_banner_table_at_index_0() -> None:
         return _FakeResp(sp500_html if "500" in url else sp400_html)
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sp500_count, sp400_count = (
+        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
             constituents._fetch_constituents()
         )
 
@@ -395,7 +495,7 @@ def test_fetch_constituents_handles_banner_table_at_index_0() -> None:
         return _FakeResp(sp500_html if "500" in url else sp400_html)
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sp500_count, sp400_count = (
+        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
             constituents._fetch_constituents()
         )
 

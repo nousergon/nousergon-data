@@ -14,7 +14,7 @@ def test_check_drift_no_drift_returns_ok():
     # Wikipedia returns a small known set; ArcticDB has the same + extras.
     fake_fetch = MagicMock(return_value=(
         ["AAPL", "MSFT", "NVDA"],  # tickers
-        {}, {},                      # sector_map, sector_etf_map
+        {}, {}, {},                   # sector_map, sector_etf_map, sub_industry_map
         2, 1,                        # sp500_count, sp400_count
     ))
     fake_lib = MagicMock()
@@ -35,7 +35,7 @@ def test_check_drift_missing_tickers_detected():
 
     fake_fetch = MagicMock(return_value=(
         ["AAPL", "MSFT", "BNY", "P", "SN"],
-        {}, {},
+        {}, {}, {},
         3, 2,
     ))
     fake_lib = MagicMock()
@@ -54,7 +54,7 @@ def test_check_drift_under_threshold_passes():
     """max_stragglers tolerance: 1 missing with cap=2 → status=ok."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, 1, 1))
+    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, {}, 1, 1))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
 
@@ -73,7 +73,7 @@ def test_check_drift_skip_list_excluded_from_diff():
     is stripped from BOTH sides of the comparison."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "SPY", "VIX"], {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL", "SPY", "VIX"], {}, {}, {}, 1, 0))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
 
@@ -89,7 +89,7 @@ def test_check_drift_sector_etf_excluded():
     """XLK / XLF / XL* prefixes excluded from drift comparison."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "XLK", "XLF"], {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL", "XLK", "XLF"], {}, {}, {}, 1, 0))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
 
@@ -113,7 +113,7 @@ def test_check_drift_wikipedia_fetch_failure_returns_error():
 def test_check_drift_arctic_failure_returns_error():
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0))
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
          patch("validators.constituents_drift_check._open_universe_lib",
                side_effect=Exception("ArcticDB unreachable")):
@@ -125,7 +125,7 @@ def test_check_drift_arctic_failure_returns_error():
 def test_main_exit_code_ok():
     from validators.constituents_drift_check import main
 
-    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
@@ -138,7 +138,7 @@ def test_main_exit_code_ok():
 def test_main_exit_code_drift_detected():
     from validators.constituents_drift_check import main
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, 1, 1))
+    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, {}, 1, 1))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
