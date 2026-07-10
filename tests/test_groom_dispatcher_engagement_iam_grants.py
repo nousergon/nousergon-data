@@ -125,3 +125,31 @@ def test_list_bucket_grants_stay_prefix_scoped():
             f"unconditioned s3:ListBucket in statement {stmt.get('Sid')!r} — "
             "scope it with an s3:prefix condition."
         )
+
+
+# ── config#2152: write surfaces (queue manifests + decision records) ─────────
+
+WRITE_SURFACES = {
+    "decision_records": "groom/decisions/2026-07-10/trigger-1900.json",
+    "queue_manifests": "groom/queues/2026-07-10/trigger-1900-high-only.json",
+}
+
+
+def _put_object_allows_key(key: str) -> bool:
+    obj_arn = f"{RESEARCH_BUCKET_ARN}/{key}"
+    for stmt in _statements():
+        if stmt.get("Effect") != "Allow" or "s3:PutObject" not in _actions(stmt):
+            continue
+        if any(fnmatch.fnmatch(obj_arn, res) for res in _resources(stmt)):
+            return True
+    return False
+
+
+def test_every_write_surface_has_put_object_grant():
+    missing = {name: key for name, key in WRITE_SURFACES.items()
+               if not _put_object_allows_key(key)}
+    assert not missing, (
+        f"iam-policy.json grants no s3:PutObject covering: {missing} — "
+        "index.py's trigger/manifest writes will AccessDenied at run time "
+        "(config#2142/#2152 gap class)."
+    )

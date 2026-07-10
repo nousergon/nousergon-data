@@ -142,6 +142,12 @@ class _FakeS3:
     def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
         return {"Body": _FakeS3Body(self._objects[Key])}
 
+    def put_object(self, Bucket, Key, Body, **kw):  # noqa: N803 — boto3 kwarg names
+        # config#2152: records queue-manifest / trigger-record writes for
+        # assertions; stored alongside the seeded read objects.
+        self._objects[Key] = Body
+        return {}
+
 
 def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None,
          running_tier_instances=None):
@@ -726,10 +732,18 @@ def test_demand_gate_kill_switch(monkeypatch):
 # ── config#1933 SYMMETRIC triggers (Brian's ratified correction) ─────────────
 
 
-def _stub_fresh_stats(monkeypatch, idx, counts, oldest=None, p0=()):
+def _stub_fresh_stats(monkeypatch, idx, counts, oldest=None, p0=(), tier_issues=None):
+    # config#2152: default tier_issues fabricates N placeholder issues per tier
+    # so the count and the manifest queue stay consistent by construction —
+    # mirroring the real single-walk enumeration.
+    if tier_issues is None:
+        tier_issues = {t: [{"repo": "nousergon/alpha-engine-config", "number": 9000 + i,
+                            "title": f"{t} issue {i}", "labels": [f"complexity:{t}"],
+                            "updated_at": "2026-07-10T00:00:00Z"}
+                           for i in range(n)] for t, n in counts.items()}
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
-                        lambda token: (counts, oldest or {}, list(p0)))
+                        lambda token: (counts, oldest or {}, list(p0), tier_issues))
     monkeypatch.setattr(idx, "_write_trigger_record", lambda *a, **k: None)
     monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
 
@@ -1010,3 +1024,49 @@ def test_load_recent_engagements_uses_lib_engaged_dispositions(monkeypatch):
     idx = _load(monkeypatch, s3_objects={key: art})
     engagements = idx._load_recent_engagements()
     assert ("nousergon/alpha-engine-config", 998) in engagements
+
+
+# ── config#2152: queue manifests (observer phase) ───────────────────────────────
+
+
+def test_symmetric_trigger_writes_queue_manifests(monkeypatch):
+    """Every launched box gets a manifest at the deterministic key carrying the
+    exact issue list behind its launch decision — counts and queue derive from
+    the same enumeration walk (config#2152 enumerate-once)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event("0 1 * * *"), None)
+    manifests = out["groom"]["queue_manifests"]
+    assert set(manifests) == {"low-only", "mid-only", "high-only"}
+    for filt, key in manifests.items():
+        assert key.startswith("groom/queues/") and key.endswith(f"-{filt}.json")
+        doc = json.loads(idx._test_s3._objects[key])
+        assert doc["schema_version"] == 1
+        assert doc["issue_filter"] == filt
+        assert doc["issue_count"] == len(doc["issues"])
+        assert all({"repo", "number", "title", "labels", "updated_at"} <= set(i)
+                   for i in doc["issues"])
+    # per-tier counts flow through to the per-filter manifests
+    assert json.loads(idx._test_s3._objects[manifests["high-only"]])["issue_count"] == 10
+
+
+def test_queue_manifest_write_failure_does_not_block_launch(monkeypatch):
+    """Observer phase: a manifest write failure is logged (driver-side parity
+    reports it) but the boxes still launch — grooms are the primary deliverable."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    def boom(**kw):
+        raise RuntimeError("AccessDenied: s3:PutObject")
+    monkeypatch.setattr(idx._test_s3, "put_object", boom)
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["queue_manifests"] == {}
+    assert len(out["groom"]["launches"]) == 3
+
+
+def test_skipped_tier_gets_no_manifest(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 2, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    # low (2 < floor 8) rides upward or skips — only launched filters get manifests
+    launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
+    assert set(out["groom"]["queue_manifests"]) == launched_filters
