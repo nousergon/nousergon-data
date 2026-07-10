@@ -36,6 +36,12 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/ci_watch/_control/completed/*"
     },
     {
+      "Sid": "CheckSfWatchCompletionMarker",
+      "Effect": "Allow",
+      "Action": "s3:HeadObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/sf_watch/_control/completed/*"
+    },
+    {
       "Sid": "TelegramSecretsSSM",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",

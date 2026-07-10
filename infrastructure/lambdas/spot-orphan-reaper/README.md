@@ -58,20 +58,30 @@ box whose watchdog failed) lingers up to 6.5h before the backstop fires instead 
 value is a process-quality signal worth investigating — the most likely cause is a
 launcher that shipped without arming its watchdog.
 
-## CI-watch incomplete-reap alert (additive, ci-watch-dispatcher migration)
+## Watch-kind incomplete-reap alert (additive, generalized config#2106)
 
-Every other tagged workload's reap path above is unchanged. Specifically for
-boxes tagged `Name=alpha-engine-ci-watch-spot`, this reaper ALSO checks — right
-before terminating — whether the sibling `ci_watch_run.sh` wrote its S3
-completion marker (`s3://alpha-engine-research/ci_watch/_control/completed/
-<repo>-<sha>.json`, written on every one of its exit paths). If the marker is
-absent, the reap fired because the diagnose+fix agent never reached a normal
-exit — `main` could still be red with nobody told — so this Lambda sends one
-best-effort Telegram ping via `krepis.telegram.send_message` (through the
-`nousergon_lib.telegram` re-export). Fail-safe direction is deliberately the
-OPPOSITE of the reap decision itself: any inability to confirm completion (a
-genuine 404 or an unrelated S3 error) still fires the alert — an occasional
-false positive is safer than silently missing a real incomplete run.
+Every other tagged workload's reap path above is unchanged. For a small,
+explicit table of "watch" workloads (`WATCH_KINDS` in `index.py` — currently
+Fleet CI Watch and Fleet-SF Watch), this reaper ALSO checks — right before
+terminating — whether the sibling run script wrote its S3 completion marker
+(`s3://alpha-engine-research/{ci_watch,sf_watch}/_control/completed/<key>.json`,
+written on every one of that script's exit paths, keyed on each kind's own
+discriminator tags: `(repo, sha)` for CI-watch, `(cadence, pipeline, run_date)`
+for SF-watch). If the marker is absent, the reap fired because the diagnose+fix
+agent never reached a normal exit — something could still be unrepaired with
+nobody told — so this Lambda sends one best-effort Telegram ping via
+`krepis.telegram.send_message` (through the `nousergon_lib.telegram`
+re-export). Fail-safe direction is deliberately the OPPOSITE of the reap
+decision itself: any inability to confirm completion (a genuine 404 or an
+unrelated S3 error) still fires the alert — an occasional false positive is
+safer than silently missing a real incomplete run.
+
+One shared check/notify code path serves every `WATCH_KINDS` entry (config#2106:
+SF-watch was about to become a second copy-pasted `_ci_watch_*`-shaped function
+pair, which is exactly the duplication class that issue exists to stop — see
+`nousergon_lib.spot_dispatch` for the sibling generalization one layer down, in
+the dispatcher Lambdas themselves). Adding a THIRD watch-kind later is a new
+`WatchKind(...)` row in `index.py`, not a new function pair.
 
 ## Deploying
 
@@ -106,7 +116,7 @@ The role's inline policy (`iam-policy.json`):
 - `ec2:DescribeInstances *` — global read for the scan
 - `ec2:TerminateInstances` scoped to instances with `tag:Name` matching `alpha-engine-*` — defence in depth so even a buggy reaper run cannot terminate anything outside the alpha-engine tag prefix
 - `cloudwatch:PutMetricData` scoped to namespace `AlphaEngine/Infra`
-- `s3:HeadObject` scoped to `s3://alpha-engine-research/ci_watch/_control/completed/*` — the CI-watch incomplete-reap marker check (above)
+- `s3:HeadObject` scoped to `s3://alpha-engine-research/ci_watch/_control/completed/*` and `s3://alpha-engine-research/sf_watch/_control/completed/*` — the watch-kind incomplete-reap marker checks (above)
 - `ssm:GetParameter` scoped to the two Telegram secrets (`/alpha-engine/TELEGRAM_BOT_TOKEN`, `/alpha-engine/TELEGRAM_CHAT_ID`) — resolved by `krepis.secrets.get_secret` inside `send_message`
 - Standard Lambda logging perms
 
