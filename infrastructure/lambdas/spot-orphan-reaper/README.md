@@ -58,6 +58,21 @@ box whose watchdog failed) lingers up to 6.5h before the backstop fires instead 
 value is a process-quality signal worth investigating — the most likely cause is a
 launcher that shipped without arming its watchdog.
 
+## CI-watch incomplete-reap alert (additive, ci-watch-dispatcher migration)
+
+Every other tagged workload's reap path above is unchanged. Specifically for
+boxes tagged `Name=alpha-engine-ci-watch-spot`, this reaper ALSO checks — right
+before terminating — whether the sibling `ci_watch_run.sh` wrote its S3
+completion marker (`s3://alpha-engine-research/ci_watch/_control/completed/
+<repo>-<sha>.json`, written on every one of its exit paths). If the marker is
+absent, the reap fired because the diagnose+fix agent never reached a normal
+exit — `main` could still be red with nobody told — so this Lambda sends one
+best-effort Telegram ping via `krepis.telegram.send_message` (through the
+`nousergon_lib.telegram` re-export). Fail-safe direction is deliberately the
+OPPOSITE of the reap decision itself: any inability to confirm completion (a
+genuine 404 or an unrelated S3 error) still fires the alert — an occasional
+false positive is safer than silently missing a real incomplete run.
+
 ## Deploying
 
 ```bash
@@ -91,6 +106,8 @@ The role's inline policy (`iam-policy.json`):
 - `ec2:DescribeInstances *` — global read for the scan
 - `ec2:TerminateInstances` scoped to instances with `tag:Name` matching `alpha-engine-*` — defence in depth so even a buggy reaper run cannot terminate anything outside the alpha-engine tag prefix
 - `cloudwatch:PutMetricData` scoped to namespace `AlphaEngine/Infra`
+- `s3:HeadObject` scoped to `s3://alpha-engine-research/ci_watch/_control/completed/*` — the CI-watch incomplete-reap marker check (above)
+- `ssm:GetParameter` scoped to the two Telegram secrets (`/alpha-engine/TELEGRAM_BOT_TOKEN`, `/alpha-engine/TELEGRAM_CHAT_ID`) — resolved by `krepis.secrets.get_secret` inside `send_message`
 - Standard Lambda logging perms
 
 ## Changing the cap
