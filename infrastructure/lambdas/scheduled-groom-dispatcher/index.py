@@ -346,7 +346,8 @@ def _resolve_pr_budget(event: dict) -> int | None:
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
                        run_token: str, soft_limit_min: int | None = None,
                        pr_budget: int | None = None, partition_index: int = 0,
-                       partition_count: int = 1) -> str:
+                       partition_count: int = 1,
+                       queue_manifest_key: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -364,6 +365,12 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
         f"export GROOM_SWEEP_PARTITION_INDEX={partition_index}\n"
         f"export GROOM_SWEEP_PARTITION_COUNT={partition_count}\n"
     ) if partition_count > 1 else ""
+    # config#2152/#2147: manifest-consumption opt-in (drain runs / post-parity
+    # cutover) — the driver builds its queue from this S3 key instead of
+    # enumerating GitHub. Validated in handler() before it reaches this
+    # root-shell command line.
+    manifest_export = (f"export GROOM_QUEUE_MANIFEST_KEY={queue_manifest_key}\n"
+                       if queue_manifest_key else "")
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -386,7 +393,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{partition_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{partition_export}{manifest_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -418,13 +425,13 @@ def _wait_ssm_online(instance_id: str) -> None:
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
                     pr_budget: int | None = None, partition_index: int = 0,
-                    partition_count: int = 1) -> str:
+                    partition_count: int = 1, queue_manifest_key: str = "") -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(
             run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            partition_index, partition_count,
+            partition_index, partition_count, queue_manifest_key,
         ),
         comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         region=REGION,
@@ -491,7 +498,8 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
                        force_on_demand: bool = False,
-                       partition_index: int = 0, partition_count: int = 1) -> dict:
+                       partition_index: int = 0, partition_count: int = 1,
+                       queue_manifest_key: str = "") -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -543,7 +551,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         )
         command_id = _send_bootstrap(
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            partition_index, partition_count,
+            partition_index, partition_count, queue_manifest_key,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -955,6 +963,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         bool(event.get("decide_only")), bool(event.get("launch_decided")),
     )
 
+    # config#2152/#2147: manifest-consumption opt-in (drain runs / post-parity
+    # cutover). FAIL LOUD on a malformed key — this string is embedded in the
+    # box's root-shell bootstrap command line, so the character set is strict.
+    queue_manifest_key = str(event.get("queue_manifest_key") or "")
+    if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
+        raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
+
     if event.get("launch_decided"):
         # config#2129: a decide_only call (or the SF's bounded-relaunch loop
         # re-invoking for the SAME already-decided box) already made this
@@ -966,6 +981,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             force_on_demand,
             partition_index=int(event.get("partition_index") or 0),
             partition_count=int(event.get("partition_count") or 1),
+            queue_manifest_key=queue_manifest_key,
         )
         return {"groom": result}
 
@@ -1072,5 +1088,6 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
         partition_index=partition_index, partition_count=partition_count,
+        queue_manifest_key=queue_manifest_key,
     )
     return {"groom": result}
