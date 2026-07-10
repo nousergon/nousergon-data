@@ -2,10 +2,12 @@
 # deploy.sh — Create or update the alpha-engine-saturday-sf-success-groom-dispatcher
 # Lambda and wire its EventBridge trigger (Saturday SF SUCCEEDED only).
 #
-# On a successful Saturday SF, this Lambda repository_dispatches the backlog
-# groom (nousergon/alpha-engine-config :: backlog-groom.yml, type
-# `saturday-sf-success-groom`) so the fresh post-Director backlog gets groomed
-# immediately. Mirrors the failure-side sibling `saturday-sf-watch-dispatcher`.
+# On a successful Saturday SF, this Lambda async-invokes the sibling
+# `alpha-engine-scheduled-groom-dispatcher` with a demand-all trigger event
+# (config#2175 — GHA groom execution retired; was: repository_dispatch to the
+# deleted backlog-groom.yml workflow) so the fresh post-Director backlog gets
+# groomed immediately on EC2 spot. Mirrors the failure-side sibling
+# `saturday-sf-watch-dispatcher`'s deploy shape.
 #
 # Managed OUTSIDE CloudFormation — same rationale as the watch sibling +
 # sf-telegram-notifier (keeps the github-actions-lambda-deploy OIDC role's blast
@@ -151,7 +153,7 @@ EOF
 run aws events put-rule \
   --name "${RULE_NAME}" \
   --event-pattern "${EVENT_PATTERN}" \
-  --description "Saturday SF SUCCEEDED → backlog groom (repository_dispatch via groom dispatcher)" \
+  --description "Saturday SF SUCCEEDED → backlog groom (async invoke of scheduled-groom-dispatcher, config#2175)" \
   --region "${REGION}" \
   --query 'RuleArn' --output text
 

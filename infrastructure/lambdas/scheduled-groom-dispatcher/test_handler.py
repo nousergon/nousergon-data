@@ -1073,11 +1073,14 @@ def test_skipped_tier_gets_no_manifest(monkeypatch):
 
 
 # ── config#2152/#2147: queue_manifest_key passthrough (drain / cutover opt-in) ──
+# config#2175 gate/market split: a manifest run no longer needs (or wants)
+# force_on_demand — the key's presence bypasses the demand-count gates on its
+# own, and the box launches SPOT-FIRST like every other run.
 
 
 def test_manifest_key_reaches_bootstrap_env(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+    out = idx.handler({"run_mode": "full", "schedule": "manual",
                        "model": "claude-haiku-4-5", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
     assert out["groom"]["launched"]
@@ -1097,6 +1100,85 @@ def test_malformed_manifest_key_fails_loud(monkeypatch):
     """The key lands on a root-shell command line — strict charset, fail loud."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     with pytest.raises(ValueError, match="invalid queue_manifest_key"):
-        idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+        idx.handler({"run_mode": "full", "schedule": "manual",
                      "model": "claude-haiku-4-5", "issue_filter": "low-only",
                      "queue_manifest_key": "groom/x; rm -rf /"}, None)
+
+
+# ── config#2175: manifest runs skip demand gates + launch spot-first ─────────
+
+
+def test_manifest_key_skips_single_tier_demand_gate_and_launches_spot(monkeypatch):
+    """A manifest run with NO force_on_demand must (a) never run the demand-
+    count enumeration (the gate counts GitHub, meaningless for an explicit
+    operator queue) and (b) launch SPOT-FIRST — the old behavior forced
+    drains onto on-demand boxes purely to bypass the gate."""
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-drain"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    enumerated = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: enumerated.append(1) or ({}, {}, False))
+    out = idx.handler({"run_mode": "full", "schedule": "manual",
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["market"] == "spot"
+    assert seen == [True], "manifest run must try spot first, not force on-demand"
+    assert enumerated == [], "manifest run must never run demand-gate enumeration"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_QUEUE_MANIFEST_KEY=groom/queues/drain/2026-07-10-low.json" in cmd
+
+
+def test_manifest_key_skips_demand_all_block(monkeypatch):
+    """queue_manifest_key + trigger=demand-all: the explicit queue wins — the
+    demand-all fan-out (which would enumerate GitHub and launch 0..3 boxes on
+    its own manifests) must be bypassed in favor of ONE box on the given key."""
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-drain"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("manifest run must not enumerate demand-all")))
+    out = idx.handler({"run_mode": "full", "trigger": "demand-all", "schedule": "manual",
+                       "model": "claude-sonnet-5", "issue_filter": "mid-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-mid.json"}, None)
+    g = out["groom"]
+    assert g["launched"] is True and g["market"] == "spot"
+    assert seen == [True]
+    assert len(idx._test_ssm.sent) == 1  # ONE box, not a demand-all fan-out
+
+
+def test_manifest_key_still_honors_pace_gate(monkeypatch):
+    """Deliberate (config#2175): the weekly WET pace gate applies to drains
+    too — a manifest bypasses the demand-COUNT gates only, never the budget."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.5 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "manual",
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "pace_gate_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_scheduled_demand_all_without_manifest_key_still_enumerates(monkeypatch):
+    """Scheduled (non-manifest) triggers are UNAFFECTED by the config#2175
+    split — demand-all still enumerates and fans out per tier."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    assert len(out["groom"]["launches"]) == 3

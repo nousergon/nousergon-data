@@ -7,23 +7,28 @@ the fresh backlog state (including the Director's just-filed items) gets groomed
 immediately, rather than waiting for the next scheduled 10pm-PT run. Added while
 still building confidence that the daily groom is as thorough as intended.
 
-Wiring mirrors the failure-side sibling `saturday-sf-watch-dispatcher`: a
-dedicated EventBridge rule on the Saturday SF's SUCCEEDED status targets this
-Lambda, which sends a `repository_dispatch` (type `saturday-sf-success-groom`)
-to `nousergon/alpha-engine-config`, where `backlog-groom.yml` listens for it and
-runs a FULL groom. Reuses the same SSM-stored fine-grained PAT
-(`/alpha-engine/saturday_sf_watch/github_pat`) the watch sibling uses for
-repository_dispatch — no new credential.
+Wiring (config#2175 — GHA groom execution retired fleet-wide): a dedicated
+EventBridge rule on the Saturday SF's SUCCEEDED status targets this Lambda,
+which fires an ASYNC (InvocationType=Event) boto3 invoke of
+`alpha-engine-scheduled-groom-dispatcher` carrying a demand-all trigger event —
+the SAME EC2-spot path every scheduled groom already uses. Demand-all evaluates
+the fresh post-SF backlog per tier and launches 0..3 spot boxes, strictly
+better than the old unconditional single FULL GHA run this Lambda used to
+`repository_dispatch` to `backlog-groom.yml` (workflow deleted; the GitHub
+PAT read + urllib dispatch machinery went with it — this Lambda needs no
+GitHub credential at all now).
 
 Best-effort with a recording surface (CLAUDE.md no-silent-fails secondary
-carve-out): a GitHub/SSM outage logs WARN and is returned in the result but does
-NOT raise — triggering the groom is a convenience, NOT the Saturday pipeline's
-deliverable, and the scheduled nightly groom is the backstop. EventBridge's
-delivery retries + the Lambda error metric still record a hard failure.
+carve-out): a Lambda-invoke outage logs WARN and is returned in the result but
+does NOT raise — triggering the groom is a convenience, NOT the Saturday
+pipeline's deliverable, and the scheduled groom cadence is the backstop.
+EventBridge's delivery retries + the Lambda error metric still record a hard
+failure.
 
 Managed OUTSIDE CloudFormation (same rationale as the watch sibling): operator-
 deployed via `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until
-bootstrapped.
+bootstrapped (and the reroute needs the iam-policy.json lambda:InvokeFunction
+grant re-applied — see README).
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.request
 
 import boto3
 
@@ -42,58 +46,45 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Kill-switch: set GROOM_DISPATCH_ENABLED=false on the Lambda to disable the
 # trigger without removing the EventBridge rule. Default ON (Brian wants it live).
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
-DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
-DISPATCH_EVENT_TYPE = os.environ.get("DISPATCH_EVENT_TYPE", "saturday-sf-success-groom")
-GITHUB_PAT_SSM_PARAM = os.environ.get(
-    "GITHUB_PAT_SSM_PARAM", "/alpha-engine/saturday_sf_watch/github_pat"
+# The scheduled-groom-dispatcher Lambda (this repo, sibling dir) — the single
+# fleet chokepoint for launching groom EC2-spot boxes (config#1432/#2175).
+GROOM_DISPATCHER_FUNCTION = os.environ.get(
+    "GROOM_DISPATCHER_FUNCTION", "alpha-engine-scheduled-groom-dispatcher"
 )
-_DISPATCH_TIMEOUT_SEC = 15
+# The demand-all trigger event (config#2175): the dispatcher enumerates the
+# fresh post-SF backlog per tier and launches 0..3 spot boxes — its own pace/
+# demand gates apply, exactly as on the cron-scheduled triggers.
+DISPATCH_EVENT = {
+    "run_mode": "full",
+    "trigger": "demand-all",
+    "schedule": "saturday-sf-success",
+}
 
 
-def _get_github_pat() -> str:
-    """Read the fine-grained PAT (SecureString) from SSM. Never logged."""
-    ssm = boto3.client("ssm", region_name=REGION)
-    resp = ssm.get_parameter(Name=GITHUB_PAT_SSM_PARAM, WithDecryption=True)
-    return resp["Parameter"]["Value"]
-
-
-def _dispatch_groom(execution_name: str, start_date) -> dict:
-    """Fire the repository_dispatch that triggers backlog-groom.yml. Best-effort:
-    records the outcome, never raises (secondary path)."""
+def _dispatch_groom(execution_name: str, start_date) -> dict:  # noqa: ARG001 — kept for handler-contract stability
+    """Async-invoke the scheduled-groom-dispatcher with the demand-all event.
+    Best-effort: records the outcome, never raises (secondary path — the
+    scheduled groom cadence is the backstop; recording surfaces are the WARN
+    log + this returned result)."""
     if not DISPATCH_ENABLED:
         return {"dispatched": False, "reason": "disabled"}
     try:
-        pat = _get_github_pat()
-        payload = {
-            "event_type": DISPATCH_EVENT_TYPE,
-            "client_payload": {
-                "trigger": "saturday-sf-success",
-                "execution_name": execution_name,
-                "start_date": start_date,
-            },
-        }
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{DISPATCH_REPO}/dispatches",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {pat}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "User-Agent": "saturday-sf-success-groom-dispatcher",
-            },
+        lam = boto3.client("lambda", region_name=REGION)
+        resp = lam.invoke(
+            FunctionName=GROOM_DISPATCHER_FUNCTION,
+            InvocationType="Event",  # async — never babysit the multi-hour groom
+            Payload=json.dumps(DISPATCH_EVENT).encode("utf-8"),
         )
-        with urllib.request.urlopen(req, timeout=_DISPATCH_TIMEOUT_SEC) as resp:
-            status_code = resp.status
+        status_code = resp["StatusCode"]
         logger.info(
-            "groom repository_dispatch sent to %s (type=%s, http=%s)",
-            DISPATCH_REPO,
-            DISPATCH_EVENT_TYPE,
+            "groom dispatcher invoked async: function=%s status=%s event=%s",
+            GROOM_DISPATCHER_FUNCTION,
             status_code,
+            DISPATCH_EVENT,
         )
         return {"dispatched": True, "status_code": status_code}
-    except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised
-        logger.warning("groom repository_dispatch failed (non-fatal): %s", exc)
+    except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised (see docstring)
+        logger.warning("groom dispatcher invoke failed (non-fatal): %s", exc)
         return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
 
 

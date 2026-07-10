@@ -12,10 +12,10 @@
       "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-saturday-sf-success-groom-dispatcher:*"
     },
     {
-      "Sid": "GroomDispatchPAT",
+      "Sid": "InvokeScheduledGroomDispatcher",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter"],
-      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-scheduled-groom-dispatcher"
     }
   ]
 }
