@@ -125,7 +125,11 @@ def _ci_watch_completion_marker_exists(s3, repo: str, sha: str) -> bool:
         # Box was reaped before its repo/sha tags ever landed (e.g. tag-write
         # failed right after launch) — cannot look up a marker either way.
         return False
-    key = f"{CI_WATCH_COMPLETION_PREFIX}{repo}-{sha}.json"
+    # repo is "owner/name" (a literal "/") — ci_watch_run.sh flattens that to
+    # "-" before writing its marker key (so the S3 key has no unintended
+    # nested "directory" per repo); mirror the SAME escaping here or every
+    # lookup 404s against a key that was never written.
+    key = f"{CI_WATCH_COMPLETION_PREFIX}{repo.replace('/', '-')}-{sha}.json"
     try:
         s3.head_object(Bucket=CI_WATCH_COMPLETION_BUCKET, Key=key)
         return True

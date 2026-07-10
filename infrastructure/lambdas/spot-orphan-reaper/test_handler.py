@@ -230,7 +230,10 @@ class TestCiWatchIncompleteReapAlert:
         assert out["ci_watch_incomplete_reaps"] == ["i-ciwatch"]
         s3.head_object.assert_called_once_with(
             Bucket="alpha-engine-research",
-            Key="ci_watch/_control/completed/nousergon/alpha-engine-config-abc123def456.json",
+            # repo's "/" is flattened to "-" (matches ci_watch_run.sh's own
+            # escaping when it WRITES the marker) — this key must reflect that,
+            # not a literal nested "nousergon/alpha-engine-config-..." path.
+            Key="ci_watch/_control/completed/nousergon-alpha-engine-config-abc123def456.json",
         )
         assert len(index_module._test_send_message.calls) == 1
         (text,), kwargs = index_module._test_send_message.calls[0]
