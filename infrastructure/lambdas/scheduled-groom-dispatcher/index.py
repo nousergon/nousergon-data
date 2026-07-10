@@ -658,6 +658,34 @@ def _write_decision_record(slot_tier: str, decision, counts: dict,
         logger.warning("decision record write failed (non-fatal): %s", exc)
 
 
+def _notify_demand_trigger_failed(exc: Exception, schedule_label: str) -> None:
+    """Loud page for a failed trigger evaluation — never raises (config#2142).
+
+    A demand-all trigger that cannot enumerate (GitHub or the S3 engagement
+    scan down) is skipped fail-closed — meaning NO groom boxes launch for
+    that slot. That must page ops-health, not sit in CloudWatch: the
+    predecessor failure mode (engagement scan AccessDenied logged at WARNING
+    only) ran undetected on 8 consecutive triggers, 2026-07-08 → 07-10.
+    """
+    text = (
+        "🔴 Backlog groom trigger FAILED — demand-all enumeration errored, "
+        f"trigger SKIPPED fail-closed (schedule={schedule_label}). NO groom "
+        f"boxes launched for this slot. Error: {exc}. If this repeats on the "
+        "next trigger, grooms are fully stalled — investigate the dispatcher "
+        "Lambda's GitHub/S3 access (cf. config#2142)."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="warning",
+            dedup_key=f"{_FLOW_NAME}:demand_trigger_failed:{schedule_label}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "error": str(exc)},
+        )
+    except Exception as notify_exc:  # noqa: BLE001 — secondary observability
+        logger.warning("trigger-failed Telegram failed (non-fatal): %s", notify_exc)
+
+
 def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
     """Best-effort ping for a demand-gate skip — never raises."""
     text = (
@@ -707,7 +735,15 @@ def _load_recent_engagements() -> dict:
     """(repo, number) -> engagement horizon epoch from the last
     ``ge.ENGAGEMENT_LOOKBACK_DAYS`` days' S3 run artifacts (same schema the
     driver's config#1893 fresh-skip reads).
-    Fail-safe {} — a read error only means counting a few extra issues.
+
+    RAISES on any read failure (config#2142). This was previously fail-safe
+    ``{}`` ("skip nothing — counting a few extra issues"), which masked a
+    total AccessDenied on the ``groom/{date}/`` engagement scan for every
+    trigger from ship (2026-07-08) to 2026-07-10: fresh-skip enumeration ran
+    with an empty map on 8 consecutive triggers with zero pipeline signal,
+    inflating every advertised per-tier count. The trigger handler's own
+    catch is the recording surface: it skips the trigger (fail-closed, no
+    launch on over-counted queues) AND pages ops-health.
 
     config#2038: the lookback (was a hardcoded ``range(3)``) and the engaged-
     disposition set (was a hardcoded tuple literal) had silently drifted from
@@ -718,27 +754,24 @@ def _load_recent_engagements() -> dict:
     can't re-drift.
     """
     out: dict = {}
-    try:
-        s3 = boto3.client("s3", region_name=REGION)
-        now = datetime.now(ZoneInfo("UTC"))
-        for d in range(ge.ENGAGEMENT_LOOKBACK_DAYS):
-            date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
-            resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
-            for obj in resp.get("Contents", []) or []:
-                if not obj["Key"].endswith(".json"):
-                    continue
-                art = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read())
-                run_start = art.get("run_start", "")
-                if not run_start:
-                    continue
-                horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
-                           + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
-                for rec in art.get("issues", []):
-                    if rec.get("disposition") in ge.ENGAGED_DISPOSITIONS:
-                        k = (rec.get("repo", ""), rec.get("number"))
-                        out[k] = max(out.get(k, 0.0), horizon)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("engagement load failed (non-fatal — skip nothing): %s", exc)
+    s3 = boto3.client("s3", region_name=REGION)
+    now = datetime.now(ZoneInfo("UTC"))
+    for d in range(ge.ENGAGEMENT_LOOKBACK_DAYS):
+        date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
+        resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
+        for obj in resp.get("Contents", []) or []:
+            if not obj["Key"].endswith(".json"):
+                continue
+            art = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read())
+            run_start = art.get("run_start", "")
+            if not run_start:
+                continue
+            horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
+                       + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
+            for rec in art.get("issues", []):
+                if rec.get("disposition") in ge.ENGAGED_DISPOSITIONS:
+                    k = (rec.get("repo", ""), rec.get("number"))
+                    out[k] = max(out.get(k, 0.0), horizon)
     return out
 
 
@@ -859,8 +892,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         try:
             counts, oldest, p0_tiers = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
-        except Exception as exc:  # noqa: BLE001 — fail-safe: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts
+        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
             logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
+            _notify_demand_trigger_failed(exc, schedule_label)
             return {"groom": {"launched": False, "reason": "demand_all_failed", "error": str(exc)}}
         if launches is not None:
             _write_trigger_record(schedule_label, launches, counts)
