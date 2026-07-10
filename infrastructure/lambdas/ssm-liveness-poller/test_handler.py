@@ -37,13 +37,17 @@ def _event(**over):
 
 
 def _mock_ssm(status="InProgress", ping="Online", rc=-1, stderr="",
-              invocation_exists=True, instance_registered=True):
+              invocation_exists=True, instance_registered=True,
+              status_details=None):
     ssm = mock.Mock()
     if invocation_exists:
         ssm.get_command_invocation.return_value = {
             "Status": status,
             "ResponseCode": rc,
-            "StatusDetails": status,
+            # SSM's StatusDetails is usually a finer-grained string than
+            # Status (e.g. Status=Failed + StatusDetails=Undeliverable for a
+            # non-delivery). Default to mirroring Status for the common case.
+            "StatusDetails": status if status_details is None else status_details,
             "StandardErrorContent": stderr,
         }
     else:
@@ -75,6 +79,67 @@ def test_terminal_failure(status):
     assert out["verdict"] == "COMMAND_FAILED"
     assert "137" in out["detail"]
     assert out["stderr_tail"] == "boom"
+
+
+def test_terminal_failure_genuine_script_error_stays_command_failed():
+    """rc>=0 + StatusDetails=Failed + agent Online = a real script failure.
+
+    Regression guard for the 2026-07-07 fix: reclassifying delivery
+    failures must NOT swallow a genuine non-zero exit into a liveness
+    verdict. A script that ran and exited 1 on a healthy box is
+    COMMAND_FAILED.
+    """
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(status="Failed", rc=1, stderr="traceback", ping="Online",
+                  status_details="Failed"),
+    ):
+        out = index.handler(_event(), None)
+    assert out["verdict"] == "COMMAND_FAILED"
+
+
+def test_undeliverable_spot_interruption_is_instance_unresponsive():
+    """The 2026-07-07 incident shape: the daily data spot was reclaimed
+    mid-MorningArcticAppend. SSM marks the invocation Failed with
+    StatusDetails=Undeliverable, rc=-1, and the agent is NotRegistered.
+    This is a host-death (spot interruption), NOT a script failure, so it
+    must carry the liveness verdict — routing to terminate-spot + alert,
+    not the COMMAND_FAILED stale-artifact path.
+    """
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(status="Failed", rc=-1, status_details="Undeliverable",
+                  instance_registered=False),
+    ):
+        out = index.handler(_event(step="morning-arctic-append"), None)
+    assert out["verdict"] == "INSTANCE_UNRESPONSIVE"
+    assert out["ping_status"] == "NotRegistered"
+    assert "vanished" in out["detail"].lower()
+
+
+@pytest.mark.parametrize("detail", ["Undeliverable", "Terminated", "DeliveryTimedOut"])
+def test_ssm_delivery_failure_details_are_liveness(detail):
+    """Every SSM non-execution StatusDetails is a host/delivery failure,
+    even if the agent momentarily still reports Online."""
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(status="Failed", rc=-1, status_details=detail, ping="Online"),
+    ):
+        out = index.handler(_event(), None)
+    assert out["verdict"] == "INSTANCE_UNRESPONSIVE"
+
+
+def test_terminal_failed_no_exit_code_and_agent_dark_is_liveness():
+    """Belt-and-suspenders: even without a delivery StatusDetails, a
+    terminal failure that captured no exit code (rc == -1) while the agent
+    is off Online is a host-death, not a command failure."""
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(status="Failed", rc=-1, status_details="Failed",
+                  ping="ConnectionLost"),
+    ):
+        out = index.handler(_event(), None)
+    assert out["verdict"] == "INSTANCE_UNRESPONSIVE"
 
 
 def test_in_progress_healthy_resets_ping_misses():

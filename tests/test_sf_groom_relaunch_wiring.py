@@ -10,6 +10,11 @@ This test catches regressions like:
 - PrepRelaunch / SetForceOnDemand stripping groomPoll (relaunch notify/runtime)
 - NotifyRelaunch blocking LaunchGroomSpot (notify must follow launch)
 - SF execution role missing s3:HeadObject for the completion-marker check
+
+config#2129: the per-box relaunch lifecycle (LaunchGroomSpot/PrepRelaunch/
+SetForceOnDemand/NotifyRelaunch/...) moved from the SF's TOP-LEVEL states into
+MapLaunches's ItemProcessor (one iteration per co-launched tier) — the
+`states` fixture below now reads that nested processor, not the top level.
 """
 
 from __future__ import annotations
@@ -29,12 +34,13 @@ _IAM_PATH = (
     / "sf-execution-iam-policy.json"
 )
 
-_PRESERVE_PATHS = ("groomPoll.$", "groomLaunch.$")
+_PRESERVE_PATHS = ("groomPoll.$", "groomLaunch.$", "launchDecision.$")
 
 
 @pytest.fixture(scope="module")
 def states() -> dict:
-    return json.loads(_SF_PATH.read_text())["States"]
+    doc = json.loads(_SF_PATH.read_text())["States"]
+    return doc["MapLaunches"]["ItemProcessor"]["States"]
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +83,7 @@ def test_set_force_on_demand_preserves_poll_context(states):
     for key in _PRESERVE_PATHS:
         assert key in params
     assert st["Next"] == "LaunchGroomSpot"
-    assert params["fod"] == {"force_on_demand": True}
+    assert params["fod"] == {"force_on_demand": True, "launch_decided": True}
 
 
 def test_relaunch_critical_path_launch_before_notify(states):

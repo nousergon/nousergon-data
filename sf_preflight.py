@@ -112,7 +112,7 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
     t0 = time.time()
     try:
         from collectors.constituents import _fetch_constituents
-        tickers, sector_map, sector_etf_map, sp500, sp400 = _fetch_constituents()
+        tickers, sector_map, sector_etf_map, sub_industry_map, sp500, sp400 = _fetch_constituents()
     except Exception as exc:
         return CheckResult(
             name="constituents_fetch",

@@ -15,9 +15,9 @@ routes deterministically to stamp → ForceStopUnresponsiveInstance →
 HandleFailure. Detection budget: ~3 polls (~1 min), not 62.
 
 This test catches regressions like:
-- A new SSM step added with a bare getCommandInvocation poll instead of
-  the liveness poller (re-introducing the copy-drift that left
-  MorningArcticAppend uncapped after #970 only patched MorningEnrich).
+- A new SSM step added on the TRADING BOX with a bare getCommandInvocation
+  poll instead of the liveness poller (re-introducing the copy-drift that
+  left MorningArcticAppend uncapped after #970 only patched MorningEnrich).
 - An INSTANCE_UNRESPONSIVE branch dropped or rerouted around the
   force-stop.
 - A poll loop whose Init state stops seeding both counters, or whose
@@ -25,6 +25,21 @@ This test catches regressions like:
   state IS the counter storage).
 - The CodeFreshnessGate unhooked from the SSM-ready path (re-opening
   the 40-minutes-to-discover-stale-code gap).
+
+config#1767 (Phase 2, merged the same week): MorningEnrich and
+MorningArcticAppend were relocated OFF the trading box onto TWO
+independent, single-workload, self-terminating ephemeral spot boxes
+(alpha-engine-data-spot-dispatcher). Their poll loops (PollMorningEnrichSpot
+/ PollMorningArcticAppendSpot) intentionally use a bare
+``ssm:getCommandInvocation`` Task instead of the liveness poller — see
+``test_sf_data_spot_relocation_wiring.py`` for their dedicated wiring pins.
+The wedged-SHARED-HOST risk config#1811 exists to catch does not apply the
+same way to a single-purpose ephemeral box with its own bootstrap watchdog
+(InstanceInitiatedShutdownBehavior=terminate), so they are excluded here by
+name — this test still fails loud on any OTHER bare poll (a real copy-drift
+on a persistent/shared target). ChronicGapSelfHeal stays on the trading box
+(small, fail-soft, 300s timeout) and keeps its liveness-poller loop,
+retargeted to the trading box instead of the now-retired shared data spot.
 """
 
 from __future__ import annotations
@@ -39,22 +54,19 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 
 _POLLER_ARN_FRAGMENT = "alpha-engine-ssm-liveness-poller"
 
+# config#1767 (Phase 2): these two dual-spot poll states intentionally use a
+# bare ssm:getCommandInvocation Task (mirroring the groom SF's
+# PollGroomCommand convention) against a single-purpose, self-terminating
+# ephemeral spot — not a persistent/shared host, so config#1811's liveness
+# pattern does not apply to them.
+_BARE_POLL_EXEMPT = {"PollMorningEnrichSpot", "PollMorningArcticAppendSpot"}
+
 # loop name -> (init, poll, check, wait, poll slot, stamp)
 _LOOPS = {
     "code-freshness-gate": (
         "InitCodeFreshnessPoll", "WaitForCodeFreshness",
         "CheckCodeFreshnessStatus", "CodeFreshnessWait",
         "$.code_freshness_poll", "StampCodeFreshnessUnresponsive",
-    ),
-    "morning-enrich": (
-        "InitMorningEnrichPoll", "WaitForMorningEnrich",
-        "CheckMorningEnrichStatus", "MorningEnrichWait",
-        "$.morning_enrich_poll", "StampMorningEnrichUnresponsive",
-    ),
-    "morning-arctic-append": (
-        "InitMorningArcticAppendPoll", "WaitForMorningArcticAppend",
-        "CheckMorningArcticAppendStatus", "MorningArcticAppendWait",
-        "$.arctic_append_poll", "StampMorningArcticAppendUnresponsive",
     ),
     "chronic-gap-heal": (
         "InitChronicGapPoll", "WaitForChronicGap",
@@ -75,13 +87,17 @@ def states() -> dict:
 
 
 def test_no_bare_get_command_invocation_polls_remain(states):
-    """Every weekday SSM poll must go through the liveness poller — a bare
-    getCommandInvocation poll has no independent liveness signal and no
-    shared budget contract (the exact copy-drift class that left
-    MorningArcticAppend uncapped)."""
+    """Every weekday SSM poll AGAINST A PERSISTENT/SHARED HOST must go
+    through the liveness poller — a bare getCommandInvocation poll has no
+    independent liveness signal and no shared budget contract (the exact
+    copy-drift class that left MorningArcticAppend uncapped). The two
+    config#1767 dual-spot poll states are exempt by name (see module
+    docstring) — they poll a single-purpose, self-terminating ephemeral box,
+    not a persistent/shared one."""
     bare = [
         n for n, st in states.items()
         if "getCommandInvocation" in str(st.get("Resource", ""))
+        and n not in _BARE_POLL_EXEMPT
     ]
     assert not bare, (
         f"bare getCommandInvocation polls in weekday SF: {bare} — use the "
@@ -124,18 +140,17 @@ def test_loop_wiring(states, step):
     assert nexts["INSTANCE_UNRESPONSIVE"] == stamp
 
     # Stamp carries the poller's detail into $.error, then force-stops the
-    # wedged host. config#1807: the three DATA loops run on the daily data
-    # spot, so their remediation terminates the SPOT; the trading-box loops
-    # keep the force-stop.
+    # wedged host. config#1767 (Phase 2): the shared "daily data spot" this
+    # comment used to describe was retired — MorningEnrich/MorningArcticAppend
+    # moved to two independent, self-terminating ephemeral spots with their
+    # OWN (non-liveness-poller) poll loops, so no loop in THIS registry targets
+    # a spot anymore. All three remaining loops (code-freshness-gate,
+    # chronic-gap-heal, morning-planner) run on the persistent trading box and
+    # force-STOP (never terminate) it.
     st_stamp = states[stamp]
     assert st_stamp["ResultPath"] == "$.error"
     assert st_stamp["Parameters"]["Cause.$"] == f"{slot}.detail"
-    _data_spot_steps = ("morning-enrich", "morning-arctic-append", "chronic-gap-heal")
-    expected_force = (
-        "ForceTerminateUnresponsiveDataSpot" if step in _data_spot_steps
-        else "ForceStopUnresponsiveInstance"
-    )
-    assert st_stamp["Next"] == expected_force
+    assert st_stamp["Next"] == "ForceStopUnresponsiveInstance"
 
 
 def test_force_stop_is_forceful_and_alerts(states):
@@ -178,7 +193,10 @@ def test_code_freshness_gate_front_loads_the_drift_check(states):
         c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
         if c.get("StringEquals") == "SUCCESS"
     ]
-    # config#1807: freshness success synchronizes with the data-spot launch
-    # (CheckDataSpotLaunched -> ReadDataSpotId) before the morning gates.
-    assert fresh == ["CheckDataSpotLaunched"]
+    # config#1767 (Phase 2): freshness success enters the first morning work
+    # gate directly — the Phase-1 shared-spot synchronization hop
+    # (CheckDataSpotLaunched -> ReadDataSpotId) this comment used to describe
+    # was retired; each Phase-2 spot now launches lazily from its own
+    # CheckSkipMorningEnrich gate.
+    assert fresh == ["CheckSkipMorningEnrich"]
     assert states["CheckCodeFreshnessStatus"]["Default"] == "HandleFailure"

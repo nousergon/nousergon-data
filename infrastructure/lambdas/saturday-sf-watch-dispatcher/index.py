@@ -19,8 +19,10 @@ ARN to the single EventBridge rule (deploy.sh), widen the IAM ARNs.
 `alpha-engine-sf-telegram-notifier` (subscribes to all three SFs / all statuses,
 pings loud on FAILED with the cause). This Lambda's distinct responsibilities are:
 the **per-pipeline, terminal-failure-only** trigger (the seam the agent dispatch
-hangs off), the **watch-log artifact** the dashboard page reads, and a
-**distinct, SILENT** Telegram record (the notifier already buzzed loud).
+hangs off), the **watch-log artifact** the dashboard page reads, and — ONLY when
+it actually takes recovery action (agent dispatch or fast-path rerun) — a
+**distinct, SILENT** Telegram receipt (sf-telegram-notifier already buzzed loud
+on the failure; observe-only paths are watch-log-only, no Fleet-SF Watch ping).
 
 **Fail-loud (CLAUDE.md no-silent-fails).** The watch-log artifact write is the
 primary deliverable → it RAISES on failure so a broken producer surfaces via the
@@ -561,11 +563,27 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
     # auto-dispatches a recovery agent (would waste a cycle and, once weekday/EOD
     # leave propose-only, risk an automated countermand of a human decision).
     operator_abort = _is_operator_abort(detail.get("status", ""), describe_resp)
-    dispatch_suppressed = "operator_abort" if operator_abort else None
+    # is_preflight: the Friday-PM dry pass of ne-weekly-freshness-pipeline
+    # (shell_run=true) is a deliberate rehearsal of Saturday's real run, not a
+    # production failure — a preflight FAILED/TIMED_OUT/ABORTED must never be
+    # indistinguishable from a genuine Saturday failure and summon the full
+    # diagnose-fix-merge-rerun agent against production. Prior to this fix
+    # is_preflight only gated the deterministic fast-path rerun (_maybe_fast_path
+    # reason="preflight"); the agent-dispatch path had no such gate at all, so a
+    # failed Friday shell-run WOULD have fired a genuine saturday-sf-failure
+    # dispatch (found 2026-07-10, before ever firing live).
+    is_preflight = _is_preflight(describe_resp)
+    if operator_abort:
+        dispatch_suppressed = "operator_abort"
+    elif is_preflight:
+        dispatch_suppressed = "preflight"
+    else:
+        dispatch_suppressed = None
     will_dispatch = (
         AGENT_DISPATCH_ENABLED
         and bool(cfg.get("has_listener", True))
         and not operator_abort
+        and not is_preflight
     )
     # SAFETY-CRITICAL (config#1375): record the per-pipeline autonomous-merge
     # mode at write time so the watch-log/dashboard shows PROPOSE-ONLY vs
@@ -582,7 +600,7 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
         "execution_arn": detail.get("executionArn", ""),
         "failed_state": failed_state,
         "cause": cause or None,
-        "is_preflight": _is_preflight(describe_resp),
+        "is_preflight": is_preflight,
         # `lane` is filled by the dispatched agent (null until it classifies).
         # `action` reflects intent at write time (the log is written just BEFORE
         # the dispatch fires): "dispatch" only when an agent will genuinely be
@@ -595,9 +613,9 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
         # PROPOSE-ONLY (False) unless this pipeline's kill-switch is on; the
         # agent still never auto-merges executor/risk/strategy (charter gate).
         "autonomous_merge": autonomous_merge,
-        # config#1827: null unless the dispatch was withheld for a recorded
-        # reason; "operator_abort" makes the human-stop decision auditable in the
-        # watch-log and on the dashboard.
+        # config#1827/preflight: null unless the dispatch was withheld for a
+        # recorded reason; "operator_abort"/"preflight" make the withholding
+        # auditable in the watch-log and on the dashboard.
         "dispatch_suppressed": dispatch_suppressed,
     }
 
@@ -635,15 +653,27 @@ def _pipeline_label(pipeline_name: str) -> str:
     return pipeline_name.removeprefix("ne-").removesuffix("-pipeline") or pipeline_name
 
 
-def _notify(record: dict, key: str, pipeline_name: str) -> bool:
-    """Distinct, SILENT Telegram record. The sf-telegram-notifier already pinged
-    loud on this FAILED event; this is the additive watch receipt (which state,
-    where the artifact is, current dispatch mode). Best-effort — never raises.
-    The header + footer reflect the LIVE ``AGENT_DISPATCH_ENABLED`` state AND
-    whether this specific pipeline has a wired listener (config#1535 — the
-    receipt must never claim "autonomous fix ACTIVE" when no workflow is
-    actually listening for this pipeline's dispatch_event_type, same spirit as
-    the 2026-06-26 stale-text bug this pattern originally fixed)."""
+def _watch_is_acting(record: dict, dispatch: dict) -> bool:
+    """True only when this invocation actually started recovery work.
+
+    Observe-only paths (kill-switch off, no listener, operator abort, fast-path
+    miss with dispatch disabled, etc.) still land in the watch-log but must NOT
+    ping Telegram — sf-telegram-notifier already alerted on the failure, and a
+    Fleet-SF Watch receipt with no action is noise (especially for pipelines
+    removed from the agent surface, e.g. groom post config#1795)."""
+    if record.get("action") == "fast_path_rerun":
+        return True
+    return dispatch.get("dispatched") is True
+
+
+def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
+    """Distinct, SILENT Telegram receipt — ONLY when ``_watch_is_acting``.
+
+    The sf-telegram-notifier already pinged loud on this FAILED event; this
+    receipt names what the watch is doing (fast-path rerun or agent dispatch).
+    Best-effort — never raises. Returns False (no send) on observe-only paths."""
+    if not _watch_is_acting(record, dispatch):
+        return False
     cfg = PIPELINES.get(pipeline_name) or {}
     has_listener = bool(cfg.get("has_listener", True))
     cadence = _pipeline_label(pipeline_name)
@@ -828,13 +858,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     fast_path = _maybe_fast_path(record, doc.get("events", []), cfg, sm_arn, describe_resp, run_date)
 
     _write_watch_log(s3, cfg["watch_prefix"], run_date, record, doc=doc)  # PRIMARY — fail-loud
-    telegram_sent = _notify(record, key, sm_name)                         # secondary — best-effort
     # M2: fire the agent AFTER the watch-log lands (agent reads fresh context).
     # A successful fast-path rerun REPLACES the agent dispatch for this event.
     if fast_path.get("fast_path"):
         dispatch = {"dispatched": False, "reason": "fast_path_rerun"}
     else:
         dispatch = _maybe_dispatch_agent(record, run_date, key, cfg, sm_name, sm_arn)  # secondary
+    # Telegram only when recovery work actually started (not observe-only).
+    telegram_sent = _notify(record, key, sm_name, dispatch)               # secondary — best-effort
 
     logger.info(
         "Fleet-SF Watch recorded: sf=%s run_date=%s failed_state=%s key=%s telegram=%s fast_path=%s dispatched=%s",

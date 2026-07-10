@@ -111,6 +111,11 @@ FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
 # v3 (metron Holdings balance-sheet band): added the absolute balance-sheet fields
 # (totalDebt / totalCash / ebitda / freeCashflow) the Holdings "Balance Sheet" columns
 # need — cash balance, debt balance, net debt, and net-debt/EBITDA leverage.
+# v4 (metron-ops#163): added trailingEps/forwardEps so the Holdings Valuation band can
+# show raw EPS alongside P/E, not just the ratio.
+# v5 (metron-ops#178): added bookValue/revenuePerShare/enterpriseValue — every Valuation
+# multiple now has its raw input(s) in the same band (P/B -> book value/share, P/S ->
+# revenue/share, EV/EBITDA -> enterprise value).
 FUNDAMENTALS_INFO_KEYS = [
     "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
     "priceToBook", "priceToSalesTrailing12Months",
@@ -118,6 +123,8 @@ FUNDAMENTALS_INFO_KEYS = [
     "returnOnEquity", "returnOnAssets", "grossMargins", "operatingMargins",
     "totalDebt", "totalCash", "ebitda", "freeCashflow",
     "beta", "dividendYield", "marketCap", "sector", "industry",
+    "trailingEps", "forwardEps",
+    "bookValue", "revenuePerShare", "enterpriseValue",
 ]
 # Technicals — per-held-symbol indicators computed from the close_history this module
 # already publishes daily (zero new fetches). Slow-moving (RSI14 / 50d-200d MA / 52w
@@ -171,7 +178,7 @@ FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
-FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow (balance sheet)
+FUNDAMENTALS_SCHEMA_VERSION = 5  # v5: + bookValue/revenuePerShare/enterpriseValue (metron-ops#178)
 INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
 TECHNICALS_SCHEMA_VERSION = 2  # v2: + pct_from_52wk_high (tearsheet parity with Holdings)
 SECURITY_PERFORMANCE_SCHEMA_VERSION = 1
@@ -1782,6 +1789,45 @@ def _flag_suspect_quotes(quotes: dict[str, dict]) -> int:
     return n_suspect
 
 
+# Cross-source scale-coherence bounds (metron-ops#159 — MARUY intraday quote landed at
+# 30.17 against a settled EOD close of 308.40, a 10.2:1 ADR-ratio-scale divergence). The
+# >40% move guard above compares a quote only to ITS OWN prior tick from the SAME
+# yfinance intraday pull — so when yfinance's live quote and its own recent-session bars
+# both silently shift onto a new scale together (an ADR ratio change the live feed picked
+# up that the settled-close run, fetched at a different time, hasn't), `last` and
+# `prev_close` agree with EACH OTHER and the move guard sees nothing wrong. Mirrors
+# metron's consumer-side guard (api/services/intraday.py `_COHERENCE_RATIO_BOUNDS`) but
+# runs at the SOURCE against THIS producer's own settled ``eod_closes`` artifact, so a
+# wrong-scale quote is flagged for every consumer of the spine, not just Metron.
+_SCALE_COHERENCE_RATIO_BOUNDS = (0.5, 2.0)
+
+
+def _flag_scale_incoherent_quotes(quotes: dict[str, dict], eod_closes: dict[str, dict]) -> int:
+    """Flag (never drop) any quote whose implied move vs THIS producer's own settled EOD
+    close (``eod_closes``, the ``market_data/eod_closes/latest.json`` artifact this module
+    also publishes) falls outside ``_SCALE_COHERENCE_RATIO_BOUNDS`` — a real single-session
+    move that large is rare enough that it's overwhelmingly a wrong-scale quote (ADR ratio
+    change, pence-vs-pounds, symbol collision). Symbols with no settled close on file are
+    skipped (nothing to cross-check against). Marks ``suspect: true`` in place and returns
+    the count newly flagged (a quote already suspect from the move guard isn't double
+    counted)."""
+    n_suspect = 0
+    lo, hi = _SCALE_COHERENCE_RATIO_BOUNDS
+    for sym, q in quotes.items():
+        eod = eod_closes.get(sym)
+        settled = (eod or {}).get("close")
+        last = q.get("last")
+        if not settled or last is None:
+            continue
+        ratio = last / settled
+        if not (lo <= ratio <= hi):
+            already = q.get("suspect", False)
+            q["suspect"] = True
+            if not already:
+                n_suspect += 1
+    return n_suspect
+
+
 def collect_intraday(
     *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
     intraday_source: IntradaySource | None = None, force: bool = False,
@@ -1807,8 +1853,11 @@ def collect_intraday(
     for manual runs). The major-index ETF proxies (``INDEX_PROXY_SYMBOLS``) are market
     context — fetched every run regardless of the held universe, so a brand-new account
     still gets the markets strip. A quote moving >40% vs prior close carries
-    ``suspect: true`` (flagged, never dropped). Single ``latest.json`` key — consumers see
-    staleness via ``as_of_utc``. Injectable source/S3 for tests."""
+    ``suspect: true`` (flagged, never dropped); a held quote whose scale disagrees with
+    this producer's own settled EOD close (metron-ops#159) is flagged the same way, even
+    when the move guard alone would miss it (see ``_flag_scale_incoherent_quotes``).
+    Single ``latest.json`` key — consumers see staleness via ``as_of_utc``. Injectable
+    source/S3 for tests."""
     if not force and not in_us_market_window(now):
         return {"status": "skipped", "reason": "outside US market window"}
     if s3_client is None:
@@ -1841,6 +1890,17 @@ def collect_intraday(
     n_suspect = _flag_suspect_quotes(quotes) + _flag_suspect_quotes(indices) + _flag_suspect_quotes(fund_proxies)
     if n_suspect:
         logger.warning("[metron_market_data] %d intraday quote(s) flagged suspect (>40%% vs prev close)", n_suspect)
+
+    # Cross-source scale-coherence check (metron-ops#159): compare each held quote against
+    # THIS producer's own settled EOD close (already published, so no extra fetch). Fail-soft
+    # — a missing/unreadable eod_closes artifact just skips the check (nothing to flag yet).
+    eod_closes = (_read_json(s3_client, bucket, f"{CLOSES_PREFIX}latest.json") or {}).get("closes", {})
+    n_scale_suspect = _flag_scale_incoherent_quotes(quotes, eod_closes)
+    if n_scale_suspect:
+        logger.warning(
+            "[metron_market_data] %d intraday quote(s) flagged suspect (scale-incoherent vs settled close)",
+            n_scale_suspect,
+        )
     artifact = {
         "schema_version": INTRADAY_SCHEMA_VERSION,
         "as_of_utc": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
