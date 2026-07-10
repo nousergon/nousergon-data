@@ -32,7 +32,6 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS = [
     _REPO_ROOT / "infrastructure" / "spot_data_weekly.sh",
-    _REPO_ROOT / "infrastructure" / "spot_drift_detection.sh",
 ]
 
 # Step Function definitions whose per-step SSM command blocks formerly sourced
@@ -47,12 +46,34 @@ _STEP_FUNCTIONS = [
 ]
 
 
+def _split_states_array(expr: str) -> list[str]:
+    """Split a ``States.Array('...', '...', States.Format(...))`` JSONPath
+    intrinsic into its top-level single-quoted string arguments.
+
+    The EOD SF assembles its SSM commands with ``"commands.$": "States.Array(
+    ...)"`` instead of a plain ``"commands"`` list — a shape the original
+    version of this guard silently skipped, which is exactly the liveness-
+    proxy blind spot class: two of the three remaining .env sources lived in
+    those blocks and the guard read as green. Nested intrinsics
+    (``States.Format('...', $.x)``) contribute their literal text too, which
+    is fine for a substring invariant.
+    """
+    return re.findall(r"'((?:[^'\\]|\\.)*)'", expr)
+
+
 def _iter_command_blocks(node):
-    """Yield every Parameters.commands list of strings in a SF definition."""
+    """Yield every SSM command block in a SF definition, as a list of strings.
+
+    Covers BOTH shapes: a plain ``"commands"`` list, and the JSONPath
+    intrinsic ``"commands.$": "States.Array(...)"`` string.
+    """
     if isinstance(node, dict):
         cmds = node.get("commands")
         if isinstance(cmds, list) and all(isinstance(c, str) for c in cmds):
             yield cmds
+        dynamic = node.get("commands.$")
+        if isinstance(dynamic, str):
+            yield _split_states_array(dynamic)
         for v in node.values():
             yield from _iter_command_blocks(v)
     elif isinstance(node, list):

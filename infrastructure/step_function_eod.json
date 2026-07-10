@@ -215,7 +215,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $.run_date))",
           "executionTimeout": [
             "120"
           ]
@@ -337,7 +337,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
           "executionTimeout": [
             "600"
           ]
