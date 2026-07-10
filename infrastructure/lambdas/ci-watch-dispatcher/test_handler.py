@@ -153,11 +153,21 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     ]
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
+    # ci_watch_spot_bootstrap.sh (alpha-engine-config) takes its CI fields as
+    # CLI FLAGS, not env vars — assert the actual invocation shape, not an
+    # `export CI_WATCH_*` form the bootstrap script never reads.
     assert "exec bash infrastructure/ci_watch_spot_bootstrap.sh" in cmd
-    assert "export CI_WATCH_REPO=nousergon/alpha-engine-config" in cmd
-    assert "export CI_WATCH_SHA=abc1234def5678900000000000000000000abcd" in cmd
-    assert 'export CI_WATCH_RUN_URL="https://github.com' in cmd
+    assert '--ci-repo "nousergon/alpha-engine-config"' in cmd
+    assert '--ci-sha "abc1234def5678900000000000000000000abcd"' in cmd
+    assert '--ci-run-url "https://github.com' in cmd
     assert "export HOME=/root" in cmd
+    # run_token is NOT threaded into the box (no in-box consumer — the
+    # completion marker keys directly on repo+sha) — only a Lambda-side
+    # correlation id, surfaced via the SSM Comment field instead.
+    assert "run_token" not in cmd
+    assert "CI_WATCH_RUN_TOKEN" not in cmd
+    assert "token" in sent["Comment"]
+
     assert sent["Parameters"]["executionTimeout"] == [str(idx.MAX_RUNTIME_SECONDS)]
 
 

@@ -171,7 +171,16 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     ci_watch_spot_bootstrap.sh entrypoint (built by a sibling agent in
     alpha-engine-config). Any prelude failure shuts the box down so a botched
-    launch never idles (mirrors groom's prelude fail() trap exactly)."""
+    launch never idles (mirrors groom's prelude fail() trap exactly).
+
+    ``ci_watch_spot_bootstrap.sh`` takes its CI fields as CLI FLAGS
+    (``--ci-repo``/``--ci-sha``/...), not environment variables — invoke it
+    that way, not via `export`. ``run_token`` is deliberately NOT threaded
+    into the box: the bootstrap/run-script side keys its S3 completion
+    marker directly on repo+sha (no per-attempt dispatch token, unlike
+    groom's ``GROOM_RUN_TOKEN``), so there is no in-box consumer for it — it
+    stays a Lambda-side-only correlation id (see the SSM Comment field in
+    ``_send_bootstrap``, and the handler's returned JSON)."""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -188,14 +197,9 @@ git clone --depth 1 --branch {CI_WATCH_CONFIG_BRANCH} \
   "https://x-access-token:${{PAT}}@github.com/{CI_WATCH_CONFIG_REPO}.git" \
   /home/ec2-user/alpha-engine-config || fail "clone failed"
 cd /home/ec2-user/alpha-engine-config
-export CI_WATCH_REPO={repo}
-export CI_WATCH_SHA={sha}
-export CI_WATCH_RUN_ID={run_id}
-export CI_WATCH_RUN_URL="{run_url}"
-export CI_WATCH_WORKFLOW="{workflow}"
-export CI_WATCH_BRANCH={branch}
-export CI_WATCH_RUN_TOKEN={run_token}
-exec bash infrastructure/ci_watch_spot_bootstrap.sh
+exec bash infrastructure/ci_watch_spot_bootstrap.sh \
+  --ci-repo "{repo}" --ci-sha "{sha}" --ci-run-id "{run_id}" \
+  --ci-run-url "{run_url}" --ci-workflow "{workflow}" --ci-branch "{branch}"
 """
 
 
@@ -251,7 +255,7 @@ def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url:
     resp = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
-        Comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id})",
+        Comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
         Parameters={
             "commands": [_bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token)],
             "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
