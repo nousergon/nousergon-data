@@ -3,19 +3,20 @@
 # wire its EventBridge Scheduler rules.
 #
 # WHY: the EC2-spot backlog groom (config#1432) self-reports its terminal state
-# (a `groom-digest` issue + Telegram ping), but only when the box lives long
-# enough to run groom_run.sh's reporting trap. SILENT modes — spot reclaim
-# mid-run, OOM/panic before the trap, a lost SSM command, a broken dispatcher
-# Lambda, a disabled/misconfigured schedule (the 2026-06-29 dead-trigger class) —
-# file NOTHING. This probe is the external watchdog: schedule-aware, it asserts
-# every scheduled groom that has had time to finish filed a terminal digest, and
-# LOUD-pings Telegram for any that didn't. (The "probe now" half; the
-# Step-Function-wrap that would let the existing Fleet-SF Watch cover the groom
-# natively is the tracked "SF later" follow-up.)
+# (an S3 run artifact under groom/{date}/ + Telegram ping), but only when the
+# box lives long enough to run groom_run.sh's reporting trap. SILENT modes —
+# spot reclaim mid-run, OOM/panic before the trap, a lost SSM command, a broken
+# dispatcher Lambda, a disabled/misconfigured schedule (the 2026-06-29
+# dead-trigger class) — file NOTHING. This probe is the external watchdog:
+# schedule-aware, it asserts every scheduled groom that has had time to finish
+# wrote a terminal run artifact, and LOUD-pings Telegram for any that didn't.
+# (The "probe now" half; the Step-Function-wrap that would let the existing
+# Fleet-SF Watch cover the groom natively is the tracked "SF later" follow-up.)
 #
-# IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds + the shared
-# Fleet-Watch PAT) + s3 Get/Put on the dedup state key. No EC2/SSM-send — it only
-# READS state, never launches anything.
+# IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds) + s3 Get/Put
+# on the dedup state key + s3 List/Get on the groom/ run-artifact prefix
+# (config#2037). No EC2/SSM-send — it only READS state, never launches
+# anything.
 #
 # Cadence (UTC): two runs/day, each after a groom's worst-case completion
 # (groom hard-ceiling 360 min + slack). Per-trigger windows + S3 dedup make the

@@ -1,20 +1,22 @@
 """alpha-engine-groom-liveness-probe — external heartbeat for the EC2-spot groom.
 
-The backlog groom (config#1432) self-reports its terminal state: a clean run
-files a ``groom-digest`` issue, a loud failure/timeout files a ``groom-digest``
-failure issue, and both ping Telegram. That covers the **loud** failure modes.
-It does NOT cover the **silent** ones — a spot reclaim mid-run, the box OOMing
-or panicking before ``groom_run.sh`` installs its reporting trap, an SSM command
-that never lands, the dispatcher Lambda erroring, or the EventBridge schedule
-being broken/disabled (the 2026-06-29 dead-trigger class). In every silent mode
-NO terminal artifact is filed for a scheduled run — and nothing notices.
+The backlog groom (config#1432) self-reports its terminal state as an S3 run
+artifact (``groom/{date}/{run_id}.json`` — config#1808 made this the PRIMARY
+run record, written by every completed run: success, floor-breach,
+crash-cascade, turn-budget-exceeded) plus a Telegram ping. That covers the
+**loud** failure modes. It does NOT cover the **silent** ones — a spot reclaim
+mid-run, the box OOMing or panicking before ``groom_run.sh`` installs its
+reporting trap, an SSM command that never lands, the dispatcher Lambda
+erroring, or the EventBridge schedule being broken/disabled (the 2026-06-29
+dead-trigger class). In every silent mode NO terminal artifact is filed for a
+scheduled run — and nothing notices.
 
 This probe is the independent watchdog. It is schedule-aware: it knows when a
 groom was *supposed* to run, and for each scheduled trigger that has had time to
-finish, it asserts a ``groom-digest`` issue was filed inside that run's window.
+finish, it asserts a run artifact was written inside that run's window.
 A trigger with no terminal report → the box died silently or never launched →
 LOUD Telegram alert (the one surface the groom's own self-report could not
-reach). Per-trigger accounting (not just "latest digest age") so a single silent
+reach). Per-trigger accounting (not just "latest artifact age") so a single silent
 death masked by the next successful groom is still caught.
 
 Mirrors the Fleet-SF Watch philosophy (nousergon/alpha-engine-config#1227) — an
@@ -23,12 +25,24 @@ applied to the groom, which (unlike the three fleet SFs) is not a Step Function
 and so gets no EventBridge terminal-failure event. (SF-wrap follow-up tracked
 separately; this is the "probe now" half.)
 
-**Fail-loud (CLAUDE.md no-silent-fails).** Reading the digest issues is the
-PRIMARY input → a GitHub/SSM error RAISES so the check's absence surfaces via the
-Lambda error metric + CW alarm (a silently-skipped liveness check is itself the
-silent failure this guards against). The Telegram alert is the delivery surface;
-its failure is logged + returned but does not raise (the missed-run finding is
-still in the structured return + logs).
+config#2037: this probe originally read GitHub issues labeled ``groom-digest``
+instead of the S3 artifact directly. config#1808 (merged 2026-07-07) retired
+the routine per-run ``groom-digest`` issue entirely, so every clean scheduled
+trigger since then produced zero matching issues and the probe was on track to
+false-alarm "SILENT FAILURE" on nearly every mature trigger; config#2033
+retires the alarm-issue class too, making the GitHub signal permanently empty.
+Switched the PRIMARY input to the S3 run-artifact prefix itself — the signal
+this probe should have used from the start (no third-party API round-trip, and
+it predates config#1808 too).
+
+**Fail-loud (CLAUDE.md no-silent-fails).** Reading the run artifacts is the
+PRIMARY input → an S3 list/read error RAISES so the check's absence surfaces via
+the Lambda error metric + CW alarm (a silently-skipped liveness check is itself
+the silent failure this guards against). A malformed individual artifact body is
+logged and skipped (a content anomaly, not an infra failure the probe itself
+should die on). The Telegram alert is the delivery surface; its failure is
+logged + returned but does not raise (the missed-run finding is still in the
+structured return + logs).
 """
 
 from __future__ import annotations
@@ -36,7 +50,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -60,14 +73,9 @@ _OPS_TOPICS = (
 # schedule/ceiling changes (no fragile probe-time tuning needed for once-per-miss).
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
 STATE_KEY = os.environ.get("GROOM_LIVENESS_STATE_KEY", "consolidated/groom_liveness/alerted.json")
-# Repo the groom files its digest / failure issues into.
-DIGEST_REPO = os.environ.get("GROOM_DIGEST_REPO", "nousergon/alpha-engine-config")
-DIGEST_LABEL = os.environ.get("GROOM_DIGEST_LABEL", "groom-digest")
-# Shared fine-grained PAT (SecureString) — same param the Fleet-SF Watch uses;
-# needs `issues:read` on DIGEST_REPO. Read at probe time only, never logged.
-GITHUB_PAT_SSM_PARAM = os.environ.get(
-    "GITHUB_PAT_SSM_PARAM", "/alpha-engine/saturday_sf_watch/github_pat"
-)
+# S3 prefix the groom driver writes its per-run PRIMARY artifact under
+# (groom_driver.py::write_run_artifact, config#1808): groom/{date}/{run_id}.json.
+RUN_ARTIFACT_PREFIX = os.environ.get("GROOM_RUN_ARTIFACT_PREFIX", "groom/")
 # A run's worst-case wall clock = the spot box hard-timeout watchdog
 # (groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS, 360 min) + slack for box boot +
 # report latency. A trigger is only checked once now >= T + CEILING + MARGIN, so
@@ -76,9 +84,8 @@ CEILING_MIN = int(os.environ.get("GROOM_CEILING_MIN", "360"))
 MARGIN_MIN = int(os.environ.get("GROOM_MARGIN_MIN", "45"))
 # How far back to enumerate triggers. Must exceed the longest inter-groom gap +
 # CEILING + MARGIN so a single silent death (otherwise masked by the next
-# successful run's digest) is still attributed to its own trigger window.
+# successful run's artifact) is still attributed to its own trigger window.
 LOOKBACK_HOURS = int(os.environ.get("GROOM_LOOKBACK_HOURS", "30"))
-_PAT_TIMEOUT_SEC = 15
 
 # Groom schedule (UTC), MIRRORS the dispatcher's EventBridge Scheduler crons
 # (scheduled-groom-dispatcher/deploy.sh SCHED_CRONS). `dows` are Python weekday
@@ -90,9 +97,9 @@ _PAT_TIMEOUT_SEC = 15
 # complexity:high-only schedule existed since 2026-07-01 (config#1495 follow-up)
 # but this probe never tracked it, a blind spot for that schedule's silent
 # failures. No special-casing needed for its "empty complexity:high queue"
-# clean-stop case: groom_driver.py files a groom-digest issue even on a
-# total==0 clean shutdown, so _missed()'s presence-in-window check (it never
-# inspects digest CONTENT) already treats that correctly as "not missed."
+# clean-stop case: groom_driver.py writes a run artifact even on a total==0
+# clean shutdown, so _missed()'s presence-in-window check (it never inspects
+# artifact CONTENT) already treats that correctly as "not missed."
 #   cron(0 1 * * ? *)  → 01:00 daily (Opus, complexity:high only)
 #   cron(0 7 * * ? *)  → 07:00 daily (Sonnet, complexity:mid only)
 #   cron(0 19 * * ? *) → 19:00 daily (Haiku, complexity:low only)
@@ -191,43 +198,46 @@ def _save_alerted(s3, alerted: set[str]) -> None:
         logger.warning("could not persist liveness state %s: %s", STATE_KEY, exc)
 
 
-def _get_github_pat() -> str:
-    ssm = boto3.client("ssm", region_name=REGION)
-    resp = ssm.get_parameter(Name=GITHUB_PAT_SSM_PARAM, WithDecryption=True)
-    return resp["Parameter"]["Value"]
-
-
-def _fetch_digest_timestamps(pat: str) -> list[datetime]:
-    """Created-at timestamps of recent ``groom-digest``-labeled issues (success
-    digests AND loud-failure issues both carry the label). PRIMARY input — RAISES
-    on error (fail-loud)."""
-    url = (
-        f"https://api.github.com/repos/{DIGEST_REPO}/issues"
-        f"?labels={DIGEST_LABEL}&state=all&sort=created&direction=desc&per_page=50"
-    )
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {pat}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "groom-liveness-probe",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=_PAT_TIMEOUT_SEC) as resp:
-        issues = json.loads(resp.read())
+def _fetch_run_artifact_timestamps(s3, now: datetime) -> list[datetime]:
+    """``run_start`` timestamps of recent groom S3 run artifacts
+    (``groom/{date}/*.json`` — config#1808's PRIMARY run record, written by
+    every completed run: success, floor-breach, crash-cascade,
+    turn-budget-exceeded). PRIMARY input — a list/read (boto3 ClientError)
+    failure RAISES uncaught (fail-loud); a malformed individual artifact body
+    is logged and skipped (content anomaly, not an infra failure)."""
+    horizon = now - timedelta(hours=LOOKBACK_HOURS)
     stamps: list[datetime] = []
-    for it in issues:
-        created = it.get("created_at")
-        if not created:
-            continue
-        stamps.append(datetime.fromisoformat(created.replace("Z", "+00:00")))
+    paginator = s3.get_paginator("list_objects_v2")
+    day = horizon.date()
+    last = now.date()
+    while day <= last:
+        prefix = f"{RUN_ARTIFACT_PREFIX}{day.isoformat()}/"
+        for page in paginator.paginate(Bucket=WATCH_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".json"):
+                    continue
+                try:
+                    body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
+                    art = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    logger.warning("could not parse run artifact %s (malformed JSON): %s", key, exc)
+                    continue
+                run_start = art.get("run_start", "")
+                if not run_start:
+                    continue
+                try:
+                    stamps.append(datetime.fromisoformat(run_start.replace("Z", "+00:00")))
+                except ValueError:
+                    logger.warning("run artifact %s has unparsable run_start=%r", key, run_start)
+        day += timedelta(days=1)
     return stamps
 
 
 def _missed(triggers: list[dict], stamps: list[datetime]) -> list[dict]:
-    """A trigger is a MISS iff no digest issue was created inside its run window
-    [T, T + CEILING + MARGIN]. Windows for the default schedule don't overlap, so
-    attribution is 1:1."""
+    """A trigger is a MISS iff no run artifact's run_start falls inside its run
+    window [T, T + CEILING + MARGIN]. Windows for the default schedule don't
+    overlap, so attribution is 1:1."""
     window = timedelta(minutes=CEILING_MIN + MARGIN_MIN)
     misses: list[dict] = []
     for trig in triggers:
@@ -244,7 +254,7 @@ def _alert(misses: list[dict]) -> bool:
     lines = [
         "\U0001f6f0️ *Groom Liveness Probe — SILENT FAILURE*",
         f"{len(misses)} scheduled groom run(s) filed NO terminal report "
-        f"(no `{DIGEST_LABEL}` issue in-window):",
+        f"(no S3 run artifact under `{RUN_ARTIFACT_PREFIX}` in-window):",
     ]
     for m in misses:
         lines.append(f"• {m['label']} @ {m['at'].strftime('%Y-%m-%d %H:%M')}Z")
@@ -273,18 +283,17 @@ def _alert(misses: list[dict]) -> bool:
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Returns a structured result; raises on
-    a PRIMARY-input (GitHub/SSM) failure so the check can never silently no-op."""
+    a PRIMARY-input (S3 list/read) failure so the check can never silently no-op."""
     now = _now()
     triggers = _expected_triggers(now)
     logger.info("groom liveness probe: %d mature trigger(s) in last %dh", len(triggers), LOOKBACK_HOURS)
     if not triggers:
         return {"checked": 0, "missed": 0, "alerted": False, "reason": "no mature triggers in window"}
 
-    pat = _get_github_pat()
-    stamps = _fetch_digest_timestamps(pat)  # PRIMARY — fail-loud
+    s3 = _s3_client()
+    stamps = _fetch_run_artifact_timestamps(s3, now)  # PRIMARY — fail-loud
     misses = _missed(triggers, stamps)
 
-    s3 = _s3_client()
     already = _load_alerted(s3, now)
     new_misses = [m for m in misses if m["at"].isoformat() not in already]
 
@@ -302,13 +311,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     elif misses:
         logger.info("groom liveness: %d miss(es) already alerted — suppressed", len(misses))
     else:
-        logger.info("groom liveness: all %d scheduled run(s) reported a terminal digest", len(triggers))
+        logger.info("groom liveness: all %d scheduled run(s) reported a terminal artifact", len(triggers))
 
     return {
         "checked": len(triggers),
         "missed": len(misses),
         "new_missed": len(new_misses),
         "missed_triggers": [m["at"].isoformat() for m in new_misses],
-        "digests_seen": len(stamps),
+        "artifacts_seen": len(stamps),
         "alerted": alerted,
     }

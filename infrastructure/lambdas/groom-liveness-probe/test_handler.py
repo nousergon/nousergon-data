@@ -156,6 +156,72 @@ def test_single_silent_death_not_masked_by_later_success(monkeypatch):
     assert [m["at"] for m in misses] == [t_dead["at"]]
 
 
+# ---- _fetch_run_artifact_timestamps -----------------------------------------
+
+
+class _FakeArtifactS3:
+    """Fake covering the paginator + get_object surface
+    ``_fetch_run_artifact_timestamps`` uses. ``objects`` maps a full S3 key to
+    either a dict (JSON-serialized on read) or a raw bytes/str body."""
+
+    def __init__(self, objects):
+        self._objects = objects
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        return self
+
+    def paginate(self, Bucket, Prefix):  # noqa: N803
+        keys = [k for k in self._objects if k.startswith(Prefix)]
+        yield {"Contents": [{"Key": k} for k in keys]}
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        import io
+
+        body = self._objects[Key]
+        if isinstance(body, dict):
+            body = index.json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        return {"Body": io.BytesIO(body)}
+
+
+def test_fetch_run_artifact_timestamps_reads_run_start(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    s3 = _FakeArtifactS3({
+        "groom/2026-06-29/abc123.json": {"run_start": "2026-06-29T23:00:00Z"},
+        "groom/2026-06-30/def456.json": {"run_start": "2026-06-30T07:00:00Z"},
+    })
+    stamps = index._fetch_run_artifact_timestamps(s3, _dt(2026, 6, 30, 8, 0))
+    assert set(stamps) == {_dt(2026, 6, 29, 23, 0), _dt(2026, 6, 30, 7, 0)}
+
+
+def test_fetch_run_artifact_timestamps_skips_malformed_json(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    s3 = _FakeArtifactS3({
+        "groom/2026-06-30/good.json": {"run_start": "2026-06-30T07:00:00Z"},
+        "groom/2026-06-30/bad.json": "{not valid json",
+    })
+    stamps = index._fetch_run_artifact_timestamps(s3, _dt(2026, 6, 30, 8, 0))
+    assert stamps == [_dt(2026, 6, 30, 7, 0)]
+
+
+def test_fetch_run_artifact_timestamps_skips_missing_run_start(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    s3 = _FakeArtifactS3({
+        "groom/2026-06-30/no-run-start.json": {"schema_version": 6},
+    })
+    assert index._fetch_run_artifact_timestamps(s3, _dt(2026, 6, 30, 8, 0)) == []
+
+
+def test_fetch_run_artifact_timestamps_ignores_non_json_keys(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    s3 = _FakeArtifactS3({
+        "groom/2026-06-30/README.md": "not an artifact",
+    })
+    assert index._fetch_run_artifact_timestamps(s3, _dt(2026, 6, 30, 8, 0)) == []
+
+
 # ---- handler (dedup + fail-loud) -------------------------------------------
 
 
@@ -185,8 +251,7 @@ def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 
     # the trigger dates the other tests share.
     monkeypatch.setattr(index, "_now", lambda: now)
     monkeypatch.setattr(index, "_expected_triggers", lambda now: triggers)
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "pat")
-    monkeypatch.setattr(index, "_fetch_digest_timestamps", lambda pat: stamps)
+    monkeypatch.setattr(index, "_fetch_run_artifact_timestamps", lambda s3, now: stamps)
     monkeypatch.setattr(index, "_s3_client", lambda: s3)
     sends = []
     monkeypatch.setattr(
@@ -225,17 +290,17 @@ def test_handler_all_reported_no_alert(monkeypatch):
     assert out["missed"] == 0 and out["alerted"] is False and sends == []
 
 
-def test_handler_fail_loud_on_github_error(monkeypatch):
-    """The PRIMARY input (digest fetch) RAISES — a silently-skipped check is the
-    exact failure this guards against."""
+def test_handler_fail_loud_on_s3_error(monkeypatch):
+    """The PRIMARY input (S3 run-artifact fetch) RAISES — a silently-skipped
+    check is the exact failure this guards against."""
     trig = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
     monkeypatch.setattr(index, "_expected_triggers", lambda now: [trig])
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "pat")
+    monkeypatch.setattr(index, "_s3_client", lambda: _FakeS3())
 
-    def _boom(pat):
-        raise RuntimeError("github 500")
+    def _boom(s3, now):
+        raise RuntimeError("s3 list error")
 
-    monkeypatch.setattr(index, "_fetch_digest_timestamps", _boom)
+    monkeypatch.setattr(index, "_fetch_run_artifact_timestamps", _boom)
     with pytest.raises(RuntimeError):
         index.handler({}, None)
 

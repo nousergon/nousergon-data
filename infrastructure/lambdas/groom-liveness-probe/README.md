@@ -1,9 +1,9 @@
 # alpha-engine-groom-liveness-probe
 
 External heartbeat for the EC2-spot backlog groom (config#1432). The groom
-self-reports its terminal state (a `groom-digest` issue + Telegram ping) **only
-when the box lives long enough to run `groom_run.sh`'s reporting trap**. This
-probe covers the modes that file *nothing*:
+self-reports its terminal state (an S3 run artifact under `groom/{date}/` +
+Telegram ping) **only when the box lives long enough to run `groom_run.sh`'s
+reporting trap**. This probe covers the modes that file *nothing*:
 
 - spot reclaim mid-run
 - OOM / kernel panic before the trap installs
@@ -21,20 +21,27 @@ Schedule-aware, per-trigger accounting:
    (01:00 daily Opus high-only, 07:00 daily Sonnet mid-only, 19:00 daily Haiku
    low-only) and is overridable via
    `GROOM_SCHEDULE` (JSON).
-2. Fetch recent `groom-digest`-labeled issues from `nousergon/alpha-engine-config`
-   (success digests **and** loud-failure issues both carry the label).
-3. For each trigger, assert a digest was created inside its run window
-   `[T, T + CEILING + MARGIN]`. A trigger with no digest → that scheduled groom
+2. List recent S3 run artifacts under `groom/{date}/` (`alpha-engine-research`
+   bucket — `groom_driver.py::write_run_artifact`'s PRIMARY run record,
+   config#1808, written by every completed run: success, floor-breach,
+   crash-cascade, turn-budget-exceeded) and read each artifact's `run_start`.
+3. For each trigger, assert an artifact's `run_start` fell inside its run window
+   `[T, T + CEILING + MARGIN]`. A trigger with no artifact → that scheduled groom
    filed no terminal report → **LOUD Telegram alert**. Per-trigger windows mean a
    single silent death is **not masked** by the next successful run.
 4. S3 dedup state (`consolidated/groom_liveness/alerted.json`) suppresses
    re-pinging a standing miss; generous lookback + dedup → tolerant to schedule /
    ceiling changes (no fragile probe-time tuning).
 
-**Fail-loud:** the digest fetch is the PRIMARY input → a GitHub/SSM error RAISES
+**Fail-loud:** the S3 artifact list/read is the PRIMARY input → an error RAISES
 (surfaces via the Lambda error metric + a CW alarm); a silently-skipped check is
 the exact failure this guards against. The Telegram send and the dedup-state
 write are best-effort.
+
+config#2037: this probe originally read `groom-digest`-labeled GitHub issues
+instead. config#1808 retired the routine per-run issue, so the GitHub signal
+went permanently empty — switched to reading the S3 artifact directly (the
+signal that should have been used from the start).
 
 ## Relationship to the Fleet-SF Watch
 
