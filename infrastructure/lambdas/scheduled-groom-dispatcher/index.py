@@ -923,6 +923,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `pr_budget` is set only on the Opus high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
+    `queue_manifest_key` (config#2152/#2175) marks an explicit operator queue
+    (drain runs): it bypasses the demand-count gates — which count GitHub
+    enumeration, meaningless for a manifest — but launches SPOT-FIRST and
+    still honors the pre-boot pace gate (weekly WET protection covers drains).
 
     Pre-boot pace gate (2026-07-04): if weekly Claude usage is running ahead
     of a linear pace through the current reset window, the launch is skipped
@@ -966,6 +970,18 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # config#2152/#2147: manifest-consumption opt-in (drain runs / post-parity
     # cutover). FAIL LOUD on a malformed key — this string is embedded in the
     # box's root-shell bootstrap command line, so the character set is strict.
+    #
+    # config#2175 (gate/market split): a manifest run BYPASSES the demand-count
+    # gates below — the demand gate counts GitHub enumeration, meaningless for
+    # an explicit operator-built queue — but launches SPOT-FIRST like every
+    # other run (the lib's on-demand capacity fallback still applies).
+    # Previously drain runs had to set force_on_demand:true just to skip the
+    # gate, paying for an on-demand box as a side effect of `force_on_demand`
+    # conflating "skip demand gate" with "force on-demand market";
+    # force_on_demand keeps BOTH meanings for its one remaining caller (the
+    # dispatch SF's final bounded relaunch retry). The pre-boot PACE gate
+    # deliberately still applies to manifest runs — weekly WET protection
+    # covers drains too.
     queue_manifest_key = str(event.get("queue_manifest_key") or "")
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
@@ -999,7 +1015,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 return {"decide": {"launches": [], **skip}}
             return {"groom": skip}
 
-    if run_mode == "full" and not force_on_demand and str(event.get("trigger", "")) == "demand-all":
+    if (run_mode == "full" and not force_on_demand and not queue_manifest_key
+            and str(event.get("trigger", "")) == "demand-all"):
         # config#1933 SYMMETRIC triggers (Brian's ratified correction): every
         # scheduled trigger evaluates the FULL backlog and launches 0..3 boxes
         # — one per tier clearing the floor, thin tiers attached upward, the
@@ -1057,7 +1074,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "launches": results}}
 
     partition_index, partition_count = 0, 1
-    if run_mode == "full" and not force_on_demand:
+    if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
             decision, counts = decided
