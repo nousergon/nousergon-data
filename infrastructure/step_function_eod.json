@@ -1,10 +1,10 @@
 {
-  "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
+  "Comment": "Alpha Engine EOD Pipeline — post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "CheckMutexRole",
   "States": {
     "CheckMutexRole": {
       "Type": "Choice",
-      "Comment": "L274 SF MutualExclusionGuard \u2014 gate at SF entry point. Allowlist cadence-roles (daily / weekly / eod / shell-run) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Daemon-triggered EOD launches set pipeline_role='eod' (executor/daemon.py:1092); operator-launched replays MUST set their own pipeline_role per the taxonomy in pipeline-reporting-revamp-260524.md \u00a76. Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations \u2014 that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell.",
+      "Comment": "L274 SF MutualExclusionGuard — gate at SF entry point. Allowlist cadence-roles (daily / weekly / eod / shell-run) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Daemon-triggered EOD launches set pipeline_role='eod' (executor/daemon.py:1092); operator-launched replays MUST set their own pipeline_role per the taxonomy in pipeline-reporting-revamp-260524.md §6. Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations — that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell.",
       "Choices": [
         {
           "And": [
@@ -40,7 +40,7 @@
     },
     "AcquireMutex": {
       "Type": "Task",
-      "Comment": "L274 \u2014 DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException \u2192 MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
+      "Comment": "L274 — DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException → MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
       "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
       "Parameters": {
         "TableName": "alpha-engine-sf-execution-mutex",
@@ -68,7 +68,7 @@
           "ErrorEquals": [
             "DynamoDB.ConditionalCheckFailedException"
           ],
-          "Comment": "Mutex held by another concurrent execution in the same minute bucket \u2014 the duplicate-trigger case we are explicitly protecting against. Fail loud (EOD has its own ForceStopInstance cost-guard on the failure path, so a MutexConflict still releases the trading instance).",
+          "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud (EOD has its own ForceStopInstance cost-guard on the failure path, so a MutexConflict still releases the trading instance).",
           "Next": "MutexConflict",
           "ResultPath": "$.mutex_conflict"
         },
@@ -87,11 +87,11 @@
     "MutexConflict": {
       "Type": "Fail",
       "Error": "MutexConflict",
-      "Cause": "L274: another EOD execution with the same pipeline_role + start-minute already holds the mutex. Cost-guard note: the EOD SF's HandleFailure \u2192 ForceStopInstance chain is unreachable from a Fail state, but a duplicate EOD execution by definition means another EOD execution IS running the cost-guard path; the trading instance still gets stopped."
+      "Cause": "L274: another EOD execution with the same pipeline_role + start-minute already holds the mutex. Cost-guard note: the EOD SF's HandleFailure → ForceStopInstance chain is unreachable from a Fail state, but a duplicate EOD execution by definition means another EOD execution IS running the cost-guard path; the trading instance still gets stopped."
     },
     "StartTradingInstance": {
       "Type": "Task",
-      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it \u2014 so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand \u2192 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 \u2192 SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it — so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand → 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 → SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -120,7 +120,7 @@
     },
     "WaitForInstanceReady": {
       "Type": "Wait",
-      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped\u2192running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
       "Seconds": 15,
       "Next": "InitSSMPollCounter"
     },
@@ -171,7 +171,7 @@
     },
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online \u2192 CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run \u2014 postmarket \u2192 arctic \u2192 snapshot \u2192 reconcile \u2014 executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails \u2014 the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile \u2014 an unreachable box fails the execution loud.",
+      "Comment": "PingStatus=Online → CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run — postmarket → arctic → snapshot → reconcile — executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails — the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile — an unreachable box fails the execution loud.",
       "Choices": [
         {
           "And": [
@@ -207,286 +207,6 @@
       "ResultPath": "$.ssm_poll",
       "Next": "DescribeInstanceInfo"
     },
-    "PostMarketData": {
-      "Type": "Task",
-      "Comment": "Capture today's closing prices via yfinance + compute the feature-store snapshot (runs on ae-trading). The slow ArcticDB daily_append is split out into the separate PostMarketArcticAppend state (2026-06-16) \u2014 mirrors the weekday MorningEnrich + MorningArcticAppend split (L4608) \u2014 because the monolithic --daily run exceeded the 1200s SSM executionTimeout mid-append on 2026-06-16 \u2192 SIGKILL \u2192 whole EOD pipeline failed. Hard-fails on non-zero exit via pipefail so tee does not mask python failures.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -o pipefail",
-            "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "export ALPHA_ENGINE_DEPLOYED=1",
-            "export FLOW_DOCTOR_ENABLED=1",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/postmarket-data.log \"s3://alpha-engine-research/_ssm_logs/postmarket-data/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python weekly_collector.py --daily --skip-arctic-append 2>&1 | tee /var/log/postmarket-data.log"
-          ],
-          "executionTimeout": [
-            "1800"
-          ]
-        },
-        "TimeoutSeconds": 1800
-      },
-      "TimeoutSeconds": 1860,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.TaskFailed"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "Hard-fail: EOD reconcile requires fresh ArcticDB closes (price_cache raises RuntimeError on miss). Don't paper over a PostMarketData failure.",
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.postmarket_result",
-      "Next": "WaitForPostMarketData"
-    },
-    "WaitForPostMarketData": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.postmarket_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
-      },
-      "ResultPath": "$.postmarket_poll",
-      "Next": "CheckPostMarketStatus"
-    },
-    "CheckPostMarketStatus": {
-      "Type": "Choice",
-      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
-      "Choices": [
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "Success",
-          "Next": "CheckSkipPostMarketArcticAppend"
-        },
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "PostMarketWait"
-        },
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "PostMarketWait"
-        },
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "PostMarketWait"
-        }
-      ],
-      "Default": "PostMarketStatusError"
-    },
-    "PostMarketStatusError": {
-      "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
-      "Parameters": {
-        "source": "post_market_status",
-        "status.$": "$.postmarket_poll.Status",
-        "status_details.$": "$.postmarket_poll.StatusDetails",
-        "response_code.$": "$.postmarket_poll.ResponseCode",
-        "command_id.$": "$.postmarket_poll.CommandId",
-        "instance_id.$": "$.postmarket_poll.InstanceId"
-      },
-      "ResultPath": "$.error",
-      "Next": "HandleFailure"
-    },
-    "PostMarketWait": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "WaitForPostMarketData"
-    },
-    "CheckSkipPostMarketArcticAppend": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate. Input {\"skip_post_market_arctic_append\": true} routes past PostMarketArcticAppend to the next gate (CheckSkipCaptureSnapshot); missing flag = run as normal. The slow ArcticDB daily_append was split out of PostMarketData 2026-06-16 (mirrors the weekday MorningArcticAppend split, L4608) \u2014 as its own state it gets a longer timeout decoupled from the feature compute, and a recovery rerun can skip whichever half already completed. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.pipeline_role",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.pipeline_role",
-              "StringEquals": "operator-replay"
-            },
-            {
-              "Variable": "$.skip_post_market_arctic_append",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_post_market_arctic_append",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipCaptureSnapshot"
-        }
-      ],
-      "Default": "PostMarketArcticAppend"
-    },
-    "PostMarketArcticAppend": {
-      "Type": "Task",
-      "Comment": "LOAD-BEARING: ArcticDB universe daily_append for today's post-market closes \u2014 writes the OHLCV row + recomputed features that EOD reconcile + predictor inference read next. Split out of PostMarketData 2026-06-16: the append is the slow part and the monolithic --daily run exceeded PostMarketData's 1200s executionTimeout mid-append \u2192 SIGKILL \u2192 whole EOD pipeline failed (no reconcile, no EOD email). Own longer timeout (2400s) decoupled from the feature compute; reads the daily_closes PostMarketData just wrote. Failure \u2192 HandleFailure. Hard-fails on non-zero exit via pipefail so tee does not mask python failures.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -o pipefail",
-            "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "export ALPHA_ENGINE_DEPLOYED=1",
-            "export FLOW_DOCTOR_ENABLED=1",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/postmarket-arctic-append.log \"s3://alpha-engine-research/_ssm_logs/postmarket-arctic-append/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python weekly_collector.py --daily-arctic-append 2>&1 | tee /var/log/postmarket-arctic-append.log"
-          ],
-          "executionTimeout": [
-            "2400"
-          ]
-        },
-        "TimeoutSeconds": 2400
-      },
-      "TimeoutSeconds": 2460,
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "Hard-fail: EOD reconcile + predictor read the ArcticDB universe next. Don't paper over an append failure.",
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.postmarket_arctic_result",
-      "Next": "WaitForPostMarketArcticAppend"
-    },
-    "WaitForPostMarketArcticAppend": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.postmarket_arctic_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
-      },
-      "ResultPath": "$.postmarket_arctic_poll",
-      "Next": "CheckPostMarketArcticAppendStatus"
-    },
-    "CheckPostMarketArcticAppendStatus": {
-      "Type": "Choice",
-      "Comment": "LOAD-BEARING like CheckPostMarketStatus: only Success proceeds (to CaptureSnapshot); any other terminal SSM status \u2192 HandleFailure (reconcile must not run on a stale ArcticDB universe). Only InProgress/Pending/Delayed keep polling.",
-      "Choices": [
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "Success",
-          "Next": "CheckSkipCaptureSnapshot"
-        },
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "PostMarketArcticAppendWait"
-        },
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "PostMarketArcticAppendWait"
-        },
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "PostMarketArcticAppendWait"
-        }
-      ],
-      "Default": "PostMarketArcticAppendStatusError"
-    },
-    "PostMarketArcticAppendStatusError": {
-      "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
-      "Parameters": {
-        "source": "post_market_arctic_append_status",
-        "status.$": "$.postmarket_arctic_poll.Status",
-        "status_details.$": "$.postmarket_arctic_poll.StatusDetails",
-        "response_code.$": "$.postmarket_arctic_poll.ResponseCode",
-        "command_id.$": "$.postmarket_arctic_poll.CommandId",
-        "instance_id.$": "$.postmarket_arctic_poll.InstanceId"
-      },
-      "ResultPath": "$.error",
-      "Next": "HandleFailure"
-    },
-    "PostMarketArcticAppendWait": {
-      "Type": "Wait",
-      "Seconds": 20,
-      "Next": "WaitForPostMarketArcticAppend"
-    },
     "CaptureSnapshot": {
       "Type": "Task",
       "Comment": "Phase 2 of EOD-SF cutover: capture live IB state once at end-of-day and persist to s3://...trades/snapshots/{run_date}.json. EODReconcile then reads the snapshot instead of querying live IB. Decouples capture from reconciliation so the row keyed by run_date=X sources from observations made at time X.",
@@ -495,7 +215,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $.run_date))",
           "executionTimeout": [
             "120"
           ]
@@ -518,7 +238,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Hard-fail: EODReconcile depends on this snapshot. No silent fallback to live IB \u2014 that's the whole point of Phase 2.",
+          "Comment": "Hard-fail: EODReconcile depends on this snapshot. No silent fallback to live IB — that's the whole point of Phase 2.",
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -592,7 +312,7 @@
     },
     "SnapshotStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result.",
+      "Comment": "Choice Default path — synthesize $.error from poll result.",
       "Parameters": {
         "source": "snapshot_status",
         "status.$": "$.snapshot_poll.Status",
@@ -611,13 +331,13 @@
     },
     "EODReconcile": {
       "Type": "Task",
-      "Comment": "Run EOD reconciliation on trading EC2 \u2014 reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Deploy-freshness is guaranteed UPSTREAM by the top-of-pipeline RefreshExecutorDeploy chokepoint (config#1549) \u2014 the whole EOD run executes latest origin/main by construction, so nousergon-data#574's per-step boot-pull is no longer carried here. eod_reconcile.py's ExecutorPreflight deploy-drift guard remains the authoritative fail-loud gate. (executionTimeout left at 600s from #574 \u2014 a safe upper bound; harmless without the inline refresh.)",
+      "Comment": "Run EOD reconciliation on trading EC2 — reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Deploy-freshness is guaranteed UPSTREAM by the top-of-pipeline RefreshExecutorDeploy chokepoint (config#1549) — the whole EOD run executes latest origin/main by construction, so nousergon-data#574's per-step boot-pull is no longer carried here. eod_reconcile.py's ExecutorPreflight deploy-drift guard remains the authoritative fail-loud gate. (executionTimeout left at 600s from #574 — a safe upper bound; harmless without the inline refresh.)",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
           "executionTimeout": [
             "600"
           ]
@@ -713,7 +433,7 @@
     },
     "EODStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
       "Parameters": {
         "source": "eod_status",
         "status.$": "$.eod_poll.Status",
@@ -732,7 +452,7 @@
     },
     "DailySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 \u2192 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (alerts on failure but does not halt pipeline) \u2014 same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed.",
+      "Comment": "Phase 2 → 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (alerts on failure but does not halt pipeline) — same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -759,7 +479,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Substrate check failure is non-blocking \u2014 continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement: trading EC2 must always stop, regardless of substrate-check outcome.",
+          "Comment": "Substrate check failure is non-blocking — continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement: trading EC2 must always stop, regardless of substrate-check outcome.",
           "Next": "StopTradingInstance",
           "ResultPath": "$.substrate_check_error"
         }
@@ -790,7 +510,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Non-blocking \u2014 continue to StopTradingInstance even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
+          "Comment": "Non-blocking — continue to StopTradingInstance even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
           "Next": "StopTradingInstance",
           "ResultPath": "$.substrate_check_error"
         }
@@ -807,7 +527,7 @@
     },
     "CheckSkipRefreshExecutorDeploy": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607) for the top-of-pipeline executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} routes past RefreshExecutorDeploy to the first work gate (CheckSkipPostMarketData); missing flag = run as normal. This is the FIRST gate the SSM-ready path enters \u2014 hoisting the refresh here (out of the per-step EODReconcile refresh added in nousergon-data#574) means the ENTIRE EOD run (PostMarketData \u2192 PostMarketArcticAppend \u2192 CaptureSnapshot \u2192 EODReconcile) executes latest origin/main by construction, closing the silent-stale-code exposure on the non-drift-guarded work steps. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4607) for the top-of-pipeline executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} routes past RefreshExecutorDeploy to the first work gate (CheckSkipPostMarketData); missing flag = run as normal. This is the FIRST gate the SSM-ready path enters — hoisting the refresh here (out of the per-step EODReconcile refresh added in nousergon-data#574) means the ENTIRE EOD run (PostMarketData → PostMarketArcticAppend → CaptureSnapshot → EODReconcile) executes latest origin/main by construction, closing the silent-stale-code exposure on the non-drift-guarded work steps. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
@@ -835,7 +555,7 @@
     },
     "RefreshExecutorDeploy": {
       "Type": "Task",
-      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07\u201308:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status \u2192 HandleFailure \u2192 ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765).",
+      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status → HandleFailure → ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against — this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here — mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly — keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -844,7 +564,8 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
-            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1"
+            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1",
+            "sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'"
           ],
           "executionTimeout": [
             "600"
@@ -868,7 +589,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-loud: a failed executor-deploy refresh must halt EOD before any work step runs stale code. Don't paper over it \u2014 the whole point of the hoist is that non-guarded steps never run stale.",
+          "Comment": "Fail-loud: a failed executor-deploy refresh must halt EOD before any work step runs stale code. Don't paper over it — the whole point of the hoist is that non-guarded steps never run stale.",
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -915,7 +636,7 @@
     },
     "CheckRefreshExecutorDeployStatus": {
       "Type": "Choice",
-      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed \u2014 a stale checkout must never reach the work steps.",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed — a stale checkout must never reach the work steps.",
       "Choices": [
         {
           "Variable": "$.refresh_executor_deploy_poll.Status",
@@ -947,7 +668,7 @@
     },
     "RefreshExecutorDeployStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
       "Parameters": {
         "source": "refresh_executor_deploy_status",
         "status.$": "$.refresh_executor_deploy_poll.Status",
@@ -961,7 +682,7 @@
     },
     "CheckSkipPostMarketData": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607). Input {\"skip_post_market_data\": true} routes past PostMarketData to the next gate (CheckSkipPostMarketArcticAppend); missing flag = run as normal. Mirrors the Saturday SF CheckSkip<State> structure so the EOD pipeline is rerunnable task-by-task \u2014 an operator recovery rerun resumes at the first incomplete task instead of re-running completed upstream work (e.g. an EODReconcile failure rerun should not re-run PostMarketData + CaptureSnapshot). Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate. Input {\"skip_post_market_data\": true} routes past the entire EOD data phase (post-market fetch + Arctic append, now on the ephemeral spot box per config#1767) straight to CheckSkipCaptureSnapshot; missing flag = run as normal. The old on-trading PostMarketData/PostMarketArcticAppend SSM states were relocated to the data spot so ae-trading no longer does EOD data work (config#1767); reconcile/snapshot/stop stays on the trading box.",
       "Choices": [
         {
           "And": [
@@ -982,10 +703,273 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipPostMarketArcticAppend"
+          "Next": "CheckSkipCaptureSnapshot"
         }
       ],
-      "Default": "PostMarketData"
+      "Default": "LaunchPostMarketDataSpot"
+    },
+    "LaunchPostMarketDataSpot": {
+      "Type": "Task",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-data-spot-dispatcher",
+        "Payload": {
+          "workload": "post-market-data"
+        }
+      },
+      "TimeoutSeconds": 420,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "FAIL-OPEN (config#1767 #4): an EOD data-spot launch failure must NOT block reconcile + instance-stop. Record it as data and continue; mirrors Saturday ResearchPredictorParallel.",
+          "Next": "ExtractDataSpotError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.postmarket_launch",
+      "Next": "CheckPostMarketDataSpotLaunched"
+    },
+    "CheckPostMarketDataSpotLaunched": {
+      "Type": "Choice",
+      "Comment": "launched:true -> poll; launched:false kill-switch -> continue to snapshot/reconcile.",
+      "Choices": [
+        {
+          "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+          "BooleanEquals": true,
+          "Next": "PollPostMarketDataSpot"
+        }
+      ],
+      "Default": "CheckSkipCaptureSnapshot"
+    },
+    "PollPostMarketDataSpot": {
+      "Type": "Task",
+      "Comment": "Poll the post-market data-spot SSM command; bounded by the on-box watchdog + reaper.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.postmarket_launch.Payload.data_spot.command_id",
+        "InstanceId.$": "$.postmarket_launch.Payload.data_spot.instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExtractDataSpotError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.postmarket_poll",
+      "Next": "CheckPostMarketDataSpotStatus"
+    },
+    "CheckPostMarketDataSpotStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open: an EOD data failure must not block reconcile + instance-stop, config#1767 #4). Inverse of the OLD on-trading CheckPostMarketStatus which HandleFailure'd.",
+      "Choices": [
+        {
+          "Variable": "$.postmarket_poll.Status",
+          "StringEquals": "Success",
+          "Next": "LaunchPostMarketArcticAppendSpot"
+        },
+        {
+          "Variable": "$.postmarket_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "PostMarketDataSpotWait"
+        },
+        {
+          "Variable": "$.postmarket_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "PostMarketDataSpotWait"
+        },
+        {
+          "Variable": "$.postmarket_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "PostMarketDataSpotWait"
+        }
+      ],
+      "Default": "ExtractDataSpotError"
+    },
+    "PostMarketDataSpotWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "PollPostMarketDataSpot"
+    },
+    "LaunchPostMarketArcticAppendSpot": {
+      "Type": "Task",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the EOD ArcticDB append on the spot box. Arctic/S3 write runs ON THE SPOT via its executor profile, not the trading box.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-data-spot-dispatcher",
+        "Payload": {
+          "workload": "post-market-arctic-append"
+        }
+      },
+      "TimeoutSeconds": 420,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "FAIL-OPEN (config#1767 #4): an EOD data-spot launch failure must NOT block reconcile + instance-stop. Record it as data and continue; mirrors Saturday ResearchPredictorParallel.",
+          "Next": "ExtractDataSpotError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.postmarket_arctic_launch",
+      "Next": "CheckPostMarketArcticAppendSpotLaunched"
+    },
+    "CheckPostMarketArcticAppendSpotLaunched": {
+      "Type": "Choice",
+      "Comment": "launched:true -> poll; launched:false kill-switch -> continue.",
+      "Choices": [
+        {
+          "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+          "BooleanEquals": true,
+          "Next": "PollPostMarketArcticAppendSpot"
+        }
+      ],
+      "Default": "CheckSkipCaptureSnapshot"
+    },
+    "PollPostMarketArcticAppendSpot": {
+      "Type": "Task",
+      "Comment": "Poll the EOD Arctic-append data-spot SSM command.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.postmarket_arctic_launch.Payload.data_spot.command_id",
+        "InstanceId.$": "$.postmarket_arctic_launch.Payload.data_spot.instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExtractDataSpotError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.postmarket_arctic_poll",
+      "Next": "CheckPostMarketArcticAppendSpotStatus"
+    },
+    "CheckPostMarketArcticAppendSpotStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open).",
+      "Choices": [
+        {
+          "Variable": "$.postmarket_arctic_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipCaptureSnapshot"
+        },
+        {
+          "Variable": "$.postmarket_arctic_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "PostMarketArcticAppendSpotWait"
+        },
+        {
+          "Variable": "$.postmarket_arctic_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "PostMarketArcticAppendSpotWait"
+        },
+        {
+          "Variable": "$.postmarket_arctic_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "PostMarketArcticAppendSpotWait"
+        }
+      ],
+      "Default": "ExtractDataSpotError"
+    },
+    "PostMarketArcticAppendSpotWait": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "PollPostMarketArcticAppendSpot"
+    },
+    "ExtractDataSpotError": {
+      "Type": "Pass",
+      "Comment": "FAIL-OPEN normalizer (config#1767 #4). An EOD data-spot launch/poll failure or non-Success terminal status lands here. Record as DATA, best-effort alert, then CONTINUE to snapshot/reconcile/instance-stop — a data-phase failure must NOT block the EOD close-out. Mirrors Saturday ResearchPredictorParallel branch-error pattern.",
+      "Parameters": {
+        "phase": "DataSpot",
+        "source": "CheckPostMarket*SpotStatus or launch Catch"
+      },
+      "ResultPath": "$.data_spot_error",
+      "Next": "PublishDataSpotFailureImmediate"
+    },
+    "PublishDataSpotFailureImmediate": {
+      "Type": "Task",
+      "Comment": "Best-effort SNS alert that the EOD data spot failed — surfaces the miss WITHOUT blocking reconcile/stop. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Data Spot — FAILED (fail-open, reconcile continues)",
+        "Message.$": "States.Format('EOD data-spot phase failed but the pipeline continued to reconcile + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
+      },
+      "ResultPath": "$.data_spot_failure_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "CheckSkipCaptureSnapshot"
+        }
+      ],
+      "Next": "CheckSkipCaptureSnapshot"
     },
     "CheckSkipCaptureSnapshot": {
       "Type": "Choice",
@@ -1102,7 +1086,7 @@
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS \u2014 instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
+      "Comment": "Failure alert via SNS — instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
@@ -1124,7 +1108,7 @@
     },
     "ForceStopInstance": {
       "Type": "Task",
-      "Comment": "Always stop trading instance even on failure \u2014 avoid cost overrun",
+      "Comment": "Always stop trading instance even on failure — avoid cost overrun",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1135,7 +1119,7 @@
     "FailExecution": {
       "Type": "Fail",
       "Error": "EODPipelineFailure",
-      "Cause": "EOD pipeline failed \u2014 trading instance stopped, check logs."
+      "Cause": "EOD pipeline failed — trading instance stopped, check logs."
     }
   }
 }

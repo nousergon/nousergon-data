@@ -226,7 +226,9 @@ def _sibling_dispatcher_pipeline_names() -> set[str]:
     start = text.index("PIPELINES: dict")
     end = text.index("\n}\n", start)
     block = text[start:end]
-    return set(re.findall(r'^\s*"([\w.-]+)":\s*\{', block, re.M))
+    # Match only keys at the dict's own 4-space indent — deeper-nested keys
+    # (e.g. a per-pipeline "fast_path" sub-config) aren't pipeline names.
+    return set(re.findall(r'^ {4}"([\w.-]+)":\s*\{', block, re.M))
 
 
 def test_expected_pipeline_names_in_lockstep_with_dispatcher_registry():

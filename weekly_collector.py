@@ -1332,7 +1332,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             tickers = []
         if not tickers:
             try:
-                tickers, _, _, _, _ = constituents._fetch_constituents()
+                tickers, _, _, _, _, _ = constituents._fetch_constituents()
             except Exception as exc:
                 logger.error("Wikipedia constituents fallback failed: %s", exc)
 
@@ -1827,7 +1827,7 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
-            tickers, _, _, _, _ = constituents._fetch_constituents()
+            tickers, _, _, _, _, _ = constituents._fetch_constituents()
             logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
         except Exception as exc:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
@@ -2063,7 +2063,7 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
         logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
-            tickers, _, _, _, _ = constituents._fetch_constituents()
+            tickers, _, _, _, _, _ = constituents._fetch_constituents()
             logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
         except Exception as exc:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
