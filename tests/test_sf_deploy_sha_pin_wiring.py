@@ -1,4 +1,4 @@
-"""config#1955: pin the deploy-drift freshness target at pipeline start.
+"""config#1955 / config#2042: pin the deploy-drift freshness target at pipeline start.
 
 The executor's ``check_deploy_drift`` historically compared the box's HEAD
 against a LIVE-fetched ``origin/main`` — a moving target during the ~48-min
@@ -13,6 +13,13 @@ SHA it synced the box to) into ``/home/ec2-user/.frozen_executor_sha`` at T0.
 ``RunMorningPlanner`` exports it as ``EXPECTED_EXECUTOR_SHA``; the
 systemd-restarted daemon reads the file directly (its process env cannot inherit
 the RunDaemon SSM shell's exports). These guards pin that wiring.
+
+config#2042 (2026-07-09): the EOD pipeline's ``RefreshExecutorDeploy`` (config#1549)
+re-pulls ``origin/main`` at the top of the EOD run by design, but never re-froze the
+pin file — so a same-day executor merge landing after the morning ``CodeFreshnessGate``
+moved the box past its own stale pin and ``EODReconcile`` hard-failed (zero
+``eod_report.json`` for the day). ``RefreshExecutorDeploy`` must re-freeze the pin
+after ``boot-pull.sh`` succeeds, mirroring ``CodeFreshnessGate``'s own pattern.
 """
 
 from __future__ import annotations
@@ -20,12 +27,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-_SF_PATH = Path(__file__).resolve().parent.parent / "infrastructure" / "step_function_daily.json"
+_INFRA_DIR = Path(__file__).resolve().parent.parent / "infrastructure"
+_SF_PATH = _INFRA_DIR / "step_function_daily.json"
+_EOD_SF_PATH = _INFRA_DIR / "step_function_eod.json"
 _PIN_FILE = "/home/ec2-user/.frozen_executor_sha"
 
 
-def _commands(state: str) -> list[str]:
-    doc = json.loads(_SF_PATH.read_text())
+def _commands(state: str, sf_path: Path = _SF_PATH) -> list[str]:
+    doc = json.loads(sf_path.read_text())
     return doc["States"][state]["Parameters"]["Parameters"]["commands"]
 
 
@@ -70,4 +79,32 @@ def test_morning_planner_exports_pinned_sha() -> None:
     assert "|| true" in exp or "2>/dev/null" in exp, (
         "a missing pin file must not abort RunMorningPlanner (executor falls "
         "back to a live origin/main fetch)."
+    )
+
+
+def test_eod_refresh_executor_deploy_repins_sha_after_bootpull() -> None:
+    """config#2042: RefreshExecutorDeploy re-pulls origin/main via boot-pull.sh
+    at the top of the EOD pipeline (config#1549) by design, so it must re-freeze
+    the pin file to match — otherwise EODReconcile's check_deploy_drift compares
+    the freshly-pulled box against the stale morning CodeFreshnessGate pin and
+    hard-fails on any executor PR merged between the morning gate and EOD."""
+    cmds = _commands("RefreshExecutorDeploy", sf_path=_EOD_SF_PATH)
+    bootpull = next((c for c in cmds if "boot-pull.sh" in c), None)
+    assert bootpull is not None, "RefreshExecutorDeploy must run boot-pull.sh."
+    freeze = next(
+        (c for c in cmds if _PIN_FILE in c and "rev-parse HEAD" in c), None
+    )
+    assert freeze is not None, (
+        "RefreshExecutorDeploy must re-freeze `git -C .../alpha-engine rev-parse "
+        f"HEAD` into {_PIN_FILE} after boot-pull.sh, mirroring CodeFreshnessGate's "
+        "own pin pattern — otherwise a same-day executor merge desyncs the box "
+        "from the stale morning pin and EODReconcile hard-fails."
+    )
+    assert "/home/ec2-user/alpha-engine" in freeze, (
+        "the re-frozen SHA must be the crucible-executor (alpha-engine) checkout HEAD."
+    )
+    # Ordering: re-freeze must come AFTER boot-pull.sh actually refreshes the checkout.
+    joined = "\n".join(cmds)
+    assert joined.index("boot-pull.sh") < joined.index(_PIN_FILE), (
+        "re-freeze the SHA only after boot-pull.sh has refreshed the checkout."
     )

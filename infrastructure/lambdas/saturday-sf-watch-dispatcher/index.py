@@ -587,10 +587,13 @@ def _build_event_record(
     #                               pipeline/day (an `action: escalated` event
     #                               already landed in today's watch-log).
     operator_abort = _is_operator_abort(detail.get("status", ""), describe_resp)
+    is_preflight = _is_preflight(describe_resp)
     operator_recovery_rerun = _is_operator_recovery_rerun(execution_name)
     already_escalated = bool(existing_events) and _already_escalated_today(existing_events)
     if operator_abort:
         dispatch_suppressed = "operator_abort"
+    elif is_preflight:
+        dispatch_suppressed = "preflight"
     elif operator_recovery_rerun:
         dispatch_suppressed = "operator_recovery_rerun"
     elif already_escalated and not DISPATCH_AFTER_ESCALATION:
@@ -610,7 +613,7 @@ def _build_event_record(
         "execution_arn": detail.get("executionArn", ""),
         "failed_state": failed_state,
         "cause": cause or None,
-        "is_preflight": _is_preflight(describe_resp),
+        "is_preflight": is_preflight,
         # `lane` is filled by the dispatched agent (null until it classifies).
         # `action` reflects intent at write time (the log is written just BEFORE
         # the dispatch fires): "dispatch" only when an agent will genuinely be
@@ -620,9 +623,9 @@ def _build_event_record(
         "action": "dispatch" if will_dispatch else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
         "has_listener": bool(cfg.get("has_listener", True)),
-        # config#1827: null unless the dispatch was withheld for a recorded
-        # reason; "operator_abort" makes the human-stop decision auditable in the
-        # watch-log and on the dashboard.
+        # config#1827/preflight: null unless the dispatch was withheld for a
+        # recorded reason; "operator_abort"/"preflight" make the withholding
+        # auditable in the watch-log and on the dashboard.
         "dispatch_suppressed": dispatch_suppressed,
     }
 

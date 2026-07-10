@@ -13,7 +13,9 @@ surface the miss).
 from __future__ import annotations
 
 import importlib
+import json
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -131,8 +133,20 @@ class _FakeS3:
         assert name == "list_objects_v2"
         return _FakeS3Paginator(self._objects)
 
+    def list_objects_v2(self, Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        # config#2038: _load_recent_engagements calls this directly (no
+        # paginator) — single-page return is sufficient for these tests.
+        keys = [k for k in self._objects if k.startswith(Prefix)]
+        return {"Contents": [{"Key": k} for k in keys]}
+
     def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
         return {"Body": _FakeS3Body(self._objects[Key])}
+
+    def put_object(self, Bucket, Key, Body, **kw):  # noqa: N803 — boto3 kwarg names
+        # config#2152: records queue-manifest / trigger-record writes for
+        # assertions; stored alongside the seeded read objects.
+        self._objects[Key] = Body
+        return {}
 
 
 def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None,
@@ -152,6 +166,20 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_param
     from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
 
     assert_hermetic_imports_satisfied(__file__)
+    # nousergon_lib.spot_dispatch (config#2106) sits between index.py and the
+    # stubbed nousergon_lib.ec2_spot/boto3 above. Its own `from nousergon_lib
+    # import ec2_spot` / `import boto3` bindings are resolved once at ITS
+    # import time — if it's already cached in sys.modules from a prior test's
+    # stub, `import index` + reload(index) alone would NOT re-resolve those
+    # bindings (index just re-fetches the same, stale spot_dispatch module
+    # object). Reload spot_dispatch in place first (never a bare del+reimport
+    # — see reference_pytest_del_reimport_vs_reload_fixture_corruption_260709)
+    # so every test sees the CURRENT stub.
+    if "nousergon_lib.spot_dispatch" in sys.modules:
+        importlib.reload(sys.modules["nousergon_lib.spot_dispatch"])
+    else:
+        import nousergon_lib.spot_dispatch  # noqa: F401 — first import picks up the current stub
+
     import index
 
     importlib.reload(index)
@@ -303,7 +331,10 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     def _launch(types_, subnets, **kw):
         raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
 
-    monkeypatch.setattr(idx.ec2_spot, "launch", _launch)
+    # index.py now delegates through nousergon_lib.spot_dispatch (config#2106)
+    # rather than calling nousergon_lib.ec2_spot directly — patch the entry
+    # point it actually calls.
+    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     g = out["groom"]
     assert g["launched"] is False
@@ -701,10 +732,18 @@ def test_demand_gate_kill_switch(monkeypatch):
 # ── config#1933 SYMMETRIC triggers (Brian's ratified correction) ─────────────
 
 
-def _stub_fresh_stats(monkeypatch, idx, counts, oldest=None, p0=()):
+def _stub_fresh_stats(monkeypatch, idx, counts, oldest=None, p0=(), tier_issues=None):
+    # config#2152: default tier_issues fabricates N placeholder issues per tier
+    # so the count and the manifest queue stay consistent by construction —
+    # mirroring the real single-walk enumeration.
+    if tier_issues is None:
+        tier_issues = {t: [{"repo": "nousergon/alpha-engine-config", "number": 9000 + i,
+                            "title": f"{t} issue {i}", "labels": [f"complexity:{t}"],
+                            "updated_at": "2026-07-10T00:00:00Z"}
+                           for i in range(n)] for t, n in counts.items()}
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
-                        lambda token: (counts, oldest or {}, list(p0)))
+                        lambda token: (counts, oldest or {}, list(p0), tier_issues))
     monkeypatch.setattr(idx, "_write_trigger_record", lambda *a, **k: None)
     monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
 
@@ -725,9 +764,19 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
                         ("low-only", "claude-haiku-4-5")}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
     assert len(cmds) == 3
-    # only the FIRST box runs PR sweeps
+    # config#2129: every co-launched box gets its OWN disjoint sweep
+    # partition — no more "only the first box sweeps" starvation. All 3
+    # share the SAME partition_count (3) with distinct partition_index
+    # values 0/1/2 (order follows decide_trigger's high-first pool order).
     assert "GROOM_NO_SWEEP=1" not in cmds[0]
-    assert all("GROOM_NO_SWEEP=1" in c for c in cmds[1:])
+    for c in cmds:
+        assert "export GROOM_SWEEP_PARTITION_COUNT=3" in c
+    indices = set()
+    for c in cmds:
+        m = re.search(r"export GROOM_SWEEP_PARTITION_INDEX=(\d+)", c)
+        assert m, f"missing partition index export in: {c}"
+        indices.add(int(m.group(1)))
+    assert indices == {0, 1, 2}
 
 
 def test_symmetric_trigger_light_backlog_zero_boxes(monkeypatch):
@@ -748,16 +797,39 @@ def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
     assert ls[0]["model"] == "claude-sonnet-5"
 
 
-def test_symmetric_trigger_fail_safe_to_legacy(monkeypatch):
+def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
+    """demand-all enumeration failure now returns early — no legacy fallthrough.
+
+    config#2142: the skip must also PAGE ops-health (a skipped trigger means
+    NO groom boxes launch for the slot — the predecessor CloudWatch-only
+    warning hid a dead engagement scan for 8 consecutive triggers)."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    notifications = _spy_notify(monkeypatch, idx)
     def boom(token):
         raise RuntimeError("github down")
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh", boom)
-    # legacy path also needs stubbing past the per-slot gate
-    monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
     out = idx.handler(_demand_event(), None)
-    assert out["groom"]["launched"]  # legacy unconditional launch
+    assert not out["groom"]["launched"]
+    assert out["groom"]["reason"] == "demand_all_failed"
+    assert len(notifications) == 1
+    text, kw = notifications[0]
+    assert "FAILED" in text and "github down" in text
+    assert kw["severity"] == "warning" and kw["silent"] is False
+
+
+def test_load_recent_engagements_raises_on_s3_access_denied(monkeypatch):
+    """config#2142: an engagement-scan read failure must RAISE, never degrade
+    to an empty map. The old fail-safe ``{}`` ("skip nothing") silently
+    disabled fresh-skip on every trigger from ship (2026-07-08) to 2026-07-10
+    when the role lacked ListBucket on groom/{date}/ — the dispatcher
+    advertised pre-skip counts (e.g. high=26) that deflated on-box (10)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def denied(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        raise RuntimeError("AccessDenied: s3:ListBucket")
+    monkeypatch.setattr(idx._test_s3, "list_objects_v2", denied)
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        idx._load_recent_engagements()
 
 
 def test_non_demand_events_keep_legacy_behavior(monkeypatch):
@@ -769,3 +841,262 @@ def test_non_demand_events_keep_legacy_behavior(monkeypatch):
     out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
                        "issue_filter": "gated-reverify"}, None)
     assert out["groom"]["launched"] and not called
+
+
+# ── config#2129: decide_only / launch_decided (two-phase SF Map-state flow) ──
+# The SF no longer invokes this Lambda once per trigger and tries to poll a
+# response shape that varies 1-vs-N launches. decide_only computes 0..N
+# launch decisions WITHOUT launching; launch_decided launches EXACTLY one
+# already-decided box. Both must never actually boot a spot instance.
+
+
+def test_decide_only_demand_all_returns_launches_without_launching(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+
+    def _launch(types_, subnets, **kw):
+        raise AssertionError("decide_only must never launch a spot instance")
+    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
+
+    out = idx.handler({**_demand_event(), "decide_only": True}, None)
+    d = out["decide"]
+    assert d["trigger"] == "demand-all"
+    assert len(d["launches"]) == 3
+    assert {e["issue_filter"] for e in d["launches"]} == {"high-only", "mid-only", "low-only"}
+    counts = {e["partition_count"] for e in d["launches"]}
+    assert counts == {3}
+    assert sorted(e["partition_index"] for e in d["launches"]) == [0, 1, 2]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_single_tier_returns_one_launch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                       "issue_filter": "mid-only", "schedule": "0 7 * * *",
+                       "decide_only": True}, None)
+    d = out["decide"]
+    assert d["launches"] == [{"model": "claude-sonnet-5", "issue_filter": "mid-only",
+                              "partition_index": 0, "partition_count": 1}]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_ungated_direct_dispatch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "gated-reverify", "decide_only": True}, None)
+    assert out["decide"]["launches"] == [{"model": "claude-haiku-4-5",
+                                          "issue_filter": "gated-reverify",
+                                          "partition_index": 0, "partition_count": 1}]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_demand_gate_skip_shape(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 3, "mid": 40, "high": 2})
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "low-only", "schedule": "0 19 * * *",
+                       "decide_only": True}, None)
+    d = out["decide"]
+    assert d["launches"] == []
+    assert d["launched"] is False
+    assert d["reason"] == "demand_gate_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_demand_all_failure_shape(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("github down")))
+    out = idx.handler({**_demand_event(), "decide_only": True}, None)
+    assert out["decide"]["launches"] == []
+    assert out["decide"]["reason"] == "demand_all_failed"
+
+
+def test_decide_only_respects_pace_gate_skip(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.5 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *",
+                       "decide_only": True}, None)
+    d = out["decide"]
+    assert d["launches"] == []
+    assert d["reason"] == "pace_gate_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    # A launch_decided event must NEVER touch demand-gate/fresh-stat enumeration
+    # (the decision was already made by a prior decide_only call).
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("launch_decided must not re-enumerate")))
+    out = idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-haiku-4-5",
+        "issue_filter": "low-only", "partition_index": 2, "partition_count": 3,
+        "launch_decided": True,
+    }, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["model"] == "claude-haiku-4-5" and g["issue_filter"] == "low-only"
+    assert g["partition_index"] == 2 and g["partition_count"] == 3
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_SWEEP_PARTITION_INDEX=2" in cmd
+    assert "export GROOM_SWEEP_PARTITION_COUNT=3" in cmd
+
+
+def test_launch_decided_bypasses_pace_gate(monkeypatch):
+    # A relaunch of an already-decided box must not be re-blocked by the
+    # pre-boot pace gate — that gate is a per-TRIGGER decision, made once by
+    # decide_only; re-checking it per-box would let a mid-run pace shift
+    # cancel a box the trigger already committed to.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.9 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-opus-4-8",
+        "issue_filter": "high-only", "launch_decided": True,
+    }, None)
+    assert out["groom"]["launched"] is True
+
+
+def test_launch_decided_defaults_partition_when_absent(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "0 1 * * *",
+                       "launch_decided": True}, None)
+    g = out["groom"]
+    assert g["partition_index"] == 0 and g["partition_count"] == 1
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_SWEEP_PARTITION" not in cmd  # count<=1 -> no export at all
+
+
+# ── config#2038: engagement lookback + disposition set must come from the lib ──
+
+
+def test_load_recent_engagements_uses_lib_lookback_window(monkeypatch):
+    """A run artifact just inside ge.ENGAGEMENT_LOOKBACK_DAYS ago must be
+    picked up — this would be dropped by the old hardcoded range(3) whenever
+    the lib's lookback is > 3 (config#2038's actual drift: 4 vs 3)."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import nousergon_lib.groom_eligibility as ge
+
+    now = datetime.now(ZoneInfo("UTC"))
+    farthest = now - timedelta(days=ge.ENGAGEMENT_LOOKBACK_DAYS - 1)
+    art = json.dumps({
+        "run_start": farthest.isoformat().replace("+00:00", "Z"),
+        "elapsed_min": 5,
+        "issues": [{"repo": "nousergon/alpha-engine-config", "number": 999,
+                    "disposition": "commented"}],
+    }).encode()
+    key = f"groom/{farthest.strftime('%Y-%m-%d')}/run1.json"
+    idx = _load(monkeypatch, s3_objects={key: art})
+    engagements = idx._load_recent_engagements()
+    assert ("nousergon/alpha-engine-config", 999) in engagements
+
+
+def test_load_recent_engagements_uses_lib_engaged_dispositions(monkeypatch):
+    """A "labeled" disposition (config#1928/#1890 — label-only edits are the
+    NORM for blocked dispositions) must count as engaged — this comes from
+    ge.ENGAGED_DISPOSITIONS, not a local hardcoded tuple that could drift."""
+    from datetime import datetime, timezone
+
+    import nousergon_lib.groom_eligibility as ge
+
+    assert "labeled" in ge.ENGAGED_DISPOSITIONS
+    now = datetime.now(timezone.utc)
+    art = json.dumps({
+        "run_start": now.isoformat().replace("+00:00", "Z"),
+        "elapsed_min": 5,
+        "issues": [{"repo": "nousergon/alpha-engine-config", "number": 998,
+                    "disposition": "labeled"}],
+    }).encode()
+    key = f"groom/{now.strftime('%Y-%m-%d')}/run1.json"
+    idx = _load(monkeypatch, s3_objects={key: art})
+    engagements = idx._load_recent_engagements()
+    assert ("nousergon/alpha-engine-config", 998) in engagements
+
+
+# ── config#2152: queue manifests (observer phase) ───────────────────────────────
+
+
+def test_symmetric_trigger_writes_queue_manifests(monkeypatch):
+    """Every launched box gets a manifest at the deterministic key carrying the
+    exact issue list behind its launch decision — counts and queue derive from
+    the same enumeration walk (config#2152 enumerate-once)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event("0 1 * * *"), None)
+    manifests = out["groom"]["queue_manifests"]
+    assert set(manifests) == {"low-only", "mid-only", "high-only"}
+    for filt, key in manifests.items():
+        assert key.startswith("groom/queues/") and key.endswith(f"-{filt}.json")
+        doc = json.loads(idx._test_s3._objects[key])
+        assert doc["schema_version"] == 1
+        assert doc["issue_filter"] == filt
+        assert doc["issue_count"] == len(doc["issues"])
+        assert all({"repo", "number", "title", "labels", "updated_at"} <= set(i)
+                   for i in doc["issues"])
+    # per-tier counts flow through to the per-filter manifests
+    assert json.loads(idx._test_s3._objects[manifests["high-only"]])["issue_count"] == 10
+
+
+def test_queue_manifest_write_failure_does_not_block_launch(monkeypatch):
+    """Observer phase: a manifest write failure is logged (driver-side parity
+    reports it) but the boxes still launch — grooms are the primary deliverable."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    def boom(**kw):
+        raise RuntimeError("AccessDenied: s3:PutObject")
+    monkeypatch.setattr(idx._test_s3, "put_object", boom)
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["queue_manifests"] == {}
+    assert len(out["groom"]["launches"]) == 3
+
+
+def test_skipped_tier_gets_no_manifest(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 2, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    # low (2 < floor 8) rides upward or skips — only launched filters get manifests
+    launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
+    assert set(out["groom"]["queue_manifests"]) == launched_filters
+
+
+# ── config#2152/#2147: queue_manifest_key passthrough (drain / cutover opt-in) ──
+
+
+def test_manifest_key_reaches_bootstrap_env(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
+    assert out["groom"]["launched"]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_QUEUE_MANIFEST_KEY=groom/queues/drain/2026-07-10-low.json" in cmd
+
+
+def test_no_manifest_key_no_export(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only"}, None)
+    assert out["groom"]["launched"]
+    assert "GROOM_QUEUE_MANIFEST_KEY" not in idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+
+
+def test_malformed_manifest_key_fails_loud(monkeypatch):
+    """The key lands on a root-shell command line — strict charset, fail loud."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    with pytest.raises(ValueError, match="invalid queue_manifest_key"):
+        idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+                     "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                     "queue_manifest_key": "groom/x; rm -rf /"}, None)

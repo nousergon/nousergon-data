@@ -257,6 +257,56 @@ UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
 
+# ArcticDB freshness-monitor sentinel (config#1787, Brian's 2026-07-08
+# Option-B ruling). A small, UNCONDITIONAL S3 marker written on every
+# successful daily_append ArcticDB write — deliberately separate from
+# ``health/universe_freshness.json`` above, which is a richer per-symbol
+# staleness receipt that only gets written when the whole scan passes
+# (and hard-raises otherwise). This sentinel exists purely so
+# ``nousergon_lib.artifact_freshness``'s ordinary S3 ArtifactSpec probe
+# (HEAD/LIST + recency, zero new backend code) has something to check for
+# the ArcticDB feature-store producer, per Brian's explicit "ordinary S3
+# ArtifactSpec, zero changes to nousergon_lib.artifact_freshness" ruling —
+# rejecting Option (A) (a first-class arcticdb backend) as premature
+# generalization for one consumer.
+FEATURE_STORE_FRESHNESS_SENTINEL_KEY = "feature_store/_freshness.json"
+
+
+def _write_feature_store_freshness_sentinel(
+    s3, bucket: str, *, library: str = "universe", symbol_or_library: str | None = None,
+) -> dict:
+    """Write the ArcticDB feature-store freshness sentinel (config#1787).
+
+    Best-effort: any S3 write failure is logged at WARN and swallowed — the
+    sentinel is an observability nicety for the freshness monitor, not a
+    load-bearing part of the daily_append pipeline, so a sentinel-write
+    failure must never fail (or even affect) the pipeline run that already
+    completed its real ArcticDB writes.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "symbol_or_library": symbol_or_library or library,
+        "library": library,
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=FEATURE_STORE_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB feature-store freshness sentinel to s3://%s/%s",
+            bucket, FEATURE_STORE_FRESHNESS_SENTINEL_KEY,
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB feature-store freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE): %s", exc,
+        )
+    return sentinel
+
 
 def _load_block_anomaly_types() -> frozenset[str]:
     """Read ``DAILY_APPEND_BLOCK_ANOMALY_TYPES`` env var or fall back to defaults.
@@ -2153,6 +2203,15 @@ def _daily_append_impl(
                 f"ArcticDB daily_append error rate {err_rate:.1%} exceeds 5% threshold "
                 f"(n_ok={n_ok} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
             )
+
+        # ArcticDB feature-store freshness sentinel (config#1787). Written
+        # here — right after the error-rate gate confirms this was a
+        # successful ArcticDB write batch, and BEFORE the staleness-scan
+        # receipt below (which hard-raises on stale symbols) — so the
+        # sentinel reflects "a write happened" independent of whether the
+        # separate per-symbol staleness scan later passes or raises.
+        # Best-effort/non-fatal by construction (see function docstring).
+        _write_feature_store_freshness_sentinel(s3, bucket, library="universe")
 
         # ── L4484: factor-momentum daily go-forward second pass ──────────────
         # factor_momentum_ratio is a cross-sectional-time-series feature that
