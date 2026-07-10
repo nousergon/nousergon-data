@@ -32,15 +32,20 @@ provenance/observability.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
-from sources.cross_source_gate import (
-    DEFAULT_TOLERANCE_BPS,
-    GateDecision,
-    GateStatus,
-    SourceClose,
-    evaluate,
-)
+# ``sources.cross_source_gate`` is imported LAZILY (inside the functions that use
+# it), NOT at module top level. This module lives under ``collectors/`` which is
+# COPY'd into the Phase-2 Lambda image, but ``sources/`` is deliberately NOT in
+# that image (its adapter stack — arcticdb/polygon/fred/yfinance — is spot-only)
+# and ``sources/__init__`` also imports ``collectors.daily_closes`` (circular).
+# A top-level ``from sources...`` here would (a) trip the Dockerfile-copy canary
+# (tests/test_dockerfile_copies_match_deployed_imports.py — the PR#254 failure
+# class) and (b) reintroduce the circular import ``daily_closes`` already dodges
+# with call-time imports. TYPE_CHECKING-only import keeps annotations resolvable
+# for tooling without any runtime/load-time cost.
+if TYPE_CHECKING:  # pragma: no cover — annotations only
+    from sources.cross_source_gate import GateDecision
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,8 @@ def _single_source_decision(
     -> ``NO_DATA``. Uses the same institutional ``evaluate`` logic as the real
     cross-check so the recorded status vocabulary is identical across both paths.
     """
+    from sources.cross_source_gate import SourceClose, evaluate  # lazy: see module top
+
     price = None
     try:
         if close is not None:
@@ -104,8 +111,8 @@ def annotate_records(
     *,
     source_mode: str = "auto",
     cross_check_tickers: tuple[str, ...] = DEFAULT_CROSS_CHECK_TICKERS,
-    cross_check_fetch: Optional[Callable[[str, str], GateDecision]] = None,
-    tolerance_bps: float = DEFAULT_TOLERANCE_BPS,
+    cross_check_fetch: Optional[Callable[[str, str], "GateDecision"]] = None,
+    tolerance_bps: Optional[float] = None,
 ) -> tuple[list[dict], dict]:
     """Annotate ingestion ``records`` with L1 observer-mode cross-source status.
 
@@ -132,7 +139,10 @@ def annotate_records(
         single-source like every other cell — no network is touched.
     tolerance_bps:
         Agreement tolerance for the single-source classifier (the real cross-check
-        carries its own tolerance inside ``cross_check_fetch``).
+        carries its own tolerance inside ``cross_check_fetch``). ``None`` (default)
+        resolves to ``sources.cross_source_gate.DEFAULT_TOLERANCE_BPS`` at call
+        time — the lazy resolution keeps ``sources`` out of this module's
+        top-level imports (see module docstring).
 
     Returns
     -------
@@ -141,6 +151,13 @@ def annotate_records(
     ``cross_checked`` (count that got a real 2nd-source fetch), ``annotated``,
     ``errors``, and ``source_mode``.
     """
+    from sources.cross_source_gate import (  # lazy: see module top
+        DEFAULT_TOLERANCE_BPS,
+        GateStatus,
+    )
+
+    if tolerance_bps is None:
+        tolerance_bps = DEFAULT_TOLERANCE_BPS
     check_set = {t.lstrip("^") for t in (cross_check_tickers or ())}
     status_counts: dict[str, int] = {}
     quarantined: list[dict] = []
