@@ -784,8 +784,13 @@ def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
 
 
 def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
-    """demand-all enumeration failure now returns early — no legacy fallthrough."""
+    """demand-all enumeration failure now returns early — no legacy fallthrough.
+
+    config#2142: the skip must also PAGE ops-health (a skipped trigger means
+    NO groom boxes launch for the slot — the predecessor CloudWatch-only
+    warning hid a dead engagement scan for 8 consecutive triggers)."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    notifications = _spy_notify(monkeypatch, idx)
     def boom(token):
         raise RuntimeError("github down")
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
@@ -793,6 +798,24 @@ def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
     out = idx.handler(_demand_event(), None)
     assert not out["groom"]["launched"]
     assert out["groom"]["reason"] == "demand_all_failed"
+    assert len(notifications) == 1
+    text, kw = notifications[0]
+    assert "FAILED" in text and "github down" in text
+    assert kw["severity"] == "warning" and kw["silent"] is False
+
+
+def test_load_recent_engagements_raises_on_s3_access_denied(monkeypatch):
+    """config#2142: an engagement-scan read failure must RAISE, never degrade
+    to an empty map. The old fail-safe ``{}`` ("skip nothing") silently
+    disabled fresh-skip on every trigger from ship (2026-07-08) to 2026-07-10
+    when the role lacked ListBucket on groom/{date}/ — the dispatcher
+    advertised pre-skip counts (e.g. high=26) that deflated on-box (10)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def denied(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        raise RuntimeError("AccessDenied: s3:ListBucket")
+    monkeypatch.setattr(idx._test_s3, "list_objects_v2", denied)
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        idx._load_recent_engagements()
 
 
 def test_non_demand_events_keep_legacy_behavior(monkeypatch):
