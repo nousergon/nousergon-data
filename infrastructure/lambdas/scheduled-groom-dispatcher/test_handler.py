@@ -1070,3 +1070,33 @@ def test_skipped_tier_gets_no_manifest(monkeypatch):
     # low (2 < floor 8) rides upward or skips — only launched filters get manifests
     launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
     assert set(out["groom"]["queue_manifests"]) == launched_filters
+
+
+# ── config#2152/#2147: queue_manifest_key passthrough (drain / cutover opt-in) ──
+
+
+def test_manifest_key_reaches_bootstrap_env(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
+    assert out["groom"]["launched"]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_QUEUE_MANIFEST_KEY=groom/queues/drain/2026-07-10-low.json" in cmd
+
+
+def test_no_manifest_key_no_export(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only"}, None)
+    assert out["groom"]["launched"]
+    assert "GROOM_QUEUE_MANIFEST_KEY" not in idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+
+
+def test_malformed_manifest_key_fails_loud(monkeypatch):
+    """The key lands on a root-shell command line — strict charset, fail loud."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    with pytest.raises(ValueError, match="invalid queue_manifest_key"):
+        idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+                     "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                     "queue_manifest_key": "groom/x; rm -rf /"}, None)
