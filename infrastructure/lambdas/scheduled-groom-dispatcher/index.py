@@ -65,7 +65,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -76,9 +75,8 @@ from krepis.usage_pacing import pace_check, reset_window
 import urllib.error
 import urllib.request
 
-from nousergon_lib import ec2_spot
 from nousergon_lib import groom_eligibility as ge
-from nousergon_lib.ec2_spot import SpotCapacityExhausted
+from nousergon_lib import spot_dispatch
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
@@ -389,49 +387,23 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
     rather than trying the same flaky spot market a third time)."""
-    common = dict(
+    return spot_dispatch.launch_with_fallback(
+        INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
         key_name=KEY_NAME,
         security_group_ids=[SECURITY_GROUP],
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
-        shutdown_behavior="terminate",
         tag_name="alpha-engine-groom-spot",
         region=REGION,
+        force_on_demand=force_on_demand,
     )
-    if force_on_demand:
-        logger.warning("force_on_demand set (config#1645 relaunch escalation) — launching ON-DEMAND")
-        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
-        return iid, "on-demand"
-    try:
-        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=True, **common)
-        return iid, "spot"
-    except SpotCapacityExhausted:
-        logger.warning(
-            "spot capacity exhausted across all type×subnet pools — relaunching ON-DEMAND"
-        )
-        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
-        return iid, "on-demand"
 
 
 def _wait_ssm_online(instance_id: str) -> None:
     """Block until the instance is running AND its SSM agent registers Online."""
-    ec2 = boto3.client("ec2", region_name=REGION)
-    ssm = boto3.client("ssm", region_name=REGION)
-    ec2.get_waiter("instance_running").wait(
-        InstanceIds=[instance_id], WaiterConfig={"Delay": 5, "MaxAttempts": 40}
-    )
-    deadline = time.time() + SSM_ONLINE_BUDGET_SEC
-    while time.time() < deadline:
-        info = ssm.describe_instance_information(
-            Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
-        ).get("InstanceInformationList", [])
-        if info and info[0].get("PingStatus") == "Online":
-            logger.info("SSM agent Online for %s", instance_id)
-            return
-        time.sleep(5)
-    raise RuntimeError(
-        f"SSM agent not Online after {SSM_ONLINE_BUDGET_SEC}s for {instance_id}"
+    spot_dispatch.wait_ssm_online(
+        instance_id, region=REGION, ssm_online_budget_sec=SSM_ONLINE_BUDGET_SEC
     )
 
 
@@ -439,26 +411,18 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
                     run_token: str, soft_limit_min: int | None = None,
                     pr_budget: int | None = None, no_sweep: bool = False) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
-    ssm = boto3.client("ssm", region_name=REGION)
-    resp = ssm.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
-        Parameters={
-            "commands": [_bootstrap_command(
-                run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget, no_sweep,
-            )],
-            # Execution timeout (NOT the start timeout) — without this SSM kills the
-            # command at the 3600s default, guillotining a multi-hour groom.
-            "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
-        },
-        TimeoutSeconds=600,  # time to START delivering before giving up
-        CloudWatchOutputConfig={
-            "CloudWatchLogGroupName": CW_LOG_GROUP,
-            "CloudWatchOutputEnabled": True,
-        },
+    return spot_dispatch.send_async_command(
+        instance_id,
+        _bootstrap_command(
+            run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget, no_sweep,
+        ),
+        comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
+        region=REGION,
+        cw_log_group=CW_LOG_GROUP,
+        # Execution timeout (NOT the start timeout) — without this SSM kills the
+        # command at the 3600s default, guillotining a multi-hour groom.
+        execution_timeout_seconds=MAX_RUNTIME_SECONDS,
     )
-    return resp["Command"]["CommandId"]
 
 
 GROOM_TIER_TAG_KEY = "groom-issue-filter"
@@ -475,18 +439,11 @@ def _running_tier_instance_ids(issue_filter: str) -> list[str]:
     tier. Fail-safe: any API error returns ``[]`` (never blocks a launch on a
     broken check — this guard is an optimization, not a correctness gate,
     mirroring every other pre-launch gate in this file)."""
-    try:
-        ec2 = boto3.client("ec2", region_name=REGION)
-        resp = ec2.describe_instances(Filters=[
-            {"Name": "tag:Name", "Values": ["alpha-engine-groom-spot"]},
-            {"Name": f"tag:{GROOM_TIER_TAG_KEY}", "Values": [issue_filter]},
-            {"Name": "instance-state-name", "Values": ["pending", "running"]},
-        ])
-        return [i["InstanceId"] for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
-    except Exception as exc:  # noqa: BLE001 — fail-safe: never block a launch
-        logger.warning("concurrent-tier check failed (non-fatal, launching anyway): %s: %s",
-                       type(exc).__name__, exc)
-        return []
+    return spot_dispatch.running_instance_ids(
+        "alpha-engine-groom-spot",
+        {GROOM_TIER_TAG_KEY: issue_filter},
+        region=REGION,
+    )
 
 
 def _notify_concurrent_skip(issue_filter: str, existing_ids: list[str], schedule_label: str) -> None:
@@ -518,14 +475,7 @@ def _terminate_instance(instance_id: str) -> None:
     the in-script watchdog nor the EXIT trap (both armed BY the bootstrap) is
     running to tear it down — it idles until manually killed. Never masks the
     original error (logged, not raised)."""
-    try:
-        boto3.client("ec2", region_name=REGION).terminate_instances(InstanceIds=[instance_id])
-        logger.warning("terminated groom box %s after post-launch failure (no orphan)", instance_id)
-    except Exception as exc:  # noqa: BLE001 — cleanup; the original error re-raises below
-        logger.error(
-            "FAILED to terminate %s after a post-launch error (%s) — MANUAL cleanup needed",
-            instance_id, exc,
-        )
+    spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="groom")
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,

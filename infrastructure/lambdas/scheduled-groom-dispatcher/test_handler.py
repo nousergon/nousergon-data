@@ -159,6 +159,20 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_param
     from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
 
     assert_hermetic_imports_satisfied(__file__)
+    # nousergon_lib.spot_dispatch (config#2106) sits between index.py and the
+    # stubbed nousergon_lib.ec2_spot/boto3 above. Its own `from nousergon_lib
+    # import ec2_spot` / `import boto3` bindings are resolved once at ITS
+    # import time — if it's already cached in sys.modules from a prior test's
+    # stub, `import index` + reload(index) alone would NOT re-resolve those
+    # bindings (index just re-fetches the same, stale spot_dispatch module
+    # object). Reload spot_dispatch in place first (never a bare del+reimport
+    # — see reference_pytest_del_reimport_vs_reload_fixture_corruption_260709)
+    # so every test sees the CURRENT stub.
+    if "nousergon_lib.spot_dispatch" in sys.modules:
+        importlib.reload(sys.modules["nousergon_lib.spot_dispatch"])
+    else:
+        import nousergon_lib.spot_dispatch  # noqa: F401 — first import picks up the current stub
+
     import index
 
     importlib.reload(index)
@@ -310,7 +324,10 @@ def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
     def _launch(types_, subnets, **kw):
         raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
 
-    monkeypatch.setattr(idx.ec2_spot, "launch", _launch)
+    # index.py now delegates through nousergon_lib.spot_dispatch (config#2106)
+    # rather than calling nousergon_lib.ec2_spot directly — patch the entry
+    # point it actually calls.
+    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     g = out["groom"]
     assert g["launched"] is False

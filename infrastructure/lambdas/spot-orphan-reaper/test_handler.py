@@ -73,13 +73,21 @@ def index_module(monkeypatch):
 
 
 def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c5.large",
-         ci_watch_repo: str | None = None, ci_watch_sha: str | None = None):
+         ci_watch_repo: str | None = None, ci_watch_sha: str | None = None,
+         sf_watch_cadence: str | None = None, sf_watch_pipeline: str | None = None,
+         sf_watch_run_date: str | None = None):
     """Build a mock describe-instances entry."""
     tags = [{"Key": "Name", "Value": name}]
     if ci_watch_repo is not None:
         tags.append({"Key": "ci-watch-repo", "Value": ci_watch_repo})
     if ci_watch_sha is not None:
         tags.append({"Key": "ci-watch-sha", "Value": ci_watch_sha})
+    if sf_watch_cadence is not None:
+        tags.append({"Key": "sf-watch-cadence", "Value": sf_watch_cadence})
+    if sf_watch_pipeline is not None:
+        tags.append({"Key": "sf-watch-pipeline", "Value": sf_watch_pipeline})
+    if sf_watch_run_date is not None:
+        tags.append({"Key": "sf-watch-run-date", "Value": sf_watch_run_date})
     return {
         "InstanceId": instance_id,
         "InstanceType": instance_type,
@@ -285,3 +293,62 @@ class TestCiWatchIncompleteReapAlert:
         assert out["ci_watch_incomplete_reaps"] == []
         s3.head_object.assert_not_called()
         assert index_module._test_send_message.calls == []
+
+
+class TestSfWatchIncompleteReapAlert:
+    """Finishing config#2001 (SF-watch's EC2-spot migration): additive alert
+    scoped to ONLY Name=alpha-engine-sf-watch-spot boxes, built on the same
+    generalized WATCH_KINDS path CI-watch uses — every other tag's reap path
+    (covered above) must stay byte-for-byte unaffected, and CI-watch's own
+    path must stay byte-for-byte unaffected too (see TestCiWatchIncompleteReapAlert,
+    unmodified by this class's existence)."""
+
+    def test_reaped_without_marker_fires_alert(self, index_module):
+        spots = [_spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600,
+                       sf_watch_cadence="saturday", sf_watch_pipeline="ne-weekly-freshness-pipeline",
+                       sf_watch_run_date="2026-07-11")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert out["terminated"] == ["i-sfwatch"]
+        assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
+        s3.head_object.assert_called_once_with(
+            Bucket="alpha-engine-research",
+            Key="sf_watch/_control/completed/saturday-ne-weekly-freshness-pipeline-2026-07-11.json",
+        )
+        assert len(index_module._test_send_message.calls) == 1
+        (text,), kwargs = index_module._test_send_message.calls[0]
+        assert "reaped WITHOUT completing" in text
+        assert "saturday" in text
+        assert "ne-weekly-freshness-pipeline" in text
+        assert kwargs["disable_notification"] is False
+
+    def test_reaped_with_marker_present_does_not_alert(self, index_module):
+        spots = [_spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600,
+                       sf_watch_cadence="saturday", sf_watch_pipeline="ne-weekly-freshness-pipeline",
+                       sf_watch_run_date="2026-07-11")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["terminated"] == ["i-sfwatch"]
+        assert out["sf_watch_incomplete_reaps"] == []
+        assert index_module._test_send_message.calls == []
+
+    def test_missing_discriminator_tags_treated_as_incomplete(self, index_module):
+        spots = [_spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600)]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
+        s3.head_object.assert_not_called()
+        assert len(index_module._test_send_message.calls) == 1
+
+    def test_ci_watch_and_sf_watch_boxes_are_independently_tracked(self, index_module):
+        """Both kinds reaped in the same scan must each land only in their
+        own result key — no cross-contamination between WATCH_KINDS entries."""
+        spots = [
+            _spot("i-ciwatch", "alpha-engine-ci-watch-spot", age_seconds=THRESHOLD + 600,
+                 ci_watch_repo="nousergon/alpha-engine-config", ci_watch_sha="abc123"),
+            _spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600,
+                 sf_watch_cadence="saturday", sf_watch_pipeline="ne-weekly-freshness-pipeline",
+                 sf_watch_run_date="2026-07-11"),
+        ]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert set(out["terminated"]) == {"i-ciwatch", "i-sfwatch"}
+        assert out["ci_watch_incomplete_reaps"] == ["i-ciwatch"]
+        assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
+        assert len(index_module._test_send_message.calls) == 2
