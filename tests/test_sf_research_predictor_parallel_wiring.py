@@ -83,9 +83,10 @@ _BRANCH_B_STATES = {
     "ExtractPredictorError", "PublishPredictorFailureImmediate",
     # config#1083 parallel model-zoo fan-out: ResolveZooSpecs -> Map -> Select.
     "ResolveZooSpecs", "WaitResolveZoo", "CheckResolveZooStatus",
-    "ResolveZooWait", "ParseZooSpecs", "ModelZooTrainMap", "ModelZooSelect",
+    "ResolveZooWait", "ExtractModelZooResolveError", "ParseZooSpecs",
+    "ModelZooTrainMap", "ModelZooSelect",
     "WaitForModelZoo", "CheckModelZooStatus", "ModelZooWait",
-    "PublishModelZooFailureImmediate",
+    "ExtractModelZooSelectError", "PublishModelZooFailureImmediate",
     "BranchBComplete", "BranchBFailed",
 }
 
@@ -325,7 +326,19 @@ class TestBranchBContents:
         check_resolve = branch_b["CheckResolveZooStatus"]
         rnexts = {c["StringEquals"]: c["Next"] for c in check_resolve["Choices"]}
         assert rnexts["Success"] == "ParseZooSpecs"
-        assert check_resolve["Default"] == "PublishModelZooFailureImmediate"
+        # Default routes through ExtractModelZooResolveError (mirrors
+        # ExtractPredictorError/ExtractResearchError/ExtractRAGIngestionError)
+        # — a Choice.Default transition does not populate $.model_zoo_error the
+        # way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's
+        # Message calls States.JsonToString($.model_zoo_error); a direct
+        # Choice->Task jump on this edge died with States.Runtime, masking the
+        # real zoo-resolve failure (observed live 2026-07-10, config#2160 arc).
+        assert check_resolve["Default"] == "ExtractModelZooResolveError"
+        extract_resolve = branch_b["ExtractModelZooResolveError"]
+        assert extract_resolve["Type"] == "Pass"
+        assert extract_resolve["ResultPath"] == "$.model_zoo_error"
+        assert extract_resolve["Parameters"]["poll.$"] == "$.resolve_zoo_poll"
+        assert extract_resolve["Next"] == "PublishModelZooFailureImmediate"
         # ParseZooSpecs lifts the JSON array into $.parsed_zoo.zoo_specs.
         parse = branch_b["ParseZooSpecs"]
         assert parse["Type"] == "Pass"
@@ -388,7 +401,17 @@ class TestBranchBContents:
         wait = branch_b["WaitForModelZoo"]
         assert all(c["Next"] != "BranchBFailed" for c in wait["Catch"])
         check = branch_b["CheckModelZooStatus"]
-        assert check["Default"] == "PublishModelZooFailureImmediate"
+        # Default routes through ExtractModelZooSelectError — same rationale
+        # as ExtractModelZooResolveError above: CheckModelZooStatus.Default
+        # does not populate $.model_zoo_error, and a direct jump to
+        # PublishModelZooFailureImmediate died with States.Runtime (observed
+        # live 2026-07-10, config#2160 arc).
+        assert check["Default"] == "ExtractModelZooSelectError"
+        extract_select = branch_b["ExtractModelZooSelectError"]
+        assert extract_select["Type"] == "Pass"
+        assert extract_select["ResultPath"] == "$.model_zoo_error"
+        assert extract_select["Parameters"]["poll.$"] == "$.model_zoo_poll"
+        assert extract_select["Next"] == "PublishModelZooFailureImmediate"
         nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
         assert nexts["InProgress"] == "ModelZooWait"
         assert nexts["Pending"] == "ModelZooWait"
