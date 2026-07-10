@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -749,9 +750,19 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
                         ("low-only", "claude-haiku-4-5")}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
     assert len(cmds) == 3
-    # only the FIRST box runs PR sweeps
+    # config#2129: every co-launched box gets its OWN disjoint sweep
+    # partition — no more "only the first box sweeps" starvation. All 3
+    # share the SAME partition_count (3) with distinct partition_index
+    # values 0/1/2 (order follows decide_trigger's high-first pool order).
     assert "GROOM_NO_SWEEP=1" not in cmds[0]
-    assert all("GROOM_NO_SWEEP=1" in c for c in cmds[1:])
+    for c in cmds:
+        assert "export GROOM_SWEEP_PARTITION_COUNT=3" in c
+    indices = set()
+    for c in cmds:
+        m = re.search(r"export GROOM_SWEEP_PARTITION_INDEX=(\d+)", c)
+        assert m, f"missing partition index export in: {c}"
+        indices.add(int(m.group(1)))
+    assert indices == {0, 1, 2}
 
 
 def test_symmetric_trigger_light_backlog_zero_boxes(monkeypatch):
@@ -773,8 +784,13 @@ def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
 
 
 def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
-    """demand-all enumeration failure now returns early — no legacy fallthrough."""
+    """demand-all enumeration failure now returns early — no legacy fallthrough.
+
+    config#2142: the skip must also PAGE ops-health (a skipped trigger means
+    NO groom boxes launch for the slot — the predecessor CloudWatch-only
+    warning hid a dead engagement scan for 8 consecutive triggers)."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    notifications = _spy_notify(monkeypatch, idx)
     def boom(token):
         raise RuntimeError("github down")
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
@@ -782,6 +798,24 @@ def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
     out = idx.handler(_demand_event(), None)
     assert not out["groom"]["launched"]
     assert out["groom"]["reason"] == "demand_all_failed"
+    assert len(notifications) == 1
+    text, kw = notifications[0]
+    assert "FAILED" in text and "github down" in text
+    assert kw["severity"] == "warning" and kw["silent"] is False
+
+
+def test_load_recent_engagements_raises_on_s3_access_denied(monkeypatch):
+    """config#2142: an engagement-scan read failure must RAISE, never degrade
+    to an empty map. The old fail-safe ``{}`` ("skip nothing") silently
+    disabled fresh-skip on every trigger from ship (2026-07-08) to 2026-07-10
+    when the role lacked ListBucket on groom/{date}/ — the dispatcher
+    advertised pre-skip counts (e.g. high=26) that deflated on-box (10)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    def denied(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        raise RuntimeError("AccessDenied: s3:ListBucket")
+    monkeypatch.setattr(idx._test_s3, "list_objects_v2", denied)
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        idx._load_recent_engagements()
 
 
 def test_non_demand_events_keep_legacy_behavior(monkeypatch):
@@ -793,6 +827,141 @@ def test_non_demand_events_keep_legacy_behavior(monkeypatch):
     out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
                        "issue_filter": "gated-reverify"}, None)
     assert out["groom"]["launched"] and not called
+
+
+# ── config#2129: decide_only / launch_decided (two-phase SF Map-state flow) ──
+# The SF no longer invokes this Lambda once per trigger and tries to poll a
+# response shape that varies 1-vs-N launches. decide_only computes 0..N
+# launch decisions WITHOUT launching; launch_decided launches EXACTLY one
+# already-decided box. Both must never actually boot a spot instance.
+
+
+def test_decide_only_demand_all_returns_launches_without_launching(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+
+    def _launch(types_, subnets, **kw):
+        raise AssertionError("decide_only must never launch a spot instance")
+    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
+
+    out = idx.handler({**_demand_event(), "decide_only": True}, None)
+    d = out["decide"]
+    assert d["trigger"] == "demand-all"
+    assert len(d["launches"]) == 3
+    assert {e["issue_filter"] for e in d["launches"]} == {"high-only", "mid-only", "low-only"}
+    counts = {e["partition_count"] for e in d["launches"]}
+    assert counts == {3}
+    assert sorted(e["partition_index"] for e in d["launches"]) == [0, 1, 2]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_single_tier_returns_one_launch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                       "issue_filter": "mid-only", "schedule": "0 7 * * *",
+                       "decide_only": True}, None)
+    d = out["decide"]
+    assert d["launches"] == [{"model": "claude-sonnet-5", "issue_filter": "mid-only",
+                              "partition_index": 0, "partition_count": 1}]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_ungated_direct_dispatch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "gated-reverify", "decide_only": True}, None)
+    assert out["decide"]["launches"] == [{"model": "claude-haiku-4-5",
+                                          "issue_filter": "gated-reverify",
+                                          "partition_index": 0, "partition_count": 1}]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_demand_gate_skip_shape(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 3, "mid": 40, "high": 2})
+    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+                       "issue_filter": "low-only", "schedule": "0 19 * * *",
+                       "decide_only": True}, None)
+    d = out["decide"]
+    assert d["launches"] == []
+    assert d["launched"] is False
+    assert d["reason"] == "demand_gate_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_demand_all_failure_shape(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("github down")))
+    out = idx.handler({**_demand_event(), "decide_only": True}, None)
+    assert out["decide"]["launches"] == []
+    assert out["decide"]["reason"] == "demand_all_failed"
+
+
+def test_decide_only_respects_pace_gate_skip(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.5 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *",
+                       "decide_only": True}, None)
+    d = out["decide"]
+    assert d["launches"] == []
+    assert d["reason"] == "pace_gate_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    # A launch_decided event must NEVER touch demand-gate/fresh-stat enumeration
+    # (the decision was already made by a prior decide_only call).
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("launch_decided must not re-enumerate")))
+    out = idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-haiku-4-5",
+        "issue_filter": "low-only", "partition_index": 2, "partition_count": 3,
+        "launch_decided": True,
+    }, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["model"] == "claude-haiku-4-5" and g["issue_filter"] == "low-only"
+    assert g["partition_index"] == 2 and g["partition_count"] == 3
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_SWEEP_PARTITION_INDEX=2" in cmd
+    assert "export GROOM_SWEEP_PARTITION_COUNT=3" in cmd
+
+
+def test_launch_decided_bypasses_pace_gate(monkeypatch):
+    # A relaunch of an already-decided box must not be re-blocked by the
+    # pre-boot pace gate — that gate is a per-TRIGGER decision, made once by
+    # decide_only; re-checking it per-box would let a mid-run pace shift
+    # cancel a box the trigger already committed to.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.9 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-opus-4-8",
+        "issue_filter": "high-only", "launch_decided": True,
+    }, None)
+    assert out["groom"]["launched"] is True
+
+
+def test_launch_decided_defaults_partition_when_absent(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "schedule": "0 1 * * *",
+                       "launch_decided": True}, None)
+    g = out["groom"]
+    assert g["partition_index"] == 0 and g["partition_count"] == 1
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_SWEEP_PARTITION" not in cmd  # count<=1 -> no export at all
 
 
 # ── config#2038: engagement lookback + disposition set must come from the lib ──

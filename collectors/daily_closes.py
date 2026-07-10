@@ -52,6 +52,7 @@ import pandas as pd
 import requests
 
 from nousergon_lib.secrets import get_secret
+from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
 
@@ -2205,12 +2206,22 @@ def _fetch_fred_closes(
     return count
 
 
+@yf_quiet
 def _fetch_yfinance_closes(
     tickers: list[str],
     date_str: str,
     records: list[dict],
 ) -> int:
-    """Fetch closes from yfinance for tickers not covered by polygon."""
+    """Fetch closes from yfinance for tickers not covered by polygon.
+
+    Runs under ``yf_quiet`` (nousergon_lib.yfinance_quiet): a delisted/renamed
+    ticker (e.g. JHG, BLD 2026-07-10) makes yfinance log its own per-symbol
+    "possibly delisted" ERROR, which Flow Doctor turns into one report per
+    symbol per worded variant — the same recurring bug class already fixed in
+    ``collectors/prices.py`` (nousergon-data#455) and
+    ``collectors/metron_market_data.py`` (config#1029). The replacement
+    recording surface is the aggregated ``log_yf_coverage`` call below.
+    """
     try:
         import yfinance as yf
     except ImportError:
@@ -2218,6 +2229,7 @@ def _fetch_yfinance_closes(
         return 0
 
     count = 0
+    covered: set[str] = set()
     batches = [tickers[i:i + _YFINANCE_BATCH_SIZE]
                for i in range(0, len(tickers), _YFINANCE_BATCH_SIZE)]
 
@@ -2274,10 +2286,12 @@ def _fetch_yfinance_closes(
                         "source": "yfinance",
                     })
                     count += 1
+                    covered.add(ticker)
                 except Exception as e:
                     logger.warning("yfinance close extract failed for %s: %s", ticker, e)
         except Exception as e:
             logger.warning("yfinance batch failed: %s", e)
 
     logger.info("yfinance fallback: %d/%d tickers captured", count, len(tickers))
+    log_yf_coverage(logger, "daily_closes", tickers, covered)
     return count
