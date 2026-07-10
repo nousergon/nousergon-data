@@ -137,7 +137,7 @@ class TestSpotScriptPreflightOnly:
         # The workloads heredoc opener was `run_remote bash -s <<WORKLOADS`
         # pre-2026-05-27 (SSH transport); post-migration it is
         # `run_ssm "workloads" "$MAX_RUNTIME_SECONDS" <<WORKLOADS` (SSM via
-        # alpha_engine_lib.ssm_dispatcher). Match either shape so the same
+        # nousergon_lib.ssm_dispatcher). Match either shape so the same
         # invariant test survives the transport flip.
         i_workloads = next(
             (
@@ -177,7 +177,7 @@ class TestSpotScriptPreflightOnly:
         # The workloads heredoc opener was `run_remote bash -s <<WORKLOADS`
         # pre-2026-05-27 (SSH transport); post-migration it is
         # `run_ssm "workloads" "$MAX_RUNTIME_SECONDS" <<WORKLOADS` (SSM via
-        # alpha_engine_lib.ssm_dispatcher). Match either shape so the same
+        # nousergon_lib.ssm_dispatcher). Match either shape so the same
         # invariant test survives the transport flip.
         i_workloads = next(
             (

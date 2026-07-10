@@ -65,7 +65,7 @@ import logging
 import os
 import time
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 
 from validators.price_validator import (
     ALL_FEATURE_ANOMALY_TYPES,

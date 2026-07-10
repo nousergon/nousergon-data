@@ -433,7 +433,7 @@ def write_form4_parquet(
     preserve audit trail. Returns the artifact S3 key.
     """
     import json as _json
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key, eval_latest_key, new_eval_run_id,
     )
 

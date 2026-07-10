@@ -179,11 +179,18 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-saturday
-      # Schedule chosen so polygon's Friday daily aggregate has settled
-      # (T+1 lag) before MorningEnrich + DataPhase1 fetch it.
-      # 09:00 UTC = 02:00 AM PT Sat (PDT) / 01:00 AM PT Sat (PST).
-      Description: Saturday 09:00 UTC (02:00 AM PT) — triggers full Alpha Engine pipeline after polygon T+1 settle
-      ScheduleExpression: 'cron(0 9 ? * SAT *)'
+      # 09:00 UTC chosen so polygon's prior-session daily aggregate has
+      # settled (T+1 lag) before MorningEnrich + DataPhase1 fetch it.
+      # THU-SAT (config#1824, Brian-ratified 2026-07-06): the weekly runs
+      # ONE DAY AFTER the week's LAST trading session — Saturday normally,
+      # Friday when Friday is an NYSE holiday, Thursday on a Thu+Fri double
+      # holiday. The cron fires all three days; the SF's WeeklyRunDayGate
+      # (predictor Lambda action=check_weekly_run_day, pure calendar math)
+      # self-selects the single correct firing and Succeed-skips the rest.
+      # Replaces the hand-built one-shot shift used for the 2026-07-03
+      # holiday week.
+      Description: Thu-Sat 09:00 UTC — weekly pipeline fires day after last trading session (WeeklyRunDayGate self-selects; config#1824)
+      ScheduleExpression: 'cron(0 9 ? * THU-SAT *)'
       State: ENABLED
       Targets:
         # SINGLE TARGET PER RULE. EventBridge dispatches the cron event
@@ -666,6 +673,67 @@ Resources:
         duplicate-trigger source.
       Namespace: AlphaEngine/StepFunctions
       MetricName: WeeklyFreshnessMutexConflictFails
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # config#1819 (2026-07-06/07): SNS-publish TaskFailed alarm on the weekly
+  # SF. Motivating incident (2026-06-12): NotifyComplete (a SUCCESS-path
+  # notifier) threw SNS.InvalidParameterException (Subject >100 chars / a
+  # newline / empty), failing an otherwise-succeeded pipeline. The SF fix
+  # (step_function.json) wraps NotifyComplete + NotifyShellRunComplete in
+  # their own Catch so a publish failure no longer fails the execution —
+  # but a silently-caught failure needs its own visibility surface so it
+  # doesn't just vanish. Step Functions logs a TaskFailed history event at
+  # LoggingConfiguration Level:ERROR REGARDLESS of whether a Catch handles
+  # it (confirmed against the AWS docs event-level table), so this filter
+  # sees the caught failure even though the execution itself still shows
+  # SUCCEEDED. SCOPE / KNOWN LIMITATION: TaskFailed's logged fields
+  # (resource/resourceType/error/cause) do NOT include the state name —
+  # CloudWatch Logs Metric Filters match a single line and cannot
+  # correlate across the separate TaskStateEntered event that DOES carry
+  # the name, so this filter matches ANY sns:publish TaskFailed on this SF
+  # (all 7 sns:publish states), not NotifyComplete specifically. That is
+  # an acceptable trade for this alarm's purpose (today, on the weekly SF,
+  # the only sns:publish sites with a Catch that swallows the failure
+  # entirely — i.e. that could otherwise go silent — are NotifyComplete /
+  # NotifyShellRunComplete; every other sns:publish site either has no
+  # Catch (so a failure already fails the execution -> the existing
+  # HandleFailure email path) or is itself a best-effort early-signal alert
+  # inside ResearchPredictorParallel whose branch still ends up visible via
+  # CheckBranchOutcomes). Same string-match-precision trade the existing
+  # MutexConflict filters above already accept.
+  SnsPublishFailedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: WeeklyFreshnessLogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-weekly-freshness-pipeline
+      FilterPattern: '"TaskFailed" "sns:publish"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: WeeklyFreshnessSnsPublishFails
+          MetricValue: '1'
+
+  SnsPublishFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ne-weekly-freshness-sns-publish-failed
+      AlarmDescription: >-
+        config#1819: an sns:publish Task failed on the weekly-freshness
+        (Saturday) pipeline (caught or uncaught). If this fires with the
+        execution otherwise SUCCEEDED, NotifyComplete/NotifyShellRunComplete
+        caught a publish failure (best-effort, per config#1819) — check
+        CloudWatch Logs for the TaskFailed cause (commonly
+        SNS.InvalidParameterException) and the SNS delivery status; the
+        pipeline result itself is NOT in question. If the execution FAILED,
+        this fired alongside the existing HandleFailure email.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: WeeklyFreshnessSnsPublishFails
       Statistic: Sum
       Period: 86400
       EvaluationPeriods: 1

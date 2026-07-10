@@ -191,8 +191,8 @@ def ingest_ticker(
     dry_run: bool = False,
 ) -> int:
     """Ingest 8-K filings for a single ticker. Returns count ingested."""
-    from alpha_engine_lib.rag.embeddings import embed_texts
-    from alpha_engine_lib.rag.retrieval import ingest_document, document_exists
+    from nousergon_lib.rag.embeddings import embed_texts
+    from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
     filings = _search_8k_filings(ticker, lookback_days)
     ingested = 0

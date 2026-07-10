@@ -1,78 +1,146 @@
 {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": "lambda:InvokeFunction",
-            "Resource": [
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-runner*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-eval-judge*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-eval-rolling-mean*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-rationale-clustering*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-aggregate-costs*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-scanner*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-concordance*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-counterfactual*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-health-check*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-substrate*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*",
-                "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator*"
-            ]
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ssm:SendCommand",
-                "ssm:GetCommandInvocation"
-            ],
-            "Resource": [
-                "arn:aws:ssm:us-east-1::document/AWS-RunShellScript",
-                "arn:aws:ec2:us-east-1:711398986525:instance/i-09b539c844515d549",
-                "arn:aws:ec2:us-east-1:711398986525:instance/i-018eb3307a21329bf",
-                "arn:aws:ssm:us-east-1:711398986525:*"
-            ]
-        },
-        {
-            "Effect": "Allow",
-            "Action": "ssm:DescribeInstanceInformation",
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ec2:StartInstances",
-                "ec2:StopInstances"
-            ],
-            "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/i-018eb3307a21329bf"
-        },
-        {
-            "Effect": "Allow",
-            "Action": "sns:Publish",
-            "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents",
-                "logs:CreateLogDelivery",
-                "logs:GetLogDelivery",
-                "logs:UpdateLogDelivery",
-                "logs:DeleteLogDelivery",
-                "logs:ListLogDeliveries",
-                "logs:PutResourcePolicy",
-                "logs:DescribeResourcePolicies",
-                "logs:DescribeLogGroups"
-            ],
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": "dynamodb:PutItem",
-            "Resource": "arn:aws:dynamodb:us-east-1:711398986525:table/alpha-engine-sf-execution-mutex"
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-runner*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-eval-judge*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-eval-rolling-mean*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-rationale-clustering*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-aggregate-costs*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-scanner*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-concordance*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-counterfactual*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-health-check*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-substrate*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation"
+      ],
+      "Resource": [
+        "arn:aws:ssm:us-east-1::document/AWS-RunShellScript",
+        "arn:aws:ec2:us-east-1:711398986525:instance/i-09b539c844515d549",
+        "arn:aws:ec2:us-east-1:711398986525:instance/i-018eb3307a21329bf",
+        "arn:aws:ssm:us-east-1:711398986525:*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ssm:DescribeInstanceInformation",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/i-018eb3307a21329bf"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:CreateLogDelivery",
+        "logs:GetLogDelivery",
+        "logs:UpdateLogDelivery",
+        "logs:DeleteLogDelivery",
+        "logs:ListLogDeliveries",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "dynamodb:PutItem",
+      "Resource": "arn:aws:dynamodb:us-east-1:711398986525:table/alpha-engine-sf-execution-mutex"
+    },
+    {
+      "Sid": "SendCommandDailyDataSpot",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringLike": {
+          "ssm:resourceTag/Name": "alpha-engine-data-*"
         }
-    ]
+      }
+    },
+    {
+      "Sid": "TerminateDailyDataSpot",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/Name": "alpha-engine-data-*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadDailyDataSpotArtifact",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/ops/daily_data_spot/*"
+    },
+    {
+      "Sid": "ListDailyDataSpotArtifactPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "ops/daily_data_spot/*"
+        }
+      }
+    },
+    {
+      "Sid": "AgentTelemetryMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine/Agents"
+        }
+      }
+    },
+    {
+      "Sid": "PollDataSpotSsmCommand",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
+    }
+  ]
 }

@@ -8,10 +8,11 @@ Phase 4 of the pipeline-reporting-revamp arc (ROADMAP L3050, plan doc
 14:00 UTC (≈ 07:00 PT, well after every SF's expected start time). For each
 of the 3 Step Functions, checks whether at least one execution started in
 the expected window. If a check fails, publishes an alert via
-``alpha_engine_lib.alerts.publish`` to a DISTINCT SNS topic
+``nousergon_lib.alerts.publish`` to a DISTINCT SNS topic
 (``alpha-engine-watchdog-alerts``, NOT the existing ``alpha-engine-alerts``
-topic) and to Telegram in parallel — channel independence preserved per
-plan doc §3.5.
+topic) and routes Telegram through flow-doctor forum topics
+(``PIPELINE_OBSERVER_TELEGRAM_TOPICS`` — config#1742 T2) — channel
+independence preserved per plan doc §3.5.
 
 **Per-SF watchdog semantics:**
 
@@ -61,7 +62,7 @@ plan doc §3.5.
 ``AWS/States ExecutionsStarted`` alarm with a 24h window would
 false-positive every weekend for Weekday + EOD (alert hygiene defect:
 operator desensitization → silenced watchdog → defeats purpose). The
-``alpha_engine_lib.trading_calendar.last_closed_trading_day`` chokepoint
+``nousergon_lib.trading_calendar.last_closed_trading_day`` chokepoint
 encodes NYSE holiday + weekend awareness, so the Lambda fires cleanly
 only when there's genuinely a missing execution on an expected
 trading day.
@@ -83,16 +84,20 @@ from typing import Optional
 
 import boto3
 
-from alpha_engine_lib import alerts
-from alpha_engine_lib.trading_calendar import (
+from nousergon_lib import alerts
+from nousergon_lib.trading_calendar import (
     last_closed_trading_day,
     previous_trading_day,
 )
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import PIPELINE_OBSERVER_TELEGRAM_TOPICS
 
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+_FLOW_NAME = "pipeline-watchdog"
+_DB_BASENAME = "flow_doctor_pipeline_watchdog"
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
@@ -369,16 +374,26 @@ def _check_sf(
         severity="error",
         source="alpha-engine-pipeline-watchdog",
         sns=True,
-        telegram=True,
+        telegram=False,
         sns_topic_arn=WATCHDOG_SNS_TOPIC_ARN,
         dedup_key=dedup_key,
         dedup_window_min=12 * 60,
+    )
+    telegram_ok = notify_via_flow_doctor(
+        message,
+        silent=False,
+        severity="error",
+        dedup_key=dedup_key,
+        flow_name=_FLOW_NAME,
+        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        context={"sf_label": sf_label, "sf_arn": sf_arn},
     )
     logger.warning(
         "watchdog ALERT: sf=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",
         sf_label,
         result.sns.ok,
-        result.telegram.ok,
+        telegram_ok,
         getattr(result, "dedup_skipped", False),
     )
     return CheckResult(
@@ -388,7 +403,7 @@ def _check_sf(
         executions_seen=0,
         alert_emitted=True,
         alert_detail=(
-            f"sns_ok={result.sns.ok} telegram_ok={result.telegram.ok} "
+            f"sns_ok={result.sns.ok} telegram_ok={telegram_ok} "
             f"dedup_skipped={getattr(result, 'dedup_skipped', False)}"
         ),
     )
@@ -407,7 +422,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         is_watch_day=is_trading_today,
         skip_reason_if_not_watching=(
             "today is not a NYSE trading day (weekend / holiday) per "
-            "alpha_engine_lib.trading_calendar"
+            "nousergon_lib.trading_calendar"
         ),
         window_seconds=WINDOW_SECONDS_DAILY,
     )
@@ -417,7 +432,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         is_watch_day=is_trading_today,
         skip_reason_if_not_watching=(
             "today is not a NYSE trading day (weekend / holiday) per "
-            "alpha_engine_lib.trading_calendar"
+            "nousergon_lib.trading_calendar"
         ),
         # Trading-day-aware: previous_trading_day-based, NOT a 24h calendar
         # window. Today's EOD fires ~20:00 UTC (after market close + daemon

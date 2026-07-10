@@ -64,6 +64,6 @@ def test_no_functional_slim_surface_in_production():
                 offenders.append(f"{rel}:{i}: {line.strip()[:100]}")
     assert not offenders, (
         "Functional slim-cache surface re-introduced (Wave-4 deleted it — "
-        "use alpha_engine_lib.arcticdb load_universe_ohlcv / "
+        "use nousergon_lib.arcticdb load_universe_ohlcv / "
         "load_macro_series instead):\n" + "\n".join(offenders)
     )

@@ -21,7 +21,7 @@ from io import BytesIO
 
 import pytest
 
-from alpha_engine_lib.sources import NewsArticle
+from nousergon_lib.sources import NewsArticle
 
 from collectors.news_aggregator import (
     AggregatedNewsArticle,

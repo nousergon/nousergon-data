@@ -176,9 +176,16 @@ class TestMutexWiring:
         # workload gate; its skip-default + gate-default converge on
         # CheckMutexRole — the mutex still sits between entry and the
         # former-first-state, one gate further down.
-        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckRunMode"
+        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
+        assert saturday_sf["States"]["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
         assert saturday_sf["States"]["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
-        assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "CheckMutexRole"
+        # config#693: the pipeline-contract preflight gate now sits between
+        # LibPinDriftGate and CheckMutexRole (see
+        # test_sf_pipeline_contract_wiring.py); its own pass-through Default
+        # still lands on CheckMutexRole, one gate further down.
+        assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "PipelineContractCheck"
+        assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"

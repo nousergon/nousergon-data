@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
 
-from alpha_engine_lib.sources import NewsArticle, NewsSource
+from nousergon_lib.sources import NewsArticle, NewsSource
 
 logger = logging.getLogger(__name__)
 

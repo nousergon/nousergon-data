@@ -1,10 +1,10 @@
 """Unit tests for alpha-engine-pipeline-watchdog index.handler.
 
-Stubs ``alpha_engine_lib.trading_calendar.last_closed_trading_day``,
-``alpha_engine_lib.alerts.publish``, and ``boto3.client('stepfunctions')``
-so tests do not hit AWS or the lib. Each test pins one decision branch
-(watch-day eligibility, alert-or-skip, dedup wiring, fail-loud) per the
-``feedback_no_silent_fails`` discipline.
+Stubs ``nousergon_lib.trading_calendar.last_closed_trading_day``,
+``nousergon_lib.alerts.publish``, ``flow_doctor_telegram.notify_via_flow_doctor``,
+and ``boto3.client('stepfunctions')`` so tests do not hit AWS or the lib.
+Each test pins one decision branch (watch-day eligibility, alert-or-skip,
+dedup wiring, fail-loud) per the ``feedback_no_silent_fails`` discipline.
 """
 
 from __future__ import annotations
@@ -18,19 +18,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-# Stub `alpha_engine_lib.trading_calendar` + `alpha_engine_lib.alerts` BEFORE
+# Stub `nousergon_lib.trading_calendar` + `nousergon_lib.alerts` BEFORE
 # importing the handler so test envs without the lib installed still pass.
-_lib_pkg = types.ModuleType("alpha_engine_lib")
-_tc_mod = types.ModuleType("alpha_engine_lib.trading_calendar")
+_lib_pkg = types.ModuleType("nousergon_lib")
+_tc_mod = types.ModuleType("nousergon_lib.trading_calendar")
 _tc_mod.last_closed_trading_day = MagicMock()
 _tc_mod.previous_trading_day = MagicMock()
-_alerts_mod = types.ModuleType("alpha_engine_lib.alerts")
+_alerts_mod = types.ModuleType("nousergon_lib.alerts")
 _alerts_mod.publish = MagicMock()
 _lib_pkg.trading_calendar = _tc_mod
 _lib_pkg.alerts = _alerts_mod
-sys.modules["alpha_engine_lib"] = _lib_pkg
-sys.modules["alpha_engine_lib.trading_calendar"] = _tc_mod
-sys.modules["alpha_engine_lib.alerts"] = _alerts_mod
+sys.modules["nousergon_lib"] = _lib_pkg
+sys.modules["nousergon_lib.trading_calendar"] = _tc_mod
+sys.modules["nousergon_lib.alerts"] = _alerts_mod
+
+_ng_pkg = types.ModuleType("nousergon_lib")
+_ng_fleet_mod = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+_ng_fleet_mod.PIPELINE_OBSERVER_TELEGRAM_TOPICS = ("CRITICAL", "PIPELINE", "OPS_HEALTH")
+_ng_pkg.flow_doctor_fleet = _ng_fleet_mod
+sys.modules["nousergon_lib"] = _ng_pkg
+sys.modules["nousergon_lib.flow_doctor_fleet"] = _ng_fleet_mod
+
+_fd_mod = types.ModuleType("flow_doctor_telegram")
+_fd_mod.notify_via_flow_doctor = MagicMock(return_value=True)
+sys.modules["flow_doctor_telegram"] = _fd_mod
 
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
@@ -55,6 +66,8 @@ def _reset_lib_mocks():
     _alerts_mod.publish.reset_mock()
     _alerts_mod.publish.side_effect = None
     _alerts_mod.publish.return_value = _make_publish_result(sns_ok=True, telegram_ok=True)
+    _fd_mod.notify_via_flow_doctor.reset_mock()
+    _fd_mod.notify_via_flow_doctor.return_value = True
 
 
 def _make_publish_result(*, sns_ok: bool, telegram_ok: bool, dedup_skipped: bool = False):
@@ -208,9 +221,16 @@ def test_check_sf_emits_alert_when_zero_executions_in_window():
     assert call_kwargs["severity"] == "error"
     assert call_kwargs["source"] == "alpha-engine-pipeline-watchdog"
     assert call_kwargs["sns_topic_arn"] == index.WATCHDOG_SNS_TOPIC_ARN
-    assert call_kwargs["telegram"] is True
+    assert call_kwargs["telegram"] is False
     assert "Weekday SF" in call_kwargs["message"]
     assert "24h" in call_kwargs["message"]
+    _fd_mod.notify_via_flow_doctor.assert_called_once()
+    fd_kwargs = _fd_mod.notify_via_flow_doctor.call_args.kwargs
+    assert fd_kwargs["silent"] is False
+    assert fd_kwargs["severity"] == "error"
+    assert fd_kwargs["flow_name"] == index._FLOW_NAME
+    assert fd_kwargs["topics"] == _ng_fleet_mod.PIPELINE_OBSERVER_TELEGRAM_TOPICS
+    assert "Weekday SF" in _fd_mod.notify_via_flow_doctor.call_args.args[0]
 
 
 def test_check_sf_alert_uses_distinct_watchdog_sns_topic_not_alpha_engine_alerts():

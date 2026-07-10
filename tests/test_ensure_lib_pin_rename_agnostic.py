@@ -3,7 +3,7 @@
 Closes the rename-gap bug class (alpha-engine-config#1369): the shared lib was
 renamed ``alpha-engine-lib`` -> ``nousergon-lib`` at v0.60.0 (the AGPL rebrand).
 ``ensure_lib_pin.sh`` originally greped ``^alpha-engine-lib`` and probed
-``import alpha_engine_lib``, so after the rename the grep silently stopped
+``import nousergon_lib``, so after the rename the grep silently stopped
 matching the renamed pin and the heal became a **no-op** — the trading box froze
 at the last pre-rename lib (the 2026-06-29 weekday MorningEnrich crash). The
 existing ``test_sf_lib_pin_self_heal_wiring.py`` only checks that the SF calls
@@ -166,7 +166,7 @@ def test_lib_absent_then_reinstalled(tmp_path):
     assert "healed" in out, out
 
 
-def test_legacy_alpha_engine_lib_pin_still_matched(tmp_path):
+def test_legacy_nousergon_lib_pin_still_matched(tmp_path):
     """Back-compat: a not-yet-renamed repo pinning alpha-engine-lib still heals."""
     rc, out, pip_log = _run(
         tmp_path, requirements=_LEGACY_PIN + "\n", installed_version="0.50.0"

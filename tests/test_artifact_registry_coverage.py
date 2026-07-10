@@ -63,7 +63,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/_price_cache_writeboth.py": 1,
-    "builders/daily_append.py": 2,  # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents, config#1150)
+    # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
+    # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
+    # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
+    # an ORDINARY S3 ArtifactSpec in ARTIFACT_REGISTRY.yaml, no changes to
+    # nousergon_lib.artifact_freshness or its probe machinery).
+    "builders/daily_append.py": 3,
     # builders/migrate_universe_crsp_basis_audit/{ts}.json — the per-ticker CRSP
     # reconciliation REPORT (corporate-actions PR7-7a, config#1434). Like the
     # other one-off migration-audit PUTs (feature_order / vwap below), this is an
@@ -76,7 +81,17 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     "collectors/alternative.py": 3,
-    "collectors/constituents.py": 2,
+    # data/sub_industry_map.json + reference/price_cache/sub_industry_map.json
+    # (config#934 narrow slice, 2026-07-09): additive GICS sub-industry capture
+    # alongside the existing sector_map.json dual-write (1 new put_object call
+    # site, textually — it writes both paths in a loop). No consumer exists yet
+    # (nothing downstream reads it — the cross-repo sub-sector-benchmark/
+    # crucible-predictor feature-wiring scope is unstarted, still gated on
+    # design Brian hasn't ruled on). No periodic freshness SLA to monitor until
+    # a consumer exists, so grandfathered out of ARTIFACT_REGISTRY.yaml (see
+    # alpha-engine-config private-docs/ARTIFACT_REGISTRY.yaml grandfathered_paths)
+    # rather than registered with a speculative cadence/SLA.
+    "collectors/constituents.py": 3,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering
@@ -115,13 +130,22 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "data/snapshotter/analyst_daily.py": 2,
     "features/compute.py": 1,
     "features/registry.py": 1,
+    # features/metron_supplemental/{date}/sectors.json sidecar (metron-ops#177) —
+    # the module's parquet writes reuse features/writer.py's existing PUT site
+    # (already pinned above); this is the ONE new site, the sectors sidecar.
+    # Covered by the already-grandfathered "features/" path_prefix in
+    # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
+    # retired the S3 mirror) — no new registry row needed.
+    "features/metron_supplemental.py": 1,
     "features/writer.py": 1,
     "lambda/handler.py": 1,
     "preflight.py": 1,
     "rag/pipelines/emit_manifest.py": 2,
     "rag/pipelines/filing_change_detection.py": 2,
     "rag/pipelines/ingest_form4.py": 2,
-    "weekly_collector.py": 6,
+    # config#1727: _write_module_health delegates to nousergon_lib.health (1 fewer
+    # local put_object); health/{module}.json still written via lib.
+    "weekly_collector.py": 5,
 }
 
 

@@ -10,7 +10,7 @@ Three rules pinned here:
    FLOW_DOCTOR_ENABLED=1`. The 2026-05-05 migration from boot-triggered
    systemd to SF-triggered SSM dropped this env var on the
    trading-instance SSM path (systemd units had it baked in via
-   `Environment=`). Without it, `alpha_engine_lib.logging.setup_logging`
+   `Environment=`). Without it, `nousergon_lib.logging.setup_logging`
    skips attaching `FlowDoctorHandler` and ERROR-level logs go only to
    stdout — exactly the failure mode on 2026-05-11, where two ERROR
    logs from `weekly_collector` fired but flow-doctor never escalated.
@@ -27,8 +27,8 @@ Three rules pinned here:
        "s3://..." --only-show-errors || true' EXIT` BEFORE a
        `| tee /var/log/X.log` work line. Used by states whose
        `commands` is a plain JSON array.
-   (b) **`nousergon_lib.ssm_log_capture` CLI** — a single
-       `python -m nousergon_lib.ssm_log_capture run --slug X
+   (b) **`krepis.ssm_log_capture` CLI** — a single
+       `python -m krepis.ssm_log_capture run --slug X
        --log /var/log/X.log -- bash <launcher> ...` invocation that
        internalizes both the trap and the tee. Used by states whose
        `commands.$` is a `States.Array(...)` (the ASL escape surface
@@ -138,7 +138,7 @@ def test_every_ssm_command_block_starts_with_pipefail(sf_path: Path) -> None:
 def test_weekday_sf_ssm_blocks_export_flow_doctor_enabled() -> None:
     """Every weekday-SF SSM command array must `export FLOW_DOCTOR_ENABLED=1`.
 
-    `alpha_engine_lib.logging.setup_logging` only attaches
+    `nousergon_lib.logging.setup_logging` only attaches
     `FlowDoctorHandler` when this env var is set; otherwise ERROR-level
     logs go only to stdout and never enter the dispatch pipeline
     (email + GitHub issue + S3 changelog).
@@ -177,7 +177,7 @@ def test_weekday_sf_ssm_blocks_export_flow_doctor_enabled() -> None:
 
 _TEE_WORK_RE = re.compile(r"\| tee (?:-a )?(/var/log/[\w.-]+\.log)")
 # Accepts all three historical/current import names for the same module:
-# alpha_engine_lib.ssm_log_capture (original) -> nousergon_lib.ssm_log_capture
+# nousergon_lib.ssm_log_capture (original) -> krepis.ssm_log_capture
 # (rename shim) -> krepis.ssm_log_capture (v0.66.0 MIT lift, the current
 # canonical path). This regex was stale at only the FIRST name until
 # 2026-07-01 (config#1552-adjacent EOD date-thread fix) — genuinely never
@@ -187,7 +187,7 @@ _TEE_WORK_RE = re.compile(r"\| tee (?:-a )?(/var/log/[\w.-]+\.log)")
 # migration rule; existing states on the older names are left as-is (not a
 # blanket forced migration in this PR).
 _LIB_CLI_RE = re.compile(
-    r"(?:alpha_engine_lib|nousergon_lib|krepis)\.ssm_log_capture"
+    r"(?:nousergon_lib|nousergon_lib|krepis)\.ssm_log_capture"
     r"\s+run\s+.*?--slug\s+(\S+)\s+--log\s+(/var/log/[\w.-]+\.log)"
 )
 
@@ -203,8 +203,8 @@ def test_long_ssm_steps_ship_log_to_s3(sf_path: Path) -> None:
 
     (a) **Inline bash trap** before `| tee /var/log/X.log` work line —
         original form, plain `commands` JSON arrays only.
-    (b) **`nousergon_lib.ssm_log_capture` CLI** — single
-        `python -m nousergon_lib.ssm_log_capture run --slug X
+    (b) **`krepis.ssm_log_capture` CLI** — single
+        `python -m krepis.ssm_log_capture run --slug X
         --log /var/log/X.log -- bash <launcher>` line; internalizes the
         trap. Required form for `commands.$ States.Array(...)` states
         (ASL doesn't unescape `\\'` in arg strings; the inline-trap
@@ -275,7 +275,7 @@ def test_long_ssm_steps_ship_log_to_s3(sf_path: Path) -> None:
         "\\\"s3://alpha-engine-research/_ssm_logs/<slug>/...\\\" "
         "--only-show-errors || true' EXIT\"` immediately before the "
         "`| tee` work line (only works in plain `commands` arrays), "
-        "OR switch the work line to `python -m nousergon_lib.ssm_log_capture "
+        "OR switch the work line to `python -m krepis.ssm_log_capture "
         "run --slug X --log /var/log/X.log -- bash <launcher>` (required "
         "for `commands.$ States.Array(...)` states). See 2026-05-22 "
         "Friday-PM dry-pass + alpha-engine-lib PR #57."

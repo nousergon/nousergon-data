@@ -37,6 +37,7 @@ from features.feature_engineer import (
     compute_features,
 )
 from features.factor_momentum import materialize_factor_momentum
+from features.cross_sectional import materialize_factor_loading_zscores
 from features.compute import (
     DEFAULT_BUCKET,
     SOURCE_CATEGORIES,
@@ -154,6 +155,13 @@ def _extract_macro_series(price_data: dict[str, pd.DataFrame]) -> dict[str, pd.S
     macro_keys = {
         "SPY": "SPY", "VIX": "VIX", "VIX3M": "VIX3M",
         "TNX": "TNX", "IRX": "IRX", "GLD": "GLD", "USO": "USO",
+        # config#939 — credit spreads. HYOAS is the FRED-only ICE BofA US
+        # HY Index OAS index ticker (see collectors/daily_closes.py
+        # _FRED_INDEX_MAP), collected the same way as VIX/TNX/IRX. Absent
+        # from price_data (e.g. pre-Stage-2.5 cache) → macro.get("HYOAS")
+        # returns None downstream, which compute_features already
+        # neutral-defaults rather than crashing.
+        "HYOAS": "HYOAS",
     }
     macro: dict[str, pd.Series] = {}
     for key, stem in macro_keys.items():
@@ -605,6 +613,7 @@ def backfill(
     gld_series = macro.get("GLD")
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
+    hyoas_series = macro.get("HYOAS")
 
     # ── 4. Compute features and write to ArcticDB ────────────────────────────
     if not dry_run:
@@ -644,6 +653,7 @@ def backfill(
                 gld_series=gld_series,
                 uso_series=uso_series,
                 vix3m_series=vix3m_series,
+                hyoas_series=hyoas_series,
                 earnings_data=ticker_alt.get("earnings"),
                 revision_data=ticker_alt.get("revisions"),
                 options_data=ticker_alt.get("options"),
@@ -763,9 +773,12 @@ def backfill(
             macro_lib.write("features", to_arctic_safe(macro_df))
             log.info("Wrote macro features: %d dates", len(macro_df))
 
-        # Write raw macro series (SPY, VIX, etc.) for consumers that need them
+        # Write raw macro series (SPY, VIX, etc.) for consumers that need them.
+        # HYOAS added config#939 (credit spreads) — mirrors the existing
+        # VIX/TNX/etc. raw-series persistence so daily_append's read-back
+        # loop (macro_lib.read("HYOAS")) resolves after this backfill runs.
         if not dry_run:
-            for key in ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]:
+            for key in ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO", "HYOAS"]:
                 series = macro.get(key)
                 if series is not None:
                     macro_series_df = pd.DataFrame({"Close": series}, index=series.index)
@@ -797,6 +810,23 @@ def backfill(
             canonical_fn=to_arctic_canonical,
         )
         log.info("Factor-momentum second pass: %s", json.dumps(fm_result, default=str))
+
+    # ── 5c. Factor-loading z-score second pass (C.1 / C.2b) ───────────────────
+    # The 9 *_zscore Barra loadings are cross-sectional (apply_factor_zscores).
+    # S3 feature-store compute.py already emits them; ArcticDB (predictor
+    # training cache + risk_model_persist) needs the same second pass so C.2b
+    # can build F + D from tmp_cache. Full-universe only — a ``--ticker X``
+    # patch can't reconstruct the cross-section.
+    if not dry_run and ticker_filter is None:
+        flz_result = materialize_factor_loading_zscores(
+            universe_lib,
+            universe_tickers,
+            canonical_fn=to_arctic_canonical,
+        )
+        log.info(
+            "Factor-loading z-score second pass: %s",
+            json.dumps(flz_result, default=str),
+        )
 
     # ── 6. Snapshot ──────────────────────────────────────────────────────────
     if not dry_run:
@@ -895,6 +925,7 @@ def _run_validation(
     gld_series = macro.get("GLD")
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
+    hyoas_series = macro.get("HYOAS")
 
     passed = 0
     failed = 0
@@ -918,6 +949,7 @@ def _run_validation(
                 gld_series=gld_series,
                 uso_series=uso_series,
                 vix3m_series=vix3m_series,
+                hyoas_series=hyoas_series,
                 earnings_data=ticker_alt.get("earnings"),
                 revision_data=ticker_alt.get("revisions"),
                 options_data=ticker_alt.get("options"),

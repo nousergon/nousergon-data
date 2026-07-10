@@ -5,9 +5,20 @@ Writes constituents.json to S3 with:
   - tickers: deduplicated list of ~900 symbols
   - sector_map: {ticker: GICS_sector_name}
   - sector_etf_map: {ticker: sector_ETF_symbol}
+  - sub_industry_map: {ticker: GICS_sub_industry_name}
   - sp500_count, sp400_count, total_count, fetched_at
 
 Falls back to a local CSV cache if Wikipedia is unreachable.
+
+``sub_industry_map`` (config#934 narrow slice, 2026-07-09): the Wikipedia
+constituents tables already scraped here carry a "GICS Sub-Industry" column
+alongside "GICS Sector" (that's *why* ``_select_constituents_table``'s sector
+matcher has to exclude "sub" — both columns exist on the same table). This is
+purely additive collector-side capture: best-effort, non-blocking (missing/
+unmapped sub-industry does NOT raise, unlike the sector map's hard
+completeness gate — sub-industry is not yet consumed by anything downstream).
+The full cross-repo ask (sub-sector benchmark definitions, crucible-predictor
+feature wiring, retrain) is separate, unstarted follow-on scope — see #934.
 """
 
 from __future__ import annotations
@@ -63,7 +74,9 @@ def collect(
     if run_date is None:
         run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    tickers, sector_map, sector_etf_map, sp500_count, sp400_count = _fetch_constituents()
+    tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
+        _fetch_constituents()
+    )
 
     if not tickers:
         return {"status": "error", "error": "No tickers fetched"}
@@ -75,12 +88,17 @@ def collect(
             f"missing GICS sector. Sample: {unmapped[:10]}. EOD reconcile sector "
             f"attribution depends on full coverage; aborting before write."
         )
+    # Sub-industry is additive/best-effort — NOT a hard gate like sector
+    # above. Nothing downstream consumes it yet (config#934 narrow slice),
+    # so a partial or empty sub_industry_map must not block the weekly
+    # constituents write the way a missing sector would.
 
     result = {
         "date": run_date,
         "tickers": tickers,
         "sector_map": sector_map,
         "sector_etf_map": sector_etf_map,
+        "sub_industry_map": sub_industry_map,
         "sp500_count": sp500_count,
         "sp400_count": sp400_count,
         "total_count": len(tickers),
@@ -109,18 +127,15 @@ def collect(
     )
     logger.info("Wrote constituents.json to s3://%s/%s (%d tickers)", bucket, key, len(tickers))
 
-    # Write sector_map.json to canonical data path + legacy predictor
-    # path + Wave-3 new reference/ path. The new ``reference/`` write
-    # was missing from PR1 #270 because that PR scoped only the
-    # ticker-parquet write paths (yfinance / FRED / chronic-gap);
-    # sector_map.json travels through this separate constituents
-    # collector and needs its own write-both update so the Wave-3
-    # readers don't see a stale ``reference/`` copy after PR4 retires
-    # legacy.
+    # Write sector_map.json to canonical data path + Wave-3 reference/
+    # path. PR4 (config#780) retired the legacy predictor/price_cache/
+    # write: the ticker-parquet side already writes reference/ only via
+    # _price_cache_write_prefixes(), and this collector's own legacy
+    # write was the one straggler still recreating the deleted prefix
+    # on every weekly run.
     sector_map_body = json.dumps(sector_etf_map, indent=2, sort_keys=True)
     for sector_map_key in (
         "data/sector_map.json",
-        "predictor/price_cache/sector_map.json",
         "reference/price_cache/sector_map.json",
     ):
         s3.put_object(
@@ -128,7 +143,25 @@ def collect(
             Body=sector_map_body, ContentType="application/json",
         )
     logger.info(
-        "Wrote sector_map.json to data/, predictor/, and reference/ paths",
+        "Wrote sector_map.json to data/ and reference/ paths",
+    )
+
+    # Write sub_industry_map.json alongside sector_map.json (config#934
+    # narrow slice) — same dual-path convention as above, so a future
+    # consumer can pick it up from either location. Purely additive: no
+    # reader exists yet (nothing in this repo or crucible-predictor is
+    # wired to it), so this write cannot change any existing behavior.
+    sub_industry_map_body = json.dumps(sub_industry_map, indent=2, sort_keys=True)
+    for sub_industry_map_key in (
+        "data/sub_industry_map.json",
+        "reference/price_cache/sub_industry_map.json",
+    ):
+        s3.put_object(
+            Bucket=bucket, Key=sub_industry_map_key,
+            Body=sub_industry_map_body, ContentType="application/json",
+        )
+    logger.info(
+        "Wrote sub_industry_map.json to data/ and reference/ paths",
     )
 
     # tickers is included in the return so callers don't need an S3 round-trip
@@ -177,18 +210,23 @@ def _select_constituents_table(tables: list[pd.DataFrame], index_name: str) -> p
     return max(candidates, key=len)
 
 
-def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], int, int]:
+def _fetch_constituents() -> tuple[
+    list[str], dict[str, str], dict[str, str], dict[str, str], int, int
+]:
     """
     Fetch constituent tickers and sector mappings from Wikipedia.
 
     Returns:
-        (tickers, sector_map, sector_etf_map, sp500_count, sp400_count)
+        (tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count)
         - sector_map: {ticker: GICS_sector_name}
         - sector_etf_map: {ticker: sector_ETF_symbol}
+        - sub_industry_map: {ticker: GICS_sub_industry_name} (best-effort,
+          additive — a ticker missing here does not block collect()).
     """
     tickers: list[str] = []
     sector_map: dict[str, str] = {}
     sector_etf_map: dict[str, str] = {}
+    sub_industry_map: dict[str, str] = {}
     sp500_count = 0
     sp400_count = 0
 
@@ -240,6 +278,37 @@ def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], in
                 index_name, len(batch), len(sector_map), len(sector_etf_map),
             )
 
+            # GICS Sub-Industry column (config#934 narrow slice) — same
+            # table, one level finer than sector (e.g. "Semiconductors" /
+            # "Application Software" vs. the parent "Information
+            # Technology" sector). Best-effort: unlike sector above, a
+            # missing sub-industry column does NOT raise — nothing
+            # downstream depends on this yet, so a Wikipedia layout
+            # change here should degrade gracefully rather than block
+            # the weekly constituents write.
+            sub_industry_col = next(
+                (c for c in df.columns if "gics" in str(c).lower() and "sub" in str(c).lower()
+                 and "industry" in str(c).lower()),
+                None,
+            )
+            if sub_industry_col is not None:
+                for ticker, sub_industry in zip(
+                    batch, df[sub_industry_col].astype(str).tolist()
+                ):
+                    sub_industry_name = sub_industry.strip()
+                    if sub_industry_name and sub_industry_name.lower() != "nan":
+                        sub_industry_map[ticker] = sub_industry_name
+                logger.info(
+                    "[%s] Sub-industry map: running total %d",
+                    index_name, len(sub_industry_map),
+                )
+            else:
+                logger.warning(
+                    "[%s] GICS Sub-Industry column missing (columns: %s) — "
+                    "sub_industry_map will be incomplete for this index.",
+                    index_name, list(df.columns),
+                )
+
         tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
 
         # Update local cache with full sector mapping so a future Wikipedia
@@ -252,30 +321,36 @@ def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], in
             "ticker": tickers,
             "gics_sector": [sector_map.get(t, "") for t in tickers],
             "sector_etf": [sector_etf_map.get(t, "") for t in tickers],
+            "gics_sub_industry": [sub_industry_map.get(t, "") for t in tickers],
         }).to_csv(_CACHE_PATH, index=False)
 
-        return tickers, sector_map, sector_etf_map, sp500_count, sp400_count
+        return tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count
 
     except Exception as e:
         logger.warning("Wikipedia fetch failed (%s); trying local cache...", e)
         return _load_from_cache()
 
 
-def _load_from_cache() -> tuple[list[str], dict[str, str], dict[str, str], int, int]:
+def _load_from_cache() -> tuple[
+    list[str], dict[str, str], dict[str, str], dict[str, str], int, int
+]:
     """Read the local cache and reconstruct ticker list + sector maps.
 
     Backwards-compatible with the legacy ticker-only cache schema: missing
-    gics_sector / sector_etf columns return empty dicts (which then trip
-    collect()'s `Sector mapping incomplete` raise — failing loud rather
-    than writing constituents.json with missing data).
+    gics_sector / sector_etf / gics_sub_industry columns return empty dicts
+    (missing gics_sector then trips collect()'s `Sector mapping incomplete`
+    raise — failing loud rather than writing constituents.json with missing
+    sector data; a missing/empty sub_industry_map does NOT raise, since it's
+    additive and not yet consumed downstream).
     """
     if not _CACHE_PATH.exists():
         logger.error("No cache found — cannot build universe")
-        return [], {}, {}, 0, 0
+        return [], {}, {}, {}, 0, 0
     df = pd.read_csv(_CACHE_PATH)
     tickers = df["ticker"].astype(str).tolist()
     sector_map: dict[str, str] = {}
     sector_etf_map: dict[str, str] = {}
+    sub_industry_map: dict[str, str] = {}
     if "gics_sector" in df.columns:
         for ticker, sector in zip(tickers, df["gics_sector"].astype(str).tolist()):
             sector = sector.strip()
@@ -286,11 +361,16 @@ def _load_from_cache() -> tuple[list[str], dict[str, str], dict[str, str], int, 
             etf = etf.strip()
             if etf and etf.lower() != "nan":
                 sector_etf_map[ticker] = etf
+    if "gics_sub_industry" in df.columns:
+        for ticker, sub_industry in zip(tickers, df["gics_sub_industry"].astype(str).tolist()):
+            sub_industry = sub_industry.strip()
+            if sub_industry and sub_industry.lower() != "nan":
+                sub_industry_map[ticker] = sub_industry
     logger.info(
-        "Loaded %d tickers from cache (sector_map=%d, sector_etf_map=%d)",
-        len(tickers), len(sector_map), len(sector_etf_map),
+        "Loaded %d tickers from cache (sector_map=%d, sector_etf_map=%d, sub_industry_map=%d)",
+        len(tickers), len(sector_map), len(sector_etf_map), len(sub_industry_map),
     )
-    return tickers, sector_map, sector_etf_map, 0, 0
+    return tickers, sector_map, sector_etf_map, sub_industry_map, 0, 0
 
 
 def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:

@@ -5,14 +5,14 @@
 # Closes the code-vs-installed-lib deploy-skew bug class (the 2026-06-10
 # weekday-SF MorningEnrich failure): an SSM entrypoint `git pull`s new code that
 # imports a NEW lib symbol AND bumps the pin in the SAME commit (data #385 added
-# `from alpha_engine_lib.logging import guard_entrypoint` + bumped the pin to
+# `from nousergon_lib.logging import guard_entrypoint` + bumped the pin to
 # v0.58.0), but the box venv is never reinstalled between the pull and the run --
 # so the new symbol resolves against the STALE installed lib -> ImportError ->
 # hard pipeline fail. The box auto-pulls code on a different cadence than it
 # reinstalls the lib, and nothing closed that window.
 #
 # This is the reconcile step that belongs BETWEEN `git pull` and the entrypoint.
-# It is deliberately a REPO script, NOT an `alpha_engine_lib` CLI like
+# It is deliberately a REPO script, NOT an `nousergon_lib` CLI like
 # `ssm_log_capture`: the whole failure mode is "the installed lib is stale," so
 # the heal mechanism must not live in the lib -- a lib-resident form would be
 # absent on the very box it needs to fix (a venv old enough to lack the new

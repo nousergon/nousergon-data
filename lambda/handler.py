@@ -26,7 +26,7 @@ import traceback
 # where Dockerfile COPYs flow-doctor.yaml) takes precedence; falls back
 # to two-dirs-up from this file for local dev (lambda/handler.py →
 # repo root). Mirrors alpha-engine-research/lambda/handler.py.
-from alpha_engine_lib.logging import setup_logging, monitor_handler
+from nousergon_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -75,7 +75,7 @@ def handler(event, context):
         # Read via get_secret() not os.environ.get() — the bulk-load shim
         # (ssm_secrets.load_secrets) was retired in PR 9f of the .env→SSM
         # arc (2026-05-14). Secrets now load from SSM at consumer sites.
-        from alpha_engine_lib.secrets import get_secret
+        from nousergon_lib.secrets import get_secret
         missing = [
             name for name in ("FMP_API_KEY", "FINNHUB_API_KEY")
             if not get_secret(name, required=False, default="")

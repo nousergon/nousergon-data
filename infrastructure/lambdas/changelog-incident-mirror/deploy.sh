@@ -163,7 +163,7 @@ echo "✓ Deployed."
 
 # Smoke test: publish a single SNS message and verify the entry lands.
 # Migrated 2026-05-20 (ROADMAP L146) from raw ``aws sns publish`` to the
-# canonical ``alpha_engine_lib.alerts`` primitive (v0.21.0, lib #52).
+# canonical ``nousergon_lib.alerts`` primitive (v0.21.0, lib #52).
 # Skips Telegram on purpose: this is a deliberate deploy smoke test, not
 # a real failure event, and a per-deploy operator ping would be noise.
 # SNS path stays identical (same default topic `alpha-engine-alerts`),
@@ -172,14 +172,25 @@ SMOKE_ARG="${1:-}"
 if [[ "${SMOKE_ARG}" == "--smoke" ]]; then
   echo "Smoke-testing via alerts.publish (SNS-only, severity=info)..."
   TS=$(date -u +%s)
-  # Resolve Python with alpha_engine_lib installed — prefer repo-local
+  # Resolve Python with the alerts CLI installed — prefer repo-local
   # .venv, fall back to system python3 (mirrors the alpha-engine
   # health_checker.sh pattern).
   _alert_python="python3"
   if [ -x "$(dirname "$0")/../../../.venv/bin/python" ]; then
     _alert_python="$(dirname "$0")/../../../.venv/bin/python"
   fi
-  "$_alert_python" -m nousergon_lib.alerts publish \
+  # Invoke the alerts CLI via ``krepis.alerts`` (config#1339), matching this
+  # repo's own infrastructure/deploy.sh. The alerts module relocated to
+  # ``krepis`` (MIT) at nousergon-lib v0.66.0; ``nousergon_lib.alerts`` and
+  # ``nousergon_lib.alerts`` are now re-export/alias shims. Running a shim
+  # under runpy (``python -m <shim>.alerts``) was a SILENT exit-0 no-op on any
+  # pin < v0.81.1 — the shim fell off its end before the target's __main__
+  # guard fired (the config#1646 incident: a weekly SF reported SUCCESS while
+  # running zero workloads). This repo pins nousergon-lib v0.77.0 (< 0.81.1),
+  # so the shim path here would no-op; ``krepis`` is a hard transitive dep
+  # (requirements.txt floors ``krepis>=0.6.0``), so ``-m krepis.alerts`` runs
+  # the real CLI under runpy regardless of the lib pin.
+  "$_alert_python" -m krepis.alerts publish \
     --severity info \
     --no-telegram \
     --source alpha-engine-data/changelog-incident-mirror/deploy.sh \

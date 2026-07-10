@@ -80,6 +80,8 @@ _CFN_PATH = (
 # targeted operator skips) — this constant + test_skip_gates_still_intact
 # enforce that none were deleted.
 _EXPECTED_SKIPS = {
+    # config#1824: scheduled-weekly run-day gate operator bypass.
+    "skip_weekly_run_day_gate",
     # Added 2026-06-08 (L4517 — preventive cross-repo lib-pin drift gate,
     # the first state after InitializeInput).
     "skip_lib_pin_drift_check",
@@ -99,7 +101,9 @@ _EXPECTED_SKIPS = {
     # CheckSkipAggregateCosts comment.
     "skip_aggregate_costs",
     "skip_predictor_training",
-    "skip_drift_detection",
+    # config#902: skip_drift_detection was removed — the DriftDetection state
+    # (and its CheckSkipDriftDetection gate) were collapsed when drift was
+    # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
@@ -159,10 +163,11 @@ _SPOT_STATES = {
         "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
-    "DriftDetection": (
-        "bash infrastructure/spot_drift_detection.sh",
-        "/var/log/drift-detection.log",
-    ),
+    # config#902: DriftDetection was collapsed — drift is now bundled onto the
+    # PredictorTraining spot (crucible-predictor spot_train.sh runs
+    # monitoring.drift_detector after training succeeds). Its Friday
+    # --preflight-only dry path folds into spot_train.sh --preflight-only, so
+    # DriftDetection is no longer a standalone spot state here.
 }
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
@@ -331,10 +336,18 @@ def orig_spot_cmds() -> dict:
       `'trap \\'aws s3 cp ...\\' EXIT'` inside `commands.$ States.Array`
       (ASL doesn't unescape `\\'` in arg strings — caught by the
       Friday-PM dry-pass). The baseline now reflects the lib-CLI form:
-      `python -m nousergon_lib.ssm_log_capture run --slug X
+      `python -m krepis.ssm_log_capture run --slug X
       --log Y -- bash <launcher>`. The keystone's byte-identicality
       proof against the new baseline still holds (the absent path runs
       the same lib-CLI invocation with `preflight_args=""`).
+    - **Regenerated 2026-07-03** as part of the `nousergon_lib.ssm_log_capture`
+      → `krepis.ssm_log_capture` caller migration (config#1646). The
+      `nousergon_lib` path became a guard-less re-export shim at lib
+      v0.66.0: under `python -m` it exits 0 WITHOUT executing the inner
+      command — the 2026-07-03 weekly ran zero EC2 workloads while
+      reporting SUCCESS. `krepis.ssm_log_capture` is the canonical
+      executable path; `test_ssm_log_capture_wrapper_executes.py` now
+      proves executability (not just importability) in CI.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -403,7 +416,9 @@ class TestStrictSuperset:
         # so the mutex→CheckShellRun superset property below is unchanged.
         # config#830: CheckRunMode (cadence preset) precedes the lib-pin gate;
         # its Default → CheckSkipLibPinDriftCheck, so the superset chain holds.
-        assert states["InitializeInput"]["Next"] == "CheckRunMode"
+        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
+        assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
         assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
             "Mutex bypass path must route to CheckShellRun so the shell-run "
@@ -441,14 +456,16 @@ class TestStrictSuperset:
         assert choices[0]["Next"] == "ApplyShellRunDefaults"
 
     def test_notify_complete_is_byte_identical(self, states):
-        """The real Saturday SUCCESS email must not change."""
+        """The real Saturday SUCCESS email — now deep-links to the console
+        pipeline-status page (config#856 push-on-transition revamp)."""
         nc = states["NotifyComplete"]
         assert nc["Resource"] == "arn:aws:states:::sns:publish"
         assert nc["Parameters"]["Subject"] == (
             "Alpha Engine Saturday Pipeline — SUCCESS"
         )
         assert nc["Parameters"]["Message"] == (
-            "All steps completed successfully. Check dashboard for results."
+            "All steps completed successfully. "
+            "View pipeline status: https://console.nousergon.ai/pipeline-status"
         )
         assert nc["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
         assert nc["ResultPath"] == "$.notify_result"
@@ -565,8 +582,10 @@ class TestApplyShellRunDefaults:
             "skip_data_phase2",
             "skip_regime_substrate",
             "skip_regime_retrospective_eval",
-            # The 5 ex-keystone skip-exceptions — now run DRY, not skipped.
-            "skip_drift_detection",
+            # The ex-keystone skip-exceptions — now run DRY, not skipped.
+            # (config#902 removed skip_drift_detection entirely — the
+            # DriftDetection state was collapsed onto the PredictorTraining
+            # spot, so there is no drift state to run dry OR skip.)
             "skip_eval_judge",
             "skip_rationale_clustering",
             "skip_replay_concordance",
@@ -647,7 +666,7 @@ class TestByteIdenticalAbsentPath:
             ``{token} --preflight-only 2>&1 | tee {log}``
         to
             ``/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m
-              nousergon_lib.ssm_log_capture run --slug X --log Y --
+              krepis.ssm_log_capture run --slug X --log Y --
               {token} --preflight-only``
         as part of the inline-trap-to-lib-CLI lift (alpha-engine-lib PR #57).
         The lib CLI internalizes tee + S3-ship; --preflight-only still
@@ -662,7 +681,7 @@ class TestByteIdenticalAbsentPath:
         final = cmds[-1]
         expected = (
             "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
-            "-m nousergon_lib.ssm_log_capture run "
+            "-m krepis.ssm_log_capture run "
             f"--slug {slug} --log {log} -- "
             f"{token} --preflight-only"
         )
@@ -918,8 +937,10 @@ class TestHappyPathTraversal:
         assert "NotifyComplete" not in order
         # Skip-exception rewire: ZERO main-thread workload states are
         # skipped — every CheckSkip gate falls through so the (dry) state is
-        # VISITED. This now INCLUDES DriftDetection (flipped skip→dry via
-        # the spot --preflight-only mechanism). (Research/DataPhase2/eval
+        # VISITED. (config#902: DriftDetection is no longer on this trace — it
+        # was collapsed onto the PredictorTraining spot, which lives inside the
+        # Parallel; its dry path is now spot_train.sh --preflight-only.)
+        # (Research/DataPhase2/eval
         # chain/PredictorTraining live inside the Parallel and aren't on
         # this main-thread trace; their dry-routing is asserted by
         # TestByteIdenticalAbsentPath +
@@ -932,7 +953,6 @@ class TestHappyPathTraversal:
         for ran_dry in (
             "MorningEnrich",
             "DataPhase1",
-            "DriftDetection",
             "Backtester",
             "PredictorBacktest",
             "PortfolioOptimizerBacktest",
@@ -972,12 +992,21 @@ class TestHappyPathTraversal:
         # config#830: CheckRunMode (cadence preset) sits between InitializeInput
         # and the lib-pin gate; with no `mode` on the input it takes its Default
         # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
+        # config#1824: the run-day gate is the first hop; a role-less input
+        # takes its Default straight to CheckRunMode — one extra Choice.
+        # config#693 (L4595): the pipeline-contract preflight gate is now
+        # composed directly after LibPinDriftGate's pass-through (no drift ->
+        # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
+        # violation) — two extra states in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            "CheckWeeklyRunDayGate",
             "CheckRunMode",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",
+            "PipelineContractCheck",
+            "PipelineContractGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",

@@ -16,7 +16,7 @@ invocation:
   1. Load the registry from S3
      (``s3://{REGISTRY_BUCKET}/{REGISTRY_KEY}``, YAML).
   2. Walk every spec. For each, call
-     :func:`alpha_engine_lib.artifact_freshness.check_freshness`
+     :func:`nousergon_lib.artifact_freshness.check_freshness`
      against the current ``now`` (UTC).
   3. Aggregate results into a single ``check_results.json`` artifact
      under ``_freshness_monitor/`` (the dashboard surface reads this).
@@ -24,9 +24,13 @@ invocation:
      — the monitor monitors itself; substrate-health-check daily
      watches the heartbeat.
   5. For misses past SLA (``state ∈ {missing, stale, probe_failed}``),
-     route to :func:`krepis.alerts.publish` with
-     ``dedup_key=resolve_dedup_key(spec, now)`` — dedup collapses
-     4×/hour retries to one alert per cycle per artifact.
+     route SNS via :func:`krepis.alerts.publish` (``telegram=False``) and
+     Telegram via flow-doctor forum topics (config#1742 T2 /
+     config#1747) with ``dedup_key=resolve_dedup_key(spec, now)`` — dedup
+     collapses 4×/hour retries to one alert per cycle per artifact.
+     **``severity=warning`` registry rows are console-only** (written to
+     ``check_results.json``; no SNS/Telegram — see ARTIFACT_REGISTRY
+     "dashboard-only" convention).
   6. **OBSERVE-mode gate**: when env
      ``FRESHNESS_MONITOR_ENABLED`` is anything other than
      ``"true"`` (case-insensitive), alerts are suppressed but the
@@ -55,7 +59,7 @@ import boto3
 import yaml
 
 from krepis.alerts import publish
-from alpha_engine_lib.artifact_freshness import (
+from nousergon_lib.artifact_freshness import (
     ArtifactSpec,
     CheckResult,
     check_freshness,
@@ -63,11 +67,19 @@ from alpha_engine_lib.artifact_freshness import (
     resolve_current_cycle,
     resolve_dedup_key,
 )
-from alpha_engine_lib.trading_calendar import previous_trading_day
+from nousergon_lib.trading_calendar import previous_trading_day
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+_FLOW_NAME = "freshness-monitor"
+_DB_BASENAME = "flow_doctor_freshness_monitor"
+_FRESHNESS_TELEGRAM_TOPICS = (
+    FleetTelegramTopic.CRITICAL,
+    FleetTelegramTopic.OPS_HEALTH,
+)
 
 # ── Configuration (env-driven so Phase 6 cutover is a single CLI flip) ──────
 
@@ -166,6 +178,9 @@ _SPEC_FIELDS = frozenset(
         # S3-contract-safe migration window.
         "active_trading_days_only",
         "active_hours_utc",
+        "produces",
+        "depends_on",
+        "liveness_via",
     }
 )
 
@@ -653,9 +668,11 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         the SLA grace window), OR ``probe_failed`` (no grace for
         broken probes — operator needs to know immediately)
       - :data:`ALERTS_ENABLED` is True
+      - resolved severity is ``critical`` (``severity=warning`` rows are
+        console-only via ``check_results.json`` — no SNS/Telegram)
 
     Dedup-key resolution via
-    :func:`alpha_engine_lib.artifact_freshness.resolve_dedup_key` ⇒
+    :func:`nousergon_lib.artifact_freshness.resolve_dedup_key` ⇒
     at most one alert per (artifact, cadence-window) regardless of
     how many 15min probes have already fired in this window.
     """
@@ -675,6 +692,23 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         )
         return False
 
+    # Probe failures route to critical (the monitor itself is broken);
+    # missing/stale respect the spec's severity. Plan §3 invariant 6.
+    severity = "critical" if result.state == "probe_failed" else spec.severity
+
+    # Registry convention: severity=warning means dashboard/console-only —
+    # the operator surface is check_results.json + this page, not ops-health
+    # Telegram. Critical (and probe_failed, coerced above) pages via SNS +
+    # flow-doctor. Aligns with ARTIFACT_REGISTRY comments ("dashboard-only")
+    # and the fleet notification consolidation arc (config#1740 / #1724).
+    if severity == "warning":
+        logger.info(
+            "console-only (severity=warning): %s state=%s — surfaced in "
+            "check_results.json, no SNS/Telegram",
+            spec.artifact_id, result.state,
+        )
+        return False
+
     # Compose the alert body.
     body = (
         f"artifact_id={spec.artifact_id} "
@@ -686,16 +720,27 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
     )
     dedup_key = resolve_dedup_key(spec, now)
 
-    # Probe failures route to critical (the monitor itself is broken);
-    # missing/stale respect the spec's severity. Plan §3 invariant 6.
-    severity = "critical" if result.state == "probe_failed" else spec.severity
-
     publish(
         body,
         severity=severity,
         source="freshness-monitor",
         dedup_key=dedup_key,
         dedup_window_min=None,  # one alert per cadence window — substrate handles cycle bucketing
+        telegram=False,
+    )
+    notify_via_flow_doctor(
+        body,
+        silent=False,
+        severity=severity,
+        dedup_key=dedup_key,
+        flow_name=_FLOW_NAME,
+        topics=_FRESHNESS_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        context={
+            "artifact_id": spec.artifact_id,
+            "state": result.state,
+            "owner_repo": spec.owner_repo,
+        },
     )
     return True
 
@@ -726,7 +771,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
 # NYSE holidays show up as false-positive "absent" days. Operators
 # interpret them in context (or filter via the page 26 surface). When
 # the holiday-aware backfill becomes worth the dependency lift, we
-# can route via alpha_engine_lib.dates.
+# can route via nousergon_lib.dates.
 
 
 def _iter_sf_firing_dates(cadence: str, now: datetime, count: int) -> list[date]:
@@ -781,7 +826,7 @@ def _resolve_axis_dates(
     alpha-engine-docs/private/DATE_CONVENTIONS.md.
 
     Calendar-naive at the SF-firing layer above, but trading_day
-    resolution uses ``alpha_engine_lib.trading_calendar.previous_trading_day``
+    resolution uses ``nousergon_lib.trading_calendar.previous_trading_day``
     which IS NYSE-holiday-aware. So holiday-skipped firings still
     surface as cleanly-absent cells, but their resolved trading_day
     skips the holiday correctly.

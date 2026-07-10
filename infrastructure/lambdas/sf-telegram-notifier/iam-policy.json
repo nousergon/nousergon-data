@@ -17,14 +17,27 @@
       "Action": ["ssm:GetParameter"],
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
-        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_PIPELINE",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH"
       ]
     },
     {
       "Sid": "DescribeExecutionForFailureCause",
       "Effect": "Allow",
-      "Action": ["states:DescribeExecution"],
+      "Action": ["states:DescribeExecution", "states:GetExecutionHistory"],
       "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-*:*"
+    },
+    {
+      "Sid": "ArtifactAttestationRead",
+      "Effect": "Allow",
+      "Action": ["s3:HeadObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research",
+        "arn:aws:s3:::alpha-engine-research/predictor/metrics/*",
+        "arn:aws:s3:::alpha-engine-research/backtest/*"
+      ]
     }
   ]
 }

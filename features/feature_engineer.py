@@ -88,7 +88,7 @@ def _load_feature_cfg_overrides() -> dict:
     # data-specific repo-local tail (``<repo>/config.yaml``, subdir-flattened) is
     # preserved via repo_local_fallback; the per-key validation loop below is
     # unchanged (a present-but-unknown override key still fails loud).
-    from alpha_engine_lib.config import resolve_experiment_config
+    from nousergon_lib.config import resolve_experiment_config
 
     repo_root = Path(__file__).resolve().parent.parent
     candidates = resolve_experiment_config(
@@ -251,6 +251,25 @@ FEATURES = [
     # emitted by apply_factor_zscores (log pre-transform registered in
     # cross_sectional.FACTOR_LOADING_TRANSFORMS). Barra SIZE loading.
     "size_zscore",
+    # config#939 — feature gaps: VWAP divergence, buying/selling pressure,
+    # credit spreads. NaN-safe optional-input features (like beta_60d /
+    # hy_oas_credit_spread_pct below): propagate NaN rather than crash when
+    # the upstream input is unavailable (VWAP is NaN for yfinance-fallback
+    # rows and during the documented 2026-04-17→23 Polygon outage).
+    "vwap_divergence_pct",
+    # Chaikin Money Flow (20d) — buying/selling pressure. Bounded ~[-1, 1]
+    # dimensionless ratio of volume-weighted close-location-value sums.
+    "cmf_20_ratio",
+    # hy_oas_credit_spread_pct: ICE BofA US HY Index OAS (FRED
+    # BAMLH0A0HYM2), percent. Per-ticker/date credit-spread level feature
+    # (identical across tickers on a given day — macro group). Deliberately
+    # named DISTINCT from crucible-predictor's regime_predictor.py
+    # ``hy_oas_level`` / ``hy_oas_change_21d`` (a SEPARATE market-wide
+    # regime-substrate feature family sourced from its own HYOAS.parquet
+    # cache, consumed only via cfg.MACRO_NORM_FEATURES) — same underlying
+    # FRED series, different namespace/consumer/compute path, so the names
+    # must not collide.
+    "hy_oas_credit_spread_pct",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer
@@ -312,6 +331,7 @@ def compute_features(
     fundamental_data: dict | None = None,
     vix3m_series: pd.Series | None = None,
     xsect_dispersion: pd.Series | None = None,
+    hyoas_series: pd.Series | None = None,
     close_col: str = "Close",
 ) -> pd.DataFrame:
     """
@@ -344,6 +364,10 @@ def compute_features(
     fundamental_data : dict with keys: pe_ratio, pb_ratio, etc.
     vix3m_series : VIX3M Close prices (DatetimeIndex).
     xsect_dispersion : Cross-sectional dispersion Series (DatetimeIndex).
+    hyoas_series : ICE BofA US HY Index OAS, FRED series BAMLH0A0HYM2, in
+        percent (DatetimeIndex). License-gated to 2023+ on FRED — rows
+        before the series' first observation fall back to the neutral
+        default like the other optional macro inputs (see hy_oas_credit_spread_pct).
 
     Returns
     -------
@@ -420,11 +444,19 @@ def compute_features(
     _vol_slow = _FC["volume_slow"]
     avg_vol_20d_raw = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
     df["avg_volume_20d_raw"] = avg_vol_20d_raw
-    volume_global_mean = volume.mean()
-    if volume_global_mean > 0:
-        df["avg_volume_20d"] = avg_vol_20d_raw / volume_global_mean
-    else:
-        df["avg_volume_20d"] = 1.0
+    # Point-in-time discipline (config#833 / L3293): normalize by a BACKWARD-ONLY
+    # per-ticker mean (expanding through T), NOT a full-sample volume.mean(). The
+    # backtest replay path computes features once over each ticker's ENTIRE history
+    # and then slices by decision date, so a whole-series mean here injected volume
+    # from T+1..T+N into every historical row's avg_volume_20d — a genuine (if mild)
+    # look-ahead. An expanding mean at row T sees only volume observed through T, so
+    # the value is identical whether features are computed on df[:T] or the full df.
+    # Warmup rows stay NaN (raw itself is NaN there); a degenerate all-zero-volume
+    # window maps to the neutral 1.0 the old scalar else-branch produced.
+    volume_expanding_mean = volume.expanding(min_periods=_vol_slow).mean()
+    df["avg_volume_20d"] = (
+        (avg_vol_20d_raw / volume_expanding_mean).replace([np.inf, -np.inf], 1.0)
+    )
 
     # ── Distance from 52-week high ─────────────────────────────────────────────
     _52w = _FC["weeks_52_days"]
@@ -585,6 +617,18 @@ def compute_features(
     else:
         df["oil_mom_5d"] = 0.0
 
+    # hy_oas_credit_spread_pct (config#939) — ICE BofA US HY Index OAS,
+    # FRED BAMLH0A0HYM2, percent. License-gated to 2023+ on FRED, so
+    # pre-2023 rows (and any date before hyoas_series' first observation)
+    # naturally ffill to NaN via reindex — fillna(0.0) below applies the
+    # same neutral-default-fallback pattern already used for gold_mom_5d /
+    # oil_mom_5d rather than hard-failing on missing history.
+    if hyoas_series is not None:
+        hyoas_aligned = hyoas_series.reindex(df.index, method="ffill")
+        df["hy_oas_credit_spread_pct"] = hyoas_aligned.fillna(0.0)
+    else:
+        df["hy_oas_credit_spread_pct"] = 0.0
+
     # ── v1.6 features — investigation upgrades (A2) ─────────────────────────
 
     # vix_term_slope
@@ -632,6 +676,20 @@ def compute_features(
     # a vol-term-structure signal (steep upward slope = vol expansion;
     # flat / inverted = mean-revert regime).
     df["realized_vol_63d"] = daily_returns.rolling(63).std() * np.sqrt(_52w)
+
+    # vwap_divergence_pct (config#939) — (Close - VWAP) / VWAP. VWAP is a
+    # first-class OHLCV column (store/arctic_store.py OHLCV_COLS) sourced
+    # from Polygon's `vw` field; it is NaN for yfinance-fallback rows and
+    # during the documented 2026-04-17→23 Polygon outage. No column at all
+    # is also possible (pre-VWAP-migration frames) — mirror the
+    # High/Low-optional guard above rather than crash. Division by a
+    # (rare) zero VWAP is guarded the same way volume_trend/obv_slope_10d
+    # guard a zero divisor; both paths propagate NaN, never raise.
+    if "VWAP" in df.columns:
+        vwap = df["VWAP"].astype(float)
+        df["vwap_divergence_pct"] = (close - vwap) / vwap.replace(0, float("nan"))
+    else:
+        df["vwap_divergence_pct"] = float("nan")
 
     # ── v3.2: Per-ticker risk features (Stage 2 regime-conditioning rebuild) ──
     # Four institutional risk dimensions that capture cross-sectional
@@ -752,6 +810,25 @@ def compute_features(
     # volume_price_div
     df["volume_price_div"] = np.sign(df["volume_trend"] - 1.0) * np.sign(df["momentum_5d"])
 
+    # cmf_20_ratio (config#939) — Chaikin Money Flow, buying/selling
+    # pressure. MFM (money flow multiplier) is the close's position within
+    # the day's H-L range, signed: +1 at the high, -1 at the low. Guard
+    # High==Low (e.g. halted / illiquid sessions) the same way
+    # volume_trend / obv_slope_10d guard a zero divisor — .replace(0, nan)
+    # so a degenerate day contributes NaN to the sum rather than a
+    # division blow-up. CMF_20 = rolling_SUM(MFM*Volume, 20) /
+    # rolling_SUM(Volume, 20) — bounded ~[-1, 1] by construction. NOTE:
+    # this is a rolling SUM denominator, not the rolling MEAN `vol_20`
+    # used by volume_trend/obv_slope_10d above — reusing that mean here
+    # would inflate CMF by ~20x and break the bounded range.
+    mfm = ((close - low) - (high - close)) / (high - low).replace(0, float("nan"))
+    mfv = mfm * volume
+    vol_sum_20 = volume.rolling(_vol_slow, min_periods=_vol_slow).sum()
+    df["cmf_20_ratio"] = (
+        mfv.rolling(_vol_slow, min_periods=_vol_slow).sum()
+        / vol_sum_20.replace(0, float("nan"))
+    )
+
     # ── v1.5 features — regime interaction terms ───────────────────────────────
 
     vix_regime = df["vix_level"] - 1.0
@@ -801,6 +878,13 @@ def compute_features(
         df["put_call_ratio"] = _safe_float(options_data.get("put_call_ratio"), 0.0)
         df["iv_rank"] = _safe_float(options_data.get("iv_rank"), 0.5)
         atm_iv = _safe_float(options_data.get("atm_iv"), 0.0)
+        # NOT a look-ahead: this whole O12 options block is an as-of-SNAPSHOT
+        # broadcast — `options_data` (atm_iv etc.) is the current, time-axis-less
+        # options state, written as one scalar to every row. Pairing the scalar
+        # atm_iv with the TERMINAL realized_vol (`.iloc[-1]`, i.e. "now") is the
+        # correct current-state reference; it is never sliced per-decision-date in
+        # the PIT replay (config#833). Do NOT "PIT-fix" this to a per-row
+        # realized_vol — that would pair a single snapshot IV with historical RV.
         realized_vol = df["realized_vol_20d"].iloc[-1] if "realized_vol_20d" in df.columns else 0.0
         if realized_vol > 0 and atm_iv > 0:
             df["iv_vs_rv"] = atm_iv / realized_vol

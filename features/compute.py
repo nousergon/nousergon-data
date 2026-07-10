@@ -41,6 +41,7 @@ from dataclasses import dataclass
 import corporate_actions as ca
 from features.cross_sectional import apply_factor_zscores
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
+from features.metron_supplemental import compute_metron_supplemental_features, write_metron_supplemental_snapshot
 from features.private_pack import apply_private_features
 from features.registry import upload_registry
 from features.writer import write_feature_snapshot
@@ -153,7 +154,7 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
 # (2y) is sufficient here — features only use the latest row and 2y gives
 # enough warmup for every indicator.
 from store.parquet_loader import load_parquet_from_s3 as _load_parquet_from_s3
-from alpha_engine_lib.arcticdb import (
+from nousergon_lib.arcticdb import (
     load_universe_ohlcv,
     load_macro_series,
     open_macro_lib,
@@ -551,6 +552,7 @@ _MACRO_SLIM_KEYS = {
     "IRX": "IRX",
     "GLD": "GLD",
     "USO": "USO",
+    "HYOAS": "HYOAS", # config#939 — credit spreads; FRED-only index ticker
 }
 
 
@@ -818,6 +820,7 @@ def compute_and_write(
     gld_series = macro.get("GLD")
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
+    hyoas_series = macro.get("HYOAS")
 
     for ticker in universe_tickers:
         try:
@@ -842,6 +845,7 @@ def compute_and_write(
                 gld_series=gld_series,
                 uso_series=uso_series,
                 vix3m_series=vix3m_series,
+                hyoas_series=hyoas_series,
                 earnings_data=earnings_data,
                 revision_data=revision_data,
                 options_data=options_data,
@@ -947,6 +951,27 @@ def compute_and_write(
             "Feature snapshot + registry written to s3://%s/%s%s/ (schema=%s)",
             bucket, FEATURE_STORE_PREFIX, date_str, _schema_hash,
         )
+
+        # Metron-held/watchlisted tickers outside the S&P500+400 universe above
+        # (metron-ops#177) — a SEPARATE, additive snapshot crucible-research's
+        # factor_scoring.py optionally reads for Attractiveness coverage. Runs
+        # strictly AFTER the core snapshot write above, and is swallowed
+        # (logged WARNING, not raised): (a) failure mode swallowed is a fetch/
+        # compute error for this display-only supplemental ticker set; (b) the
+        # primary deliverable — the ML training/risk-model feature snapshot
+        # Predictor and Executor depend on — is already durably written by this
+        # point and must not be taken down by a Metron-coverage nice-to-have;
+        # (c) recording surface is this log.warning, which the weekly SF's log
+        # aggregation surfaces same as any other WARNING.
+        try:
+            supp_features_df, supp_sector_map = compute_metron_supplemental_features(
+                bucket, s3, set(features_df["ticker"]), macro,
+            )
+            write_metron_supplemental_snapshot(
+                date_str, supp_features_df, supp_sector_map, bucket, s3_client=s3,
+            )
+        except Exception as supp_exc:
+            log.warning("Metron supplemental factor-scoring compute failed (non-fatal): %s", supp_exc)
 
     t_total = time.time() - t0
 

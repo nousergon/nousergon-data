@@ -32,12 +32,18 @@ These tests lock the contract:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+
+# Shared "today" anchor (config#1630): promoted out of this module into
+# tests/conftest.py so every date-driven daily_append test — not just the
+# two originally cross-importing this file — has one discoverable
+# chokepoint. See conftest.recent_trading_day_str's docstring for the
+# incident history (2026-05-04, 2026-06-22, 2026-07-03).
+from tests.conftest import recent_trading_day_str
 
 
 _DAILY_APPEND = Path(__file__).parent.parent / "builders" / "daily_append.py"
@@ -51,6 +57,7 @@ def _disable_factor_momentum_daily(monkeypatch):
     # assertions here. The pass has its own tests (test_factor_momentum.py +
     # test_daily_append_factor_momentum.py).
     monkeypatch.setenv("FACTOR_MOMENTUM_DAILY_ENABLED", "false")
+    monkeypatch.setenv("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "false")
 
 
 def _stub_closes(tickers: list[str]) -> dict:
@@ -173,11 +180,11 @@ def test_skip_if_exists_true_skips_when_today_in_hist(monkeypatch):
     spend, just a microsecond ``today_ts in hist.index`` check."""
     from builders.daily_append import daily_append
 
-    # Use real "now" so the daily_append freshness scan (5d threshold
-    # against datetime.now(timezone.utc)) doesn't trip as the calendar
-    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
-    # surfaced because "2026-04-28" had aged 6d past the threshold.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor to the most recent NYSE *trading* day (see
+    # conftest.recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # and detonates the config#1572 phantom-session gate on weekends and
+    # market holidays (2026-07-03). The trading-day anchor dodges both.
+    today_str = recent_trading_day_str()
     universe = ["AAPL", "MSFT", "GOOGL"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -208,11 +215,11 @@ def test_skip_if_exists_true_writes_when_today_missing(monkeypatch):
     silent-skip bug for tickers with genuinely-missing today rows."""
     from builders.daily_append import daily_append
 
-    # Use real "now" so the daily_append freshness scan (5d threshold
-    # against datetime.now(timezone.utc)) doesn't trip as the calendar
-    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
-    # surfaced because "2026-04-28" had aged 6d past the threshold.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor to the most recent NYSE *trading* day (see
+    # conftest.recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # and detonates the config#1572 phantom-session gate on weekends and
+    # market holidays (2026-07-03). The trading-day anchor dodges both.
+    today_str = recent_trading_day_str()
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -238,11 +245,11 @@ def test_skip_if_exists_false_writes_even_when_today_in_hist(monkeypatch):
     that the 2026-04-18 commit introduced for the polygon-label incident."""
     from builders.daily_append import daily_append
 
-    # Use real "now" so the daily_append freshness scan (5d threshold
-    # against datetime.now(timezone.utc)) doesn't trip as the calendar
-    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
-    # surfaced because "2026-04-28" had aged 6d past the threshold.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor to the most recent NYSE *trading* day (see
+    # conftest.recent_trading_day_str): raw "now" rots when hardcoded (2026-05-04)
+    # and detonates the config#1572 phantom-session gate on weekends and
+    # market holidays (2026-07-03). The trading-day anchor dodges both.
+    today_str = recent_trading_day_str()
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,

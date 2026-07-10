@@ -1,6 +1,6 @@
 """Unit tests for ``rag.pipelines.emit_manifest``.
 
-Mocks ``alpha_engine_lib.rag.db.execute_query`` so the manifest assembly
+Mocks ``nousergon_lib.rag.db.execute_query`` so the manifest assembly
 runs without a live pgvector connection. Verifies the manifest schema
 shape, the per-source rollup math, and the S3 put-object key pattern.
 """

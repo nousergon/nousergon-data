@@ -9,7 +9,7 @@ per-segment estimate distribution that other vendors don't expose.
 
 from __future__ import annotations
 
-from alpha_engine_lib.sources import AnalystSnapshot
+from nousergon_lib.sources import AnalystSnapshot
 
 
 class VisibleAlphaAnalystAdapter:

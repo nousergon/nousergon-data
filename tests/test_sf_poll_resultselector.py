@@ -58,15 +58,34 @@ def _walk_states(states: dict):
                 yield from _walk_states(b["States"])
 
 
+def _is_liveness_poller(st: dict) -> bool:
+    """config#1811: the weekday SF's poll loops migrated from bare
+    aws-sdk getCommandInvocation to the ssm-liveness-poller Lambda. The
+    256 KB invariant applies identically — the poller's result rides in
+    SF state through the same Wait/Choice loops and HandleFailure still
+    serializes all of $ — so those states are held to the same
+    ResultSelector rules. (The Lambda caps stderr_tail at 1500 chars and
+    never returns stdout, but the ResultSelector remains the SF-side
+    guard.)"""
+    if "lambda:invoke" not in str(st.get("Resource", "")).lower():
+        return False
+    return "alpha-engine-ssm-liveness-poller" in json.dumps(
+        st.get("Parameters", {})
+    )
+
+
 def _poll_states():
-    """Yield (sf, name, state, sf_text) for every SSM getCommandInvocation poll
+    """Yield (sf, name, state, sf_text) for every SSM command poll —
+    bare getCommandInvocation Tasks AND ssm-liveness-poller invocations —
     across all three SFs."""
     out = []
     for sf, path in _SF_FILES.items():
         text = path.read_text()
         sf_def = json.loads(text)
         for name, st in _walk_states(sf_def.get("States", {})):
-            if "aws-sdk:ssm:getCommandInvocation" in str(st.get("Resource", "")):
+            if "aws-sdk:ssm:getCommandInvocation" in str(
+                st.get("Resource", "")
+            ) or _is_liveness_poller(st):
                 out.append((sf, name, st, text))
     return out
 
@@ -80,7 +99,10 @@ def _fields_read_downstream(result_path: str, sf_text: str) -> set:
     if not result_path:
         return set()
     esc = re.escape(result_path)
-    return set(re.findall(rf"{esc}\.([A-Za-z][A-Za-z0-9]*)", sf_text))
+    # Field charset includes underscore: the config#1811 liveness-poller
+    # fields are snake_case (ping_misses, attempts, verdict, detail) — the
+    # pre-1811 charset silently truncated ping_misses to "ping".
+    return set(re.findall(rf"{esc}\.([A-Za-z][A-Za-z0-9_]*)", sf_text))
 
 
 def _rs_keeps(rs: dict) -> set:

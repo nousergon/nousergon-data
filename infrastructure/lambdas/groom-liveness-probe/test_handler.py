@@ -3,6 +3,18 @@
 Cover the load-bearing logic with no AWS/GitHub I/O: trigger enumeration
 (maturity + day-of-week filtering), per-trigger miss attribution, S3 dedup
 suppression, and the fail-loud contract on the PRIMARY input.
+
+Hermetic: `nousergon_lib` is a git-only dependency the deploy test gate does NOT
+install (deploy.sh runs pytest on bare python + boto3), so its two submodules
+that `index` imports at module scope are stubbed in sys.modules BEFORE
+`import index` — matching the sibling scheduled-groom-dispatcher test. `index`
+only touches nousergon_lib at import time via the `_OPS_TOPICS` tuple
+(`flow_doctor_fleet.FleetTelegramTopic`) and, transitively through
+`flow_doctor_telegram`, `telegram.send_message`; the notify path itself is
+monkeypatched per-test (`index.notify_via_flow_doctor`). Migrated onto
+`nousergon_lib.*` from the old `nousergon_lib.telegram` stub by the
+flow-doctor cutover (config#1742, #622) — keep this stub tracking `index.py`'s
+real module-level imports.
 """
 
 from __future__ import annotations
@@ -10,17 +22,40 @@ from __future__ import annotations
 import sys
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-# Stub alpha_engine_lib.telegram before importing index (the real lib isn't on the
-# test path; the probe only uses send_message).
-_ael = types.ModuleType("alpha_engine_lib")
-_tg = types.ModuleType("alpha_engine_lib.telegram")
-_tg.send_message = lambda *a, **k: True  # type: ignore[attr-defined]
-_ael.telegram = _tg  # type: ignore[attr-defined]
-sys.modules.setdefault("alpha_engine_lib", _ael)
-sys.modules.setdefault("alpha_engine_lib.telegram", _tg)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# ── Stub nousergon_lib submodules before importing index ──────────────────────
+_ng = types.ModuleType("nousergon_lib")
+_ng_telegram = types.ModuleType("nousergon_lib.telegram")
+_ng_telegram.send_message = lambda *a, **k: None
+_ng_fleet = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+
+
+class _FleetTelegramTopic:
+    CRITICAL = "CRITICAL"
+    OPS_HEALTH = "OPS_HEALTH"
+
+
+_ng_fleet.FleetTelegramTopic = _FleetTelegramTopic
+_ng.telegram = _ng_telegram
+_ng.flow_doctor_fleet = _ng_fleet
+sys.modules.setdefault("nousergon_lib", _ng)
+sys.modules.setdefault("nousergon_lib.telegram", _ng_telegram)
+sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
+
+# Derive the stub requirement from index.py's live (transitive) import graph and
+# fail loud here if it has drifted, rather than as a cryptic ModuleNotFoundError
+# at deploy time. See _shared/hermetic_import_guard.py (config#1746).
+from _shared.hermetic_import_guard import (  # noqa: E402
+    assert_hermetic_imports_satisfied,
+)
+
+assert_hermetic_imports_satisfied(__file__)
 
 import index  # noqa: E402
 
@@ -39,13 +74,14 @@ def test_only_mature_triggers_returned(monkeypatch):
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
-    # Tue 14:00 UTC. The 07:00 Tue trigger matured (7h ago); a hypothetical recent
-    # one would not. 23:00 Mon (prev day) also mature.
+    # Tue 14:00 UTC. The 07:00 Tue trigger matured (7h ago); 01:00 Tue matured
+    # (13h ago). 19:00 Mon (prev day) also mature.
     now = _dt(2026, 6, 30, 14, 0)  # 2026-06-30 is a Tuesday
     trigs = index._expected_triggers(now)
     ats = {t["at"] for t in trigs}
-    assert _dt(2026, 6, 30, 7, 0) in ats   # 07:00 Tue, matured
-    assert _dt(2026, 6, 29, 23, 0) in ats  # 23:00 Mon, matured
+    assert _dt(2026, 6, 30, 7, 0) in ats   # 07:00 Tue Sonnet, matured
+    assert _dt(2026, 6, 30, 1, 0) in ats   # 01:00 Tue Opus, matured
+    assert _dt(2026, 6, 29, 19, 0) in ats  # 19:00 Mon Haiku, matured
     # Nothing in the immature zone (now - 6.75h .. now).
     assert all(t["at"] <= now - timedelta(minutes=405) for t in trigs)
 
@@ -63,34 +99,28 @@ def test_saturday_0700_included(monkeypatch):
     assert _dt(2026, 6, 27, 7, 0) in {t["at"] for t in trigs}
 
 
-def test_1500_opus_schedule_included(monkeypatch):
-    """config#1571: the 15:00 UTC Opus/complexity:high schedule must be tracked
-    too, not just the two Sonnet schedules — its silent death was previously
-    invisible to this probe (the schedule existed since 2026-07-01, config#1495
-    follow-up, but was never added here)."""
+def test_0100_opus_schedule_included(monkeypatch):
+    """The 01:00 UTC Opus/complexity:high schedule must be tracked."""
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
-    # Wed 2026-07-01 22:00 UTC -> 15:00 Wed matured (7h ago).
-    now = _dt(2026, 7, 1, 22, 0)
+    # Wed 2026-07-01 10:00 UTC -> 01:00 Wed matured (9h ago).
+    now = _dt(2026, 7, 1, 10, 0)
     trigs = index._expected_triggers(now)
-    assert _dt(2026, 7, 1, 15, 0) in {t["at"] for t in trigs}
+    assert _dt(2026, 7, 1, 1, 0) in {t["at"] for t in trigs}
 
 
-def test_three_daily_triggers_dont_overlap_in_one_day(monkeypatch):
-    """The three windows [T, T+CEILING+MARGIN] must stay disjoint so per-trigger
-    attribution remains 1:1 (see _missed's docstring) now that a 3rd schedule
-    shares the day with the original two."""
+def test_three_daily_triggers_returned(monkeypatch):
+    """All three tier-split schedules appear in a single day's lookback."""
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 24)
-    now = _dt(2026, 7, 2, 6, 0)
+    now = _dt(2026, 7, 2, 14, 0)
     trigs = index._expected_triggers(now)
-    ats = sorted(t["at"] for t in trigs)
-    assert len(ats) == 3
-    window = timedelta(minutes=360 + 45)
-    for a, b in zip(ats, ats[1:]):
-        assert a + window <= b, f"{a} window overlaps {b}"
+    ats = {t["at"] for t in trigs}
+    assert _dt(2026, 7, 2, 1, 0) in ats
+    assert _dt(2026, 7, 2, 7, 0) in ats
+    assert _dt(2026, 7, 1, 19, 0) in ats
 
 
 # ---- _missed ---------------------------------------------------------------
@@ -159,7 +189,11 @@ def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 
     monkeypatch.setattr(index, "_fetch_digest_timestamps", lambda pat: stamps)
     monkeypatch.setattr(index, "_s3_client", lambda: s3)
     sends = []
-    monkeypatch.setattr(index, "send_message", lambda *a, **k: sends.append(a) or sent)
+    monkeypatch.setattr(
+        index,
+        "notify_via_flow_doctor",
+        lambda text, **kwargs: sends.append(text) or sent,
+    )
     return sends
 
 

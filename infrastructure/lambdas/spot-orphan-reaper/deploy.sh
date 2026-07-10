@@ -6,6 +6,15 @@
 # scripts. Hourly scan terminates any alpha-engine-* tagged spot instance
 # whose age exceeds its per-tag-prefix budget + 30-min grace.
 #
+# ci-watch-dispatcher migration (new dependency): index.py now imports
+# nousergon_lib.telegram (re-exports krepis.telegram.send_message) for the
+# CI-watch incomplete-reap alert. nousergon-lib pulls in pydantic (pydantic-
+# core ships a compiled, platform-specific wheel — verified: a bare macOS
+# `pip install --target` produces a darwin/arm64 .so that is NOT Lambda-safe),
+# so packaging now goes through lambda_pip_install.sh (Docker linux/amd64),
+# mirroring scheduled-groom-dispatcher/deploy.sh exactly, instead of the old
+# single-file `zip index.py`.
+#
 # Managed outside CloudFormation — same rationale as the
 # changelog-cloudwatch-mirror Lambda (keeps the github-actions-lambda-deploy
 # OIDC role's blast radius narrow; this Lambda has destructive ec2:Terminate
@@ -53,7 +62,13 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler ---------------------------------------------------
+# ----- 0. Scratch dirs + validate handler syntax -----------------------------
+# PKG and TEST_DEPS are both created up front (mirrors scheduled-groom-
+# dispatcher/deploy.sh) so ONE trap covers both.
+
+PKG=$(mktemp -d)
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
 python3 -c "
 import ast, sys
@@ -62,9 +77,18 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# Hermetic for AWS: boto3 + nousergon_lib.telegram are stubbed in sys.modules
+# before `import index` (see test_handler.py). The pinned nousergon-lib is
+# installed for real into a scratch TEST_DEPS dir (config#1746 hermetic-
+# import-guard pattern) — NOT the caller's global site-packages, not bundled
+# into the Lambda zip.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  echo "Installing pytest + pinned nousergon-lib into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${NOUSERGON_LIB_REQ}"
   echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Bootstrap (first-time only) ---------------------------------------
@@ -94,11 +118,12 @@ if $BOOTSTRAP; then
     sleep 10
   fi
 
-  PKG=$(mktemp -d)
-  trap "rm -rf '$PKG'" EXIT
+  LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  echo "  Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+  bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
   cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
   ZIP="${PKG}/function.zip"
-  (cd "${PKG}" && zip -q "function.zip" index.py)
+  (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
   echo "  Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -145,11 +170,12 @@ fi
 # ----- 2. Update function code (always) -------------------------------------
 
 if ! $BOOTSTRAP; then
-  PKG=$(mktemp -d)
-  trap "rm -rf '$PKG'" EXIT
+  LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+  bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
   cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
   ZIP="${PKG}/function.zip"
-  (cd "${PKG}" && zip -q "function.zip" index.py)
+  (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
   echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
   echo "Updating Lambda function code: ${FUNCTION_NAME}"

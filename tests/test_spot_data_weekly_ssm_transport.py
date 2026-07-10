@@ -87,7 +87,7 @@ def test_no_top_level_ssh_invocation():
         f"spot_data_weekly.sh:\n"
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
         + "\n\nThe 2026-05-27 SSH→SSM migration moved all dispatch to "
-        "``python -m nousergon_lib.ssm_dispatcher``. Re-introducing "
+        "``python -m krepis.ssm_dispatcher``. Re-introducing "
         "ssh re-opens the port-22 dependency the migration retired. "
         "If the change is deliberate, update this test + ROADMAP L342 "
         "PR 5 (the planned port-22 SG revoke)."
@@ -139,18 +139,33 @@ def test_no_ssh_keyscan_invocation():
 
 def test_uses_lib_ssm_dispatcher_chokepoint():
     """The migration's load-bearing surface: ``python -m
-    nousergon_lib.ssm_dispatcher`` MUST appear in the script. Pinning
+    krepis.ssm_dispatcher`` MUST appear in the script. Pinning
     this catches a regression where a future PR replaces the lib CLI
     with an inline ``aws ssm send-command`` bash helper (the
     alpha-engine-predictor #168 pre-lift pattern that L342 explicitly
     lifts to the lib chokepoint)."""
     body = _SCRIPT.read_text()
-    assert "nousergon_lib.ssm_dispatcher" in body, (
+    assert "krepis.ssm_dispatcher" in body, (
         "spot_data_weekly.sh does not reference "
-        "nousergon_lib.ssm_dispatcher. The 2026-05-27 migration uses "
+        "krepis.ssm_dispatcher. The 2026-05-27 migration uses "
         "the lib chokepoint as the SSM dispatch path; re-introducing a "
         "raw `aws ssm send-command` bash helper would undo the lift to "
         "``alpha-engine-lib`` v0.35.0."
+    )
+    offenders = [
+        (n, line)
+        for n, line in _script_lines()
+        if "-m nousergon_lib." in line
+    ]
+    assert not offenders, (
+        f"Found {len(offenders)} non-comment 'python -m nousergon_lib.<mod>' "
+        f"invocation(s) in spot_data_weekly.sh:\n"
+        + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
+        + "\n\nOn lib >=0.81.0 that path is a guard-less re-export shim: "
+        "under `python -m` (runpy) it exits 0 silently WITHOUT executing "
+        "the inner dispatch (config#1646 bug class). Invoke `-m "
+        "krepis.ssm_dispatcher` / `-m krepis.ec2_spot` directly "
+        "(config#1649)."
     )
 
 
@@ -206,7 +221,7 @@ def test_no_inline_aws_ssm_send_command():
         f"Found {len(offenders)} non-comment ``aws ssm send-command`` "
         f"invocations in spot_data_weekly.sh:\n"
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
-        + "\n\nRoute through ``python -m nousergon_lib.ssm_dispatcher "
+        + "\n\nRoute through ``python -m krepis.ssm_dispatcher "
         "run`` instead — that's the chokepoint v0.35.0 lifted."
     )
 

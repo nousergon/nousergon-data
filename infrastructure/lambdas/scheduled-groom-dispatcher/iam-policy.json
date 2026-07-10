@@ -28,7 +28,9 @@
       "Action": "iam:PassRole",
       "Resource": "arn:aws:iam::711398986525:role/alpha-engine-executor-role",
       "Condition": {
-        "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" }
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
       }
     },
     {
@@ -43,11 +45,73 @@
     {
       "Sid": "TerminateGroomSpotOnError",
       "Effect": "Allow",
-      "Action": ["ec2:TerminateInstances"],
+      "Action": [
+        "ec2:TerminateInstances"
+      ],
       "Resource": "*",
       "Condition": {
-        "StringEquals": { "ec2:ResourceTag/Name": "alpha-engine-groom-spot" }
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "alpha-engine-groom-spot"
+        }
       }
+    },
+    {
+      "Sid": "ReadClaudeCodeUsageForPaceGate",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "claude_code_usage/*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadClaudeCodeUsageObjectsForPaceGate",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/claude_code_usage/*"
+    },
+    {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_GROOM"
+      ]
+    },
+    {
+      "Sid": "ReadGroomBudgetOverrideParam",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/dynamic_budget_override_until"
+    },
+    {
+      "Sid": "ReadGroomPatForDemandGate",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_pat",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
+      ]
+    },
+    {
+      "Sid": "WriteGroomDecisionRecords",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/decisions/*"
     }
   ]
 }

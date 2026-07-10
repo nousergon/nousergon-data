@@ -22,12 +22,12 @@ from typing import Optional
 import boto3
 import numpy as np
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 import pandas as pd
 import requests
 import yfinance as yf
 
-from alpha_engine_lib.arcticdb import load_universe_ohlcv
+from nousergon_lib.arcticdb import load_universe_ohlcv
 
 logger = logging.getLogger(__name__)
 

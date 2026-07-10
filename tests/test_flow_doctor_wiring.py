@@ -190,6 +190,16 @@ class TestFlowDoctorYamlSchema:
         for key in ("max_alerts_per_day", "max_issues_per_day", "max_diagnosed_per_day"):
             assert key in rl, f"rate_limits.{key} required (Anthropic-cost cap)"
 
+    def test_yaml_github_notifier_category_gated_same_repo(self):
+        """config#1696 — narrow auto_fix_pr eligibility; keep repo local."""
+        import yaml
+        with open(REPO_ROOT / "flow-doctor.yaml") as f:
+            cfg = yaml.safe_load(f)
+        github = next(n for n in cfg["notify"] if n.get("type") == "github")
+        assert github["repo"] == "nousergon/nousergon-data"
+        assert github.get("notify_on_category") == ["CODE", "CONFIG"]
+        assert github.get("auto_fix_pr") is True
+
 
 @flow_doctor_required
 class TestSetupLoggingAttach:
@@ -201,7 +211,7 @@ class TestSetupLoggingAttach:
 
     def test_disabled_attaches_no_flow_doctor_handler(self, monkeypatch, reset_root_logger):
         monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "0")
-        from alpha_engine_lib.logging import setup_logging
+        from nousergon_lib.logging import setup_logging
         setup_logging(
             "data-collector-test-disabled",
             flow_doctor_yaml=str(REPO_ROOT / "flow-doctor.yaml"),
@@ -215,7 +225,7 @@ class TestSetupLoggingAttach:
     def test_enabled_attaches_flow_doctor_handler(
         self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
     ):
-        from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+        from nousergon_lib.logging import setup_logging, get_flow_doctor
         setup_logging(
             "data-collector-test-enabled",
             flow_doctor_yaml=temp_flow_doctor_yaml,
@@ -232,7 +242,7 @@ class TestSetupLoggingAttach:
     def test_exclude_patterns_plumbed_to_handler(
         self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
     ):
-        from alpha_engine_lib.logging import setup_logging
+        from nousergon_lib.logging import setup_logging
         patterns = [r"polygon transient 5\d\d", r"yfinance possibly delisted"]
         setup_logging(
             "data-collector-test-patterns",
