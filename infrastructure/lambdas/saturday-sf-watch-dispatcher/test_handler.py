@@ -545,6 +545,77 @@ def test_programmatic_abort_still_dispatches(monkeypatch):
     assert written["events"][-1]["dispatch_suppressed"] is None
 
 
+# ── preflight dispatch carve-out (found 2026-07-10, before ever firing live) ──
+# The Friday-PM dry pass of ne-weekly-freshness-pipeline (shell_run=true in the
+# execution input) is a deliberate rehearsal, not a production failure. Prior
+# to this fix, is_preflight only suppressed the deterministic fast-path rerun
+# (_maybe_fast_path) — the agent-dispatch path had no equivalent gate, so a
+# FAILED Friday shell-run would fire a genuine saturday-sf-failure
+# repository_dispatch, indistinguishable from a real Saturday production
+# failure, and summon the full diagnose-fix-merge-rerun agent.
+
+
+def test_preflight_suppresses_agent_dispatch(monkeypatch):
+    """A Friday shell-run (preflight) failure must NOT auto-dispatch a recovery
+    agent even when the flag + listener are on — mirrors the operator-abort
+    carve-out (config#1827) exactly, but for a rehearsal run rather than a
+    human stop. Watch-log still written (fail-loud preserved); no Telegram."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    describe = {
+        "input": json.dumps({"shell_run": True}),
+        "error": "States.TaskFailed",
+        "cause": "RAGIngestion failed",
+    }
+    factory, _, s3 = _make_clients(describe=describe)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
+
+    # Dispatch suppressed — no repository_dispatch HTTP call fired.
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "preflight"}
+    assert result["action"] == "observe"
+    assert fired["called"] is False
+    # Watch-log STILL written (fail-loud) and carries the auditable reason.
+    s3.put_object.assert_called_once()
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["is_preflight"] is True
+    assert ev["dispatch_suppressed"] == "preflight"
+    assert ev["action"] == "observe"
+    assert result["telegram_sent"] is False
+    index.notify_via_flow_doctor.assert_not_called()
+
+
+def test_preflight_also_still_gated_from_fast_path(monkeypatch):
+    """Over-suppression is impossible to get backwards here: a preflight FAILED
+    must not fall through to the fast path either (fast path has its own
+    is_preflight check, config#1900) — confirms both recovery layers agree a
+    preflight failure gets NO automated action, only the watch-log record.
+    Uses the weekday pipeline since it's the only one with a `fast_path` scope
+    configured — the is_preflight gate itself is cadence-agnostic."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "FAST_PATH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    describe = {
+        "input": json.dumps({"shell_run": True, "trading_instance_id": ["i-0"]}),
+        "error": "States.TaskFailed",
+        "cause": "transient",
+    }
+    factory, _, s3 = _make_clients(describe=describe)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["fast_path"] == {"fast_path": False, "reason": "preflight"}
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "preflight"}
+
+
 # ── config#1900: deterministic zero-token fast path ──────────────────────────
 # A weekday failure whose history EXACTLY matches a known-transient signature
 # (data-spot host death / SendCommand invalid-instance) is recovered by a plain

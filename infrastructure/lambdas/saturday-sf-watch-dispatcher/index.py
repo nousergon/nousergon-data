@@ -504,11 +504,27 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
     # auto-dispatches a recovery agent (would waste a cycle and, once weekday/EOD
     # leave propose-only, risk an automated countermand of a human decision).
     operator_abort = _is_operator_abort(detail.get("status", ""), describe_resp)
-    dispatch_suppressed = "operator_abort" if operator_abort else None
+    # is_preflight: the Friday-PM dry pass of ne-weekly-freshness-pipeline
+    # (shell_run=true) is a deliberate rehearsal of Saturday's real run, not a
+    # production failure — a preflight FAILED/TIMED_OUT/ABORTED must never be
+    # indistinguishable from a genuine Saturday failure and summon the full
+    # diagnose-fix-merge-rerun agent against production. Prior to this fix
+    # is_preflight only gated the deterministic fast-path rerun (_maybe_fast_path
+    # reason="preflight"); the agent-dispatch path had no such gate at all, so a
+    # failed Friday shell-run WOULD have fired a genuine saturday-sf-failure
+    # dispatch (found 2026-07-10, before ever firing live).
+    is_preflight = _is_preflight(describe_resp)
+    if operator_abort:
+        dispatch_suppressed = "operator_abort"
+    elif is_preflight:
+        dispatch_suppressed = "preflight"
+    else:
+        dispatch_suppressed = None
     will_dispatch = (
         AGENT_DISPATCH_ENABLED
         and bool(cfg.get("has_listener", True))
         and not operator_abort
+        and not is_preflight
     )
     return {
         "detected_at": now_iso,
@@ -518,7 +534,7 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
         "execution_arn": detail.get("executionArn", ""),
         "failed_state": failed_state,
         "cause": cause or None,
-        "is_preflight": _is_preflight(describe_resp),
+        "is_preflight": is_preflight,
         # `lane` is filled by the dispatched agent (null until it classifies).
         # `action` reflects intent at write time (the log is written just BEFORE
         # the dispatch fires): "dispatch" only when an agent will genuinely be
@@ -528,9 +544,9 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
         "action": "dispatch" if will_dispatch else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
         "has_listener": bool(cfg.get("has_listener", True)),
-        # config#1827: null unless the dispatch was withheld for a recorded
-        # reason; "operator_abort" makes the human-stop decision auditable in the
-        # watch-log and on the dashboard.
+        # config#1827/preflight: null unless the dispatch was withheld for a
+        # recorded reason; "operator_abort"/"preflight" make the withholding
+        # auditable in the watch-log and on the dashboard.
         "dispatch_suppressed": dispatch_suppressed,
     }
 
