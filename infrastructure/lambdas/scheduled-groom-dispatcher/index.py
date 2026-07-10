@@ -345,7 +345,8 @@ def _resolve_pr_budget(event: dict) -> int | None:
 
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
                        run_token: str, soft_limit_min: int | None = None,
-                       pr_budget: int | None = None, no_sweep: bool = False) -> str:
+                       pr_budget: int | None = None, partition_index: int = 0,
+                       partition_count: int = 1) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -355,7 +356,14 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
     pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
-    no_sweep_export = "export GROOM_NO_SWEEP=1\n" if no_sweep else ""
+    # config#2129: replaces GROOM_NO_SWEEP=1 (the old "only the first box
+    # sweeps" starvation bug) — every co-launched box now sweeps its OWN
+    # disjoint partition_count-slice of the org's open PRs, so all of them
+    # get real sweep coverage instead of only whichever tier launched first.
+    partition_export = (
+        f"export GROOM_SWEEP_PARTITION_INDEX={partition_index}\n"
+        f"export GROOM_SWEEP_PARTITION_COUNT={partition_count}\n"
+    ) if partition_count > 1 else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -378,7 +386,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{no_sweep_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{partition_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -409,12 +417,14 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
-                    pr_budget: int | None = None, no_sweep: bool = False) -> str:
+                    pr_budget: int | None = None, partition_index: int = 0,
+                    partition_count: int = 1) -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(
-            run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget, no_sweep,
+            run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
+            partition_index, partition_count,
         ),
         comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         region=REGION,
@@ -481,7 +491,7 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
                        force_on_demand: bool = False,
-                       no_sweep: bool = False) -> dict:
+                       partition_index: int = 0, partition_count: int = 1) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
@@ -532,7 +542,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             f"#logsV2:log-groups (log group {CW_LOG_GROUP}, instance {instance_id})"
         )
         command_id = _send_bootstrap(
-            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget, no_sweep,
+            instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
+            partition_index, partition_count,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -558,6 +569,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "model": model,
         "issue_filter": issue_filter,
         "run_token": run_token,
+        "partition_index": partition_index,
+        "partition_count": partition_count,
         **({"pr_budget": pr_budget} if pr_budget is not None else {}),
     }
 
@@ -858,6 +871,21 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     .send_message` never raises) since this is the ONLY place a pre-boot skip
     is ever visible; a run that never boots has no on-box `groom_run.sh` to
     fire its own notification the way the on-box budget-gate skip does.
+
+    config#2129 two-phase SF flow (`decide_only` / `launch_decided`): the
+    dispatch Step Function no longer invokes this Lambda once per trigger and
+    tries to poll a response shape that varies 1-vs-N launches (the OLD
+    single-invocation demand-all path returned ``{"launches": [...]}`` with NO
+    top-level ``launched``/``instance_id``/``command_id`` — the SF's
+    CheckLaunched/PollGroomCommand states expected the singular shape and
+    failed with States.Runtime on ~83% of real triggers, see I2129). Instead:
+    ``event.get("decide_only")`` computes 0..N launch decisions WITHOUT
+    launching anything (used by the SF's DecideLaunches state); the SF then
+    fans out one ``launch_decided`` invocation per decision via a Map state,
+    each an independently pollable/relaunchable branch reusing the existing
+    per-box states unchanged. Legacy direct invokes (no `decide_only` /
+    `launch_decided` key) behave EXACTLY as before — decide AND launch in one
+    call, same response shapes — for any caller not yet on the new SF flow.
     """
     event = event or {}
     run_mode = _resolve_run_mode(event)
@@ -869,9 +897,24 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     schedule_label = str(event.get("schedule") or "unknown")
     logger.info(
         "scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s "
-        "pr_budget=%s force_on_demand=%s schedule=%s",
+        "pr_budget=%s force_on_demand=%s schedule=%s decide_only=%s launch_decided=%s",
         run_mode, model, issue_filter, soft_limit_min, pr_budget, force_on_demand, schedule_label,
+        bool(event.get("decide_only")), bool(event.get("launch_decided")),
     )
+
+    if event.get("launch_decided"):
+        # config#2129: a decide_only call (or the SF's bounded-relaunch loop
+        # re-invoking for the SAME already-decided box) already made this
+        # decision — launch EXACTLY what's given, no pace gate (a per-TRIGGER
+        # call, not per-box), no re-decision. Returns the SAME singular
+        # {"groom": {...}} shape the SF's existing per-box states expect.
+        result = _launch_groom_spot(
+            run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget,
+            force_on_demand,
+            partition_index=int(event.get("partition_index") or 0),
+            partition_count=int(event.get("partition_count") or 1),
+        )
+        return {"groom": result}
 
     if PACE_GATE_ENABLED:
         pace = _pace_gate_status()
@@ -882,41 +925,61 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 pace["used_frac"], pace["elapsed_frac"], pace["overrun"], pace["wet"],
             )
             _notify_pace_skip(pace, schedule_label, run_mode)
-            return {"groom": {"launched": False, "reason": "pace_gate_skip", **pace}}
+            skip = {"launched": False, "reason": "pace_gate_skip", **pace}
+            if event.get("decide_only"):
+                return {"decide": {"launches": [], **skip}}
+            return {"groom": skip}
 
     if run_mode == "full" and not force_on_demand and str(event.get("trigger", "")) == "demand-all":
         # config#1933 SYMMETRIC triggers (Brian's ratified correction): every
         # scheduled trigger evaluates the FULL backlog and launches 0..3 boxes
         # — one per tier clearing the floor, thin tiers attached upward, the
-        # leftover-thin pool valve-gated. Only the FIRST box runs PR sweeps.
+        # leftover-thin pool valve-gated. Every co-launched box now gets its
+        # own disjoint PR-sweep partition (config#2129) — no more "only the
+        # first box sweeps".
         try:
             counts, oldest, p0_tiers = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
         except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
             logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
             _notify_demand_trigger_failed(exc, schedule_label)
-            return {"groom": {"launched": False, "reason": "demand_all_failed", "error": str(exc)}}
+            err = {"launched": False, "reason": "demand_all_failed", "error": str(exc)}
+            if event.get("decide_only"):
+                return {"decide": {"launches": [], **err}}
+            return {"groom": err}
         if launches is not None:
             _write_trigger_record(schedule_label, launches, counts)
-            results = []
-            first = True
+            entries = []
             for d in launches:
                 if not d.launch:
                     logger.info("demand trigger: %s", d.reason)
                     _notify_demand_skip(d, counts, schedule_label)
                     continue
-                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
-                            d.reason, d.issue_filter, d.model)
-                results.append(_launch_groom_spot(
-                    run_mode, schedule_label, d.model, d.issue_filter,
-                    soft_limit_min, pr_budget if "high" in d.tiers else None,
-                    force_on_demand, no_sweep=not first,
-                ))
-                first = False
+                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s partition=%d/%d)",
+                            d.reason, d.issue_filter, d.model, d.partition_index, d.partition_count)
+                entry = {
+                    "model": d.model, "issue_filter": d.issue_filter,
+                    "partition_index": d.partition_index, "partition_count": d.partition_count,
+                }
+                if pr_budget is not None and "high" in d.tiers:
+                    entry["pr_budget"] = pr_budget
+                entries.append(entry)
+            decisions_record = [d.as_record() for d in launches]
+            if event.get("decide_only"):
+                return {"decide": {"trigger": "demand-all", "counts": counts,
+                                   "decisions": decisions_record, "launches": entries}}
+            results = [
+                _launch_groom_spot(
+                    run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
+                    e.get("pr_budget"), force_on_demand,
+                    partition_index=e["partition_index"], partition_count=e["partition_count"],
+                )
+                for e in entries
+            ]
             return {"groom": {"trigger": "demand-all", "counts": counts,
-                              "decisions": [d.as_record() for d in launches],
-                              "launches": results}}
+                              "decisions": decisions_record, "launches": results}}
 
+    partition_index, partition_count = 0, 1
     if run_mode == "full" and not force_on_demand:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
@@ -924,17 +987,29 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             if not decision.launch:
                 logger.info("demand gate SKIP — %s", decision.reason)
                 _notify_demand_skip(decision, counts, schedule_label)
-                return {"groom": {"launched": False, "reason": "demand_gate_skip",
-                                  "decision": decision.as_record(), "counts": counts}}
+                skip = {"launched": False, "reason": "demand_gate_skip",
+                        "decision": decision.as_record(), "counts": counts}
+                if event.get("decide_only"):
+                    return {"decide": {"launches": [], **skip}}
+                return {"groom": skip}
             # Launch with the DECIDED bundle + cheapest adequate model — the
             # schedule's model is only the slot default; high never runs
             # below Opus, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
             model = decision.model
+            partition_index, partition_count = decision.partition_index, decision.partition_count
             logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",
                         decision.reason, issue_filter, model)
 
+    if event.get("decide_only"):
+        entry = {"model": model, "issue_filter": issue_filter,
+                 "partition_index": partition_index, "partition_count": partition_count}
+        if pr_budget is not None:
+            entry["pr_budget"] = pr_budget
+        return {"decide": {"launches": [entry]}}
+
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
+        partition_index=partition_index, partition_count=partition_count,
     )
     return {"groom": result}
