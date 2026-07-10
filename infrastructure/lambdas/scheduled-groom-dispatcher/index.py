@@ -788,14 +788,19 @@ def _load_recent_engagements() -> dict:
     return out
 
 
-def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list]:
+def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     """Tier stats with config#1893 fresh-skip applied (P0 exempt).
 
-    Returns (counts, oldest_wait_hours, p0_tiers) for ge.decide_trigger().
-    """
+    Returns (counts, oldest_wait_hours, p0_tiers, tier_issues) —
+    the first three for ge.decide_trigger(); ``tier_issues`` maps tier →
+    the actual issue dicts behind each count (repo/number/title/labels/
+    updated_at), consumed by ``_write_queue_manifests`` (config#2152: the
+    enumerate-once queue manifest — counts and queue derive from the SAME
+    walk by construction, so they can never diverge)."""
     engagements = _load_recent_engagements()
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
+    tier_issues: dict[str, list[dict]] = {t: [] for t in ge.TIERS}
     p0_tiers: set = set()
     now = datetime.now(ZoneInfo("UTC"))
     now_epoch = now.timestamp()
@@ -825,13 +830,61 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list]:
                 if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
                     continue
                 counts[tier] += 1
+                tier_issues[tier].append({
+                    "repo": repo, "number": it["number"],
+                    "title": it.get("title", ""), "labels": labels,
+                    "updated_at": str(it.get("updated_at", "")),
+                })
                 oldest[tier] = max(oldest[tier], (now_epoch - updated_epoch) / 3600.0)
                 if is_p0:
                     p0_tiers.add(tier)
             if len(batch) < 100:
                 break
             page += 1
-    return counts, oldest, sorted(p0_tiers)
+    return counts, oldest, sorted(p0_tiers), tier_issues
+
+
+def _write_queue_manifests(schedule_label: str, launches: list,
+                           tier_issues: dict) -> dict:
+    """config#2152 (queue manifest, OBSERVER phase): one manifest per launched
+    box at a deterministic key — ``groom/queues/{date}/trigger-{HHMM}-{issue_
+    filter}.json`` — carrying the exact issue list behind the launch decision.
+    The on-box driver discovers its manifest by (date, issue_filter, freshness)
+    and records a parity comparison in its run artifact; it does NOT consume
+    the manifest yet. Cutover (driver enumeration replaced by manifest +
+    revalidation) is gated on ≥3 days of clean parity — see I2152/I2154.
+
+    Best-effort during the observer phase ONLY: a write failure here must not
+    block the launches (the grooms are the primary deliverable), and the
+    failure IS recorded — the driver's parity check reports the missing
+    manifest in its run artifact (``manifest_parity``), which the I2152
+    cutover review reads. At cutover this becomes fail-loud like the trigger
+    record itself.
+
+    Returns {issue_filter: s3_key} for the trigger record / response payload.
+    """
+    now = datetime.now(ZoneInfo("UTC"))
+    keys: dict = {}
+    for d in launches:
+        if not d.launch:
+            continue
+        issues = [it for t in d.tiers for it in tier_issues.get(t, [])]
+        key = f"groom/queues/{now:%Y-%m-%d}/trigger-{now:%H%M}-{d.issue_filter}.json"
+        body = json.dumps({
+            "schema_version": 1, "schedule": schedule_label,
+            "issue_filter": d.issue_filter, "model": d.model,
+            "tiers": list(d.tiers), "decided_at": now.isoformat(),
+            "issue_count": len(issues), "issues": issues,
+        })
+        try:
+            boto3.client("s3", region_name=REGION).put_object(
+                Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+                ContentType="application/json")
+            keys[d.issue_filter] = key
+        except Exception as exc:  # noqa: BLE001 — observer phase; recording surface = driver manifest_parity (see docstring)
+            logger.warning("queue manifest write failed for %s (observer phase — "
+                           "driver parity will report it): %s", d.issue_filter, exc)
+    return keys
 
 
 def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> None:
@@ -938,7 +991,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # own disjoint PR-sweep partition (config#2129) — no more "only the
         # first box sweeps".
         try:
-            counts, oldest, p0_tiers = _enumerate_tier_stats_fresh(_github_token())
+            counts, oldest, p0_tiers, tier_issues = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
         except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
             logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
@@ -948,6 +1001,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 return {"decide": {"launches": [], **err}}
             return {"groom": err}
         if launches is not None:
+            manifest_keys = _write_queue_manifests(schedule_label, launches, tier_issues)
             _write_trigger_record(schedule_label, launches, counts)
             entries = []
             for d in launches:
@@ -966,8 +1020,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 entries.append(entry)
             decisions_record = [d.as_record() for d in launches]
             if event.get("decide_only"):
+                # config#2152: manifests are written at DECIDE time (above) —
+                # the enumerate-once product of the same walk as the counts —
+                # so the two-phase SF path records them here too.
                 return {"decide": {"trigger": "demand-all", "counts": counts,
-                                   "decisions": decisions_record, "launches": entries}}
+                                   "decisions": decisions_record,
+                                   "queue_manifests": manifest_keys,
+                                   "launches": entries}}
             results = [
                 _launch_groom_spot(
                     run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
@@ -977,7 +1036,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 for e in entries
             ]
             return {"groom": {"trigger": "demand-all", "counts": counts,
-                              "decisions": decisions_record, "launches": results}}
+                              "decisions": decisions_record,
+                              "queue_manifests": manifest_keys,
+                              "launches": results}}
 
     partition_index, partition_count = 0, 1
     if run_mode == "full" and not force_on_demand:

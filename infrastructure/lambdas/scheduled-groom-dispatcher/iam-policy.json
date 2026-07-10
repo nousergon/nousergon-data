@@ -133,6 +133,12 @@
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/decisions/*"
+    },
+    {
+      "Sid": "WriteGroomQueueManifests",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/queues/*"
     }
   ]
 }
