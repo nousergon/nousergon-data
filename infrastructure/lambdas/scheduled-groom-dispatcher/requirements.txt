@@ -5,10 +5,12 @@ boto3>=1.34.0
 # directly through v0.97.0). v0.101.0 is the first version carrying
 # SlotDecision.partition_index/partition_count (config#2129) — this Lambda's
 # decide_only/launch_decided operations read those fields off ge.decide_
-# trigger()'s output and WILL AttributeError against v0.100.0. MERGE ORDER:
-# nousergon-lib-PR179 must merge (and auto-tag v0.101.0 via .github/workflows/
-# auto-tag.yml) BEFORE this PR merges — this pin bump is what makes that
-# ordering an explicit, CI-enforced gate rather than a silent runtime crash
-# on the next demand-all trigger.
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.101.0
+# trigger()'s output and WILL AttributeError against v0.100.0.
+# v0.104.0 (config#2146 / alpha-engine-config-I2230, 2026-07-11) adds
+# groom:stalled/triage:session to BASE_EXCLUDE_LABELS — keeps this Lambda's
+# pre-boot per-tier actionable-issue count in parity with groom_driver.py's
+# own (already-fixed) mirrored copy, which is what actually governs on-box
+# enumeration. Mechanical pin-only bump — no behavior change on this Lambda's
+# own code.
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.104.0
 krepis>=0.10.2
