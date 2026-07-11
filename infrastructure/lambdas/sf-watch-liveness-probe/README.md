@@ -26,6 +26,20 @@ Read-only, schedule-aware config-drift check:
    failure to expose it.
 4. The target dispatcher Lambda is `Active` with a successful last code
    update.
+5. **EC2-spot dispatch leg** (the LIVE repair path since the 2026-07-10 spot
+   migration, config#2001/#2106): `alpha-engine-sf-watch-spot-dispatcher` and
+   `alpha-engine-ci-watch-dispatcher` exist and are `Active`. Their
+   kill-switch env values (`SF_WATCH_DISPATCH_ENABLED` /
+   `CI_WATCH_DISPATCH_ENABLED`) are read and **reported** in the probe
+   record/log — never alerted on: a deliberate operator disable is state, not
+   an incident.
+6. **Launch-config existence** (the deregistered-AMI silent-break guard,
+   config#2265): the AMI, security group, and subnets the spot dispatcher
+   would launch with — read from its DEPLOYED live env (`SF_WATCH_AMI_ID` /
+   `SF_WATCH_SECURITY_GROUP` / `SF_WATCH_SUBNETS`, pinned by that Lambda's
+   `deploy.sh` and lockstep-tested against its in-code defaults) — still
+   exist in EC2. A missing expected env key is itself a loud finding, never a
+   skip.
 
 Silent-unless-broken (mirrors the groom-liveness-probe's philosophy, one
 layer up): a clean check logs and returns, no Telegram noise. Any problem
@@ -35,9 +49,11 @@ alert state clears automatically once the check is clean again.
 
 **Fail-loud:** every AWS describe/list call is the PRIMARY input — an error
 code other than the specific "doesn't exist" ones being checked for RAISES,
-surfacing via the Lambda error metric + a CW alarm rather than silently
-skipping the one check that verifies nothing else is silently broken. The
-Telegram send and dedup-state write are best-effort.
+surfacing via the Lambda `Errors` metric, alarmed by the watch-plane
+CloudWatch alarms provisioned in `infrastructure/setup_watch_plane_alarms.sh`
+(the dead-probe backstop) — rather than silently skipping the one check that
+verifies nothing else is silently broken. The Telegram send and dedup-state
+write are best-effort.
 
 ## Deploy (operator-gated, outside CloudFormation)
 
@@ -49,8 +65,8 @@ bash deploy.sh --smoke       # invoke once (read-only; pings only on a REAL prob
 ```
 
 Merging the PR has **zero** live effect until an operator runs `--bootstrap`.
-Recommend wiring a CloudWatch alarm on this function's `Errors` metric (the
-fail-loud contract assumes one).
+The CloudWatch alarm on this function's `Errors` metric (which the fail-loud
+contract assumes) is provisioned by `infrastructure/setup_watch_plane_alarms.sh`.
 
 Cadence (UTC): `cron(45 6 * * ? *)` and `cron(45 14 * * ? *)` — offset 15 min
 from the groom-liveness-probe's cadence purely to avoid simultaneous

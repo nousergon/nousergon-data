@@ -43,7 +43,21 @@
       "Sid": "ReadDispatcherLambdaHealth",
       "Effect": "Allow",
       "Action": ["lambda:GetFunctionConfiguration"],
-      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-saturday-sf-watch-dispatcher"
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-saturday-sf-watch-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-sf-watch-spot-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ci-watch-dispatcher"
+      ]
+    },
+    {
+      "Sid": "ReadSpotLaunchConfigEc2DescribeNotResourceScopable",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeImages",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets"
+      ],
+      "Resource": "*"
     },
     {
       "Sid": "LivenessDedupState",
