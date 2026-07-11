@@ -2,6 +2,16 @@
 # deploy_step_function.sh — Create/update the Saturday pipeline Step Functions
 # state machine, IAM role, SNS topic, and EventBridge trigger.
 #
+# SINGLE-WRITER CONTRACT (config#2273): the repo file
+# infrastructure/step_function.json is the sole source of truth for the
+# ne-weekly-freshness-pipeline definition. Every deploy path (this script
+# for manual/bootstrap use, deploy-infrastructure.sh on merge) uploads the
+# stamped repo bytes to the CFN-referenced S3 key BEFORE calling
+# update-state-machine from those same bytes, and passes
+# --logging-configuration explicitly. CFN's DefinitionS3Location is only
+# read at stack-create/replacement, so keeping the S3 object in lockstep
+# means CFN can never restamp different bytes — see section 3 below.
+#
 # Prerequisites:
 #   1. AWS CLI configured with admin credentials
 #   2. SSM agent installed on the always-on EC2 instance
@@ -20,7 +30,12 @@
 #
 # After deployment:
 #   1. Run a test execution from the Step Functions console
-#   2. Monitor first automated Saturday run (00:00 UTC)
+#   2. Monitor the next automated weekly run — schedule SoT is the CFN
+#      SaturdayTrigger ScheduleExpression in
+#      cloudformation/alpha-engine-orchestration.yaml plus the SF's
+#      WeeklyRunDayGate self-selection (config#1824); the cron is
+#      deliberately NOT copied here, it has gone stale in this file before
+#      (config#2281)
 #   3. After 2 successful weeks, run with --disable-old-crons
 
 set -euo pipefail
@@ -104,7 +119,39 @@ echo "  Role ARN: $ROLE_ARN"
 echo "  Inline policy is codified in infrastructure/iam/${ROLE_NAME}.json"
 echo "  Apply via: ./infrastructure/iam/apply.sh $ROLE_NAME"
 
-# ── 3. State Machine ───────────────────────────────────────────────────────
+# ── 3. State Machine — SINGLE-WRITER CONTRACT (config#2273) ────────────────
+#
+# The repo file infrastructure/step_function.json is the SOLE source of
+# truth for the ne-weekly-freshness-pipeline definition. Three copies of
+# the definition exist — the repo file, the S3 object CFN's
+# DefinitionS3Location references, and the live state machine — and the
+# deploy path is the ONLY thing allowed to move any of them. Every deploy
+# therefore does ALL of:
+#
+#   (a) stamp the repo file with the current git SHA (the same idempotent
+#       [git:<sha>] Comment stamp as deploy-infrastructure.sh, so this
+#       manual/bootstrap path and the on-merge CI path emit byte-identical
+#       artifacts for the same commit);
+#   (b) upload the stamped bytes to the CFN-referenced S3 key
+#       (WEEKLY_SF_S3_BUCKET/WEEKLY_SF_S3_KEY below — MUST stay equal to
+#       the SaturdayPipeline DefinitionS3Location in
+#       cloudformation/alpha-engine-orchestration.yaml). CFN only reads
+#       that object at stack-create / resource-replacement time; keeping
+#       it in lockstep means a future CFN restamp re-deploys the SAME
+#       bytes instead of silently rolling the live definition back to a
+#       stale object — CFN stops being an independent writer in practice;
+#   (c) update-state-machine from the SAME stamped bytes, passing
+#       --logging-configuration EXPLICITLY — reconstructed from the shape
+#       CFN declares on the SaturdayPipeline resource (level=ERROR,
+#       includeExecutionData=true, the WeeklyFreshnessLogGroup log group)
+#       — never relying on partial-update preservation (the
+#       recreate-drops-logging bug class is config#1464; the ne-* rename
+#       config#1381 hit it live).
+#
+# Drift backstop: infrastructure/step-functions/check-definition-drift.py
+# compares repo file vs live definition vs S3 staged copy (normalized)
+# and exits non-zero on any divergence. Shape-guard for THIS section:
+# tests/test_deploy_step_function_single_writer.py.
 
 echo "Creating/updating state machine: $STATE_MACHINE_NAME..."
 
@@ -114,36 +161,62 @@ if [ ! -f "$ASL_FILE" ]; then
   exit 1
 fi
 
-# Read the ASL definition
-DEFINITION=$(cat "$ASL_FILE")
+# CFN-referenced definition location (SaturdayPipeline DefinitionS3Location).
+# tests/test_deploy_step_function_single_writer.py pins these to the CFN
+# template so the script and CFN can never point at different objects.
+WEEKLY_SF_S3_BUCKET="alpha-engine-research"
+WEEKLY_SF_S3_KEY="infrastructure/step_function.json"
 
-# Check if state machine exists
+# Git SHA stamp — identical mechanics to deploy-infrastructure.sh so the
+# deploy-drift preflight can compare the live Comment stamp against
+# origin/main regardless of which deploy path last wrote the definition.
+GIT_SHA="${GITHUB_SHA:-$(git -C "$SCRIPT_DIR/.." rev-parse HEAD 2>/dev/null || echo unknown)}"
+echo "  Stamping definition with GIT_SHA=${GIT_SHA}"
+STAMPED_ASL="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
+trap 'rm -f "$STAMPED_ASL"' EXIT
+python3 -c "
+import json, sys
+path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path_in))
+orig = d.get('Comment', '')
+# Strip any existing [git:…] prefix so re-stamping is idempotent
+if orig.startswith('[git:'):
+    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
+d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
+json.dump(d, open(path_out, 'w'), indent=2)
+" "$ASL_FILE" "$STAMPED_ASL" "$GIT_SHA"
+
+# (b) S3 upload FIRST — the CFN read-source must never lag the live machine.
+echo "  Uploading stamped definition to s3://${WEEKLY_SF_S3_BUCKET}/${WEEKLY_SF_S3_KEY}..."
+aws s3 cp "$STAMPED_ASL" "s3://${WEEKLY_SF_S3_BUCKET}/${WEEKLY_SF_S3_KEY}" --quiet --region "$REGION"
+
+# (c) Explicit LoggingConfiguration — shape mirrors the CFN SaturdayPipeline
+# LoggingConfiguration declaration (CFN stays the declarative SoT for the
+# SHAPE; asserting it on every update self-heals a recreate-dropped config
+# instead of leaving the gap to the drift checker).
+LOG_GROUP_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/stepfunctions/${STATE_MACHINE_NAME}:*"
+LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$LOG_GROUP_ARN"'"}}]}'
+
+# --definition via file:// — an inline "$(cat ...)" arg blows ARG_MAX once
+# the ASL grows (2026-06-04 regression in deploy-infrastructure.sh; the
+# weekly ASL is ~130 KB and growing).
 SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${STATE_MACHINE_NAME}"
 if aws stepfunctions describe-state-machine --state-machine-arn "$SM_ARN" --region "$REGION" &>/dev/null; then
   echo "  Updating existing state machine..."
   aws stepfunctions update-state-machine \
     --state-machine-arn "$SM_ARN" \
-    --definition "$DEFINITION" \
+    --definition "file://$STAMPED_ASL" \
     --role-arn "$ROLE_ARN" \
+    --logging-configuration "$LOGGING_CONFIG" \
     --region "$REGION" > /dev/null
 else
   echo "  Creating new state machine..."
   aws stepfunctions create-state-machine \
     --name "$STATE_MACHINE_NAME" \
-    --definition "$DEFINITION" \
+    --definition "file://$STAMPED_ASL" \
     --role-arn "$ROLE_ARN" \
     --type STANDARD \
-    --logging-configuration '{
-      "level": "ERROR",
-      "includeExecutionData": true,
-      "destinations": [
-        {
-          "cloudWatchLogsLogGroup": {
-            "logGroupArn": "arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/'"$STATE_MACHINE_NAME"':*"
-          }
-        }
-      ]
-    }' \
+    --logging-configuration "$LOGGING_CONFIG" \
     --region "$REGION" > /dev/null
   SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${STATE_MACHINE_NAME}"
 fi
@@ -244,7 +317,10 @@ echo ""
 echo "=== Deployment Complete ==="
 echo ""
 echo "  State machine:  $SM_ARN"
-echo "  EventBridge:    $EVENTBRIDGE_RULE (Saturday 00:00 UTC)"
+# Schedule SoT is the CFN SaturdayTrigger rule (ScheduleExpression +
+# WeeklyRunDayGate self-selection, config#1824) — point there rather than
+# hand-copying the cron into a second place that goes stale (config#2281).
+echo "  EventBridge:    $EVENTBRIDGE_RULE (schedule: CFN-owned — SoT is the SaturdayTrigger ScheduleExpression in infrastructure/cloudformation/alpha-engine-orchestration.yaml, plus the SF's WeeklyRunDayGate self-selecting the single run day)"
 echo "  SNS topic:      $SNS_TOPIC_ARN"
 echo ""
 echo "To test manually:"
