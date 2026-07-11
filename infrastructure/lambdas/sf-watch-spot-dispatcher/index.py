@@ -140,6 +140,26 @@ SF_WATCH_TAG_NAME = "alpha-engine-sf-watch-spot"
 SF_WATCH_CADENCE_TAG_KEY = "sf-watch-cadence"
 SF_WATCH_PIPELINE_TAG_KEY = "sf-watch-pipeline"
 SF_WATCH_RUN_DATE_TAG_KEY = "sf-watch-run-date"
+# Canary drill discriminator (config#2223): set on drill boxes ONLY, so any
+# fleet consumer (dashboard live-box signal, ad-hoc audits) can tell a
+# synthetic drill box from a real repair box with one tag read. The SAME tag
+# key is used by ci-watch-dispatcher — one fleet-wide drill marker.
+SF_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
+
+# DRILL RUN_DATE PREFIX (config#2223). DRILL-vs-REAL ISOLATION INVARIANT: a
+# drill's effective run_date is ALWAYS synthesized as f"drill-{utc-date}" —
+# it can NEVER match _RUN_DATE_RE (real run_dates are bare YYYY-MM-DD), so
+# every surface keyed on run_date is structurally collision-free between
+# drills and real dispatches: the (cadence, pipeline, run_date) concurrency
+# lock, the completion-marker key sf_watch/_control/completed/
+# {cadence}-{pipeline}-{run_date}.json (what spot-orphan-reaper and the
+# sf-watch-liveness-probe reclaim checker derive from the tags), the
+# watch-log key consolidated/{cadence}_sf_watch/{run_date}.json, and the
+# saturday dispatcher's config#2269 per-(cadence, pipeline, run_date)
+# mechanical attempt ceiling. A drill therefore can never dedupe-block,
+# budget-consume, or reclaim-relaunch against a real dispatch. Pinned by
+# test_drill_run_date_can_never_collide_with_a_real_run_date.
+DRILL_RUN_DATE_PREFIX = "drill-"
 
 # Discriminator tag write (config#2267 site 2): the tags are LOAD-BEARING —
 # without them the next failure's dedupe guard is blind (duplicate box) and
@@ -236,7 +256,17 @@ def _resolve_event_fields(event: dict) -> dict:
     clean launched:false — see module docstring's synchronous contract)."""
     pipeline_name = _require(event, "pipeline_name", _PIPELINE_RE)
     cadence_slug = _require(event, "cadence_slug", _CADENCE_RE)
-    run_date = _require(event, "run_date", _RUN_DATE_RE)
+    # is_drill (config#2223): "true" on the weekly synthetic canary drill the
+    # EventBridge Scheduler rule fires (see deploy.sh --bootstrap). A drill's
+    # effective run_date is ALWAYS synthesized here — never taken from the
+    # payload — so no payload (scheduler Input, operator refire, anything)
+    # can ever carry a real run_date into a drill's lock/marker/watch-log
+    # keys. See the DRILL_RUN_DATE_PREFIX isolation invariant above.
+    is_drill = _optional(event, "is_drill", _BOOL_RE, default="false")
+    if is_drill == "true":
+        run_date = f"{DRILL_RUN_DATE_PREFIX}{datetime.now(timezone.utc):%Y-%m-%d}"
+    else:
+        run_date = _require(event, "run_date", _RUN_DATE_RE)
     execution_arn = _require(event, "execution_arn", _ARN_RE)
     state_machine_arn = _optional(event, "state_machine_arn", _ARN_RE)
     failed_state = _optional(event, "failed_state", _FAILED_STATE_RE)
@@ -260,6 +290,7 @@ def _resolve_event_fields(event: dict) -> dict:
         "failed_state": failed_state,
         "watch_log_key": watch_log_key,
         "is_preflight": is_preflight,
+        "is_drill": is_drill,
         "force_on_demand": force_on_demand,
         "cause": cause,
     }
@@ -300,7 +331,7 @@ exec bash infrastructure/sf_watch_spot_bootstrap.sh \
   --state-machine-arn "{fields['state_machine_arn']}" --execution-arn "{fields['execution_arn']}" \
   --run-date "{fields['run_date']}" --failed-state "{fields['failed_state']}" \
   --cause-b64 "{cause_b64}" --watch-log-key "{fields['watch_log_key']}" \
-  --is-preflight "{fields['is_preflight']}"
+  --is-preflight "{fields['is_preflight']}" --is-drill "{fields['is_drill']}"
 """
 
 
@@ -378,18 +409,23 @@ def _terminate_instance(instance_id: str) -> None:
 
 
 def _create_discriminator_tags(
-    instance_id: str, cadence_slug: str, pipeline_name: str, run_date: str
+    instance_id: str, cadence_slug: str, pipeline_name: str, run_date: str,
+    is_drill: bool = False,
 ) -> str | None:
     """Write the load-bearing discriminator tags (config#2267 site 2) with a
     bounded retry. Returns None on success, or the final ``"ExcName: msg"``
     string after TAG_WRITE_ATTEMPTS failures — the caller terminates the box
     and fails the dispatch (the tags are what make the box visible to the
-    dedupe guard and the spot-orphan-reaper; an untagged box must not run)."""
+    dedupe guard and the spot-orphan-reaper; an untagged box must not run).
+    A canary drill box (config#2223) additionally carries
+    ``sf-watch-drill=true`` so fleet consumers can tell it apart."""
     tags = [
         {"Key": SF_WATCH_CADENCE_TAG_KEY, "Value": cadence_slug},
         {"Key": SF_WATCH_PIPELINE_TAG_KEY, "Value": pipeline_name},
         {"Key": SF_WATCH_RUN_DATE_TAG_KEY, "Value": run_date},
     ]
+    if is_drill:
+        tags.append({"Key": SF_WATCH_DRILL_TAG_KEY, "Value": "true"})
     last_error = ""
     for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
         try:
@@ -482,7 +518,7 @@ def _defer_relaunch(fields: dict, generation: int, context, existing: list[str])
     payload = {k: fields[k] for k in (
         "pipeline_name", "cadence_slug", "run_date", "execution_arn",
         "state_machine_arn", "failed_state", "watch_log_key", "is_preflight",
-        "force_on_demand", "cause",
+        "is_drill", "force_on_demand", "cause",
     )}
     payload["defer_generation"] = next_generation
     fire_at = datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECONDS)
@@ -652,7 +688,21 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
             "duplicate box is possible): %s",
             cadence_slug, pipeline_name, run_date, dedupe_probe_error,
         )
+    is_drill = fields.get("is_drill") == "true"
     if existing:
+        if is_drill:
+            # A drill is NOT a repair: defer-not-drop (config#2226) exists so
+            # a REAL failure is never silently dropped — a duplicate drill
+            # for the same day carries no coverage obligation, so it skips
+            # cleanly instead of minting a one-shot re-invoke schedule
+            # (config#2223).
+            logger.info(
+                "sf-watch canary drill already live for %s/%s@%s (%s) — "
+                "skipping (no defer for drills)",
+                cadence_slug, pipeline_name, run_date, existing,
+            )
+            return {"launched": False, "reason": "drill_concurrent_skip",
+                    "existing_instance_ids": existing, "is_drill": True}
         # DEFER, NOT DROP (config#2226): the live box has no obligation to
         # notice THIS failure — schedule a one-shot re-invoke instead of
         # silently dropping it (see module docstring).
@@ -679,7 +729,9 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
     # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
     # RunInstances chokepoint, growing an extra-tags parameter; until then
     # this retry+terminate closes the hole loudly.)
-    tag_error = _create_discriminator_tags(instance_id, cadence_slug, pipeline_name, run_date)
+    tag_error = _create_discriminator_tags(
+        instance_id, cadence_slug, pipeline_name, run_date, is_drill=is_drill
+    )
     if tag_error is not None:
         _terminate_instance(instance_id)
         logger.error(
@@ -724,6 +776,7 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         "run_token": run_token,
         "dedupe_degraded": dedupe_degraded,
         "force_on_demand": force_on_demand,
+        "is_drill": is_drill,
     }
     if dedupe_degraded:
         verdict["dedupe_probe_error"] = dedupe_probe_error
@@ -746,6 +799,15 @@ def handler(event: dict, context) -> dict:
     watch-log; the budget-visible `action: reclaim_relaunch` watch-log event
     (counted by the saturday dispatcher's config#2269 attempt ceiling) is
     written by the PROBE before it invokes here.
+
+    CANARY DRILL (config#2223): a weekly EventBridge Scheduler rule
+    (`alpha-engine-sf-watch-canary-drill-weekly`, created by deploy.sh
+    --bootstrap) invokes this same handler with `is_drill: "true"` and a
+    synthetic execution_arn. The dispatch pipe runs FOR REAL (spot launch,
+    SSM, bootstrap start) but the box short-circuits before the agent
+    (alpha-engine-config's sf_watch_run.sh drill guard), writes the
+    `consolidated/{cadence}_sf_watch/_canary/{date}.json` heartbeat, and
+    self-terminates. Drill isolation: see DRILL_RUN_DATE_PREFIX.
 
     Returns {"launched": bool, "reason": str, "instance_id": ..., ...} — read
     DIRECTLY by the GHA job as its success signal. Every anticipated failure
