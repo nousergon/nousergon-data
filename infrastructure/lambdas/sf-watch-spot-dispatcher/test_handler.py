@@ -907,3 +907,133 @@ def test_deploy_sh_launch_config_pins_match_index_defaults(monkeypatch):
         assert f'\\"{env_key}\\"' in deploy_sh or f'"{env_key}"' in deploy_sh, (
             f"deploy.sh's lambda_env_json no longer sets {env_key}"
         )
+
+
+# ── config#2223: weekly synthetic canary drill ───────────────────────────────
+
+
+def _drill_event(**overrides):
+    """Mirror of the static EventBridge Scheduler Input deploy.sh's --bootstrap
+    wires (run_date deliberately absent — the handler ALWAYS synthesizes it)."""
+    base = {
+        "is_drill": "true",
+        "pipeline_name": "ne-weekly-freshness-pipeline",
+        "cadence_slug": "saturday",
+        "execution_arn": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:canary-drill",
+        "cause": "synthetic weekly canary drill of the dispatch pipe (config#2223) - not a real failure",
+    }
+    base.update(overrides)
+    return base
+
+
+def _expected_drill_run_date():
+    from datetime import datetime, timezone
+    return f"drill-{datetime.now(timezone.utc):%Y-%m-%d}"
+
+
+def test_drill_event_launches_with_drill_scoped_run_date_and_drill_tag(monkeypatch):
+    """The happy path the weekly canary exists to verify: a drill payload
+    round-trips the REAL launch pipe (spot launch + tags + SSM bootstrap),
+    with the drill-scoped run_date threaded everywhere a real run_date would
+    be, plus the sf-watch-drill discriminator tag."""
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_drill_event(), None)
+    drill_date = _expected_drill_run_date()
+    assert out["launched"] is True
+    assert out["is_drill"] is True
+    assert out["run_date"] == drill_date
+    # Tags: the normal discriminator triple (run_date drill-scoped) PLUS the
+    # drill marker tag fleet consumers filter on.
+    assert idx._test_ec2.tags_created == [
+        (["i-stub"], [
+            {"Key": "sf-watch-cadence", "Value": "saturday"},
+            {"Key": "sf-watch-pipeline", "Value": "ne-weekly-freshness-pipeline"},
+            {"Key": "sf-watch-run-date", "Value": drill_date},
+            {"Key": "sf-watch-drill", "Value": "true"},
+        ])
+    ]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--is-drill "true"' in cmd
+    assert f'--run-date "{drill_date}"' in cmd
+    # The synthesized watch_log_key is drill-scoped too (never a real key).
+    assert f'--watch-log-key "consolidated/saturday_sf_watch/{drill_date}.json"' in cmd
+
+
+def test_drill_run_date_is_synthesized_never_taken_from_payload(monkeypatch):
+    """ISOLATION INVARIANT (see index.DRILL_RUN_DATE_PREFIX): even a payload
+    that smuggles a real run_date into a drill gets the code-synthesized
+    drill run_date — no payload can point a drill at a real dispatch's
+    lock/marker/watch-log keys."""
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_drill_event(run_date="2026-07-11"), None)
+    assert out["launched"] is True
+    assert out["run_date"] == _expected_drill_run_date()
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--run-date "2026-07-11"' not in cmd
+
+
+def test_drill_run_date_can_never_collide_with_a_real_run_date(monkeypatch):
+    """Pins the structural non-collision every drill-vs-real isolation claim
+    rests on (index.DRILL_RUN_DATE_PREFIX comment): a real run_date always
+    matches _RUN_DATE_RE, a drill run_date never does — so the concurrency
+    lock, completion-marker key, watch-log key, and the saturday dispatcher's
+    config#2269 per-run_date budget can never mix the two."""
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    drill_date = _expected_drill_run_date()
+    assert drill_date.startswith(idx.DRILL_RUN_DATE_PREFIX)
+    assert idx._RUN_DATE_RE.match("2026-07-11")
+    assert not idx._RUN_DATE_RE.match(drill_date)
+
+
+def test_drill_concurrent_skip_never_defers(monkeypatch):
+    """A drill is not a repair: a live drill box for the same day skips
+    cleanly — it must NOT mint a defer-not-drop one-shot schedule (that
+    machinery exists so REAL failures are never dropped)."""
+    drill_date = _expected_drill_run_date()
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={
+            ("saturday", "ne-weekly-freshness-pipeline", drill_date): ["i-drill-live"],
+        },
+    )
+    out = idx.handler(_drill_event(), _FakeContext())
+    assert out["launched"] is False
+    assert out["reason"] == "drill_concurrent_skip"
+    assert out["is_drill"] is True
+    assert out["existing_instance_ids"] == ["i-drill-live"]
+    assert idx._test_scheduler.created == []
+    assert idx._test_ssm.sent == []
+
+
+def test_real_dispatch_is_not_blocked_by_a_live_drill_box(monkeypatch):
+    """The other direction of the isolation invariant: a live drill box holds
+    only the drill-scoped lock key, so a real failure for the same
+    (cadence, pipeline) on the same day still launches."""
+    drill_date = _expected_drill_run_date()
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={
+            ("saturday", "ne-weekly-freshness-pipeline", drill_date): ["i-drill-live"],
+        },
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+
+
+def test_malformed_is_drill_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_drill_event(is_drill="yes-please"), None)
+    assert out["launched"] is False
+    assert out["reason"] == "invalid_event"
+    assert idx._test_ssm.sent == []
+
+
+def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["is_drill"] is False
+    (_, tags), = idx._test_ec2.tags_created
+    assert all(t["Key"] != "sf-watch-drill" for t in tags)
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--is-drill "false"' in cmd
