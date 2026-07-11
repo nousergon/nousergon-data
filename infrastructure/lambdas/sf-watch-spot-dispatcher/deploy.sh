@@ -7,10 +7,12 @@
 # runner for saturday-sf-failure, burning the org's metered Actions-minutes
 # budget — exactly the exposure config#2001 was filed to eliminate. This
 # Lambda moves it to EC2 spot, mirroring ci-watch-dispatcher's PROVEN pattern
-# byte-for-byte in shape: no Step Function, no EventBridge Scheduler rules —
-# invoked directly via a SYNCHRONOUS `lambda invoke` from a GHA job (built in
-# alpha-engine-config's sf-watch.yml, `sf-watch-dispatch` job) once per real
-# saturday-sf-failure event, not on a cron cadence.
+# byte-for-byte in shape: no Step Function — invoked directly via a
+# SYNCHRONOUS `lambda invoke` from a GHA job (built in alpha-engine-config's
+# sf-watch.yml, `sf-watch-dispatch` job) once per real saturday-sf-failure
+# event, not on a cron cadence. The ONE standing schedule is the weekly
+# canary drill (config#2223, step 2c below), which fires a synthetic
+# `is_drill` payload through the same pipe.
 #
 # IAM (iam-policy.json): the Lambda needs ec2:RunInstances + iam:PassRole
 # (scoped to alpha-engine-sf-watch-executor-role — a NEW, dedicated role
@@ -36,7 +38,7 @@
 #
 # Usage:
 #   bash .../sf-watch-spot-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
-#   bash .../sf-watch-spot-dispatcher/deploy.sh --bootstrap # operator-only: create/update the IAM role + Lambda function
+#   bash .../sf-watch-spot-dispatcher/deploy.sh --bootstrap # operator-only: create/update the IAM roles + Lambda function + weekly canary drill schedule (config#2223)
 #   bash .../sf-watch-spot-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../sf-watch-spot-dispatcher/deploy.sh --smoke     # invoke once with a synthetic event (fires a REAL spot box)
 
@@ -209,6 +211,56 @@ EOF
       --query 'FunctionArn' --output text
   else
     echo "  Lambda exists, code will be updated in step 3"
+  fi
+
+  # --- 2c. Weekly canary drill schedule (config#2223) ---
+  # Exercises the WHOLE dispatch pipe (Lambda IAM -> scoped RunInstances ->
+  # SSM -> bootstrap start) without a real SF failure. The box short-circuits
+  # before the agent and writes the _canary heartbeat the Fleet Status page
+  # escalates on when missed. Reuses the defer-scheduler role (created in 2a2
+  # above) — its policy is exactly "invoke THIS function", which is all the
+  # canary schedule needs; no new role. Idempotent create-or-update, mirrors
+  # sf-watch-liveness-probe/deploy.sh's scheduler style.
+  CANARY_SCHED_NAME="alpha-engine-sf-watch-canary-drill-weekly"
+  CANARY_CRON="cron(0 15 ? * WED *)"
+  FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+  # Static Input: run_date is deliberately ABSENT — the handler ALWAYS
+  # synthesizes a drill-scoped run_date (drill-YYYY-MM-DD) so no payload can
+  # carry a real run_date into a drill (see index.py DRILL_RUN_DATE_PREFIX).
+  # The execution_arn is synthetic but ARN-shaped (allowlist-valid); the
+  # drill never touches it.
+  CANARY_TARGET=$(python3 - <<PY
+import json
+payload = {
+    "is_drill": "true",
+    "pipeline_name": "ne-weekly-freshness-pipeline",
+    "cadence_slug": "saturday",
+    "execution_arn": "arn:aws:states:${REGION}:${ACCOUNT_ID}:execution:ne-weekly-freshness-pipeline:canary-drill",
+    "cause": "synthetic weekly canary drill of the dispatch pipe (config#2223) - not a real failure",
+}
+print(json.dumps({
+    "Arn": "${FN_ARN}",
+    "RoleArn": "${DEFER_ROLE_ARN}",
+    "Input": json.dumps(payload),
+}))
+PY
+)
+  if aws scheduler get-schedule --name "${CANARY_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
+    echo "  Updating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
+    run aws scheduler update-schedule --name "${CANARY_SCHED_NAME}" \
+      --schedule-expression "${CANARY_CRON}" --schedule-expression-timezone "UTC" \
+      --flexible-time-window '{"Mode":"OFF"}' --target "${CANARY_TARGET}" \
+      --region "${REGION}" --query 'ScheduleArn' --output text
+  else
+    echo "  Creating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
+    run aws scheduler create-schedule --name "${CANARY_SCHED_NAME}" \
+      --schedule-expression "${CANARY_CRON}" --schedule-expression-timezone "UTC" \
+      --flexible-time-window '{"Mode":"OFF"}' --target "${CANARY_TARGET}" \
+      --region "${REGION}" --query 'ScheduleArn' --output text
+  fi
+  if ! $DRY_RUN; then
+    aws scheduler get-schedule --name "${CANARY_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null \
+      || { echo "ERROR: Scheduler rule ${CANARY_SCHED_NAME} not found after create/update" >&2; exit 1; }
   fi
 fi
 

@@ -661,6 +661,33 @@ def _handle_reclaim_event(event: dict) -> dict:
     key_ctx = {"instance_id": instance_id, "cadence": cadence,
                "pipeline": pipeline, "run_date": run_date}
     marker_key = f"{COMPLETION_MARKER_PREFIX}{cadence}-{pipeline}-{run_date}.json"
+
+    # Canary-drill isolation (config#2223): a drill box's run_date tag is
+    # ALWAYS "drill-YYYY-MM-DD" (synthesized by sf-watch-spot-dispatcher —
+    # a real run_date is bare YYYY-MM-DD, so the two can never collide). A
+    # drill is not a repair: its death — clean OR mid-run — must NEVER
+    # consume the reclaim-relaunch budget, spend an on-demand relaunch, or
+    # page "unreconstructable dispatch fields" (a drill writes no watch-log
+    # at all, so that escalation would fire on every reclaimed drill). A
+    # drill that died before writing its completion marker surfaces through
+    # the DESIGNED canary channel instead: the missing
+    # consolidated/*/_canary/{date}.json heartbeat escalates the Fleet
+    # Status dot to YELLOW/RED (crucible-dashboard fleet_status.py).
+    if run_date.startswith("drill-"):
+        completed = _completion_marker_exists(marker_key)
+        if completed:
+            logger.info("reclaim check: drill box %s (%s/%s@%s) finished cleanly",
+                        instance_id, cadence, pipeline, run_date)
+        else:
+            logger.warning(
+                "reclaim check: drill box %s (%s/%s@%s) died WITHOUT a "
+                "completion marker — no relaunch/escalation for drills; the "
+                "missed _canary heartbeat is the alerting surface (config#2223)",
+                instance_id, cadence, pipeline, run_date,
+            )
+        return {**base, "watch_box": True, "drill": True,
+                "completed": completed, "relaunched": False}
+
     if _completion_marker_exists(marker_key):
         logger.info("reclaim check: %s finished cleanly (marker %s present)",
                     instance_id, marker_key)

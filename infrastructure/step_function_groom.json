@@ -140,6 +140,15 @@
                 "MaxAttempts": 10,
                 "IntervalSeconds": 10,
                 "BackoffRate": 1.5
+              },
+              {
+                "ErrorEquals": [
+                  "Ssm.SdkClientException",
+                  "States.Timeout"
+                ],
+                "MaxAttempts": 2,
+                "IntervalSeconds": 5,
+                "BackoffRate": 1.5
               }
             ],
             "Catch": [

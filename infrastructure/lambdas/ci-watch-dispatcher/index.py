@@ -62,11 +62,13 @@ until the new code + IAM are deployed AND a sibling agent's GHA workflow
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 
 import boto3
 from nousergon_lib import spot_dispatch
@@ -123,6 +125,34 @@ VOLUME_SIZE_GB = int(os.environ.get("CI_WATCH_VOLUME_SIZE_GB", "40"))
 CI_WATCH_TAG_NAME = "alpha-engine-ci-watch-spot"
 CI_WATCH_REPO_TAG_KEY = "ci-watch-repo"
 CI_WATCH_SHA_TAG_KEY = "ci-watch-sha"
+# Canary drill discriminator (config#2223): set on drill boxes ONLY. The tag
+# KEY is deliberately the same one sf-watch-spot-dispatcher uses
+# (sf-watch-drill) — one fleet-wide drill marker every consumer can filter
+# on, not a per-dispatcher variant.
+CI_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
+
+# ── Canary drill identity (config#2223) ──────────────────────────────────────
+# DRILL-vs-REAL ISOLATION INVARIANT: a drill's (repo, sha) lock key is ALWAYS
+# synthesized in code — never taken from the payload. DRILL_REPO is not a
+# real fleet repository: the only real caller of this Lambda is sf-watch.yml's
+# `ci-watch-dispatch` job relaying nousergon-lib's notify-ci-failure.yml
+# repository_dispatch, which always carries the actual `owner/repo` of a live
+# fleet repo — so the (repo, sha) concurrency lock and the completion-marker
+# key `ci_watch/_control/completed/{repo-with-slash-flattened}-{sha}.json`
+# (which therefore contains "drill-") can never collide with, dedupe-block,
+# or reclaim-confuse a real dispatch. The sha is a deterministic per-UTC-day
+# digest so a duplicate drill on the same day dedupes against itself only.
+# Pinned by test_drill_identity_can_never_collide_with_a_real_dispatch.
+DRILL_REPO = "nousergon/ci-watch-drill"
+DRILL_RUN_URL = "https://drill.invalid/ci-watch-canary"
+DRILL_WORKFLOW = "canary-drill"
+
+
+def _drill_sha(now: datetime) -> str:
+    """Deterministic per-UTC-day 40-hex drill sha (matches _SHA_RE)."""
+    return hashlib.sha256(
+        f"ci-watch-drill-{now:%Y-%m-%d}".encode("utf-8")
+    ).hexdigest()[:40]
 
 # Discriminator tag write (config#2267 site 2, same defect class as
 # sf-watch-spot-dispatcher's): the (repo, sha) tags are LOAD-BEARING —
@@ -161,6 +191,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _RUN_ID_RE = re.compile(r"^[0-9]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,200}$")
 _WORKFLOW_RE = re.compile(r"^[A-Za-z0-9 _./:()-]{1,200}$")
+_BOOL_RE = re.compile(r"^(true|false)$")
 
 
 class _InvalidEvent(ValueError):
@@ -174,10 +205,30 @@ def _require(event: dict, key: str, pattern: "re.Pattern[str]") -> str:
     return val
 
 
-def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str]:
+def _optional(event: dict, key: str, pattern: "re.Pattern[str]", default: str = "") -> str:
+    val = str(event.get(key) or "").strip()
+    if not val:
+        return default
+    if not pattern.match(val):
+        raise _InvalidEvent(f"malformed {key!r} in event: {val!r}")
+    return val
+
+
+def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str]:
     """Validate the GHA payload's CI fields; raises _InvalidEvent on any
     missing/malformed field (caught once, at the handler, and converted to a
-    clean launched:false — see module docstring's synchronous contract)."""
+    clean launched:false — see module docstring's synchronous contract).
+
+    is_drill (config#2223): "true" on the weekly synthetic canary drill the
+    EventBridge Scheduler rule fires (see deploy.sh --bootstrap). A drill's
+    ENTIRE identity is synthesized in code — repo/sha/run_id/run_url/
+    workflow/branch from the payload are IGNORED — so no payload can carry a
+    real (repo, sha) into a drill's lock/marker keys. See the DRILL_REPO
+    isolation invariant above."""
+    is_drill = _optional(event, "is_drill", _BOOL_RE, default="false")
+    if is_drill == "true":
+        return (DRILL_REPO, _drill_sha(datetime.now(timezone.utc)), "0",
+                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill)
     repo = _require(event, "repo", _REPO_RE)
     sha = _require(event, "sha", _SHA_RE)
     run_id = _require(event, "run_id", _RUN_ID_RE)
@@ -189,11 +240,12 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str]:
         # under `set -u` it could expand as a positional param (same gotcha
         # groom's run_url note documents) and abort the prelude.
         raise _InvalidEvent(f"missing/malformed 'run_url' in event: {run_url!r}")
-    return repo, sha, run_id, run_url, workflow, branch
+    return repo, sha, run_id, run_url, workflow, branch, is_drill
 
 
 def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
-                       workflow: str, branch: str, run_token: str) -> str:
+                       workflow: str, branch: str, run_token: str,
+                       is_drill: str = "false") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     ci_watch_spot_bootstrap.sh entrypoint (built by a sibling agent in
     alpha-engine-config). Any prelude failure shuts the box down so a botched
@@ -225,7 +277,8 @@ git clone --depth 1 --branch {CI_WATCH_CONFIG_BRANCH} \
 cd /home/ec2-user/alpha-engine-config
 exec bash infrastructure/ci_watch_spot_bootstrap.sh \
   --ci-repo "{repo}" --ci-sha "{sha}" --ci-run-id "{run_id}" \
-  --ci-run-url "{run_url}" --ci-workflow "{workflow}" --ci-branch "{branch}"
+  --ci-run-url "{run_url}" --ci-workflow "{workflow}" --ci-branch "{branch}" \
+  --is-drill "{is_drill}"
 """
 
 
@@ -254,11 +307,13 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 
 def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url: str,
-                    workflow: str, branch: str, run_token: str) -> str:
+                    workflow: str, branch: str, run_token: str,
+                    is_drill: str = "false") -> str:
     """Fire the async, detached SSM command that runs CI-watch + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
-        _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token),
+        _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token,
+                           is_drill=is_drill),
         comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -290,17 +345,21 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="ci-watch")
 
 
-def _create_discriminator_tags(instance_id: str, repo: str, sha: str) -> str | None:
+def _create_discriminator_tags(instance_id: str, repo: str, sha: str,
+                               is_drill: bool = False) -> str | None:
     """Write the load-bearing (repo, sha) discriminator tags (config#2267
     site 2) with a bounded retry. Returns None on success, or the final
     ``"ExcName: msg"`` string after TAG_WRITE_ATTEMPTS failures — the caller
     terminates the box and fails the dispatch (the tags are what make the
     box visible to the dedupe guard and the spot-orphan-reaper; an untagged
-    box must not run)."""
+    box must not run). A canary drill box (config#2223) additionally carries
+    ``sf-watch-drill=true`` so fleet consumers can tell it apart."""
     tags = [
         {"Key": CI_WATCH_REPO_TAG_KEY, "Value": repo},
         {"Key": CI_WATCH_SHA_TAG_KEY, "Value": sha},
     ]
+    if is_drill:
+        tags.append({"Key": CI_WATCH_DRILL_TAG_KEY, "Value": "true"})
     last_error = ""
     for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
         try:
@@ -320,7 +379,8 @@ def _create_discriminator_tags(instance_id: str, repo: str, sha: str) -> str | N
 
 
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
-                          workflow: str, branch: str) -> dict:
+                          workflow: str, branch: str,
+                          is_drill: str = "false") -> dict:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -374,7 +434,8 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
     # RunInstances chokepoint, growing an extra-tags parameter; until then
     # this retry+terminate closes the hole loudly.)
-    tag_error = _create_discriminator_tags(instance_id, repo, sha)
+    tag_error = _create_discriminator_tags(instance_id, repo, sha,
+                                           is_drill=is_drill == "true")
     if tag_error is not None:
         _terminate_instance(instance_id)
         logger.error(
@@ -393,7 +454,8 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     # error to unwrap).
     try:
         _wait_ssm_online(instance_id)
-        command_id = _send_bootstrap(instance_id, repo, sha, run_id, run_url, workflow, branch, run_token)
+        command_id = _send_bootstrap(instance_id, repo, sha, run_id, run_url,
+                                     workflow, branch, run_token, is_drill=is_drill)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false
         _terminate_instance(instance_id)
         logger.error("ci-watch post-launch step failed for %s: %s: %s",
@@ -418,6 +480,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
         "run_id": run_id,
         "run_token": run_token,
         "dedupe_degraded": dedupe_degraded,
+        "is_drill": is_drill == "true",
     }
     if dedupe_degraded:
         verdict["dedupe_probe_error"] = dedupe_probe_error
@@ -425,9 +488,18 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """Synchronous handler invoked once per real CI failure event — NOT on a
-    schedule. `event` carries {"repo", "sha", "run_id", "run_url", "workflow",
-    "branch"} from the GHA job's `lambda invoke` payload (RequestResponse).
+    """Synchronous handler invoked once per real CI failure event. `event`
+    carries {"repo", "sha", "run_id", "run_url", "workflow", "branch"} from
+    the GHA job's `lambda invoke` payload (RequestResponse).
+
+    CANARY DRILL (config#2223): the ONE scheduled caller is the weekly
+    EventBridge Scheduler rule (`alpha-engine-ci-watch-canary-drill-weekly`,
+    created by deploy.sh --bootstrap) invoking with `{"is_drill": "true"}`.
+    The dispatch pipe runs FOR REAL (spot launch, SSM, bootstrap start) but
+    the box short-circuits before the agent (alpha-engine-config's
+    ci_watch_run.sh drill guard), writes the
+    `consolidated/ci_watch/_canary/{date}.json` heartbeat, and
+    self-terminates. Drill isolation: see DRILL_REPO.
 
     Returns {"launched": bool, "reason": str, "instance_id": ..., ...} —
     read DIRECTLY by the GHA job as its success signal. Every anticipated
@@ -437,13 +509,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     try:
-        repo, sha, run_id, run_url, workflow, branch = _resolve_event_fields(event)
+        repo, sha, run_id, run_url, workflow, branch, is_drill = _resolve_event_fields(event)
     except _InvalidEvent as exc:
         logger.error("invalid ci-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
 
     logger.info(
-        "ci-watch trigger: repo=%s sha=%s run_id=%s workflow=%s branch=%s",
-        repo, sha, run_id, workflow, branch,
+        "ci-watch trigger: repo=%s sha=%s run_id=%s workflow=%s branch=%s is_drill=%s",
+        repo, sha, run_id, workflow, branch, is_drill,
     )
-    return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch)
+    return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch,
+                                 is_drill=is_drill)
