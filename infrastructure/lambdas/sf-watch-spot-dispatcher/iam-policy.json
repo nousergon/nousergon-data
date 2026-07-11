@@ -54,6 +54,36 @@
           "ec2:ResourceTag/Name": "alpha-engine-sf-watch-spot"
         }
       }
+    },
+    {
+      "Sid": "DeferNotDropOneShotSchedules",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:CreateSchedule",
+        "scheduler:GetSchedule"
+      ],
+      "Resource": "arn:aws:scheduler:*:*:schedule/default/sf-watch-defer-*"
+    },
+    {
+      "Sid": "PassDeferSchedulerRoleToScheduler",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-sf-watch-defer-scheduler-role",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "scheduler.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DeferReevaluationListExecutions",
+      "Effect": "Allow",
+      "Action": "states:ListExecutions",
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
     }
   ]
 }

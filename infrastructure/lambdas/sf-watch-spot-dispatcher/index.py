@@ -35,6 +35,20 @@ own use of its full (repo, sha) key, not a partial one): two different
 run_dates failing independently for the same pipeline+cadence must each get
 their own box. Fail-safe OPEN on any API error.
 
+DEFER, NOT DROP (config#2226): when the lock finds a live box for the SAME
+key, the second failure is NOT dropped — the live box has no obligation to
+notice it (2026-07-11: a concurrent_skip left ne-weekly-freshness-pipeline
+FAILED with zero watch coverage). Instead the dispatcher creates a ONE-SHOT
+EventBridge Scheduler schedule (`ActionAfterCompletion=DELETE`) that
+re-invokes this same Lambda ~10 minutes later with the original payload plus
+`defer_generation` (capped at 3 — exhaustion returns `defer_exhausted`,
+which the GHA caller treats as launched!=true and files a P1). A deferred
+invocation (`defer_generation` >= 1) first RE-EVALUATES via
+`states:ListExecutions`: if the newest execution is RUNNING/SUCCEEDED the
+live box (or an operator) recovered the pipeline → `recovered`, no launch;
+if it is FAILED/TIMED_OUT/ABORTED the dispatch proceeds against that NEWEST
+failed execution's ARN (the original one may be stale by then).
+
 CAUSE FIELD IS BASE64: `cause` (the SF failure detail) is arbitrary AWS-
 supplied text, unlike every other event field here — it is NOT regex-
 validated and is base64-encoded before being embedded in the constructed SSM
@@ -56,11 +70,14 @@ has ZERO live effect until the new code + IAM are deployed AND
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import os
 import re
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from nousergon_lib import spot_dispatch
@@ -125,6 +142,36 @@ SF_WATCH_CONFIG_BRANCH = os.environ.get("SF_WATCH_CONFIG_BRANCH", "main")
 MAX_RUNTIME_SECONDS = int(os.environ.get("SF_WATCH_MAX_RUNTIME_SECONDS", "19200"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("SF_WATCH_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("SF_WATCH_CW_LOG_GROUP", "/alpha-engine/sf-watch-spot")
+
+# ── Defer-not-drop config (config#2226) ──────────────────────────────────────
+# How far out the one-shot re-invoke schedule fires, and the generation cap
+# beyond which we stop deferring and fail LOUD (`defer_exhausted` — the GHA
+# caller files a P1 on any unexpected launched!=true reason).
+DEFER_DELAY_SECONDS = int(os.environ.get("SF_WATCH_DEFER_DELAY_SECONDS", "600"))
+DEFER_MAX_GENERATION = int(os.environ.get("SF_WATCH_DEFER_MAX_GENERATION", "3"))
+# Role EventBridge Scheduler assumes to invoke this Lambda. Set by deploy.sh
+# --bootstrap; when unset, constructed at call time from the account id parsed
+# out of context.invoked_function_arn (see _defer_relaunch).
+DEFER_ROLE_ARN = os.environ.get("SF_WATCH_DEFER_ROLE_ARN", "")
+DEFER_ROLE_NAME = "alpha-engine-sf-watch-defer-scheduler-role"
+DEFER_SCHEDULE_GROUP = os.environ.get("SF_WATCH_DEFER_SCHEDULE_GROUP", "default")
+
+# Operator-refire fallback (config#2226): the canonical watch_log_key is
+# minted ONLY by saturday-sf-watch-dispatcher's `_artifact_key(watch_prefix,
+# run_date)`. When an operator re-fires this Lambda by hand with an EMPTY
+# watch_log_key, synthesize `{prefix}/{run_date}.json` from this mirror of
+# that dispatcher's PIPELINES watch_prefix column. LOCKSTEP-GUARDED:
+# tests/test_sf_watch_defer_prefix_lockstep.py fails CI if this dict drifts
+# from saturday-sf-watch-dispatcher/index.py's PIPELINES.
+_WATCH_PREFIXES = {
+    "ne-weekly-freshness-pipeline": "consolidated/saturday_sf_watch",
+    "ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch",
+    "ne-postclose-trading-pipeline": "consolidated/eod_sf_watch",
+    # TRANSITIONAL old EOD SF name — mirrors the same entry in
+    # saturday-sf-watch-dispatcher's PIPELINES (remove together at the
+    # config#1408 SF-rename cutover; the lockstep test enforces "together").
+    "alpha-engine-eod-pipeline": "consolidated/eod_sf_watch",
+}
 
 # Defense-in-depth allowlists for event fields embedded verbatim into the SSM
 # shell command below (mirrors ci-watch-dispatcher's _REPO_RE/_SHA_RE/etc).
@@ -295,7 +342,219 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="sf-watch")
 
 
-def _launch_sf_watch_spot(fields: dict) -> dict:
+def _defer_schedule_name(
+    cadence_slug: str, pipeline_name: str, run_date: str, generation: int
+) -> str:
+    """Deterministic one-shot schedule name for (key, generation) — the
+    determinism IS the idempotency lock: a duplicate defer attempt for the
+    same key+generation hits ConflictException and is treated as
+    already-deferred. EventBridge Scheduler caps Name at 64 chars; the
+    readable form overflows for ne-weekly-freshness-pipeline (66 chars), so
+    anything over the cap degrades to an equally-deterministic sha256 digest
+    of the key. BOTH forms keep the `sf-watch-defer-` prefix the IAM policy
+    scopes on (`schedule/default/sf-watch-defer-*`)."""
+    name = f"sf-watch-defer-{cadence_slug}-{pipeline_name}-{run_date}-g{generation}"
+    if len(name) <= 64:
+        return name
+    digest = hashlib.sha256(
+        f"{cadence_slug}|{pipeline_name}|{run_date}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"sf-watch-defer-{digest}-g{generation}"
+
+
+def _is_scheduler_conflict(exc: Exception) -> bool:
+    """True when the Scheduler API says the schedule already exists — matched
+    by exception class name AND botocore error code (covers both the real
+    boto3 ConflictException class and a generic ClientError carrying it)."""
+    if type(exc).__name__ == "ConflictException":
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return response.get("Error", {}).get("Code") == "ConflictException"
+    return False
+
+
+def _defer_relaunch(fields: dict, generation: int, context, existing: list[str]) -> dict:
+    """A live box holds the (cadence, pipeline, run_date) lock — DEFER this
+    dispatch instead of dropping it (config#2226): schedule a one-shot
+    EventBridge Scheduler re-invoke of this same Lambda in
+    DEFER_DELAY_SECONDS carrying the original payload + defer_generation.
+    Every failure mode returns a clean launched:false (synchronous contract),
+    but exhaustion and scheduling failures log ERROR so the drop is LOUD."""
+    if generation >= DEFER_MAX_GENERATION:
+        logger.error(
+            "sf-watch defer EXHAUSTED at generation %d for %s/%s@%s — a live box "
+            "(%s) still holds the lock and this failure will NOT be retried; the "
+            "synchronous caller must escalate (P1)",
+            generation, fields["cadence_slug"], fields["pipeline_name"],
+            fields["run_date"], existing,
+        )
+        return {"launched": False, "reason": "defer_exhausted",
+                "defer_generation": generation, "existing_instance_ids": existing}
+
+    next_generation = generation + 1
+    schedule_name = _defer_schedule_name(
+        fields["cadence_slug"], fields["pipeline_name"], fields["run_date"], next_generation
+    )
+
+    function_arn = str(getattr(context, "invoked_function_arn", "") or "")
+    if not function_arn:
+        logger.error(
+            "sf-watch defer FAILED for %s/%s@%s: no invoked_function_arn on the "
+            "Lambda context — cannot self-target the deferred re-invoke",
+            fields["cadence_slug"], fields["pipeline_name"], fields["run_date"],
+        )
+        return {"launched": False, "reason": "defer_schedule_failed",
+                "error": "no invoked_function_arn on context"}
+    # arn:aws:lambda:region:acct:function:name[:qualifier] — target the
+    # UNQUALIFIED function so the deferred invoke always runs the live code.
+    target_arn = ":".join(function_arn.split(":")[:7])
+    role_arn = DEFER_ROLE_ARN or (
+        f"arn:aws:iam::{function_arn.split(':')[4]}:role/{DEFER_ROLE_NAME}"
+    )
+
+    payload = {k: fields[k] for k in (
+        "pipeline_name", "cadence_slug", "run_date", "execution_arn",
+        "state_machine_arn", "failed_state", "watch_log_key", "is_preflight",
+        "cause",
+    )}
+    payload["defer_generation"] = next_generation
+    fire_at = datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECONDS)
+
+    try:
+        boto3.client("scheduler", region_name=REGION).create_schedule(
+            Name=schedule_name,
+            GroupName=DEFER_SCHEDULE_GROUP,
+            # at() with no ScheduleExpressionTimezone is UTC — matches fire_at.
+            ScheduleExpression=f"at({fire_at.strftime('%Y-%m-%dT%H:%M:%S')})",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            ActionAfterCompletion="DELETE",  # one-shot: self-deletes after firing
+            Description=(
+                f"sf-watch defer-not-drop re-invoke (config#2226): "
+                f"{fields['cadence_slug']}/{fields['pipeline_name']}@"
+                f"{fields['run_date']} generation {next_generation}"
+            ),
+            Target={
+                "Arn": target_arn,
+                "RoleArn": role_arn,
+                "Input": json.dumps(payload),
+                # Bounded retry: the re-invoke is a re-CHECK, not the repair
+                # itself — a next-generation defer covers a missed window.
+                "RetryPolicy": {
+                    "MaximumRetryAttempts": 3,
+                    "MaximumEventAgeInSeconds": 3600,
+                },
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — synchronous contract: clean JSON verdict, never raise
+        if _is_scheduler_conflict(exc):
+            # Already-deferred swallow: a duplicate defer attempt for the same
+            # (key, generation) — the earlier schedule already covers this
+            # failure; recorded via this INFO log + the returned verdict.
+            logger.info(
+                "sf-watch defer schedule %s already exists — treating as "
+                "already-deferred", schedule_name,
+            )
+            return {"launched": False, "reason": "deferred",
+                    "defer_generation": next_generation,
+                    "schedule_name": schedule_name, "already_scheduled": True}
+        logger.error(
+            "sf-watch defer schedule creation FAILED for %s (%s: %s) — this "
+            "failure will NOT be retried; the synchronous caller must escalate",
+            schedule_name, type(exc).__name__, exc,
+        )
+        return {"launched": False, "reason": "defer_schedule_failed",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+    logger.warning(
+        "sf-watch box already live for %s/%s@%s (%s) — DEFERRED (not dropped): "
+        "schedule %s re-invokes at %sZ (generation %d)",
+        fields["cadence_slug"], fields["pipeline_name"], fields["run_date"],
+        existing, schedule_name, fire_at.strftime("%Y-%m-%dT%H:%M:%S"), next_generation,
+    )
+    return {"launched": False, "reason": "deferred",
+            "defer_generation": next_generation, "schedule_name": schedule_name,
+            "existing_instance_ids": existing}
+
+
+def _state_machine_arn_from_execution(execution_arn: str) -> str:
+    """Derive the stateMachine ARN from an execution ARN:
+    arn:aws:states:R:A:execution:SM:NAME -> arn:aws:states:R:A:stateMachine:SM
+    (drop the trailing :NAME segment, swap the resource type)."""
+    without_name = execution_arn.rpartition(":")[0]
+    return without_name.replace(":execution:", ":stateMachine:", 1)
+
+
+def _reevaluate_after_defer(fields: dict) -> dict | None:
+    """On a DEFERRED invocation (defer_generation >= 1), re-check the state
+    machine before dispatching: the live box that forced the defer may have
+    recovered the pipeline meanwhile. Returns a terminal verdict dict
+    (`recovered`) to short-circuit the dispatch, or None to proceed — in the
+    proceed case, `fields["execution_arn"]` is retargeted at the NEWEST
+    failed execution (the originally-reported one may be stale by now).
+    Fail-safe toward LAUNCHING on any States API error (mirrors the
+    concurrency check's posture: a broken check never blocks a repair)."""
+    state_machine_arn = fields["state_machine_arn"] or _state_machine_arn_from_execution(
+        fields["execution_arn"]
+    )
+    try:
+        response = boto3.client("stepfunctions", region_name=REGION).list_executions(
+            stateMachineArn=state_machine_arn, maxResults=5
+        )
+        executions = response.get("executions") or []
+    except Exception as exc:  # noqa: BLE001 — fail-safe: a broken re-check must not block the repair dispatch (logged here)
+        logger.warning(
+            "deferred re-evaluation ListExecutions failed for %s (non-fatal, "
+            "dispatching anyway): %s: %s", state_machine_arn, type(exc).__name__, exc,
+        )
+        return None
+    if not executions:
+        # Zero executions on a machine we KNOW failed is a States-API anomaly,
+        # not a recovery signal — fail-safe toward launching (logged here).
+        logger.warning(
+            "deferred re-evaluation found NO executions for %s — dispatching "
+            "against the original execution_arn", state_machine_arn,
+        )
+        return None
+
+    latest = executions[0]  # ListExecutions returns newest-first
+    status = str(latest.get("status") or "")
+    if status in ("RUNNING", "SUCCEEDED", "PENDING_REDRIVE"):
+        # RUNNING/SUCCEEDED: the live box (or an operator) already recovered
+        # the pipeline. PENDING_REDRIVE: a redrive is in flight — launching a
+        # repair box now would duplicate it.
+        logger.info(
+            "deferred re-evaluation: latest execution %s is %s — recovered, "
+            "no dispatch needed", latest.get("executionArn"), status,
+        )
+        return {"launched": False, "reason": "recovered",
+                "latest_execution_arn": latest.get("executionArn"),
+                "latest_status": status}
+
+    # FAILED / TIMED_OUT / ABORTED — still broken; retarget the dispatch at
+    # the NEWEST failed execution so the repair agent diagnoses the current
+    # failure, not a stale one. The ARN comes from AWS but is embedded into a
+    # shell command downstream — hold it to the same allowlist as the event's.
+    newest_arn = str(latest.get("executionArn") or "")
+    if _ARN_RE.match(newest_arn):
+        if newest_arn != fields["execution_arn"]:
+            logger.info(
+                "deferred re-evaluation: retargeting dispatch from %s to newest "
+                "%s execution %s", fields["execution_arn"], status, newest_arn,
+            )
+            fields["execution_arn"] = newest_arn
+    else:
+        # Malformed-ARN swallow: keep the original validated execution_arn
+        # rather than embedding an unvalidated string into the SSM shell
+        # command; recorded via this WARNING log.
+        logger.warning(
+            "deferred re-evaluation: newest execution ARN %r fails the ARN "
+            "allowlist — keeping the original execution_arn", newest_arn,
+        )
+    return None
+
+
+def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0) -> dict:
     """Launch + bootstrap the SF-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -308,11 +567,10 @@ def _launch_sf_watch_spot(fields: dict) -> dict:
     )
     existing = _running_sf_watch_instance_ids(cadence_slug, pipeline_name, run_date)
     if existing:
-        logger.warning(
-            "sf-watch box already live for %s/%s@%s (%s) — skipping launch to "
-            "avoid a concurrent duplicate run", cadence_slug, pipeline_name, run_date, existing)
-        return {"launched": False, "reason": "concurrent_skip",
-                "existing_instance_ids": existing}
+        # DEFER, NOT DROP (config#2226): the live box has no obligation to
+        # notice THIS failure — schedule a one-shot re-invoke instead of
+        # silently dropping it (see module docstring).
+        return _defer_relaunch(fields, defer_generation, context, existing)
 
     run_token = uuid.uuid4().hex
     try:
@@ -372,18 +630,21 @@ def _launch_sf_watch_spot(fields: dict) -> dict:
     }
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict, context) -> dict:
     """Synchronous handler invoked once per real saturday-sf-failure event —
-    NOT on a schedule. `event` carries {"pipeline_name", "cadence_slug",
+    NOT on a cron schedule. `event` carries {"pipeline_name", "cadence_slug",
     "state_machine_arn", "execution_arn", "run_date", "failed_state", "cause",
     "watch_log_key", "is_preflight"} from the GHA job's `lambda invoke`
-    payload (RequestResponse).
+    payload (RequestResponse). A DEFERRED re-invoke (config#2226 — fired by
+    the one-shot EventBridge Scheduler schedule this handler created on a
+    concurrency skip) carries the same payload plus `defer_generation` >= 1
+    and first re-evaluates the state machine before dispatching.
 
     Returns {"launched": bool, "reason": str, "instance_id": ..., ...} — read
     DIRECTLY by the GHA job as its success signal. Every anticipated failure
-    (malformed event, concurrency skip, spot+on-demand launch exhaustion,
-    post-launch SSM failure) is a clean return, never an exception — see
-    module docstring's synchronous contract.
+    (malformed event, defer-scheduling failure, defer exhaustion,
+    spot+on-demand launch exhaustion, post-launch SSM failure) is a clean
+    return, never an exception — see module docstring's synchronous contract.
     """
     event = event or {}
     try:
@@ -392,9 +653,42 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         logger.error("invalid sf-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
 
+    try:
+        defer_generation = int(str(event.get("defer_generation") or 0))
+        if defer_generation < 0:
+            raise ValueError(defer_generation)
+    except ValueError:
+        logger.error("invalid sf-watch event: malformed defer_generation %r",
+                     event.get("defer_generation"))
+        return {"launched": False, "reason": "invalid_event",
+                "error": f"malformed defer_generation: {event.get('defer_generation')!r}"}
+
+    if not fields["watch_log_key"]:
+        # Operator-refire fallback (config#2226): synthesize the canonical
+        # per-pipeline key exactly as saturday-sf-watch-dispatcher's
+        # _artifact_key mints it (lockstep-guarded — see _WATCH_PREFIXES).
+        prefix = _WATCH_PREFIXES.get(fields["pipeline_name"])
+        if prefix:
+            fields["watch_log_key"] = f"{prefix}/{fields['run_date']}.json"
+            logger.info("empty watch_log_key — synthesized %s", fields["watch_log_key"])
+        else:
+            # Unknown-pipeline swallow: watch_log_key is OPTIONAL in the box's
+            # contract (the bootstrap tolerates an empty flag), so an
+            # unregistered pipeline proceeds without one; recorded via this
+            # WARNING log.
+            logger.warning(
+                "empty watch_log_key and pipeline %r has no registered watch "
+                "prefix — dispatching without one", fields["pipeline_name"],
+            )
+
     logger.info(
-        "sf-watch trigger: pipeline=%s cadence=%s run_date=%s execution_arn=%s",
+        "sf-watch trigger: pipeline=%s cadence=%s run_date=%s execution_arn=%s "
+        "defer_generation=%d",
         fields["pipeline_name"], fields["cadence_slug"], fields["run_date"],
-        fields["execution_arn"],
+        fields["execution_arn"], defer_generation,
     )
-    return _launch_sf_watch_spot(fields)
+    if defer_generation >= 1:
+        verdict = _reevaluate_after_defer(fields)
+        if verdict is not None:
+            return verdict
+    return _launch_sf_watch_spot(fields, context, defer_generation)

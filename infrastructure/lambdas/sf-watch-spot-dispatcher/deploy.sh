@@ -19,6 +19,13 @@
 # ssm:SendCommand. The BOX reads its own run secrets (PAT) via ITS instance
 # profile, so this Lambda needs no secret access of its own.
 #
+# DEFER-NOT-DROP (config#2226): the Lambda additionally needs
+# scheduler:CreateSchedule/GetSchedule (scoped to schedule/default/
+# sf-watch-defer-*), iam:PassRole on alpha-engine-sf-watch-defer-scheduler-
+# role (the role EventBridge Scheduler assumes to re-invoke this Lambda —
+# created below in --bootstrap), and states:ListExecutions on the three ne-*
+# pipeline state machines for the deferred-invocation re-evaluation.
+#
 # Managed OUTSIDE CloudFormation (same rationale as the sibling dispatchers):
 # keeps the github-actions-lambda-deploy OIDC role's blast radius narrow — it
 # deliberately lacks iam:CreateRole/iam:PutRolePolicy (fleet-wide policy after
@@ -39,8 +46,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUNCTION_NAME="alpha-engine-sf-watch-spot-dispatcher"
 ROLE_NAME="alpha-engine-sf-watch-spot-dispatcher-role"
 POLICY_NAME="alpha-engine-sf-watch-spot-dispatcher-policy"
+# Role EventBridge Scheduler assumes to fire the one-shot defer-not-drop
+# re-invokes of this Lambda (config#2226). Created in --bootstrap only.
+DEFER_ROLE_NAME="alpha-engine-sf-watch-defer-scheduler-role"
+DEFER_POLICY_NAME="alpha-engine-sf-watch-defer-scheduler-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
+DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
+LAMBDA_ENV="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true,SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
 
 DRY_RUN=false
 BOOTSTRAP=false
@@ -127,6 +140,33 @@ if $BOOTSTRAP; then
     --policy-name "${POLICY_NAME}" \
     --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
 
+  # --- 2a2. EventBridge Scheduler invoke role (defer-not-drop, config#2226) ---
+  # Assumed by scheduler.amazonaws.com to fire the one-shot deferred
+  # re-invokes; may ONLY invoke THIS function.
+  DEFER_TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${DEFER_ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  Creating IAM role: ${DEFER_ROLE_NAME}"
+    run aws iam create-role \
+      --role-name "${DEFER_ROLE_NAME}" \
+      --assume-role-policy-document "${DEFER_TRUST_POLICY}" \
+      --query 'Role.RoleName' --output text
+  else
+    echo "  IAM role exists: ${DEFER_ROLE_NAME}"
+  fi
+
+  echo "  Applying inline policy: ${DEFER_POLICY_NAME}"
+  # Both the unqualified function ARN and :* (version/alias-qualified) — the
+  # schedule targets the unqualified ARN, but keep qualified invokes working
+  # if an alias is ever introduced.
+  DEFER_INVOKE_POLICY=$(cat <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":["arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}","arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}:*"]}]}
+EOF
+)
+  run aws iam put-role-policy \
+    --role-name "${DEFER_ROLE_NAME}" \
+    --policy-name "${DEFER_POLICY_NAME}" \
+    --policy-document "${DEFER_INVOKE_POLICY}"
+
   if ! $DRY_RUN; then
     echo "  Waiting 10s for IAM role propagation..."
     sleep 10
@@ -144,7 +184,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true}' \
+      --environment "${LAMBDA_ENV}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -172,7 +212,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true}' \
+  --environment "${LAMBDA_ENV}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then
