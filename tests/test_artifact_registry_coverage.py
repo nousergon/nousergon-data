@@ -91,7 +91,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # a consumer exists, so grandfathered out of ARTIFACT_REGISTRY.yaml (see
     # alpha-engine-config private-docs/ARTIFACT_REGISTRY.yaml grandfathered_paths)
     # rather than registered with a speculative cadence/SLA.
-    "collectors/constituents.py": 3,
+    #
+    # 4th PUT site (config#934): data/sub_sector_etf_map.json +
+    # reference/price_cache/sub_sector_etf_map.json — ticker → sub-sector
+    # benchmark ETF (defaulting to the sector ETF), consumed by
+    # feature_engineer's sub_sector_vs_benchmark_* features. Same dual-path
+    # loop as the two maps above (1 new put_object call site, textually). The
+    # two new S3 paths still need an ARTIFACT_REGISTRY.yaml grandfather —
+    # companion config PR, same as config#2020 did for sub_industry_map.
+    "collectors/constituents.py": 4,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering

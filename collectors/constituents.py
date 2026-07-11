@@ -50,6 +50,35 @@ GICS_TO_ETF: dict[str, str] = {
     "Materials": "XLB",
 }
 
+# GICS sub-industry name → sub-sector benchmark ETF symbol (config#934).
+#
+# INTENTIONALLY PARTIAL + EXTENSIBLE. This map only covers the well-known,
+# liquid sub-industry ETF proxies where a sub-sector benchmark meaningfully
+# differs from the parent GICS-sector ETF (e.g. Semiconductors → SMH is a
+# far tighter benchmark for NVDA than the whole-Tech XLK). Any sub-industry
+# NOT listed here falls back to the ticker's existing GICS-sector ETF (see
+# _build_sub_sector_etf_map below), so the downstream sub-sector-relative
+# feature is ALWAYS defined and, for an unmapped sub-industry, gracefully
+# equals the sector-relative value. Add rows here (with a liquid ETF proxy)
+# to make a sub-industry benchmark-distinct — no other code change needed.
+#
+# Keys must be the EXACT GICS sub-industry spellings that appear in the
+# Wikipedia "GICS Sub-Industry" column captured by _fetch_constituents
+# (which stores them verbatim into sub_industry_map). Getting a spelling
+# wrong just means that sub-industry silently falls back to its sector ETF.
+GICS_SUBINDUSTRY_TO_ETF: dict[str, str] = {
+    "Semiconductors": "SMH",
+    "Semiconductor Materials & Equipment": "SMH",
+    "Application Software": "IGV",
+    "Systems Software": "IGV",
+    "Biotechnology": "XBI",
+    "Pharmaceuticals": "PPH",
+    "Oil & Gas Exploration & Production": "XOP",
+    "Regional Banks": "KRE",
+    "Aerospace & Defense": "ITA",
+    "Gold": "GDX",
+}
+
 _CACHE_PATH = Path(__file__).parent.parent / "data" / "constituents_cache.csv"
 
 _URLS = {
@@ -93,12 +122,22 @@ def collect(
     # so a partial or empty sub_industry_map must not block the weekly
     # constituents write the way a missing sector would.
 
+    # sub_sector_etf_map (config#934 forward step): ticker → sub-sector
+    # benchmark ETF, defaulting to the ticker's sector ETF where the
+    # sub-industry has no liquid proxy. Additive/best-effort like
+    # sub_industry_map — derived purely from the two maps above, so it
+    # cannot fail independently and never blocks the write.
+    sub_sector_etf_map = _build_sub_sector_etf_map(
+        tickers, sector_etf_map, sub_industry_map
+    )
+
     result = {
         "date": run_date,
         "tickers": tickers,
         "sector_map": sector_map,
         "sector_etf_map": sector_etf_map,
         "sub_industry_map": sub_industry_map,
+        "sub_sector_etf_map": sub_sector_etf_map,
         "sp500_count": sp500_count,
         "sp400_count": sp400_count,
         "total_count": len(tickers),
@@ -162,6 +201,28 @@ def collect(
         )
     logger.info(
         "Wrote sub_industry_map.json to data/ and reference/ paths",
+    )
+
+    # Write sub_sector_etf_map.json (config#934 forward step) — same
+    # dual-path convention as sector_map.json / sub_industry_map.json above.
+    # This IS consumed downstream (features/feature_engineer's
+    # sub_sector_vs_benchmark_* + builders/daily_append), unlike the raw
+    # sub_industry_map. Additive: written non-blocking (an empty map on a
+    # Wikipedia layout drift degrades the sub-sector features to their
+    # neutral default rather than failing the weekly write). The two new S3
+    # paths need an ARTIFACT_REGISTRY.yaml grandfather (companion config PR,
+    # same as config#2020 did for sub_industry_map).
+    sub_sector_etf_map_body = json.dumps(sub_sector_etf_map, indent=2, sort_keys=True)
+    for sub_sector_etf_map_key in (
+        "data/sub_sector_etf_map.json",
+        "reference/price_cache/sub_sector_etf_map.json",
+    ):
+        s3.put_object(
+            Bucket=bucket, Key=sub_sector_etf_map_key,
+            Body=sub_sector_etf_map_body, ContentType="application/json",
+        )
+    logger.info(
+        "Wrote sub_sector_etf_map.json to data/ and reference/ paths",
     )
 
     # tickers is included in the return so callers don't need an S3 round-trip
@@ -371,6 +432,36 @@ def _load_from_cache() -> tuple[
         len(tickers), len(sector_map), len(sector_etf_map), len(sub_industry_map),
     )
     return tickers, sector_map, sector_etf_map, sub_industry_map, 0, 0
+
+
+def _build_sub_sector_etf_map(
+    tickers: list[str],
+    sector_etf_map: dict[str, str],
+    sub_industry_map: dict[str, str],
+) -> dict[str, str]:
+    """Build {ticker: sub-sector ETF symbol} (config#934).
+
+    For each ticker, pick a sub-sector benchmark ETF from its GICS
+    sub-industry via ``GICS_SUBINDUSTRY_TO_ETF``. When the sub-industry
+    has no liquid ETF proxy (unmapped, or the ticker has no sub-industry
+    captured at all), FALL BACK to the ticker's existing sector ETF from
+    ``sector_etf_map`` — so the map is always defined for any ticker that
+    has a sector ETF, and an unmapped sub-industry gracefully resolves to
+    the same benchmark the sector-relative feature already uses.
+
+    Best-effort/additive, mirroring ``sub_industry_map``: a ticker with no
+    sector ETF (rare — sector coverage is a hard gate in ``collect``) and
+    no sub-industry proxy is simply omitted rather than raising.
+    """
+    sub_sector_etf_map: dict[str, str] = {}
+    for ticker in tickers:
+        sub_industry = sub_industry_map.get(ticker)
+        etf = GICS_SUBINDUSTRY_TO_ETF.get(sub_industry) if sub_industry else None
+        if not etf:
+            etf = sector_etf_map.get(ticker)
+        if etf:
+            sub_sector_etf_map[ticker] = etf
+    return sub_sector_etf_map
 
 
 def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:

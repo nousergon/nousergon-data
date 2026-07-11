@@ -43,6 +43,7 @@ from features.compute import (
     _UNIVERSE_EXTRA,
     _is_sector_etf,
     _load_sector_map,
+    _load_sub_sector_etf_map,
     _load_cached_fundamentals,
     _load_cached_alternative,
 )
@@ -1157,6 +1158,19 @@ def _daily_append_impl(
 
     # ── 2. Load supporting data ──────────────────────────────────────────────
     sector_map = _load_sector_map(s3, bucket)
+    # sub_sector_etf_map (config#934): ticker → sub-sector benchmark ETF
+    # (SMH/IGV/…), defaulting to the sector ETF for sub-industries with no
+    # liquid proxy. Best-effort: an empty map (file not yet written by the
+    # weekly collector) degrades sub_sector_vs_benchmark_* to neutral 0.0.
+    sub_sector_etf_map = _load_sub_sector_etf_map(s3, bucket)
+    # The distinct NON-sector sub-sector ETF symbols this run must keep fresh
+    # in ArcticDB (the XL* sector ETFs are already handled by the sector-ETF
+    # write/read loops). Derived from the map's values so the fetched symbol
+    # universe tracks whatever GICS_SUBINDUSTRY_TO_ETF currently maps — no
+    # separate hard-coded list to drift out of sync.
+    sub_sector_etf_symbols = sorted(
+        {sym for sym in sub_sector_etf_map.values() if sym and not _is_sector_etf(sym)}
+    )
     fundamentals = _load_cached_fundamentals(s3, bucket, date_str)
     alt_data = _load_cached_alternative(s3, bucket)
 
@@ -1270,6 +1284,41 @@ def _daily_append_impl(
                 raise RuntimeError(
                     f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
                 ) from exc
+
+        # Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/… . Unlike the
+        # XL* sector ETFs above (load-bearing for sector_vs_spy_* on every
+        # stock, hence hard-fail), these are ADDITIVE/best-effort: a missing
+        # bar degrades one feature family (sub_sector_vs_benchmark_*) to its
+        # neutral default for the affected stocks rather than failing the run,
+        # matching feature_engineer's None-input neutral-0.0 fallback and the
+        # HYOAS-style optional-input philosophy. Not added to
+        # macro_missing_from_closes (which drives the mandatory hard-fail).
+        for sym in sub_sector_etf_symbols:
+            bar = closes.get(sym)
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                log.warning(
+                    "Sub-sector ETF %s missing from daily closes for %s — "
+                    "sub_sector_vs_benchmark_* will neutral-default for its "
+                    "stocks (non-fatal, additive feature).",
+                    sym, date_str,
+                )
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                    mode = _write_row_backfill_safe(macro_lib, sym, new_row)
+                sector_updated.append(sym)
+                macro_write_modes[sym] = mode
+            except Exception as exc:
+                log.warning(
+                    "Sub-sector ETF %s bar write failed for %s (non-fatal — "
+                    "sub_sector_vs_benchmark_* will neutral-default): %s",
+                    sym, date_str, exc,
+                )
 
         # HYOAS (config#939, credit spreads) — best-effort, NOT added to
         # `macro_keys` above. Unlike SPY/VIX/TNX/etc. (battle-tested,
@@ -1515,6 +1564,39 @@ def _daily_append_impl(
                     # loop above; same non-monotonic-on-holiday-backfill hazard.
                     series = series[~series.index.duplicated(keep="last")].sort_index()
                 macro[sym] = series
+
+        # Sub-sector benchmark ETFs (config#934) — best-effort read, mirroring
+        # the best-effort write above. NOT a hard-fail loop like the XL*
+        # sector ETFs: a symbol absent from ArcticDB (never populated yet, or
+        # unreadable) simply leaves macro[sym] unset, and the downstream
+        # `sub_sector_etf_series = macro.get(sym)` resolves to None →
+        # sub_sector_vs_benchmark_* neutral-defaults for the affected stocks.
+        for sym in sub_sector_etf_symbols:
+            if sym in macro:
+                continue  # already loaded (e.g. also a macro_key) — don't reread
+            try:
+                mdf = macro_lib.read(sym).data
+            except Exception as exc:
+                log.warning(
+                    "Sub-sector ETF %s unreadable from ArcticDB (non-fatal — "
+                    "sub_sector_vs_benchmark_* will neutral-default): %s",
+                    sym, exc,
+                )
+                continue
+            if "Close" not in mdf.columns:
+                log.warning(
+                    "Sub-sector ETF %s has no Close column — ArcticDB schema "
+                    "drift (non-fatal, treated as missing).", sym,
+                )
+                continue
+            series = mdf["Close"].dropna()
+            ticker_close = closes.get(sym)
+            if ticker_close and not np.isnan(ticker_close["Close"]):
+                series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
+                # Re-sort after the today_ts concat — see the macro_keys loop
+                # above; same non-monotonic-on-holiday-backfill hazard.
+                series = series[~series.index.duplicated(keep="last")].sort_index()
+            macro[sym] = series
 
         # HYOAS (config#939, credit spreads) — best-effort read, mirroring
         # the best-effort write above. Not part of the mandatory
@@ -1828,6 +1910,16 @@ def _daily_append_impl(
                 # in features/feature_engineer.py.
                 sector_etf_sym = sector_map.get(ticker)
                 sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+                # Sub-sector benchmark ETF (config#934) — resolved the same way
+                # as the sector ETF above. sub_sector_etf_map falls back to the
+                # sector ETF for unmapped sub-industries, so this is often the
+                # SAME series as sector_etf_series (→ sub_sector_vs_benchmark_*
+                # == sector_vs_spy_*). None if the ETF's series never loaded
+                # (best-effort) → the feature neutral-defaults.
+                sub_sector_etf_sym = sub_sector_etf_map.get(ticker)
+                sub_sector_etf_series = (
+                    macro.get(sub_sector_etf_sym) if sub_sector_etf_sym else None
+                )
                 ticker_alt = alt_data.get(ticker, {})
 
                 featured = compute_features(
@@ -1835,6 +1927,7 @@ def _daily_append_impl(
                     spy_series=spy_series,
                     vix_series=vix_series,
                     sector_etf_series=sector_etf_series,
+                    sub_sector_etf_series=sub_sector_etf_series,
                     tnx_series=tnx_series,
                     irx_series=irx_series,
                     gld_series=gld_series,
