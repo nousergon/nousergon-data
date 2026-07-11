@@ -436,3 +436,106 @@ def test_disabled_flag_short_circuits(monkeypatch):
     assert out["launched"] is False
     assert out["reason"] == "disabled"
     assert idx._test_ssm.sent == []
+
+
+# ── config#2223: weekly synthetic canary drill ───────────────────────────────
+
+
+def test_drill_synthesizes_isolated_identity_and_launches(monkeypatch):
+    """The happy path the weekly canary exists to verify: `{"is_drill":
+    "true"}` (the EventBridge Scheduler rule's entire static Input)
+    round-trips the REAL launch pipe with a code-synthesized drill identity —
+    DRILL_REPO + per-day sha — plus the sf-watch-drill discriminator tag."""
+    from datetime import datetime, timezone
+
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"is_drill": "true"}, None)
+    expected_sha = idx._drill_sha(datetime.now(timezone.utc))
+    assert out["launched"] is True
+    assert out["is_drill"] is True
+    assert out["repo"] == idx.DRILL_REPO == "nousergon/ci-watch-drill"
+    assert out["sha"] == expected_sha
+    assert idx._test_ec2.tags_created == [
+        (["i-stub"], [
+            {"Key": "ci-watch-repo", "Value": idx.DRILL_REPO},
+            {"Key": "ci-watch-sha", "Value": expected_sha},
+            {"Key": "sf-watch-drill", "Value": "true"},
+        ])
+    ]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--is-drill "true"' in cmd
+    assert f'--ci-repo "{idx.DRILL_REPO}"' in cmd
+    assert f'--ci-sha "{expected_sha}"' in cmd
+
+
+def test_drill_identity_can_never_collide_with_a_real_dispatch(monkeypatch):
+    """Pins the structural isolation invariant (index.DRILL_REPO comment):
+    the drill sha is allowlist-valid but per-day-deterministic, DRILL_REPO is
+    not a real fleet repository, and the slash-flattened completion-marker
+    stem contains 'drill-' — so a drill can never dedupe-block a real
+    dispatch and its marker key never collides with a real one."""
+    from datetime import datetime, timezone
+
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    sha = idx._drill_sha(datetime.now(timezone.utc))
+    assert idx._SHA_RE.match(sha)
+    # ci_watch_run.sh's completion key stem is "{repo//\//-}-{sha}" — for a
+    # drill that is "nousergon-ci-watch-drill-<sha>", which contains "drill-".
+    marker_stem = f"{idx.DRILL_REPO.replace('/', '-')}-{sha}"
+    assert "drill-" in marker_stem
+    # Deterministic within a day — a duplicate drill dedupes against itself.
+    assert sha == idx._drill_sha(datetime.now(timezone.utc))
+
+
+def test_drill_ignores_payload_supplied_identity(monkeypatch):
+    """ISOLATION INVARIANT: even a payload that smuggles a real (repo, sha)
+    into a drill gets the code-synthesized drill identity — no payload can
+    point a drill at a real dispatch's lock/marker keys."""
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler({
+        "is_drill": "true",
+        "repo": "nousergon/alpha-engine-config",
+        "sha": "abc1234def5678900000000000000000000abcd",
+        "run_id": "123456789",
+        "run_url": "https://github.com/nousergon/alpha-engine-config/actions/runs/123456789",
+        "workflow": "Fleet CI",
+        "branch": "main",
+    }, None)
+    assert out["launched"] is True
+    assert out["repo"] == idx.DRILL_REPO
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--ci-repo "nousergon/alpha-engine-config"' not in cmd
+
+
+def test_drill_same_day_duplicate_dedupes_against_itself_only(monkeypatch):
+    from datetime import datetime, timezone
+
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    sha = idx._drill_sha(datetime.now(timezone.utc))
+    idx2 = _load(
+        monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={(idx.DRILL_REPO, sha): ["i-drill-live"]},
+    )
+    out = idx2.handler({"is_drill": "true"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "concurrent_skip"
+    assert idx2._test_ssm.sent == []
+
+
+def test_malformed_is_drill_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"is_drill": "yes-please"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "invalid_event"
+    assert idx._test_ssm.sent == []
+
+
+def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch):
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["is_drill"] is False
+    (_, tags), = idx._test_ec2.tags_created
+    assert all(t["Key"] != "sf-watch-drill" for t in tags)
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--is-drill "false"' in cmd

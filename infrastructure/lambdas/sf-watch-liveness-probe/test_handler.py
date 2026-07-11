@@ -828,3 +828,63 @@ def test_watch_prefixes_follow_the_cadence_convention_the_reclaim_checker_derive
             f"watch_prefix {watch_prefix!r} for cadence {cadence_slug!r} breaks "
             "the convention the reclaim checker's key derivation relies on"
         )
+
+
+# ── config#2223: canary-drill isolation in the reclaim checker ───────────────
+# A drill box's run-date tag is always "drill-YYYY-MM-DD" (synthesized by
+# sf-watch-spot-dispatcher; a real run_date is bare YYYY-MM-DD). Drills are
+# not repairs: their deaths must never relaunch, consume the reclaim budget,
+# or page — a failed drill's alerting surface is the missing _canary
+# heartbeat (Fleet Status escalation), by design.
+
+DRILL_TAGS = {
+    "Name": "alpha-engine-sf-watch-spot",
+    "sf-watch-cadence": "saturday",
+    "sf-watch-pipeline": "ne-weekly-freshness-pipeline",
+    "sf-watch-run-date": "drill-2026-07-15",
+    "sf-watch-drill": "true",
+}
+DRILL_MARKER_KEY = ("sf_watch/_control/completed/"
+                    "saturday-ne-weekly-freshness-pipeline-drill-2026-07-15.json")
+
+
+def test_reclaim_of_completed_drill_box_is_clean_no_relaunch_no_page():
+    ec2 = _make_reclaim_ec2(tags=DRILL_TAGS)
+    s3 = _make_reclaim_s3(marker_exists=True)
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), ec2=ec2, s3=s3)
+    assert result["watch_box"] is True
+    assert result["drill"] is True
+    assert result["completed"] is True
+    assert result["relaunched"] is False
+    assert s3.head_object.call_args.kwargs["Key"] == DRILL_MARKER_KEY
+    lam.invoke.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
+
+
+def test_reclaim_of_dead_drill_box_never_relaunches_or_escalates():
+    """A drill reclaimed/killed mid-run has NO completion marker and NO
+    watch-log — the pre-drill code would have paged 'dispatch fields
+    UNRECONSTRUCTABLE' and/or burned the exactly-one relaunch on a synthetic
+    run. The drill branch exits before any of that; the missed _canary
+    heartbeat (Fleet Status YELLOW/RED) is the designed signal."""
+    ec2 = _make_reclaim_ec2(tags=DRILL_TAGS)
+    s3 = _make_reclaim_s3(marker_exists=False)
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), ec2=ec2, s3=s3)
+    assert result["watch_box"] is True
+    assert result["drill"] is True
+    assert result["completed"] is False
+    assert result["relaunched"] is False
+    # Exits BEFORE the watch-log read — a drill has no watch-log to consult.
+    s3.get_object.assert_not_called()
+    s3.put_object.assert_not_called()
+    lam.invoke.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
+
+
+def test_real_reclaim_path_unaffected_by_drill_branch():
+    """A real (bare YYYY-MM-DD) run_date must never enter the drill branch."""
+    s3 = _make_reclaim_s3(watch_log=_watch_log_doc([_dispatch_log_event()]))
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), s3=s3)
+    assert "drill" not in result
+    assert result["relaunched"] is True
+    lam.invoke.assert_called_once()
