@@ -66,7 +66,7 @@ _load_dotenv()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
-from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint, get_flow_doctor
 from nousergon_lib.phase_registry import PhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
 # lift of the five inline _find_config / load_config / config_loader copies into
@@ -2770,6 +2770,18 @@ def main() -> None:
         raise SystemExit(0)
 
     results = run_weekly(config, args)
+
+    # config#646 (Option A): write the flow's end-of-run status() snapshot to
+    # s3://alpha-engine-research/_flow_doctor/heartbeat/data-collector/{date}.json
+    # so the dashboard System Health consumer can read it. emit_heartbeat soft-
+    # fails (returns None, never raises); fires here — after run_weekly() and
+    # before the exit-code decision — so the heartbeat lands on every completed
+    # run (ok, partial, or failing). config["bucket"] is the research bucket
+    # (RESEARCH_BUCKET default "alpha-engine-research"; see preflight.py:197),
+    # which is where the dashboard reads heartbeats from.
+    fd = get_flow_doctor()
+    if fd:
+        fd.emit_heartbeat(bucket=config["bucket"])
 
     # Hard-fail on any non-ok status — strict form of the no-silent-fails
     # rule applied while the system is unstable. `partial` previously exited
