@@ -81,7 +81,8 @@ Resources:
   # `universe_writer_lock` covers for manual `daily_append` invocations —
   # that lock guards the data writer; this table guards the SF entry point.
   # Together they cover both halves of "exactly one cron-fired execution of
-  # each SF per minute bucket."
+  # each SF per slot" (run-date slot for the weekly SF, minute bucket for
+  # the weekday/EOD SFs — see Schema note below).
   #
   # Trigger of record: the 2026-05-26 duplicate-EventBridge-target incident
   # (PR #322), where two parallel SF executions raced 321 unique-symbol
@@ -92,13 +93,25 @@ Resources:
   # throttle, cross-region replay coincidence, any future shape the CI
   # chokepoint misses).
   #
-  # Schema: mutex_key (S) PK only — no TTL attribute and no auto-release.
-  # The mutex_key encodes `{state-machine-name}#{pipeline_role}#{minute-bucket}`,
-  # so a successfully-acquired key is naturally single-use: no future
-  # execution can land in the same minute-bucket of a past UTC date. Item
-  # accumulation is ~12 items/week × cadence runs ≈ <1000/yr; PAY_PER_REQUEST
-  # storage cost is negligible (sub-cent annual). Periodic sweeper deferred —
-  # operationally meaningful staleness is a non-issue.
+  # Schema: mutex_key (S) PK, plus (config#2280) an OPTIONAL ttl_epoch (N)
+  # attribute with table TTL enabled.
+  # - WEEKLY SF (step_function.json): mutex_key encodes
+  #   `{state-machine-name}#{pipeline_role}#{run_date}` — the RUN-SLOT — so
+  #   staggered duplicate triggers of the same run-slot conflict at ANY
+  #   minute distance (the old minute bucket only caught same-minute dups).
+  #   A run-date key has no natural expiry, so the weekly AcquireMutex
+  #   stamps ttl_epoch (~24h) as the crashed-holder BACKSTOP; the PRIMARY
+  #   stale-item mechanism is scripts/weekly_sf_rerun.py's verified steal
+  #   (delete only after the holder execution is confirmed terminal).
+  # - WEEKDAY/EOD SFs still key on the minute bucket and write NO ttl_epoch;
+  #   items without the attribute never expire (DynamoDB TTL ignores them),
+  #   so this TimeToLiveSpecification is a purely ADDITIVE, backward-
+  #   compatible change — enabling TTL on a live table is a safe in-place
+  #   UpdateTimeToLive, no table replacement.
+  # Item accumulation is ~12 items/week × cadence runs ≈ <1000/yr;
+  # PAY_PER_REQUEST storage cost is negligible (sub-cent annual). TTL
+  # supersedes the config#730 stale-item sweeper for weekly items; the
+  # weekday/eod minute-bucket items remain permanent-but-benign as before.
   ExecutionMutexTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -110,6 +123,9 @@ Resources:
       KeySchema:
         - AttributeName: mutex_key
           KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl_epoch
+        Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: false
 

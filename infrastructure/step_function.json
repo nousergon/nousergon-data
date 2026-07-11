@@ -434,20 +434,27 @@
               ]
             }
           ],
-          "Next": "AcquireMutex"
+          "Next": "ComputeMutexTtl"
         }
       ],
       "Default": "CheckShellRun"
     },
+    "ComputeMutexTtl": {
+      "Type": "Pass",
+      "QueryLanguage": "JSONata",
+      "Comment": "config#2280 — TTL epoch for the run-slot mutex item. JSONPath intrinsics cannot convert ISO-8601 to epoch (States.MathAdd needs a number the context object never provides), so this single Pass state opts into JSONata ($toMillis) to stamp mutex_ttl_epoch = epoch(Execution.StartTime) + 86400s (~24h) as a STRING (DynamoDB's N attribute is string-encoded on the wire). Chosen over (a) piggybacking a Lambda that runs before AcquireMutex — the only in-repo candidates (LibPinDriftCheck/PipelineContractCheck) are skip-gated, so the ttl attribute would be conditionally absent and a missing JSONPath in AcquireMutex's Item would throw States.Runtime into the States.ALL fail-open, silently disabling the mutex exactly on skip-flag runs — and over (b) a new epoch-computation Lambda (forbidden overhead). Only this state is JSONata; AcquireMutex stays JSONPath so its Catch/ResultPath semantics are untouched. Reached only via CheckMutexRole's cadence-role path, so $.mutex_ttl_epoch is ALWAYS present when AcquireMutex runs.",
+      "Output": "{% $merge([$states.input, {\"mutex_ttl_epoch\": $string($floor($toMillis($states.context.Execution.StartTime) / 1000) + 86400)}]) %}",
+      "Next": "AcquireMutex"
+    },
     "AcquireMutex": {
       "Type": "Task",
-      "Comment": "L274 — DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException → MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
+      "Comment": "L274 + config#2280 — DynamoDB conditional PUT on the RUN-SLOT. mutex_key = '{state-machine-name}#{pipeline_role}#{run_date}' ($.run_date is stamped by InitializeInput before any gate). The old key's UTC minute bucket only caught duplicates landing in the SAME minute — an EventBridge internal retry >60s later, an operator re-paste a minute later, or a re-introduced duplicate rule at minute distance all got fresh keys and ran concurrently (double spot spend + artifact write races on the same run_date prefixes). Keying on run_date makes ANY second cadence execution of the same run-slot lose with ConditionalCheckFailedException → MutexConflict Fail, regardless of stagger. Staleness: a run-date key has no natural expiry (unlike the minute bucket), so items carry ttl_epoch (~24h, from ComputeMutexTtl) with table TTL enabled as the crashed-holder backstop; the PRIMARY stale-item mechanism is scripts/weekly_sf_rerun.py, which deletes the failed holder's item after verifying the holder execution is terminal (never steals from a RUNNING one). Recovery reruns themselves carry pipeline_role='watch-rerun' (non-cadence) and bypass this state entirely. Redrives resume the SAME execution and never re-enter this state. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
       "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
       "Parameters": {
         "TableName": "alpha-engine-sf-execution-mutex",
         "Item": {
           "mutex_key": {
-            "S.$": "States.Format('{}#{}#{}:{}', $$.StateMachine.Name, $.pipeline_role, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
+            "S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"
           },
           "execution_arn": {
             "S.$": "$$.Execution.Id"
@@ -460,6 +467,9 @@
           },
           "pipeline_role": {
             "S.$": "$.pipeline_role"
+          },
+          "ttl_epoch": {
+            "N.$": "$.mutex_ttl_epoch"
           }
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
@@ -481,7 +491,7 @@
           "ErrorEquals": [
             "DynamoDB.ConditionalCheckFailedException"
           ],
-          "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert.",
+          "Comment": "Mutex held by another execution of the same run-slot (state-machine + pipeline_role + run_date) — the duplicate-trigger case we are explicitly protecting against, now at ANY stagger, not just same-minute. Fail loud so the dup is visible in SF execution history + SNS alert.",
           "Next": "MutexConflict",
           "ResultPath": "$.mutex_conflict"
         },
@@ -500,7 +510,7 @@
     "MutexConflict": {
       "Type": "Fail",
       "Error": "MutexConflict",
-      "Cause": "L274: another SF execution with the same state-machine + pipeline_role + start-minute already holds the mutex. Most likely cause: duplicate EventBridge target fan-out (PR #322 closes the specific CFN-vs-deploy-script shape; this Fail catches the broader class). Forensic: check execution history for the prior holder's executionArn via DynamoDB GetItem on the mutex_key in $.mutex_conflict."
+      "Cause": "L274/config#2280: another SF execution with the same state-machine + pipeline_role + run_date already holds the run-slot mutex. Most likely causes: duplicate EventBridge target fan-out or a staggered duplicate trigger (internal retry / operator re-paste). Forensic: DynamoDB GetItem on the mutex_key in $.mutex_conflict names the holder's executionArn. If the holder is TERMINAL and a recovery rerun is intended, use scripts/weekly_sf_rerun.py — it verifies the holder is terminal, deletes the stale item, and starts a correctly-scoped watch-rerun; never delete the item while the holder is RUNNING."
     },
     "CheckShellRun": {
       "Type": "Choice",
