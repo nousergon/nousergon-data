@@ -171,12 +171,12 @@ _SPEC_FIELDS = frozenset(
         # (trading_days / all_days / market_hours). Drives both the idle
         # short-circuit and a trading-day-aware freshness floor.
         "run_calendar",
-        # Continuous active-window bounds. active_hours_utc is the
-        # market_hours session window (nousergon-lib >= v0.63.0); the
-        # active_trading_days_only boolean is DEPRECATED (subsumed by
-        # run_calendar="trading_days") but still parsed during the
-        # S3-contract-safe migration window.
-        "active_trading_days_only",
+        # Continuous active-window bound: active_hours_utc is the
+        # market_hours session window (nousergon-lib >= v0.63.0). The
+        # deprecated active_trading_days_only boolean (subsumed by
+        # run_calendar) was removed in nousergon-lib v0.102.0 / config#1334;
+        # unknown keys in the registry are stripped by the loader below, so
+        # this is forward-safe regardless of the pinned lib version.
         "active_hours_utc",
         "produces",
         "depends_on",
