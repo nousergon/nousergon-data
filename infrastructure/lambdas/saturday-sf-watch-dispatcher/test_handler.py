@@ -835,3 +835,82 @@ def test_fast_path_preflight_excluded(fast_path_on):
 
     sf.start_execution.assert_not_called()
     assert result["fast_path"]["reason"] == "preflight"
+
+
+# ── _load_existing fail-loud contract (config#2267 site 4) ───────────────────
+# Only a TRUE absence (404/NoSuchKey) may mean "first failure of the day";
+# 403/AccessDenied and every other read error must RAISE — the old
+# 403-as-absent behavior reset the attempt budget on every failure (unbounded
+# re-dispatch) while an IAM read regression masqueraded as first-failure.
+
+
+def test_load_existing_404_means_fresh_skeleton():
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("404")
+    out = index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+    assert out == {"schema_version": index.SCHEMA_VERSION, "events": []}
+
+
+def test_load_existing_nosuchkey_means_fresh_skeleton():
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("NoSuchKey")
+    out = index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+    assert out == {"schema_version": index.SCHEMA_VERSION, "events": []}
+
+
+def test_load_existing_403_raises_instead_of_resetting_attempt_budget():
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("403")
+    with pytest.raises(FakeClientError):
+        index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+
+
+def test_load_existing_access_denied_raises():
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("AccessDenied")
+    with pytest.raises(FakeClientError):
+        index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+
+
+def test_load_existing_other_client_error_raises():
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("Throttling")
+    with pytest.raises(FakeClientError):
+        index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+
+
+def test_load_existing_non_client_error_raises():
+    # An exception with no botocore-shaped .response (e.g. a socket error)
+    # must also raise — it is not absence.
+    s3 = MagicMock()
+    s3.get_object.side_effect = RuntimeError("connection reset")
+    with pytest.raises(RuntimeError):
+        index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+
+
+def test_load_existing_unparseable_blob_starts_fresh():
+    s3 = MagicMock()
+    body = MagicMock()
+    body.read.return_value = b"{not-json"
+    s3.get_object.return_value = {"Body": body}
+    out = index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+    assert out == {"schema_version": index.SCHEMA_VERSION, "events": []}
+
+
+def test_load_existing_wrong_shape_starts_fresh():
+    s3 = MagicMock()
+    body = MagicMock()
+    body.read.return_value = json.dumps(["not", "a", "watch-log"]).encode()
+    s3.get_object.return_value = {"Body": body}
+    out = index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+    assert out == {"schema_version": index.SCHEMA_VERSION, "events": []}
+
+
+def test_load_existing_valid_watch_log_accumulates():
+    existing = {"schema_version": index.SCHEMA_VERSION, "events": [{"prior": True}]}
+    s3 = MagicMock()
+    body = MagicMock()
+    body.read.return_value = json.dumps(existing).encode()
+    s3.get_object.return_value = {"Body": body}
+    out = index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
+    assert out == existing

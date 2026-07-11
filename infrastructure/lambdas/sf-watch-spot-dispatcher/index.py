@@ -33,7 +33,11 @@ CONCURRENCY LOCK: keyed on `Name=alpha-engine-sf-watch-spot` +
 `sf-watch-run-date=<run_date>` — the FULL identifying key (mirrors ci-watch's
 own use of its full (repo, sha) key, not a partial one): two different
 run_dates failing independently for the same pipeline+cadence must each get
-their own box. Fail-safe OPEN on any API error.
+their own box. A FAILED probe (SpotProbeError, config#2267 site 1) does NOT
+fail-open silently: the dispatch proceeds — coverage beats dedupe; a probe
+failure must never leave a real SF failure uncovered — but the degradation
+is recorded loudly (`dedupe_degraded: true` in the returned verdict + an
+ERROR log naming the probe error).
 
 DEFER, NOT DROP (config#2226): when the lock finds a live box for the SAME
 key, the second failure is NOT dropped — the live box has no obligation to
@@ -81,7 +85,11 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 from nousergon_lib import spot_dispatch
-from nousergon_lib.spot_dispatch import SpotCapacityExhausted, SpotLaunchError
+from nousergon_lib.spot_dispatch import (  # SpotProbeError: nousergon-lib >= 0.106.0
+    SpotCapacityExhausted,
+    SpotLaunchError,
+    SpotProbeError,
+)
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -96,6 +104,13 @@ DISPATCH_ENABLED = os.environ.get("SF_WATCH_DISPATCH_ENABLED", "true").lower() =
 # ── Spot launch config (env-overridable; defaults mirror ci-watch-dispatcher/
 # scheduled-groom-dispatcher — same default-VPC/AMI/security-group, only the
 # IAM profile differs for blast-radius isolation). ────────────────────────────
+# IAM LOCKSTEP (config#2271): the INSTANCE_TYPES default below, AMI_ID,
+# SUBNETS, and SECURITY_GROUP are ENUMERATED in this Lambda's scoped
+# ec2:RunInstances policy (sibling iam-policy.json — JSON carries no
+# comments, so this is the canonical cross-reference). Changing any of these
+# defaults (or their env overrides at deploy time) WITHOUT updating
+# iam-policy.json + re-applying it will make RunInstances fail with
+# UnauthorizedOperation at the next dispatch. Keep them in sync.
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
@@ -125,6 +140,15 @@ SF_WATCH_TAG_NAME = "alpha-engine-sf-watch-spot"
 SF_WATCH_CADENCE_TAG_KEY = "sf-watch-cadence"
 SF_WATCH_PIPELINE_TAG_KEY = "sf-watch-pipeline"
 SF_WATCH_RUN_DATE_TAG_KEY = "sf-watch-run-date"
+
+# Discriminator tag write (config#2267 site 2): the tags are LOAD-BEARING —
+# without them the next failure's dedupe guard is blind (duplicate box) and
+# spot-orphan-reaper cannot derive the completion-marker key (guaranteed
+# false "incomplete reap" page for a healthy run). Bounded retry, then
+# terminate-the-box-and-fail-the-dispatch on final failure. Retry delay is
+# env-overridable so tests run at 0.
+TAG_WRITE_ATTEMPTS = int(os.environ.get("SF_WATCH_TAG_WRITE_ATTEMPTS", "3"))
+TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("SF_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "2"))
 
 # The box reads its own run secrets (PAT) via its instance profile in the
 # common case, but the PRELUDE below (run before the profile-backed bootstrap
@@ -319,8 +343,10 @@ def _running_sf_watch_instance_ids(cadence_slug: str, pipeline_name: str, run_da
     THIS exact (cadence_slug, pipeline_name, run_date) — the full identifying
     key (mirrors ci-watch-dispatcher's own use of its full (repo, sha) key):
     two different run_dates failing independently for the same
-    pipeline+cadence must each get their own box. Fail-safe: any API error
-    returns [] (never blocks a launch on a broken check)."""
+    pipeline+cadence must each get their own box. Raises SpotProbeError
+    (nousergon-lib >= 0.106.0, config#2267 site 1) when the probe itself
+    fails — the caller degrades to launch-with-dedupe_degraded, never a
+    silent fail-open []."""
     return spot_dispatch.running_instance_ids(
         SF_WATCH_TAG_NAME,
         {
@@ -340,6 +366,37 @@ def _terminate_instance(instance_id: str) -> None:
     (logged, not raised) — mirrors ci-watch-dispatcher's `_terminate_instance`
     exactly."""
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="sf-watch")
+
+
+def _create_discriminator_tags(
+    instance_id: str, cadence_slug: str, pipeline_name: str, run_date: str
+) -> str | None:
+    """Write the load-bearing discriminator tags (config#2267 site 2) with a
+    bounded retry. Returns None on success, or the final ``"ExcName: msg"``
+    string after TAG_WRITE_ATTEMPTS failures — the caller terminates the box
+    and fails the dispatch (the tags are what make the box visible to the
+    dedupe guard and the spot-orphan-reaper; an untagged box must not run)."""
+    tags = [
+        {"Key": SF_WATCH_CADENCE_TAG_KEY, "Value": cadence_slug},
+        {"Key": SF_WATCH_PIPELINE_TAG_KEY, "Value": pipeline_name},
+        {"Key": SF_WATCH_RUN_DATE_TAG_KEY, "Value": run_date},
+    ]
+    last_error = ""
+    for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
+        try:
+            boto3.client("ec2", region_name=REGION).create_tags(
+                Resources=[instance_id], Tags=tags
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — bounded retry; final failure is FATAL to the dispatch (caller terminates + fails)
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "sf-watch discriminator tag write attempt %d/%d failed for %s: %s",
+                attempt, TAG_WRITE_ATTEMPTS, instance_id, last_error,
+            )
+            if attempt < TAG_WRITE_ATTEMPTS:
+                time.sleep(TAG_WRITE_RETRY_DELAY_SEC)
+    return last_error
 
 
 def _defer_schedule_name(
@@ -565,7 +622,27 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
     cadence_slug, pipeline_name, run_date = (
         fields["cadence_slug"], fields["pipeline_name"], fields["run_date"],
     )
-    existing = _running_sf_watch_instance_ids(cadence_slug, pipeline_name, run_date)
+    dedupe_degraded = False
+    dedupe_probe_error = ""
+    try:
+        existing = _running_sf_watch_instance_ids(cadence_slug, pipeline_name, run_date)
+    except SpotProbeError as exc:
+        # Degraded-probe swallow (config#2267 site 1 POLICY): failure mode
+        # swallowed = a possible duplicate box (the probe could not rule one
+        # out); the primary deliverable — watch coverage of a REAL SF failure
+        # — survives, and coverage beats dedupe: a probe failure must never
+        # leave a real SF failure uncovered. Recording surfaces: this ERROR
+        # log + `dedupe_degraded: true` in the returned verdict the GHA
+        # caller archives.
+        dedupe_degraded = True
+        dedupe_probe_error = f"{type(exc).__name__}: {exc}"
+        existing = []
+        logger.error(
+            "sf-watch concurrency probe FAILED for %s/%s@%s — proceeding to "
+            "launch with dedupe_degraded=true (coverage beats dedupe; a "
+            "duplicate box is possible): %s",
+            cadence_slug, pipeline_name, run_date, dedupe_probe_error,
+        )
     if existing:
         # DEFER, NOT DROP (config#2226): the live box has no obligation to
         # notice THIS failure — schedule a one-shot re-invoke instead of
@@ -579,24 +656,30 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         logger.error("sf-watch spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
 
-    logger.info("launched sf-watch box %s (%s) for %s/%s@%s",
-               instance_id, market, cadence_slug, pipeline_name, run_date)
+    logger.info("launched sf-watch box %s (%s) for %s/%s@%s%s",
+               instance_id, market, cadence_slug, pipeline_name, run_date,
+               " dedupe_degraded=true" if dedupe_degraded else "")
     # config#1979-style tags so the NEXT trigger's guard check (above) — and
-    # the fleet spot-orphan-reaper's incomplete-reap alert — can find them.
-    # Best-effort — a tag-write failure must not abort an already-launched
-    # box (mirrors ci-watch-dispatcher's fail-safe posture on its own tags).
-    try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id],
-            Tags=[
-                {"Key": SF_WATCH_CADENCE_TAG_KEY, "Value": cadence_slug},
-                {"Key": SF_WATCH_PIPELINE_TAG_KEY, "Value": pipeline_name},
-                {"Key": SF_WATCH_RUN_DATE_TAG_KEY, "Value": run_date},
-            ],
+    # the fleet spot-orphan-reaper's completion-marker lookup — can find the
+    # box. LOAD-BEARING, not cosmetic (config#2267 site 2): bounded retry,
+    # then TERMINATE the box and fail the dispatch on final failure — a box
+    # invisible to the dedupe guard and the reaper must not run. (The root
+    # fix — discriminator tags atomic with launch via RunInstances
+    # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
+    # RunInstances chokepoint, growing an extra-tags parameter; until then
+    # this retry+terminate closes the hole loudly.)
+    tag_error = _create_discriminator_tags(instance_id, cadence_slug, pipeline_name, run_date)
+    if tag_error is not None:
+        _terminate_instance(instance_id)
+        logger.error(
+            "sf-watch discriminator tag write FAILED after %d attempts for %s "
+            "(%s/%s@%s) — box terminated, dispatch failed: %s",
+            TAG_WRITE_ATTEMPTS, instance_id, cadence_slug, pipeline_name,
+            run_date, tag_error,
         )
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors ci-watch's tag write
-        logger.warning("sf-watch discriminator tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
+        return {"launched": False, "reason": "tag_write_failed",
+                "instance_id": instance_id, "error": tag_error,
+                "dedupe_degraded": dedupe_degraded}
 
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —
@@ -610,14 +693,15 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         logger.error("sf-watch post-launch step failed for %s: %s: %s",
                      instance_id, type(exc).__name__, exc)
         return {"launched": False, "reason": "post_launch_failed",
-                "instance_id": instance_id, "error": str(exc)}
+                "instance_id": instance_id, "error": str(exc),
+                "dedupe_degraded": dedupe_degraded}
 
     logger.info(
         "sf-watch dispatched: instance=%s market=%s command=%s cadence=%s pipeline=%s "
-        "run_date=%s run_token=%s", instance_id, market, command_id, cadence_slug,
-        pipeline_name, run_date, run_token,
+        "run_date=%s run_token=%s dedupe_degraded=%s", instance_id, market, command_id,
+        cadence_slug, pipeline_name, run_date, run_token, dedupe_degraded,
     )
-    return {
+    verdict = {
         "launched": True,
         "reason": "launched",
         "instance_id": instance_id,
@@ -627,7 +711,11 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         "pipeline_name": pipeline_name,
         "run_date": run_date,
         "run_token": run_token,
+        "dedupe_degraded": dedupe_degraded,
     }
+    if dedupe_degraded:
+        verdict["dedupe_probe_error"] = dedupe_probe_error
+    return verdict
 
 
 def handler(event: dict, context) -> dict:

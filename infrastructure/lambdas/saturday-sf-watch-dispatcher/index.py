@@ -481,18 +481,43 @@ def _artifact_key(watch_prefix: str, run_date: str) -> str:
 
 def _load_existing(s3, key: str) -> dict:
     """Read the existing watch-log for this date (so repeated failures in one
-    run accumulate), or a fresh skeleton. A missing object (404/403) is the
-    common first-failure-of-the-day case, NOT an error."""
+    run accumulate), or a fresh skeleton. ONLY a true absence (404/NoSuchKey)
+    is the common first-failure-of-the-day case; every OTHER read error —
+    403/AccessDenied above all — RAISES (config#2267 site 4: treating a 403
+    as "absent" made an IAM read regression reset the attempt budget on
+    every failure, unbounded re-dispatch masquerading as first-failure-of-
+    the-day; the watch-plane alarms are the backstop for the resulting
+    Lambda error)."""
+    fresh = {"schema_version": SCHEMA_VERSION, "events": []}
     try:
         obj = s3.get_object(Bucket=WATCH_BUCKET, Key=key)
+    except Exception as exc:  # noqa: BLE001 — only genuine absence is swallowed; everything else re-raises
+        response = getattr(exc, "response", None)
+        code = ""
+        if isinstance(response, dict):
+            code = str(response.get("Error", {}).get("Code", ""))
+        if code in {"NoSuchKey", "404"}:
+            return fresh
+        logger.error("could not read existing watch-log %s (code=%s): %s", key, code, exc)
+        raise
+    try:
         data = json.loads(obj["Body"].read())
-        if isinstance(data, dict) and isinstance(data.get("events"), list):
-            return data
-    except Exception as exc:  # noqa: BLE001 — absence is expected; bad blob is recoverable
-        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
-        if code not in {"NoSuchKey", "404", "403"}:
-            logger.warning("could not read existing watch-log %s: %s", key, exc)
-    return {"schema_version": SCHEMA_VERSION, "events": []}
+    except (ValueError, TypeError) as exc:
+        # Malformed-blob swallow: failure mode swallowed = a corrupted/
+        # unparseable existing watch-log (loses that day's accumulated event
+        # history, NOT the current event — the fresh skeleton still records
+        # it and the artifact write stays the fail-loud primary deliverable).
+        # Recording surface: this WARNING log.
+        logger.warning("existing watch-log %s is unparseable — starting a "
+                       "fresh skeleton: %s", key, exc)
+        return fresh
+    if isinstance(data, dict) and isinstance(data.get("events"), list):
+        return data
+    # Wrong-shape swallow: same failure mode + recording surface as the
+    # unparseable case above — a valid-JSON blob that is not a watch-log.
+    logger.warning("existing watch-log %s has an unexpected shape — starting "
+                   "a fresh skeleton", key)
+    return fresh
 
 
 def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str, cfg: dict) -> dict:
