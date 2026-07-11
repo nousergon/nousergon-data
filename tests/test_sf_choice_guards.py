@@ -296,9 +296,9 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         ("WeeklyRunDayGateChoice", {"weekly_run_day_gate": {"Payload": {}}},
          "WeeklyRunDayGateMalformed"),
         ("LibPinDriftGate", {"libpin_drift_result": {"Payload": {}}},
-         "PipelineContractCheck"),  # documented fail-open (alerting: config#2278)
+         "LibPinGateDegraded"),  # fail-open, VISIBLY (config#2278)
         ("PipelineContractGate", {"pipeline_contract_result": {"Payload": {}}},
-         "CheckMutexRole"),  # documented fail-open (alerting: config#2278)
+         "PipelineContractGateDegraded"),  # fail-open, VISIBLY (config#2278)
         ("EvalJudgePollChoice", {"eval_judge_submit": {"Payload": {}}},
          "EvalRollingMean"),  # eval is observability — fail-soft
         ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},

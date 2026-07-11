@@ -472,7 +472,10 @@ class TestStrictSuperset:
         assert nc["End"] is True
 
     def test_success_notify_gate_default_is_notify_complete(self, states):
-        assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
+        # config#2278: the real-run success edge now passes through the
+        # gate-degraded completion Choice before NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
 
 class TestApplyShellRunDefaults:

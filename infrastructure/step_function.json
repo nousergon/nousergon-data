@@ -192,9 +192,19 @@
             "Lambda.ServiceException",
             "Lambda.TooManyRequestsException"
           ],
-          "MaxAttempts": 1,
+          "MaxAttempts": 2,
           "IntervalSeconds": 15,
-          "BackoffRate": 1.0
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2278: transient tier — most gate-infra flakes (GitHub/S3 fetch inside the Lambda surfacing as a crash/timeout) are transient; two backed-off retries make silent gate degradation rarer before the fail-open+alert Catch below engages.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 10,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -202,8 +212,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
-          "Next": "CheckMutexRole",
+          "Comment": "config#2278: still fail-open — the probe's own failure must not halt the weekly run — but no longer SILENT, and no longer skipping the sibling gate: route through the degraded-flag Pass + SNS alert, then into PipelineContractCheck (the old direct CheckMutexRole jump silently skipped gate 2 as well).",
+          "Next": "LibPinGateDegraded",
           "ResultPath": "$.libpin_drift_error"
         }
       ],
@@ -225,8 +235,16 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_drift) previously threw States.Runtime here, bypassing HandleFailure. Absence now falls through to Default: the gate's documented fail-open posture (config#2278 adds the degraded-visibility alert for that path).",
+          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_drift) previously threw States.Runtime here, bypassing HandleFailure.",
           "Next": "ExtractLibPinDriftError"
+        },
+        {
+          "Not": {
+            "Variable": "$.libpin_drift_result.Payload.has_drift",
+            "IsPresent": true
+          },
+          "Comment": "config#2278: a gate payload WITHOUT has_drift means the gate could not check — fail open VISIBLY (degraded flag + SNS alert) instead of silently converting 'checked and clean' into 'never checked'.",
+          "Next": "LibPinGateDegraded"
         }
       ],
       "Default": "PipelineContractCheck"
@@ -259,9 +277,19 @@
             "Lambda.ServiceException",
             "Lambda.TooManyRequestsException"
           ],
-          "MaxAttempts": 1,
+          "MaxAttempts": 2,
           "IntervalSeconds": 15,
-          "BackoffRate": 1.0
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2278: transient tier — most gate-infra flakes (GitHub/S3 fetch inside the Lambda surfacing as a crash/timeout) are transient; two backed-off retries make silent gate degradation rarer before the fail-open+alert Catch below engages.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 10,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -269,8 +297,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
-          "Next": "CheckMutexRole",
+          "Comment": "config#2278: still fail-open — the probe's own failure must not halt the weekly run — but no longer silent: route through the degraded-flag Pass + SNS alert before proceeding to CheckMutexRole.",
+          "Next": "PipelineContractGateDegraded",
           "ResultPath": "$.pipeline_contract_error"
         }
       ],
@@ -292,8 +320,16 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_violation) previously threw States.Runtime here, bypassing HandleFailure. Absence now falls through to Default: the gate's documented fail-open posture (config#2278 adds the degraded-visibility alert for that path).",
+          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_violation) previously threw States.Runtime here, bypassing HandleFailure.",
           "Next": "ExtractPipelineContractError"
+        },
+        {
+          "Not": {
+            "Variable": "$.pipeline_contract_result.Payload.has_violation",
+            "IsPresent": true
+          },
+          "Comment": "config#2278: a gate payload WITHOUT has_violation means the gate could not check — fail open VISIBLY (degraded flag + SNS alert) instead of silently converting 'checked and clean' into 'never checked'.",
+          "Next": "PipelineContractGateDegraded"
         }
       ],
       "Default": "CheckMutexRole"
@@ -308,6 +344,64 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "LibPinGateDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2278: the lib-pin gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_drift). Still fail-open — availability over gating for a weekly pipeline — but VISIBLE and rarer: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishLibPinGateDegraded alerts NOW (mirroring WeeklyRunDayGateFailed's fail-open+alert shape). Proceeds into PipelineContractCheck so a lib-pin-gate infra flake no longer silently skips the SIBLING gate too.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishLibPinGateDegraded"
+    },
+    "PublishLibPinGateDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278: fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline — never States.Format against input). Best-effort Catch: a publish failure must not halt the fail-open path this alert decorates; the caught TaskFailed still logs at ERROR and is matched by SnsPublishFailedMetricFilter.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Lib-Pin Gate DEGRADED (Proceeding Unchecked)",
+        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.libpin_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.libpin_gate_degraded_notify_error",
+          "Next": "PipelineContractCheck"
+        }
+      ],
+      "Next": "PipelineContractCheck"
+    },
+    "PipelineContractGateDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2278: the pipeline-contract gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_violation). Fail-open, visibly: gate_degraded=true + SNS alert, then proceed to CheckMutexRole. Mirrors LibPinGateDegraded exactly.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishPipelineContractGateDegraded"
+    },
+    "PublishPipelineContractGateDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278: fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch mirrors PublishLibPinGateDegraded.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Contract Gate DEGRADED (Proceeding Unchecked)",
+        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.pipeline_contract_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.pipeline_contract_gate_degraded_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
     },
     "CheckMutexRole": {
       "Type": "Choice",
@@ -3491,7 +3585,49 @@
           "Next": "NotifyShellRunComplete"
         }
       ],
+      "Default": "CheckGateDegradedNotify"
+    },
+    "CheckGateDegradedNotify": {
+      "Type": "Choice",
+      "Comment": "config#2278: a green run that could not run its pre-spend gates must SAY SO in the completion email. gate_degraded is set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states (an SF-controlled boolean; IsPresent-guarded per config#2275). Routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing the flag into NotifyComplete — preserving config#1819's Subject/Message-are-constants invariant.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteGatesDegraded"
+        }
+      ],
       "Default": "NotifyComplete"
+    },
+    "NotifyCompleteGatesDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278: SUCCESS notifier for a run whose pre-spend gates were DEGRADED (failed open, unchecked). Mirrors NotifyComplete exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819) — with a Subject that says the gates were skipped.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (pre-spend gates DEGRADED)",
+        "Message": "All steps completed successfully — BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "End": true
     },
     "NotifyShellRunComplete": {
       "Type": "Task",

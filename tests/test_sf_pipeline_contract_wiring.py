@@ -65,7 +65,10 @@ def test_check_fails_open_via_catch(states):
     # weekly run.
     catch = states["PipelineContractCheck"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "CheckMutexRole"  # the pipeline, not HandleFailure
+    # config#2278: still fail-open (the pipeline, not HandleFailure) — but
+    # through the visible degraded chain (flag + SNS alert); full topology
+    # in test_sf_prespend_gate_alerting.
+    assert catch["Next"] == "PipelineContractGateDegraded"
 
 
 def test_gate_halts_only_on_confirmed_violation(states):
