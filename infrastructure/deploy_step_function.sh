@@ -30,7 +30,12 @@
 #
 # After deployment:
 #   1. Run a test execution from the Step Functions console
-#   2. Monitor first automated Saturday run (00:00 UTC)
+#   2. Monitor the next automated weekly run — schedule SoT is the CFN
+#      SaturdayTrigger ScheduleExpression in
+#      cloudformation/alpha-engine-orchestration.yaml plus the SF's
+#      WeeklyRunDayGate self-selection (config#1824); the cron is
+#      deliberately NOT copied here, it has gone stale in this file before
+#      (config#2281)
 #   3. After 2 successful weeks, run with --disable-old-crons
 
 set -euo pipefail
@@ -312,7 +317,10 @@ echo ""
 echo "=== Deployment Complete ==="
 echo ""
 echo "  State machine:  $SM_ARN"
-echo "  EventBridge:    $EVENTBRIDGE_RULE (Saturday 00:00 UTC)"
+# Schedule SoT is the CFN SaturdayTrigger rule (ScheduleExpression +
+# WeeklyRunDayGate self-selection, config#1824) — point there rather than
+# hand-copying the cron into a second place that goes stale (config#2281).
+echo "  EventBridge:    $EVENTBRIDGE_RULE (schedule: CFN-owned — SoT is the SaturdayTrigger ScheduleExpression in infrastructure/cloudformation/alpha-engine-orchestration.yaml, plus the SF's WeeklyRunDayGate self-selecting the single run day)"
 echo "  SNS topic:      $SNS_TOPIC_ARN"
 echo ""
 echo "To test manually:"
