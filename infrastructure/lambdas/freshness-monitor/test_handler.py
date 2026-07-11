@@ -181,9 +181,11 @@ artifacts:
 
 
 def test_load_registry_threads_active_window_fields(fake_s3):
-    """Continuous active-window fields (nousergon-lib >=0.63.0) must survive
+    """The continuous active-window bound (nousergon-lib >=0.63.0) must survive
     the _SPEC_FIELDS strip and thread through to ArtifactSpec, with
-    active_hours_utc coerced from a YAML list to a tuple."""
+    active_hours_utc coerced from a YAML list to a tuple. A deprecated
+    active_trading_days_only key (removed in lib v0.102.0 / config#1334) is a
+    now-unknown field and must be silently stripped, not error."""
     fake_s3._registry_body = b"""\
 schema_version: 1
 defaults:
@@ -202,7 +204,6 @@ artifacts:
 """
     import index
     spec = index.load_registry(fake_s3, "buck", "key")[0]
-    assert spec.active_trading_days_only is True
     assert spec.active_hours_utc == (14, 21)
 
 
