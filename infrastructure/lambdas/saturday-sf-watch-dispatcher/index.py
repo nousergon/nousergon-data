@@ -26,7 +26,10 @@ on the failure; observe-only paths are watch-log-only, no Fleet-SF Watch ping).
 
 **Fail-loud (CLAUDE.md no-silent-fails).** The watch-log artifact write is the
 primary deliverable → it RAISES on failure so a broken producer surfaces via the
-Lambda error metric + CW alarm. Enrichment (DescribeExecution /
+Lambda Errors metric and the ``alpha-engine-watch-plane-saturday-sf-watch-
+dispatcher-errors`` CloudWatch alarm (provisioned by
+``infrastructure/setup_watch_plane_alarms.sh``, routed to the independent
+``alpha-engine-alarm-backstop`` SNS topic — config#2266). Enrichment (DescribeExecution /
 GetExecutionHistory), the Telegram record, and the agent dispatch are secondary
 observability hung off the primary path: their failure is logged at WARNING and
 recorded in the artifact — the artifact still records that a failure was detected.
@@ -556,9 +559,11 @@ def _write_watch_log(
 ) -> str:
     """Append the event to the date's watch-log and write it back. PRIMARY
     deliverable — RAISES on failure (fail-loud: a broken producer must surface
-    via the Lambda error metric + CW alarm, never silently). ``doc`` lets the
-    handler pass the already-loaded document (the fast path reads prior events
-    from it first) so load-append-write stays a single read."""
+    via the Lambda Errors metric + the alpha-engine-watch-plane-*-errors CW
+    alarm from infrastructure/setup_watch_plane_alarms.sh, never silently).
+    ``doc`` lets the handler pass the already-loaded document (the fast path
+    reads prior events from it first) so load-append-write stays a single
+    read."""
     key = _artifact_key(watch_prefix, run_date)
     if doc is None:
         doc = _load_existing(s3, key)
