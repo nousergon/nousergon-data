@@ -22,6 +22,7 @@ from pathlib import Path
 _LAMBDAS = Path(__file__).parent.parent / "infrastructure" / "lambdas"
 _SPOT_DISPATCHER = _LAMBDAS / "sf-watch-spot-dispatcher" / "index.py"
 _SATURDAY_DISPATCHER = _LAMBDAS / "saturday-sf-watch-dispatcher" / "index.py"
+_LIVENESS_PROBE = _LAMBDAS / "sf-watch-liveness-probe" / "index.py"
 
 
 def _module_assign_value(path: Path, name: str) -> ast.expr:
@@ -70,10 +71,23 @@ def _saturday_pipeline_prefixes() -> dict[str, str]:
 def test_spot_dispatcher_watch_prefixes_match_saturday_dispatcher_exactly():
     """EXACT equality, both directions: a pipeline added/removed/renamed (or a
     prefix changed) in saturday-sf-watch-dispatcher's PIPELINES must land in
-    the spot dispatcher's _WATCH_PREFIXES in the same PR — including the
-    TRANSITIONAL alpha-engine-eod-pipeline alias, which must be REMOVED from
-    both together at the config#1408 SF-rename cutover."""
+    the spot dispatcher's _WATCH_PREFIXES in the same PR — exactly how the
+    TRANSITIONAL alpha-engine-eod-pipeline alias was removed from both
+    together at the config#2272 retirement (2026-07-11)."""
     assert _spot_dispatcher_prefixes() == _saturday_pipeline_prefixes()
+
+
+def test_liveness_probe_sweep_prefixes_match_saturday_dispatcher_exactly():
+    """config#2257: the liveness probe's dropped-failure sweep reads the
+    canonical watch-log key to decide whether a terminal execution is already
+    covered — its `_WATCH_PREFIXES` mirror is the THIRD copy of the
+    {pipeline_name: watch_prefix} column and drifts fail CI here exactly like
+    the spot dispatcher's copy above (a drifted prefix would make the sweep
+    read a wrong/empty log and re-dispatch an already-covered failure)."""
+    value = _module_assign_value(_LIVENESS_PROBE, "_WATCH_PREFIXES")
+    prefixes = ast.literal_eval(value)
+    assert isinstance(prefixes, dict) and prefixes, "_WATCH_PREFIXES must be a non-empty dict"
+    assert prefixes == _saturday_pipeline_prefixes()
 
 
 def test_synthesized_key_shape_matches_artifact_key():
@@ -84,3 +98,5 @@ def test_synthesized_key_shape_matches_artifact_key():
     assert 'return f"{watch_prefix}/{run_date}.json"' in saturday_src
     spot_src = _SPOT_DISPATCHER.read_text()
     assert '''f"{prefix}/{fields['run_date']}.json"''' in spot_src
+    probe_src = _LIVENESS_PROBE.read_text()
+    assert 'f"{prefix}/{run_date}.json"' in probe_src

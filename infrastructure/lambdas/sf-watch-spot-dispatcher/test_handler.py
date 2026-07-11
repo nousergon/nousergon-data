@@ -15,8 +15,11 @@ invocation re-evaluates via ListExecutions (recovered / retarget-newest-
 failed / defer-again / fail-safe-launch); the empty-watch_log_key synthesis
 fallback; a post-launch SSM-send failure terminates the box and returns
 launched:false; a malformed event returns launched:false rather than
-raising; the kill-switch short-circuit; and the cause-field base64
-command-injection guard.
+raising; the kill-switch short-circuit; the cause-field base64
+command-injection guard; and the config#2267 launch-path hardening — a
+failed concurrency probe launches WITH dedupe_degraded:true recorded
+(site 1), and the load-bearing discriminator tag write is retried then
+terminate-and-fail on final failure (site 2).
 """
 
 from __future__ import annotations
@@ -62,9 +65,12 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
-    def __init__(self, running_instances=None):
+    def __init__(self, running_instances=None, create_tags_failures=0):
         self.terminated = []
         self.tags_created = []
+        self.create_tags_attempts = 0
+        # First N create_tags calls raise (config#2267 site 2 retry tests).
+        self._create_tags_failures = create_tags_failures
         # {(cadence_slug, pipeline_name, run_date) -> [instance_ids]} already
         # "live" for the concurrency guard's describe_instances check to find.
         self._running_instances = dict(running_instances or {})
@@ -77,6 +83,9 @@ class _FakeEc2:
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
 
     def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
+        self.create_tags_attempts += 1
+        if self.create_tags_attempts <= self._create_tags_failures:
+            raise RuntimeError(f"CreateTags throttled (attempt {self.create_tags_attempts})")
         self.tags_created.append((Resources, Tags))
         return {}
 
@@ -145,11 +154,14 @@ class _FakeContext:
 
 
 def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None,
-          scheduler=None, sfn=None):
+          scheduler=None, sfn=None, create_tags_failures=0):
+    # config#2267 site 2 retry loop sleeps between attempts — zero it out.
+    monkeypatch.setenv("SF_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "0")
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
-    ec2 = _FakeEc2(running_instances=running_instances)
+    ec2 = _FakeEc2(running_instances=running_instances,
+                   create_tags_failures=create_tags_failures)
     scheduler = scheduler if scheduler is not None else _FakeScheduler()
     sfn = sfn if sfn is not None else _FakeSfn()
     clients = {"ec2": ec2, "ssm": ssm, "scheduler": scheduler, "stepfunctions": sfn}
@@ -172,6 +184,16 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None,
         importlib.reload(sys.modules["nousergon_lib.spot_dispatch"])
     else:
         import nousergon_lib.spot_dispatch  # noqa: F401 — first import picks up the current stub
+
+    # SpotProbeError back-fill (config#2267 site 1): index.py imports it and
+    # its requirements pin nousergon-lib v0.106.0 (the first version carrying
+    # it), but a local/shared environment may still have an OLDER installed
+    # lib. Inject a name-compatible stand-in so the suite runs under both —
+    # under >= 0.106.0 the real class is present and this is a no-op. (Reload
+    # above re-executes the module, so re-check every _load call.)
+    _sd = sys.modules["nousergon_lib.spot_dispatch"]
+    if not hasattr(_sd, "SpotProbeError"):
+        _sd.SpotProbeError = type("SpotProbeError", (Exception,), {})
 
     import index
 
@@ -380,7 +402,6 @@ def test_defer_schedule_name_deterministic_and_within_aws_cap(monkeypatch):
         ("saturday", "ne-weekly-freshness-pipeline"),
         ("weekday", "ne-preopen-trading-pipeline"),
         ("eod", "ne-postclose-trading-pipeline"),
-        ("eod", "alpha-engine-eod-pipeline"),
     ):
         for gen in (1, 2, 3):
             name = idx._defer_schedule_name(cadence, pipeline, "2026-07-11", gen)
@@ -644,7 +665,13 @@ def test_different_pipeline_same_cadence_and_date_is_not_blocked(monkeypatch):
     assert out["launched"] is True
 
 
-def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
+def test_concurrency_check_failure_still_launches(monkeypatch):
+    # config#2267 site 1 POLICY: a broken probe must never block a launch —
+    # coverage beats dedupe. (Under nousergon-lib >= 0.106.0 the raw
+    # describe_instances error surfaces as SpotProbeError and the launch is
+    # flagged dedupe_degraded; under the old fail-open lib it degrades to []
+    # silently. Either way the box launches — the explicit degraded-flag
+    # contract is pinned separately below.)
     idx = _load(
         monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
         env={"SF_WATCH_DISPATCH_ENABLED": "true"},
@@ -655,9 +682,70 @@ def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
 
     idx._test_ec2.describe_instances = _boom
     out = idx.handler(_event(), None)
-    # A broken check must never block a launch — optimization, not a
-    # correctness gate.
     assert out["launched"] is True
+
+
+def test_probe_failure_launches_with_dedupe_degraded_recorded(monkeypatch):
+    """config#2267 site 1: SpotProbeError from the concurrency probe →
+    proceed to launch, with dedupe_degraded:true + the probe error recorded
+    in the returned verdict (lib-version-agnostic via a direct monkeypatch
+    of the probe primitive)."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-degraded",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+    )
+
+    def _probe_down(*args, **kwargs):
+        raise idx.SpotProbeError("concurrency probe failed for tag_name='alpha-engine-sf-watch-spot': ThrottlingException: rate exceeded")
+
+    monkeypatch.setattr(idx.spot_dispatch, "running_instance_ids", _probe_down)
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["dedupe_degraded"] is True
+    # The verdict names the probe error — the GHA caller archives it.
+    assert "ThrottlingException" in out["dedupe_probe_error"]
+    # A healthy probe keeps the flag False.
+    idx2 = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out2 = idx2.handler(_event(), None)
+    assert out2["launched"] is True
+    assert out2["dedupe_degraded"] is False
+    assert "dedupe_probe_error" not in out2
+
+
+def test_transient_tag_write_failure_is_retried_then_launch_succeeds(monkeypatch):
+    """config#2267 site 2: create_tags failing twice then succeeding on the
+    third (final) attempt keeps the dispatch alive — the tags land."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-retagged",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        create_tags_failures=2,
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert idx._test_ec2.create_tags_attempts == 3
+    assert idx._test_ec2.tags_created  # third attempt landed the tags
+    assert idx._test_ec2.terminated == []
+
+
+def test_persistent_tag_write_failure_terminates_box_and_fails_dispatch(monkeypatch):
+    """config#2267 site 2: the discriminator tags are LOAD-BEARING — after
+    the bounded retry is exhausted the box is TERMINATED (it is invisible to
+    the dedupe guard and the orphan-reaper's completion check) and the
+    dispatch fails loudly with a clean launched:false."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-untaggable",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        create_tags_failures=99,
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is False
+    assert out["reason"] == "tag_write_failed"
+    assert out["instance_id"] == "i-untaggable"
+    assert "CreateTags throttled" in out["error"]
+    assert idx._test_ec2.create_tags_attempts == idx.TAG_WRITE_ATTEMPTS
+    # The untagged box was terminated, and no bootstrap was ever sent to it.
+    assert idx._test_ec2.terminated == ["i-untaggable"]
+    assert idx._test_ssm.sent == []
 
 
 def test_post_launch_ssm_failure_terminates_instance_returns_clean_false(monkeypatch):
@@ -716,9 +804,106 @@ def test_missing_optional_fields_still_launches(monkeypatch):
     assert out["launched"] is True
 
 
+# ── config#2270: force_on_demand relaunch (mid-run spot-reclaim coverage) ────
+
+
+def test_force_on_demand_threads_through_to_launch(monkeypatch):
+    """The reclaim checker's relaunch payload carries force_on_demand:"true" —
+    launch_with_fallback (nousergon-lib v0.106.0) must go STRAIGHT to
+    on-demand, never trying spot first."""
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-ondemand-relaunch"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(force_on_demand="true"), None)
+    assert out["launched"] is True
+    assert out["market"] == "on-demand"
+    assert out["force_on_demand"] is True
+    assert seen == [False]  # single attempt, spot=False — no spot try at all
+
+
+def test_force_on_demand_defaults_false_spot_first(monkeypatch):
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-spot"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["market"] == "spot"
+    assert out["force_on_demand"] is False
+    assert seen == [True]
+
+
+def test_force_on_demand_malformed_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(force_on_demand="yes-please"), None)
+    assert out["launched"] is False
+    assert out["reason"] == "invalid_event"
+    assert idx._test_ssm.sent == []
+
+
+def test_defer_payload_carries_force_on_demand(monkeypatch):
+    """A deferred re-invoke must not lose the on-demand escalation: the
+    one-shot schedule's payload carries force_on_demand through, so the
+    relaunch stays on-demand when it finally fires."""
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={
+            ("saturday", "ne-weekly-freshness-pipeline", "2026-07-11"): ["i-still-dying"],
+        },
+    )
+    out = idx.handler(_event(force_on_demand="true"), _FakeContext())
+    assert out["reason"] == "deferred"
+    (sched,) = idx._test_scheduler.created
+    payload = json.loads(sched["Target"]["Input"])
+    assert payload["force_on_demand"] == "true"
+
+
 def test_disabled_flag_short_circuits(monkeypatch):
     idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "false"})
     out = idx.handler(_event(), None)
     assert out["launched"] is False
     assert out["reason"] == "disabled"
     assert idx._test_ssm.sent == []
+
+
+def test_deploy_sh_launch_config_pins_match_index_defaults(monkeypatch):
+    """LOCKSTEP GUARD (config#2265): deploy.sh pins SF_WATCH_AMI_ID /
+    SF_WATCH_SECURITY_GROUP / SF_WATCH_SUBNETS into the deployed Lambda env —
+    the observable source of truth sf-watch-liveness-probe reads to verify the
+    launch config (AMI/SG/subnets) still exists twice daily. The pins MUST
+    equal this module's own in-code defaults, or the probe would verify a
+    DIFFERENT launch config than the one an env-stripped dispatcher would
+    actually launch with. Mirrors the probe's own EXPECTED_PIPELINE_NAMES
+    source-text lockstep guard."""
+    for var in ("SF_WATCH_AMI_ID", "SF_WATCH_SECURITY_GROUP", "SF_WATCH_SUBNETS"):
+        monkeypatch.delenv(var, raising=False)
+    idx = _load(monkeypatch)
+
+    deploy_sh = open(os.path.join(os.path.dirname(__file__), "deploy.sh")).read()
+    pins = {}
+    for var in ("LAUNCH_AMI_ID", "LAUNCH_SECURITY_GROUP", "LAUNCH_SUBNETS"):
+        m = re.search(rf'^{var}="([^"]+)"$', deploy_sh, re.M)
+        assert m is not None, (
+            f"deploy.sh no longer pins {var} — the liveness probe would alert "
+            "a MISSING launch-config key on every run after the next deploy"
+        )
+        pins[var] = m.group(1)
+
+    assert pins["LAUNCH_AMI_ID"] == idx.AMI_ID
+    assert pins["LAUNCH_SECURITY_GROUP"] == idx.SECURITY_GROUP
+    assert [s.strip() for s in pins["LAUNCH_SUBNETS"].split(",")] == idx.SUBNETS
+
+    # And the env JSON template actually carries all three pins into the
+    # deployed env (both the bootstrap create AND the every-deploy update use
+    # lambda_env_json).
+    for env_key in ("SF_WATCH_AMI_ID", "SF_WATCH_SECURITY_GROUP", "SF_WATCH_SUBNETS"):
+        assert f'\\"{env_key}\\"' in deploy_sh or f'"{env_key}"' in deploy_sh, (
+            f"deploy.sh's lambda_env_json no longer sets {env_key}"
+        )

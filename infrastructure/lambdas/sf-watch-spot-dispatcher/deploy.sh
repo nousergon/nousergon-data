@@ -53,7 +53,27 @@ DEFER_POLICY_NAME="alpha-engine-sf-watch-defer-scheduler-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
-LAMBDA_ENV="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true,SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
+# Launch-config pins (config#2265): the DEPLOYED env is the observable source
+# of truth the sf-watch-liveness-probe reads (it verifies these AMI/SG/subnet
+# ids still exist twice daily and alerts loud if any key is MISSING from the
+# live env). Values MUST equal index.py's in-code defaults — a lockstep test
+# in test_handler.py (test_deploy_sh_launch_config_pins_match_index_defaults)
+# enforces it. JSON form (not the Variables={...} shorthand) because the
+# subnet list itself contains commas.
+LAUNCH_AMI_ID="ami-0c421724a94bba6d6"
+LAUNCH_SECURITY_GROUP="sg-03cd3c4bd91e610b0"
+LAUNCH_SUBNETS="subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,subnet-c670118d,subnet-7cff7c43,subnet-e07166ec"
+lambda_env_json() {
+  # $1 = SF_WATCH_DISPATCH_ENABLED value (true|false)
+  printf '{"Variables":{"LOG_LEVEL":"INFO","SF_WATCH_DISPATCH_ENABLED":"%s","SF_WATCH_DEFER_ROLE_ARN":"%s","SF_WATCH_AMI_ID":"%s","SF_WATCH_SECURITY_GROUP":"%s","SF_WATCH_SUBNETS":"%s"}}' \
+    "$1" "${DEFER_ROLE_ARN}" "${LAUNCH_AMI_ID}" "${LAUNCH_SECURITY_GROUP}" "${LAUNCH_SUBNETS}"
+}
+# Bootstrap default (first-time deployment only) — sets SF_WATCH_DISPATCH_ENABLED=true
+# as the safe default. The update path (step 3) will read the live value and preserve it.
+LAMBDA_ENV_BOOTSTRAP="$(lambda_env_json true)"
+
+# Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
+source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
 
 DRY_RUN=false
 BOOTSTRAP=false
@@ -184,7 +204,7 @@ EOF
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment "${LAMBDA_ENV}" \
+      --environment "${LAMBDA_ENV_BOOTSTRAP}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -209,7 +229,15 @@ fi
 
 echo "✓ Code deployed."
 
-echo "Updating Lambda environment..."
+echo "Updating Lambda environment (preserving operator-owned SF_WATCH_DISPATCH_ENABLED)..."
+# SF_WATCH_DISPATCH_ENABLED is an OPERATOR-OWNED runtime flag (defer-not-drop gate) —
+# the update path must PRESERVE its live value, never reset it to bootstrap defaults.
+# This mirrors the saturday-sf-watch-dispatcher fix (config#1818): a routine redeploy
+# should not silently re-arm/disarm the operator's incident-response flag.
+CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" SF_WATCH_DISPATCH_ENABLED true)
+# Launch-config pins ride every update so the liveness probe always finds them
+# in the live env (see the lambda_env_json comment near the top, config#2265).
+LAMBDA_ENV="$(lambda_env_json "${CURRENT_DISPATCH}")"
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
   --environment "${LAMBDA_ENV}" \

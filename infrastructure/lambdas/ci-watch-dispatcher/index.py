@@ -41,9 +41,12 @@ CONCURRENCY LOCK — narrower than groom's per-tier lock (config#1979):
 keyed on `Name=alpha-engine-ci-watch-spot` + `ci-watch-repo=<repo>` +
 `ci-watch-sha=<sha>` (NOT bare repo). Two different commits on the same repo
 failing CI independently must each get their own box — a repo-only lock
-would starve the second commit's fix. Fail-safe OPEN on any API error (same
-posture as groom's `_running_tier_instance_ids`) — this guard is an
-optimization against duplicate spend, never a correctness gate.
+would starve the second commit's fix. A FAILED probe (SpotProbeError,
+config#2267 site 1) does NOT fail-open silently: the dispatch proceeds —
+coverage beats dedupe; a probe failure must never leave a real CI failure
+uncovered — but the degradation is recorded loudly (`dedupe_degraded: true`
+in the returned verdict + an ERROR log naming the probe error). This guard
+is an optimization against duplicate spend, never a correctness gate.
 
 IAM PROFILE — deliberately NOT `alpha-engine-executor-profile` (shared with
 the live trading executor). Uses `alpha-engine-ci-watch-executor-profile`, a
@@ -62,11 +65,16 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import uuid
 
 import boto3
 from nousergon_lib import spot_dispatch
-from nousergon_lib.spot_dispatch import SpotCapacityExhausted, SpotLaunchError
+from nousergon_lib.spot_dispatch import (  # SpotProbeError: nousergon-lib >= 0.106.0
+    SpotCapacityExhausted,
+    SpotLaunchError,
+    SpotProbeError,
+)
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -81,6 +89,13 @@ DISPATCH_ENABLED = os.environ.get("CI_WATCH_DISPATCH_ENABLED", "true").lower() =
 # ── Spot launch config (env-overridable; defaults mirror scheduled-groom-
 # dispatcher/data-spot-dispatcher — same default-VPC/AMI/security-group, only
 # the IAM profile differs for blast-radius isolation). ────────────────────────
+# IAM LOCKSTEP (config#2271): the INSTANCE_TYPES default below, AMI_ID,
+# SUBNETS, and SECURITY_GROUP are ENUMERATED in this Lambda's scoped
+# ec2:RunInstances policy (sibling iam-policy.json — JSON carries no
+# comments, so this is the canonical cross-reference). Changing any of these
+# defaults (or their env overrides at deploy time) WITHOUT updating
+# iam-policy.json + re-applying it will make RunInstances fail with
+# UnauthorizedOperation at the next dispatch. Keep them in sync.
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
@@ -108,6 +123,16 @@ VOLUME_SIZE_GB = int(os.environ.get("CI_WATCH_VOLUME_SIZE_GB", "40"))
 CI_WATCH_TAG_NAME = "alpha-engine-ci-watch-spot"
 CI_WATCH_REPO_TAG_KEY = "ci-watch-repo"
 CI_WATCH_SHA_TAG_KEY = "ci-watch-sha"
+
+# Discriminator tag write (config#2267 site 2, same defect class as
+# sf-watch-spot-dispatcher's): the (repo, sha) tags are LOAD-BEARING —
+# without them the next failure's dedupe guard is blind (duplicate box) and
+# spot-orphan-reaper cannot derive the completion-marker key (guaranteed
+# false "incomplete reap" page for a healthy run). Bounded retry, then
+# terminate-the-box-and-fail-the-dispatch on final failure. Retry delay is
+# env-overridable so tests run at 0.
+TAG_WRITE_ATTEMPTS = int(os.environ.get("CI_WATCH_TAG_WRITE_ATTEMPTS", "3"))
+TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("CI_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "2"))
 
 # The box reads its own run secrets (PAT) via its instance profile in the
 # common case, but the PRELUDE below (run before the profile-backed bootstrap
@@ -245,10 +270,10 @@ def _running_ci_watch_instance_ids(repo: str, sha: str) -> list[str]:
     """Instance ids for a LIVE (pending/running) ci-watch box already working
     THIS exact (repo, sha) — deliberately NARROWER than groom's per-tier lock
     (config#1979): two different commits on the same repo failing CI
-    independently must each get their own box. Fail-safe: any API error
-    returns [] (never blocks a launch on a broken check — an optimization,
-    not a correctness gate, mirroring every other pre-launch guard in the
-    fleet)."""
+    independently must each get their own box. Raises SpotProbeError
+    (nousergon-lib >= 0.106.0, config#2267 site 1) when the probe itself
+    fails — the caller degrades to launch-with-dedupe_degraded, never a
+    silent fail-open []."""
     return spot_dispatch.running_instance_ids(
         CI_WATCH_TAG_NAME,
         {CI_WATCH_REPO_TAG_KEY: repo, CI_WATCH_SHA_TAG_KEY: sha},
@@ -265,6 +290,35 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="ci-watch")
 
 
+def _create_discriminator_tags(instance_id: str, repo: str, sha: str) -> str | None:
+    """Write the load-bearing (repo, sha) discriminator tags (config#2267
+    site 2) with a bounded retry. Returns None on success, or the final
+    ``"ExcName: msg"`` string after TAG_WRITE_ATTEMPTS failures — the caller
+    terminates the box and fails the dispatch (the tags are what make the
+    box visible to the dedupe guard and the spot-orphan-reaper; an untagged
+    box must not run)."""
+    tags = [
+        {"Key": CI_WATCH_REPO_TAG_KEY, "Value": repo},
+        {"Key": CI_WATCH_SHA_TAG_KEY, "Value": sha},
+    ]
+    last_error = ""
+    for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
+        try:
+            boto3.client("ec2", region_name=REGION).create_tags(
+                Resources=[instance_id], Tags=tags
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — bounded retry; final failure is FATAL to the dispatch (caller terminates + fails)
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "ci-watch discriminator tag write attempt %d/%d failed for %s: %s",
+                attempt, TAG_WRITE_ATTEMPTS, instance_id, last_error,
+            )
+            if attempt < TAG_WRITE_ATTEMPTS:
+                time.sleep(TAG_WRITE_RETRY_DELAY_SEC)
+    return last_error
+
+
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str) -> dict:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
@@ -274,7 +328,27 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
         logger.warning("CI_WATCH_DISPATCH_ENABLED=false — ci-watch spot NOT launched")
         return {"launched": False, "reason": "disabled"}
 
-    existing = _running_ci_watch_instance_ids(repo, sha)
+    dedupe_degraded = False
+    dedupe_probe_error = ""
+    try:
+        existing = _running_ci_watch_instance_ids(repo, sha)
+    except SpotProbeError as exc:
+        # Degraded-probe swallow (config#2267 site 1 POLICY): failure mode
+        # swallowed = a possible duplicate box (the probe could not rule one
+        # out); the primary deliverable — watch coverage of a REAL CI failure
+        # — survives, and coverage beats dedupe: a probe failure must never
+        # leave a real CI failure uncovered. Recording surfaces: this ERROR
+        # log + `dedupe_degraded: true` in the returned verdict the GHA
+        # caller archives.
+        dedupe_degraded = True
+        dedupe_probe_error = f"{type(exc).__name__}: {exc}"
+        existing = []
+        logger.error(
+            "ci-watch concurrency probe FAILED for %s@%s — proceeding to "
+            "launch with dedupe_degraded=true (coverage beats dedupe; a "
+            "duplicate box is possible): %s",
+            repo, sha, dedupe_probe_error,
+        )
     if existing:
         logger.warning(
             "ci-watch box already live for %s@%s (%s) — skipping launch to avoid a "
@@ -289,21 +363,28 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
         logger.error("ci-watch spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
 
-    logger.info("launched ci-watch box %s (%s) for %s@%s", instance_id, market, repo, sha)
-    # config#1979-style tag so the NEXT trigger's guard check (above) can find
-    # it. Best-effort — a tag-write failure must not abort an already-launched
-    # box (mirrors groom's fail-safe posture on its own tier tag).
-    try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id],
-            Tags=[
-                {"Key": CI_WATCH_REPO_TAG_KEY, "Value": repo},
-                {"Key": CI_WATCH_SHA_TAG_KEY, "Value": sha},
-            ],
+    logger.info("launched ci-watch box %s (%s) for %s@%s%s", instance_id, market, repo, sha,
+                " dedupe_degraded=true" if dedupe_degraded else "")
+    # config#1979-style tags so the NEXT trigger's guard check (above) — and
+    # the fleet spot-orphan-reaper's completion-marker lookup — can find the
+    # box. LOAD-BEARING, not cosmetic (config#2267 site 2): bounded retry,
+    # then TERMINATE the box and fail the dispatch on final failure — a box
+    # invisible to the dedupe guard and the reaper must not run. (The root
+    # fix — discriminator tags atomic with launch via RunInstances
+    # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
+    # RunInstances chokepoint, growing an extra-tags parameter; until then
+    # this retry+terminate closes the hole loudly.)
+    tag_error = _create_discriminator_tags(instance_id, repo, sha)
+    if tag_error is not None:
+        _terminate_instance(instance_id)
+        logger.error(
+            "ci-watch discriminator tag write FAILED after %d attempts for %s "
+            "(%s@%s) — box terminated, dispatch failed: %s",
+            TAG_WRITE_ATTEMPTS, instance_id, repo, sha, tag_error,
         )
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors groom's tier-tag write
-        logger.warning("ci-watch repo/sha tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
+        return {"launched": False, "reason": "tag_write_failed",
+                "instance_id": instance_id, "error": tag_error,
+                "dedupe_degraded": dedupe_degraded}
 
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —
@@ -318,13 +399,15 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
         logger.error("ci-watch post-launch step failed for %s: %s: %s",
                      instance_id, type(exc).__name__, exc)
         return {"launched": False, "reason": "post_launch_failed",
-                "instance_id": instance_id, "error": str(exc)}
+                "instance_id": instance_id, "error": str(exc),
+                "dedupe_degraded": dedupe_degraded}
 
     logger.info(
         "ci-watch dispatched: instance=%s market=%s command=%s repo=%s sha=%s run_id=%s "
-        "run_token=%s", instance_id, market, command_id, repo, sha, run_id, run_token,
+        "run_token=%s dedupe_degraded=%s", instance_id, market, command_id, repo, sha,
+        run_id, run_token, dedupe_degraded,
     )
-    return {
+    verdict = {
         "launched": True,
         "reason": "launched",
         "instance_id": instance_id,
@@ -334,7 +417,11 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
         "sha": sha,
         "run_id": run_id,
         "run_token": run_token,
+        "dedupe_degraded": dedupe_degraded,
     }
+    if dedupe_degraded:
+        verdict["dedupe_probe_error"] = dedupe_probe_error
+    return verdict
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
