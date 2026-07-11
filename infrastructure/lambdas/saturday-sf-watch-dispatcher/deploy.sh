@@ -125,7 +125,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FAST_PATH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FAST_PATH_ENABLED=false,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -205,9 +205,14 @@ CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" AGENT_DISPAT
 # FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
 # AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
 CURRENT_FAST_PATH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" FAST_PATH_ENABLED false)
+# EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION (config#2003) is operator-owned
+# exactly like the two flags above — preserved via the shared helper
+# (config#1818/#2264 class: the update call REPLACES the whole Variables
+# map, so any operator-set flag missing here silently resets on redeploy).
+CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION false)
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
+  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

@@ -21,6 +21,8 @@ OPERATOR_FLAGS = {
     "saturday-sf-watch-dispatcher": [
         ("AGENT_DISPATCH_ENABLED", "false", "CURRENT_DISPATCH"),
         ("FAST_PATH_ENABLED", "false", "CURRENT_FAST_PATH"),
+        # config#2003: post-escalation dispatch override — operator-owned
+        ("EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION", "false", "CURRENT_DISPATCH_AFTER_ESCALATION"),
     ],
     "sf-watch-spot-dispatcher": [
         ("SF_WATCH_DISPATCH_ENABLED", "true", "CURRENT_DISPATCH"),

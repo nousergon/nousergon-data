@@ -33,6 +33,22 @@ dispatcher-errors`` CloudWatch alarm (provisioned by
 GetExecutionHistory), the Telegram record, and the agent dispatch are secondary
 observability hung off the primary path: their failure is logged at WARNING and
 recorded in the artifact — the artifact still records that a failure was detected.
+
+**Dispatch suppression, never silent (config#2003).** Two carve-outs stop a
+SECOND agent from being summoned for an incident already being handled — both
+still write the watch-log event AND send the Telegram receipt (`mode:
+DISPATCH SUPPRESSED`), recording the decision via `dispatch_suppressed`
+(never a silent skip):
+1. **Operator-recovery reruns** — an execution named after the watch's own
+   recommended recovery-rerun convention (`watch-rerun-*`) or this Lambda's
+   own fast-path rerun (`fast-path-rerun-*`) is a recovery attempt already in
+   progress, not a fresh incident (`RECOVERY_RERUN_NAME_PREFIXES`).
+2. **Same-day post-escalation repeats** — once this pipeline's watch-log for
+   today already carries an `action: escalated` event (a human is already
+   engaged), subsequent failures suppress by default. Opt back into the old
+   dispatch-every-failure behavior with
+   `EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true`.
+Neither carve-out suppresses the FIRST failure of a pipeline/day.
 """
 
 from __future__ import annotations
@@ -78,6 +94,14 @@ AGENT_DISPATCH_ENABLED = (
 # the live value across redeploys — the config#1818 lesson).
 FAST_PATH_ENABLED = (
     os.environ.get("FAST_PATH_ENABLED", "false").lower() == "true"
+)
+# config#2003 — post-escalation dispatch kill-switch. Default OFF (old
+# ask-forgiveness behavior: dispatch on every failure, even after an
+# `action: escalated` event already engaged a human that same run_date).
+# Setting this true OPTS BACK IN to duplicate dispatch on repeat failures of an
+# already-escalated pipeline/day — see `_already_escalated_today`.
+DISPATCH_AFTER_ESCALATION = (
+    os.environ.get("EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION", "false").lower() == "true"
 )
 # repository_dispatch target — the private alpha-engine-config repo hosts the
 # agent GHA workflow (on: repository_dispatch, types: [*-sf-failure]).
@@ -165,6 +189,19 @@ _CAUSE_MAX_CHARS = 600
 # `ABORTED`, because a programmatic/self-abort can still be a real defect that
 # must dispatch. `OperatorAbort` is the marker the fleet's manual-stop path sets.
 OPERATOR_ABORT_ERRORS = frozenset({"OperatorAbort"})
+# config#2003 — operator-recovery-rerun carve-out. `watch-rerun-*` is the
+# dispatcher's OWN recommended-command naming convention (the Telegram receipt
+# / runbook tell the operator to StartExecution with this prefix when manually
+# recovering an already-diagnosed, already-escalated incident — see the
+# 2026-07-08 EOD incident, config#1446/#1464, where the watch escalated the
+# original failure then dispatched TWO more agents for the operator's own
+# `watch-rerun-2026-07-08-1`/`-2` recovery attempts). `fast-path-rerun-*` is
+# this Lambda's own deterministic-rerun prefix (config#1900) — an execution it
+# started itself never needs a second agent dispatch either. Prefix-matched
+# against the SF execution NAME (`detail.name`), never the ARN. Keep this list
+# SMALL and EXPLICIT, mirroring OPERATOR_ABORT_ERRORS above — a new recovery
+# convention must be added here deliberately, not inferred.
+RECOVERY_RERUN_NAME_PREFIXES = ("watch-rerun-", "fast-path-rerun-")
 # Bound the history scan: fetch the newest N events (reverseOrder), reconstruct
 # chronological order locally to find the entered-but-not-exited state. The
 # failed state's enclosing StateEntered is always in the tail of the history.
@@ -214,6 +251,35 @@ def _is_operator_abort(status: str, describe_resp: dict | None) -> bool:
         return False
     error = (describe_resp.get("error") or "").strip()
     return error in OPERATOR_ABORT_ERRORS
+
+
+def _is_operator_recovery_rerun(execution_name: str) -> bool:
+    """True iff ``execution_name`` matches one of the dispatcher's own
+    documented recovery-rerun naming conventions (config#2003).
+
+    A failure of an execution named e.g. ``watch-rerun-2026-07-08-1`` is not a
+    fresh incident — it's the operator (or the fast path) already acting on an
+    incident this watch already diagnosed/escalated. Dispatching a second
+    agent for it duplicates a recovery already in progress and risks a
+    collision. Deliberately a prefix allowlist, not a heuristic — an unmatched
+    name (including one that merely CONTAINS "rerun") still dispatches
+    normally, so a genuine new incident is never silently swallowed."""
+    return execution_name.startswith(RECOVERY_RERUN_NAME_PREFIXES)
+
+
+def _already_escalated_today(existing_events: list[dict]) -> bool:
+    """True iff this run_date's watch-log (already loaded) contains an
+    ``action: escalated`` event for this pipeline (config#2003).
+
+    ``escalated`` is written back into the watch-log by the downstream
+    resilience agent when it classifies an incident as human-gated (e.g. an
+    IAM change) — the same convention exercised by the fast-path's own
+    prior-attempt fixture (see `_prior_attempt_state`'s sibling tests). Once a
+    human is already engaged for this pipeline/day, a second failure (an
+    operator-recovery attempt or an unrelated repeat) should not summon a
+    SECOND agent by default — see `DISPATCH_AFTER_ESCALATION` for the
+    operator-owned override."""
+    return any(ev.get("action") == "escalated" for ev in existing_events)
 
 
 def _is_preflight(describe_resp: dict | None) -> bool:
@@ -520,10 +586,17 @@ def _load_existing(s3, key: str) -> dict:
     return fresh
 
 
-def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str, cfg: dict) -> dict:
+def _build_event_record(
+    detail: dict,
+    describe_resp: dict | None,
+    run_date: str,
+    cfg: dict,
+    existing_events: list[dict] | None = None,
+) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
     cause = _failure_cause(describe_resp)
     failed_state = _failed_state_from_history(detail.get("executionArn", ""))
+    execution_name = detail.get("name", "")
     # config#1535: "will an agent actually be dispatched" depends on BOTH the
     # global kill-switch AND this specific pipeline having a wired listener —
     # not the global flag alone (that was the bug: claiming "dispatch" for a
@@ -531,28 +604,34 @@ def _build_event_record(detail: dict, describe_resp: dict | None, run_date: str,
     # config#1827: a deliberate operator abort is recorded loudly but never
     # auto-dispatches a recovery agent (would waste a cycle and, once weekday/EOD
     # leave propose-only, risk an automated countermand of a human decision).
+    # config#2003: two more carve-outs, checked in order (first match wins —
+    # the reason string is a single value, most-specific/deliberate first):
+    #   operator_abort            — an explicit human STOP marker.
+    #   operator_recovery_rerun   — this execution's OWN name says it's a
+    #                               recovery attempt (watch-rerun-*, this
+    #                               Lambda's own fast-path-rerun-*), not a
+    #                               fresh incident.
+    #   already_escalated_today   — a human is already engaged for this
+    #                               pipeline/day (an `action: escalated` event
+    #                               already landed in today's watch-log).
     operator_abort = _is_operator_abort(detail.get("status", ""), describe_resp)
-    # is_preflight: the Friday-PM dry pass of ne-weekly-freshness-pipeline
-    # (shell_run=true) is a deliberate rehearsal of Saturday's real run, not a
-    # production failure — a preflight FAILED/TIMED_OUT/ABORTED must never be
-    # indistinguishable from a genuine Saturday failure and summon the full
-    # diagnose-fix-merge-rerun agent against production. Prior to this fix
-    # is_preflight only gated the deterministic fast-path rerun (_maybe_fast_path
-    # reason="preflight"); the agent-dispatch path had no such gate at all, so a
-    # failed Friday shell-run WOULD have fired a genuine saturday-sf-failure
-    # dispatch (found 2026-07-10, before ever firing live).
     is_preflight = _is_preflight(describe_resp)
+    operator_recovery_rerun = _is_operator_recovery_rerun(execution_name)
+    already_escalated = bool(existing_events) and _already_escalated_today(existing_events)
     if operator_abort:
         dispatch_suppressed = "operator_abort"
     elif is_preflight:
         dispatch_suppressed = "preflight"
+    elif operator_recovery_rerun:
+        dispatch_suppressed = "operator_recovery_rerun"
+    elif already_escalated and not DISPATCH_AFTER_ESCALATION:
+        dispatch_suppressed = "already_escalated_today"
     else:
         dispatch_suppressed = None
     will_dispatch = (
         AGENT_DISPATCH_ENABLED
         and bool(cfg.get("has_listener", True))
-        and not operator_abort
-        and not is_preflight
+        and dispatch_suppressed is None
     )
     return {
         "detected_at": now_iso,
@@ -614,15 +693,32 @@ def _pipeline_label(pipeline_name: str) -> str:
     return pipeline_name.removeprefix("ne-").removesuffix("-pipeline") or pipeline_name
 
 
-def _watch_is_acting(record: dict, dispatch: dict) -> bool:
-    """True only when this invocation actually started recovery work.
+# config#2003 — suppression reasons that STILL get a Telegram receipt (the
+# issue's "observability stays; only the agent spin-up is suppressed"
+# requirement). Distinct from `operator_abort` (config#1827), which stays
+# SILENT because it's a deliberate human STOP the operator already knows
+# about first-hand. These two are the opposite case: the operator needs the
+# confirmation that the watch correctly recognized their recovery attempt (or
+# the already-escalated repeat) and deliberately did NOT spin up a duplicate
+# agent — silence there would look like the watch simply missed the failure.
+_TELEGRAM_ON_SUPPRESSED_REASONS = frozenset(
+    {"operator_recovery_rerun", "already_escalated_today"}
+)
 
-    Observe-only paths (kill-switch off, no listener, operator abort, fast-path
-    miss with dispatch disabled, etc.) still land in the watch-log but must NOT
-    ping Telegram — sf-telegram-notifier already alerted on the failure, and a
-    Fleet-SF Watch receipt with no action is noise (especially for pipelines
-    removed from the agent surface, e.g. groom post config#1795)."""
+
+def _watch_is_acting(record: dict, dispatch: dict) -> bool:
+    """True when this invocation either started recovery work OR made a
+    suppression decision the operator needs a receipt for (config#2003).
+
+    Pure observe-only paths (kill-switch off, no listener, operator abort,
+    fast-path miss with dispatch disabled, etc.) still land in the watch-log
+    but must NOT ping Telegram — sf-telegram-notifier already alerted on the
+    failure, and a Fleet-SF Watch receipt with no action is noise (especially
+    for pipelines removed from the agent surface, e.g. groom post
+    config#1795)."""
     if record.get("action") == "fast_path_rerun":
+        return True
+    if record.get("dispatch_suppressed") in _TELEGRAM_ON_SUPPRESSED_REASONS:
         return True
     return dispatch.get("dispatched") is True
 
@@ -646,7 +742,12 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     will_dispatch = (
         AGENT_DISPATCH_ENABLED and has_listener and not suppressed and not fast_path
     )
-    mode = "AUTO-RERUN" if fast_path else ("AUTO-FIX" if will_dispatch else "OBSERVE")
+    mode = (
+        "AUTO-RERUN" if fast_path
+        else "AUTO-FIX" if will_dispatch
+        else "DISPATCH SUPPRESSED" if suppressed in _TELEGRAM_ON_SUPPRESSED_REASONS
+        else "OBSERVE"
+    )
     lines = [
         f"\U0001f6f0️ *Fleet-SF Watch — {mode}*",
         f"{label}: {record['status']}",
@@ -666,6 +767,17 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
         footer = "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
     elif suppressed == "operator_abort":
         footer = "_operator abort — recorded loudly, no autonomous recovery (deliberate human stop)_"
+    elif suppressed == "operator_recovery_rerun":
+        footer = (
+            "_execution name matches a recovery-rerun convention "
+            f"(`{record.get('execution_name', '')}`) — no duplicate agent dispatched "
+            "(config#2003)_"
+        )
+    elif suppressed == "already_escalated_today":
+        footer = (
+            "_pipeline already escalated to a human today — no duplicate agent dispatched "
+            "(config#2003; set EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true to opt back in)_"
+        )
     elif AGENT_DISPATCH_ENABLED and not has_listener:
         footer = "_observe-only for this pipeline — no autonomous remediation wired yet (needs Brian)_"
     else:
@@ -788,11 +900,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     describe_resp = _describe_execution(detail.get("executionArn", ""))
     run_date = _run_date(describe_resp, detail)
-    record = _build_event_record(detail, describe_resp, run_date, cfg)
 
     s3 = _s3_client()
     key = _artifact_key(cfg["watch_prefix"], run_date)
     doc = _load_existing(s3, key)
+    # config#2003: today's already-written events (if any) feed the
+    # already-escalated-today + operator-recovery-rerun suppression checks —
+    # loaded BEFORE building the record so the very first failure of the
+    # pipeline/day (empty `events`) can never see a false "already escalated".
+    record = _build_event_record(detail, describe_resp, run_date, cfg, doc.get("events", []))
     # config#1900: the deterministic fast path runs BEFORE the write so the
     # watch-log event carries the full outcome (action/signature/rerun arn) in
     # one record. It mutates `record` in place on success; every non-fire is a
