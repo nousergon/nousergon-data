@@ -402,7 +402,6 @@ def test_defer_schedule_name_deterministic_and_within_aws_cap(monkeypatch):
         ("saturday", "ne-weekly-freshness-pipeline"),
         ("weekday", "ne-preopen-trading-pipeline"),
         ("eod", "ne-postclose-trading-pipeline"),
-        ("eod", "alpha-engine-eod-pipeline"),
     ):
         for gen in (1, 2, 3):
             name = idx._defer_schedule_name(cadence, pipeline, "2026-07-11", gen)
@@ -803,6 +802,67 @@ def test_missing_optional_fields_still_launches(monkeypatch):
         del event[optional]
     out = idx.handler(event, None)
     assert out["launched"] is True
+
+
+# ── config#2270: force_on_demand relaunch (mid-run spot-reclaim coverage) ────
+
+
+def test_force_on_demand_threads_through_to_launch(monkeypatch):
+    """The reclaim checker's relaunch payload carries force_on_demand:"true" —
+    launch_with_fallback (nousergon-lib v0.106.0) must go STRAIGHT to
+    on-demand, never trying spot first."""
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-ondemand-relaunch"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(force_on_demand="true"), None)
+    assert out["launched"] is True
+    assert out["market"] == "on-demand"
+    assert out["force_on_demand"] is True
+    assert seen == [False]  # single attempt, spot=False — no spot try at all
+
+
+def test_force_on_demand_defaults_false_spot_first(monkeypatch):
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-spot"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["market"] == "spot"
+    assert out["force_on_demand"] is False
+    assert seen == [True]
+
+
+def test_force_on_demand_malformed_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(force_on_demand="yes-please"), None)
+    assert out["launched"] is False
+    assert out["reason"] == "invalid_event"
+    assert idx._test_ssm.sent == []
+
+
+def test_defer_payload_carries_force_on_demand(monkeypatch):
+    """A deferred re-invoke must not lose the on-demand escalation: the
+    one-shot schedule's payload carries force_on_demand through, so the
+    relaunch stays on-demand when it finally fires."""
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={
+            ("saturday", "ne-weekly-freshness-pipeline", "2026-07-11"): ["i-still-dying"],
+        },
+    )
+    out = idx.handler(_event(force_on_demand="true"), _FakeContext())
+    assert out["reason"] == "deferred"
+    (sched,) = idx._test_scheduler.created
+    payload = json.loads(sched["Target"]["Input"])
+    assert payload["force_on_demand"] == "true"
 
 
 def test_disabled_flag_short_circuits(monkeypatch):

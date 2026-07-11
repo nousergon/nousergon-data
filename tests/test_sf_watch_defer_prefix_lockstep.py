@@ -70,9 +70,9 @@ def _saturday_pipeline_prefixes() -> dict[str, str]:
 def test_spot_dispatcher_watch_prefixes_match_saturday_dispatcher_exactly():
     """EXACT equality, both directions: a pipeline added/removed/renamed (or a
     prefix changed) in saturday-sf-watch-dispatcher's PIPELINES must land in
-    the spot dispatcher's _WATCH_PREFIXES in the same PR — including the
-    TRANSITIONAL alpha-engine-eod-pipeline alias, which must be REMOVED from
-    both together at the config#1408 SF-rename cutover."""
+    the spot dispatcher's _WATCH_PREFIXES in the same PR — exactly how the
+    TRANSITIONAL alpha-engine-eod-pipeline alias was removed from both
+    together at the config#2272 retirement (2026-07-11)."""
     assert _spot_dispatcher_prefixes() == _saturday_pipeline_prefixes()
 
 

@@ -49,6 +49,23 @@ DISPATCH SUPPRESSED`), recording the decision via `dispatch_suppressed`
    dispatch-every-failure behavior with
    `EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true`.
 Neither carve-out suppresses the FIRST failure of a pipeline/day.
+
+**Mechanical per-cadence dispatch ceiling (config#2269).** The charter's
+attempt budget is honor-system — it depends on the dispatched agent reading
+the watch-log AND enriching it with `agent_attempt`. This dispatcher now ALSO
+enforces the budget mechanically: before each agent dispatch it counts PRIOR
+budget-consuming events for this (cadence, pipeline, run_date) from its OWN
+watch-log (see ``_BUDGET_CONSUMING_ACTIONS`` — dispatcher-authored ``action``
+values plus the agent's in-place outcome rewrites of those same events; NEVER
+the agent-enriched ``agent_attempt`` field, so an agent crash can neither
+reset nor starve the count). At/over the per-cadence ceiling
+(``SF_WATCH_MAX_DISPATCHES_{SATURDAY,WEEKDAY,EOD}``, defaults 8/2/2 per
+Brian's 2026-07-11 per-cadence ruling) the dispatch is suppressed with
+``dispatch_suppressed: attempt_budget_exhausted`` and a LOUD Telegram
+escalation fires — budget exhaustion means "the watch has given up on today;
+human needed", which must page, never the silent receipt. This ceiling
+COMPOSES with (never replaces) the config#2003 suppressions and the
+charter-side budget: it is the outermost runaway backstop.
 """
 
 from __future__ import annotations
@@ -103,6 +120,24 @@ FAST_PATH_ENABLED = (
 DISPATCH_AFTER_ESCALATION = (
     os.environ.get("EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION", "false").lower() == "true"
 )
+# config#2269 — mechanical per-cadence dispatch ceiling. Hard runaway backstop
+# on agent dispatches per (cadence, pipeline, run_date), mirroring the
+# charter's Brian-ruled per-cadence budgets (2026-07-11): saturday tolerates
+# distinct-new-root-causes, hard backstop 8/run_date; weekday/eod cap 2.
+# These are CONFIG DEFAULTS, not operator kill-switches: deploy.sh pins them
+# and deliberately does NOT run them through the preserve_env_flag helper —
+# the canonical way to change a ceiling is a PR editing these defaults +
+# deploy.sh, not a live env tweak that a redeploy should preserve.
+# int() raising on a malformed env value is deliberate fail-loud: a broken
+# ceiling config must surface at deploy/import time, never default silently.
+SF_WATCH_MAX_DISPATCHES: dict[str, int] = {
+    "saturday": int(os.environ.get("SF_WATCH_MAX_DISPATCHES_SATURDAY", "8")),
+    "weekday": int(os.environ.get("SF_WATCH_MAX_DISPATCHES_WEEKDAY", "2")),
+    "eod": int(os.environ.get("SF_WATCH_MAX_DISPATCHES_EOD", "2")),
+}
+# A cadence slug not in the map (e.g. a future pipeline registered before its
+# budget is ruled) gets the CONSERVATIVE weekday/eod cap, never the saturday 8.
+_DEFAULT_MAX_DISPATCHES = 2
 # repository_dispatch target — the private alpha-engine-config repo hosts the
 # agent GHA workflow (on: repository_dispatch, types: [*-sf-failure]).
 DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
@@ -166,19 +201,9 @@ PIPELINES: dict[str, dict[str, object]] = {
         "dispatch_event_type": "eod-sf-failure",
         "has_listener": True,
     },
-    # TRANSITIONAL (remove at the SF-rename cutover — config#1408 / re-exam
-    # 2026-07-03). The EOD SF still runs under its OLD name `alpha-engine-eod-
-    # pipeline` (saturday/weekday already renamed; EOD lags). Until cutover, the
-    # LIVE failures arrive under the old ARN, so the registry must recognize it —
-    # otherwise the handler ignores the event (the 2026-06-29 dead-watch gap).
-    # Routes to the SAME eod cadence resources as ne-postclose-trading-pipeline.
-    "alpha-engine-eod-pipeline": {
-        "cadence_slug": "eod",
-        "label": "Post-close Trading",
-        "watch_prefix": "consolidated/eod_sf_watch",
-        "dispatch_event_type": "eod-sf-failure",
-        "has_listener": True,
-    },
+    # The transitional `alpha-engine-eod-pipeline` alias (config#1408) was
+    # retired 2026-07-11 (config#2272) after the dormant old state machine was
+    # DELETED live — zero executions since the 2026-06-29 ne-rename.
 }
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600
@@ -280,6 +305,54 @@ def _already_escalated_today(existing_events: list[dict]) -> bool:
     SECOND agent by default — see `DISPATCH_AFTER_ESCALATION` for the
     operator-owned override."""
     return any(ev.get("action") == "escalated" for ev in existing_events)
+
+
+# config#2269 — watch-log `action` values that CONSUMED a dispatch/rerun out
+# of the day's budget. Chosen from what this dispatcher itself writes plus the
+# charter's documented in-place enrichment of those same events, so the count
+# is correct whether the dispatched agent crashed OR completed:
+#   dispatch           — written by THIS Lambda at dispatch intent (the state
+#                        an event stays in when the agent crashes before
+#                        enriching — the exact starvation case config#2269
+#                        exists to close).
+#   fixed_merged_rerun / rerun / proposed / refused / escalated
+#                      — the charter's STEP 6 outcome values, which REWRITE
+#                        the matching dispatch event's `action` IN PLACE (one
+#                        event, one action — never a double count).
+#   dispatched         — defensive: post-hoc/manual enrichment variant already
+#                        present in historical fixtures.
+#   fast_path_rerun    — this Lambda's own deterministic rerun (config#1900);
+#                        charter STEP 2 counts these against the same budget.
+#   reclaim_relaunch   — sf-watch-liveness-probe's mid-run spot-reclaim
+#                        relaunch record (config#2270; same shared counter).
+# Deliberately NOT keyed on `agent_attempt`: that field is agent-enriched, so
+# an agent crash would make the count starvable (unbounded re-dispatch).
+# `observe` events never consume budget.
+_BUDGET_CONSUMING_ACTIONS = frozenset({
+    "dispatch",
+    "dispatched",
+    "fixed_merged_rerun",
+    "rerun",
+    "proposed",
+    "refused",
+    "escalated",
+    "fast_path_rerun",
+    "reclaim_relaunch",
+})
+
+
+def _prior_dispatch_count(existing_events: list[dict]) -> int:
+    """How many of today's already-recorded events consumed the dispatch
+    budget (config#2269). Counts dispatcher-authored `action` values (and
+    their documented in-place agent rewrites) ONLY — see
+    ``_BUDGET_CONSUMING_ACTIONS``."""
+    return sum(1 for ev in existing_events if ev.get("action") in _BUDGET_CONSUMING_ACTIONS)
+
+
+def _max_dispatches(cadence_slug: str) -> int:
+    """Per-cadence dispatch ceiling (config#2269) — 8 for saturday, 2 for
+    weekday/eod, conservative 2 for any unruled future cadence."""
+    return SF_WATCH_MAX_DISPATCHES.get(cadence_slug, _DEFAULT_MAX_DISPATCHES)
 
 
 def _is_preflight(describe_resp: dict | None) -> bool:
@@ -614,10 +687,18 @@ def _build_event_record(
     #   already_escalated_today   — a human is already engaged for this
     #                               pipeline/day (an `action: escalated` event
     #                               already landed in today's watch-log).
+    # config#2269: checked LAST in the chain below — the ceiling is the
+    #   outermost runaway backstop and must fire even when the operator opted
+    #   back into post-escalation dispatch (DISPATCH_AFTER_ESCALATION=true).
+    #   The count uses dispatcher-authored fields only (never agent_attempt)
+    #   so an agent crash can't reset it — see _BUDGET_CONSUMING_ACTIONS.
     operator_abort = _is_operator_abort(detail.get("status", ""), describe_resp)
     is_preflight = _is_preflight(describe_resp)
     operator_recovery_rerun = _is_operator_recovery_rerun(execution_name)
     already_escalated = bool(existing_events) and _already_escalated_today(existing_events)
+    prior_dispatches = _prior_dispatch_count(existing_events or [])
+    dispatch_ceiling = _max_dispatches(str(cfg.get("cadence_slug", "")))
+    budget_exhausted = prior_dispatches >= dispatch_ceiling
     if operator_abort:
         dispatch_suppressed = "operator_abort"
     elif is_preflight:
@@ -626,6 +707,8 @@ def _build_event_record(
         dispatch_suppressed = "operator_recovery_rerun"
     elif already_escalated and not DISPATCH_AFTER_ESCALATION:
         dispatch_suppressed = "already_escalated_today"
+    elif budget_exhausted:
+        dispatch_suppressed = "attempt_budget_exhausted"
     else:
         dispatch_suppressed = None
     will_dispatch = (
@@ -633,7 +716,7 @@ def _build_event_record(
         and bool(cfg.get("has_listener", True))
         and dispatch_suppressed is None
     )
-    return {
+    record: dict = {
         "detected_at": now_iso,
         "status": detail.get("status", "UNKNOWN"),
         "state_machine": (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1],
@@ -656,6 +739,12 @@ def _build_event_record(
         # auditable in the watch-log and on the dashboard.
         "dispatch_suppressed": dispatch_suppressed,
     }
+    if dispatch_suppressed == "attempt_budget_exhausted":
+        # config#2269: make the exhaustion auditable in the watch-log itself
+        # (additive fields — S3 schema contract allows ADD only).
+        record["prior_dispatch_count"] = prior_dispatches
+        record["dispatch_ceiling"] = dispatch_ceiling
+    return record
 
 
 def _write_watch_log(
@@ -806,6 +895,50 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
         return False
 
 
+def _escalate_budget_exhausted(record: dict, key: str, pipeline_name: str, run_date: str) -> bool:
+    """LOUD Telegram escalation when the mechanical dispatch ceiling suppresses
+    a dispatch (config#2269). Deliberately NOT the silent ``_notify`` receipt:
+    budget exhaustion means "the watch has given up on today; human needed" —
+    it must page (``silent=False, severity="error"``, mirroring the watch
+    plane's loud path, e.g. sf-watch-liveness-probe's ``_alert``). Deduped per
+    (pipeline, run_date) so a runaway fail-loop pages a human ONCE, not on
+    every subsequent suppressed failure. Best-effort delivery surface: a
+    Telegram outage logs WARNING and is returned in the handler result — the
+    watch-log record (primary) already landed, and the suppression itself
+    never depends on the page being delivered."""
+    label = _pipeline_label(pipeline_name)
+    text = "\n".join([
+        "\U0001f6a8 *Fleet-SF Watch — ATTEMPT BUDGET EXHAUSTED*",
+        f"{label} SF: {record.get('status', 'UNKNOWN')} — dispatch #"
+        f"{record.get('prior_dispatch_count', '?')} today already hit the "
+        f"{record.get('dispatch_ceiling', '?')}-attempt ceiling for run_date {run_date}.",
+        f"Failed state: `{record.get('failed_state')}`" if record.get("failed_state") else "",
+        f"Cause: `{record['cause']}`" if record.get("cause") else "",
+        f"Watch log: `s3://{WATCH_BUCKET}/{key}`",
+        "_The watch has GIVEN UP on today for this pipeline — no further agent "
+        "dispatches or reruns will fire. Human needed (config#2269)._",
+    ]).replace("\n\n", "\n")
+    try:
+        return notify_via_flow_doctor(
+            text,
+            silent=False,
+            severity="error",
+            dedup_key=f"{_FLOW_NAME}:budget_exhausted:{pipeline_name}:{run_date}",
+            flow_name=_FLOW_NAME,
+            topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={
+                "pipeline": pipeline_name,
+                "run_date": run_date,
+                "prior_dispatch_count": record.get("prior_dispatch_count"),
+                "dispatch_ceiling": record.get("dispatch_ceiling"),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — delivery surface; suppression already recorded in the watch-log
+        logger.warning("budget-exhausted escalation Telegram send failed (non-fatal): %s", exc)
+        return False
+
+
 def _get_github_pat() -> str:
     """Read the dedicated fine-grained PAT (SecureString) from SSM. Never logged."""
     ssm = boto3.client("ssm", region_name=REGION)
@@ -884,7 +1017,8 @@ def _maybe_dispatch_agent(
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge handler — fires only on a registered fleet SF terminal failure
     (FAILED / TIMED_OUT / ABORTED), per the dedicated rule
-    ``alpha-engine-sf-watch-failed`` (scoped to the three SFs in ``PIPELINES``).
+    ``alpha-engine-saturday-sf-watch-failed`` (scoped to the three SFs in
+    ``PIPELINES``; rule name pinned in deploy.sh's RULE_NAME).
     """
     detail = event.get("detail") or {}
     sm_arn = detail.get("stateMachineArn") or ""
@@ -922,6 +1056,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         dispatch = {"dispatched": False, "reason": "fast_path_rerun"}
     else:
         dispatch = _maybe_dispatch_agent(record, run_date, key, cfg, sm_name, sm_arn)  # secondary
+    # config#2269: budget exhaustion pages LOUD (a human must take over the
+    # day) — instead of the silent receipt below, never in addition to it
+    # (attempt_budget_exhausted is deliberately NOT in
+    # _TELEGRAM_ON_SUPPRESSED_REASONS).
+    budget_escalated = False
+    if record.get("dispatch_suppressed") == "attempt_budget_exhausted":
+        budget_escalated = _escalate_budget_exhausted(record, key, sm_name, run_date)
     # Telegram only when recovery work actually started (not observe-only).
     telegram_sent = _notify(record, key, sm_name, dispatch)               # secondary — best-effort
 
@@ -937,6 +1078,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "failed_state": record.get("failed_state"),
         "watch_log_key": key,
         "telegram_sent": telegram_sent,
+        "budget_escalated": budget_escalated,
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
         "fast_path_enabled": FAST_PATH_ENABLED,
         "fast_path": fast_path,

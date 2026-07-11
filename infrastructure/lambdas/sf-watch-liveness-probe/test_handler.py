@@ -269,12 +269,12 @@ def test_dead_state_machine_arn_alerts():
     """The exact 2026-06-29 bug class: registered in the rule, but the SF
     itself no longer exists (deleted/renamed)."""
     events = _make_events_client()
-    sfn = _make_sfn_client(missing_names={"alpha-engine-eod-pipeline"})
+    sfn = _make_sfn_client(missing_names={"ne-postclose-trading-pipeline"})
     lam = _make_lambda_client()
     s3 = _make_s3_client()
     with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
         result = index.handler({}, None)
-    assert any("NO live Step Function" in p and "alpha-engine-eod-pipeline" in p for p in result["problems"])
+    assert any("NO live Step Function" in p and "ne-postclose-trading-pipeline" in p for p in result["problems"])
 
 
 def test_unhealthy_lambda_alerts():
@@ -520,3 +520,311 @@ def test_unexpected_error_is_not_swallowed():
     with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
         with pytest.raises(FakeClientError):
             index.handler({}, None)
+
+
+# ── config#2270: mid-run spot-reclaim checker ────────────────────────────────
+# EC2 reclaim/termination EventBridge events route to a checker branch in this
+# same handler: non-watch boxes exit quietly; a watch box with its completion
+# marker is a clean run; a watch box WITHOUT a marker died mid-repair — invoke
+# the spot dispatcher once with force_on_demand (recorded as an
+# `action: reclaim_relaunch` watch-log event, the exactly-one bound); a second
+# death for the same key escalates LOUD instead.
+
+WATCH_TAGS = {
+    "Name": "alpha-engine-sf-watch-spot",
+    "sf-watch-cadence": "saturday",
+    "sf-watch-pipeline": "ne-weekly-freshness-pipeline",
+    "sf-watch-run-date": "2026-07-11",
+}
+EXEC_ARN = ("arn:aws:states:us-east-1:711398986525:execution:"
+            "ne-weekly-freshness-pipeline:run-1")
+WATCH_LOG_KEY = "consolidated/saturday_sf_watch/2026-07-11.json"
+MARKER_KEY = ("sf_watch/_control/completed/"
+              "saturday-ne-weekly-freshness-pipeline-2026-07-11.json")
+
+
+def _reclaim_event(detail_type="EC2 Spot Instance Interruption Warning",
+                   instance_id="i-dead", **detail_overrides):
+    detail = {"instance-id": instance_id}
+    detail.update(detail_overrides)
+    return {"source": "aws.ec2", "detail-type": detail_type, "detail": detail}
+
+
+def _make_reclaim_ec2(tags=WATCH_TAGS):
+    ec2 = _make_ec2_client()
+    ec2.describe_tags.return_value = {
+        "Tags": [{"Key": k, "Value": v, "ResourceId": "i-dead"} for k, v in tags.items()]
+    }
+    return ec2
+
+
+def _make_reclaim_s3(*, marker_exists=False, watch_log=None):
+    """s3 mock for the reclaim path: head_object → completion marker;
+    get_object/put_object → the watch-log doc."""
+    s3 = MagicMock()
+    if marker_exists:
+        s3.head_object.return_value = {}
+    else:
+        s3.head_object.side_effect = FakeClientError("404")
+    if watch_log is None:
+        s3.get_object.side_effect = FakeClientError("NoSuchKey")
+    else:
+        body = MagicMock()
+        body.read.return_value = json.dumps(watch_log).encode()
+        s3.get_object.return_value = {"Body": body}
+    return s3
+
+
+def _watch_log_doc(events):
+    return {"schema_version": 1, "run_date": "2026-07-11", "events": events}
+
+
+def _dispatch_log_event(**overrides):
+    ev = {
+        "detected_at": "2026-07-11T09:15:00+00:00",
+        "action": "dispatch",
+        "status": "FAILED",
+        "execution_arn": EXEC_ARN,
+        "failed_state": "RAGIngestion",
+        "cause": "States.TaskFailed: RAGIngestion failed",
+        "is_preflight": False,
+    }
+    ev.update(overrides)
+    return ev
+
+
+def _run_reclaim(event, *, ec2=None, s3=None, lam=None):
+    ec2 = ec2 if ec2 is not None else _make_reclaim_ec2()
+    s3 = s3 if s3 is not None else _make_reclaim_s3()
+    lam = lam if lam is not None else MagicMock()
+    factory = _clients_factory(_make_events_client(), _make_sfn_client(), lam, s3, ec2)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(event, None)
+    return result, ec2, s3, lam
+
+
+def test_reclaim_event_for_non_watch_box_exits_quietly():
+    """Every instance in the account hits the (untag-scopable) rules — a box
+    whose Name tag isn't the watch tag is ignored with a log line only: no
+    S3 reads, no invoke, no Telegram."""
+    ec2 = _make_reclaim_ec2(tags={"Name": "alpha-engine-data-spot"})
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), ec2=ec2)
+    assert result["reclaim_event"] is True
+    assert result["watch_box"] is False
+    s3.head_object.assert_not_called()
+    lam.invoke.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
+
+
+def test_reclaim_event_with_completion_marker_is_clean_exit():
+    s3 = _make_reclaim_s3(marker_exists=True)
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), s3=s3)
+    assert result["watch_box"] is True
+    assert result["completed"] is True
+    s3.head_object.assert_called_once()
+    assert s3.head_object.call_args.kwargs["Key"] == MARKER_KEY
+    lam.invoke.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
+
+
+def test_reclaim_without_marker_relaunches_on_demand_once_with_record_and_note():
+    """First mid-run death: exactly one dispatcher invoke (Event type) with
+    force_on_demand + the fields reconstructed from tags + the newest
+    watch-log event; the reclaim_relaunch record is written BEFORE the
+    invoke; a silent Telegram note fires."""
+    s3 = _make_reclaim_s3(watch_log=_watch_log_doc([_dispatch_log_event()]))
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), s3=s3)
+
+    assert result["watch_box"] is True
+    assert result["completed"] is False
+    assert result["relaunched"] is True
+
+    lam.invoke.assert_called_once()
+    kwargs = lam.invoke.call_args.kwargs
+    assert kwargs["FunctionName"] == index.SPOT_DISPATCHER_FUNCTION
+    assert kwargs["InvocationType"] == "Event"
+    payload = json.loads(kwargs["Payload"])
+    assert payload == {
+        "pipeline_name": "ne-weekly-freshness-pipeline",
+        "cadence_slug": "saturday",
+        "run_date": "2026-07-11",
+        "execution_arn": EXEC_ARN,
+        "state_machine_arn": ("arn:aws:states:us-east-1:711398986525:"
+                              "stateMachine:ne-weekly-freshness-pipeline"),
+        "failed_state": "RAGIngestion",
+        "cause": "States.TaskFailed: RAGIngestion failed",
+        "watch_log_key": WATCH_LOG_KEY,
+        "is_preflight": "false",
+        "force_on_demand": "true",
+    }
+
+    # The relaunch decision landed in the watch-log (the exactly-one bound +
+    # the event the saturday dispatcher's config#2269 ceiling counts).
+    s3.put_object.assert_called_once()
+    assert s3.put_object.call_args.kwargs["Key"] == WATCH_LOG_KEY
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["action"] == "reclaim_relaunch"
+    assert ev["dead_instance_id"] == "i-dead"
+    assert ev["force_on_demand"] is True
+    assert ev["execution_arn"] == EXEC_ARN
+
+    # Silent note — the loud alert already happened at the SF failure itself.
+    index.notify_via_flow_doctor.assert_called_once()
+    note_kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert note_kwargs["silent"] is True
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "reclaimed mid-repair" in text
+    assert "ON-DEMAND" in text
+
+
+def test_second_death_escalates_loud_and_never_reinvokes():
+    """Exactly-one bound: a prior reclaim_relaunch for this key (different
+    box) means the relaunched box ALSO died — LOUD escalation, no second
+    dispatcher invoke, no second watch-log relaunch record."""
+    prior = {
+        "action": "reclaim_relaunch",
+        "dead_instance_id": "i-original-box",
+        "execution_arn": EXEC_ARN,
+    }
+    s3 = _make_reclaim_s3(watch_log=_watch_log_doc([_dispatch_log_event(), prior]))
+    result, _, s3, lam = _run_reclaim(
+        _reclaim_event(instance_id="i-relaunched-box"), s3=s3
+    )
+    assert result["relaunched"] is False
+    assert result["reason"] == "second_death"
+    lam.invoke.assert_not_called()
+    s3.put_object.assert_not_called()
+    index.notify_via_flow_doctor.assert_called_once()
+    esc_kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert esc_kwargs["silent"] is False
+    assert esc_kwargs["severity"] == "error"
+    assert "SECOND watch-box death" in index.notify_via_flow_doctor.call_args.args[0]
+
+
+def test_duplicate_notification_of_same_death_is_quiet():
+    """The interruption WARNING and the terminated state-change both fire for
+    ONE reclaim — the second notification for the SAME instance-id must
+    neither re-invoke nor escalate."""
+    prior = {
+        "action": "reclaim_relaunch",
+        "dead_instance_id": "i-dead",
+        "execution_arn": EXEC_ARN,
+    }
+    s3 = _make_reclaim_s3(watch_log=_watch_log_doc([_dispatch_log_event(), prior]))
+    result, _, s3, lam = _run_reclaim(
+        _reclaim_event(detail_type="EC2 Instance State-change Notification",
+                       instance_id="i-dead", state="terminated"),
+        s3=s3,
+    )
+    assert result["duplicate_notification"] is True
+    lam.invoke.assert_not_called()
+    s3.put_object.assert_not_called()
+    index.notify_via_flow_doctor.assert_not_called()
+
+
+def test_reclaim_with_missing_discriminator_tags_escalates_loud():
+    """A watch box that died inside the launch→tag window: no marker key, no
+    dispatch fields — must page a human, never drop quietly."""
+    ec2 = _make_reclaim_ec2(tags={"Name": "alpha-engine-sf-watch-spot"})
+    result, _, _, lam = _run_reclaim(_reclaim_event(), ec2=ec2)
+    assert result["watch_box"] is True
+    assert result["reason"] == "missing_discriminator_tags"
+    lam.invoke.assert_not_called()
+    esc_kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert esc_kwargs["silent"] is False
+    assert esc_kwargs["severity"] == "error"
+
+
+def test_reclaim_with_no_usable_watch_log_event_escalates_loud():
+    """No watch-log (or none of its events carries an execution_arn) → the
+    dispatch cannot be reconstructed — LOUD escalation, no blind invoke."""
+    s3 = _make_reclaim_s3(watch_log=None)  # 404: no watch-log at all
+    result, _, s3, lam = _run_reclaim(_reclaim_event(), s3=s3)
+    assert result["relaunched"] is False
+    assert result["reason"] == "no_source_event"
+    lam.invoke.assert_not_called()
+    esc_kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    assert esc_kwargs["silent"] is False
+
+
+def test_non_terminated_state_change_is_ignored():
+    result, ec2, s3, lam = _run_reclaim(
+        _reclaim_event(detail_type="EC2 Instance State-change Notification",
+                       state="stopping")
+    )
+    assert result["handled"] is False
+    assert result["reason"] == "not_terminated"
+    ec2.describe_tags.assert_not_called()
+    lam.invoke.assert_not_called()
+
+
+def test_reclaim_event_without_instance_id_raises():
+    """Rule contract violation — fail loud, never silently ignore what might
+    be a real watch-box death."""
+    event = {"source": "aws.ec2",
+             "detail-type": "EC2 Spot Instance Interruption Warning",
+             "detail": {}}
+    with pytest.raises(ValueError, match="instance-id"):
+        index.handler(event, None)
+
+
+def test_marker_head_unexpected_error_is_not_swallowed():
+    """Only a true 404 means 'no marker' — an S3 hiccup must RAISE, never be
+    misread as absent (duplicate relaunch) or present (dropped coverage)."""
+    s3 = _make_reclaim_s3()
+    s3.head_object.side_effect = FakeClientError("AccessDenied")
+    with pytest.raises(FakeClientError):
+        _run_reclaim(_reclaim_event(), s3=s3)
+
+
+def test_scheduled_probe_event_never_routes_to_reclaim_branch():
+    """The scheduled probe payload is {} — it must run the wiring checks, not
+    the reclaim checker (pinned by test_all_clean_alerts_nothing running the
+    full check set; this pins the discriminator directly)."""
+    assert index._is_reclaim_event({}) is False
+    assert index._is_reclaim_event({"source": "aws.ec2"}) is False
+    assert index._is_reclaim_event(_reclaim_event()) is True
+    assert index._is_reclaim_event(
+        _reclaim_event(detail_type="EC2 Instance State-change Notification")
+    ) is True
+
+
+def _sibling_dispatcher_cadence_prefix_pairs() -> set[tuple[str, str]]:
+    """(cadence_slug, watch_prefix) pairs out of the sibling dispatcher's
+    PIPELINES — ast-extracted (the inner dicts carry non-literal values)."""
+    import ast
+
+    path = Path(__file__).parent.parent / "saturday-sf-watch-dispatcher" / "index.py"
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "PIPELINES":
+            pipelines = node.value
+            break
+    else:
+        raise AssertionError("PIPELINES not found in sibling dispatcher")
+    pairs = set()
+    for cfg in pipelines.values:
+        fields = {
+            k.value: v.value
+            for k, v in zip(cfg.keys, cfg.values)
+            if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
+        }
+        pairs.add((fields["cadence_slug"], fields["watch_prefix"]))
+    return pairs
+
+
+def test_watch_prefixes_follow_the_cadence_convention_the_reclaim_checker_derives():
+    """LOCKSTEP GUARD (config#2270): the reclaim checker derives the watch-log
+    key as consolidated/{cadence_slug}_sf_watch/{run_date}.json from the box's
+    cadence tag. That derivation is only sound while EVERY dispatcher
+    watch_prefix equals consolidated/{cadence_slug}_sf_watch — if a pipeline
+    ever breaks the convention, this test forces the checker to grow a real
+    mapping instead of silently reading a wrong key."""
+    pairs = _sibling_dispatcher_cadence_prefix_pairs()
+    assert pairs, "no (cadence_slug, watch_prefix) pairs extracted"
+    for cadence_slug, watch_prefix in pairs:
+        assert watch_prefix == f"consolidated/{cadence_slug}_sf_watch", (
+            f"watch_prefix {watch_prefix!r} for cadence {cadence_slug!r} breaks "
+            "the convention the reclaim checker's key derivation relies on"
+        )

@@ -52,6 +52,31 @@ problem fires a LOUD alert, deduplicated by the CONTENT of the problem set
 (a hash), not a timestamp — so a standing issue doesn't re-ping every run, and
 the alert state clears automatically the moment the check is clean again.
 
+**Mid-run spot-reclaim checker (config#2270).** This Lambda is ALSO the
+EventBridge target for `EC2 Spot Instance Interruption Warning` and
+`EC2 Instance State-change Notification` (state=terminated) events — the
+handler branches on event shape (the scheduled probe payload is `{}`; the EC2
+events carry `source: aws.ec2`). A spot reclaim MID-REPAIR used to kill the
+watch box with no completion marker, no failure marker, and no relaunch —
+detection was the >=6.5h spot-orphan-reaper ping. The checker lives HERE
+(rather than a new Lambda) per the issue's candidate-home evaluation: this is
+already the external observer of the watch plane. Flow: the EC2 events carry
+only an instance-id (no tags — the rules cannot be tag-scoped), so the
+checker DescribeTags the instance (tags stay queryable post-termination for a
+while) → non-watch boxes (`Name` != alpha-engine-sf-watch-spot) exit quietly
+→ for a watch box it heads the S3 completion marker
+`sf_watch/_control/completed/{cadence}-{pipeline}-{run_date}.json` (the same
+key the spot-orphan-reaper derives) → marker present = clean run, exit;
+marker ABSENT = the box died mid-run: re-invoke
+alpha-engine-sf-watch-spot-dispatcher ONCE with the original dispatch fields
+(reconstructed from the discriminator tags + the newest watch-log event) and
+`force_on_demand: true` — the groom-SF bounded-relaunch pattern
+(config#1645 / nousergon-data#658). Exactly-one bound: the relaunch decision
+is recorded as an `action: reclaim_relaunch` watch-log event (which the
+saturday dispatcher's config#2269 mechanical attempt ceiling counts) BEFORE
+the invoke; a second death for the same (cadence, pipeline, run_date)
+escalates LOUD instead of relaunching again (second death = human).
+
 **Fail-loud (CLAUDE.md no-silent-fails).** Every AWS describe/list call here is
 the PRIMARY input: an UNEXPECTED API error (anything other than the specific
 "this resource doesn't exist" codes we're explicitly checking for) RAISES, so a
@@ -100,7 +125,8 @@ EXPECTED_PIPELINE_NAMES = [
     "ne-weekly-freshness-pipeline",
     "ne-preopen-trading-pipeline",
     "ne-postclose-trading-pipeline",
-    "alpha-engine-eod-pipeline",  # transitional alias, config#1408 / re-exam 2026-07-03
+    # transitional alpha-engine-eod-pipeline alias retired 2026-07-11
+    # (config#2272; dormant old SF deleted live).
 ]
 
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
@@ -126,6 +152,23 @@ SPOT_LEG_DISPATCHERS: list[tuple[str, str]] = [
 # Reading the live env instead of re-declaring the values here means this
 # probe can never drift from what the dispatcher will actually launch with.
 LAUNCH_CONFIG_ENV_KEYS = ("SF_WATCH_AMI_ID", "SF_WATCH_SECURITY_GROUP", "SF_WATCH_SUBNETS")
+
+# ── Mid-run spot-reclaim checker (config#2270) ───────────────────────────────
+# Tag names/keys mirror sf-watch-spot-dispatcher/index.py (SF_WATCH_TAG_NAME +
+# the three SF_WATCH_*_TAG_KEY discriminators) and spot-orphan-reaper's
+# WATCH_KINDS sf-watch entry — the same triple every watch-plane consumer keys
+# on. The completion-marker key shape below is the reaper's `_completion_key`
+# shape for the sf-watch kind.
+SF_WATCH_SPOT_TAG_NAME = "alpha-engine-sf-watch-spot"
+SF_WATCH_CADENCE_TAG_KEY = "sf-watch-cadence"
+SF_WATCH_PIPELINE_TAG_KEY = "sf-watch-pipeline"
+SF_WATCH_RUN_DATE_TAG_KEY = "sf-watch-run-date"
+COMPLETION_MARKER_PREFIX = "sf_watch/_control/completed/"
+RECLAIM_INTERRUPTION_DETAIL_TYPE = "EC2 Spot Instance Interruption Warning"
+RECLAIM_STATE_CHANGE_DETAIL_TYPE = "EC2 Instance State-change Notification"
+RECLAIM_DETAIL_TYPES = frozenset(
+    {RECLAIM_INTERRUPTION_DETAIL_TYPE, RECLAIM_STATE_CHANGE_DETAIL_TYPE}
+)
 
 
 def _error_code(exc: Exception) -> str:
@@ -389,9 +432,296 @@ def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> 
         return False
 
 
+# ── Mid-run spot-reclaim checker (config#2270) ───────────────────────────────
+
+
+def _is_reclaim_event(event: dict) -> bool:
+    """True iff this invocation is an EC2 reclaim/termination EventBridge
+    event rather than the scheduled probe (whose payload is ``{}``)."""
+    return (
+        isinstance(event, dict)
+        and event.get("source") == "aws.ec2"
+        and event.get("detail-type") in RECLAIM_DETAIL_TYPES
+    )
+
+
+def _instance_tags(instance_id: str) -> dict[str, str]:
+    """Tags for ``instance_id`` via DescribeTags — still queryable for a
+    while after termination, unlike the instance record itself. Raises on any
+    API error (fail-loud: the tags are the PRIMARY input of the reclaim
+    check; an unreadable tag set must surface via the Lambda Errors metric,
+    never silently classify a dead watch box as 'not ours')."""
+    resp = _ec2_client().describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [instance_id]}]
+    )
+    return {t.get("Key", ""): t.get("Value", "") for t in resp.get("Tags", [])}
+
+
+def _completion_marker_exists(marker_key: str) -> bool:
+    """HeadObject on the run's completion marker. Only a true absence
+    (404/NoSuchKey/NotFound) means "no marker"; any OTHER error RAISES —
+    misreading an S3 hiccup as 'absent' would fire a duplicate relaunch, and
+    misreading it as 'present' would silently drop coverage (the config#2267
+    site-4 lesson, applied to this read)."""
+    try:
+        _s3_client().head_object(Bucket=WATCH_BUCKET, Key=marker_key)
+        return True
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+
+
+def _load_watch_log(s3, watch_log_key: str) -> dict | None:
+    """The day's watch-log doc, or None when it truly doesn't exist (404).
+    Any other read error RAISES (fail-loud — the exactly-one relaunch bound
+    depends on this read). A present-but-unparseable doc also returns None:
+    without a readable event history the checker can neither reconstruct the
+    dispatch fields nor verify the exactly-one bound, and the None path below
+    escalates LOUDLY instead of relaunching — that escalation is the
+    recording surface for this swallow (failure mode swallowed: a corrupted
+    watch-log blob; the reclaim finding itself still pages)."""
+    try:
+        obj = s3.get_object(Bucket=WATCH_BUCKET, Key=watch_log_key)
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) in {"404", "NoSuchKey"}:
+            return None
+        raise
+    try:
+        doc = json.loads(obj["Body"].read())
+    except (ValueError, TypeError) as exc:
+        logger.warning("watch-log %s unparseable during reclaim check: %s", watch_log_key, exc)
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("events"), list):
+        return doc
+    logger.warning("watch-log %s has an unexpected shape during reclaim check", watch_log_key)
+    return None
+
+
+def _record_reclaim_relaunch(s3, watch_log_key: str, doc: dict, record: dict) -> None:
+    """Append the relaunch decision to the day's watch-log and write it back.
+    PRIMARY deliverable of the relaunch path — RAISES on failure, and runs
+    BEFORE the dispatcher invoke: if this write fails, NO relaunch fires (the
+    Lambda error pages via the watch-plane alarms) — the safe failure
+    direction, since a relaunch without its record would break the
+    exactly-one bound and permit unbounded relaunches."""
+    doc["updated_at"] = record["detected_at"]
+    doc["events"].append(record)
+    s3.put_object(
+        Bucket=WATCH_BUCKET,
+        Key=watch_log_key,
+        Body=json.dumps(doc, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def _reclaim_escalate(text: str, dedup_key: str, context_info: dict) -> bool:
+    """LOUD reclaim-path escalation (second death / unreconstructable dispatch
+    fields = human needed). Best-effort delivery surface — a Telegram outage
+    logs WARNING and is returned, never masks the finding (which is already
+    in the CloudWatch log + returned verdict)."""
+    try:
+        return notify_via_flow_doctor(
+            text,
+            silent=False,
+            severity="error",
+            dedup_key=dedup_key,
+            flow_name=_FLOW_NAME,
+            topics=_OPS_TOPICS,
+            db_basename=_DB_BASENAME,
+            context=context_info,
+        )
+    except Exception as exc:  # noqa: BLE001 — delivery surface; finding still logged + returned
+        logger.warning("reclaim escalation Telegram send failed (non-fatal): %s", exc)
+        return False
+
+
+def _reclaim_note(text: str, dedup_key: str, context_info: dict) -> bool:
+    """Silent Telegram note for a successful bounded relaunch (mirrors the
+    dispatcher's silent 'watch is acting' receipt). Best-effort."""
+    try:
+        return notify_via_flow_doctor(
+            text,
+            silent=True,
+            severity="info",
+            dedup_key=dedup_key,
+            flow_name=_FLOW_NAME,
+            topics=_OPS_TOPICS,
+            db_basename=_DB_BASENAME,
+            context=context_info,
+            silent_topic=FleetTelegramTopic.OPS_HEALTH,
+        )
+    except Exception as exc:  # noqa: BLE001 — delivery surface; relaunch already fired + recorded
+        logger.warning("reclaim relaunch Telegram note failed (non-fatal): %s", exc)
+        return False
+
+
+def _handle_reclaim_event(event: dict) -> dict:
+    """Mid-run spot-reclaim checker (config#2270) — see module docstring."""
+    detail = event.get("detail") or {}
+    detail_type = str(event.get("detail-type") or "")
+    instance_id = str(detail.get("instance-id") or "")
+    if not instance_id:
+        # Rule contract violation — the EventBridge patterns always carry an
+        # instance-id. Fail loud rather than silently ignoring a malformed
+        # event that might be a real watch-box death.
+        raise ValueError(f"EC2 reclaim event without instance-id (detail-type={detail_type!r})")
+    base = {"reclaim_event": True, "detail_type": detail_type, "instance_id": instance_id}
+
+    # Defense in depth: the terminated rule's pattern filters state=terminated;
+    # a stopping/running state-change reaching us anyway is not a death.
+    if detail_type == RECLAIM_STATE_CHANGE_DETAIL_TYPE and str(detail.get("state") or "") != "terminated":
+        logger.info("reclaim check: ignoring non-terminated state-change for %s", instance_id)
+        return {**base, "handled": False, "reason": "not_terminated"}
+
+    tags = _instance_tags(instance_id)
+    if tags.get("Name") != SF_WATCH_SPOT_TAG_NAME:
+        # Every instance in the account hits these rules (they cannot be
+        # tag-scoped) — non-watch boxes exit quietly, log only.
+        logger.info("reclaim check: %s is not an sf-watch box (Name=%r) — ignoring",
+                    instance_id, tags.get("Name"))
+        return {**base, "watch_box": False}
+
+    cadence = tags.get(SF_WATCH_CADENCE_TAG_KEY, "")
+    pipeline = tags.get(SF_WATCH_PIPELINE_TAG_KEY, "")
+    run_date = tags.get(SF_WATCH_RUN_DATE_TAG_KEY, "")
+    if not (cadence and pipeline and run_date):
+        # A watch box died inside the narrow launch→tag window (or a tag write
+        # regressed): no discriminators means no marker key and no dispatch
+        # fields — a human must look. LOUD, never a quiet drop.
+        alerted = _reclaim_escalate(
+            "\U0001f6a8 *SF-Watch reclaim checker — UNTAGGED watch box died*\n"
+            f"Watch box `{instance_id}` terminated without its cadence/pipeline/"
+            "run-date discriminator tags — cannot verify completion or relaunch. "
+            "Check the sf-watch-spot-dispatcher tag-write path (config#2267 site 2).",
+            dedup_key=f"{_FLOW_NAME}:reclaim_untagged:{instance_id}",
+            context_info={"instance_id": instance_id, "tags": tags},
+        )
+        return {**base, "watch_box": True, "handled": False,
+                "reason": "missing_discriminator_tags", "escalated": alerted}
+
+    key_ctx = {"instance_id": instance_id, "cadence": cadence,
+               "pipeline": pipeline, "run_date": run_date}
+    marker_key = f"{COMPLETION_MARKER_PREFIX}{cadence}-{pipeline}-{run_date}.json"
+    if _completion_marker_exists(marker_key):
+        logger.info("reclaim check: %s finished cleanly (marker %s present)",
+                    instance_id, marker_key)
+        return {**base, "watch_box": True, "completed": True}
+
+    # No completion marker: the box died MID-RUN.
+    watch_log_key = f"consolidated/{cadence}_sf_watch/{run_date}.json"
+    s3 = _s3_client()
+    doc = _load_watch_log(s3, watch_log_key)
+    events = (doc or {}).get("events", [])
+    relaunches = [ev for ev in events if ev.get("action") == "reclaim_relaunch"]
+
+    if any(ev.get("dead_instance_id") == instance_id for ev in relaunches):
+        # The interruption WARNING and the terminated state-change both fire
+        # for one reclaim — the second notification of the SAME death is a
+        # duplicate, not a second death.
+        logger.info("reclaim check: death of %s already handled — duplicate notification",
+                    instance_id)
+        return {**base, "watch_box": True, "completed": False,
+                "duplicate_notification": True}
+
+    if relaunches:
+        # Exactly-one bound: a DIFFERENT box already died and was relaunched
+        # for this (cadence, pipeline, run_date) — second death = human.
+        alerted = _reclaim_escalate(
+            "\U0001f6a8 *SF-Watch reclaim checker — SECOND watch-box death*\n"
+            f"{cadence}/{pipeline}@{run_date}: relaunched box `{instance_id}` "
+            "ALSO died without a completion marker (prior relaunch: "
+            f"`{relaunches[-1].get('dead_instance_id', '?')}` → on-demand). "
+            "The bounded relaunch budget is spent — human needed (config#2270).",
+            dedup_key=f"{_FLOW_NAME}:reclaim_second_death:{pipeline}:{run_date}",
+            context_info=key_ctx,
+        )
+        return {**base, "watch_box": True, "completed": False, "relaunched": False,
+                "reason": "second_death", "escalated": alerted}
+
+    # First mid-run death for this key: reconstruct the dispatch fields. The
+    # tags carry (cadence, pipeline, run_date); the execution context comes
+    # from the NEWEST watch-log event carrying an execution_arn — the failure
+    # this box was dispatched for (the dispatcher writes the log BEFORE
+    # dispatching, so a dispatched box always has one... unless the log is
+    # missing/corrupted, in which case escalate LOUD instead of guessing).
+    source_ev = next((ev for ev in reversed(events) if ev.get("execution_arn")), None)
+    if source_ev is None:
+        alerted = _reclaim_escalate(
+            "\U0001f6a8 *SF-Watch reclaim checker — watch box died mid-run, "
+            "dispatch fields UNRECONSTRUCTABLE*\n"
+            f"{cadence}/{pipeline}@{run_date}: box `{instance_id}` died without "
+            f"a completion marker, and the watch-log `{watch_log_key}` has no "
+            "usable event to rebuild the dispatch from — relaunch manually "
+            "(config#2270).",
+            dedup_key=f"{_FLOW_NAME}:reclaim_no_source:{pipeline}:{run_date}",
+            context_info=key_ctx,
+        )
+        return {**base, "watch_box": True, "completed": False, "relaunched": False,
+                "reason": "no_source_event", "escalated": alerted}
+
+    payload = {
+        "pipeline_name": pipeline,
+        "cadence_slug": cadence,
+        "run_date": run_date,
+        "execution_arn": source_ev.get("execution_arn", ""),
+        "state_machine_arn": f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{pipeline}",
+        "failed_state": source_ev.get("failed_state") or "",
+        "cause": source_ev.get("cause") or "",
+        "watch_log_key": watch_log_key,
+        "is_preflight": "true" if source_ev.get("is_preflight") else "false",
+        # The whole point: a spot reclaim already proved spot unreliable for
+        # this run — relaunch straight to on-demand (lib >= 0.106.0
+        # launch_with_fallback(force_on_demand=True), config#1645 pattern).
+        "force_on_demand": "true",
+    }
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    record = {
+        "detected_at": now_iso,
+        # Counted by the saturday dispatcher's config#2269 mechanical attempt
+        # ceiling (_BUDGET_CONSUMING_ACTIONS) — the relaunch consumes the same
+        # shared budget as agent dispatches and fast-path reruns.
+        "action": "reclaim_relaunch",
+        "source": _FLOW_NAME,
+        "dead_instance_id": instance_id,
+        "reclaim_detail_type": detail_type,
+        "cadence_slug": cadence,
+        "pipeline": pipeline,
+        "run_date": run_date,
+        "execution_arn": source_ev.get("execution_arn", ""),
+        "force_on_demand": True,
+    }
+    # Record FIRST (exactly-one bound), then invoke — both fail-loud.
+    _record_reclaim_relaunch(s3, watch_log_key, doc, record)
+    _lambda_client().invoke(
+        FunctionName=SPOT_DISPATCHER_FUNCTION,
+        InvocationType="Event",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    logger.warning(
+        "reclaim check: watch box %s (%s/%s@%s) died mid-repair — relaunch "
+        "dispatched with force_on_demand", instance_id, cadence, pipeline, run_date,
+    )
+    noted = _reclaim_note(
+        "\U0001f6f0️ *SF-Watch reclaim checker — bounded relaunch*\n"
+        f"Watch box `{instance_id}` ({cadence}/{pipeline}@{run_date}) was "
+        "reclaimed mid-repair — relaunched ON-DEMAND (attempt 1/1; a second "
+        "death escalates loud, config#2270).",
+        dedup_key=f"{_FLOW_NAME}:reclaim_relaunch:{pipeline}:{run_date}:{instance_id}",
+        context_info=key_ctx,
+    )
+    return {**base, "watch_box": True, "completed": False, "relaunched": True,
+            "telegram_sent": noted, "watch_log_key": watch_log_key}
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """Scheduled (EventBridge) entrypoint. Read-only; raises on an unexpected
+    """Scheduled (EventBridge) entrypoint — plus the mid-run spot-reclaim
+    checker branch (config#2270) when invoked by the EC2 reclaim/termination
+    EventBridge rules. Read-only on the probe path; raises on an unexpected
     AWS API failure so the check can never silently no-op."""
+    if _is_reclaim_event(event or {}):
+        return _handle_reclaim_event(event)
     spot_problems, kill_switches = _check_spot_dispatch_leg()
     problems = (
         _check_rule() + _check_state_machines_exist() + _check_lambda_healthy() + spot_problems
