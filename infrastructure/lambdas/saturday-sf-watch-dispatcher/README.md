@@ -74,6 +74,30 @@ decision in `dispatch_suppressed` (never a silent skip); only the
 
 Neither carve-out suppresses the **first** failure of a pipeline/day.
 
+## Mechanical per-cadence dispatch ceiling (config#2269)
+
+The charter's attempt budget is honor-system (it depends on the dispatched
+agent reading + enriching the watch-log). The dispatcher ALSO enforces it
+mechanically: before each agent dispatch it counts prior budget-consuming
+events for this (cadence, pipeline, run_date) from its own watch-log —
+dispatcher-authored `action` values (`dispatch`, `fast_path_rerun`,
+`reclaim_relaunch`) plus the charter's in-place outcome rewrites of dispatch
+events (`fixed_merged_rerun`/`rerun`/`proposed`/`refused`/`escalated`), never
+the agent-enriched `agent_attempt` field, so an agent crash can't reset the
+count. At/over the ceiling the dispatch is suppressed
+(`dispatch_suppressed: attempt_budget_exhausted`) and a **LOUD** Telegram
+escalation pages — "the watch has given up on today; human needed" — instead
+of the silent receipt.
+
+Ceilings (env, config defaults — **not** operator flags, not preserved across
+redeploys; change via PR): `SF_WATCH_MAX_DISPATCHES_SATURDAY=8`,
+`SF_WATCH_MAX_DISPATCHES_WEEKDAY=2`, `SF_WATCH_MAX_DISPATCHES_EOD=2`
+(the charter's Brian-ruled per-cadence budgets, 2026-07-11). The ceiling
+composes with the config#2003 suppressions and the charter-side budget — it
+is the outermost runaway backstop, and it still applies when
+`EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true` opts back into post-escalation
+dispatch.
+
 ## Why it's not a second notifier
 
 `alpha-engine-sf-telegram-notifier` already covers generic SF notification

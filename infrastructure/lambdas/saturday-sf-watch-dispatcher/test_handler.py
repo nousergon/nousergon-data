@@ -1162,3 +1162,233 @@ def test_load_existing_valid_watch_log_accumulates():
     s3.get_object.return_value = {"Body": body}
     out = index._load_existing(s3, "consolidated/saturday_sf_watch/2026-07-11.json")
     assert out == existing
+
+
+# ── config#2269: mechanical per-cadence dispatch ceiling ─────────────────────
+# The charter's attempt budget is honor-system; the dispatcher enforces it
+# mechanically by counting PRIOR budget-consuming events (dispatcher-authored
+# `action` values, never agent-enriched `agent_attempt`) for the
+# (cadence, pipeline, run_date). At/over the per-cadence ceiling (saturday 8,
+# weekday/eod 2) the dispatch is suppressed with a LOUD Telegram escalation.
+
+
+def _dispatch_events(n: int, action: str = "dispatch") -> list[dict]:
+    return [{"action": action, "execution_name": f"exec-{i:03d}"} for i in range(n)]
+
+
+def _existing_doc(events: list[dict]) -> dict:
+    return {"schema_version": 1, "run_date": "2023-11-14", "events": events}
+
+
+def test_per_cadence_ceiling_defaults_mirror_charter_budgets():
+    """Pins the Brian-ruled 2026-07-11 per-cadence budgets: saturday 8,
+    weekday 2, eod 2 (env-overridable via SF_WATCH_MAX_DISPATCHES_*)."""
+    assert index.SF_WATCH_MAX_DISPATCHES == {"saturday": 8, "weekday": 2, "eod": 2}
+    assert index._max_dispatches("saturday") == 8
+    assert index._max_dispatches("weekday") == 2
+    assert index._max_dispatches("eod") == 2
+    # Unruled future cadence gets the conservative cap, never saturday's 8.
+    assert index._max_dispatches("some-future-cadence") == 2
+
+
+def test_saturday_failure_at_8_prior_dispatches_suppressed_and_paged_loud(monkeypatch):
+    """Saturday's hard runaway backstop: with 8 prior dispatch events already
+    in today's watch-log, the next qualifying failure must NOT dispatch —
+    suppressed with `attempt_budget_exhausted` AND a LOUD (silent=False,
+    severity=error) Telegram escalation, never the silent receipt."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients(existing=_existing_doc(_dispatch_events(8)))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=SATURDAY_ARN), None)
+
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "attempt_budget_exhausted",
+    }
+    assert fired["called"] is False
+    assert result["budget_escalated"] is True
+
+    # Watch-log STILL written (fail-loud) and carries the auditable reason +
+    # the counts that justified it.
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["dispatch_suppressed"] == "attempt_budget_exhausted"
+    assert ev["prior_dispatch_count"] == 8
+    assert ev["dispatch_ceiling"] == 8
+    assert ev["action"] == "observe"
+
+    # LOUD page — not the silent receipt.
+    index.notify_via_flow_doctor.assert_called_once()
+    kwargs = index.notify_via_flow_doctor.call_args.kwargs
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert kwargs["silent"] is False
+    assert kwargs["severity"] == "error"
+    assert "ATTEMPT BUDGET EXHAUSTED" in text
+    assert "Human needed" in text
+
+
+def test_saturday_below_ceiling_passes_through(monkeypatch):
+    """7 prior dispatches on saturday (ceiling 8) → the 8th dispatch fires."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, s3 = _make_clients(existing=_existing_doc(_dispatch_events(7)))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=SATURDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["budget_escalated"] is False
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert written["events"][-1]["dispatch_suppressed"] is None
+
+
+@pytest.mark.parametrize("sm_arn", [WEEKDAY_ARN, EOD_ARN])
+def test_weekday_and_eod_third_failure_with_2_prior_dispatches_suppressed(monkeypatch, sm_arn):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients(existing=_existing_doc(_dispatch_events(2)))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=sm_arn), None)
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "attempt_budget_exhausted",
+    }
+    assert fired["called"] is False
+    assert result["budget_escalated"] is True
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["dispatch_suppressed"] == "attempt_budget_exhausted"
+    assert ev["prior_dispatch_count"] == 2
+    assert ev["dispatch_ceiling"] == 2
+
+
+def test_weekday_below_ceiling_passes_through(monkeypatch):
+    """1 prior dispatch on weekday (ceiling 2) → the 2nd dispatch fires."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients(existing=_existing_doc(_dispatch_events(1)))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["budget_escalated"] is False
+
+
+def test_fast_path_rerun_events_count_toward_the_budget(monkeypatch):
+    """config#2269 deliverable 2: dispatcher fast-path reruns consume the SAME
+    budget — one dispatch + one fast_path_rerun on weekday (ceiling 2)
+    exhausts it."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    events = [{"action": "dispatch"}, {"action": "fast_path_rerun"}]
+    factory, _, _ = _make_clients(existing=_existing_doc(events))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "attempt_budget_exhausted",
+    }
+
+
+def test_agent_outcome_rewritten_events_still_count(monkeypatch):
+    """The charter REWRITES a dispatch event's `action` in place with its
+    outcome (fixed_merged_rerun/rerun/proposed/...). The mechanical count must
+    survive that rewrite — otherwise a HEALTHY agent would reset the budget
+    (the inverse of the agent-crash starvation the counter guards against).
+    Uses outcomes that don't trip the separate already_escalated_today
+    suppression, so this pins the budget reason specifically."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    events = [
+        {"action": "fixed_merged_rerun", "agent_attempt": 1},
+        {"action": "rerun", "agent_attempt": 2},
+    ]
+    factory, _, _ = _make_clients(existing=_existing_doc(events))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "attempt_budget_exhausted",
+    }
+
+
+def test_observe_events_never_consume_budget(monkeypatch):
+    """Pure observe records (kill-switch-off days, suppressed repeats) must
+    not eat the budget — only genuine dispatches/reruns do."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, _, _ = _make_clients(
+        existing=_existing_doc(_dispatch_events(5, action="observe"))
+    )
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+
+
+def test_budget_ceiling_also_blocks_fast_path(monkeypatch):
+    """Composition guard: an exhausted budget suppresses the deterministic
+    fast path too (it consumes the same budget), not just the agent dispatch."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "FAST_PATH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    factory, sf, _ = _make_clients(existing=_existing_doc(_dispatch_events(2)))
+    sf.describe_execution.return_value = {
+        "input": WEEKDAY_INPUT, "error": "DailyPipelineFailure", "cause": "steps failed",
+    }
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    sf.start_execution.assert_not_called()
+    assert result["fast_path"] == {"fast_path": False, "reason": "attempt_budget_exhausted"}
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "attempt_budget_exhausted",
+    }
+
+
+def test_budget_ceiling_applies_even_with_dispatch_after_escalation_opt_in(monkeypatch):
+    """The ceiling is the OUTERMOST backstop: EOD_SF_WATCH_DISPATCH_AFTER_
+    ESCALATION=true opts back into post-escalation dispatch, but can never
+    override the mechanical ceiling (escalated events themselves consumed
+    dispatches, so they count)."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    events = [
+        {"action": "escalated", "agent_attempt": 1},
+        {"action": "dispatch"},
+    ]
+    factory, _, _ = _make_clients(existing=_existing_doc(events))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=EOD_ARN), None)
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "attempt_budget_exhausted",
+    }
+
+
+def test_budget_escalation_telegram_failure_is_non_fatal(monkeypatch):
+    """The loud page is a delivery surface: its outage must not mask the
+    suppression (watch-log already recorded it) nor crash the handler."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    index.notify_via_flow_doctor.side_effect = RuntimeError("bot down")
+    factory, _, s3 = _make_clients(existing=_existing_doc(_dispatch_events(2)))
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["budget_escalated"] is False
+    assert result["agent_dispatch"]["reason"] == "attempt_budget_exhausted"
+    s3.put_object.assert_called_once()  # primary deliverable survived

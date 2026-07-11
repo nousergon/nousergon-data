@@ -243,6 +243,12 @@ def _resolve_event_fields(event: dict) -> dict:
     failed_state = _optional(event, "failed_state", _FAILED_STATE_RE)
     watch_log_key = _optional(event, "watch_log_key", _WATCH_LOG_KEY_RE)
     is_preflight = _optional(event, "is_preflight", _BOOL_RE, default="false")
+    # force_on_demand (config#2270): set "true" by the sf-watch-liveness-probe
+    # reclaim checker's bounded relaunch — a spot reclaim already proved spot
+    # unreliable for this run, so the relaunch skips spot entirely (threaded
+    # to launch_with_fallback(force_on_demand=...), present in the pinned
+    # nousergon-lib v0.106.0). Boolean-validated like is_preflight.
+    force_on_demand = _optional(event, "force_on_demand", _BOOL_RE, default="false")
     # cause: deliberately unvalidated — arbitrary AWS text, base64-encoded
     # before it ever reaches a shell command (see _bootstrap_command).
     cause = str(event.get("cause") or "")
@@ -255,6 +261,7 @@ def _resolve_event_fields(event: dict) -> dict:
         "failed_state": failed_state,
         "watch_log_key": watch_log_key,
         "is_preflight": is_preflight,
+        "force_on_demand": force_on_demand,
         "cause": cause,
     }
 
@@ -298,11 +305,13 @@ exec bash infrastructure/sf_watch_spot_bootstrap.sh \
 """
 
 
-def _launch_instance() -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     """Launch the SF-watch box; spot first, on-demand fallback on capacity
-    exhaustion. Raises SpotLaunchError (or the SpotCapacityExhausted
-    subclass) if BOTH the spot attempt and the on-demand fallback are
-    exhausted/fail — caught once by the caller and converted to a clean
+    exhaustion — or straight to on-demand when ``force_on_demand`` (the
+    config#2270 reclaim relaunch; ``launch_with_fallback`` grew the kwarg in
+    nousergon-lib v0.106.0, this Lambda's pinned version). Raises
+    SpotLaunchError (or the SpotCapacityExhausted subclass) if every attempt
+    is exhausted/fails — caught once by the caller and converted to a clean
     launched:false."""
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
@@ -313,6 +322,7 @@ def _launch_instance() -> tuple[str, str]:
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name=SF_WATCH_TAG_NAME,
         region=REGION,
+        force_on_demand=force_on_demand,
     )
 
 
@@ -473,7 +483,7 @@ def _defer_relaunch(fields: dict, generation: int, context, existing: list[str])
     payload = {k: fields[k] for k in (
         "pipeline_name", "cadence_slug", "run_date", "execution_arn",
         "state_machine_arn", "failed_state", "watch_log_key", "is_preflight",
-        "cause",
+        "force_on_demand", "cause",
     )}
     payload["defer_generation"] = next_generation
     fire_at = datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECONDS)
@@ -650,8 +660,10 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         return _defer_relaunch(fields, defer_generation, context, existing)
 
     run_token = uuid.uuid4().hex
+    # config#2270: the reclaim checker's bounded relaunch skips spot entirely.
+    force_on_demand = fields.get("force_on_demand") == "true"
     try:
-        instance_id, market = _launch_instance()
+        instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     except SpotLaunchError as exc:
         logger.error("sf-watch spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
@@ -712,6 +724,7 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         "run_date": run_date,
         "run_token": run_token,
         "dedupe_degraded": dedupe_degraded,
+        "force_on_demand": force_on_demand,
     }
     if dedupe_degraded:
         verdict["dedupe_probe_error"] = dedupe_probe_error
@@ -726,7 +739,14 @@ def handler(event: dict, context) -> dict:
     payload (RequestResponse). A DEFERRED re-invoke (config#2226 — fired by
     the one-shot EventBridge Scheduler schedule this handler created on a
     concurrency skip) carries the same payload plus `defer_generation` >= 1
-    and first re-evaluates the state machine before dispatching.
+    and first re-evaluates the state machine before dispatching. The
+    sf-watch-liveness-probe's mid-run reclaim checker (config#2270) invokes
+    this same handler (async Event) with the payload plus
+    `force_on_demand: "true"` — note this Lambda records its dispatch
+    decisions ONLY in the returned verdict + CloudWatch logs, never in the
+    watch-log; the budget-visible `action: reclaim_relaunch` watch-log event
+    (counted by the saturday dispatcher's config#2269 attempt ceiling) is
+    written by the PROBE before it invokes here.
 
     Returns {"launched": bool, "reason": str, "instance_id": ..., ...} — read
     DIRECTLY by the GHA job as its success signal. Every anticipated failure
