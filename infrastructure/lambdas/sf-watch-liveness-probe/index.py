@@ -241,6 +241,92 @@ def _alert(problems: list[str]) -> bool:
         return False
 
 
+def _sweep_dropped_failures() -> dict | None:
+    """Sweep for failures dropped during disabled windows (config#2257).
+    Check each pipeline's latest execution: if it's FAILED/TIMED_OUT/ABORTED
+    and newer than the last watch-log event, synthesize a dispatch.
+    Best-effort (non-fatal on API errors) since this is an opportunistic sweep.
+    Returns a dict with sweep results if any dropped failures found."""
+    try:
+        sfn = _sfn_client()
+        s3 = _s3_client()
+        dispatcher = boto3.client("lambda", region_name=REGION)
+
+        # Watch prefixes map (must stay in lockstep with sf-watch-spot-dispatcher)
+        watch_prefixes = {
+            "ne-weekly-freshness-pipeline": "consolidated/saturday_sf_watch",
+            "ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch",
+            "ne-postclose-trading-pipeline": "consolidated/eod_sf_watch",
+            "alpha-engine-eod-pipeline": "consolidated/eod_sf_watch",
+        }
+
+        dropped_count = 0
+        for pipeline_name, watch_prefix in watch_prefixes.items():
+            arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{pipeline_name}"
+            try:
+                response = sfn.list_executions(stateMachineArn=arn, maxResults=1)
+                latest = response.get("executions", [{}])[0]
+            except Exception as exc:
+                logger.warning("sweep: could not list executions for %s: %s", pipeline_name, exc)
+                continue
+
+            status = latest.get("status")
+            if status not in ("FAILED", "TIMED_OUT", "ABORTED"):
+                continue
+
+            # Check if this failure has a watch-log entry
+            run_date = latest.get("name", "").split("-")[-1] if latest.get("name") else ""
+            if not run_date:
+                continue
+
+            watch_log_key = f"{watch_prefix}/{run_date}.json"
+            try:
+                obj = s3.get_object(Bucket="alpha-engine-research", Key=watch_log_key)
+                watch_log = json.loads(obj["Body"].read())
+                events = watch_log.get("events", [])
+                if events and events[-1].get("execution_arn") == latest.get("executionArn"):
+                    # Already covered
+                    continue
+            except Exception as exc:
+                if _error_code(exc) != "NoSuchKey":
+                    logger.warning("sweep: could not read watch-log %s: %s", watch_log_key, exc)
+                # If no watch-log, the failure is dropped
+
+            # Found a dropped failure — invoke dispatcher
+            logger.warning(
+                "sweep: found dropped %s execution %s — invoking dispatcher",
+                status, latest.get("executionArn"),
+            )
+            try:
+                dispatcher.invoke(
+                    FunctionName="alpha-engine-sf-watch-spot-dispatcher",
+                    InvocationType="Event",  # async
+                    Payload=json.dumps({
+                        "pipeline_name": pipeline_name,
+                        "cadence_slug": "swept",  # marker: this came from sweep, not a real event
+                        "run_date": run_date,
+                        "execution_arn": latest.get("executionArn", ""),
+                        "state_machine_arn": arn,
+                        "failed_state": "",
+                        "cause": f"recovered from disabled-window drop by sf-watch-liveness-probe sweep (status: {status})",
+                        "watch_log_key": watch_log_key,
+                        "is_preflight": "false",
+                    }),
+                )
+                dropped_count += 1
+            except Exception as exc:
+                logger.warning("sweep: dispatcher invoke failed for %s: %s", pipeline_name, exc)
+
+        if dropped_count > 0:
+            logger.info("sweep: invoked dispatcher for %d dropped failures", dropped_count)
+            return {"dropped_failures_swept": dropped_count}
+
+    except Exception as exc:
+        logger.warning("sweep for dropped failures failed (non-fatal): %s", exc)
+
+    return None
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Read-only; raises on an unexpected
     AWS API failure so the check can never silently no-op."""
@@ -263,4 +349,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         if already is not None:
             _save_alerted_fingerprint(s3, None)  # clear dedup state now that it's healthy again
 
-    return {"problems": problems, "alerted": alerted, "clean": not problems}
+    # Sweep for dropped failures (config#2257) — best-effort, doesn't affect liveness verdict
+    sweep_result = _sweep_dropped_failures()
+
+    return {
+        "problems": problems,
+        "alerted": alerted,
+        "clean": not problems,
+        "sweep_result": sweep_result,
+    }
