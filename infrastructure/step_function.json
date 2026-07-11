@@ -468,6 +468,15 @@
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -628,6 +637,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],
@@ -832,6 +850,15 @@
                   ],
                   "MaxAttempts": 10,
                   "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
                   "BackoffRate": 1.5
                 }
               ],
@@ -1900,6 +1927,15 @@
                   "MaxAttempts": 10,
                   "IntervalSeconds": 30,
                   "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
                 }
               ],
               "Catch": [
@@ -2035,6 +2071,15 @@
                   ],
                   "MaxAttempts": 10,
                   "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
                   "BackoffRate": 1.5
                 }
               ],
@@ -2180,6 +2225,15 @@
                         "MaxAttempts": 10,
                         "IntervalSeconds": 30,
                         "BackoffRate": 1.5
+                      },
+                      {
+                        "ErrorEquals": [
+                          "Ssm.SdkClientException",
+                          "States.Timeout"
+                        ],
+                        "MaxAttempts": 2,
+                        "IntervalSeconds": 5,
+                        "BackoffRate": 1.5
                       }
                     ],
                     "Catch": [
@@ -2318,6 +2372,15 @@
                   ],
                   "MaxAttempts": 10,
                   "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
                   "BackoffRate": 1.5
                 }
               ],
@@ -2565,6 +2628,15 @@
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -2687,6 +2759,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],
@@ -2811,6 +2892,15 @@
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -2933,6 +3023,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],
@@ -3057,6 +3156,15 @@
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -3175,6 +3283,15 @@
           "MaxAttempts": 5,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -3250,6 +3367,15 @@
             "Ssm.InvocationDoesNotExist"
           ],
           "MaxAttempts": 5,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
