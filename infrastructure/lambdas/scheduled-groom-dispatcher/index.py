@@ -1063,10 +1063,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     continue
                 logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
                             d.reason, d.issue_filter, d.model)
-                # config#2201: SlotDecision still carries partition_index/
-                # partition_count (lib fields kept for pin-lockstep compat —
-                # deferred lib cleanup), but they are no longer consumed:
-                # the end-of-SF sweep box replaced per-box partitioned sweeps.
+                # config#2201/#2205: the end-of-SF sweep box replaced per-box
+                # partitioned sweeps, so this dispatcher consumes only
+                # d.model/d.issue_filter. The now-unused SlotDecision
+                # partition_index/partition_count fields were dropped in
+                # nousergon-lib v0.103.0 (pinned above).
                 entry = {"model": d.model, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget

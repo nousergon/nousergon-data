@@ -10,5 +10,5 @@ boto3>=1.34.0
 # auto-tag.yml) BEFORE this PR merges — this pin bump is what makes that
 # ordering an explicit, CI-enforced gate rather than a silent runtime crash
 # on the next demand-all trigger.
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.101.0
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.103.0
 krepis>=0.10.2
