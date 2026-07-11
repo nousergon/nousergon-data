@@ -57,6 +57,9 @@ DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
 # as the safe default. The update path (step 3) will read the live value and preserve it.
 LAMBDA_ENV_BOOTSTRAP="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true,SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
 
+# Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
+source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
+
 DRY_RUN=false
 BOOTSTRAP=false
 SMOKE=false
@@ -216,12 +219,7 @@ echo "Updating Lambda environment (preserving operator-owned SF_WATCH_DISPATCH_E
 # the update path must PRESERVE its live value, never reset it to bootstrap defaults.
 # This mirrors the saturday-sf-watch-dispatcher fix (config#1818): a routine redeploy
 # should not silently re-arm/disarm the operator's incident-response flag.
-CURRENT_DISPATCH=$(aws lambda get-function-configuration \
-  --function-name "${FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --query 'Environment.Variables.SF_WATCH_DISPATCH_ENABLED' --output text 2>/dev/null)
-case "${CURRENT_DISPATCH}" in true|false) ;; *) CURRENT_DISPATCH=true ;; esac
-echo "  preserving SF_WATCH_DISPATCH_ENABLED=${CURRENT_DISPATCH} (operator-owned)"
+CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" SF_WATCH_DISPATCH_ENABLED true)
 LAMBDA_ENV="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=${CURRENT_DISPATCH},SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
