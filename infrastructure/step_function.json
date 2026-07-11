@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich — plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected. config#2274: top-level TimeoutSeconds=43200 (12h) — the global hang ceiling. Recorded max full run is 3.04h (24-execution history sampled 2026-07-11); the longest LEGITIMATE composition is well under 12h even in the worst case (EvalJudgePoll's 21600s max_wait batch cap + the 7200s spot stages + retry ladders + offcycle/shell presets). Before this ceiling, a hung SSM WaitFor* poll loop (SSM control-plane degradation, e.g. the 2026-07-11 disk-full incident) polled toward the SF 1-year default, invisible to BOTH the deadman alarm (ExecutionsStarted only) and sf-watch (terminal statuses only). A ceiling breach yields status TIMED_OUT, which the sf-watch EventBridge rule already matches (saturday-sf-watch-dispatcher/deploy.sh EVENT_PATTERN) — a hang now pages and dispatches repair automatically. Per-poll-loop iteration caps deliberately skipped: the global ceiling is the load-bearing fix.",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich — plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected. config#2274: top-level TimeoutSeconds=43200 (12h) — the global hang ceiling. Recorded max full run is 3.04h (24-execution history sampled 2026-07-11); the longest LEGITIMATE composition is well under 12h even in the worst case (EvalJudgePoll's 21600s max_wait batch cap + the 7200s spot stages + retry ladders + offcycle/shell presets). Before this ceiling, a hung SSM WaitFor* poll loop (SSM control-plane degradation, e.g. the 2026-07-11 disk-full incident) polled toward the SF 1-year default, invisible to BOTH the deadman alarm (ExecutionsStarted only) and sf-watch (terminal statuses only). A ceiling breach yields status TIMED_OUT, which the sf-watch EventBridge rule already matches (saturday-sf-watch-dispatcher/deploy.sh EVENT_PATTERN) — a hang now pages and dispatches repair automatically. Per-poll-loop iteration caps deliberately skipped: the global ceiling is the load-bearing fix. config#2279: DECLARED RETRY CONVENTION for SSM states — every aws-sdk:ssm:sendCommand spot-stage state carries the 4+2 jittered ladder ([States.TaskFailed,States.Timeout]x4 + [States.ALL]x2, 30s base, backoff 2.0, MaxDelay 300, Jitter FULL); re-issue is idempotent for ALL stages because the send-state Retry fires only on pre-execution API failures (the launcher never ran; the WaitFor* poll loop owns post-delivery outcomes). The two tail health-check sends are the declared health-observe class (no Retry, fail-soft Catch). getCommandInvocation poll states carry the InvocationDoesNotExist eventual-consistency ladder. Enforced by tests/test_sf_retry_ladder_convention.py — a new SSM state must be added to a declared class there or CI fails. Lambda-state States.TaskFailed hardening is the sibling half (config#2250, data-PR752).",
   "StartAt": "InitializeInput",
   "TimeoutSeconds": 43200,
   "States": {
@@ -2087,10 +2087,23 @@
                     "States.TaskFailed",
                     "States.Timeout"
                   ],
-                  "MaxAttempts": 2,
-                  "IntervalSeconds": 180,
+                  "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
                   "BackoffRate": 2.0,
-                  "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -2223,9 +2236,23 @@
                     "States.TaskFailed",
                     "States.Timeout"
                   ],
-                  "MaxAttempts": 1,
+                  "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
                   "IntervalSeconds": 30,
-                  "BackoffRate": 2.0
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -2366,10 +2393,23 @@
                           "States.TaskFailed",
                           "States.Timeout"
                         ],
-                        "MaxAttempts": 1,
-                        "IntervalSeconds": 180,
+                        "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                        "MaxAttempts": 4,
+                        "IntervalSeconds": 30,
                         "BackoffRate": 2.0,
-                        "Comment": "Single best-effort retry (e.g. spot interruption) for this one spec."
+                        "MaxDelaySeconds": 300,
+                        "JitterStrategy": "FULL"
+                      },
+                      {
+                        "ErrorEquals": [
+                          "States.ALL"
+                        ],
+                        "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                        "MaxAttempts": 2,
+                        "IntervalSeconds": 30,
+                        "BackoffRate": 2.0,
+                        "MaxDelaySeconds": 300,
+                        "JitterStrategy": "FULL"
                       }
                     ],
                     "Catch": [
@@ -2505,10 +2545,23 @@
                     "States.TaskFailed",
                     "States.Timeout"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 180,
+                  "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
                   "BackoffRate": 2.0,
-                  "Comment": "Single best-effort retry (e.g. spot interruption); selection is non-critical."
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -2752,10 +2805,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -2875,10 +2941,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture."
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -2998,10 +3077,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture."
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -3121,10 +3213,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -3244,10 +3349,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture for symmetry."
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -3347,7 +3465,7 @@
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration.",
+      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs to the success notifier, so a retry ladder would only delay completion, never protect spend (the health-check masking class itself is config#2276 scope).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3420,7 +3538,7 @@
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state).",
+      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs to the success notifier, so a retry ladder would only delay completion, never protect spend.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
