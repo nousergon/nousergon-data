@@ -53,7 +53,9 @@ DEFER_POLICY_NAME="alpha-engine-sf-watch-defer-scheduler-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
-LAMBDA_ENV="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true,SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
+# Bootstrap default (first-time deployment only) — sets SF_WATCH_DISPATCH_ENABLED=true
+# as the safe default. The update path (step 3) will read the live value and preserve it.
+LAMBDA_ENV_BOOTSTRAP="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=true,SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
 
 DRY_RUN=false
 BOOTSTRAP=false
@@ -184,7 +186,7 @@ EOF
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment "${LAMBDA_ENV}" \
+      --environment "${LAMBDA_ENV_BOOTSTRAP}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -209,7 +211,18 @@ fi
 
 echo "✓ Code deployed."
 
-echo "Updating Lambda environment..."
+echo "Updating Lambda environment (preserving operator-owned SF_WATCH_DISPATCH_ENABLED)..."
+# SF_WATCH_DISPATCH_ENABLED is an OPERATOR-OWNED runtime flag (defer-not-drop gate) —
+# the update path must PRESERVE its live value, never reset it to bootstrap defaults.
+# This mirrors the saturday-sf-watch-dispatcher fix (config#1818): a routine redeploy
+# should not silently re-arm/disarm the operator's incident-response flag.
+CURRENT_DISPATCH=$(aws lambda get-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --region "${REGION}" \
+  --query 'Environment.Variables.SF_WATCH_DISPATCH_ENABLED' --output text 2>/dev/null)
+case "${CURRENT_DISPATCH}" in true|false) ;; *) CURRENT_DISPATCH=true ;; esac
+echo "  preserving SF_WATCH_DISPATCH_ENABLED=${CURRENT_DISPATCH} (operator-owned)"
+LAMBDA_ENV="Variables={LOG_LEVEL=INFO,SF_WATCH_DISPATCH_ENABLED=${CURRENT_DISPATCH},SF_WATCH_DEFER_ROLE_ARN=${DEFER_ROLE_ARN}}"
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
   --environment "${LAMBDA_ENV}" \
