@@ -15,8 +15,11 @@ invocation re-evaluates via ListExecutions (recovered / retarget-newest-
 failed / defer-again / fail-safe-launch); the empty-watch_log_key synthesis
 fallback; a post-launch SSM-send failure terminates the box and returns
 launched:false; a malformed event returns launched:false rather than
-raising; the kill-switch short-circuit; and the cause-field base64
-command-injection guard.
+raising; the kill-switch short-circuit; the cause-field base64
+command-injection guard; and the config#2267 launch-path hardening — a
+failed concurrency probe launches WITH dedupe_degraded:true recorded
+(site 1), and the load-bearing discriminator tag write is retried then
+terminate-and-fail on final failure (site 2).
 """
 
 from __future__ import annotations
@@ -62,9 +65,12 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
-    def __init__(self, running_instances=None):
+    def __init__(self, running_instances=None, create_tags_failures=0):
         self.terminated = []
         self.tags_created = []
+        self.create_tags_attempts = 0
+        # First N create_tags calls raise (config#2267 site 2 retry tests).
+        self._create_tags_failures = create_tags_failures
         # {(cadence_slug, pipeline_name, run_date) -> [instance_ids]} already
         # "live" for the concurrency guard's describe_instances check to find.
         self._running_instances = dict(running_instances or {})
@@ -77,6 +83,9 @@ class _FakeEc2:
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
 
     def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
+        self.create_tags_attempts += 1
+        if self.create_tags_attempts <= self._create_tags_failures:
+            raise RuntimeError(f"CreateTags throttled (attempt {self.create_tags_attempts})")
         self.tags_created.append((Resources, Tags))
         return {}
 
@@ -145,11 +154,14 @@ class _FakeContext:
 
 
 def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None,
-          scheduler=None, sfn=None):
+          scheduler=None, sfn=None, create_tags_failures=0):
+    # config#2267 site 2 retry loop sleeps between attempts — zero it out.
+    monkeypatch.setenv("SF_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "0")
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
-    ec2 = _FakeEc2(running_instances=running_instances)
+    ec2 = _FakeEc2(running_instances=running_instances,
+                   create_tags_failures=create_tags_failures)
     scheduler = scheduler if scheduler is not None else _FakeScheduler()
     sfn = sfn if sfn is not None else _FakeSfn()
     clients = {"ec2": ec2, "ssm": ssm, "scheduler": scheduler, "stepfunctions": sfn}
@@ -172,6 +184,16 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None,
         importlib.reload(sys.modules["nousergon_lib.spot_dispatch"])
     else:
         import nousergon_lib.spot_dispatch  # noqa: F401 — first import picks up the current stub
+
+    # SpotProbeError back-fill (config#2267 site 1): index.py imports it and
+    # its requirements pin nousergon-lib v0.106.0 (the first version carrying
+    # it), but a local/shared environment may still have an OLDER installed
+    # lib. Inject a name-compatible stand-in so the suite runs under both —
+    # under >= 0.106.0 the real class is present and this is a no-op. (Reload
+    # above re-executes the module, so re-check every _load call.)
+    _sd = sys.modules["nousergon_lib.spot_dispatch"]
+    if not hasattr(_sd, "SpotProbeError"):
+        _sd.SpotProbeError = type("SpotProbeError", (Exception,), {})
 
     import index
 
@@ -644,7 +666,13 @@ def test_different_pipeline_same_cadence_and_date_is_not_blocked(monkeypatch):
     assert out["launched"] is True
 
 
-def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
+def test_concurrency_check_failure_still_launches(monkeypatch):
+    # config#2267 site 1 POLICY: a broken probe must never block a launch —
+    # coverage beats dedupe. (Under nousergon-lib >= 0.106.0 the raw
+    # describe_instances error surfaces as SpotProbeError and the launch is
+    # flagged dedupe_degraded; under the old fail-open lib it degrades to []
+    # silently. Either way the box launches — the explicit degraded-flag
+    # contract is pinned separately below.)
     idx = _load(
         monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
         env={"SF_WATCH_DISPATCH_ENABLED": "true"},
@@ -655,9 +683,70 @@ def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
 
     idx._test_ec2.describe_instances = _boom
     out = idx.handler(_event(), None)
-    # A broken check must never block a launch — optimization, not a
-    # correctness gate.
     assert out["launched"] is True
+
+
+def test_probe_failure_launches_with_dedupe_degraded_recorded(monkeypatch):
+    """config#2267 site 1: SpotProbeError from the concurrency probe →
+    proceed to launch, with dedupe_degraded:true + the probe error recorded
+    in the returned verdict (lib-version-agnostic via a direct monkeypatch
+    of the probe primitive)."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-degraded",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+    )
+
+    def _probe_down(*args, **kwargs):
+        raise idx.SpotProbeError("concurrency probe failed for tag_name='alpha-engine-sf-watch-spot': ThrottlingException: rate exceeded")
+
+    monkeypatch.setattr(idx.spot_dispatch, "running_instance_ids", _probe_down)
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["dedupe_degraded"] is True
+    # The verdict names the probe error — the GHA caller archives it.
+    assert "ThrottlingException" in out["dedupe_probe_error"]
+    # A healthy probe keeps the flag False.
+    idx2 = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out2 = idx2.handler(_event(), None)
+    assert out2["launched"] is True
+    assert out2["dedupe_degraded"] is False
+    assert "dedupe_probe_error" not in out2
+
+
+def test_transient_tag_write_failure_is_retried_then_launch_succeeds(monkeypatch):
+    """config#2267 site 2: create_tags failing twice then succeeding on the
+    third (final) attempt keeps the dispatch alive — the tags land."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-retagged",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        create_tags_failures=2,
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert idx._test_ec2.create_tags_attempts == 3
+    assert idx._test_ec2.tags_created  # third attempt landed the tags
+    assert idx._test_ec2.terminated == []
+
+
+def test_persistent_tag_write_failure_terminates_box_and_fails_dispatch(monkeypatch):
+    """config#2267 site 2: the discriminator tags are LOAD-BEARING — after
+    the bounded retry is exhausted the box is TERMINATED (it is invisible to
+    the dedupe guard and the orphan-reaper's completion check) and the
+    dispatch fails loudly with a clean launched:false."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-untaggable",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        create_tags_failures=99,
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is False
+    assert out["reason"] == "tag_write_failed"
+    assert out["instance_id"] == "i-untaggable"
+    assert "CreateTags throttled" in out["error"]
+    assert idx._test_ec2.create_tags_attempts == idx.TAG_WRITE_ATTEMPTS
+    # The untagged box was terminated, and no bootstrap was ever sent to it.
+    assert idx._test_ec2.terminated == ["i-untaggable"]
+    assert idx._test_ssm.sent == []
 
 
 def test_post_launch_ssm_failure_terminates_instance_returns_clean_false(monkeypatch):
