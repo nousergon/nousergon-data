@@ -72,8 +72,15 @@ def test_gate_halts_only_on_confirmed_violation(states):
     gate = states["PipelineContractGate"]
     assert gate["Type"] == "Choice"
     c = gate["Choices"][0]
-    assert c["Variable"] == "$.pipeline_contract_result.Payload.has_violation"
-    assert c["BooleanEquals"] is True
+    # config#2275: the dereference is IsPresent-guarded (And short-circuit)
+    # so a partial gate payload falls to Default instead of States.Runtime.
+    guard, comparison = c["And"]
+    assert guard == {
+        "Variable": "$.pipeline_contract_result.Payload.has_violation",
+        "IsPresent": True,
+    }
+    assert comparison["Variable"] == "$.pipeline_contract_result.Payload.has_violation"
+    assert comparison["BooleanEquals"] is True
     # Confirmed violation halts, but routes through the $.error normalizer
     # FIRST (not straight to HandleFailure) — see
     # test_violation_halt_normalizes_error.

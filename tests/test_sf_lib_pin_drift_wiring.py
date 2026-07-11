@@ -83,8 +83,15 @@ def test_gate_halts_only_on_confirmed_drift(states):
     gate = states["LibPinDriftGate"]
     assert gate["Type"] == "Choice"
     c = gate["Choices"][0]
-    assert c["Variable"] == "$.libpin_drift_result.Payload.has_drift"
-    assert c["BooleanEquals"] is True
+    # config#2275: the dereference is IsPresent-guarded (And short-circuit)
+    # so a partial gate payload falls to Default instead of States.Runtime.
+    guard, comparison = c["And"]
+    assert guard == {
+        "Variable": "$.libpin_drift_result.Payload.has_drift",
+        "IsPresent": True,
+    }
+    assert comparison["Variable"] == "$.libpin_drift_result.Payload.has_drift"
+    assert comparison["BooleanEquals"] is True
     # Confirmed drift halts, but routes through the $.error normalizer FIRST
     # (not straight to HandleFailure) — see test_drift_halt_normalizes_error.
     assert c["Next"] == "ExtractLibPinDriftError"

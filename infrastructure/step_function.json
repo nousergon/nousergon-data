@@ -76,9 +76,25 @@
       "Comment": "Not the run day -> clean Succeed skip BEFORE any spend (no mutex, no lib-pin check, no spot, no alert): on a normal week 2 of the 3 THU-SAT firings land here by design. Run day or any non-false result -> proceed. Fail-open mirrors the weekday gate posture: missing the weekly run is worse than a duplicate.",
       "Choices": [
         {
-          "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
-          "BooleanEquals": false,
+          "And": [
+            {
+              "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+              "BooleanEquals": false
+            }
+          ],
           "Next": "WeeklyRunDaySkip"
+        },
+        {
+          "Not": {
+            "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+            "IsPresent": true
+          },
+          "Comment": "config#2275: gate Lambda returned a payload WITHOUT is_weekly_run_day (partial/malformed result). Unguarded, this dereference threw States.Runtime and ended the run FAILED without HandleFailure context. Route through the malformed-payload floor Pass into the existing fail-open+alert notifier: proceed as run day, but SAY SO.",
+          "Next": "WeeklyRunDayGateMalformed"
         }
       ],
       "Default": "CheckRunMode"
@@ -86,6 +102,16 @@
     "WeeklyRunDaySkip": {
       "Type": "Succeed",
       "Comment": "Designed no-op: scheduled THU-SAT firing on a non-run day. Succeed (never Fail) so SF-success metrics, the SF-watch agent, and page-25 treat this exactly like the weekday NotifyHolidaySkip — a green skip, not a failure. Cycle health remains artifact-freshness-as-authority (config#1724); this state produces no artifacts on purpose."
+    },
+    "WeeklyRunDayGateMalformed": {
+      "Type": "Pass",
+      "Comment": "config#2275: floor $.weekly_run_day_gate_error before WeeklyRunDayGateFailed formats it into the SNS message — that state's Message.$ calls States.JsonToString($.weekly_run_day_gate_error), which would itself throw States.Runtime were the field absent. The Catch path sets it via ResultPath; this Choice path must floor it explicitly.",
+      "Result": {
+        "Error": "WeeklyRunDayGateMalformedPayload",
+        "Cause": "check_weekly_run_day returned a payload without is_weekly_run_day — proceeding fail-open as a run day (mirrors the gate Catch posture)."
+      },
+      "ResultPath": "$.weekly_run_day_gate_error",
+      "Next": "WeeklyRunDayGateFailed"
     },
     "WeeklyRunDayGateFailed": {
       "Type": "Task",
@@ -188,8 +214,17 @@
       "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention. On pass, proceeds to PipelineContractCheck (L4595 / config#693) — the sibling pre-spend preflight gate — rather than straight to CheckMutexRole, composing both invariant probes into one preflight chain before any spot spend.",
       "Choices": [
         {
-          "Variable": "$.libpin_drift_result.Payload.has_drift",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.libpin_drift_result.Payload.has_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.libpin_drift_result.Payload.has_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_drift) previously threw States.Runtime here, bypassing HandleFailure. Absence now falls through to Default: the gate's documented fail-open posture (config#2278 adds the degraded-visibility alert for that path).",
           "Next": "ExtractLibPinDriftError"
         }
       ],
@@ -246,8 +281,17 @@
       "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error. config#1819: ExtractPipelineContractError itself hands off to NormalizeFailureContext (the single Catch/Next chokepoint), not HandleFailure directly.",
       "Choices": [
         {
-          "Variable": "$.pipeline_contract_result.Payload.has_violation",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.pipeline_contract_result.Payload.has_violation",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_contract_result.Payload.has_violation",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_violation) previously threw States.Runtime here, bypassing HandleFailure. Absence now falls through to Default: the gate's documented fail-open posture (config#2278 adds the degraded-visibility alert for that path).",
           "Next": "ExtractPipelineContractError"
         }
       ],
@@ -1110,13 +1154,30 @@
               "Comment": "Verify research returned OK (not ERROR)",
               "Choices": [
                 {
-                  "Variable": "$.research_result.Payload.status",
-                  "StringEquals": "OK",
+                  "And": [
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "StringEquals": "OK"
+                    }
+                  ],
                   "Next": "CheckSkipDataPhase2"
                 },
                 {
-                  "Variable": "$.research_result.Payload.status",
-                  "StringEquals": "SKIPPED",
+                  "And": [
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "StringEquals": "SKIPPED"
+                    }
+                  ],
+                  "Comment": "config#2275: both rules IsPresent-guarded so a research Lambda returning a payload WITHOUT status (e.g. {}) falls to Default=ExtractResearchError -> HandleFailure with real context, instead of throwing a bare States.Runtime that bypasses the whole failure chain (the 2026-07-03 incident class).",
                   "Next": "CheckSkipDataPhase2"
                 }
               ],
@@ -1302,13 +1363,30 @@
               "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) → route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK → enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
               "Choices": [
                 {
-                  "Variable": "$.eval_judge_submit.Payload.status",
-                  "StringEquals": "EMPTY",
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "StringEquals": "EMPTY"
+                    }
+                  ],
                   "Next": "EvalJudgeProcess"
                 },
                 {
-                  "Variable": "$.eval_judge_submit.Payload.status",
-                  "StringEquals": "OK",
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "StringEquals": "OK"
+                    }
+                  ],
+                  "Comment": "config#2275: IsPresent-guarded so a submit payload WITHOUT status actually reaches the fail-soft Default this state's own comment promises ('missing fields routes to EvalRollingMean') instead of throwing States.Runtime.",
                   "Next": "EvalJudgePollWait"
                 }
               ],
@@ -1363,21 +1441,55 @@
               "Comment": "Branch on poll status. processing_status='ended' → run Process. exceeded_max_wait=true → fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else → loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
               "Choices": [
                 {
-                  "Or": [
+                  "And": [
                     {
                       "Variable": "$.eval_judge_poll.Payload.processing_status",
-                      "StringEquals": "ended"
+                      "IsPresent": true
                     },
                     {
-                      "Variable": "$.eval_judge_poll.Payload.processing_status",
-                      "StringEquals": "ended_empty"
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_poll.Payload.processing_status",
+                          "StringEquals": "ended"
+                        },
+                        {
+                          "Variable": "$.eval_judge_poll.Payload.processing_status",
+                          "StringEquals": "ended_empty"
+                        }
+                      ]
                     }
                   ],
                   "Next": "EvalJudgeProcess"
                 },
                 {
-                  "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                  "BooleanEquals": true,
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "EvalRollingMean"
+                },
+                {
+                  "And": [
+                    {
+                      "Not": {
+                        "Variable": "$.eval_judge_poll.Payload.processing_status",
+                        "IsPresent": true
+                      }
+                    },
+                    {
+                      "Not": {
+                        "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                        "IsPresent": true
+                      }
+                    }
+                  ],
+                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed — fail-soft to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
                   "Next": "EvalRollingMean"
                 }
               ],

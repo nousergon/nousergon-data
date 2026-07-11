@@ -240,10 +240,11 @@ class TestBranchAContents:
 
     def test_data_phase2_after_research_in_branch_a(self, branch_a):
         # Research success → CheckSkipDataPhase2 → DataPhase2
+        # config#2275: rules are And:[{IsPresent}, {StringEquals}] guarded.
         ok = [
             c["Next"]
             for c in branch_a["CheckResearchStatus"]["Choices"]
-            if c.get("StringEquals") == "OK"
+            if any(leaf.get("StringEquals") == "OK" for leaf in c.get("And", []))
         ]
         assert ok == ["CheckSkipDataPhase2"]
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
