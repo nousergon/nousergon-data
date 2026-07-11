@@ -722,3 +722,39 @@ def test_disabled_flag_short_circuits(monkeypatch):
     assert out["launched"] is False
     assert out["reason"] == "disabled"
     assert idx._test_ssm.sent == []
+
+
+def test_deploy_sh_launch_config_pins_match_index_defaults(monkeypatch):
+    """LOCKSTEP GUARD (config#2265): deploy.sh pins SF_WATCH_AMI_ID /
+    SF_WATCH_SECURITY_GROUP / SF_WATCH_SUBNETS into the deployed Lambda env —
+    the observable source of truth sf-watch-liveness-probe reads to verify the
+    launch config (AMI/SG/subnets) still exists twice daily. The pins MUST
+    equal this module's own in-code defaults, or the probe would verify a
+    DIFFERENT launch config than the one an env-stripped dispatcher would
+    actually launch with. Mirrors the probe's own EXPECTED_PIPELINE_NAMES
+    source-text lockstep guard."""
+    for var in ("SF_WATCH_AMI_ID", "SF_WATCH_SECURITY_GROUP", "SF_WATCH_SUBNETS"):
+        monkeypatch.delenv(var, raising=False)
+    idx = _load(monkeypatch)
+
+    deploy_sh = open(os.path.join(os.path.dirname(__file__), "deploy.sh")).read()
+    pins = {}
+    for var in ("LAUNCH_AMI_ID", "LAUNCH_SECURITY_GROUP", "LAUNCH_SUBNETS"):
+        m = re.search(rf'^{var}="([^"]+)"$', deploy_sh, re.M)
+        assert m is not None, (
+            f"deploy.sh no longer pins {var} — the liveness probe would alert "
+            "a MISSING launch-config key on every run after the next deploy"
+        )
+        pins[var] = m.group(1)
+
+    assert pins["LAUNCH_AMI_ID"] == idx.AMI_ID
+    assert pins["LAUNCH_SECURITY_GROUP"] == idx.SECURITY_GROUP
+    assert [s.strip() for s in pins["LAUNCH_SUBNETS"].split(",")] == idx.SUBNETS
+
+    # And the env JSON template actually carries all three pins into the
+    # deployed env (both the bootstrap create AND the every-deploy update use
+    # lambda_env_json).
+    for env_key in ("SF_WATCH_AMI_ID", "SF_WATCH_SECURITY_GROUP", "SF_WATCH_SUBNETS"):
+        assert f'\\"{env_key}\\"' in deploy_sh or f'"{env_key}"' in deploy_sh, (
+            f"deploy.sh's lambda_env_json no longer sets {env_key}"
+        )

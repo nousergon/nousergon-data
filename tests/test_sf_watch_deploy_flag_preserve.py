@@ -66,14 +66,25 @@ def test_deploy_update_path_preserves_operator_dispatch_flag():
             )
             assert call in src, \
                 f"{dispatcher}: update path must preserve {flag_name} via the helper"
-            # ...and the env applied on update carries the preserved value.
-            assert f"{flag_name}=${{{shell_var}}}" in src, \
+            # ...and the env applied on update carries the preserved value —
+            # either inline (`Variables={...,FLAG=${VAR},...}`) or through a
+            # JSON env-builder taking the preserved var as its argument
+            # (sf-watch-spot-dispatcher's lambda_env_json, config#2265).
+            inline_carry = f"{flag_name}=${{{shell_var}}}" in src
+            builder_carry = (
+                f'lambda_env_json "${{{shell_var}}}"' in src
+                and f'"{flag_name}":"%s"' in src
+            )
+            assert inline_carry or builder_carry, \
                 f"{dispatcher}: update env must use the preserved {flag_name} value"
 
             # The hardcoded default may only exist in the bootstrap
             # (create-function) posture, never in the update path's env.
             assert "create-function" in src, f"{dispatcher}: bootstrap block missing"
-            hardcoded = f"{flag_name}={default_val}"
+            hardcoded = (
+                f"{flag_name}={default_val}" if inline_carry
+                else f"lambda_env_json {default_val}"
+            )
             assert src.count(hardcoded) >= 1, \
                 f"{dispatcher}: must keep one hardcoded {hardcoded} (bootstrap default)"
             update_pos = src.index("Updating Lambda environment")
