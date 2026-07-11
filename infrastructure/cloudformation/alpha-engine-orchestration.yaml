@@ -136,16 +136,24 @@ Resources:
       DefinitionS3Location:
         Bucket: alpha-engine-research
         Key: infrastructure/step_function.json
-      # Alternative: inline definition via DefinitionString
-      # Using S3 location so the JSON files in the repo are the source of truth.
-      # Deploy script uploads JSON to S3 then updates the state machine.
-      # LoggingConfiguration is OWNED HERE (declarative SoT). The deploy
-      # script's update-state-machine call passes only --definition, which is a
-      # partial update (omitted loggingConfiguration is left unchanged), so this
-      # CFN-set logging is NOT wiped on each deploy. Logging the SF execution
-      # FailedEvents (level=ERROR) is what carries the L274 MutexConflict Cause
-      # into the log group for the metric filter below. The ne-* rename
-      # (config#1381) re-created these SFs without logging — this restores it.
+      # SINGLE-WRITER CONTRACT (config#2273): the repo file
+      # infrastructure/step_function.json is the sole source of truth for
+      # this definition. DefinitionS3Location is only READ at stack-create /
+      # resource-replacement time; both deploy paths
+      # (deploy-infrastructure.sh on merge, deploy_step_function.sh for
+      # manual/bootstrap) upload the stamped repo bytes to this exact S3
+      # key BEFORE update-state-machine, so a CFN restamp can only ever
+      # re-deploy the same bytes — CFN is not an independent writer in
+      # practice. Drift backstop across all three copies (repo / S3 / live):
+      # infrastructure/step-functions/check-definition-drift.py.
+      # LoggingConfiguration is DECLARED here (declarative SoT for the
+      # shape) and ASSERTED explicitly (--logging-configuration) by the
+      # deploy scripts on every update since config#2273 — never left to
+      # partial-update preservation (the recreate-drops-logging class is
+      # config#1464). Logging the SF execution FailedEvents (level=ERROR)
+      # is what carries the L274 MutexConflict Cause into the log group
+      # for the metric filter below. The ne-* rename (config#1381)
+      # re-created these SFs without logging — this restores it.
       LoggingConfiguration:
         Level: ERROR
         IncludeExecutionData: true

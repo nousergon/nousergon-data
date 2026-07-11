@@ -153,10 +153,22 @@ sf_exists() {
 # Regression: 2026-06-04 — the Director SF state pushed the ASL over the line.
 
 # CFN-managed SF: update if present, else defer creation to CloudFormation (step 4).
+# The 4th arg is a JSON LoggingConfiguration string, passed EXPLICITLY on every
+# update (config#2273 deliverable 3): never rely on partial-update semantics to
+# preserve the CFN-set logging — a recreate-dropped config (config#1464 class,
+# hit live by the ne-* rename config#1381) is self-healed by the next deploy
+# instead of lingering until step-functions/check-drift.py pages. The SHAPE
+# stays declared in cloudformation/alpha-engine-orchestration.yaml (SoT); the
+# literals below must mirror it. Same mechanics as the EOD precedent
+# (config#1416) in update_or_create below.
 update_or_defer_to_cfn() {
-    local arn="$1" stamped="$2" label="$3"
+    local arn="$1" stamped="$2" label="$3" logging="${4:-}"
+    local logging_args=()
+    if [ -n "$logging" ]; then
+        logging_args=(--logging-configuration "$logging")
+    fi
     if sf_exists "$arn"; then
-        aws stepfunctions update-state-machine --state-machine-arn "$arn" --definition "file://$stamped" --query "updateDate" --output text
+        aws stepfunctions update-state-machine --state-machine-arn "$arn" --definition "file://$stamped" "${logging_args[@]}" --query "updateDate" --output text
         echo "  $label updated."
     else
         echo "  $label absent — CloudFormation will create it from S3 in step 4 (rename cutover)."
@@ -197,8 +209,14 @@ aws logs create-log-group --log-group-name "$EOD_LOG_GROUP_NAME" --region "$REGI
 aws logs put-retention-policy --log-group-name "$EOD_LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
 EOD_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$EOD_LOG_GROUP_ARN"'"}}]}'
 
-update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline"
-update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline"
+# CFN-pair logging configs — mirror the LoggingConfiguration blocks CFN
+# declares on SaturdayPipeline / WeekdayPipeline (level=ERROR,
+# includeExecutionData=true, the CFN-owned per-SF log groups).
+SAT_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-weekly-freshness-pipeline:*"}}]}'
+DAILY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-preopen-trading-pipeline:*"}}]}'
+
+update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline" "$SAT_LOGGING_CONFIG"
+update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline" "$DAILY_LOGGING_CONFIG"
 update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline" "$EOD_LOGGING_CONFIG"
 update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-pipeline" "Backlog groom pipeline"
 
