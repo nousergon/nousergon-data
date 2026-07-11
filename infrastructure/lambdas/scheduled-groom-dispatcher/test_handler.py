@@ -15,7 +15,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import re
 import sys
 import types
 from pathlib import Path
@@ -764,19 +763,12 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
                         ("low-only", "claude-haiku-4-5")}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
     assert len(cmds) == 3
-    # config#2129: every co-launched box gets its OWN disjoint sweep
-    # partition — no more "only the first box sweeps" starvation. All 3
-    # share the SAME partition_count (3) with distinct partition_index
-    # values 0/1/2 (order follows decide_trigger's high-first pool order).
-    assert "GROOM_NO_SWEEP=1" not in cmds[0]
+    # config#2201: groom boxes are pure issue-coverage workers — the
+    # config#2129 per-box sweep-partition exports are retired (the dispatch
+    # SF's end-of-SF run_mode=sweep box owns ALL PR sweeping now).
     for c in cmds:
-        assert "export GROOM_SWEEP_PARTITION_COUNT=3" in c
-    indices = set()
-    for c in cmds:
-        m = re.search(r"export GROOM_SWEEP_PARTITION_INDEX=(\d+)", c)
-        assert m, f"missing partition index export in: {c}"
-        indices.add(int(m.group(1)))
-    assert indices == {0, 1, 2}
+        assert "GROOM_NO_SWEEP" not in c
+        assert "GROOM_SWEEP_PARTITION" not in c
 
 
 def test_symmetric_trigger_light_backlog_zero_boxes(monkeypatch):
@@ -863,9 +855,10 @@ def test_decide_only_demand_all_returns_launches_without_launching(monkeypatch):
     assert d["trigger"] == "demand-all"
     assert len(d["launches"]) == 3
     assert {e["issue_filter"] for e in d["launches"]} == {"high-only", "mid-only", "low-only"}
-    counts = {e["partition_count"] for e in d["launches"]}
-    assert counts == {3}
-    assert sorted(e["partition_index"] for e in d["launches"]) == [0, 1, 2]
+    # config#2201: decide entries carry no partition fields any more — the
+    # end-of-SF sweep box replaced per-box partitioned sweeps.
+    for e in d["launches"]:
+        assert "partition_index" not in e and "partition_count" not in e
     assert idx._test_ssm.sent == []
 
 
@@ -876,8 +869,7 @@ def test_decide_only_single_tier_returns_one_launch(monkeypatch):
                        "issue_filter": "mid-only", "schedule": "0 7 * * *",
                        "decide_only": True}, None)
     d = out["decide"]
-    assert d["launches"] == [{"model": "claude-sonnet-5", "issue_filter": "mid-only",
-                              "partition_index": 0, "partition_count": 1}]
+    assert d["launches"] == [{"model": "claude-sonnet-5", "issue_filter": "mid-only"}]
     assert idx._test_ssm.sent == []
 
 
@@ -886,8 +878,7 @@ def test_decide_only_ungated_direct_dispatch(monkeypatch):
     out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
                        "issue_filter": "gated-reverify", "decide_only": True}, None)
     assert out["decide"]["launches"] == [{"model": "claude-haiku-4-5",
-                                          "issue_filter": "gated-reverify",
-                                          "partition_index": 0, "partition_count": 1}]
+                                          "issue_filter": "gated-reverify"}]
     assert idx._test_ssm.sent == []
 
 
@@ -938,16 +929,15 @@ def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
                             AssertionError("launch_decided must not re-enumerate")))
     out = idx.handler({
         "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-haiku-4-5",
-        "issue_filter": "low-only", "partition_index": 2, "partition_count": 3,
+        "issue_filter": "low-only",
         "launch_decided": True,
     }, None)
     g = out["groom"]
     assert g["launched"] is True
     assert g["model"] == "claude-haiku-4-5" and g["issue_filter"] == "low-only"
-    assert g["partition_index"] == 2 and g["partition_count"] == 3
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_SWEEP_PARTITION_INDEX=2" in cmd
-    assert "export GROOM_SWEEP_PARTITION_COUNT=3" in cmd
+    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+    assert "export GROOM_ISSUE_FILTER=low-only" in cmd
 
 
 def test_launch_decided_bypasses_pace_gate(monkeypatch):
@@ -968,14 +958,114 @@ def test_launch_decided_bypasses_pace_gate(monkeypatch):
     assert out["groom"]["launched"] is True
 
 
-def test_launch_decided_defaults_partition_when_absent(monkeypatch):
+# ── config#2201: end-of-SF sweep box (run_mode=sweep + launch_decided) ───────
+# The dispatch SF's final DispatchEndOfSfSweep state fires this exact event
+# after the groom Map winds down (and on the zero-launches path): ONE Haiku
+# sweep box per trigger cycle, guarded on its own distinct 'sweep' lane tag.
+
+
+_SWEEP_SF_EVENT = {
+    "run_mode": "sweep", "launch_decided": True, "model": "claude-haiku-4-5",
+    "issue_filter": "mid-only", "schedule": "end-of-sf-sweep",
+}
+
+
+def test_sweep_launch_decided_launches_haiku_sweep_box(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    # Unconditional by design: no demand/pace enumeration on the sweep path.
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("sweep launch_decided must not enumerate")))
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["run_mode"] == "sweep"
+    assert g["model"] == "claude-haiku-4-5"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "groom_spot_bootstrap.sh --mode sweep" in cmd
+    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+
+
+def test_sweep_box_tagged_with_distinct_sweep_lane(monkeypatch):
+    # The concurrent guard keys on tag groom-issue-filter — a sweep box tagged
+    # with its (inert) issue_filter verbatim would collide with the mid-only
+    # GROOM box's tag. Sweep boxes get the distinct 'sweep' tag value instead;
+    # the event's issue_filter still passes the lib filter validation.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert out["groom"]["tier_tag"] == "sweep"
+    assert out["groom"]["issue_filter"] == "mid-only"
+    assert idx._test_ec2.tags_created == [
+        (["i-stub"], [{"Key": "groom-issue-filter", "Value": "sweep"}])
+    ]
+
+
+def test_sweep_launch_skipped_when_sweep_box_already_live(monkeypatch):
+    launched = []
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: launched.append(1) or "i-new",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"sweep": ["i-live-sweep"]},
+    )
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "concurrent_tier_skip"
+    assert g["existing_instance_ids"] == ["i-live-sweep"]
+    assert launched == []  # zero spend — the live sweep box owns this cycle
+
+
+def test_sweep_launch_not_blocked_by_live_mid_only_groom_box(monkeypatch):
+    # The exact collision the distinct tag exists to prevent: a live mid-only
+    # GROOM box (routine — Sonnet runs can go hours) must never starve the
+    # end-of-SF sweep.
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"mid-only": ["i-live-mid-groom"]},
+    )
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert out["groom"]["launched"] is True
+    assert out["groom"]["tier_tag"] == "sweep"
+
+
+def test_live_sweep_box_does_not_block_mid_only_groom_launch(monkeypatch):
+    # Symmetric half: a still-running sweep box must not block the next
+    # mid-only groom launch (their queues are disjoint: open PRs vs issues).
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"sweep": ["i-live-sweep"]},
+    )
+    out = idx.handler({"run_mode": "full", "schedule": "0 7 * * *",
+                       "model": "claude-sonnet-5", "issue_filter": "mid-only",
+                       "launch_decided": True}, None)
+    assert out["groom"]["launched"] is True
+    assert out["groom"]["tier_tag"] == "mid-only"
+
+
+def test_sweep_launch_failure_raises_for_sf_catch(monkeypatch):
+    # The SF's DispatchEndOfSfSweep state converts this raise into a recorded,
+    # non-fatal skip (Catch → RecordSweepDispatchFailure) — the Lambda itself
+    # stays fail-loud so direct invokes/EventBridge retries also see the miss.
+    def _boom(types_, subnets, **kw):
+        raise _SpotLaunchError("RunInstances denied")
+
+    idx = _load(monkeypatch, launch_impl=_boom, env={"GROOM_DISPATCH_ENABLED": "true"})
+    with pytest.raises(_SpotLaunchError, match="RunInstances denied"):
+        idx.handler(dict(_SWEEP_SF_EVENT), None)
+
+
+def test_launch_decided_never_exports_partition_envs(monkeypatch):
+    # config#2201: the config#2129 partition machinery is fully retired — a
+    # stale caller still sending partition fields must not resurrect the
+    # exports (they're simply ignored), and no launch path emits them.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "0 1 * * *",
+                       "partition_index": 2, "partition_count": 3,
                        "launch_decided": True}, None)
-    g = out["groom"]
-    assert g["partition_index"] == 0 and g["partition_count"] == 1
+    assert out["groom"]["launched"] is True
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "GROOM_SWEEP_PARTITION" not in cmd  # count<=1 -> no export at all
+    assert "GROOM_SWEEP_PARTITION" not in cmd
+    assert "GROOM_NO_SWEEP" not in cmd
 
 
 # ── config#2038: engagement lookback + disposition set must come from the lib ──
@@ -1073,11 +1163,14 @@ def test_skipped_tier_gets_no_manifest(monkeypatch):
 
 
 # ── config#2152/#2147: queue_manifest_key passthrough (drain / cutover opt-in) ──
+# config#2175 gate/market split: a manifest run no longer needs (or wants)
+# force_on_demand — the key's presence bypasses the demand-count gates on its
+# own, and the box launches SPOT-FIRST like every other run.
 
 
 def test_manifest_key_reaches_bootstrap_env(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+    out = idx.handler({"run_mode": "full", "schedule": "manual",
                        "model": "claude-haiku-4-5", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
     assert out["groom"]["launched"]
@@ -1097,6 +1190,85 @@ def test_malformed_manifest_key_fails_loud(monkeypatch):
     """The key lands on a root-shell command line — strict charset, fail loud."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     with pytest.raises(ValueError, match="invalid queue_manifest_key"):
-        idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
+        idx.handler({"run_mode": "full", "schedule": "manual",
                      "model": "claude-haiku-4-5", "issue_filter": "low-only",
                      "queue_manifest_key": "groom/x; rm -rf /"}, None)
+
+
+# ── config#2175: manifest runs skip demand gates + launch spot-first ─────────
+
+
+def test_manifest_key_skips_single_tier_demand_gate_and_launches_spot(monkeypatch):
+    """A manifest run with NO force_on_demand must (a) never run the demand-
+    count enumeration (the gate counts GitHub, meaningless for an explicit
+    operator queue) and (b) launch SPOT-FIRST — the old behavior forced
+    drains onto on-demand boxes purely to bypass the gate."""
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-drain"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    enumerated = []
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: enumerated.append(1) or ({}, {}, False))
+    out = idx.handler({"run_mode": "full", "schedule": "manual",
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["market"] == "spot"
+    assert seen == [True], "manifest run must try spot first, not force on-demand"
+    assert enumerated == [], "manifest run must never run demand-gate enumeration"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_QUEUE_MANIFEST_KEY=groom/queues/drain/2026-07-10-low.json" in cmd
+
+
+def test_manifest_key_skips_demand_all_block(monkeypatch):
+    """queue_manifest_key + trigger=demand-all: the explicit queue wins — the
+    demand-all fan-out (which would enumerate GitHub and launch 0..3 boxes on
+    its own manifests) must be bypassed in favor of ONE box on the given key."""
+    seen = []
+
+    def _launch(types_, subnets, **kw):
+        seen.append(kw.get("spot"))
+        return "i-drain"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("manifest run must not enumerate demand-all")))
+    out = idx.handler({"run_mode": "full", "trigger": "demand-all", "schedule": "manual",
+                       "model": "claude-sonnet-5", "issue_filter": "mid-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-mid.json"}, None)
+    g = out["groom"]
+    assert g["launched"] is True and g["market"] == "spot"
+    assert seen == [True]
+    assert len(idx._test_ssm.sent) == 1  # ONE box, not a demand-all fan-out
+
+
+def test_manifest_key_still_honors_pace_gate(monkeypatch):
+    """Deliberate (config#2175): the weekly WET pace gate applies to drains
+    too — a manifest bypasses the demand-COUNT gates only, never the budget."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.5 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "manual",
+                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "pace_gate_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_scheduled_demand_all_without_manifest_key_still_enumerates(monkeypatch):
+    """Scheduled (non-manifest) triggers are UNAFFECTED by the config#2175
+    split — demand-all still enumerates and fans out per tier."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    assert len(out["groom"]["launches"]) == 3

@@ -1,5 +1,5 @@
 {
-  "Comment": "Backlog groom dispatch (config#1472, restructured config#2129) — wraps the EventBridge Scheduler -> Lambda -> EC2-spot-via-SSM dispatch chain in a Step Function so the fleet's existing Fleet-SF Watch resilience/observability agent covers groom runs the SAME way it covers the Saturday/weekday/EOD pipelines. config#2129 TWO-PHASE REDESIGN: the OLD version invoked the scheduled-groom-dispatcher Lambda ONCE per trigger and tried to poll a SINGLE CommandId/InstanceId — that worked for a single-tier launch, but config#1933's 'demand-all' symmetric triggers made ALL 3 tiers co-launch on every recorded trigger (2026-07-08..10), and the Lambda's demand-all response is a `launches: [...]` ARRAY with no top-level launched/instance_id/command_id. CheckLaunched/PollGroomCommand's Choice/Task Parameters referenced that missing singular shape and failed with States.Runtime on ~83% of real triggers (5 of the last 6 executions checked 2026-07-10) — the SF reported FAILED (or never even reached PollGroomCommand) on runs where the real EC2 boxes launched and worked FINE; Fleet-SF-Watch had zero real visibility into them. This is now: DecideLaunches (Lambda op=decide_only — enumerate + decide WITHOUT launching, returns 0..3 launch decisions, each carrying its own disjoint PR-sweep partition per config#2129's OTHER fix in nousergon-lib/alpha-engine-config) -> CheckAnyLaunches -> a Map state, ONE ITERATION PER DECISION, each independently launching (Lambda op=launch_decided) and polling via the SAME per-box states the old single-launch design already had (LaunchGroomSpot/PollGroomCommand/CheckGroomStatus/.../GroomSucceeded/GroomSkipped/FailExecution, now scoped inside the Map's ItemProcessor instead of the top level). A Standard Map state's default semantics (ToleratedFailurePercentage=0) mean ANY iteration reaching its own FailExecution fails the whole Map — and hence the whole SF execution — which is the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes. config#1645's bounded auto-relaunch (spot-interruption recovery via the S3 completion-marker check) is UNCHANGED, just now per-iteration instead of per-execution — each co-launched tier can independently die mid-run and independently relaunch up to max_retries times without affecting its siblings.",
+  "Comment": "Backlog groom dispatch (config#1472, restructured config#2129, end-of-SF sweep config#2201) — wraps the EventBridge Scheduler -> Lambda -> EC2-spot-via-SSM dispatch chain in a Step Function so the fleet's existing Fleet-SF Watch resilience/observability agent covers groom runs the SAME way it covers the Saturday/weekday/EOD pipelines. config#2129 TWO-PHASE REDESIGN: the OLD version invoked the scheduled-groom-dispatcher Lambda ONCE per trigger and tried to poll a SINGLE CommandId/InstanceId — that worked for a single-tier launch, but config#1933's 'demand-all' symmetric triggers made ALL 3 tiers co-launch on every recorded trigger (2026-07-08..10), and the Lambda's demand-all response is a `launches: [...]` ARRAY with no top-level launched/instance_id/command_id. CheckLaunched/PollGroomCommand's Choice/Task Parameters referenced that missing singular shape and failed with States.Runtime on ~83% of real triggers (5 of the last 6 executions checked 2026-07-10) — the SF reported FAILED (or never even reached PollGroomCommand) on runs where the real EC2 boxes launched and worked FINE; Fleet-SF-Watch had zero real visibility into them. This is now: DecideLaunches (Lambda op=decide_only — enumerate + decide WITHOUT launching, returns 0..3 launch decisions) -> CheckAnyLaunches -> a Map state, ONE ITERATION PER DECISION, each independently launching (Lambda op=launch_decided) and polling via the SAME per-box states the old single-launch design already had (LaunchGroomSpot/PollGroomCommand/CheckGroomStatus/.../GroomSucceeded/GroomSkipped/FailExecution, now scoped inside the Map's ItemProcessor instead of the top level). A Standard Map state's default semantics (ToleratedFailurePercentage=0) mean ANY iteration reaching its own FailExecution fails the whole Map — and hence the whole SF execution — which is the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes. config#1645's bounded auto-relaunch (spot-interruption recovery via the S3 completion-marker check) is UNCHANGED, just now per-iteration instead of per-execution — each co-launched tier can independently die mid-run and independently relaunch up to max_retries times without affecting its siblings. config#2201 END-OF-SF SWEEP (Brian design 2026-07-10): after the Map fully winds down — and equally on the zero-launches path — a final DispatchEndOfSfSweep state launches ONE Haiku run_mode=sweep spot box covering the full org PR set. This replaces the config#2129 per-box partitioned sweeps (the partition machinery is retired in the dispatcher + config driver): sweeps now run unconditionally every trigger cycle (the drain-the-backlog end state can never starve them) and AFTER all groomers finish (catching the PRs they just opened). The sweep dispatch is fire-and-forget (no polling loop — Brian removed the wait): a sweep-launch failure is RECORDED in the execution output + SNS-notified but never fails the SF (the groom boxes are the primary deliverable; the next trigger's sweep covers the tail).",
   "StartAt": "InitRunState",
   "States": {
     "InitRunState": {
@@ -13,7 +13,7 @@
     },
     "DecideLaunches": {
       "Type": "Task",
-      "Comment": "config#2129: invoke the Lambda's NEW decide_only operation — enumerates the backlog (or applies the pre-boot pace gate) and returns 0..3 launch DECISIONS without launching anything. Each decision carries model/issue_filter/partition_index/partition_count(+pr_budget when applicable). Payload is schedInput merged with the decide_only marker — same pass-through-wrapper contract the old LaunchGroomSpot had, just decide instead of decide-and-launch.",
+      "Comment": "config#2129: invoke the Lambda's NEW decide_only operation — enumerates the backlog (or applies the pre-boot pace gate) and returns 0..3 launch DECISIONS without launching anything. Each decision carries model/issue_filter(+pr_budget when applicable) — the config#2129 per-decision sweep-partition fields are retired (config#2201: one end-of-SF sweep box replaces per-box partitioned sweeps). Payload is schedInput merged with the decide_only marker — same pass-through-wrapper contract the old LaunchGroomSpot had, just decide instead of decide-and-launch.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -52,8 +52,11 @@
       "Default": "AllSkipped"
     },
     "AllSkipped": {
-      "Type": "Succeed",
-      "Comment": "No tier cleared the demand floor this trigger, OR the pre-boot pace gate skipped, OR enumeration transiently failed (fail-safe skip) — see $.decideResult.Payload.decide.reason. Zero spot/WET spend; not a failure."
+      "Type": "Pass",
+      "Comment": "No tier cleared the demand floor this trigger, OR the pre-boot pace gate skipped, OR enumeration transiently failed (fail-safe skip) — see $.decideResult.Payload.decide.reason (present on the skip shapes; NOT referenced here via JSONPath because a plain light-backlog decide response carries launches:[] with no reason field). Zero groom spot/WET spend; not a failure. config#2201: no longer a terminal Succeed — the zero-launches path MUST still reach DispatchEndOfSfSweep (unconditional sweep coverage is the whole point of the end-of-SF design: the drain-the-backlog end state can never starve the PR sweep).",
+      "Result": {"all_skipped": true},
+      "ResultPath": "$.allSkipped",
+      "Next": "DispatchEndOfSfSweep"
     },
     "MapLaunches": {
       "Type": "Map",
@@ -73,7 +76,7 @@
         "States": {
           "LaunchGroomSpot": {
             "Type": "Task",
-            "Comment": "config#2129: invoke the Lambda's launch_decided operation with EXACTLY this iteration's already-made decision (model/issue_filter/partition_index/partition_count[/pr_budget]) merged with schedInput (run_mode/schedule/soft_limit_min) and fod (force_on_demand + the launch_decided marker, both literal so no pace-gate re-check and no re-decision). Returns the SAME singular {launched, instance_id, command_id, run_token, ...} shape the polling states below already expect.",
+            "Comment": "config#2129: invoke the Lambda's launch_decided operation with EXACTLY this iteration's already-made decision (model/issue_filter[/pr_budget]) merged with schedInput (run_mode/schedule/soft_limit_min) and fod (force_on_demand + the launch_decided marker, both literal so no pace-gate re-check and no re-decision). Returns the SAME singular {launched, instance_id, command_id, run_token, ...} shape the polling states below already expect.",
             "Resource": "arn:aws:states:::lambda:invoke",
             "Parameters": {
               "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -328,11 +331,75 @@
         }
       },
       "ResultPath": "$.mapOutcome",
-      "Next": "AllLaunchesSucceeded"
+      "Next": "DispatchEndOfSfSweep"
     },
-    "AllLaunchesSucceeded": {
+    "DispatchEndOfSfSweep": {
+      "Type": "Task",
+      "Comment": "config#2201: ONE Haiku run_mode=sweep spot box per trigger cycle, launched AFTER every groom box has fully wound down (this state is only reached when every Map iteration hit its own GroomSucceeded/GroomSkipped — any FailExecution fails the whole Map, and hence the execution, before reaching here) — and equally via AllSkipped when zero groom boxes launched. Payload is a LITERAL launch_decided event (no pace/demand re-check — the sweep is unconditional by design; issue_filter is inert for run_mode=sweep but the launch path validates it, so the mid-only default is passed explicitly). The dispatcher tags sweep boxes groom-issue-filter=sweep — distinct from every groom tier tag — so its config#1979 concurrent guard skips ONLY when a prior cycle's sweep box is still live (launched:false, reason=concurrent_tier_skip, recorded in $.sweep), never colliding with a live mid-only groom box. Fire-and-forget: the Lambda returns as soon as the async SSM command is delivered; no polling loop here (Brian removed the wait — the sweep box self-terminates and writes its own S3 run artifact + completion marker). NON-FATAL: a sweep-launch failure must never fail the groom SF execution — Catch records it in the execution output (no-silent-caps) + SNS-notifies, then the SF still succeeds.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
+        "Payload": {
+          "run_mode": "sweep",
+          "launch_decided": true,
+          "model": "claude-haiku-4-5",
+          "issue_filter": "mid-only",
+          "schedule": "end-of-sf-sweep"
+        }
+      },
+      "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Sweep-launch failure (spot+on-demand exhaustion, SSM send failure, Lambda error) — recorded + notified below, NEVER fatal to the groom SF: the groom boxes already ran/skipped cleanly by the time this state executes, and the next trigger cycle's sweep covers the tail. The Lambda itself already terminates any partially-launched box before re-raising.",
+          "Next": "RecordSweepDispatchFailure",
+          "ResultPath": "$.sweepDispatchError"
+        }
+      ],
+      "ResultPath": "$.sweep",
+      "Next": "GroomDispatchComplete"
+    },
+    "RecordSweepDispatchFailure": {
+      "Type": "Pass",
+      "Comment": "config#2201 no-silent-caps: shape an explicit dispatched:false record into $.sweep so a skipped sweep is visible in the SF execution output (a cycle that ends with neither a sweep launch record nor this marker is a wiring bug, not a quiet cap). The raw error stays alongside in $.sweepDispatchError.",
+      "Parameters": {
+        "dispatched": false,
+        "reason": "sweep_dispatch_failed",
+        "error.$": "$.sweepDispatchError"
+      },
+      "ResultPath": "$.sweep",
+      "Next": "NotifySweepDispatchFailure"
+    },
+    "NotifySweepDispatchFailure": {
+      "Type": "Task",
+      "Comment": "Best-effort WARNING ping — the sweep miss must page (no-silent-caps) but must not fail the SF; an SNS publish failure routes straight to the terminal Succeed (the $.sweep record above already persisted into the execution output).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine Backlog Groom — end-of-SF PR sweep NOT dispatched",
+        "Message.$": "States.Format('End-of-SF PR-sweep box failed to launch (config#2201) — the groom boxes themselves completed/skipped cleanly and this execution still SUCCEEDS, but this cycle has NO PR merge-readiness sweep. Next trigger cycle covers the tail. Error: {}', States.JsonToString($.sweepDispatchError))"
+      },
+      "ResultPath": "$.sweep_notify",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "GroomDispatchComplete",
+          "ResultPath": "$.sweep_notify_error"
+        }
+      ],
+      "Next": "GroomDispatchComplete"
+    },
+    "GroomDispatchComplete": {
       "Type": "Succeed",
-      "Comment": "Reached only if every co-launched iteration reached its own GroomSucceeded/GroomSkipped — a Standard Map state's default ToleratedFailurePercentage=0 means ANY iteration reaching its own FailExecution fails the whole Map (and hence this whole execution) instead — the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes."
+      "Comment": "Terminal success for BOTH paths (config#2201): every co-launched iteration reached its own GroomSucceeded/GroomSkipped (a Standard Map state's default ToleratedFailurePercentage=0 means ANY iteration reaching its own FailExecution fails the whole Map — and hence this whole execution — instead, the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes), OR the zero-launches AllSkipped path — and in EITHER case the end-of-SF sweep dispatch was attempted, with its outcome recorded in $.sweep (launched box, concurrent-sweep skip, kill-switch skip, or dispatched:false failure record)."
     },
     "HandleDecideFailure": {
       "Type": "Task",

@@ -42,6 +42,12 @@ ROLE_NAME="alpha-engine-ci-watch-dispatcher-role"
 POLICY_NAME="alpha-engine-ci-watch-dispatcher-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
+# Bootstrap default (first-time deployment only) — sets CI_WATCH_DISPATCH_ENABLED=true
+# as the safe default. The update path (step 3) will read the live value and preserve it.
+LAMBDA_ENV_BOOTSTRAP='Variables={LOG_LEVEL=INFO,CI_WATCH_DISPATCH_ENABLED=true}'
+
+# Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
+source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
 
 DRY_RUN=false
 BOOTSTRAP=false
@@ -145,7 +151,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,CI_WATCH_DISPATCH_ENABLED=true}' \
+      --environment "${LAMBDA_ENV_BOOTSTRAP}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -170,10 +176,16 @@ fi
 
 echo "✓ Code deployed."
 
-echo "Updating Lambda environment..."
+echo "Updating Lambda environment (preserving operator-owned CI_WATCH_DISPATCH_ENABLED)..."
+# CI_WATCH_DISPATCH_ENABLED is an OPERATOR-OWNED runtime kill-switch — the
+# update path must PRESERVE its live value, never reset it to the bootstrap
+# default. Mirrors the saturday/spot dispatcher fixes (config#1818/#2236): a
+# routine redeploy must not silently re-arm the operator's containment flag.
+CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" CI_WATCH_DISPATCH_ENABLED true)
+LAMBDA_ENV="Variables={LOG_LEVEL=INFO,CI_WATCH_DISPATCH_ENABLED=${CURRENT_DISPATCH}}"
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,CI_WATCH_DISPATCH_ENABLED=true}' \
+  --environment "${LAMBDA_ENV}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

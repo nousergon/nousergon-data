@@ -345,8 +345,7 @@ def _resolve_pr_budget(event: dict) -> int | None:
 
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
                        run_token: str, soft_limit_min: int | None = None,
-                       pr_budget: int | None = None, partition_index: int = 0,
-                       partition_count: int = 1,
+                       pr_budget: int | None = None,
                        queue_manifest_key: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
@@ -354,17 +353,14 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     repo's infrastructure/groom_spot_bootstrap.sh; this prelude is only the
     minimal clone glue (it needs the PAT before it can clone the private repo).
     Any prelude failure shuts the box down so a botched launch never idles.
+
+    config#2201: the config#2129 GROOM_SWEEP_PARTITION_INDEX/COUNT exports are
+    retired — groom boxes are pure issue-coverage workers now; PR merge-
+    readiness sweeping moved to the single end-of-SF run_mode=sweep box the
+    dispatch SF launches after every Map wind-down.
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
     pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
-    # config#2129: replaces GROOM_NO_SWEEP=1 (the old "only the first box
-    # sweeps" starvation bug) — every co-launched box now sweeps its OWN
-    # disjoint partition_count-slice of the org's open PRs, so all of them
-    # get real sweep coverage instead of only whichever tier launched first.
-    partition_export = (
-        f"export GROOM_SWEEP_PARTITION_INDEX={partition_index}\n"
-        f"export GROOM_SWEEP_PARTITION_COUNT={partition_count}\n"
-    ) if partition_count > 1 else ""
     # config#2152/#2147: manifest-consumption opt-in (drain runs / post-parity
     # cutover) — the driver builds its queue from this S3 key instead of
     # enumerating GitHub. Validated in handler() before it reaches this
@@ -393,7 +389,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{partition_export}{manifest_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -424,14 +420,13 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
-                    pr_budget: int | None = None, partition_index: int = 0,
-                    partition_count: int = 1, queue_manifest_key: str = "") -> str:
+                    pr_budget: int | None = None, queue_manifest_key: str = "") -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(
             run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            partition_index, partition_count, queue_manifest_key,
+            queue_manifest_key,
         ),
         comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
         region=REGION,
@@ -443,31 +438,49 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
 
 
 GROOM_TIER_TAG_KEY = "groom-issue-filter"
+# config#2201: the value stamped into GROOM_TIER_TAG_KEY for run_mode=sweep
+# boxes. Sweep boxes are guarded per-KIND, not per-issue_filter — the launch
+# event still carries a lib-valid issue_filter (inert for sweep mode, but the
+# launch path validates it), and tagging that filter verbatim would make a
+# live mid-only GROOM box block the end-of-SF sweep launch (and a live sweep
+# box block the next mid-only groom) via the config#1979 concurrent guard.
+# "sweep" is deliberately NOT a member of VALID_ISSUE_FILTERS — it exists in
+# the EC2 tag namespace only, never in the filter-validation path.
+_SWEEP_TIER_TAG = "sweep"
 
 
-def _running_tier_instance_ids(issue_filter: str) -> list[str]:
+def _tier_tag(run_mode: str, issue_filter: str) -> str:
+    """The concurrent-guard tag value for a launch (config#1979/#2201):
+    groom boxes guard per issue_filter tier; sweep boxes guard as one
+    distinct 'sweep' lane regardless of the (inert) issue_filter they carry."""
+    return _SWEEP_TIER_TAG if run_mode == "sweep" else issue_filter
+
+
+def _running_tier_instance_ids(tier_tag: str) -> list[str]:
     """Instance ids for a LIVE (pending/running) groom-spot box already working
-    THIS ``issue_filter`` tier (config#1979). Two concurrent boxes on the same
-    tier would race the identical GitHub issue queue and double-spend WET on
+    THIS ``tier_tag`` lane (config#1979; an ``issue_filter`` for groom boxes,
+    the distinct ``sweep`` lane for run_mode=sweep boxes — config#2201). Two
+    concurrent boxes on the same lane would race the identical GitHub queue
+    (issue queue for grooms, open-PR set for sweeps) and double-spend WET on
     duplicate work — config#1969's adaptive re-queue now makes a full-coverage
     run legitimately take longer (a run can now genuinely work its ENTIRE
     queue rather than stopping early), raising the odds a prior trigger's box
-    for a tier is still running when the next trigger re-evaluates the same
-    tier. Fail-safe: any API error returns ``[]`` (never blocks a launch on a
+    for a lane is still running when the next trigger re-evaluates the same
+    lane. Fail-safe: any API error returns ``[]`` (never blocks a launch on a
     broken check — this guard is an optimization, not a correctness gate,
     mirroring every other pre-launch gate in this file)."""
     return spot_dispatch.running_instance_ids(
         "alpha-engine-groom-spot",
-        {GROOM_TIER_TAG_KEY: issue_filter},
+        {GROOM_TIER_TAG_KEY: tier_tag},
         region=REGION,
     )
 
 
-def _notify_concurrent_skip(issue_filter: str, existing_ids: list[str], schedule_label: str) -> None:
-    """Best-effort loud ping for a concurrent-same-tier skip — never raises."""
+def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
+    """Best-effort loud ping for a concurrent-same-lane skip — never raises."""
     text = (
-        "⚪ Backlog groom slot SKIPPED — a box for this tier is already running "
-        f"(config#1979). issue_filter={issue_filter}, existing instance(s): "
+        "⚪ Backlog groom slot SKIPPED — a box for this lane is already running "
+        f"(config#1979). lane={tier_tag}, existing instance(s): "
         f"{', '.join(existing_ids)}. schedule={schedule_label}. Zero spot/WET "
         "spend; this slot's queue rides the next trigger once the running box "
         "finishes."
@@ -475,15 +488,15 @@ def _notify_concurrent_skip(issue_filter: str, existing_ids: list[str], schedule
     try:
         notify_via_flow_doctor(
             text, silent=True, severity="info",
-            dedup_key=f"{_FLOW_NAME}:concurrent_tier_skip:{issue_filter}",
+            dedup_key=f"{_FLOW_NAME}:concurrent_tier_skip:{tier_tag}",
             flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_DB_BASENAME,
-            context={"schedule": schedule_label, "issue_filter": issue_filter,
+            context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "existing_instance_ids": existing_ids},
             silent_topic=FleetTelegramTopic.GROOM,
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
-        logger.warning("concurrent-tier skip Telegram failed (non-fatal): %s", exc)
+        logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
 
 
 def _terminate_instance(instance_id: str) -> None:
@@ -498,25 +511,28 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
                        force_on_demand: bool = False,
-                       partition_index: int = 0, partition_count: int = 1,
                        queue_manifest_key: str = "") -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
 
-    # config#1979: skip if a box for THIS SAME tier is already live — a prior
+    # config#1979: skip if a box for THIS SAME lane is already live — a prior
     # trigger's run that's still working its queue (now more likely to run
     # long thanks to config#1969's adaptive re-queue) must not get a second,
-    # concurrent box racing the identical GitHub issue queue.
-    existing = _running_tier_instance_ids(issue_filter)
+    # concurrent box racing the identical GitHub queue. config#2201: sweep
+    # boxes guard on the distinct 'sweep' lane (see _tier_tag) so the
+    # end-of-SF sweep never collides with a live mid-only groom box.
+    tier_tag = _tier_tag(run_mode, issue_filter)
+    existing = _running_tier_instance_ids(tier_tag)
     if existing:
         logger.warning(
-            "tier %s already has a live groom box (%s) — skipping launch to avoid "
-            "a concurrent same-tier run", issue_filter, existing)
-        _notify_concurrent_skip(issue_filter, existing, schedule_label)
+            "lane %s already has a live groom box (%s) — skipping launch to avoid "
+            "a concurrent same-lane run", tier_tag, existing)
+        _notify_concurrent_skip(tier_tag, existing, schedule_label)
         return {"launched": False, "reason": "concurrent_tier_skip",
-                "issue_filter": issue_filter, "existing_instance_ids": existing}
+                "issue_filter": issue_filter, "tier_tag": tier_tag,
+                "existing_instance_ids": existing}
 
     # config#1645: a fresh token per launch ATTEMPT (not per schedule) — the
     # dispatch Step Function's relaunch loop calls this Lambda again with a new
@@ -525,12 +541,13 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     run_token = uuid.uuid4().hex
     instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     logger.info("launched groom box %s (%s)", instance_id, market)
-    # config#1979: tag the box with its tier so the NEXT trigger's guard check
-    # (above) can find it. Best-effort — a tag-write failure must not abort an
-    # already-launched box (mirrors the fail-safe posture of the check itself).
+    # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
+    # so the NEXT trigger's guard check (above) can find it. Best-effort — a
+    # tag-write failure must not abort an already-launched box (mirrors the
+    # fail-safe posture of the check itself).
     try:
         boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": issue_filter}])
+            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": tier_tag}])
     except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
         logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
                        type(exc).__name__, exc)
@@ -551,7 +568,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         )
         command_id = _send_bootstrap(
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            partition_index, partition_count, queue_manifest_key,
+            queue_manifest_key,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -576,9 +593,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "run_mode": run_mode,
         "model": model,
         "issue_filter": issue_filter,
+        "tier_tag": tier_tag,
         "run_token": run_token,
-        "partition_index": partition_index,
-        "partition_count": partition_count,
         **({"pr_budget": pr_budget} if pr_budget is not None else {}),
     }
 
@@ -923,6 +939,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `pr_budget` is set only on the Opus high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
+    `queue_manifest_key` (config#2152/#2175) marks an explicit operator queue
+    (drain runs): it bypasses the demand-count gates — which count GitHub
+    enumeration, meaningless for a manifest — but launches SPOT-FIRST and
+    still honors the pre-boot pace gate (weekly WET protection covers drains).
 
     Pre-boot pace gate (2026-07-04): if weekly Claude usage is running ahead
     of a linear pace through the current reset window, the launch is skipped
@@ -966,6 +986,18 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # config#2152/#2147: manifest-consumption opt-in (drain runs / post-parity
     # cutover). FAIL LOUD on a malformed key — this string is embedded in the
     # box's root-shell bootstrap command line, so the character set is strict.
+    #
+    # config#2175 (gate/market split): a manifest run BYPASSES the demand-count
+    # gates below — the demand gate counts GitHub enumeration, meaningless for
+    # an explicit operator-built queue — but launches SPOT-FIRST like every
+    # other run (the lib's on-demand capacity fallback still applies).
+    # Previously drain runs had to set force_on_demand:true just to skip the
+    # gate, paying for an on-demand box as a side effect of `force_on_demand`
+    # conflating "skip demand gate" with "force on-demand market";
+    # force_on_demand keeps BOTH meanings for its one remaining caller (the
+    # dispatch SF's final bounded relaunch retry). The pre-boot PACE gate
+    # deliberately still applies to manifest runs — weekly WET protection
+    # covers drains too.
     queue_manifest_key = str(event.get("queue_manifest_key") or "")
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
@@ -976,11 +1008,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # decision — launch EXACTLY what's given, no pace gate (a per-TRIGGER
         # call, not per-box), no re-decision. Returns the SAME singular
         # {"groom": {...}} shape the SF's existing per-box states expect.
+        # config#2201: the SF's end-of-SF DispatchEndOfSfSweep state also
+        # lands here (run_mode=sweep + launch_decided) — the sweep box is
+        # unconditional by design, so bypassing the pace/demand gates is
+        # exactly right; the config#1979 concurrent guard (on the distinct
+        # 'sweep' lane tag) is the only pre-launch check that applies.
         result = _launch_groom_spot(
             run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget,
             force_on_demand,
-            partition_index=int(event.get("partition_index") or 0),
-            partition_count=int(event.get("partition_count") or 1),
             queue_manifest_key=queue_manifest_key,
         )
         return {"groom": result}
@@ -999,13 +1034,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 return {"decide": {"launches": [], **skip}}
             return {"groom": skip}
 
-    if run_mode == "full" and not force_on_demand and str(event.get("trigger", "")) == "demand-all":
+    if (run_mode == "full" and not force_on_demand and not queue_manifest_key
+            and str(event.get("trigger", "")) == "demand-all"):
         # config#1933 SYMMETRIC triggers (Brian's ratified correction): every
         # scheduled trigger evaluates the FULL backlog and launches 0..3 boxes
         # — one per tier clearing the floor, thin tiers attached upward, the
-        # leftover-thin pool valve-gated. Every co-launched box now gets its
-        # own disjoint PR-sweep partition (config#2129) — no more "only the
-        # first box sweeps".
+        # leftover-thin pool valve-gated. config#2201: PR sweeping is no
+        # longer a per-box concern at all — the dispatch SF launches ONE
+        # end-of-SF run_mode=sweep box after all these groom boxes wind down.
         try:
             counts, oldest, p0_tiers, tier_issues = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
@@ -1025,12 +1061,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     logger.info("demand trigger: %s", d.reason)
                     _notify_demand_skip(d, counts, schedule_label)
                     continue
-                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s partition=%d/%d)",
-                            d.reason, d.issue_filter, d.model, d.partition_index, d.partition_count)
-                entry = {
-                    "model": d.model, "issue_filter": d.issue_filter,
-                    "partition_index": d.partition_index, "partition_count": d.partition_count,
-                }
+                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
+                            d.reason, d.issue_filter, d.model)
+                # config#2201: SlotDecision still carries partition_index/
+                # partition_count (lib fields kept for pin-lockstep compat —
+                # deferred lib cleanup), but they are no longer consumed:
+                # the end-of-SF sweep box replaced per-box partitioned sweeps.
+                entry = {"model": d.model, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
                 entries.append(entry)
@@ -1047,7 +1084,6 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 _launch_groom_spot(
                     run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
                     e.get("pr_budget"), force_on_demand,
-                    partition_index=e["partition_index"], partition_count=e["partition_count"],
                 )
                 for e in entries
             ]
@@ -1056,8 +1092,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "queue_manifests": manifest_keys,
                               "launches": results}}
 
-    partition_index, partition_count = 0, 1
-    if run_mode == "full" and not force_on_demand:
+    if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
             decision, counts = decided
@@ -1074,20 +1109,17 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             # below Opus, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
             model = decision.model
-            partition_index, partition_count = decision.partition_index, decision.partition_count
             logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",
                         decision.reason, issue_filter, model)
 
     if event.get("decide_only"):
-        entry = {"model": model, "issue_filter": issue_filter,
-                 "partition_index": partition_index, "partition_count": partition_count}
+        entry = {"model": model, "issue_filter": issue_filter}
         if pr_budget is not None:
             entry["pr_budget"] = pr_budget
         return {"decide": {"launches": [entry]}}
 
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
-        partition_index=partition_index, partition_count=partition_count,
         queue_manifest_key=queue_manifest_key,
     )
     return {"groom": result}

@@ -1730,8 +1730,29 @@
           "States": {
             "CheckSkipPredictorTraining": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_predictor_training\": true} bypasses GBM retrain (and, per config#902, the now-bundled drift step that rides on the same spot) and converges to BranchBComplete.",
+              "Comment": "Skip-gate (config#2253 validated-skip upgrade). {\"skip_predictor_training\": true} bypasses GBM retrain (and, per config#902, the bundled drift step riding the same spot) AND the config#1083 model-zoo fan-out — but the skip claim is VALIDATED first: ValidatePredictorSkipWeightsFresh HeadObjects the live weights manifest (predictor/weights/meta/manifest.json — written UNCONDITIONALLY by every non-dry training run in alpha-engine-predictor training/meta_trainer.py, regardless of the promotion gate, unlike the live .pkl weights which only move on gate-pass) and CheckPredictorSkipWeightsFresh requires its LastModified DATE >= $.run_date — i.e. this run_date's training genuinely completed before the operator/watch-agent claimed it. Stale manifest → BranchBFailed (fail loud: silently honoring a false weights-are-already-live claim would hand Backtester stale weights AND swallow the very re-training the pipeline owed). EXCEPTION (first Choice rule): mode=backtest-eval (config#830 replay preset, which force-seeds this flag) routes straight to PredictorTrainingSkipped with NO freshness validation — that preset's contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage', so a mid-week replay must not demand a same-day manifest. NOTE the manifest is the validation surface, NOT weights/meta/archive/{date}/: the dated archive is TRADING-DAY-keyed (config#1015 — Friday's close), while $.run_date is the Saturday calendar date, so an archive-prefix check would NEVER match on the standard Saturday recovery rerun this flag exists for. Cross-UTC-midnight recovery reruns: pass the ORIGINAL run_date explicitly (the watch charter's take-the-original-input rule already implies this for every date-keyed stage) and the lexicographic >= compare composes correctly.",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_predictor_training",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_predictor_training",
+                      "BooleanEquals": true
+                    },
+                    {
+                      "Variable": "$.mode",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.mode",
+                      "StringEquals": "backtest-eval"
+                    }
+                  ],
+                  "Next": "PredictorTrainingSkipped"
+                },
                 {
                   "And": [
                     {
@@ -1743,10 +1764,84 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "BranchBComplete"
+                  "Next": "ValidatePredictorSkipWeightsFresh"
                 }
               ],
               "Default": "PredictorTraining"
+            },
+            "ValidatePredictorSkipWeightsFresh": {
+              "Type": "Task",
+              "Comment": "config#2253 artifact-presence validation for skip_predictor_training. HeadObject on the live weights manifest; ResultSelector lifts LastModified's DATE part (ISO-8601 'YYYY-MM-DDThh:mm:ssZ' → 'YYYY-MM-DD') for the lexicographic >= compare against $.run_date in CheckPredictorSkipWeightsFresh (both sides YYYY-MM-DD, so string ordering IS date ordering). Deliberately an aws-sdk:s3 integration, not a sendCommand/Lambda: (a) zero boot cost / no dependency on the always-on box, (b) aws-sdk:s3 is NOT in nousergon_lib pipeline_status SUBSTANTIVE_RESOURCES, so this stays console-invisible plumbing with no cross-repo registry entry required. IAM: s3:GetObject on the manifest key (Sid HeadPredictorWeightsManifest in infrastructure/iam/alpha-engine-step-functions-role.json — apply.sh before merge, iam-drift-check enforces). Any S3 error or an unexpected LastModified serialization (intrinsic parse failure) routes to BranchBFailed via Catch — fail loud, no silent swallow (recording surface: $.error → branch_b_error → post-join FAILED SNS).",
+              "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+              "Parameters": {
+                "Bucket": "alpha-engine-research",
+                "Key": "predictor/weights/meta/manifest.json"
+              },
+              "ResultSelector": {
+                "manifest_last_modified_date.$": "States.ArrayGetItem(States.StringSplit($.LastModified, 'T'), 0)"
+              },
+              "ResultPath": "$.predictor_skip_validation",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 2.0,
+                  "Comment": "Transient S3 5xx/throttle; a genuine 403/404 burns ~15s of retries then fails through to the Catch — acceptable on an operator-initiated recovery path."
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "BranchBFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "CheckPredictorSkipWeightsFresh"
+            },
+            "CheckPredictorSkipWeightsFresh": {
+              "Type": "Choice",
+              "Comment": "config#2253: manifest LastModified date >= run_date ⇒ a non-dry training run completed for this run_date ⇒ the skip claim is genuine → PredictorTrainingSkipped (branch reads as succeeded downstream). Otherwise the claim is false → PredictorSkipWeightsStale synthesizes $.error → BranchBFailed (the SF fails AFTER the join per CheckBranchOutcomes, so the sibling Research branch still completes and its artifacts persist). The StringMatches '20*-*-*' shape guard is load-bearing: no fleet SF has consumed the aws-sdk:s3 LastModified serialization before (the groom SF's headObject is existence-only), and if it ever arrived non-ISO (HTTP-date 'Sat, 11 Jul ...', epoch string) a bare lexicographic >= against 'YYYY-MM-DD' could SILENTLY wrong-pass — the guard converts that into the loud stale/malformed path whose Cause prints the raw value.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.predictor_skip_validation.manifest_last_modified_date",
+                      "StringMatches": "20*-*-*"
+                    },
+                    {
+                      "Variable": "$.predictor_skip_validation.manifest_last_modified_date",
+                      "StringGreaterThanEqualsPath": "$.run_date"
+                    }
+                  ],
+                  "Next": "PredictorTrainingSkipped"
+                }
+              ],
+              "Default": "PredictorSkipWeightsStale"
+            },
+            "PredictorSkipWeightsStale": {
+              "Type": "Pass",
+              "Comment": "config#2253: synthesize $.error for BranchBFailed's branch_b_error.$=$.error contract (a Choice.Default transition does not populate an error path the way a Task Catch does — same States.Runtime trap the ExtractModelZoo*Error states exist for, config#2160 arc). Names both dates so the FAILED SNS alert is self-diagnosing.",
+              "Parameters": {
+                "Error": "PredictorSkipWeightsStale",
+                "Cause.$": "States.Format('skip_predictor_training=true but s3://alpha-engine-research/predictor/weights/meta/manifest.json LastModified date {} < run_date {} — no completed predictor training for this run_date; refusing to silently skip onto stale weights. Either re-run WITHOUT skip_predictor_training (training genuinely did not complete), or pass the ORIGINAL run_date explicitly if this is a cross-UTC-midnight recovery rerun.', $.predictor_skip_validation.manifest_last_modified_date, $.run_date)"
+              },
+              "ResultPath": "$.error",
+              "Next": "BranchBFailed"
+            },
+            "PredictorTrainingSkipped": {
+              "Type": "Pass",
+              "Comment": "config#2253 branch-B skip terminal. Reads as a SUCCEEDED branch to AggregateBranchOutcomes/CheckBranchOutcomes — the join reads ONLY $.parallel_result[1].branch_b.branch_b_status, and this records the identical branch_b_status=OK contract as BranchBComplete — plus an explicit skipped:true marker for execution-history forensics (no fabricated training payload beyond what routing requires). End:true so the sibling Research branch is never cancelled (the per-branch error-isolation invariant).",
+              "Result": {
+                "branch_b_status": "OK",
+                "skipped": true
+              },
+              "ResultPath": "$.branch_b",
+              "End": true
             },
             "PredictorTraining": {
               "Type": "Task",
@@ -2307,7 +2402,7 @@
             },
             "BranchBComplete": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining quartet) completed (training success OR skipped via skip_predictor_training; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch.",
+              "Comment": "Branch B (PredictorTraining quartet) completed (training success; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). The skip_predictor_training path terminates at its own PredictorTrainingSkipped terminal (config#2253) with the same branch_b_status=OK contract plus a skipped:true marker. Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch.",
               "Result": {
                 "branch_b_status": "OK"
               },
@@ -3463,7 +3558,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — FAILED', $.pipeline_label)",
-        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status  (Use the Step Functions console to redrive from the failed step.)', $.pipeline_label, States.JsonToString($.error))"
+        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry, start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_data_phase1 / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"
@@ -3471,7 +3566,7 @@
     "FailExecution": {
       "Type": "Fail",
       "Error": "PipelineFailure",
-      "Cause": "One or more pipeline steps failed. Check CloudWatch logs and redrive from the Step Functions console."
+      "Cause": "One or more pipeline steps failed. Check CloudWatch logs for details. Do NOT redrive-execution: every Task Catch in this pipeline routes to this shared FailExecution state, so redrive is a deterministic no-op (it re-enters FailExecution and re-fails immediately with the same stale input). To retry, start a fresh execution with skip_* input flags set true for stages already completed (e.g. skip_morning_enrich, skip_data_phase1, skip_backtester) -- see infrastructure/README.md for the full flag list and rationale."
     }
   }
 }

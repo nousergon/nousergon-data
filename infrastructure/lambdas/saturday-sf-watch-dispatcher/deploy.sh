@@ -35,6 +35,9 @@ RULE_NAME="alpha-engine-saturday-sf-watch-failed"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
+# Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
+source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
+
 DRY_RUN=false
 BOOTSTRAP=false
 SMOKE=false
@@ -198,31 +201,15 @@ echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 # 2026-07-06 preopen SF failures (dispatched=False on both) while the market
 # was open. Bootstrap (create-function above) still defaults false — safe
 # rollout posture for a NEW deployment only.
-CURRENT_DISPATCH=$(aws lambda get-function-configuration \
-  --function-name "${FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --query 'Environment.Variables.AGENT_DISPATCH_ENABLED' --output text 2>/dev/null)
-case "${CURRENT_DISPATCH}" in true|false) ;; *) CURRENT_DISPATCH=false ;; esac
+CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" AGENT_DISPATCH_ENABLED false)
 # FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
 # AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
-CURRENT_FAST_PATH=$(aws lambda get-function-configuration \
-  --function-name "${FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --query 'Environment.Variables.FAST_PATH_ENABLED' --output text 2>/dev/null)
-case "${CURRENT_FAST_PATH}" in true|false) ;; *) CURRENT_FAST_PATH=false ;; esac
+CURRENT_FAST_PATH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" FAST_PATH_ENABLED false)
 # EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION (config#2003) is operator-owned
-# exactly like the two flags above — same config#1818 lesson applies: this
-# update-function-configuration call REPLACES the whole Variables map, so any
-# operator-set flag missing from the string here gets silently reset to the
-# bootstrap default on the next routine redeploy. Preserve the live value.
-CURRENT_DISPATCH_AFTER_ESCALATION=$(aws lambda get-function-configuration \
-  --function-name "${FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --query 'Environment.Variables.EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION' --output text 2>/dev/null)
-case "${CURRENT_DISPATCH_AFTER_ESCALATION}" in true|false) ;; *) CURRENT_DISPATCH_AFTER_ESCALATION=false ;; esac
-echo "  preserving AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH} (operator-owned)"
-echo "  preserving FAST_PATH_ENABLED=${CURRENT_FAST_PATH} (operator-owned)"
-echo "  preserving EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION} (operator-owned)"
+# exactly like the two flags above — preserved via the shared helper
+# (config#1818/#2264 class: the update call REPLACES the whole Variables
+# map, so any operator-set flag missing here silently resets on redeploy).
+CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION false)
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
   --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \

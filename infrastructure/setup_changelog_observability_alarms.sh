@@ -44,7 +44,6 @@ TARGET_FUNCTIONS=(
   "alpha-engine-friday-shell-run-report"
   "alpha-engine-pipeline-watchdog"
   "alpha-engine-saturday-integrity-sentinel"
-  "alpha-engine-saturday-sf-success-groom-dispatcher"
   "alpha-engine-saturday-sf-watch-dispatcher"
   "alpha-engine-sf-telegram-notifier"
 )

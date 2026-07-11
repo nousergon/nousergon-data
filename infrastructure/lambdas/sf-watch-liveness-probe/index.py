@@ -27,6 +27,24 @@ and asserts, read-only:
      2026-06-29 dead-ARN class directly, instead of waiting for a real failure
      to expose it.
   4. The target Lambda is Active with a successful last code update.
+  5. The EC2-spot dispatch leg — the LIVE repair path since the 2026-07-10
+     spot migration (config#2001/#2106): alpha-engine-sf-watch-spot-dispatcher
+     and alpha-engine-ci-watch-dispatcher exist and are Active. Their
+     kill-switch env values (SF_WATCH_DISPATCH_ENABLED /
+     CI_WATCH_DISPATCH_ENABLED) are READ AND REPORTED in the probe record so a
+     disabled watch is visible — but never alerted on: a deliberate operator
+     disable is state, not an incident (config#2265; sweep obligation lives
+     with config#2257).
+  6. The spot launch config still exists, read from the DEPLOYED spot
+     dispatcher's live env (SF_WATCH_AMI_ID / SF_WATCH_SECURITY_GROUP /
+     SF_WATCH_SUBNETS — pinned by that Lambda's deploy.sh, so the env is the
+     observable source of truth; this probe deliberately duplicates NO
+     constants): DescribeImages / DescribeSecurityGroups / DescribeSubnets.
+     A deregistered AMI or deleted SG/subnet would break every future spot
+     launch with ZERO signal until the next real failure needed a repair —
+     the exact "healthy idle vs silently broken idle" class that bit twice on
+     2026-07-10. A missing expected env key is itself a LOUD finding, never a
+     skip.
 
 Silent-unless-broken (mirrors the groom probe and Fleet-SF Watch's own
 failure-driven design): a clean check logs and returns, no Telegram noise. Any
@@ -37,8 +55,10 @@ the alert state clears automatically the moment the check is clean again.
 **Fail-loud (CLAUDE.md no-silent-fails).** Every AWS describe/list call here is
 the PRIMARY input: an UNEXPECTED API error (anything other than the specific
 "this resource doesn't exist" codes we're explicitly checking for) RAISES, so a
-broken probe surfaces via the Lambda error metric + CW alarm rather than
-silently skipping the one check that verifies nothing else is silently broken.
+broken probe surfaces via the Lambda Errors metric — alarmed by the watch-plane
+CloudWatch alarms provisioned in infrastructure/setup_watch_plane_alarms.sh
+(the dead-probe backstop) — rather than silently skipping the one check that
+verifies nothing else is silently broken.
 The Telegram alert itself is a secondary delivery surface: its own failure is
 logged + returned, not raised.
 """
@@ -86,6 +106,27 @@ EXPECTED_PIPELINE_NAMES = [
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
 STATE_KEY = os.environ.get("SF_WATCH_LIVENESS_STATE_KEY", "consolidated/sf_watch_liveness/alerted.json")
 
+# ── EC2-spot dispatch leg (the LIVE repair path since 2026-07-10) ────────────
+SPOT_DISPATCHER_FUNCTION = os.environ.get(
+    "SF_WATCH_SPOT_DISPATCHER_FUNCTION", "alpha-engine-sf-watch-spot-dispatcher"
+)
+CI_WATCH_DISPATCHER_FUNCTION = os.environ.get(
+    "CI_WATCH_DISPATCHER_FUNCTION", "alpha-engine-ci-watch-dispatcher"
+)
+# (function name, kill-switch env key). The kill-switch value is REPORTED in
+# the probe record, never alerted on — a deliberate operator disable is state,
+# not an incident.
+SPOT_LEG_DISPATCHERS: list[tuple[str, str]] = [
+    (SPOT_DISPATCHER_FUNCTION, "SF_WATCH_DISPATCH_ENABLED"),
+    (CI_WATCH_DISPATCHER_FUNCTION, "CI_WATCH_DISPATCH_ENABLED"),
+]
+# Launch-config keys read from the DEPLOYED spot dispatcher's live env (its
+# deploy.sh pins them — a lockstep test in sf-watch-spot-dispatcher/
+# test_handler.py holds deploy.sh's pins equal to that index.py's defaults).
+# Reading the live env instead of re-declaring the values here means this
+# probe can never drift from what the dispatcher will actually launch with.
+LAUNCH_CONFIG_ENV_KEYS = ("SF_WATCH_AMI_ID", "SF_WATCH_SECURITY_GROUP", "SF_WATCH_SUBNETS")
+
 
 def _error_code(exc: Exception) -> str:
     return str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
@@ -105,6 +146,10 @@ def _lambda_client():
 
 def _s3_client():
     return boto3.client("s3", region_name=REGION)
+
+
+def _ec2_client():
+    return boto3.client("ec2", region_name=REGION)
 
 
 def _check_rule() -> list[str]:
@@ -179,6 +224,108 @@ def _check_lambda_healthy() -> list[str]:
     return problems
 
 
+def _check_launch_config(env: dict[str, str]) -> list[str]:
+    """The deregistered-AMI silent-break guard: assert the AMI/SG/subnets the
+    DEPLOYED spot dispatcher would launch with still exist. Uses Filters (not
+    ImageIds/GroupIds/SubnetIds) so a missing resource comes back as an EMPTY
+    result set instead of a per-service error code to pattern-match; unexpected
+    API errors therefore always RAISE (fail-loud)."""
+    problems: list[str] = []
+
+    missing_keys = sorted(k for k in LAUNCH_CONFIG_ENV_KEYS if not (env.get(k) or "").strip())
+    if missing_keys:
+        # Fail-loud on env absence: an unreadable launch config is itself the
+        # finding (deploy.sh pins these keys; their absence means the deployed
+        # env drifted from deploy.sh). Deliberately STOP here rather than probe
+        # EC2 with unknown ids — the problem line above is the recording surface.
+        problems.append(
+            f"spot dispatcher '{SPOT_DISPATCHER_FUNCTION}' live env is MISSING launch-config "
+            f"key(s) {missing_keys} — AMI/SG/subnet existence is UNVERIFIABLE (its deploy.sh "
+            "pins these; redeploy it)"
+        )
+        return problems
+
+    ami = env["SF_WATCH_AMI_ID"].strip()
+    sg = env["SF_WATCH_SECURITY_GROUP"].strip()
+    subnets = sorted({s.strip() for s in env["SF_WATCH_SUBNETS"].split(",") if s.strip()})
+
+    ec2 = _ec2_client()
+
+    # IncludeDeprecated: an old-but-still-registered AMI must NOT false-alarm —
+    # only a deregistered/deleted one (which every future spot launch would
+    # fail on) is a finding.
+    images = ec2.describe_images(
+        Filters=[{"Name": "image-id", "Values": [ami]}], IncludeDeprecated=True
+    ).get("Images", [])
+    if not images:
+        problems.append(
+            f"spot AMI '{ami}' NOT FOUND (deregistered/deleted) — every future "
+            "sf-watch spot launch would fail"
+        )
+    elif images[0].get("State") != "available":
+        problems.append(f"spot AMI '{ami}' state={images[0].get('State')}, not available")
+
+    groups = ec2.describe_security_groups(
+        Filters=[{"Name": "group-id", "Values": [sg]}]
+    ).get("SecurityGroups", [])
+    if not groups:
+        problems.append(f"spot security group '{sg}' NOT FOUND")
+
+    found_subnets = {
+        s.get("SubnetId")
+        for s in ec2.describe_subnets(
+            Filters=[{"Name": "subnet-id", "Values": subnets}]
+        ).get("Subnets", [])
+    }
+    missing_subnets = sorted(set(subnets) - found_subnets)
+    if missing_subnets:
+        problems.append(f"spot subnet(s) NOT FOUND: {missing_subnets}")
+
+    return problems
+
+
+def _check_spot_dispatch_leg() -> tuple[list[str], dict[str, str]]:
+    """The live EC2-spot repair path (config#2001/#2106): both dispatcher
+    Lambdas exist + Active, kill-switch env values read + REPORTED (never
+    alerted — see module docstring), and the spot dispatcher's launch config
+    verified against live EC2 state."""
+    problems: list[str] = []
+    kill_switches: dict[str, str] = {}
+    lam = _lambda_client()
+
+    for fn_name, switch_key in SPOT_LEG_DISPATCHERS:
+        try:
+            cfg = lam.get_function_configuration(FunctionName=fn_name)
+        except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+            if _error_code(exc) == "ResourceNotFoundException":
+                problems.append(
+                    f"spot-leg dispatcher Lambda '{fn_name}' does NOT EXIST — "
+                    "the live repair path cannot launch"
+                )
+                kill_switches[switch_key] = "UNREADABLE(function missing)"
+                # Launch-config check deliberately skipped for a missing spot
+                # dispatcher: there is no env to read, and the does-NOT-EXIST
+                # problem line above is the loud recording surface for it.
+                continue
+            raise
+        if cfg.get("State") != "Active":
+            problems.append(
+                f"spot-leg dispatcher Lambda '{fn_name}' state={cfg.get('State')}, not Active"
+            )
+        if cfg.get("LastUpdateStatus") != "Successful":
+            problems.append(
+                f"spot-leg dispatcher Lambda '{fn_name}' LastUpdateStatus={cfg.get('LastUpdateStatus')}"
+            )
+        env = (cfg.get("Environment") or {}).get("Variables") or {}
+        # REPORTED, never alerted: absence of the key means the dispatcher's
+        # own in-code default applies ("true").
+        kill_switches[switch_key] = env.get(switch_key, "unset(default:true)")
+        if fn_name == SPOT_DISPATCHER_FUNCTION:
+            problems.extend(_check_launch_config(env))
+
+    return problems, kill_switches
+
+
 def _problem_fingerprint(problems: list[str]) -> str:
     return hashlib.sha256("\n".join(sorted(problems)).encode()).hexdigest()[:16]
 
@@ -212,7 +359,7 @@ def _save_alerted_fingerprint(s3, fingerprint: str | None) -> None:
         logger.warning("could not persist sf-watch liveness state %s: %s", STATE_KEY, exc)
 
 
-def _alert(problems: list[str]) -> bool:
+def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> bool:
     lines = [
         "\U0001f6f0️ *Fleet-SF Watch Liveness Probe — WIRING PROBLEM*",
         f"{len(problems)} issue(s) found with the Fleet-SF Watch trigger itself "
@@ -221,8 +368,9 @@ def _alert(problems: list[str]) -> bool:
     for p in problems:
         lines.append(f"• {p}")
     lines.append(
-        "_Fleet-SF Watch may not catch a real pipeline failure right now. "
-        "Check the EventBridge rule + saturday-sf-watch-dispatcher Lambda._"
+        "_Fleet-SF Watch may not catch (or repair) a real pipeline failure right "
+        "now. Check the EventBridge rule, the saturday-sf-watch-dispatcher "
+        "Lambda, and the sf-watch/ci-watch spot dispatchers._"
     )
     text = "\n".join(lines)
     try:
@@ -234,7 +382,7 @@ def _alert(problems: list[str]) -> bool:
             flow_name=_FLOW_NAME,
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
-            context={"problems": len(problems)},
+            context={"problems": len(problems), "kill_switches": kill_switches or {}},
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still returned
         logger.warning("sf-watch liveness alert Telegram send failed (non-fatal): %s", exc)
@@ -244,8 +392,15 @@ def _alert(problems: list[str]) -> bool:
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Read-only; raises on an unexpected
     AWS API failure so the check can never silently no-op."""
-    problems = _check_rule() + _check_state_machines_exist() + _check_lambda_healthy()
+    spot_problems, kill_switches = _check_spot_dispatch_leg()
+    problems = (
+        _check_rule() + _check_state_machines_exist() + _check_lambda_healthy() + spot_problems
+    )
     fingerprint = _problem_fingerprint(problems) if problems else None
+
+    # Always surfaced (record + log), never alerted: a deliberate operator
+    # disable is state, not an incident.
+    logger.info("sf-watch liveness: dispatch kill-switches: %s", kill_switches)
 
     s3 = _s3_client()
     already = _load_alerted_fingerprint(s3)
@@ -253,7 +408,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     alerted = False
     if problems and fingerprint != already:
         logger.warning("sf-watch liveness: %d NEW problem(s): %s", len(problems), problems)
-        alerted = _alert(problems)
+        alerted = _alert(problems, kill_switches)
         if alerted:
             _save_alerted_fingerprint(s3, fingerprint)
     elif problems:
@@ -263,4 +418,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         if already is not None:
             _save_alerted_fingerprint(s3, None)  # clear dedup state now that it's healthy again
 
-    return {"problems": problems, "alerted": alerted, "clean": not problems}
+    return {
+        "problems": problems,
+        "alerted": alerted,
+        "clean": not problems,
+        "kill_switches": kill_switches,
+    }
