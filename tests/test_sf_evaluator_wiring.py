@@ -147,12 +147,19 @@ class TestEvaluatorTask:
         assert states["Evaluator"]["TimeoutSeconds"] == 3660
 
     def test_retry_mirrors_backtester_posture(self, states):
-        # Spot interruption handling: 2 attempts, 180s initial backoff,
-        # 2.0x multiplier — matches Backtester for symmetry.
+        # config#2279: both Evaluator and Backtester now carry the declared
+        # spot-stage gold ladder (4+2 jittered) — symmetry preserved; the
+        # exact ladder shape is pinned centrally in
+        # test_sf_retry_ladder_convention.py.
+        def _sig(state):
+            return [
+                {k: v for k, v in rule.items() if k != "Comment"}
+                for rule in state["Retry"]
+            ]
+        assert _sig(states["Evaluator"]) == _sig(states["Backtester"])
         retry = states["Evaluator"]["Retry"][0]
-        assert retry["MaxAttempts"] == 2
-        assert retry["IntervalSeconds"] == 180
-        assert retry["BackoffRate"] == 2.0
+        assert retry["MaxAttempts"] == 4
+        assert retry["JitterStrategy"] == "FULL"
 
     def test_catch_routes_to_handle_failure(self, states):
         # Evaluator failure halts the pipeline (unlike eval-judge which

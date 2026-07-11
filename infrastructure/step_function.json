@@ -1,10 +1,11 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich — plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich — plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md — for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email — pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot — accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected. config#2274: top-level TimeoutSeconds=43200 (12h) — the global hang ceiling. Recorded max full run is 3.04h (24-execution history sampled 2026-07-11); the longest LEGITIMATE composition is well under 12h even in the worst case (EvalJudgePoll's 21600s max_wait batch cap + the 7200s spot stages + retry ladders + offcycle/shell presets). Before this ceiling, a hung SSM WaitFor* poll loop (SSM control-plane degradation, e.g. the 2026-07-11 disk-full incident) polled toward the SF 1-year default, invisible to BOTH the deadman alarm (ExecutionsStarted only) and sf-watch (terminal statuses only). A ceiling breach yields status TIMED_OUT, which the sf-watch EventBridge rule already matches (saturday-sf-watch-dispatcher/deploy.sh EVENT_PATTERN) — a hang now pages and dispatches repair automatically. Per-poll-loop iteration caps deliberately skipped: the global ceiling is the load-bearing fix. config#2279: DECLARED RETRY CONVENTION for SSM states — every aws-sdk:ssm:sendCommand spot-stage state carries the 4+2 jittered ladder ([States.TaskFailed,States.Timeout]x4 + [States.ALL]x2, 30s base, backoff 2.0, MaxDelay 300, Jitter FULL); re-issue is idempotent for ALL stages because the send-state Retry fires only on pre-execution API failures (the launcher never ran; the WaitFor* poll loop owns post-delivery outcomes). The two tail health-check sends are the declared health-observe class (no Retry, fail-soft Catch). getCommandInvocation poll states carry the InvocationDoesNotExist eventual-consistency ladder. Enforced by tests/test_sf_retry_ladder_convention.py — a new SSM state must be added to a declared class there or CI fails. Lambda-state States.TaskFailed hardening is the sibling half (config#2250, data-PR752).",
   "StartAt": "InitializeInput",
+  "TimeoutSeconds": 43200,
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values — preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values — preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY — $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place — that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext).",
       "Parameters": {
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
@@ -76,9 +77,25 @@
       "Comment": "Not the run day -> clean Succeed skip BEFORE any spend (no mutex, no lib-pin check, no spot, no alert): on a normal week 2 of the 3 THU-SAT firings land here by design. Run day or any non-false result -> proceed. Fail-open mirrors the weekday gate posture: missing the weekly run is worse than a duplicate.",
       "Choices": [
         {
-          "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
-          "BooleanEquals": false,
+          "And": [
+            {
+              "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+              "BooleanEquals": false
+            }
+          ],
           "Next": "WeeklyRunDaySkip"
+        },
+        {
+          "Not": {
+            "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+            "IsPresent": true
+          },
+          "Comment": "config#2275: gate Lambda returned a payload WITHOUT is_weekly_run_day (partial/malformed result). Unguarded, this dereference threw States.Runtime and ended the run FAILED without HandleFailure context. Route through the malformed-payload floor Pass into the existing fail-open+alert notifier: proceed as run day, but SAY SO.",
+          "Next": "WeeklyRunDayGateMalformed"
         }
       ],
       "Default": "CheckRunMode"
@@ -86,6 +103,16 @@
     "WeeklyRunDaySkip": {
       "Type": "Succeed",
       "Comment": "Designed no-op: scheduled THU-SAT firing on a non-run day. Succeed (never Fail) so SF-success metrics, the SF-watch agent, and page-25 treat this exactly like the weekday NotifyHolidaySkip — a green skip, not a failure. Cycle health remains artifact-freshness-as-authority (config#1724); this state produces no artifacts on purpose."
+    },
+    "WeeklyRunDayGateMalformed": {
+      "Type": "Pass",
+      "Comment": "config#2275: floor $.weekly_run_day_gate_error before WeeklyRunDayGateFailed formats it into the SNS message — that state's Message.$ calls States.JsonToString($.weekly_run_day_gate_error), which would itself throw States.Runtime were the field absent. The Catch path sets it via ResultPath; this Choice path must floor it explicitly.",
+      "Result": {
+        "Error": "WeeklyRunDayGateMalformedPayload",
+        "Cause": "check_weekly_run_day returned a payload without is_weekly_run_day — proceeding fail-open as a run day (mirrors the gate Catch posture)."
+      },
+      "ResultPath": "$.weekly_run_day_gate_error",
+      "Next": "WeeklyRunDayGateFailed"
     },
     "WeeklyRunDayGateFailed": {
       "Type": "Task",
@@ -165,9 +192,19 @@
             "Lambda.ServiceException",
             "Lambda.TooManyRequestsException"
           ],
-          "MaxAttempts": 1,
+          "MaxAttempts": 2,
           "IntervalSeconds": 15,
-          "BackoffRate": 1.0
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2278: transient tier — most gate-infra flakes (GitHub/S3 fetch inside the Lambda surfacing as a crash/timeout) are transient; two backed-off retries make silent gate degradation rarer before the fail-open+alert Catch below engages.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 10,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -175,8 +212,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
-          "Next": "CheckMutexRole",
+          "Comment": "config#2278: still fail-open — the probe's own failure must not halt the weekly run — but no longer SILENT, and no longer skipping the sibling gate: route through the degraded-flag Pass + SNS alert, then into PipelineContractCheck (the old direct CheckMutexRole jump silently skipped gate 2 as well).",
+          "Next": "LibPinGateDegraded",
           "ResultPath": "$.libpin_drift_error"
         }
       ],
@@ -188,9 +225,26 @@
       "Comment": "Hard-fail when the lib-pin probe reports has_drift=true (a confirmed co-install parity break or below-floor regression). Surfaces cross-repo pin drift loudly before the SF spends on any spot launch. Routes via ExtractLibPinDriftError (NOT straight to HandleFailure): a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — jumping here directly made HandleFailure itself die with States.Runtime ('$.error could not be found', 2026-07-03 offcycle-shell), swallowing the drift reason behind an opaque meta-error. Mirrors the existing Extract*Error normalizer convention. On pass, proceeds to PipelineContractCheck (L4595 / config#693) — the sibling pre-spend preflight gate — rather than straight to CheckMutexRole, composing both invariant probes into one preflight chain before any spot spend.",
       "Choices": [
         {
-          "Variable": "$.libpin_drift_result.Payload.has_drift",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.libpin_drift_result.Payload.has_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.libpin_drift_result.Payload.has_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_drift) previously threw States.Runtime here, bypassing HandleFailure.",
           "Next": "ExtractLibPinDriftError"
+        },
+        {
+          "Not": {
+            "Variable": "$.libpin_drift_result.Payload.has_drift",
+            "IsPresent": true
+          },
+          "Comment": "config#2278: a gate payload WITHOUT has_drift means the gate could not check — fail open VISIBLY (degraded flag + SNS alert) instead of silently converting 'checked and clean' into 'never checked'.",
+          "Next": "LibPinGateDegraded"
         }
       ],
       "Default": "PipelineContractCheck"
@@ -223,9 +277,19 @@
             "Lambda.ServiceException",
             "Lambda.TooManyRequestsException"
           ],
-          "MaxAttempts": 1,
+          "MaxAttempts": 2,
           "IntervalSeconds": 15,
-          "BackoffRate": 1.0
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2278: transient tier — most gate-infra flakes (GitHub/S3 fetch inside the Lambda surfacing as a crash/timeout) are transient; two backed-off retries make silent gate degradation rarer before the fail-open+alert Catch below engages.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 10,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -233,8 +297,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open — the probe's own failure must not halt the weekly run; proceed to the pipeline.",
-          "Next": "CheckMutexRole",
+          "Comment": "config#2278: still fail-open — the probe's own failure must not halt the weekly run — but no longer silent: route through the degraded-flag Pass + SNS alert before proceeding to CheckMutexRole.",
+          "Next": "PipelineContractGateDegraded",
           "ResultPath": "$.pipeline_contract_error"
         }
       ],
@@ -246,9 +310,26 @@
       "Comment": "Hard-fail when the pipeline-contract probe reports has_violation=true (a confirmed PIPELINE_CONTRACT.yaml self-consistency breach or dangling artifact_id). Surfaces the contract break loudly before the SF spends on any spot launch. Routes via ExtractPipelineContractError (NOT straight to HandleFailure), mirroring LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime ('$.error could not be found'), swallowing the violation list behind an opaque meta-error. config#1819: ExtractPipelineContractError itself hands off to NormalizeFailureContext (the single Catch/Next chokepoint), not HandleFailure directly.",
       "Choices": [
         {
-          "Variable": "$.pipeline_contract_result.Payload.has_violation",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.pipeline_contract_result.Payload.has_violation",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_contract_result.Payload.has_violation",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config#2275: IsPresent-guarded — a partial gate payload (no has_violation) previously threw States.Runtime here, bypassing HandleFailure.",
           "Next": "ExtractPipelineContractError"
+        },
+        {
+          "Not": {
+            "Variable": "$.pipeline_contract_result.Payload.has_violation",
+            "IsPresent": true
+          },
+          "Comment": "config#2278: a gate payload WITHOUT has_violation means the gate could not check — fail open VISIBLY (degraded flag + SNS alert) instead of silently converting 'checked and clean' into 'never checked'.",
+          "Next": "PipelineContractGateDegraded"
         }
       ],
       "Default": "CheckMutexRole"
@@ -263,6 +344,64 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "LibPinGateDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2278: the lib-pin gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_drift). Still fail-open — availability over gating for a weekly pipeline — but VISIBLE and rarer: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishLibPinGateDegraded alerts NOW (mirroring WeeklyRunDayGateFailed's fail-open+alert shape). Proceeds into PipelineContractCheck so a lib-pin-gate infra flake no longer silently skips the SIBLING gate too.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishLibPinGateDegraded"
+    },
+    "PublishLibPinGateDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278: fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline — never States.Format against input). Best-effort Catch: a publish failure must not halt the fail-open path this alert decorates; the caught TaskFailed still logs at ERROR and is matched by SnsPublishFailedMetricFilter.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Lib-Pin Gate DEGRADED (Proceeding Unchecked)",
+        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.libpin_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.libpin_gate_degraded_notify_error",
+          "Next": "PipelineContractCheck"
+        }
+      ],
+      "Next": "PipelineContractCheck"
+    },
+    "PipelineContractGateDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2278: the pipeline-contract gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_violation). Fail-open, visibly: gate_degraded=true + SNS alert, then proceed to CheckMutexRole. Mirrors LibPinGateDegraded exactly.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishPipelineContractGateDegraded"
+    },
+    "PublishPipelineContractGateDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278: fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch mirrors PublishLibPinGateDegraded.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Contract Gate DEGRADED (Proceeding Unchecked)",
+        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.pipeline_contract_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.pipeline_contract_gate_degraded_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
     },
     "CheckMutexRole": {
       "Type": "Choice",
@@ -325,6 +464,18 @@
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
       },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ServiceException",
+            "DynamoDB.RequestLimitExceededException",
+            "DynamoDB.TimeoutException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 2,
+          "BackoffRate": 1.0
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": [
@@ -743,7 +894,8 @@
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
@@ -968,7 +1120,8 @@
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
@@ -1123,13 +1276,30 @@
               "Comment": "Verify research returned OK (not ERROR)",
               "Choices": [
                 {
-                  "Variable": "$.research_result.Payload.status",
-                  "StringEquals": "OK",
+                  "And": [
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "StringEquals": "OK"
+                    }
+                  ],
                   "Next": "CheckSkipDataPhase2"
                 },
                 {
-                  "Variable": "$.research_result.Payload.status",
-                  "StringEquals": "SKIPPED",
+                  "And": [
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_result.Payload.status",
+                      "StringEquals": "SKIPPED"
+                    }
+                  ],
+                  "Comment": "config#2275: both rules IsPresent-guarded so a research Lambda returning a payload WITHOUT status (e.g. {}) falls to Default=ExtractResearchError -> HandleFailure with real context, instead of throwing a bare States.Runtime that bypasses the whole failure chain (the 2026-07-03 incident class).",
                   "Next": "CheckSkipDataPhase2"
                 }
               ],
@@ -1171,7 +1341,8 @@
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
@@ -1314,13 +1485,30 @@
               "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) → route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK → enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
               "Choices": [
                 {
-                  "Variable": "$.eval_judge_submit.Payload.status",
-                  "StringEquals": "EMPTY",
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "StringEquals": "EMPTY"
+                    }
+                  ],
                   "Next": "EvalJudgeProcess"
                 },
                 {
-                  "Variable": "$.eval_judge_submit.Payload.status",
-                  "StringEquals": "OK",
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "StringEquals": "OK"
+                    }
+                  ],
+                  "Comment": "config#2275: IsPresent-guarded so a submit payload WITHOUT status actually reaches the fail-soft Default this state's own comment promises ('missing fields routes to EvalRollingMean') instead of throwing States.Runtime.",
                   "Next": "EvalJudgePollWait"
                 }
               ],
@@ -1375,21 +1563,55 @@
               "Comment": "Branch on poll status. processing_status='ended' → run Process. exceeded_max_wait=true → fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else → loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
               "Choices": [
                 {
-                  "Or": [
+                  "And": [
                     {
                       "Variable": "$.eval_judge_poll.Payload.processing_status",
-                      "StringEquals": "ended"
+                      "IsPresent": true
                     },
                     {
-                      "Variable": "$.eval_judge_poll.Payload.processing_status",
-                      "StringEquals": "ended_empty"
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_poll.Payload.processing_status",
+                          "StringEquals": "ended"
+                        },
+                        {
+                          "Variable": "$.eval_judge_poll.Payload.processing_status",
+                          "StringEquals": "ended_empty"
+                        }
+                      ]
                     }
                   ],
                   "Next": "EvalJudgeProcess"
                 },
                 {
-                  "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                  "BooleanEquals": true,
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "EvalRollingMean"
+                },
+                {
+                  "And": [
+                    {
+                      "Not": {
+                        "Variable": "$.eval_judge_poll.Payload.processing_status",
+                        "IsPresent": true
+                      }
+                    },
+                    {
+                      "Not": {
+                        "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                        "IsPresent": true
+                      }
+                    }
+                  ],
+                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed — fail-soft to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
                   "Next": "EvalRollingMean"
                 }
               ],
@@ -1892,10 +2114,23 @@
                     "States.TaskFailed",
                     "States.Timeout"
                   ],
-                  "MaxAttempts": 2,
-                  "IntervalSeconds": 180,
+                  "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
                   "BackoffRate": 2.0,
-                  "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -2037,9 +2272,23 @@
                     "States.TaskFailed",
                     "States.Timeout"
                   ],
-                  "MaxAttempts": 1,
+                  "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
                   "IntervalSeconds": 30,
-                  "BackoffRate": 2.0
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -2189,10 +2438,23 @@
                           "States.TaskFailed",
                           "States.Timeout"
                         ],
-                        "MaxAttempts": 1,
-                        "IntervalSeconds": 180,
+                        "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                        "MaxAttempts": 4,
+                        "IntervalSeconds": 30,
                         "BackoffRate": 2.0,
-                        "Comment": "Single best-effort retry (e.g. spot interruption) for this one spec."
+                        "MaxDelaySeconds": 300,
+                        "JitterStrategy": "FULL"
+                      },
+                      {
+                        "ErrorEquals": [
+                          "States.ALL"
+                        ],
+                        "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                        "MaxAttempts": 2,
+                        "IntervalSeconds": 30,
+                        "BackoffRate": 2.0,
+                        "MaxDelaySeconds": 300,
+                        "JitterStrategy": "FULL"
                       }
                     ],
                     "Catch": [
@@ -2337,10 +2599,23 @@
                     "States.TaskFailed",
                     "States.Timeout"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 180,
+                  "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
                   "BackoffRate": 2.0,
-                  "Comment": "Single best-effort retry (e.g. spot interruption); selection is non-critical."
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -2593,10 +2868,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -2725,10 +3013,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture."
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -2857,10 +3158,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture."
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -2989,10 +3303,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -3121,10 +3448,23 @@
             "States.TaskFailed",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 180,
+          "Comment": "config#2279: declared spot-stage sendCommand convention — the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) — BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
           "BackoffRate": 2.0,
-          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry). Mirrors Backtester retry posture for symmetry."
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier — same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -3233,7 +3573,7 @@
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration.",
+      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs to the success notifier, so a retry ladder would only delay completion, never protect spend (the health-check masking class itself is config#2276 scope).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3315,7 +3655,7 @@
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state).",
+      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs to the success notifier, so a retry ladder would only delay completion, never protect spend.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3489,7 +3829,49 @@
           "Next": "NotifyShellRunComplete"
         }
       ],
+      "Default": "CheckGateDegradedNotify"
+    },
+    "CheckGateDegradedNotify": {
+      "Type": "Choice",
+      "Comment": "config#2278: a green run that could not run its pre-spend gates must SAY SO in the completion email. gate_degraded is set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states (an SF-controlled boolean; IsPresent-guarded per config#2275). Routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing the flag into NotifyComplete — preserving config#1819's Subject/Message-are-constants invariant.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteGatesDegraded"
+        }
+      ],
       "Default": "NotifyComplete"
+    },
+    "NotifyCompleteGatesDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278: SUCCESS notifier for a run whose pre-spend gates were DEGRADED (failed open, unchecked). Mirrors NotifyComplete exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819) — with a Subject that says the gates were skipped.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (pre-spend gates DEGRADED)",
+        "Message": "All steps completed successfully — BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "End": true
     },
     "NotifyShellRunComplete": {
       "Type": "Task",
@@ -3636,7 +4018,7 @@
     },
     "NormalizeFailureContext": {
       "Type": "Pass",
-      "Comment": "config#1819 notifier-totality fix. Single Catch/Next target for EVERY failure path before HandleFailure — structurally guarantees the fields HandleFailure's States.Format/JsonToString template consumes ($.error, $.pipeline_label, $.sns_topic_arn) are present, regardless of what any upstream Catch, Extract*Error normalizer, or manual Execution.Input supplied. Mirrors the InitializeInput JsonMerge-defaults idiom (defaults as the base/first-arg, current state $ as the override/second-arg — second-arg wins — so a real $.error from a Catch's ResultPath always survives). 2026-07-02 incident (offcycle-shell-20260703-005835): a manual-trigger input omitted pipeline_label and HandleFailure's States.Format('Saturday{} Pipeline failed...', $.pipeline_label, ...) threw States.Runtime, masking the true underlying error — this state closes that CLASS (not just this instance). error/sns_topic_arn get a floor default here for defense-in-depth against any FUTURE Catch that forgets its own ResultPath: $.error (every CURRENT path already sets $.error via a Task Catch ResultPath or an Extract*Error Pass, so this is a backstop, not a behavior change for today's paths). pipeline_label is ALSO re-pinned by NormalizeFailureContextRepin (next state) from $.shell_run rather than trusted verbatim — closes the Subject-injection shape (an arbitrary/oversized/newline-bearing manual pipeline_label reaching HandleFailure's States.Format Subject; SNS Subject must be <=100 chars with no newlines) at the root, the same class of bug as the 2026-06-12 NotifyComplete Subject crash (SNS.InvalidParameterException).",
+      "Comment": "config#1819 notifier-totality fix. Single Catch/Next target for EVERY failure path before HandleFailure — structurally guarantees the fields HandleFailure's States.Format/JsonToString template consumes ($.error, $.pipeline_label, $.sns_topic_arn) are present, regardless of what any upstream Catch, Extract*Error normalizer, or manual Execution.Input supplied. Mirrors the InitializeInput JsonMerge-defaults idiom (defaults as the base/first-arg, current state $ as the override/second-arg — second-arg wins — so a real $.error from a Catch's ResultPath always survives). 2026-07-02 incident (offcycle-shell-20260703-005835): a manual-trigger input omitted pipeline_label and HandleFailure's States.Format('Saturday{} Pipeline failed...', $.pipeline_label, ...) threw States.Runtime, masking the true underlying error — this state closes that CLASS (not just this instance). error/sns_topic_arn get a floor default here for defense-in-depth against any FUTURE Catch that forgets its own ResultPath: $.error (every CURRENT path already sets $.error via a Task Catch ResultPath or an Extract*Error Pass, so this is a backstop, not a behavior change for today's paths). pipeline_label is ALSO re-pinned by NormalizeFailureContextRepin (next state) from $.shell_run rather than trusted verbatim — closes the Subject-injection shape (an arbitrary/oversized/newline-bearing manual pipeline_label reaching HandleFailure's States.Format Subject; SNS Subject must be <=100 chars with no newlines) at the root, the same class of bug as the 2026-06-12 NotifyComplete Subject crash (SNS.InvalidParameterException). PROVENANCE (config#2281): the sns_topic_arn literal in this JsonMerge is the failure-path FLOOR of last resort — the merge keeps any already-present $.sns_topic_arn (the execution-input-sourced value from InitializeInput); the literal engages only if the input context was lost upstream. Kept in lockstep with InitializeInput's floor by tests/test_sf_sns_arn_single_source.py.",
       "Parameters": {
         "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"phase\":\"Unknown\",\"source\":\"NormalizeFailureContext\",\"detail\":\"no $.error was set by the upstream Catch/normalizer\"},\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"pipeline_label\":\"\"}'),$,false)"
       },

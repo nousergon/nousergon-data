@@ -33,8 +33,8 @@ and asserts, read-only:
      kill-switch env values (SF_WATCH_DISPATCH_ENABLED /
      CI_WATCH_DISPATCH_ENABLED) are READ AND REPORTED in the probe record so a
      disabled watch is visible — but never alerted on: a deliberate operator
-     disable is state, not an incident (config#2265; sweep obligation lives
-     with config#2257).
+     disable is state, not an incident (config#2265; the recovery obligation
+     for failures dropped while disabled is the config#2257 sweep below).
   6. The spot launch config still exists, read from the DEPLOYED spot
      dispatcher's live env (SF_WATCH_AMI_ID / SF_WATCH_SECURITY_GROUP /
      SF_WATCH_SUBNETS — pinned by that Lambda's deploy.sh, so the env is the
@@ -76,6 +76,40 @@ is recorded as an `action: reclaim_relaunch` watch-log event (which the
 saturday dispatcher's config#2269 mechanical attempt ceiling counts) BEFORE
 the invoke; a second death for the same (cadence, pipeline, run_date)
 escalates LOUD instead of relaunching again (second death = human).
+
+**Disabled-window dropped-failure sweep (config#2257).** Demonstrated live
+2026-07-11 ~16:47 UTC: `watch-rerun-4` failed minutes before dispatch was
+re-enabled — the trigger was declined ("disabled") and dropped FOREVER; the
+operator had to notice and manually re-fire. A disabled window of ANY length
+can eat exactly one critical failure event this way. Every scheduled probe
+pass therefore sweeps the registered pipelines' LATEST execution: a
+terminal-failed (FAILED/TIMED_OUT/ABORTED) execution with NO covering
+watch-log event for its run_date — and dispatch currently ENABLED — gets a
+synthesized failure event re-driven through
+``alpha-engine-saturday-sf-watch-dispatcher`` (async invoke of
+EXPECTED_TARGET_FUNCTION with the same EventBridge event shape the real rule
+delivers). Design decisions, deliberate:
+  * The sweep re-enters the SATURDAY dispatcher, NOT the spot dispatcher
+    directly: the saturday dispatcher owns the watch-log write (which is what
+    marks the execution COVERED, making the sweep exactly-once), the
+    config#2269 mechanical attempt ceiling, and the config#2003/#1827
+    suppression carve-outs (operator aborts, recovery reruns, post-escalation
+    repeats). A direct spot-dispatcher invoke would bypass all three — an
+    unbounded, suppression-blind re-dispatch loop.
+  * Coverage = "any event in the run_date's watch-log carries this
+    execution_arn" (membership, not last-event recency): robust to multiple
+    failures per day. Known limitation, deliberate: a failure whose watch-log
+    event WAS written but whose downstream spot launch was declined is
+    "covered" here — that half of config#2257 (decline-aware re-fire) belongs
+    to the dispatcher home, not this probe.
+  * A freshness floor (_SWEEP_MIN_AGE_SECONDS) skips executions that
+    terminated moments ago: the real-time EventBridge→dispatcher path may
+    still be in flight, and racing it would double-dispatch one failure.
+  * Gated on the spot dispatcher's live SF_WATCH_DISPATCH_ENABLED value the
+    probe already reads: sweeping while dispatch is DISABLED would burn the
+    one-shot coverage marker on a dispatch the spot leg then declines. The
+    enable transition needs no hook — the first probe pass after re-enable
+    sweeps the window's drops.
 
 **Fail-loud (CLAUDE.md no-silent-fails).** Every AWS describe/list call here is
 the PRIMARY input: an UNEXPECTED API error (anything other than the specific
@@ -169,6 +203,30 @@ RECLAIM_STATE_CHANGE_DETAIL_TYPE = "EC2 Instance State-change Notification"
 RECLAIM_DETAIL_TYPES = frozenset(
     {RECLAIM_INTERRUPTION_DETAIL_TYPE, RECLAIM_STATE_CHANGE_DETAIL_TYPE}
 )
+
+# ── Disabled-window dropped-failure sweep (config#2257) ──────────────────────
+# {pipeline_name: watch_prefix} — MUST stay in lockstep with
+# saturday-sf-watch-dispatcher's PIPELINES watch prefixes AND
+# sf-watch-spot-dispatcher's _WATCH_PREFIXES (tests/
+# test_sf_watch_defer_prefix_lockstep.py pins all three copies equal). The
+# sweep reads the canonical watch-log at f"{prefix}/{run_date}.json" — the
+# exact key saturday-sf-watch-dispatcher's _artifact_key mints — to decide
+# whether a terminal execution is already covered.
+_WATCH_PREFIXES: dict[str, str] = {
+    "ne-weekly-freshness-pipeline": "consolidated/saturday_sf_watch",
+    "ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch",
+    "ne-postclose-trading-pipeline": "consolidated/eod_sf_watch",
+}
+# The statuses the watch's EventBridge rule matches (deploy.sh EVENT_PATTERN);
+# the saturday dispatcher itself applies the ABORTED operator-abort carve-out.
+_SWEEP_TERMINAL_STATUSES = frozenset({"FAILED", "TIMED_OUT", "ABORTED"})
+# Don't sweep an execution that terminated moments ago: the real-time
+# EventBridge→dispatcher path (seconds, worst-case a few minutes including the
+# dispatcher's DescribeExecution/GetExecutionHistory enrichment) may not have
+# written its watch-log event yet, and racing it would dispatch TWICE for one
+# failure. 15 min is far beyond real-time delivery while still well inside a
+# single probe cadence.
+_SWEEP_MIN_AGE_SECONDS = 900
 
 
 def _error_code(exc: Exception) -> str:
@@ -742,6 +800,163 @@ def _handle_reclaim_event(event: dict) -> dict:
             "telegram_sent": noted, "watch_log_key": watch_log_key}
 
 
+# ── Disabled-window dropped-failure sweep (config#2257) — see module docstring
+
+
+def _sweep_dispatch_enabled(kill_switches: dict[str, str]) -> bool:
+    """True iff the spot dispatcher's LIVE kill-switch permits dispatch —
+    computed from the value _check_spot_dispatch_leg already read, applying
+    the dispatcher's own semantics (unset defaults to true). An UNREADABLE
+    value (function missing) reads as disabled: there is nothing to dispatch
+    through, and the missing function is already a loud probe finding."""
+    raw = str(kill_switches.get("SF_WATCH_DISPATCH_ENABLED") or "")
+    return raw == "unset(default:true)" or raw.lower() == "true"
+
+
+def _sweep_run_date(sfn, execution: dict) -> str:
+    """Mirror saturday-sf-watch-dispatcher's `_run_date` derivation (execution
+    input's run_date → execution startDate → today UTC) so the coverage check
+    reads the SAME watch-log key the dispatcher would write for this event.
+    DescribeExecution failure is a best-effort swallow (failure mode: the
+    fallback date could differ from the dispatcher's input-derived one,
+    risking ONE duplicate dispatch — bounded by the dispatcher's config#2269
+    attempt ceiling; recording surface: the WARNING below), mirroring the
+    dispatcher's own best-effort `_describe_execution` posture."""
+    execution_arn = str(execution.get("executionArn") or "")
+    resp = None
+    try:
+        resp = _sfn_client().describe_execution(executionArn=execution_arn)
+    except Exception as exc:  # noqa: BLE001 — see docstring: bounded, recorded here
+        logger.warning(
+            "sweep: describe_execution failed for %s — deriving run_date from "
+            "startDate instead: %s", execution_arn, exc,
+        )
+    if resp is not None:
+        try:
+            rd = json.loads(resp.get("input") or "{}").get("run_date")
+        except (ValueError, TypeError):
+            rd = None
+        if isinstance(rd, str) and rd:
+            return rd
+    start = execution.get("startDate")
+    if isinstance(start, datetime):
+        return start.astimezone(timezone.utc).date().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _sweep_execution_covered(s3, watch_log_key: str, execution_arn: str) -> bool:
+    """True iff ANY event in the run_date's watch-log carries this
+    execution_arn (membership, not last-event recency — robust to multiple
+    failures per day). A missing watch-log means nothing covered it. Reuses
+    `_load_watch_log`: unexpected S3 errors RAISE (a misread here would either
+    re-dispatch a covered failure or silently drop an uncovered one)."""
+    doc = _load_watch_log(s3, watch_log_key)
+    if doc is None:
+        return False
+    return any(str(ev.get("execution_arn") or "") == execution_arn for ev in doc.get("events", []))
+
+
+def _sweep_dropped_failures(kill_switches: dict[str, str]) -> dict:
+    """Sweep the registered pipelines' latest executions for terminal failures
+    with no covering watch-log event (config#2257) — see module docstring for
+    the design decisions. Per-pipeline errors are collected so one broken
+    pipeline never blocks sweeping the others, then RAISED together at the
+    end (fail-loud: a silently failing sweep is exactly the silent drop this
+    sweep exists to close; already-fired dispatches are async and unaffected)."""
+    if not _sweep_dispatch_enabled(kill_switches):
+        logger.info(
+            "sweep: SF_WATCH_DISPATCH_ENABLED=%r — sweep skipped (the first "
+            "probe pass after re-enable sweeps the window's drops)",
+            kill_switches.get("SF_WATCH_DISPATCH_ENABLED"),
+        )
+        return {"enabled": False, "swept": [], "skipped_recent": []}
+
+    sfn = _sfn_client()
+    s3 = _s3_client()
+    lam = _lambda_client()
+    now = datetime.now(timezone.utc)
+    swept: list[dict] = []
+    skipped_recent: list[str] = []
+    errors: list[str] = []
+    for pipeline, prefix in _WATCH_PREFIXES.items():
+        sm_arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{pipeline}"
+        try:
+            executions = sfn.list_executions(
+                stateMachineArn=sm_arn, maxResults=1
+            ).get("executions") or []
+            if not executions:
+                continue
+            latest = executions[0]
+            status = str(latest.get("status") or "")
+            if status not in _SWEEP_TERMINAL_STATUSES:
+                continue
+            stop = latest.get("stopDate")
+            if isinstance(stop, datetime) and (now - stop).total_seconds() < _SWEEP_MIN_AGE_SECONDS:
+                # Real-time EventBridge→dispatcher delivery may still be in
+                # flight — racing it would double-dispatch one failure. The
+                # next probe pass re-checks (by then it is covered or truly
+                # dropped).
+                skipped_recent.append(pipeline)
+                continue
+            execution_arn = str(latest.get("executionArn") or "")
+            run_date = _sweep_run_date(sfn, latest)
+            watch_log_key = f"{prefix}/{run_date}.json"
+            if _sweep_execution_covered(s3, watch_log_key, execution_arn):
+                continue
+
+            # Dropped failure: re-drive it through the saturday dispatcher
+            # with the same event shape the real EventBridge rule delivers —
+            # its watch-log write is what marks this execution covered
+            # (exactly-once), and its suppression carve-outs + attempt
+            # ceiling all apply (see module docstring).
+            detail: dict[str, object] = {
+                "executionArn": execution_arn,
+                "stateMachineArn": sm_arn,
+                "name": str(latest.get("name") or ""),
+                "status": status,
+            }
+            start = latest.get("startDate")
+            if isinstance(start, datetime):
+                detail["startDate"] = int(start.timestamp() * 1000)
+            if isinstance(stop, datetime):
+                detail["stopDate"] = int(stop.timestamp() * 1000)
+            lam.invoke(
+                FunctionName=EXPECTED_TARGET_FUNCTION,
+                InvocationType="Event",
+                Payload=json.dumps({
+                    "source": "aws.states",
+                    "detail-type": "Step Functions Execution Status Change",
+                    # Provenance marker — ignored by the dispatcher's handler,
+                    # visible in its invocation log for forensics.
+                    "sf_watch_sweep": {"source": _FLOW_NAME, "swept_at": now.isoformat()},
+                    "detail": detail,
+                }).encode("utf-8"),
+            )
+            logger.warning(
+                "sweep: dropped %s execution %s (%s, run_date=%s) had NO "
+                "covering event in %s — re-driven through %s (config#2257)",
+                status, execution_arn, pipeline, run_date, watch_log_key,
+                EXPECTED_TARGET_FUNCTION,
+            )
+            swept.append({
+                "pipeline": pipeline,
+                "execution_arn": execution_arn,
+                "status": status,
+                "run_date": run_date,
+                "watch_log_key": watch_log_key,
+            })
+        except Exception as exc:  # noqa: BLE001 — collected, then RAISED below
+            logger.error("sweep: %s failed: %s: %s", pipeline, type(exc).__name__, exc)
+            errors.append(f"{pipeline}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError(
+            f"config#2257 dropped-failure sweep hit unexpected errors on "
+            f"{len(errors)} pipeline(s) (swept {len(swept)} before/around "
+            f"them): {'; '.join(errors)}"
+        )
+    return {"enabled": True, "swept": swept, "skipped_recent": skipped_recent}
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint — plus the mid-run spot-reclaim
     checker branch (config#2270) when invoked by the EC2 reclaim/termination
@@ -775,9 +990,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         if already is not None:
             _save_alerted_fingerprint(s3, None)  # clear dedup state now that it's healthy again
 
+    # config#2257: sweep for failures dropped during a disabled window — runs
+    # LAST so wiring problems above always alert before a sweep error raises.
+    sweep = _sweep_dropped_failures(kill_switches)
+
     return {
         "problems": problems,
         "alerted": alerted,
         "clean": not problems,
         "kill_switches": kill_switches,
+        "sweep": sweep,
     }

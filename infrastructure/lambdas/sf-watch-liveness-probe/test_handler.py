@@ -76,6 +76,8 @@ def _make_sfn_client(*, missing_names=()):
         return {"name": name, "status": "ACTIVE"}
 
     sfn.describe_state_machine.side_effect = describe
+    # config#2257 sweep default: no executions at all — sweep finds nothing.
+    sfn.list_executions.return_value = {"executions": []}
     return sfn
 
 
@@ -208,6 +210,7 @@ def test_all_clean_alerts_nothing():
         "alerted": False,
         "clean": True,
         "kill_switches": HEALTHY_KILL_SWITCHES,
+        "sweep": {"enabled": True, "swept": [], "skipped_recent": []},
     }
     index.notify_via_flow_doctor.assert_not_called()
 
@@ -887,4 +890,210 @@ def test_real_reclaim_path_unaffected_by_drill_branch():
     result, _, s3, lam = _run_reclaim(_reclaim_event(), s3=s3)
     assert "drill" not in result
     assert result["relaunched"] is True
+
+
+# ---------------------------------------------------------------------------
+# Disabled-window dropped-failure sweep (config#2257)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+SWEEP_PIPELINE = "ne-weekly-freshness-pipeline"
+SWEEP_SM_ARN = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{SWEEP_PIPELINE}"
+SWEEP_EXEC_ARN = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:execution:{SWEEP_PIPELINE}:drill-1"
+
+
+def _terminal_execution(*, status="FAILED", age_seconds=3600, name="drill-1",
+                        execution_arn=SWEEP_EXEC_ARN):
+    now = datetime.now(timezone.utc)
+    return {
+        "executionArn": execution_arn,
+        "stateMachineArn": SWEEP_SM_ARN,
+        "name": name,
+        "status": status,
+        "startDate": now - timedelta(seconds=age_seconds + 120),
+        "stopDate": now - timedelta(seconds=age_seconds),
+    }
+
+
+def _make_sweep_sfn(execution=None, *, per_pipeline=None, exec_input=None):
+    """sfn mock whose list_executions returns `execution` for SWEEP_PIPELINE
+    (or per_pipeline overrides) and nothing for the others; describe_execution
+    returns `exec_input` as the execution input JSON."""
+    sfn = _make_sfn_client()
+
+    def list_executions(stateMachineArn, maxResults):  # noqa: N803
+        name = stateMachineArn.rsplit(":", 1)[-1]
+        if per_pipeline and name in per_pipeline:
+            return {"executions": [per_pipeline[name]]}
+        if execution is not None and name == SWEEP_PIPELINE:
+            return {"executions": [execution]}
+        return {"executions": []}
+
+    sfn.list_executions.side_effect = list_executions
+    sfn.describe_execution.return_value = {
+        "input": json.dumps(exec_input if exec_input is not None else {})
+    }
+    return sfn
+
+
+def _make_sweep_s3(*, watch_logs=None):
+    """Keyed s3 mock: serves the probe's dedup-state key (absent) plus any
+    given watch-log docs; everything else is NoSuchKey."""
+    s3 = MagicMock()
+    watch_logs = watch_logs or {}
+
+    def get_object(Bucket, Key):  # noqa: N803
+        if Key in watch_logs:
+            body = MagicMock()
+            body.read.return_value = json.dumps(watch_logs[Key]).encode()
+            return {"Body": body}
+        raise FakeClientError("NoSuchKey")
+
+    s3.get_object.side_effect = get_object
+    return s3
+
+
+def _run_probe(sfn, s3, lam=None):
+    events = _make_events_client()
+    lam = lam if lam is not None else _make_lambda_client()
+    with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
+        return index.handler({}, None), lam
+
+
+def test_sweep_dropped_failure_redrives_through_saturday_dispatcher():
+    """The config#2257 class: a terminal FAILED execution with NO covering
+    watch-log event gets a synthesized EventBridge-shaped event re-driven
+    through the saturday dispatcher (never the spot dispatcher directly)."""
+    execution = _terminal_execution()
+    sfn = _make_sweep_sfn(execution, exec_input={"run_date": "2026-07-11"})
+    s3 = _make_sweep_s3()
+    result, lam = _run_probe(sfn, s3)
+
+    assert result["sweep"]["enabled"] is True
+    assert result["sweep"]["swept"] == [{
+        "pipeline": SWEEP_PIPELINE,
+        "execution_arn": SWEEP_EXEC_ARN,
+        "status": "FAILED",
+        "run_date": "2026-07-11",
+        "watch_log_key": "consolidated/saturday_sf_watch/2026-07-11.json",
+    }]
+    (kwargs,) = [c.kwargs for c in lam.invoke.call_args_list]
+    assert kwargs["FunctionName"] == index.EXPECTED_TARGET_FUNCTION
+    assert kwargs["InvocationType"] == "Event"
+    payload = json.loads(kwargs["Payload"])
+    assert payload["source"] == "aws.states"
+    assert payload["detail-type"] == "Step Functions Execution Status Change"
+    assert payload["detail"]["executionArn"] == SWEEP_EXEC_ARN
+    assert payload["detail"]["stateMachineArn"] == SWEEP_SM_ARN
+    assert payload["detail"]["status"] == "FAILED"
+    assert payload["detail"]["name"] == "drill-1"
+    assert isinstance(payload["detail"]["startDate"], int)
+    assert isinstance(payload["detail"]["stopDate"], int)
+    assert payload["sf_watch_sweep"]["source"] == "sf-watch-liveness-probe"
+
+
+def test_sweep_covered_execution_is_not_redriven():
+    """Membership coverage: ANY event in the run_date's watch-log carrying the
+    execution_arn marks it covered — including the event the dispatcher writes
+    when the sweep's own re-drive lands (the exactly-once bound)."""
+    execution = _terminal_execution()
+    sfn = _make_sweep_sfn(execution, exec_input={"run_date": "2026-07-11"})
+    s3 = _make_sweep_s3(watch_logs={
+        "consolidated/saturday_sf_watch/2026-07-11.json": {
+            "schema_version": 1,
+            "events": [
+                {"execution_arn": "arn:other", "action": "dispatch"},
+                {"execution_arn": SWEEP_EXEC_ARN, "action": "dispatch"},
+            ],
+        },
+    })
+    result, lam = _run_probe(sfn, s3)
+    assert result["sweep"] == {"enabled": True, "swept": [], "skipped_recent": []}
+    lam.invoke.assert_not_called()
+
+
+def test_sweep_skips_fresh_failure_for_realtime_path():
+    """A failure younger than the freshness floor is left to the real-time
+    EventBridge->dispatcher path (racing it would double-dispatch)."""
+    execution = _terminal_execution(age_seconds=60)
+    sfn = _make_sweep_sfn(execution)
+    result, lam = _run_probe(sfn, _make_sweep_s3())
+    assert result["sweep"] == {
+        "enabled": True, "swept": [], "skipped_recent": [SWEEP_PIPELINE],
+    }
+    lam.invoke.assert_not_called()
+
+
+def test_sweep_ignores_non_terminal_latest_execution():
+    execution = _terminal_execution(status="RUNNING")
+    sfn = _make_sweep_sfn(execution)
+    result, lam = _run_probe(sfn, _make_sweep_s3())
+    assert result["sweep"] == {"enabled": True, "swept": [], "skipped_recent": []}
+    lam.invoke.assert_not_called()
+
+
+def test_sweep_disabled_kill_switch_skips_sweep_entirely():
+    """Sweeping while dispatch is DISABLED would burn the one-shot coverage
+    marker on a dispatch the spot leg then declines — the first probe pass
+    after re-enable performs the sweep instead."""
+    execution = _terminal_execution()
+    sfn = _make_sweep_sfn(execution)
+    spot_env = dict(HEALTHY_SPOT_ENV, SF_WATCH_DISPATCH_ENABLED="false")
+    lam = _make_lambda_client(spot_env=spot_env)
+    result, lam = _run_probe(sfn, _make_sweep_s3(), lam=lam)
+    assert result["sweep"] == {"enabled": False, "swept": [], "skipped_recent": []}
+    sfn.list_executions.assert_not_called()
+    lam.invoke.assert_not_called()
+
+
+def test_sweep_unset_kill_switch_defaults_to_enabled():
+    """`unset(default:true)` — the dispatcher's own in-code default — sweeps."""
+    execution = _terminal_execution()
+    sfn = _make_sweep_sfn(execution, exec_input={"run_date": "2026-07-11"})
+    spot_env = {k: v for k, v in HEALTHY_SPOT_ENV.items() if k != "SF_WATCH_DISPATCH_ENABLED"}
+    lam = _make_lambda_client(spot_env=spot_env)
+    result, lam = _run_probe(sfn, _make_sweep_s3(), lam=lam)
+    assert [e["pipeline"] for e in result["sweep"]["swept"]] == [SWEEP_PIPELINE]
     lam.invoke.assert_called_once()
+
+
+def test_sweep_run_date_falls_back_to_start_date_when_describe_fails():
+    """DescribeExecution flake: run_date derives from startDate (mirroring the
+    dispatcher's own fallback), recorded via WARNING — the sweep still fires."""
+    execution = _terminal_execution()
+    sfn = _make_sweep_sfn(execution)
+    sfn.describe_execution.side_effect = FakeClientError("Throttled")
+    result, lam = _run_probe(sfn, _make_sweep_s3())
+    expected_run_date = execution["startDate"].astimezone(timezone.utc).date().isoformat()
+    assert result["sweep"]["swept"][0]["run_date"] == expected_run_date
+    lam.invoke.assert_called_once()
+
+
+def test_sweep_unexpected_error_raises_after_sweeping_other_pipelines():
+    """Fail-loud: a broken sweep must surface via the Lambda Errors metric
+    (watch-plane alarms), never silently no-op — but only AFTER every other
+    pipeline got its sweep attempt (already-fired dispatches are async)."""
+    healthy = _terminal_execution()
+    sfn = _make_sfn_client()
+
+    def list_executions(stateMachineArn, maxResults):  # noqa: N803
+        name = stateMachineArn.rsplit(":", 1)[-1]
+        if name == SWEEP_PIPELINE:
+            raise FakeClientError("InternalError")
+        if name == "ne-preopen-trading-pipeline":
+            return {"executions": [dict(
+                healthy,
+                stateMachineArn=stateMachineArn,
+                executionArn=f"{stateMachineArn.replace('stateMachine', 'execution')}:x1",
+            )]}
+        return {"executions": []}
+
+    sfn.list_executions.side_effect = list_executions
+    sfn.describe_execution.return_value = {"input": json.dumps({"run_date": "2026-07-11"})}
+    lam = _make_lambda_client()
+    events = _make_events_client()
+    with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, _make_sweep_s3())):
+        with pytest.raises(RuntimeError, match="config#2257"):
+            index.handler({}, None)
+    # The healthy pipeline's dropped failure was still re-driven first.    lam.invoke.assert_called_once()

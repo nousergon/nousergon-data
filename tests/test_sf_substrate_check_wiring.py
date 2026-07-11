@@ -92,7 +92,10 @@ class TestChainOrdering:
         assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
         assert states["Director"]["Next"] == "CheckShellRunNotify"
         assert all(c["Next"] == "CheckShellRunNotify" for c in states["Director"]["Catch"])
-        assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
+        # config#2278: the real-run success edge now passes through the
+        # gate-degraded completion Choice before NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
 
 class TestCatchSemantics:

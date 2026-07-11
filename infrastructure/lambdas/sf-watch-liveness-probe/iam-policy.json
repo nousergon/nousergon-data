@@ -31,11 +31,21 @@
     {
       "Sid": "ReadRegisteredStateMachines",
       "Effect": "Allow",
-      "Action": ["states:DescribeStateMachine"],
+      "Action": ["states:DescribeStateMachine", "states:ListExecutions"],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
+    },
+    {
+      "Sid": "SweepDescribeExecutionsForRunDate",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
       ]
     },
     {
@@ -82,6 +92,12 @@
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
       "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-sf-watch-spot-dispatcher"
+    },
+    {
+      "Sid": "SweepInvokeSaturdayDispatcher",
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-saturday-sf-watch-dispatcher"
     }
   ]
 }
