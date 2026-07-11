@@ -2779,8 +2779,13 @@ def main() -> None:
     # run (ok, partial, or failing). config["bucket"] is the research bucket
     # (RESEARCH_BUCKET default "alpha-engine-research"; see preflight.py:197),
     # which is where the dashboard reads heartbeats from.
+    # hasattr guard: emit_heartbeat only exists in flow-doctor >=0.6.2. The 5
+    # producing repos deploy independently, so a version-skewed box could hold
+    # an older lib (the #646 arc historically pinned 0.6.0rc3, which lacks it)
+    # — guarding on the method's presence keeps this forward/backward-compatible
+    # during the phased rollout so it can never AttributeError a production run.
     fd = get_flow_doctor()
-    if fd:
+    if fd and hasattr(fd, "emit_heartbeat"):
         fd.emit_heartbeat(bucket=config["bucket"])
 
     # Hard-fail on any non-ok status — strict form of the no-silent-fails

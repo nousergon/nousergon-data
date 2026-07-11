@@ -105,10 +105,19 @@ def test_heartbeat_emit_uses_research_bucket_expr():
 
 
 def test_heartbeat_emit_gated_on_flow_doctor_instance():
-    """Source guard: emit is gated on a truthy flow-doctor instance (soft-fail)."""
+    """Source guard: emit is gated on a truthy flow-doctor instance AND the
+    presence of the emit_heartbeat method (soft-fail + lib-version skew safe).
+
+    ``hasattr(fd, "emit_heartbeat")`` is load-bearing: emit_heartbeat only
+    exists in flow-doctor >=0.6.2 and the 5 producing repos deploy
+    independently, so an older lib on a version-skewed box would AttributeError
+    at end-of-run without it (config#646 lib-pin follow-up).
+    """
     src = _main_source()
     assert "fd = get_flow_doctor()" in src
-    assert "if fd:" in src, (
-        "The emit_heartbeat call must be guarded by `if fd:` so a disabled "
-        "flow-doctor (get_flow_doctor() -> None) is a no-op."
+    assert 'if fd and hasattr(fd, "emit_heartbeat"):' in src, (
+        "The emit_heartbeat call must be guarded by "
+        '`if fd and hasattr(fd, "emit_heartbeat"):` so a disabled flow-doctor '
+        "(get_flow_doctor() -> None) OR an older lib without emit_heartbeat "
+        "(>=0.6.2 only) is a no-op — never an AttributeError in production."
     )
