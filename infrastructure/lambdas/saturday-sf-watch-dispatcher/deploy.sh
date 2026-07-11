@@ -133,8 +133,9 @@ if $BOOTSTRAP; then
   fi
 
   # EventBridge rule: terminal-failure statuses of ANY of the three fleet
-  # trading SFs (+ the transitional EOD alias). One rule, one target — keep
-  # the ARN list in lockstep with index.PIPELINES.
+  # trading SFs. One rule, one target — keep the ARN list in lockstep with
+  # index.PIPELINES. (The transitional alpha-engine-eod-pipeline alias was
+  # retired 2026-07-11 — config#2272; old SF deleted live.)
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -144,8 +145,7 @@ if $BOOTSTRAP; then
     "stateMachineArn": [
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }

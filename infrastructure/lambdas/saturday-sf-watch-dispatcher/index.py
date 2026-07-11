@@ -201,19 +201,9 @@ PIPELINES: dict[str, dict[str, object]] = {
         "dispatch_event_type": "eod-sf-failure",
         "has_listener": True,
     },
-    # TRANSITIONAL (remove at the SF-rename cutover — config#1408 / re-exam
-    # 2026-07-03). The EOD SF still runs under its OLD name `alpha-engine-eod-
-    # pipeline` (saturday/weekday already renamed; EOD lags). Until cutover, the
-    # LIVE failures arrive under the old ARN, so the registry must recognize it —
-    # otherwise the handler ignores the event (the 2026-06-29 dead-watch gap).
-    # Routes to the SAME eod cadence resources as ne-postclose-trading-pipeline.
-    "alpha-engine-eod-pipeline": {
-        "cadence_slug": "eod",
-        "label": "Post-close Trading",
-        "watch_prefix": "consolidated/eod_sf_watch",
-        "dispatch_event_type": "eod-sf-failure",
-        "has_listener": True,
-    },
+    # The transitional `alpha-engine-eod-pipeline` alias (config#1408) was
+    # retired 2026-07-11 (config#2272) after the dormant old state machine was
+    # DELETED live — zero executions since the 2026-06-29 ne-rename.
 }
 SCHEMA_VERSION = 1
 _CAUSE_MAX_CHARS = 600
@@ -1027,7 +1017,8 @@ def _maybe_dispatch_agent(
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge handler — fires only on a registered fleet SF terminal failure
     (FAILED / TIMED_OUT / ABORTED), per the dedicated rule
-    ``alpha-engine-sf-watch-failed`` (scoped to the three SFs in ``PIPELINES``).
+    ``alpha-engine-saturday-sf-watch-failed`` (scoped to the three SFs in
+    ``PIPELINES``; rule name pinned in deploy.sh's RULE_NAME).
     """
     detail = event.get("detail") or {}
     sm_arn = detail.get("stateMachineArn") or ""

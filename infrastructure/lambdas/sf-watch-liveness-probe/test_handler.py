@@ -269,12 +269,12 @@ def test_dead_state_machine_arn_alerts():
     """The exact 2026-06-29 bug class: registered in the rule, but the SF
     itself no longer exists (deleted/renamed)."""
     events = _make_events_client()
-    sfn = _make_sfn_client(missing_names={"alpha-engine-eod-pipeline"})
+    sfn = _make_sfn_client(missing_names={"ne-postclose-trading-pipeline"})
     lam = _make_lambda_client()
     s3 = _make_s3_client()
     with patch("index.boto3.client", side_effect=_clients_factory(events, sfn, lam, s3)):
         result = index.handler({}, None)
-    assert any("NO live Step Function" in p and "alpha-engine-eod-pipeline" in p for p in result["problems"])
+    assert any("NO live Step Function" in p and "ne-postclose-trading-pipeline" in p for p in result["problems"])
 
 
 def test_unhealthy_lambda_alerts():

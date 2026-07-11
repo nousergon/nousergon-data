@@ -191,10 +191,9 @@ _WATCH_PREFIXES = {
     "ne-weekly-freshness-pipeline": "consolidated/saturday_sf_watch",
     "ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch",
     "ne-postclose-trading-pipeline": "consolidated/eod_sf_watch",
-    # TRANSITIONAL old EOD SF name — mirrors the same entry in
-    # saturday-sf-watch-dispatcher's PIPELINES (remove together at the
-    # config#1408 SF-rename cutover; the lockstep test enforces "together").
-    "alpha-engine-eod-pipeline": "consolidated/eod_sf_watch",
+    # The transitional alpha-engine-eod-pipeline alias was removed together
+    # with saturday-sf-watch-dispatcher's PIPELINES entry on 2026-07-11
+    # (config#2272) — the lockstep test enforces "together".
 }
 
 # Defense-in-depth allowlists for event fields embedded verbatim into the SSM

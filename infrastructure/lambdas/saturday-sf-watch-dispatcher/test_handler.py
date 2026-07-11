@@ -459,12 +459,14 @@ def test_registry_and_eventbridge_rule_are_in_lockstep():
     )
 
 
-def test_live_old_named_eod_is_registered_during_rename_transition():
-    """Until the SF-rename cutover (config#1408 / re-exam 2026-07-03) the EOD SF
-    still runs as `alpha-engine-eod-pipeline`. Drop this assertion when the old
-    ARN is removed from the registry + rule at cutover."""
-    assert "alpha-engine-eod-pipeline" in index.PIPELINES
-    assert index.PIPELINES["alpha-engine-eod-pipeline"]["cadence_slug"] == "eod"
+def test_transitional_eod_alias_is_retired():
+    """config#2272 (2026-07-11): the dormant `alpha-engine-eod-pipeline` state
+    machine was deleted live and the transitional alias retired from every
+    hand-maintained list — it must never quietly reappear in the registry
+    (drift seed) nor in the deploy.sh rule (the lockstep test above covers the
+    rule side)."""
+    assert "alpha-engine-eod-pipeline" not in index.PIPELINES
+    assert "alpha-engine-eod-pipeline" not in _deploy_sh_rule_arns()
 
 
 # ── config#1827: operator-abort dispatch carve-out ──────────────────────────

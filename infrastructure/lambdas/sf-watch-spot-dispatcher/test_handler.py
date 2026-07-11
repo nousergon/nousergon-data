@@ -402,7 +402,6 @@ def test_defer_schedule_name_deterministic_and_within_aws_cap(monkeypatch):
         ("saturday", "ne-weekly-freshness-pipeline"),
         ("weekday", "ne-preopen-trading-pipeline"),
         ("eod", "ne-postclose-trading-pipeline"),
-        ("eod", "alpha-engine-eod-pipeline"),
     ):
         for gen in (1, 2, 3):
             name = idx._defer_schedule_name(cadence, pipeline, "2026-07-11", gen)

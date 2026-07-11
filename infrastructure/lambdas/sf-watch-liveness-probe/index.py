@@ -125,7 +125,8 @@ EXPECTED_PIPELINE_NAMES = [
     "ne-weekly-freshness-pipeline",
     "ne-preopen-trading-pipeline",
     "ne-postclose-trading-pipeline",
-    "alpha-engine-eod-pipeline",  # transitional alias, config#1408 / re-exam 2026-07-03
+    # transitional alpha-engine-eod-pipeline alias retired 2026-07-11
+    # (config#2272; dormant old SF deleted live).
 ]
 
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
