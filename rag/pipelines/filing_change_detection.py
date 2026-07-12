@@ -26,6 +26,31 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _embedding_to_f32(embedding) -> np.ndarray:
+    """Coerce a pgvector ``vector`` column value to a float32 ndarray.
+
+    ``nousergon_lib.rag.db.get_connection`` registers pgvector's psycopg2
+    codec, whose contract is that ``vector`` columns come back as numpy
+    arrays. Depending on the pgvector/psycopg2 build that resolves on the
+    weekly data spot, that same codec can instead hand back a
+    ``pgvector.Vector`` object — which has NO numpy interop (no
+    ``__array__``/``__len__``/``__iter__``), so ``np.array(v, dtype=...)``
+    falls through to ``float(v)`` and raises
+    ``TypeError: float() argument must be ... not 'Vector'`` (the
+    2026-07-11 weekly-freshness break at Step 8/9, filing change detection).
+
+    Normalize via pgvector's documented ``Vector.to_numpy()`` before the
+    array cast so the "laziness" signal computes identically regardless of
+    which representation the codec returns. This stays FAIL-LOUD: a raw
+    string here means the codec silently failed to register, and
+    ``np.asarray('[...]', dtype=np.float32)`` still raises rather than
+    silently mis-parsing it.
+    """
+    if hasattr(embedding, "to_numpy"):  # pgvector.Vector — not numpy-coercible
+        embedding = embedding.to_numpy()
+    return np.asarray(embedding, dtype=np.float32)
+
+
 def _load_filing_embeddings() -> dict[str, list[dict]]:
     """Load all 10-K and 10-Q filing embeddings grouped by ticker.
 
@@ -59,7 +84,7 @@ def _load_filing_embeddings() -> dict[str, list[dict]]:
                 "sections": defaultdict(list),
             }
         if embedding is not None:
-            vec = np.array(embedding, dtype=np.float32)
+            vec = _embedding_to_f32(embedding)
             grouped[key]["embeddings"].append(vec)
             if section_label:
                 grouped[key]["sections"][section_label].append(vec)

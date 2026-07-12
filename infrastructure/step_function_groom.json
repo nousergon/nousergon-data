@@ -70,6 +70,14 @@
         "max_retries": 2,
         "fod": {"force_on_demand": false, "launch_decided": true}
       },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "config#2311: a Standard Map's default ToleratedFailurePercentage=0 means ANY iteration reaching FailExecution fails the whole Map — that's still correct 'fail loud' per-lane semantics (Fleet-SF Watch must see it), but it must NOT also starve the end-of-SF sweep the way it did on 2026-07-11 (a single transient Ssm.SdkClientException 2h43m into a Haiku launch killed that iteration, the Map, and skipped DispatchEndOfSfSweep entirely — the wiring test's own 'unconditional coverage' invariant was violated in production on this exact path). Route through RecordMapLaunchFailure so the sweep still fires, then re-assert FAILED via CheckMapLaunchOutcome/GroomMapLaunchFailed after the sweep dispatch completes — preserving both properties instead of trading one for the other.",
+          "Next": "RecordMapLaunchFailure",
+          "ResultPath": "$.mapLaunchError"
+        }
+      ],
       "ItemProcessor": {
         "ProcessorConfig": {"Mode": "INLINE"},
         "StartAt": "LaunchGroomSpot",
@@ -128,7 +136,7 @@
           },
           "PollGroomCommand": {
             "Type": "Task",
-            "Comment": "Poll the async SSM command to a terminal state. No attempt-cap/counter here (mirrors the fleet's existing poll-loop convention, e.g. step_function_eod.json's PostMarketData/WaitForPostMarketData) — the underlying command is itself bounded by groom_spot_bootstrap.sh's own hard watchdog (MAX_RUNTIME_SECONDS, default 21600s/6h) plus the spot-orphan-reaper's 6.5h fleet cap, so this loop always resolves to a terminal SSM status without needing its own ceiling.",
+            "Comment": "Poll the async SSM command to a terminal state. No attempt-cap/counter here (mirrors the fleet's existing poll-loop convention, e.g. step_function_eod.json's PostMarketData/WaitForPostMarketData) — the underlying command is itself bounded by groom_spot_bootstrap.sh's own hard watchdog (MAX_RUNTIME_SECONDS, default 21600s/6h) plus the spot-orphan-reaper's 6.5h fleet cap, so this loop always resolves to a terminal SSM status without needing its own ceiling. config#2311/#761: retries transient SDK/network errors (Ssm.SdkClientException, States.Timeout) too — this loop fires every ~15s across a run that can span hours, so a single momentary connectivity blip has a near-certain chance of occurring somewhere in the window; uncaught, it previously fell straight through to HandleFailure and killed the whole iteration 2h43m into an otherwise-healthy run (2026-07-11 live incident). Mirrors the retry shape the fleet already uses for Ssm.SdkClientException elsewhere (see DescribeInstanceInfo in step_function_eod.json/step_function_daily.json) — this specific retry block was fixed fleet-wide across all 23 getCommandInvocation states by #761, landed independently/concurrently with this PR's structural fix below.",
             "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
             "Parameters": {
               "CommandId.$": "$.groomLaunch.Payload.groom.command_id",
@@ -139,6 +147,15 @@
                 "ErrorEquals": ["Ssm.InvocationDoesNotExistException", "Ssm.InvocationDoesNotExist"],
                 "MaxAttempts": 10,
                 "IntervalSeconds": 10,
+                "BackoffRate": 1.5
+              },
+              {
+                "ErrorEquals": [
+                  "Ssm.SdkClientException",
+                  "States.Timeout"
+                ],
+                "MaxAttempts": 2,
+                "IntervalSeconds": 5,
                 "BackoffRate": 1.5
               }
             ],
@@ -333,6 +350,17 @@
       "ResultPath": "$.mapOutcome",
       "Next": "DispatchEndOfSfSweep"
     },
+    "RecordMapLaunchFailure": {
+      "Type": "Pass",
+      "Comment": "config#2311 no-silent-caps: shape an explicit failed:true record into $.mapFailure (mirrors RecordSweepDispatchFailure's $.sweep shape) so a Map-iteration failure is visible in the execution output. The raw error stays alongside in $.mapLaunchError. Falls through to the SAME DispatchEndOfSfSweep the healthy paths use — the sweep is unconditional regardless of how this state was reached — then CheckMapLaunchOutcome re-asserts FAILED once the sweep dispatch is done.",
+      "Parameters": {
+        "failed": true,
+        "reason": "map_iteration_failed",
+        "error.$": "$.mapLaunchError"
+      },
+      "ResultPath": "$.mapFailure",
+      "Next": "DispatchEndOfSfSweep"
+    },
     "DispatchEndOfSfSweep": {
       "Type": "Task",
       "Comment": "config#2201: ONE Haiku run_mode=sweep spot box per trigger cycle, launched AFTER every groom box has fully wound down (this state is only reached when every Map iteration hit its own GroomSucceeded/GroomSkipped — any FailExecution fails the whole Map, and hence the execution, before reaching here) — and equally via AllSkipped when zero groom boxes launched. Payload is a LITERAL launch_decided event (no pace/demand re-check — the sweep is unconditional by design; issue_filter is inert for run_mode=sweep but the launch path validates it, so the mid-only default is passed explicitly). The dispatcher tags sweep boxes groom-issue-filter=sweep — distinct from every groom tier tag — so its config#1979 concurrent guard skips ONLY when a prior cycle's sweep box is still live (launched:false, reason=concurrent_tier_skip, recorded in $.sweep), never colliding with a live mid-only groom box. Fire-and-forget: the Lambda returns as soon as the async SSM command is delivered; no polling loop here (Brian removed the wait — the sweep box self-terminates and writes its own S3 run artifact + completion marker). NON-FATAL: a sweep-launch failure must never fail the groom SF execution — Catch records it in the execution output (no-silent-caps) + SNS-notifies, then the SF still succeeds.",
@@ -365,7 +393,7 @@
         }
       ],
       "ResultPath": "$.sweep",
-      "Next": "GroomDispatchComplete"
+      "Next": "CheckMapLaunchOutcome"
     },
     "RecordSweepDispatchFailure": {
       "Type": "Pass",
@@ -391,15 +419,32 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "GroomDispatchComplete",
+          "Next": "CheckMapLaunchOutcome",
           "ResultPath": "$.sweep_notify_error"
         }
       ],
-      "Next": "GroomDispatchComplete"
+      "Next": "CheckMapLaunchOutcome"
+    },
+    "CheckMapLaunchOutcome": {
+      "Type": "Choice",
+      "Comment": "config#2311: every path (MapLaunches success, AllSkipped, RecordMapLaunchFailure) converges here AFTER the end-of-SF sweep has already been attempted, so the sweep's unconditional-coverage guarantee holds regardless of which branch set this. IsPresent (not BooleanEquals — the field is absent on the two healthy paths, and referencing an absent path in a non-IsPresent rule is a States.Runtime error) routes a genuine Map-iteration failure to GroomMapLaunchFailed so the execution still terminates FAILED for Fleet-SF Watch, instead of the pre-fix behavior where reaching this point meant the failure was silently absorbed.",
+      "Choices": [
+        {
+          "Variable": "$.mapFailure",
+          "IsPresent": true,
+          "Next": "GroomMapLaunchFailed"
+        }
+      ],
+      "Default": "GroomDispatchComplete"
+    },
+    "GroomMapLaunchFailed": {
+      "Type": "Fail",
+      "Error": "GroomMapLaunchFailure",
+      "Cause": "One or more groom launch lanes failed (see $.mapFailure / the per-lane SNS alert). The end-of-SF PR sweep was still dispatched unconditionally (see $.sweep) — this execution is marked FAILED so Fleet-SF Watch alerts on the underlying lane failure."
     },
     "GroomDispatchComplete": {
       "Type": "Succeed",
-      "Comment": "Terminal success for BOTH paths (config#2201): every co-launched iteration reached its own GroomSucceeded/GroomSkipped (a Standard Map state's default ToleratedFailurePercentage=0 means ANY iteration reaching its own FailExecution fails the whole Map — and hence this whole execution — instead, the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes), OR the zero-launches AllSkipped path — and in EITHER case the end-of-SF sweep dispatch was attempted, with its outcome recorded in $.sweep (launched box, concurrent-sweep skip, kill-switch skip, or dispatched:false failure record)."
+      "Comment": "Terminal success (config#2201/config#2311): every co-launched iteration reached its own GroomSucceeded/GroomSkipped, OR the zero-launches AllSkipped path — and in EITHER case the end-of-SF sweep dispatch was attempted, with its outcome recorded in $.sweep (launched box, concurrent-sweep skip, kill-switch skip, or dispatched:false failure record). A genuine Map-iteration failure never reaches here — CheckMapLaunchOutcome routes it to GroomMapLaunchFailed instead, after the sweep still fires."
     },
     "HandleDecideFailure": {
       "Type": "Task",

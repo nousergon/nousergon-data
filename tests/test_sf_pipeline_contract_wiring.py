@@ -65,15 +65,25 @@ def test_check_fails_open_via_catch(states):
     # weekly run.
     catch = states["PipelineContractCheck"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "CheckMutexRole"  # the pipeline, not HandleFailure
+    # config#2278: still fail-open (the pipeline, not HandleFailure) — but
+    # through the visible degraded chain (flag + SNS alert); full topology
+    # in test_sf_prespend_gate_alerting.
+    assert catch["Next"] == "PipelineContractGateDegraded"
 
 
 def test_gate_halts_only_on_confirmed_violation(states):
     gate = states["PipelineContractGate"]
     assert gate["Type"] == "Choice"
     c = gate["Choices"][0]
-    assert c["Variable"] == "$.pipeline_contract_result.Payload.has_violation"
-    assert c["BooleanEquals"] is True
+    # config#2275: the dereference is IsPresent-guarded (And short-circuit)
+    # so a partial gate payload falls to Default instead of States.Runtime.
+    guard, comparison = c["And"]
+    assert guard == {
+        "Variable": "$.pipeline_contract_result.Payload.has_violation",
+        "IsPresent": True,
+    }
+    assert comparison["Variable"] == "$.pipeline_contract_result.Payload.has_violation"
+    assert comparison["BooleanEquals"] is True
     # Confirmed violation halts, but routes through the $.error normalizer
     # FIRST (not straight to HandleFailure) — see
     # test_violation_halt_normalizes_error.

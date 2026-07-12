@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
-# infrastructure/spot_data_weekly.sh — Run weekly data workloads on a spot EC2.
+# infrastructure/spot_data_weekly.sh — Launch a weekly data workload on its
+# own fresh spot EC2 (c5.large-class), run it, emit a heartbeat on success,
+# and self-terminate.
 #
-# Bundles DataPhase1 + RAGIngestion on a single spot: launches c5.large,
-# clones alpha-engine-data, runs `python weekly_collector.py --phase 1`
-# followed by `bash rag/pipelines/run_weekly_ingestion.sh`, emits a
-# heartbeat on success, and self-terminates.
+# ONE SPOT PER WORKLOAD (preflight-task-split, 2026-05-16): the weekly SF
+# (ne-weekly-freshness-pipeline) SSM-invokes this script on the launching
+# host once per data state, and each invocation launches its OWN spot for
+# exactly one workload:
+#
+#   SF state MorningEnrich → --morning-enrich-only
+#       (Saturday-morning polygon T+1 fill: weekly_collector.py --morning-enrich)
+#   SF state DataPhase1    → --phase1-only
+#       (full price-cache refresh: weekly_collector.py --phase 1)
+#   SF state RAGIngestion  → --rag-only
+#       (rag/pipelines/run_weekly_ingestion.sh)
+#
+# Each SF state polls its own spot's completion independently (Wait /
+# CheckStatus / RetryGate / Reissue loop in step_function.json), so a
+# phase1 failure no longer re-pays the ~28-min morning-enrich, and a RAG
+# failure doesn't invalidate the price data. The pre-split single-spot
+# bundle survives only as MANUAL rerun modes: --data-only (morning-enrich
+# + phase1) and the no-flag default "full" (morning-enrich + phase1 + RAG
+# on one spot) — the SF never uses them.
 #
 # Origin: moved off ae-dashboard (t3.micro, 1 GB RAM) after the 2026-04-16
 # OOM incident (features/compute.py in the DAILY code path exhausted micro
@@ -13,12 +30,6 @@
 # fragile-by-design. This spot pattern mirrors the Backtester +
 # PredictorTraining launchers so all heavy weekly compute lives on
 # fresh, self-terminating instances instead of the always-on micro.
-#
-# Bundling rationale: Phase 1 and RAG ingestion are sequential SF steps
-# that share the same repo + venv. One spot per bundle saves ~7 min of
-# bootstrap overhead and one spot request. Trade-off: any failure fails
-# both — acceptable since partial Saturday failures typically require a
-# full-pipeline rerun anyway.
 #
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 2).**
 # Communication with the spot is now via `aws ssm send-command`
@@ -35,7 +46,11 @@
 # audit.
 #
 # Usage:
-#   ./infrastructure/spot_data_weekly.sh                   # phase1 + rag
+#   ./infrastructure/spot_data_weekly.sh --morning-enrich-only  # one spot: morning enrich (SF: MorningEnrich)
+#   ./infrastructure/spot_data_weekly.sh --phase1-only          # one spot: DataPhase1 (SF: DataPhase1)
+#   ./infrastructure/spot_data_weekly.sh --rag-only             # one spot: RAG ingestion (SF: RAGIngestion)
+#   ./infrastructure/spot_data_weekly.sh --data-only            # manual rerun: morning-enrich + phase1
+#   ./infrastructure/spot_data_weekly.sh                        # manual full bundle: enrich + phase1 + rag
 #   ./infrastructure/spot_data_weekly.sh --smoke-only      # quick validation, then terminate
 #   ./infrastructure/spot_data_weekly.sh --preflight-only  # boot + DataPhase1/MorningEnrich preflight, exit 0 (NO fetch/write)
 #   ./infrastructure/spot_data_weekly.sh --rag-only --preflight-only  # boot + RAG-path preflight, exit 0 (NO fetch/write)

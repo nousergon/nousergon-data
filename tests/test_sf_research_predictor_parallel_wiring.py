@@ -87,6 +87,11 @@ _BRANCH_B_STATES = {
     "ModelZooTrainMap", "ModelZooSelect",
     "WaitForModelZoo", "CheckModelZooStatus", "ModelZooWait",
     "ExtractModelZooSelectError", "PublishModelZooFailureImmediate",
+    # config#2253 validated skip path: skip_predictor_training=true routes
+    # through a manifest-freshness HeadObject before the branch may read
+    # as succeeded (backtest-eval preset bypasses validation by design).
+    "ValidatePredictorSkipWeightsFresh", "CheckPredictorSkipWeightsFresh",
+    "PredictorSkipWeightsStale", "PredictorTrainingSkipped",
     "BranchBComplete", "BranchBFailed",
 }
 
@@ -235,10 +240,11 @@ class TestBranchAContents:
 
     def test_data_phase2_after_research_in_branch_a(self, branch_a):
         # Research success → CheckSkipDataPhase2 → DataPhase2
+        # config#2275: rules are And:[{IsPresent}, {StringEquals}] guarded.
         ok = [
             c["Next"]
             for c in branch_a["CheckResearchStatus"]["Choices"]
-            if c.get("StringEquals") == "OK"
+            if any(leaf.get("StringEquals") == "OK" for leaf in c.get("And", []))
         ]
         assert ok == ["CheckSkipDataPhase2"]
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
@@ -274,13 +280,156 @@ class TestBranchBContents:
         assert name in branch_b
 
     def test_skip_predictor_training_gate_preserved(self, branch_b):
-        c = branch_b["CheckSkipPredictorTraining"]["Choices"][0]
-        variables = {cond["Variable"] for cond in c["And"]}
-        assert variables == {"$.skip_predictor_training"}
-        # skip → branch-local completion (NOT the old CheckSkipDrift edge)
-        assert c["Next"] == "BranchBComplete"
-        assert branch_b["CheckSkipPredictorTraining"]["Default"] == (
-            "PredictorTraining"
+        """config#2253: the skip gate is now a TWO-rule Choice. Rule order
+        is load-bearing (ASL evaluates in order, first match wins):
+        rule 0 = backtest-eval preset (skip AND mode) → straight to the
+        skip terminal, NO freshness validation (the config#830 replay
+        preset's contract is 'existing artifacts, whatever their vintage');
+        rule 1 = plain skip → the manifest-freshness validation task.
+        Absent flag still defaults to PredictorTraining (scheduled runs
+        unaffected)."""
+        gate = branch_b["CheckSkipPredictorTraining"]
+        assert len(gate["Choices"]) == 2
+        preset_rule, plain_rule = gate["Choices"]
+        # Rule 0: skip + mode=backtest-eval — must come FIRST or the plain
+        # skip rule would shadow it and mid-week replays would hard-fail
+        # on a stale manifest.
+        preset_vars = {cond["Variable"] for cond in preset_rule["And"]}
+        assert preset_vars == {"$.skip_predictor_training", "$.mode"}
+        assert any(
+            cond.get("StringEquals") == "backtest-eval"
+            for cond in preset_rule["And"]
+        )
+        assert preset_rule["Next"] == "PredictorTrainingSkipped"
+        # Rule 1: plain skip → validated-skip path (present-and-true; a
+        # missing flag must never match).
+        plain_vars = {cond["Variable"] for cond in plain_rule["And"]}
+        assert plain_vars == {"$.skip_predictor_training"}
+        assert any(
+            cond.get("IsPresent") is True for cond in plain_rule["And"]
+        )
+        assert any(
+            cond.get("BooleanEquals") is True for cond in plain_rule["And"]
+        )
+        assert plain_rule["Next"] == "ValidatePredictorSkipWeightsFresh"
+        assert gate["Default"] == "PredictorTraining"
+
+    def test_validated_skip_path_wiring(self, branch_b):
+        """config#2253: the plain-skip path must VALIDATE the operator's
+        weights-are-already-live claim against the live weights manifest
+        before the branch may read as succeeded.
+
+        Surface choice is load-bearing: manifest.json is written
+        UNCONDITIONALLY by every non-dry training run (promotion-gate
+        independent), while weights/meta/archive/{date}/ is TRADING-DAY
+        keyed (config#1015 — Friday) and would NEVER match the Saturday
+        calendar $.run_date this validation compares against."""
+        v = branch_b["ValidatePredictorSkipWeightsFresh"]
+        assert v["Type"] == "Task"
+        assert v["Resource"] == "arn:aws:states:::aws-sdk:s3:headObject"
+        assert v["Parameters"]["Bucket"] == "alpha-engine-research"
+        assert v["Parameters"]["Key"] == (
+            "predictor/weights/meta/manifest.json"
+        )
+        # ResultSelector lifts the DATE part of LastModified so the Choice
+        # can do a lexicographic (== chronological for YYYY-MM-DD) compare.
+        sel = v["ResultSelector"]["manifest_last_modified_date.$"]
+        assert "States.StringSplit($.LastModified, 'T')" in sel
+        assert v["ResultPath"] == "$.predictor_skip_validation"
+        # Fail loud: any S3/serialization error is a branch failure, not a
+        # silent fall-through to either skipping OR re-training.
+        assert [c["Next"] for c in v["Catch"]] == ["BranchBFailed"]
+        assert all(c["ResultPath"] == "$.error" for c in v["Catch"])
+        assert v["Next"] == "CheckPredictorSkipWeightsFresh"
+
+    def test_validated_skip_freshness_choice(self, branch_b):
+        """manifest date >= run_date → skip terminal; stale → synthesized
+        $.error → BranchBFailed (never a silent skip onto stale weights,
+        never an implicit re-run of the 1h training spot the operator
+        asked to skip)."""
+        c = branch_b["CheckPredictorSkipWeightsFresh"]
+        assert c["Type"] == "Choice"
+        (fresh,) = c["Choices"]
+        conds = {
+            k: v for cond in fresh["And"] for k, v in cond.items()
+            if k != "Variable"
+        }
+        assert all(
+            cond["Variable"]
+            == "$.predictor_skip_validation.manifest_last_modified_date"
+            for cond in fresh["And"]
+        )
+        # Shape guard: no fleet SF consumed the aws-sdk:s3 LastModified
+        # serialization before — a non-ISO value (HTTP-date/epoch) must
+        # fail LOUD, not silently wrong-pass a lexicographic compare.
+        assert conds["StringMatches"] == "20*-*-*"
+        assert conds["StringGreaterThanEqualsPath"] == "$.run_date"
+        assert fresh["Next"] == "PredictorTrainingSkipped"
+        assert c["Default"] == "PredictorSkipWeightsStale"
+        # The stale Pass synthesizes $.error (a Choice.Default transition
+        # does not populate an error path — the config#2160 States.Runtime
+        # trap) and routes to BranchBFailed.
+        stale = branch_b["PredictorSkipWeightsStale"]
+        assert stale["Type"] == "Pass"
+        assert stale["ResultPath"] == "$.error"
+        assert stale["Parameters"]["Error"] == "PredictorSkipWeightsStale"
+        assert "$.run_date" in stale["Parameters"]["Cause.$"]
+        assert stale["Next"] == "BranchBFailed"
+
+    def test_skip_terminal_reads_as_succeeded_branch(self, branch_b):
+        """THE aggregator seam (config#2253): AggregateBranchOutcomes reads
+        ONLY $.parallel_result[1].branch_b.branch_b_status, so the skip
+        terminal must record the IDENTICAL success contract as
+        BranchBComplete — same ResultPath, same branch_b_status=OK — plus
+        an explicit skipped marker (and nothing fabricated beyond that).
+        End:true preserves the per-branch error-isolation invariant."""
+        skipped = branch_b["PredictorTrainingSkipped"]
+        assert skipped["Type"] == "Pass"
+        assert skipped["End"] is True
+        assert skipped["ResultPath"] == "$.branch_b"
+        assert skipped["Result"]["branch_b_status"] == "OK"
+        assert skipped["Result"]["skipped"] is True
+        # Exactly the success contract + the marker — nothing else.
+        assert set(skipped["Result"]) == {"branch_b_status", "skipped"}
+        # Contract equivalence with the real success terminal.
+        complete = branch_b["BranchBComplete"]
+        assert (
+            skipped["Result"]["branch_b_status"]
+            == complete["Result"]["branch_b_status"]
+        )
+        assert skipped["ResultPath"] == complete["ResultPath"]
+
+    def test_validation_head_object_key_is_iam_granted(self, branch_b):
+        """Cross-guard: the manifest key the SF HeadObjects must be granted
+        to the SF role in infrastructure/iam/alpha-engine-step-functions-
+        role.json (Sid HeadPredictorWeightsManifest) — the aws-sdk:s3 task
+        runs AS the state machine role, and a missing grant only surfaces
+        live as an AccessDenied on the recovery path (the worst time)."""
+        iam_path = (
+            _REPO_ROOT / "infrastructure" / "iam"
+            / "alpha-engine-step-functions-role.json"
+        )
+        policy = json.loads(iam_path.read_text())
+        key = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"]["Key"]
+        bucket = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"][
+            "Bucket"
+        ]
+        expected_arn = f"arn:aws:s3:::{bucket}/{key}"
+        grants = [
+            s for s in policy["Statement"]
+            if s.get("Effect") == "Allow"
+            and "s3:GetObject" in (
+                s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+            )
+            and expected_arn in (
+                s["Resource"]
+                if isinstance(s["Resource"], list) else [s["Resource"]]
+            )
+        ]
+        assert grants, (
+            f"SF role policy lacks s3:GetObject on {expected_arn} — the "
+            f"ValidatePredictorSkipWeightsFresh HeadObject would "
+            f"AccessDenied live."
         )
 
     def test_predictor_status_poll_quartet_preserved(self, branch_b):
@@ -822,10 +971,28 @@ class TestNoDanglingTargetsAnywhere:
                         f"Branch{bi} dangling: {n} -> {t}"
                     )
 
-    def test_exactly_one_end_terminal_class_per_branch(self, parallel):
+    def test_branch_terminal_sets_pinned(self, parallel):
+        """Pin the CLOSED set of End:true terminals per branch, and require
+        every terminal to record its branch status as data (the Parallel
+        error-isolation contract). Branch B gained a third terminal in
+        config#2253: PredictorTrainingSkipped (validated-skip success)."""
+        expected = [
+            ("$.branch_a", {"BranchAComplete", "BranchAFailed"}),
+            (
+                "$.branch_b",
+                {
+                    "BranchBComplete",
+                    "BranchBFailed",
+                    "PredictorTrainingSkipped",
+                },
+            ),
+        ]
         for bi, b in enumerate(parallel["Branches"]):
             ends = {
                 k for k, v in b["States"].items() if v.get("End") is True
             }
-            # Each branch has exactly its 2 Complete/Failed terminals.
-            assert len(ends) == 2, (bi, ends)
+            result_path, names = expected[bi]
+            assert ends == names, (bi, ends)
+            for k in ends:
+                assert b["States"][k]["Type"] == "Pass", (bi, k)
+                assert b["States"][k]["ResultPath"] == result_path, (bi, k)
