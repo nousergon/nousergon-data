@@ -653,13 +653,13 @@ class TestEnsureScorePerformanceSchemaIncludesStance:
         assert "stance" in cols
 
 
-# ── Canonical 21d returns + log-alpha backfill (ROADMAP L480, 2026-05-29) ──
+# ── Wide-column retirement (EPIC config#1483 Phase 4, config#1550) ──────────
 #
-# The judge outcome-IC validation correlates judge quality scores against
-# realized canonical 21d log-domain market-relative alpha. These tests pin
-# that _backfill_score_returns now populates the 21d arithmetic parity
-# columns AND log_alpha_21d (= log_return_21d - log_spy_return_21d, the
-# same definition the predictor's actual_log_alpha uses).
+# The horizon-suffixed OUTCOME columns (return_/spy_*_return/beat_spy_/
+# log_alpha_21d) are RETIRED from the write path — the canonical outcome store
+# is now the long-format score_performance_outcomes table, and every consumer
+# reads it. These tests pin that _backfill_score_returns writes ONLY the
+# non-outcome price_{h}d bookkeeping and leaves the retired outcome columns NULL.
 
 
 from collectors.signal_returns import _backfill_score_returns
@@ -721,7 +721,7 @@ def _make_21d_db(
 
 
 class TestBackfillScoreReturns21d:
-    def test_populates_21d_arithmetic_and_canonical_log_alpha(self, tmp_path):
+    def test_writes_price_only_retires_outcome_columns(self, tmp_path):
         db = str(tmp_path / "research.db")
         _make_21d_db(db, log_21d=0.0488, log_spy_21d=0.00995)
 
@@ -734,36 +734,33 @@ class TestBackfillScoreReturns21d:
                 "log_alpha_21d FROM score_performance WHERE symbol='AAPL'"
             ).fetchone()
         price_21d, return_21d, spy_21d_return, beat_spy_21d, log_alpha_21d = row
+        # Only the non-outcome price bookkeeping is written.
         assert price_21d == pytest.approx(105.0)         # 100 * (1 + 0.05)
-        assert return_21d == pytest.approx(5.0)          # stored as percent
-        assert spy_21d_return == pytest.approx(1.0)
-        assert beat_spy_21d == 1
-        # Canonical: log_alpha = log_return_21d - log_spy_return_21d
-        assert log_alpha_21d == pytest.approx(0.0488 - 0.00995, abs=1e-6)
+        # The wide OUTCOME columns are RETIRED — never written (config#1550).
+        assert return_21d is None
+        assert spy_21d_return is None
+        assert beat_spy_21d is None
+        assert log_alpha_21d is None
 
-    def test_missing_log_columns_warns_but_arithmetic_survives(self, tmp_path, caplog):
-        import logging
-
+    def test_missing_log_columns_irrelevant_to_price(self, tmp_path):
+        # log_alpha backfill retired with the wide writes → absent log columns
+        # no longer matter; price is still written from the arithmetic return.
         db = str(tmp_path / "research.db")
         _make_21d_db(db, include_log_cols=False)
 
-        with caplog.at_level(logging.WARNING, logger="collectors.signal_returns"):
-            out = _backfill_score_returns(db, dry_run=False)
+        out = _backfill_score_returns(db, dry_run=False)
         assert out["status"] == "ok"
 
         with sqlite3.connect(db) as conn:
             row = conn.execute(
-                "SELECT return_21d, log_alpha_21d FROM score_performance WHERE symbol='AAPL'"
+                "SELECT price_21d, return_21d, log_alpha_21d "
+                "FROM score_performance WHERE symbol='AAPL'"
             ).fetchone()
-        # Primary deliverable (arithmetic 21d) survives; canonical alpha NULL.
-        assert row[0] == pytest.approx(5.0)
-        assert row[1] is None
-        assert any(
-            "log_alpha_21d" in r.getMessage() for r in caplog.records
-            if r.levelno == logging.WARNING
-        ), "no-silent-fails: missing log columns must emit a WARN"
+        assert row[0] == pytest.approx(105.0)  # price still written
+        assert row[1] is None                  # outcome column retired
+        assert row[2] is None                  # log_alpha retired
 
-    def test_dry_run_does_not_write_21d(self, tmp_path):
+    def test_dry_run_does_not_write_price(self, tmp_path):
         db = str(tmp_path / "research.db")
         _make_21d_db(db)
 
@@ -771,16 +768,17 @@ class TestBackfillScoreReturns21d:
 
         with sqlite3.connect(db) as conn:
             row = conn.execute(
-                "SELECT return_21d, log_alpha_21d FROM score_performance WHERE symbol='AAPL'"
+                "SELECT price_21d, return_21d, log_alpha_21d "
+                "FROM score_performance WHERE symbol='AAPL'"
             ).fetchone()
-        assert row == (None, None)
+        assert row == (None, None, None)
 
     def test_rerun_is_noop_once_populated(self, tmp_path):
         db = str(tmp_path / "research.db")
         _make_21d_db(db)
         _backfill_score_returns(db, dry_run=False)
         out = _backfill_score_returns(db, dry_run=False)
-        # Second pass finds nothing NULL → 0 further writes.
+        # Second pass finds no NULL price_{h}d → 0 further writes.
         assert out["rows_written"] == 0
 
     def test_schema_ensure_adds_21d_columns(self, tmp_db):
