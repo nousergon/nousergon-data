@@ -13,6 +13,23 @@ rows (lineage, risk_events, residual_pct) get checked on the day they
 land — without this, a bad emission Mon-Thu wouldn't surface until
 Saturday's run.
 
+config#2326 (ports config#2276's weekly-SF health-check-honesty fix onto
+the EOD SF) changed the WAIT/CATCH shape pinned below:
+- ``WaitForDailySubstrateHealthCheck`` no longer check-once's straight to
+  ``StopTradingInstance``; it now feeds ``CheckDailySubstrateHealthCheckStatus``,
+  a poll-to-terminal-status Choice (Success -> StopTradingInstance,
+  in-flight -> DailySubstrateHealthCheckPollWait -> re-poll, terminal
+  non-Success -> SubstrateHealthCheckDegraded).
+- Both states' Catches now route through ``SubstrateHealthCheckDegraded``
+  (sets ``$.health_check_degraded``) instead of directly to
+  ``StopTradingInstance`` — but the COST-GUARD INVARIANT this file has
+  always pinned is UNCHANGED: every path still terminates at
+  ``StopTradingInstance``, never ``HandleFailure``. Degraded now ALSO
+  publishes a dedicated best-effort SNS alert
+  (``PublishSubstrateHealthCheckDegradedAlert``) before continuing, since
+  (per test_sf_notifier_totality_wiring.py's audit) the EOD SF has no
+  success-path notifier to thread the flag into.
+
 Catches regressions like:
 - Someone reroutes ``CheckEODStatus`` Success back to ``StopTradingInstance``
   and silently drops the substrate check.
@@ -25,6 +42,8 @@ Catches regressions like:
   up overnight (cost overrun).
 - Someone targets the trading EC2 instead of the dashboard EC2 (the
   trading EC2 doesn't have the dashboard repo or lib pin installed).
+- Someone reintroduces a check-once poll (the config#2276/config#2326
+  masking-Catch defect class) or a runtime ``pip install``.
 """
 
 from __future__ import annotations
@@ -84,8 +103,14 @@ class TestChainOrdering:
             "WaitForDailySubstrateHealthCheck"
         )
 
-    def test_wait_for_substrate_routes_to_stop_trading_instance(self, states):
-        assert states["WaitForDailySubstrateHealthCheck"]["Next"] == "StopTradingInstance"
+    def test_wait_for_substrate_routes_to_status_check(self, states):
+        """config#2326: check-once fix — WaitForDailySubstrateHealthCheck no
+        longer chains directly to StopTradingInstance; it feeds the
+        terminal-status Choice so an in-flight/hung command is polled to
+        completion instead of being treated as done on the first read."""
+        assert states["WaitForDailySubstrateHealthCheck"]["Next"] == (
+            "CheckDailySubstrateHealthCheckStatus"
+        )
 
 
 class TestCatchSemantics:
@@ -96,23 +121,140 @@ class TestCatchSemantics:
     row-level failures; the SF Catch only fires on infra-level failures
     (SSM unreachable, EC2 down). Either way, the failure path must
     terminate at StopTradingInstance, not HandleFailure.
+
+    config#2326: the Catches no longer jump DIRECTLY to StopTradingInstance
+    (that was the masking-Catch defect config#2276 closed on the weekly SF)
+    — they now route through SubstrateHealthCheckDegraded, which sets
+    $.health_check_degraded and publishes a best-effort alert before still
+    continuing to StopTradingInstance. The cost-guard invariant (must reach
+    StopTradingInstance, must NOT reach HandleFailure) is preserved; only
+    the masking (silent, unsignaled continue) is removed.
     """
 
-    def test_substrate_check_catch_continues_to_stop(self, states):
+    def test_substrate_check_catch_routes_through_degraded(self, states):
         catches = states["DailySubstrateHealthCheck"]["Catch"]
         assert len(catches) >= 1
         for c in catches:
-            assert c["Next"] == "StopTradingInstance", (
-                f"Substrate Catch must continue to StopTradingInstance, not "
-                f"{c['Next']!r} — letting the trading EC2 run overnight on a "
-                f"substrate-check infra failure is a cost regression."
+            assert c["Next"] == "SubstrateHealthCheckDegraded", (
+                f"Substrate Catch must route through SubstrateHealthCheckDegraded "
+                f"(sets health_check_degraded + alerts), not {c['Next']!r} — a "
+                "direct jump to StopTradingInstance is the silent-skip masking "
+                "config#2326 (mirroring config#2276) closed."
             )
 
-    def test_substrate_wait_catch_continues_to_stop(self, states):
+    def test_substrate_wait_catch_routes_through_degraded(self, states):
         catches = states["WaitForDailySubstrateHealthCheck"]["Catch"]
         assert len(catches) >= 1
         for c in catches:
-            assert c["Next"] == "StopTradingInstance"
+            assert c["Next"] == "SubstrateHealthCheckDegraded"
+
+    def test_degraded_pass_still_terminates_at_stop_trading_instance(self, states):
+        """The degraded path must still reach StopTradingInstance (via the
+        alert publish) — visibility must never come at the cost of delaying
+        or skipping the cost-guard shutdown."""
+        degraded = states["SubstrateHealthCheckDegraded"]
+        assert degraded["Type"] == "Pass"
+        assert degraded["Result"] is True
+        assert degraded["ResultPath"] == "$.health_check_degraded"
+        alert = states[degraded["Next"]]
+        assert alert["Type"] == "Task"
+        assert alert["Resource"] == "arn:aws:states:::sns:publish"
+        assert alert["Next"] == "StopTradingInstance"
+        # The alert's own Catch must ALSO continue to StopTradingInstance —
+        # a best-effort notifier must never be able to block the cost-guard.
+        (alert_catch,) = alert["Catch"]
+        assert alert_catch["ErrorEquals"] == ["States.ALL"]
+        assert alert_catch["Next"] == "StopTradingInstance"
+
+    def test_degraded_never_reaches_handle_failure(self, states):
+        """The exact failure mode a careless port could introduce: routing
+        the new degraded/alert states into HandleFailure instead of
+        StopTradingInstance, which would delay/block the cost-guard."""
+        for name in (
+            "SubstrateHealthCheckDegraded",
+            "PublishSubstrateHealthCheckDegradedAlert",
+        ):
+            st = states[name]
+            assert st.get("Next") != "HandleFailure"
+            for c in st.get("Catch", []) or []:
+                assert c.get("Next") != "HandleFailure"
+
+
+class TestPollToTerminalStatus:
+    """config#2326: the check-once poll fix — mirrors the weekly SF's
+    CheckSaturdayHealthCheckStatus / CheckSubstrateHealthCheckStatus shape
+    (config#2276) and this repo's own CheckMorningEnrichStatus idiom."""
+
+    def test_status_choice_success_goes_to_stop_trading_instance(self, states):
+        choice = states["CheckDailySubstrateHealthCheckStatus"]
+        assert choice["Type"] == "Choice"
+        success = next(
+            c for c in choice["Choices"] if c.get("StringEquals") == "Success"
+        )
+        assert success["Variable"] == "$.substrate_check_poll.Status"
+        assert success["Next"] == "StopTradingInstance"
+
+    def test_status_choice_loops_on_exactly_in_flight_statuses(self, states):
+        choice = states["CheckDailySubstrateHealthCheckStatus"]
+        in_flight = next(c for c in choice["Choices"] if "Or" in c)
+        looped = {op["StringEquals"] for op in in_flight["Or"]}
+        assert looped == {"InProgress", "Pending", "Delayed"}
+        assert in_flight["Next"] == "DailySubstrateHealthCheckPollWait"
+
+    def test_status_choice_default_is_degraded(self, states):
+        """The drill edge: a terminal non-Success (Failed / TimedOut /
+        Cancelled) must land on the degraded Pass, not fall through to
+        StopTradingInstance un-signaled."""
+        assert states["CheckDailySubstrateHealthCheckStatus"]["Default"] == (
+            "SubstrateHealthCheckDegraded"
+        )
+
+    def test_poll_wait_loops_back_to_wait_state(self, states):
+        wait = states["DailySubstrateHealthCheckPollWait"]
+        assert wait["Type"] == "Wait"
+        assert wait["Next"] == "WaitForDailySubstrateHealthCheck"
+
+
+class TestNoRuntimePipInstall:
+    """config#2326: deps come from the dashboard box's deploy-time venv sync
+    (crucible-dashboard infrastructure/deploy-on-merge.sh pip-installs on
+    requirements.txt diff; nousergon-lib is tag-pinned so a lib bump always
+    diffs requirements.txt) — same rationale test_sf_health_check_honesty_wiring.py
+    pins for the weekly SF's WeeklySubstrateHealthCheck."""
+
+    def test_no_pip_install_in_substrate_check_commands(self, states):
+        cmds = states["DailySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands"]
+        assert not any("pip install" in cmd for cmd in cmds), (
+            "runtime pip install must not reappear in DailySubstrateHealthCheck"
+        )
+
+    def test_no_pip_install_anywhere_in_eod_definition(self, sf):
+        def _commands(states):
+            for name, st in states.items():
+                cmds = (st.get("Parameters", {}) or {}).get("Parameters", {}).get(
+                    "commands"
+                )
+                if cmds:
+                    yield name, cmds
+
+        offenders = [
+            name for name, cmds in _commands(sf["States"])
+            if "pip install" in " ".join(cmds)
+        ]
+        assert not offenders, f"runtime pip install in: {offenders}"
+
+
+class TestTimeoutConvention:
+    """config#2326 convention (mirrors config#2276): inner executionTimeout =
+    script budget; SSM Parameters.TimeoutSeconds = 60 uniform (delivery
+    timeout); outer Task TimeoutSeconds = inner + 30."""
+
+    def test_timeout_triple(self, states):
+        st = states["DailySubstrateHealthCheck"]
+        ssm_params = st["Parameters"]["Parameters"]
+        inner = int(ssm_params["executionTimeout"][0])
+        assert st["Parameters"]["TimeoutSeconds"] == 60
+        assert st["TimeoutSeconds"] == inner + 30
 
 
 class TestCommandShape:
