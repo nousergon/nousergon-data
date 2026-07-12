@@ -45,7 +45,7 @@ def test_discovers_all_four_orchestrated_state_machines(cd):
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
-        "alpha-engine-groom-pipeline",
+        "alpha-engine-groom-dispatch",
     }
 
 
@@ -81,7 +81,7 @@ def test_groom_sf_expects_no_logging(cd):
     logging arg on purpose — this guard's codified expectation must match
     that, not silently assume logging is wanted everywhere."""
     entries = {e["sf_name"]: e for e in cd._discover_expected_logging_configs()}
-    groom = entries["alpha-engine-groom-pipeline"]
+    groom = entries["alpha-engine-groom-dispatch"]
     assert groom["expected_level"] == "OFF"
 
 
@@ -204,7 +204,7 @@ def test_check_sf_missing_state_machine_on_aws(cd):
 
 def test_check_sf_groom_no_drift_when_live_is_off(cd):
     entry = {
-        "sf_name": "alpha-engine-groom-pipeline",
+        "sf_name": "alpha-engine-groom-dispatch",
         "source_file": _REPO_ROOT / "infrastructure" / "deploy-infrastructure.sh",
         "expected_level": "OFF",
         "expected_include_execution_data": None,
