@@ -58,7 +58,15 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Scratch dirs + validate handler syntax -----------------------------
+# PKG and TEST_DEPS are both created up front (mirrors ci-watch-dispatcher/
+# deploy.sh) so ONE trap covers both — a pytest-install failure below still
+# cleans up.
+
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PKG=$(mktemp -d)
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
 python3 -c "
 import ast
@@ -67,16 +75,28 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# The gate now runs on bare CI runners (deploy-saturday-sf-watch-dispatcher.yml,
+# config#2295), not just operator laptops where pytest/boto3 were ambient — so
+# it must self-provision its own test deps or it dies "No module named pytest"
+# (2026-07-12 incident; same class the fleet already hit 2026-07-02/-04 and
+# fixed the same way in ci-watch-dispatcher, spot-orphan-reaper, groom-liveness-
+# probe, et al). test_handler.py does a REAL `import index` (no sys.modules
+# stubs), which pulls boto3, the local flow_doctor_telegram (found via the
+# test's sys.path parent insert), and nousergon_lib.flow_doctor_fleet. pytest +
+# boto3 + the pinned nousergon-lib + krepis are installed into a scratch
+# TEST_DEPS dir — NOT the caller's global site-packages, not bundled into the
+# Lambda zip.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  echo "Installing pytest + boto3 + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3 "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
   echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
-
-LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
