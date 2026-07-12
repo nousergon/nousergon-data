@@ -493,7 +493,7 @@
             "for r in $REPOS; do d=/home/ec2-user/$r; br=$(sudo -u ec2-user git -C $d rev-parse --abbrev-ref HEAD); h=$(sudo -u ec2-user git -C $d rev-parse HEAD); u=$(sudo -u ec2-user git -C $d rev-parse origin/main); if [ \"$br\" != \"main\" ] || [ \"$h\" != \"$u\" ]; then echo \"DRIFT $r branch=$br head=$h upstream=$u\"; drift=1; fi; done",
             "if [ $drift -eq 1 ]; then echo 'SELF-HEAL: ownership reclaim + reset to origin/main'; for r in $REPOS; do d=/home/ec2-user/$r; chown -R ec2-user:ec2-user $d; git_retry -C $d checkout -f main; git_retry -C $d reset --hard origin/main; done; fi",
             "for r in $REPOS; do d=/home/ec2-user/$r; br=$(sudo -u ec2-user git -C $d rev-parse --abbrev-ref HEAD); h=$(sudo -u ec2-user git -C $d rev-parse HEAD); u=$(sudo -u ec2-user git -C $d rev-parse origin/main); if [ \"$br\" != \"main\" ] || [ \"$h\" != \"$u\" ]; then echo \"CODE-STALE-AFTER-HEAL $r branch=$br head=$h upstream=$u\"; exit 1; fi; done",
-            "cd /home/ec2-user/alpha-engine && sudo -u ec2-user .venv/bin/python -c \"import ast; [ast.parse(open(f).read()) for f in ('executor/main.py','executor/daemon.py','executor/eod_reconcile.py')]\"",
+            "cd /home/ec2-user/alpha-engine && sudo -u ec2-user .venv/bin/python -c \"import executor.main, executor.daemon, executor.eod_reconcile\"",
             "sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'",
             "echo CODE_FRESH"
           ],
