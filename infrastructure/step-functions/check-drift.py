@@ -30,7 +30,7 @@ not a hypothetical one):
     (`ne-postclose-trading-pipeline`) is NOT in CloudFormation (script-
     managed); its `EOD_LOGGING_CONFIG` literal there is the source of truth,
     passed explicitly on every `update-state-machine` / `create-state-machine`
-    call. The backlog-groom SF (`alpha-engine-groom-pipeline`) is also
+    call. The backlog-groom SF (`alpha-engine-groom-dispatch`) is also
     script-managed but its `update_or_create` call deliberately omits a
     logging arg ("preserving its current no-logging behavior exactly", per
     that script's comment) — so this guard's codified expectation for groom
