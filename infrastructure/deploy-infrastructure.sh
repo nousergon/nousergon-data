@@ -134,7 +134,7 @@ echo "==> Updating Step Function definitions..."
 SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
-GROOM_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-pipeline"
+GROOM_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-dispatch"
 # Shared SF execution role (the CFN StepFunctionsRoleArn default; all three
 # orchestration SFs run under it). Used only for the EOD create-if-absent path.
 SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-step-functions-role"
@@ -218,7 +218,12 @@ DAILY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline" "$SAT_LOGGING_CONFIG"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline" "$DAILY_LOGGING_CONFIG"
 update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline" "$EOD_LOGGING_CONFIG"
-update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-pipeline" "Backlog groom pipeline"
+# CORRECTED 2026-07-12: was alpha-engine-groom-pipeline (the OLD name) — the EventBridge
+# Scheduler targets alpha-engine-groom-dispatch (created by the scheduled-groom-dispatcher
+# deploy.sh --bootstrap). Every deploy between config#2129 (2026-07-01) and this fix was
+# updating the orphaned groom-pipeline name instead of the live groom-dispatch, which is
+# why PRs #761 and #763's SF definition fixes had zero live effect on actual groom runs.
+update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Backlog groom dispatch"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""
