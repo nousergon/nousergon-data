@@ -27,7 +27,12 @@ upload in ``for prefix in price_cache_write_prefixes(s3_prefix): ...``.
 
 from __future__ import annotations
 
+import json
+import logging
+from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Wave 3 PR4 (cutover, DONE) — ``reference/price_cache/`` is the sole write +
 # read home. ``PRICE_CACHE_LEGACY_PREFIX`` is retained only as the
@@ -37,6 +42,17 @@ from typing import Any
 # ``aws s3 rm --recursive s3://alpha-engine-research/predictor/price_cache/``.
 PRICE_CACHE_LEGACY_PREFIX = "predictor/price_cache/"
 PRICE_CACHE_NEW_PREFIX = "reference/price_cache/"
+
+# config#2350 — the per-ticker ``reference/price_cache/`` tree is variable
+# cardinality (needs ``list_prefix_recent``, not in the freshness monitor's
+# v0.40.0 substrate) so it stays grandfathered in ARTIFACT_REGISTRY.yaml, but
+# a stale week should still trip the monitor. Mirrors the
+# ``feature_store_freshness_sentinel`` pattern (config#1787, Brian's
+# 2026-07-08 Option-B ruling): a small, UNCONDITIONAL fixed-key S3 marker
+# that ``nousergon_lib.artifact_freshness``'s ordinary S3 ArtifactSpec probe
+# (HEAD/LIST + recency, zero new backend code) can watch in place of the
+# variable-cardinality prefix itself.
+PRICE_CACHE_FRESHNESS_SENTINEL_KEY = "reference/price_cache/_freshness.json"
 
 
 def price_cache_write_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[str]:
@@ -146,10 +162,44 @@ def list_price_cache_keys(
     return out
 
 
+def write_price_cache_freshness_sentinel(s3: Any, bucket: str, *, writer: str) -> dict:
+    """Write the price-cache freshness sentinel (config#2350).
+
+    Best-effort: any S3 write failure is logged at WARN and swallowed — the
+    sentinel is an observability nicety for the freshness monitor, not a
+    load-bearing part of the weekly collector run, so a sentinel-write
+    failure must never fail (or even affect) a run that already completed
+    its real price-cache writes. Mirrors
+    ``builders.daily_append._write_feature_store_freshness_sentinel``.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "writer": writer,
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=PRICE_CACHE_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(
+            "Wrote price-cache freshness sentinel to s3://%s/%s",
+            bucket, PRICE_CACHE_FRESHNESS_SENTINEL_KEY,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Price-cache freshness sentinel write FAILED (non-fatal, OBSERVE): %s", exc,
+        )
+    return sentinel
+
+
 __all__ = [
     "PRICE_CACHE_LEGACY_PREFIX",
     "PRICE_CACHE_NEW_PREFIX",
+    "PRICE_CACHE_FRESHNESS_SENTINEL_KEY",
     "price_cache_write_prefixes",
     "price_cache_read_prefixes",
     "list_price_cache_keys",
+    "write_price_cache_freshness_sentinel",
 ]
