@@ -75,8 +75,7 @@ run() {
 # ----- 0. Scratch dirs + validate handler syntax -----------------------------
 
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
@@ -88,12 +87,8 @@ python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print(
 # `krepis.usage_pacing` are REAL; requirements.txt deliberately omits boto3
 # (Lambda runtime provides it), so install both explicitly here (mirrors
 # groom-liveness-probe/deploy.sh).
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest + boto3 + krepis into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3 "krepis>=0.10.2"
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3 "krepis>=0.10.2"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
