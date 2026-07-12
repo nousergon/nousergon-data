@@ -54,6 +54,12 @@ jobs:
       # another's stubbed-boto3-in-sys.modules test process. The changelog pair
       # above is intentionally excluded here (zero deps, already covered).
       - name: Run ALL lambda handler tests (glob-derived, per-lambda deps)
+        # config#2381: this pre-merge glob and every post-merge deploy.sh gate
+        # now delegate to the SAME _shared/run_handler_tests.sh, so the two can
+        # never re-drift into the naive no-install form (config#2295). ci passes
+        # `-r requirements.txt` (the config#1759 superset-source-of-truth model);
+        # deploy scripts pass a minimal explicit dep set — both share the helper's
+        # provision-then-run mechanism.
         env:
           # ssm-liveness-poller/index.py (and any future handler) calls
           # boto3.client(...) at MODULE SCOPE with no explicit region. Lambdas
@@ -69,6 +75,7 @@ jobs:
         run: |
           set -uo pipefail
           shopt -s nullglob
+          source infrastructure/lambdas/_shared/run_handler_tests.sh
           fail=0
           for t in infrastructure/lambdas/*/test_handler.py; do
             d="$(dirname "$t")"
@@ -76,15 +83,13 @@ jobs:
               */changelog-incident-mirror|*/changelog-cloudwatch-mirror)
                 continue ;;
             esac
-            deps="$(mktemp -d)"
             echo "::group::$t"
-            pip install --quiet --target "$deps" pytest
             if [ -f "$d/requirements.txt" ]; then
-              pip install --quiet --target "$deps" -r "$d/requirements.txt"
+              run_handler_tests "$d" -r "$d/requirements.txt" || fail=1
+            else
+              run_handler_tests "$d" || fail=1
             fi
-            PYTHONPATH="$deps" python3 -m pytest "$t" -q || fail=1
             echo "::endgroup::"
-            rm -rf "$deps"
           done
           exit $fail
 

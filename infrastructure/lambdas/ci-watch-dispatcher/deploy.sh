@@ -78,14 +78,12 @@ run() {
   fi
 }
 
-# ----- 0. Scratch dirs + validate handler syntax -----------------------------
-# PKG and TEST_DEPS are both created up front (mirrors scheduled-groom-
-# dispatcher/deploy.sh) so ONE trap covers both — a pytest-install failure
-# below still cleans up.
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
 
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast
@@ -97,16 +95,12 @@ print('index.py syntax OK')
 # ----- 0b. Preflight handler unit tests --------------------------------------
 # Hermetic for AWS: boto3 + nousergon_lib.ec2_spot are stubbed in sys.modules
 # before `import index` (see test_handler.py). The pinned nousergon-lib +
-# krepis are installed for real into a scratch TEST_DEPS dir — NOT the
+# krepis are installed for real by the shared gate into its own scratch dir — NOT the
 # caller's global site-packages, not bundled into the Lambda zip.
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  echo "Installing pytest + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
