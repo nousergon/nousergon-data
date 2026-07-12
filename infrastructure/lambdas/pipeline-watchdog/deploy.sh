@@ -65,10 +65,11 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# Delegates to the one _shared/run_handler_tests.sh so this gate can never
+# re-drift into the naive no-install `python3 -m pytest` form (config#2295).
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 

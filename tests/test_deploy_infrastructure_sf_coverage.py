@@ -122,7 +122,12 @@ def _sf_names_deployed_by_script() -> set[str]:
     """
     script = _DEPLOY.read_text()
     return set(
-        re.findall(r"stateMachine:((?:alpha-engine|ne)-[a-z0-9-]+pipeline)", script)
+        # Match BOTH pipeline names (ne-*-pipeline) and the groom-dispatch SF
+        # (alpha-engine-groom-dispatch). The regex was originally [a-z0-9-]+pipeline
+        # to match all pipeline-named SFs; alpha-engine-groom-dispatch is the only
+        # orchestration SF that doesn't use the -pipeline suffix. If a future SF
+        # joins it, add an alternation here.
+        re.findall(r"stateMachine:(alpha-engine-groom-dispatch|(?:alpha-engine|ne)-[a-z0-9-]+pipeline)", script)
     )
 
 
