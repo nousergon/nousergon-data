@@ -11,8 +11,9 @@ other); a post-launch SSM-send failure terminates the box and returns
 launched:false; a malformed event returns launched:false rather than raising;
 the kill-switch short-circuit; and the config#2267 launch-path hardening — a
 failed concurrency probe launches WITH dedupe_degraded:true recorded
-(site 1), and the load-bearing discriminator tag write is retried then
-terminate-and-fail on final failure (site 2).
+(site 1), and the load-bearing discriminator tags ride the RunInstances
+launch call ATOMICALLY via extra_tags (site 2 root fix, config#2292) — the
+PR758 post-launch create_tags bounded-retry/terminate path is gone entirely.
 """
 
 from __future__ import annotations
@@ -54,12 +55,8 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
-    def __init__(self, running_instances=None, create_tags_failures=0):
+    def __init__(self, running_instances=None):
         self.terminated = []
-        self.tags_created = []
-        self.create_tags_attempts = 0
-        # First N create_tags calls raise (config#2267 site 2 retry tests).
-        self._create_tags_failures = create_tags_failures
         # {(repo, sha) -> [instance_ids]} already "live" for the concurrency
         # guard's describe_instances check to find.
         self._running_instances = dict(running_instances or {})
@@ -70,13 +67,6 @@ class _FakeEc2:
     def terminate_instances(self, InstanceIds):  # noqa: N803 — boto3 kwarg name
         self.terminated.extend(InstanceIds)
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
-
-    def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
-        self.create_tags_attempts += 1
-        if self.create_tags_attempts <= self._create_tags_failures:
-            raise RuntimeError(f"CreateTags throttled (attempt {self.create_tags_attempts})")
-        self.tags_created.append((Resources, Tags))
-        return {}
 
     def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
         by_name = {f["Name"]: f["Values"] for f in Filters}
@@ -98,15 +88,11 @@ class _FakeSsm:
         return {"Command": {"CommandId": "cmd-123"}}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None,
-          create_tags_failures=0):
-    # config#2267 site 2 retry loop sleeps between attempts — zero it out.
-    monkeypatch.setenv("CI_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "0")
+def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
-    ec2 = _FakeEc2(running_instances=running_instances,
-                   create_tags_failures=create_tags_failures)
+    ec2 = _FakeEc2(running_instances=running_instances)
     clients = {"ec2": ec2, "ssm": ssm}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
@@ -171,6 +157,7 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
         calls["spot"] = kw.get("spot")
         calls["profile"] = kw.get("iam_instance_profile")
         calls["tag_name"] = kw.get("tag_name")
+        calls["extra_tags"] = kw.get("extra_tags")
         return "i-abc"
 
     idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
@@ -184,11 +171,14 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     assert calls["spot"] is True
     assert calls["profile"] == "alpha-engine-ci-watch-executor-profile"
     assert calls["tag_name"] == "alpha-engine-ci-watch-spot"
-    # The instance is tagged with its repo+sha for the concurrency guard.
-    assert idx._test_ec2.tags_created == [
-        (["i-abc"], [{"Key": "ci-watch-repo", "Value": "nousergon/alpha-engine-config"},
-                     {"Key": "ci-watch-sha", "Value": "abc1234def5678900000000000000000000abcd"}])
-    ]
+    # config#2292 root fix: the repo+sha discriminator tags ride the SAME
+    # RunInstances call as the launch itself (extra_tags), not a separate
+    # post-launch create_tags call.
+    assert calls["extra_tags"] == {
+        "ci-watch-repo": "nousergon/alpha-engine-config",
+        "ci-watch-sha": "abc1234def5678900000000000000000000abcd",
+    }
+    assert idx._test_ec2.terminated == []
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
     # ci_watch_spot_bootstrap.sh (alpha-engine-config) takes its CI fields as
@@ -346,41 +336,22 @@ def test_probe_failure_launches_with_dedupe_degraded_recorded(monkeypatch):
     assert "dedupe_probe_error" not in out2
 
 
-def test_transient_tag_write_failure_is_retried_then_launch_succeeds(monkeypatch):
-    """config#2267 site 2: create_tags failing twice then succeeding on the
-    third (final) attempt keeps the dispatch alive — the tags land."""
+def test_discriminator_tags_ride_the_launch_call_not_a_separate_create_tags(monkeypatch):
+    """config#2292 root fix for config#2267 site 2: the (repo, sha)
+    discriminator tags are passed to spot_dispatch.launch_with_fallback as
+    extra_tags — merged into krepis.ec2_spot.launch's RunInstances
+    TagSpecifications — so there is no separate post-launch create_tags call
+    left to retry or fail. A launch that succeeds is a fully-tagged launch,
+    unconditionally; no ec2.create_tags call happens at all."""
     idx = _load(
-        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-retagged",  # noqa: E731
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-atomic",  # noqa: E731
         env={"CI_WATCH_DISPATCH_ENABLED": "true"},
-        create_tags_failures=2,
     )
     out = idx.handler(_event(), None)
     assert out["launched"] is True
-    assert idx._test_ec2.create_tags_attempts == 3
-    assert idx._test_ec2.tags_created  # third attempt landed the tags
+    assert out["instance_id"] == "i-atomic"
     assert idx._test_ec2.terminated == []
-
-
-def test_persistent_tag_write_failure_terminates_box_and_fails_dispatch(monkeypatch):
-    """config#2267 site 2: the (repo, sha) discriminator tags are
-    LOAD-BEARING — after the bounded retry is exhausted the box is
-    TERMINATED (it is invisible to the dedupe guard and the orphan-reaper's
-    completion check) and the dispatch fails loudly with a clean
-    launched:false."""
-    idx = _load(
-        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-untaggable",  # noqa: E731
-        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
-        create_tags_failures=99,
-    )
-    out = idx.handler(_event(), None)
-    assert out["launched"] is False
-    assert out["reason"] == "tag_write_failed"
-    assert out["instance_id"] == "i-untaggable"
-    assert "CreateTags throttled" in out["error"]
-    assert idx._test_ec2.create_tags_attempts == idx.TAG_WRITE_ATTEMPTS
-    # The untagged box was terminated, and no bootstrap was ever sent to it.
-    assert idx._test_ec2.terminated == ["i-untaggable"]
-    assert idx._test_ssm.sent == []
+    assert not hasattr(idx._test_ec2, "create_tags_attempts")
 
 
 def test_post_launch_ssm_failure_terminates_instance_returns_clean_false(monkeypatch):
@@ -448,20 +419,24 @@ def test_drill_synthesizes_isolated_identity_and_launches(monkeypatch):
     DRILL_REPO + per-day sha — plus the sf-watch-drill discriminator tag."""
     from datetime import datetime, timezone
 
-    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    calls = {}
+
+    def _launch(types_, subnets, **kw):
+        calls["extra_tags"] = kw.get("extra_tags")
+        return "i-stub"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
     out = idx.handler({"is_drill": "true"}, None)
     expected_sha = idx._drill_sha(datetime.now(timezone.utc))
     assert out["launched"] is True
     assert out["is_drill"] is True
     assert out["repo"] == idx.DRILL_REPO == "nousergon/ci-watch-drill"
     assert out["sha"] == expected_sha
-    assert idx._test_ec2.tags_created == [
-        (["i-stub"], [
-            {"Key": "ci-watch-repo", "Value": idx.DRILL_REPO},
-            {"Key": "ci-watch-sha", "Value": expected_sha},
-            {"Key": "sf-watch-drill", "Value": "true"},
-        ])
-    ]
+    assert calls["extra_tags"] == {
+        "ci-watch-repo": idx.DRILL_REPO,
+        "ci-watch-sha": expected_sha,
+        "sf-watch-drill": "true",
+    }
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert '--is-drill "true"' in cmd
     assert f'--ci-repo "{idx.DRILL_REPO}"' in cmd
@@ -531,11 +506,16 @@ def test_malformed_is_drill_returns_clean_false(monkeypatch):
 
 
 def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch):
-    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    calls = {}
+
+    def _launch(types_, subnets, **kw):
+        calls["extra_tags"] = kw.get("extra_tags")
+        return "i-stub"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
     out = idx.handler(_event(), None)
     assert out["launched"] is True
     assert out["is_drill"] is False
-    (_, tags), = idx._test_ec2.tags_created
-    assert all(t["Key"] != "sf-watch-drill" for t in tags)
+    assert "sf-watch-drill" not in calls["extra_tags"]
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert '--is-drill "false"' in cmd
