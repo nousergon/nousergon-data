@@ -58,7 +58,14 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Scratch dirs + validate handler syntax -----------------------------
+# PKG and TEST_DEPS are both created up front (mirrors sf-watch-spot-dispatcher/
+# scheduled-groom-dispatcher/deploy.sh) so ONE trap covers both — a
+# pytest-install failure below still cleans up.
+
+PKG=$(mktemp -d)
+TEST_DEPS=$(mktemp -d)
+trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
 
 python3 -c "
 import ast
@@ -67,16 +74,23 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# Hermetic for AWS: boto3 + nousergon-lib are stubbed in sys.modules before
+# `import index` (see test_handler.py). The pinned nousergon-lib + krepis are
+# installed for real into a scratch TEST_DEPS dir — NOT the caller's global
+# site-packages, not bundled into the Lambda zip.
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+  echo "Installing pytest + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
   echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
+  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
