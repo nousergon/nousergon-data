@@ -489,6 +489,17 @@ class TestEODSFTopLevelFieldsClosed:
             "substrate_check_error",
             "substrate_check_poll",
             "substrate_check_result",
+            # config#2326: poll-to-terminal-status honesty fix (ports
+            # config#2276's weekly-SF pattern) — SubstrateHealthCheckDegraded
+            # sets $.health_check_degraded (SF-controlled boolean, shared name
+            # with the weekly SF's flag though the two SFs have no notifier in
+            # common); PublishSubstrateHealthCheckDegradedAlert (the EOD SF's
+            # dedicated best-effort degraded-alert notifier, since EOD has no
+            # success-path notifier to thread the flag into) emits its own
+            # ResultPath + fail-open Catch ResultPath.
+            "health_check_degraded",
+            "substrate_health_check_degraded_notify",
+            "substrate_health_check_degraded_notify_error",
             "trading_instance_id",
             # L274 SF MutualExclusionGuard (2026-05-27) — CheckMutexRole
             # reads $.pipeline_role; AcquireMutex emits $.mutex_result on
