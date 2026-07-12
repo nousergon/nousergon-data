@@ -232,6 +232,46 @@ def test_reconcile_no_overlap_is_unexplained():
     assert rec.explained is False
 
 
+def test_reconcile_anchor_rebase_absorbs_differing_normalization_epoch():
+    """config#1455: a split/spinoff name where the two feeds agree on every
+    RETURN but differ on absolute LEVEL (different back-adjustment epoch)
+    must reconcile within-tol, not false-fail on the raw level gap."""
+    idx = pd.bdate_range("2026-06-01", periods=6)
+    new = pd.Series([50.0, 50.0, 55.0, 55.0, 60.5, 60.5], index=idx)
+    # Same period-over-period returns as `new`, but rebased onto a different
+    # absolute epoch (2x) — exactly what differing normalization conventions
+    # produce for a name with a stock split in its history.
+    old = new * 2.0
+    rec = reconcile_total_return("X", new, old, rel_tol=0.001)
+    assert rec.status == "within_tol"
+    assert rec.explained is True
+    assert rec.max_rel_dev == pytest.approx(0.0, abs=1e-9)
+
+
+def test_reconcile_anchor_rebase_still_catches_genuine_return_divergence():
+    """A real per-date return disagreement (not just an epoch offset) must
+    still fail loud after anchor-rebasing — the fix must not mask real bugs."""
+    idx = pd.bdate_range("2026-06-01", periods=6)
+    new = pd.Series([50.0, 50.0, 55.0, 55.0, 60.5, 60.5], index=idx)
+    old = new * 2.0
+    old.iloc[4:] = old.iloc[4:] * 1.10  # genuine 10% divergence from idx[4] on
+    rec = reconcile_total_return("X", new, old, rel_tol=0.02)
+    assert rec.status == "out_of_tol"
+    assert rec.explained is False
+    assert rec.max_rel_dev > 0.02
+
+
+def test_reconcile_degenerate_zero_anchor_is_unexplained():
+    """A zero/degenerate anchor date can't be rebased against — fail loud
+    rather than silently falling back to a raw-level comparison."""
+    idx = pd.bdate_range("2026-06-01", periods=4)
+    new = pd.Series([0.0, 50.0, 50.0, 50.0], index=idx)
+    old = pd.Series([50.0, 50.0, 50.0, 50.0], index=idx)
+    rec = reconcile_total_return("X", new, old, rel_tol=0.02)
+    assert rec.status == "no_overlap"
+    assert rec.explained is False
+
+
 # ── orchestration: scratch-only writes, idempotency, fail-loud ───────────────
 
 

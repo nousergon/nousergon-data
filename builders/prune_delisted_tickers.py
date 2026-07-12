@@ -1,5 +1,23 @@
 """builders/prune_delisted_tickers.py — orchestrated delisted-ticker cleanup.
 
+SURVIVORSHIP-FREE RETENTION (config#1943, Leg 3): a confirmed delisting is NO
+LONGER hard-deleted. Its FULL OHLCV history + as-of-membership metadata is first
+MOVED into the separate ``delisted_history`` ArcticDB library (retention store),
+and ONLY on a successful retention write is the symbol removed from the live
+``universe`` library. This stops the destruction of delisted price history that
+was the dominant survivorship-bias term (~1-4%/yr overstatement) — a
+point-in-time backtest universe can now be reconstructed from the retention
+store. If the retention write FAILS, the symbol is NOT deleted from ``universe``
+this pass (fail-safe: never lose data). Retention is idempotent — re-running the
+pruner overwrites the same ``delisted_history`` record in place rather than
+duplicating it. The separate-library choice (over an in-``universe`` "delisted"
+flag) keeps every live-trading consumer of ``universe`` unchanged: they still see
+only tradable names and never learn a flag. See
+``store.arctic_store.get_delisted_history_lib`` for the record schema/contract.
+Backfilling already-pruned names and the backtester's consumption of this store
+are SEPARATE follow-on legs (config#1942 / #1943 dependents) — this builder only
+establishes the retention store and stops destroying history going forward.
+
 Before any deletion, RENAME-triggered migration runs (corporate-actions PR6,
 config#1433): a candidate going missing may be a 1:1 ticker RENAME, not a
 delisting. Each candidate is checked against polygon's ticker-events API; a
@@ -56,12 +74,17 @@ import corporate_actions as ca
 from builders._constituents_loader import load_constituents_for_run_date
 from features.compute import DEFAULT_BUCKET, _SKIP_TICKERS, _is_sector_etf
 from polygon_client import polygon_client
-from store.arctic_store import get_universe_lib
+from store.arctic_store import get_delisted_history_lib, get_universe_lib
 
 log = logging.getLogger(__name__)
 
 DEFAULT_ABSENT_DAYS = 14
 AUDIT_PREFIX = "builders/prune_audit/"
+
+# Schema version stamped on every delisted_history record's metadata. Bump
+# only on a breaking layout change; readers gate on it. Kept next to the
+# producer so the contract version lives beside the code that writes it.
+DELISTED_HISTORY_SCHEMA_VERSION = 1
 
 
 def _build_registry(s3, bucket: str):
@@ -145,6 +168,70 @@ def _read_last_date(universe_lib, ticker: str) -> pd.Timestamp | None:
     return pd.Timestamp(df.index[-1]).normalize()
 
 
+def _retain_delisted(
+    universe_lib,
+    delisted_lib,
+    ticker: str,
+    *,
+    today: pd.Timestamp,
+    constituents_date: str,
+) -> dict:
+    """MOVE a confirmed-delisted ticker's history into ``delisted_history``.
+
+    Reads ``ticker``'s FULL frame from the universe library and writes it
+    VERBATIM (re-keyed, NOT re-projected — same identity-preserving discipline
+    as ``corporate_actions.migrate_symbol``) into ``delisted_lib`` under the
+    same ticker key, carrying the as-of-membership metadata contract defined in
+    ``store.arctic_store.get_delisted_history_lib``.
+
+    Idempotent: writes with ``prune_previous_versions=True`` so a re-run over an
+    already-retained (but not-yet-deleted) ticker overwrites the single record
+    in place — no duplication, no version pile-up.
+
+    This is the RETENTION half of the fail-safe: the caller only deletes from
+    the live universe AFTER this returns successfully. Any read/empty/write
+    failure RAISES here so the caller can abort the delete for this ticker and
+    preserve the data (never lose history on a retention failure).
+
+    Returns the record's metadata dict (also embedded in the audit summary).
+    """
+    df = universe_lib.read(ticker).data
+    if df is None or df.empty:
+        # An empty frame means there's nothing to retain — refuse to proceed to
+        # a delete on a symbol we couldn't actually read (defensive; the
+        # staleness gate already read a non-empty tail(1), so this is a
+        # concurrent-mutation / read-inconsistency guard).
+        raise RuntimeError(
+            f"refusing to retain+delete {ticker}: universe read returned an "
+            f"empty frame (nothing to preserve in delisted_history)"
+        )
+
+    first_active = pd.Timestamp(df.index[0]).strftime("%Y-%m-%d")
+    last_active = pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")
+    metadata = {
+        "schema_version": DELISTED_HISTORY_SCHEMA_VERSION,
+        "symbol": ticker,
+        "delisted_detected_on": today.strftime("%Y-%m-%d"),
+        "first_active_date": first_active,
+        "last_active_date": last_active,
+        "rows": int(len(df)),
+        "constituents_date": constituents_date,
+        "retained_at": datetime.now(timezone.utc).isoformat(),
+        "source": "prune_delisted_tickers",
+    }
+    # Write-then-(caller-deletes): the retention record lands BEFORE the live
+    # universe delete, so a failure here leaves the universe untouched.
+    delisted_lib.write(
+        ticker, df, metadata=metadata, prune_previous_versions=True,
+    )
+    log.warning(
+        "RETAINED ticker=%s -> delisted_history rows=%d window=%s..%s "
+        "detected_on=%s", ticker, metadata["rows"], first_active, last_active,
+        metadata["delisted_detected_on"],
+    )
+    return metadata
+
+
 def prune_delisted_tickers(
     *,
     bucket: str = DEFAULT_BUCKET,
@@ -202,6 +289,10 @@ def prune_delisted_tickers(
     """
     s3 = boto3.client("s3")
     universe_lib = get_universe_lib(bucket)
+    # Survivorship-free retention store (config#1943, Leg 3). Opened lazily via
+    # a module-level seam so tests can patch it; only actually touched on the
+    # apply-path deletion loop below.
+    delisted_lib = None
     today = today or pd.Timestamp(datetime.now(timezone.utc).date())
     threshold_date = today - timedelta(days=absent_days)
 
@@ -341,6 +432,8 @@ def prune_delisted_tickers(
     pruned: list[dict] = []
     skipped_recent: list[dict] = []
     skipped_unreadable: list[str] = []
+    retained: list[dict] = []
+    skipped_retention_failed: list[str] = []
 
     for ticker in candidates:
         last_date = _read_last_date(universe_lib, ticker)
@@ -364,23 +457,50 @@ def prune_delisted_tickers(
             "constituents_date": weekly_date,
         }
         if apply:
+            # RETENTION-BEFORE-DELETE (config#1943, Leg 3, fail-safe): move the
+            # full OHLCV history + as-of-membership metadata into the separate
+            # delisted_history library FIRST. Only on a successful retention
+            # write do we delete from the live universe. A retention failure
+            # SKIPS the delete for this ticker (never lose data) and is retried
+            # next pass — it does NOT abort the whole run, so one bad symbol
+            # can't strand the rest of the prune.
+            if delisted_lib is None:
+                delisted_lib = get_delisted_history_lib(bucket)
+            try:
+                meta = _retain_delisted(
+                    universe_lib, delisted_lib, ticker,
+                    today=today, constituents_date=weekly_date,
+                )
+            except Exception as exc:  # noqa: BLE001 - fail safe, never delete
+                log.warning(
+                    "RETENTION FAILED for %s (%s) — NOT deleting from universe "
+                    "this pass (history-safety); will retry next run", ticker, exc,
+                )
+                skipped_retention_failed.append(ticker)
+                continue
+            record["retained"] = True
+            record["retained_rows"] = meta["rows"]
+            retained.append({"ticker": ticker, **meta})
             try:
                 universe_lib.delete(ticker)
             except Exception as exc:
                 # Fail loudly — we don't want a half-pruned universe
-                # silently passing as "done".
+                # silently passing as "done". The history is already safe in
+                # delisted_history at this point, so no data is lost; the
+                # operator investigates the delete failure.
                 raise RuntimeError(
                     f"Failed to delete {ticker} from ArcticDB universe "
-                    f"(others already pruned: {[p['ticker'] for p in pruned]}): "
-                    f"{exc}"
+                    f"(history already retained in delisted_history; others "
+                    f"already pruned: {[p['ticker'] for p in pruned]}): {exc}"
                 ) from exc
             log.warning(
-                "PRUNED ticker=%s last_date=%s days_stale=%d",
+                "PRUNED ticker=%s last_date=%s days_stale=%d (history retained "
+                "in delisted_history)",
                 ticker, record["last_date"], record["days_stale"],
             )
         else:
             log.info(
-                "DRY-RUN would prune ticker=%s last_date=%s days_stale=%d",
+                "DRY-RUN would retain+prune ticker=%s last_date=%s days_stale=%d",
                 ticker, record["last_date"], record["days_stale"],
             )
         pruned.append(record)
@@ -394,23 +514,28 @@ def prune_delisted_tickers(
         "arctic_universe_size_before": len(arctic_symbols),
         "candidates_count": len(candidates),
         "pruned_count": len(pruned),
+        "retained_count": len(retained),
         "skipped_recent_count": len(skipped_recent),
         "skipped_unreadable_count": len(skipped_unreadable),
+        "skipped_retention_failed_count": len(skipped_retention_failed),
         "migrated_count": len([m for m in migrated if m.get("migrated")]),
         "skipped_rename_detect_failed_count": len(skipped_rename_detect_failed),
         "pruned": pruned,
+        "retained": retained,
         "skipped_recent": skipped_recent,
         "skipped_unreadable": skipped_unreadable,
+        "skipped_retention_failed": sorted(set(skipped_retention_failed)),
         "migrated": migrated,
         "skipped_rename_detect_failed": sorted(set(skipped_rename_detect_failed)),
     }
 
     log.info(
-        "prune_delisted_tickers: applied=%s pruned=%d migrated=%d "
-        "skipped_recent=%d skipped_unreadable=%d skipped_rename_detect_failed=%d",
-        apply, len(pruned), summary["migrated_count"],
+        "prune_delisted_tickers: applied=%s pruned=%d retained=%d migrated=%d "
+        "skipped_recent=%d skipped_unreadable=%d skipped_retention_failed=%d "
+        "skipped_rename_detect_failed=%d",
+        apply, len(pruned), len(retained), summary["migrated_count"],
         len(skipped_recent), len(skipped_unreadable),
-        len(skipped_rename_detect_failed),
+        len(skipped_retention_failed), len(skipped_rename_detect_failed),
     )
 
     # Always write the audit, even on dry-run + zero-prune — gives Sat

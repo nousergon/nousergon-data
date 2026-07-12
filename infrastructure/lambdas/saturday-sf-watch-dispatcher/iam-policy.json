@@ -39,8 +39,7 @@
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:*"
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
       ]
     },
     {
@@ -48,6 +47,19 @@
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
+    },
+    {
+      "Sid": "FastPathRerun",
+      "Effect": "Allow",
+      "Action": [
+        "states:StartExecution",
+        "states:ListExecutions"
+      ],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
     }
   ]
 }

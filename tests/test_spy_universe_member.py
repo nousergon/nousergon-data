@@ -90,13 +90,22 @@ def _stub_universe_lib(*, symbols, last_dates):
     lib = MagicMock()
     lib.list_symbols.return_value = symbols
 
+    def _frame_for(symbol):
+        idx = pd.DatetimeIndex([last_dates[symbol]])
+        return pd.DataFrame({"Close": [100.0]}, index=idx)
+
     def fake_tail(symbol, n):
         if symbol not in last_dates:
             return MagicMock(data=pd.DataFrame())
-        idx = pd.DatetimeIndex([last_dates[symbol]])
-        return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+        return MagicMock(data=_frame_for(symbol))
+
+    def fake_read(symbol, **kwargs):
+        if symbol not in last_dates:
+            return MagicMock(data=pd.DataFrame())
+        return MagicMock(data=_frame_for(symbol))
 
     lib.tail.side_effect = fake_tail
+    lib.read.side_effect = fake_read
     return lib
 
 
@@ -121,6 +130,9 @@ def test_spy_in_universe_is_never_pruned_even_when_absent_and_stale(monkeypatch)
     )
     monkeypatch.setattr(
         _prune_mod, "get_universe_lib", lambda *a, **k: lib
+    )
+    monkeypatch.setattr(
+        _prune_mod, "get_delisted_history_lib", lambda *a, **k: MagicMock()
     )
     # PR6: prune runs rename detection before deletion — neutralize the polygon
     # seam (HOLX is a genuine delist, no ticker_change) so this guard tests the

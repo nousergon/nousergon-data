@@ -57,26 +57,48 @@ def _stub_s3(*, constituents_tickers: list[str], weekly_date: str = "2026-04-25"
 
 def _stub_universe_lib(*, symbols: list[str], last_dates: dict[str, str]):
     """Return a MagicMock universe_lib whose tail() returns a frame with
-    a single row at the given last_date for each symbol."""
+    a single row at the given last_date for each symbol. ``read()`` returns
+    the same single-row frame so the retention-before-delete path (which reads
+    the FULL frame) works against the mock too."""
     lib = MagicMock()
     lib.list_symbols.return_value = symbols
+
+    def _frame_for(symbol):
+        idx = pd.DatetimeIndex([last_dates[symbol]])
+        return pd.DataFrame({"Close": [100.0]}, index=idx)
 
     def fake_tail(symbol, n):
         if symbol not in last_dates:
             return MagicMock(data=pd.DataFrame())
-        idx = pd.DatetimeIndex([last_dates[symbol]])
-        return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+        return MagicMock(data=_frame_for(symbol))
+
+    def fake_read(symbol, **kwargs):
+        if symbol not in last_dates:
+            return MagicMock(data=pd.DataFrame())
+        return MagicMock(data=_frame_for(symbol))
 
     lib.tail.side_effect = fake_tail
+    lib.read.side_effect = fake_read
     return lib
 
 
-def _patch_targets(monkeypatch, *, s3_mock, universe_lib_mock):
-    """Common patch surface — stub boto3.client + get_universe_lib."""
+def _stub_delisted_lib():
+    """Return a MagicMock delisted_history lib that records write() calls."""
+    return MagicMock()
+
+
+def _patch_targets(monkeypatch, *, s3_mock, universe_lib_mock, delisted_lib_mock=None):
+    """Common patch surface — stub boto3.client + get_universe_lib +
+    get_delisted_history_lib. Returns the delisted-history lib mock so tests
+    can assert on the retention writes."""
     monkeypatch.setattr(
         _mod, "boto3", MagicMock(client=lambda *a, **k: s3_mock),
     )
     monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: universe_lib_mock)
+    delisted_lib_mock = delisted_lib_mock or _stub_delisted_lib()
+    monkeypatch.setattr(
+        _mod, "get_delisted_history_lib", lambda *a, **k: delisted_lib_mock,
+    )
     # PR6: prune now runs rename detection before deletion. Default the polygon
     # seam to a fake that reports NO ticker_change for any candidate, so the
     # two-condition prune invariants below behave exactly as pre-PR6 (a genuine
@@ -84,6 +106,7 @@ def _patch_targets(monkeypatch, *, s3_mock, universe_lib_mock):
     no_rename_poly = MagicMock()
     no_rename_poly.get_ticker_events.return_value = []
     monkeypatch.setattr(_mod, "polygon_client", lambda *a, **k: no_rename_poly)
+    return delisted_lib_mock
 
 
 # ── A. Two-condition invariant ─────────────────────────────────────────────────
@@ -99,7 +122,10 @@ def test_absent_from_constituents_AND_stale_prunes(monkeypatch):
             "HOLX": "2026-04-06",  # 22 days stale @ today=2026-04-28
         },
     )
-    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+    delisted = _stub_delisted_lib()
+    _patch_targets(
+        monkeypatch, s3_mock=s3, universe_lib_mock=lib, delisted_lib_mock=delisted,
+    )
 
     summary = _mod.prune_delisted_tickers(
         absent_days=14, apply=True,
@@ -108,6 +134,11 @@ def test_absent_from_constituents_AND_stale_prunes(monkeypatch):
 
     assert summary["pruned_count"] == 1
     assert summary["pruned"][0]["ticker"] == "HOLX"
+    # Retention-before-delete: HOLX's history was written to delisted_history
+    # BEFORE it was deleted from the live universe (config#1943, Leg 3).
+    assert summary["retained_count"] == 1
+    delisted.write.assert_called_once()
+    assert delisted.write.call_args.args[0] == "HOLX"
     lib.delete.assert_called_once_with("HOLX")
 
 
@@ -398,14 +429,15 @@ def test_arctic_delete_failure_propagates(monkeypatch):
     lib = MagicMock()
     lib.list_symbols.return_value = ["AAPL", "HOLX", "RACE"]
 
-    def fake_tail(symbol, n):
-        if symbol == "AAPL":
-            idx = pd.DatetimeIndex(["2026-04-25"])
-        else:
-            idx = pd.DatetimeIndex(["2026-04-06"])
-        return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+    def _frame(symbol):
+        idx = (
+            pd.DatetimeIndex(["2026-04-25"]) if symbol == "AAPL"
+            else pd.DatetimeIndex(["2026-04-06"])
+        )
+        return pd.DataFrame({"Close": [100.0]}, index=idx)
 
-    lib.tail.side_effect = fake_tail
+    lib.tail.side_effect = lambda symbol, n: MagicMock(data=_frame(symbol))
+    lib.read.side_effect = lambda symbol, **k: MagicMock(data=_frame(symbol))
     # First delete succeeds, second raises
     lib.delete.side_effect = [None, RuntimeError("S3 5xx")]
     _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
@@ -621,11 +653,19 @@ class _FakeS3Registry:
         return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
 
 
-def _real_universe_lib(tmp_path, symbols: dict[str, str]):
-    """A REAL LMDB ArcticDB universe seeded with one row per symbol at the given
-    last_date (so has_symbol / read / write / delete all behave for real)."""
+def _real_arctic(tmp_path):
+    """A REAL LMDB ArcticDB instance for retention integration tests."""
     adb = pytest.importorskip("arcticdb")
-    ac = adb.Arctic(f"lmdb://{tmp_path}")
+    return adb.Arctic(f"lmdb://{tmp_path}")
+
+
+def _real_universe_lib(tmp_path, symbols: dict[str, str], *, arctic=None):
+    """A REAL LMDB ArcticDB universe seeded with one row per symbol at the given
+    last_date (so has_symbol / read / write / delete all behave for real).
+
+    Pass an existing ``arctic`` to co-locate the universe + delisted_history
+    libraries on one instance (so the retention-move round-trips for real)."""
+    ac = arctic or _real_arctic(tmp_path)
     lib = ac.get_library("universe", create_if_missing=True)
     for ticker, last_date in symbols.items():
         idx = pd.DatetimeIndex([pd.Timestamp(last_date)])
@@ -638,11 +678,20 @@ def _real_universe_lib(tmp_path, symbols: dict[str, str]):
     return lib
 
 
-def _patch_rename(monkeypatch, *, s3_mock, universe_lib, events_by_ticker, raise_for=None):
-    """Patch prune for the rename phase: boto3 + get_universe_lib + a real
-    registry (proper marker semantics) + a fake polygon ticker-events client."""
+def _patch_rename(
+    monkeypatch, *, s3_mock, universe_lib, events_by_ticker,
+    raise_for=None, delisted_lib=None,
+):
+    """Patch prune for the rename phase: boto3 + get_universe_lib +
+    get_delisted_history_lib + a real registry (proper marker semantics) + a
+    fake polygon ticker-events client. Defaults the retention store to a
+    fresh MagicMock; pass a real LMDB ``delisted_lib`` to exercise the move."""
     monkeypatch.setattr(_mod, "boto3", MagicMock(client=lambda *a, **k: s3_mock))
     monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: universe_lib)
+    delisted_lib = delisted_lib if delisted_lib is not None else MagicMock()
+    monkeypatch.setattr(
+        _mod, "get_delisted_history_lib", lambda *a, **k: delisted_lib,
+    )
     reg = ca.CorporateActionRegistry(_FakeS3Registry(), "alpha-engine-research")
     monkeypatch.setattr(_mod, "_build_registry", lambda *a, **k: reg)
 
@@ -736,6 +785,7 @@ def test_no_polygon_client_refuses_to_prune_blind(monkeypatch, tmp_path):
     })
     monkeypatch.setattr(_mod, "boto3", MagicMock(client=lambda *a, **k: s3))
     monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: lib)
+    monkeypatch.setattr(_mod, "get_delisted_history_lib", lambda *a, **k: MagicMock())
     reg = ca.CorporateActionRegistry(_FakeS3Registry(), "alpha-engine-research")
     monkeypatch.setattr(_mod, "_build_registry", lambda *a, **k: reg)
     monkeypatch.setattr(_mod, "polygon_client", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no key")))
@@ -772,3 +822,167 @@ def test_dry_run_does_not_migrate_or_prune(monkeypatch, tmp_path):
     assert lib.has_symbol("FB")
     assert not lib.has_symbol("META")
     assert summary["pruned_count"] == 0
+
+
+# ── H. Survivorship-free RETENTION (config#1943, Leg 3) ────────────────────────
+#
+# A confirmed delisting must be MOVED into the separate ``delisted_history``
+# library (full OHLCV + as-of-membership metadata) BEFORE it is removed from the
+# live universe — never hard-deleted. These tests run against REAL co-located
+# LMDB ArcticDB libraries so the move round-trips for real (read → write →
+# delete), plus the fail-safe (retention failure must NOT delete) and the
+# idempotency invariant (re-run must not duplicate/corrupt the record).
+
+
+def _real_delisted_lib(arctic):
+    """The REAL LMDB delisted_history library co-located with the universe lib."""
+    return arctic.get_library("delisted_history", create_if_missing=True)
+
+
+def _seed_multiday_universe(arctic, ticker: str, dates: list[str], *, lib=None):
+    """Overwrite ``ticker`` in the real universe lib with a multi-row OHLCV
+    frame spanning ``dates`` — so the retained window (first..last) is testable.
+
+    Pass the SAME ``lib`` handle the pruner uses so the write is visible to it
+    (distinct LMDB library handles don't share an in-memory symbol view)."""
+    lib = lib if lib is not None else arctic.get_library("universe", create_if_missing=True)
+    idx = pd.DatetimeIndex([pd.Timestamp(d) for d in dates])
+    n = len(idx)
+    df = pd.DataFrame(
+        {
+            "Open": np.linspace(1.0, 2.0, n),
+            "High": np.linspace(1.0, 2.0, n),
+            "Low": np.linspace(1.0, 2.0, n),
+            "Close": np.linspace(100.0, 110.0, n),
+            "Volume": np.full(n, 1e6),
+            "source": ["polygon"] * n,
+        },
+        index=idx,
+    )
+    lib.write(ticker, df)
+    return df
+
+
+def test_confirmed_delist_moved_to_delisted_history_not_deleted(monkeypatch, tmp_path):
+    """The root-cause fix: a confirmed delist's full OHLCV history lands in the
+    delisted_history library (with the as-of-membership metadata contract) and
+    ONLY THEN is removed from the live universe. History is preserved, not
+    destroyed — the survivorship-free retention invariant."""
+    arctic = _real_arctic(tmp_path)
+    lib = _real_universe_lib(arctic=arctic, tmp_path=tmp_path, symbols={
+        "AAPL": "2026-04-25",  # in constituents → never a candidate
+        "DEAD": "2026-04-01",  # absent + stale + no rename → confirmed delist
+    })
+    original_dead = _seed_multiday_universe(
+        arctic, "DEAD", ["2026-01-02", "2026-02-02", "2026-04-01"], lib=lib,
+    )
+    delisted = _real_delisted_lib(arctic)
+
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    _patch_rename(
+        monkeypatch, s3_mock=s3, universe_lib=lib,
+        events_by_ticker={"DEAD": []}, delisted_lib=delisted,
+    )
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-04-28"),
+    )
+
+    # Removed from the LIVE universe...
+    assert summary["pruned_count"] == 1
+    assert not lib.has_symbol("DEAD")
+    assert lib.has_symbol("AAPL")
+    # ...but PRESERVED verbatim in delisted_history.
+    assert summary["retained_count"] == 1
+    assert delisted.has_symbol("DEAD")
+    item = delisted.read("DEAD")
+    pd.testing.assert_frame_equal(item.data, original_dead)
+
+    # Metadata contract (as-of-membership provenance).
+    meta = item.metadata
+    assert meta["schema_version"] == _mod.DELISTED_HISTORY_SCHEMA_VERSION
+    assert meta["symbol"] == "DEAD"
+    assert meta["delisted_detected_on"] == "2026-04-28"
+    assert meta["first_active_date"] == "2026-01-02"
+    assert meta["last_active_date"] == "2026-04-01"
+    assert meta["rows"] == 3
+    assert meta["source"] == "prune_delisted_tickers"
+    assert "retained_at" in meta
+
+
+def test_retention_write_failure_does_not_delete_from_universe(monkeypatch, tmp_path):
+    """Fail-safe: if the delisted_history write RAISES, the ticker must NOT be
+    deleted from the live universe (never lose data). It's reported as
+    skipped_retention_failed and retried next pass; a healthy sibling still
+    prunes (one bad symbol doesn't strand the run)."""
+    arctic = _real_arctic(tmp_path)
+    lib = _real_universe_lib(arctic=arctic, tmp_path=tmp_path, symbols={
+        "AAPL": "2026-04-25",
+        "BADWRITE": "2026-04-01",  # retention write will raise for this one
+        "GOODDELIST": "2026-04-01",
+    })
+
+    delisted = MagicMock()
+
+    def fake_write(symbol, df, **kwargs):
+        if symbol == "BADWRITE":
+            raise RuntimeError("S3 500 on delisted_history write")
+        return None
+
+    delisted.write.side_effect = fake_write
+
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    _patch_rename(
+        monkeypatch, s3_mock=s3, universe_lib=lib,
+        events_by_ticker={"BADWRITE": [], "GOODDELIST": []}, delisted_lib=delisted,
+    )
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-04-28"),
+    )
+
+    # BADWRITE: retention failed → NOT deleted from the universe (data preserved).
+    assert "BADWRITE" in summary["skipped_retention_failed"]
+    assert lib.has_symbol("BADWRITE")
+    assert "BADWRITE" not in {p["ticker"] for p in summary["pruned"]}
+    # GOODDELIST: retained + pruned normally — one bad symbol doesn't abort.
+    assert "GOODDELIST" in {p["ticker"] for p in summary["pruned"]}
+    assert not lib.has_symbol("GOODDELIST")
+
+
+def test_retention_is_idempotent_on_rerun(monkeypatch, tmp_path):
+    """Re-running the pruner must not duplicate/corrupt the delisted_history
+    record. First pass moves DEAD; a second pass where DEAD is re-seeded into
+    the universe (simulating a partial-failure replay) overwrites the SAME
+    single record in place (one version stub, no pile-up)."""
+    arctic = _real_arctic(tmp_path)
+    lib = _real_universe_lib(arctic=arctic, tmp_path=tmp_path, symbols={
+        "AAPL": "2026-04-25", "DEAD": "2026-04-01",
+    })
+    _seed_multiday_universe(arctic, "DEAD", ["2026-01-02", "2026-04-01"], lib=lib)
+    delisted = _real_delisted_lib(arctic)
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    _patch_rename(
+        monkeypatch, s3_mock=s3, universe_lib=lib,
+        events_by_ticker={"DEAD": []}, delisted_lib=delisted,
+    )
+
+    _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-04-28"),
+    )
+    assert delisted.has_symbol("DEAD")
+
+    # Simulate a replay: DEAD reappears in the universe (e.g. the prior delete
+    # is retried), and the pruner runs again.
+    _seed_multiday_universe(arctic, "DEAD", ["2026-01-02", "2026-04-01"], lib=lib)
+    _mod.prune_delisted_tickers(
+        absent_days=14, apply=True, today=pd.Timestamp("2026-05-05"),
+    )
+
+    # Still exactly one live record, not duplicated; prune_previous_versions
+    # keeps the version history from piling up.
+    assert delisted.has_symbol("DEAD")
+    versions = delisted.list_versions("DEAD")
+    assert len(versions) == 1
+    # The second pass's detection date is reflected (record refreshed in place).
+    assert delisted.read("DEAD").metadata["delisted_detected_on"] == "2026-05-05"

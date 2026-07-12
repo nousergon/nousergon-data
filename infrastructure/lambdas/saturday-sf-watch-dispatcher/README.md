@@ -14,9 +14,10 @@ Lambda:
    `s3://alpha-engine-research/consolidated/saturday_sf_watch/{run_date}.json`
    (the contract the M3 dashboard page reads; repeated failures in one Saturday
    accumulate).
-3. Sends a **distinct, SILENT** Telegram receipt naming the failed state + the
-   artifact location (the `sf-telegram-notifier` already pinged loud on the same
-   FAILED event — this is the additive watch record, not a duplicate alert).
+3. Sends a **distinct, SILENT** Telegram receipt **only when recovery work
+   actually starts** (agent dispatched or fast-path rerun). Observe-only paths
+   are recorded in the watch-log only — `sf-telegram-notifier` already alerted
+   on the failure; a Fleet-SF Watch ping with no action is noise.
 
 ## M2 — agent dispatch (behind a flag, default OFF)
 
@@ -46,6 +47,56 @@ and is never logged.
 3. Land the agent GHA workflow + scoped OIDC role (M2c, alpha-engine-config).
 4. Flip the flag:
    `aws lambda update-function-configuration --function-name alpha-engine-saturday-sf-watch-dispatcher --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=true}' --query LastUpdateStatus --output text`.
+
+## Dispatch suppression (config#2003)
+
+Two carve-outs stop a **second** agent from being dispatched for an incident
+already being handled. Both still write the watch-log event AND send the
+(SILENT) Telegram receipt — `mode: DISPATCH SUPPRESSED` — recording the
+decision in `dispatch_suppressed` (never a silent skip); only the
+`repository_dispatch` call itself is withheld.
+
+1. **Operator-recovery reruns.** An execution named after the watch's own
+   recommended recovery-rerun convention (`watch-rerun-<date>-<n>`) or this
+   Lambda's own fast-path rerun (`fast-path-rerun-<date>-<hms>`) is a recovery
+   attempt already in progress, not a fresh incident. Prefix-matched via
+   `RECOVERY_RERUN_NAME_PREFIXES` in `index.py`.
+   (Observed 2026-07-08, EOD incident config#1446/#1464: the watch escalated
+   the original failure, then dispatched two MORE agents for the operator's
+   own `watch-rerun-2026-07-08-1`/`-2` recovery reruns — the naming
+   convention the watch itself recommended.)
+2. **Same-day post-escalation repeats.** Once this pipeline's watch-log for
+   today already has an `action: escalated` event (human-gated, e.g. IAM), a
+   subsequent failure of the same pipeline that day suppresses by default —
+   the human is already engaged. Kill-switch:
+   `EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true` restores the old
+   dispatch-every-failure behavior.
+
+Neither carve-out suppresses the **first** failure of a pipeline/day.
+
+## Mechanical per-cadence dispatch ceiling (config#2269)
+
+The charter's attempt budget is honor-system (it depends on the dispatched
+agent reading + enriching the watch-log). The dispatcher ALSO enforces it
+mechanically: before each agent dispatch it counts prior budget-consuming
+events for this (cadence, pipeline, run_date) from its own watch-log —
+dispatcher-authored `action` values (`dispatch`, `fast_path_rerun`,
+`reclaim_relaunch`) plus the charter's in-place outcome rewrites of dispatch
+events (`fixed_merged_rerun`/`rerun`/`proposed`/`refused`/`escalated`), never
+the agent-enriched `agent_attempt` field, so an agent crash can't reset the
+count. At/over the ceiling the dispatch is suppressed
+(`dispatch_suppressed: attempt_budget_exhausted`) and a **LOUD** Telegram
+escalation pages — "the watch has given up on today; human needed" — instead
+of the silent receipt.
+
+Ceilings (env, config defaults — **not** operator flags, not preserved across
+redeploys; change via PR): `SF_WATCH_MAX_DISPATCHES_SATURDAY=8`,
+`SF_WATCH_MAX_DISPATCHES_WEEKDAY=2`, `SF_WATCH_MAX_DISPATCHES_EOD=2`
+(the charter's Brian-ruled per-cadence budgets, 2026-07-11). The ceiling
+composes with the config#2003 suppressions and the charter-side budget — it
+is the outermost runaway backstop, and it still applies when
+`EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true` opts back into post-escalation
+dispatch.
 
 ## Why it's not a second notifier
 

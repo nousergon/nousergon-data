@@ -257,6 +257,56 @@ UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
 
+# ArcticDB freshness-monitor sentinel (config#1787, Brian's 2026-07-08
+# Option-B ruling). A small, UNCONDITIONAL S3 marker written on every
+# successful daily_append ArcticDB write — deliberately separate from
+# ``health/universe_freshness.json`` above, which is a richer per-symbol
+# staleness receipt that only gets written when the whole scan passes
+# (and hard-raises otherwise). This sentinel exists purely so
+# ``nousergon_lib.artifact_freshness``'s ordinary S3 ArtifactSpec probe
+# (HEAD/LIST + recency, zero new backend code) has something to check for
+# the ArcticDB feature-store producer, per Brian's explicit "ordinary S3
+# ArtifactSpec, zero changes to nousergon_lib.artifact_freshness" ruling —
+# rejecting Option (A) (a first-class arcticdb backend) as premature
+# generalization for one consumer.
+FEATURE_STORE_FRESHNESS_SENTINEL_KEY = "feature_store/_freshness.json"
+
+
+def _write_feature_store_freshness_sentinel(
+    s3, bucket: str, *, library: str = "universe", symbol_or_library: str | None = None,
+) -> dict:
+    """Write the ArcticDB feature-store freshness sentinel (config#1787).
+
+    Best-effort: any S3 write failure is logged at WARN and swallowed — the
+    sentinel is an observability nicety for the freshness monitor, not a
+    load-bearing part of the daily_append pipeline, so a sentinel-write
+    failure must never fail (or even affect) the pipeline run that already
+    completed its real ArcticDB writes.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "symbol_or_library": symbol_or_library or library,
+        "library": library,
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=FEATURE_STORE_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB feature-store freshness sentinel to s3://%s/%s",
+            bucket, FEATURE_STORE_FRESHNESS_SENTINEL_KEY,
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB feature-store freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE): %s", exc,
+        )
+    return sentinel
+
 
 def _load_block_anomaly_types() -> frozenset[str]:
     """Read ``DAILY_APPEND_BLOCK_ANOMALY_TYPES`` env var or fall back to defaults.
@@ -1221,6 +1271,43 @@ def _daily_append_impl(
                     f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
                 ) from exc
 
+        # HYOAS (config#939, credit spreads) — best-effort, NOT added to
+        # `macro_keys` above. Unlike SPY/VIX/TNX/etc. (battle-tested,
+        # load-bearing for every downstream feature), HYOAS is a newer,
+        # optional macro input: FRED-license-gated to 2023+ and not yet
+        # guaranteed present in every daily_closes parquet. Gating the
+        # WHOLE daily pipeline on its freshness (via macro_missing_from_closes
+        # -> the hard-fail below) would be a disproportionate blast radius
+        # for one optional feature — feature_engineer.compute_features
+        # already neutral-defaults hy_oas_credit_spread_pct to 0.0 when
+        # hyoas_series is None, so a missing HYOAS bar degrades one column
+        # to its neutral default rather than failing the run.
+        bar = closes.get("HYOAS")
+        if bar is not None and not np.isnan(bar.get("Close", np.nan)):
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                    mode = _write_row_backfill_safe(macro_lib, "HYOAS", new_row)
+                macro_updated.append("HYOAS")
+                macro_write_modes["HYOAS"] = mode
+            except Exception as exc:
+                log.warning(
+                    "HYOAS macro bar write failed for %s (non-fatal — "
+                    "hy_oas_credit_spread_pct will neutral-default): %s",
+                    date_str, exc,
+                )
+        else:
+            log.info(
+                "HYOAS bar missing/NaN from today's daily_closes for %s — "
+                "hy_oas_credit_spread_pct will neutral-default this run "
+                "(non-fatal, unlike the mandatory macro_keys set below).",
+                date_str,
+            )
+
         # Hard-fail on any missing key — macro inputs are not optional.
         # downstream feature compute + predictor preflight both depend on
         # these being fresh.
@@ -1429,6 +1516,35 @@ def _daily_append_impl(
                     series = series[~series.index.duplicated(keep="last")].sort_index()
                 macro[sym] = series
 
+        # HYOAS (config#939, credit spreads) — best-effort read, mirroring
+        # the best-effort write above. Not part of the mandatory
+        # `macro_keys` hard-fail loop: if the symbol doesn't exist yet
+        # (fresh deploy before any backfill/daily-write has populated it)
+        # or the read otherwise fails, `macro["HYOAS"]` simply stays
+        # unset and `hyoas_series = macro.get("HYOAS")` downstream is
+        # None — feature_engineer.compute_features already neutral-
+        # defaults hy_oas_credit_spread_pct to 0.0 in that case.
+        try:
+            mdf = macro_lib.read("HYOAS").data
+        except Exception as exc:
+            log.info(
+                "HYOAS macro series unreadable from ArcticDB (non-fatal — "
+                "hy_oas_credit_spread_pct will neutral-default): %s", exc,
+            )
+        else:
+            if "Close" in mdf.columns:
+                series = mdf["Close"].dropna()
+                ticker_close = closes.get("HYOAS")
+                if ticker_close and not np.isnan(ticker_close["Close"]):
+                    series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
+                    series = series[~series.index.duplicated(keep="last")].sort_index()
+                macro["HYOAS"] = series
+            else:
+                log.warning(
+                    "HYOAS macro series has no Close column — ArcticDB "
+                    "schema drift (non-fatal, treated as missing)."
+                )
+
     t_load = time.time() - t0
     log.info("Data loaded in %.1fs: %d closes, %d macro series", t_load, len(closes), len(macro))
 
@@ -1440,6 +1556,7 @@ def _daily_append_impl(
     gld_series = macro.get("GLD")
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
+    hyoas_series = macro.get("HYOAS")
 
     # Filter to stock tickers only
     # _UNIVERSE_EXTRA (SPY) is maintained as a full universe member here too;
@@ -1723,6 +1840,7 @@ def _daily_append_impl(
                     gld_series=gld_series,
                     uso_series=uso_series,
                     vix3m_series=vix3m_series,
+                    hyoas_series=hyoas_series,
                     earnings_data=ticker_alt.get("earnings"),
                     revision_data=ticker_alt.get("revisions"),
                     options_data=ticker_alt.get("options"),
@@ -2085,6 +2203,15 @@ def _daily_append_impl(
                 f"ArcticDB daily_append error rate {err_rate:.1%} exceeds 5% threshold "
                 f"(n_ok={n_ok} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
             )
+
+        # ArcticDB feature-store freshness sentinel (config#1787). Written
+        # here — right after the error-rate gate confirms this was a
+        # successful ArcticDB write batch, and BEFORE the staleness-scan
+        # receipt below (which hard-raises on stale symbols) — so the
+        # sentinel reflects "a write happened" independent of whether the
+        # separate per-symbol staleness scan later passes or raises.
+        # Best-effort/non-fatal by construction (see function docstring).
+        _write_feature_store_freshness_sentinel(s3, bucket, library="universe")
 
         # ── L4484: factor-momentum daily go-forward second pass ──────────────
         # factor_momentum_ratio is a cross-sectional-time-series feature that

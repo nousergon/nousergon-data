@@ -38,10 +38,11 @@ def _body(obj: dict) -> dict:
 
 # ── Fundamentals v2: P/B + P/S are published ─────────────────────────────────
 
-def test_fundamentals_schema_v3_includes_multiples_and_balance_sheet():
-    assert mmd.FUNDAMENTALS_SCHEMA_VERSION == 3
+def test_fundamentals_schema_v5_includes_multiples_balance_sheet_eps_and_valuation_inputs():
+    assert mmd.FUNDAMENTALS_SCHEMA_VERSION == 5
     for k in ("priceToBook", "priceToSalesTrailing12Months", "totalDebt", "totalCash",
-              "ebitda", "freeCashflow"):
+              "ebitda", "freeCashflow", "trailingEps", "forwardEps",
+              "bookValue", "revenuePerShare", "enterpriseValue"):
         assert k in mmd.FUNDAMENTALS_INFO_KEYS
 
     s3 = MagicMock()
@@ -53,7 +54,7 @@ def test_fundamentals_schema_v3_includes_multiples_and_balance_sheet():
 
     assert result["status"] == "ok"
     art = _puts(s3)[f"{mmd.FUNDAMENTALS_PREFIX}latest.json"]
-    assert art["schema_version"] == 3
+    assert art["schema_version"] == 5
     aapl = art["fundamentals"]["AAPL"]
     assert aapl["priceToBook"] == 6.0 and aapl["priceToSalesTrailing12Months"] == 7.5
     assert aapl["totalDebt"] == 1.1e11 and aapl["totalCash"] == 6.0e10 and aapl["ebitda"] == 1.3e11
@@ -97,7 +98,7 @@ def test_technicals_artifact_shape_and_keys():
     row = art["technicals"]["AAPL"]
     for field in ("rsi_14", "macd_hist", "ma_50", "ma_200", "pct_to_ma_50",
                   "pct_to_ma_200", "high_52w", "low_52w", "pct_in_52w_range",
-                  "mom_20d", "mom_60d"):
+                  "pct_from_52wk_high", "mom_20d", "mom_60d"):
         assert field in row
     # Up-trending series: RSI elevated, last > both MAs, near the top of its 52w range.
     assert row["rsi_14"] > 55
@@ -121,6 +122,55 @@ def test_technicals_short_series_nulls_deep_windows():
     out = mmd._compute_technicals(_ramp(120))
     assert out["ma_50"] is not None and out["rsi_14"] is not None
     assert out["ma_200"] is None and out["pct_to_ma_200"] is None
+    assert out["pct_from_52wk_high"] is not None
+
+
+# ── Security performance: derived from close_history + SPY benchmark ───────────
+
+def test_security_performance_artifact_shape_and_vs_spy_1y():
+    spy = _ramp(300, start=400.0, step=0.3)
+    aapl = _ramp(300, start=100.0, step=0.6)
+    s3 = _technicals_s3({"AAPL": aapl, "SPY": spy})
+
+    result = mmd.collect_security_performance(bucket="b", run_date="2026-06-26", s3_client=s3)
+
+    assert result["status"] == "ok" and result["performance"] == 1
+    art = _puts(s3)[f"{mmd.SECURITY_PERFORMANCE_PREFIX}latest.json"]
+    assert art["schema_version"] == mmd.SECURITY_PERFORMANCE_SCHEMA_VERSION
+    row = art["performance"]["AAPL"]
+    for field in (
+        "period_returns", "ytd_pct", "ltm_pct", "volatility", "sharpe", "sortino",
+        "max_drawdown", "beta_vs_spy", "vs_spy_window", "vs_spy_1y", "n_bars", "history_from",
+    ):
+        assert field in row
+    assert isinstance(row["period_returns"], dict)
+    assert row["n_bars"] >= 260
+
+
+def test_security_performance_omits_symbol_with_no_history():
+    s3 = _technicals_s3({"AAPL": _ramp(300), "MSFT": []})
+
+    result = mmd.collect_security_performance(bucket="b", run_date="2026-06-26", s3_client=s3)
+
+    art = _puts(s3)[f"{mmd.SECURITY_PERFORMANCE_PREFIX}latest.json"]
+    assert set(art["performance"]) == {"AAPL"}
+    assert result["performance"] == 1
+
+
+def test_price_derived_universe_unions_sp1500_and_metron(monkeypatch):
+    """SP1500 ∪ held/watchlist — overlap deduped, metron-only foreign names kept."""
+    s3 = MagicMock()
+    s3.get_object.side_effect = lambda Bucket, Key: _body(_UNIVERSE) if Key == mmd.HOLDINGS_UNIVERSE_KEY else (
+        _body({"holdings": [{"yf_symbol": "RMS.PA", "currency": "EUR"}]})
+        if Key == mmd.WATCHLIST_UNIVERSE_KEY else (_ for _ in ()).throw(Exception("NoSuchKey"))
+    )
+    monkeypatch.setattr(mmd, "_load_sp1500_symbols", lambda bucket: {"AAPL", "MSFT", "NVDA"})
+    holdings, currencies = mmd.load_price_derived_universe("b", s3)
+    yf = {h["yf_symbol"] for h in holdings}
+    assert yf == {"AAPL", "MSFT", "NVDA", "RMS.PA"}
+    assert currencies == ["EUR"]
+    assert next(h for h in holdings if h["yf_symbol"] == "AAPL")["currency"] == "USD"
+    assert next(h for h in holdings if h["yf_symbol"] == "RMS.PA")["currency"] == "EUR"
 
 
 # ── Valuation medians: SP1500-broad sector & country benchmark ────────────────

@@ -83,8 +83,9 @@ class TestChainOrdering:
         # downstream mutex→CheckShellRun→CheckSkipMorningEnrich chain is unchanged.
         # config#830: a cadence-preset gate (CheckRunMode) now precedes the lib-pin
         # gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the chain holds.
-        assert states["InitializeInput"]["Next"] == "CheckRunMode", (
-            "InitializeInput now hands off to the config#830 cadence-preset gate; "
+        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate", (
+            "InitializeInput hands off to the config#1824 run-day gate, whose "
+            "bypass Default -> CheckRunMode (config#830 cadence preset); "
             "CheckRunMode.Default → CheckSkipLibPinDriftCheck (the L4517 lib-pin "
             "gate); see tests/test_sf_lib_pin_drift_wiring.py for the gate→mutex chain"
         )
@@ -269,9 +270,11 @@ class TestSsmCommandShape:
 
 
 class TestCatchSemantics:
-    """Both new Task states must Catch States.ALL → HandleFailure with
-    ResultPath $.error, exactly like the DataPhase1 / RAGIngestion
-    quartets (the SF halts on infra failure of these states)."""
+    """Both new Task states must Catch States.ALL → NormalizeFailureContext
+    (config#1819: the single chokepoint in front of HandleFailure, was
+    HandleFailure directly pre-fix) with ResultPath $.error, exactly like the
+    DataPhase1 / RAGIngestion quartets (the SF halts on infra failure of
+    these states)."""
 
     @pytest.mark.parametrize("name", ["MorningEnrich", "WaitForMorningEnrich"])
     def test_catch_routes_to_handle_failure(self, states, name):
@@ -279,14 +282,14 @@ class TestCatchSemantics:
         assert len(catches) >= 1
         for c in catches:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "HandleFailure"
+            assert c["Next"] == "NormalizeFailureContext"
             assert c["ResultPath"] == "$.error"
 
     def test_extract_error_routes_to_handle_failure(self, states):
         st = states["ExtractMorningEnrichError"]
         assert st["Type"] == "Pass"
         assert st["ResultPath"] == "$.error"
-        assert st["Next"] == "HandleFailure"
+        assert st["Next"] == "NormalizeFailureContext"
         assert st["Parameters"]["phase"] == "MorningEnrich"
 
 

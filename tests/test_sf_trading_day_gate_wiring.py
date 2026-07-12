@@ -75,6 +75,11 @@ class TestTradingDayGateChoice:
         assert false_branch == ["NotifyHolidaySkip"]
 
     def test_default_proceeds_to_start_box(self, states):
+        # config#1767 (Phase 2): the Phase-1 pre-launch-before-boot data-spot
+        # hop (CheckSkipDataSpot -> LaunchDailyDataSpot) was retired — each
+        # Phase-2 spot now launches lazily, later, from its own
+        # CheckSkipMorningEnrich gate — so trading day confirmed proceeds
+        # straight to booting the box.
         assert states["TradingDayGateChoice"]["Default"] == "StartExecutorEC2"
 
     def test_choice_reads_is_trading_day_off_gate_payload(self, states):
@@ -86,6 +91,8 @@ class TestTradingDayGateFailed:
     def test_failed_proceeds_to_start_box(self, states):
         failed = states["TradingDayGateFailed"]
         assert failed["Resource"] == "arn:aws:states:::sns:publish"
+        # config#1767 (Phase 2): fail-open path also proceeds straight to
+        # booting the box — no pre-launch data-spot hop anymore.
         assert failed["Next"] == "StartExecutorEC2"
 
 

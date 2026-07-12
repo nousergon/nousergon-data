@@ -71,7 +71,23 @@ def test_every_get_command_invocation_retries_both_error_forms(sf_path):
     with open(repo_root / sf_path) as fh:
         definition = json.load(fh)
     targets = _find_get_command_invocation_states(definition)
-    assert targets, f"No getCommandInvocation Tasks found in {sf_path}"
+    if not targets:
+        # config#1811: the weekday SF's poll loops migrated to the
+        # liveness-aware ssm-liveness-poller Lambda, which handles the
+        # InvocationDoesNotExist registration race INTERNALLY (reported
+        # as a Registering/IN_PROGRESS verdict, bounded by the attempt
+        # budget) — legitimately zero bare getCommandInvocation Tasks
+        # remain in that file. The invariant pinned here only applies
+        # where the bare aws-sdk poll form is still in use (Saturday +
+        # EOD). Require the poller to actually be present so a future
+        # removal of BOTH forms still fails loud.
+        content = json.dumps(definition)
+        assert "alpha-engine-ssm-liveness-poller" in content, (
+            f"{sf_path}: no getCommandInvocation Tasks AND no "
+            f"ssm-liveness-poller invocations — SSM polling vanished "
+            f"entirely?"
+        )
+        return
 
     missing_both: list[str] = []
     missing_bare: list[str] = []

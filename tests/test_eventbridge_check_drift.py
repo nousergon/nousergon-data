@@ -33,14 +33,17 @@ def cd():
 # ── Discovery against the real repo state ───────────────────────────────────
 
 
-def test_discovers_all_three_historically_bitten_rules(cd):
-    """The 3 rules named in config#1464 as historically orphaned by the
-    2026-06-29 ne-* rename must all be discovered from their deploy.sh."""
+def test_discovers_historically_bitten_rules(cd):
+    """Rules named in config#1464 as historically orphaned by the 2026-06-29
+    ne-* rename must be discovered from their deploy.sh. (The third such rule,
+    alpha-engine-saturday-succeeded-groom, was retired with its
+    saturday-sf-success-groom-dispatcher Lambda — config#2201: the end-of-SF
+    sweep + gate_sf_run_sweep made the event-driven post-SF groom redundant.)"""
     rules = cd._discover_codified_rules()
     rule_names = {r["rule_name"] for r in rules}
     assert "alpha-engine-sf-status-change" in rule_names  # sf-telegram-notifier
     assert "alpha-engine-friday-shell-run-report" in rule_names
-    assert "alpha-engine-saturday-succeeded-groom" in rule_names  # saturday-sf-success-groom-dispatcher
+    assert "alpha-engine-saturday-succeeded-groom" not in rule_names  # retired config#2201
 
 
 def test_discovered_rules_have_no_parse_errors(cd):

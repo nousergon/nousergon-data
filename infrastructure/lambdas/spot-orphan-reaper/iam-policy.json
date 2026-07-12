@@ -30,6 +30,27 @@
       }
     },
     {
+      "Sid": "CheckCiWatchCompletionMarker",
+      "Effect": "Allow",
+      "Action": "s3:HeadObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/ci_watch/_control/completed/*"
+    },
+    {
+      "Sid": "CheckSfWatchCompletionMarker",
+      "Effect": "Allow",
+      "Action": "s3:HeadObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/sf_watch/_control/completed/*"
+    },
+    {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+      ]
+    },
+    {
       "Sid": "LambdaLogging",
       "Effect": "Allow",
       "Action": [
