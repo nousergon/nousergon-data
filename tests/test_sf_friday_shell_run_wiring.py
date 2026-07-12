@@ -720,9 +720,18 @@ class TestConsolidatedNotify:
         # grading/advisory succeed or fail. On the Friday preflight the states
         # still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) — they are
         # not skipped — so the success edge is identical on real + preflight runs.
+        # config#2276: the substrate poll resolves to a terminal status
+        # first; its Success edge is what feeds ReportCard.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckSubstrateHealthCheckStatus"
         )
+        substrate_success = next(
+            r
+            for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
+            if r.get("StringEquals") == "Success"
+        )
+        assert substrate_success["Next"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "Director"
         assert all(c["Next"] == "CheckShellRunNotify" for c in report_card["Catch"])

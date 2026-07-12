@@ -3583,7 +3583,7 @@
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs to the success notifier, so a retry ladder would only delay completion, never protect spend (the health-check masking class itself is config#2276 scope).",
+      "Comment": "Check data freshness after full pipeline — non-blocking (a failure degrades the completion email, it does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 timeout convention (both health-observe states): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded — it is a runaway bound, no longer a silent kill-and-skip); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout — time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call, which returns in <1s — pinned to inner+30 so the relation stays coherent if this ever flips to a .sync integration). Budget: executionTimeout raised 60→300 (config#2276): observed successful health_checker.py runs complete in ~2.7-2.8s (n=2 Success in the 30-day SSM history sampled 2026-07-11 — most runs FAILED sub-second on git-pull collisions, see CheckSaturdayHealthCheckStatus), so 300s is ~100x observed with headroom for S3-latency-bound freshness scans; under the poll loop a generous budget costs nothing on the happy path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3598,19 +3598,19 @@
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
           "executionTimeout": [
-            "60"
+            "300"
           ]
         },
         "TimeoutSeconds": 60
       },
-      "TimeoutSeconds": 90,
+      "TimeoutSeconds": 330,
       "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Health check failure is non-blocking — continue to notify",
-          "Next": "NotifyComplete",
+          "Comment": "config#2276: health-check failure is non-blocking but must be VISIBLE — set health_check_degraded (threads into the completion-email selection) and continue to the sibling substrate check (independent observability paths; both must run). Pre-fix this jumped straight to NotifyComplete: a crash here sent the plain real-run SUCCESS email AND silently skipped WeeklySubstrateHealthCheck, ReportCard and the Director.",
+          "Next": "SaturdayHealthCheckDegraded",
           "ResultPath": "$.health_check_error"
         }
       ],
@@ -3649,8 +3649,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Non-blocking — continue to substrate check even if freshness polling fails. SaturdayHealthCheck (artifact freshness) and WeeklySubstrateHealthCheck (row-driven inventory validation) are independent observability paths; both must run.",
-          "Next": "WeeklySubstrateHealthCheck",
+          "Comment": "config#2276: non-blocking but VISIBLE — a freshness-poll infra failure sets health_check_degraded, then continues to the substrate check (SaturdayHealthCheck artifact freshness and WeeklySubstrateHealthCheck row-driven inventory validation are independent observability paths; both must run). Pre-fix this continued WITHOUT any flag — the outcome was simply lost.",
+          "Next": "SaturdayHealthCheckDegraded",
           "ResultPath": "$.health_check_error"
         }
       ],
@@ -3661,11 +3661,52 @@
         "StandardErrorContent.$": "$.StandardErrorContent"
       },
       "ResultPath": "$.health_check_poll",
+      "Next": "CheckSaturdayHealthCheckStatus"
+    },
+    "CheckSaturdayHealthCheckStatus": {
+      "Type": "Choice",
+      "Comment": "config#2276: poll the freshness check to a TERMINAL status (mirrors the CheckMorningEnrichStatus wait-loop idiom, minus the re-issue gate — observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved on, so (a) a hung/failing health_checker.py was invisible (green email regardless — verified live: most 30-day invocations FAILED sub-second and every run still emailed plain SUCCESS), and (b) WeeklySubstrateHealthCheck was dispatched while this command's git pull still held the dashboard repo's ref lock — the two concurrent `git pull`s produced the recurring 'Cannot fast-forward to multiple branches' / 'cannot lock ref' failures observed 2026-06-19→07-11. Sequential-to-terminal polling fixes both structurally. Terminal non-Success (Failed / TimedOut / Cancelled — incl. executionTimeout expiry and delivery timeout) → health_check_degraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds (config#2274) backstops SSM control-plane pathology. $.health_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForSaturdayHealthCheck pins Status via its ResultSelector (config#2275 rule 3b).",
+      "Choices": [
+        {
+          "Variable": "$.health_check_poll.Status",
+          "StringEquals": "Success",
+          "Next": "WeeklySubstrateHealthCheck"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.health_check_poll.Status",
+              "StringEquals": "InProgress"
+            },
+            {
+              "Variable": "$.health_check_poll.Status",
+              "StringEquals": "Pending"
+            },
+            {
+              "Variable": "$.health_check_poll.Status",
+              "StringEquals": "Delayed"
+            }
+          ],
+          "Next": "SaturdayHealthCheckPollWait"
+        }
+      ],
+      "Default": "SaturdayHealthCheckDegraded"
+    },
+    "SaturdayHealthCheckPollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForSaturdayHealthCheck"
+    },
+    "SaturdayHealthCheckDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2276: the freshness health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckSaturdayHealthCheckStatus.Default). Mirrors the LibPinGateDegraded shape (config#2278): an SF-controlled boolean that threads into the completion-email selection (CheckGateDegradedNotify) so the run emails 'SUCCESS (health checks DEGRADED)' instead of the plain real-run SUCCESS. Specifics live on the execution record: $.health_check_error (Catch path) / $.health_check_poll (status path). Continues to the sibling substrate check — a degraded freshness check must not skip the independent substrate/ReportCard/Director tail.",
+      "Result": true,
+      "ResultPath": "$.health_check_degraded",
       "Next": "WeeklySubstrateHealthCheck"
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs to the success notifier, so a retry ladder would only delay completion, never protect spend.",
+      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (a failure degrades the completion email, it does not halt) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 — DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) — best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 — NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync — infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. Timeout convention + budget: see SaturdayHealthCheck's Comment — inner 240 (observed Success ~19-20s incl. the since-removed pip; ~12x headroom as a runaway bound), delivery 60, outer = inner + 30. The previous 240/180/240 set conflated the delivery timeout with an execution ceiling (inversion flagged by config#2276).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3676,27 +3717,26 @@
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
-            "pip install --quiet --upgrade -r requirements.txt",
             "trap 'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python -m nousergon_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log",
             "echo '--- constituents drift check ---' | tee -a /var/log/substrate-health-check.log",
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log || true"
+            "cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log"
           ],
           "executionTimeout": [
             "240"
           ]
         },
-        "TimeoutSeconds": 180
+        "TimeoutSeconds": 60
       },
-      "TimeoutSeconds": 240,
+      "TimeoutSeconds": 270,
       "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Substrate check failure is non-blocking — continue to notify. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure.",
-          "Next": "NotifyComplete",
+          "Comment": "config#2276: substrate-check failure is non-blocking but VISIBLE — set health_check_degraded and continue to the ReportCard/Director tail (Lambdas, independent of the dashboard box). Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure. Pre-fix this jumped straight to NotifyComplete: plain SUCCESS email, ReportCard + Director silently skipped.",
+          "Next": "SubstrateHealthCheckDegraded",
           "ResultPath": "$.substrate_check_error"
         }
       ],
@@ -3735,8 +3775,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Non-blocking — continue even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
-          "Next": "NotifyComplete",
+          "Comment": "config#2276: non-blocking but VISIBLE — a substrate-poll infra failure sets health_check_degraded, then continues to ReportCard. Row-level alarms still page on failure regardless of polling outcome.",
+          "Next": "SubstrateHealthCheckDegraded",
           "ResultPath": "$.substrate_check_error"
         }
       ],
@@ -3747,6 +3787,47 @@
         "StandardErrorContent.$": "$.StandardErrorContent"
       },
       "ResultPath": "$.substrate_check_poll",
+      "Next": "CheckSubstrateHealthCheckStatus"
+    },
+    "CheckSubstrateHealthCheckStatus": {
+      "Type": "Choice",
+      "Comment": "config#2276: poll the substrate check to a TERMINAL status — same shape and rationale as CheckSaturdayHealthCheckStatus (check-once masked a failing/hung checker AND raced the next consumer; see that state's Comment). A terminal non-Success lands on SubstrateHealthCheckDegraded. This is also where the constituents-drift sub-step became fail-VISIBLE (config#2276): its former `|| true` swallowed exit-1 (= alert-worthy Wikipedia-vs-ArcticDB drift, the exact 2026-05-23 BNY/P/SN incident surface) with no recording surface in the SF; now drift exit-1 fails the command → Status Failed → health_check_degraded → 'SUCCESS (health checks DEGRADED)' email, alongside the validator's own alerts.publish. $.substrate_check_poll.Status is safe un-guarded: sole predecessor WaitForWeeklySubstrateHealthCheck pins Status via ResultSelector (config#2275 rule 3b).",
+      "Choices": [
+        {
+          "Variable": "$.substrate_check_poll.Status",
+          "StringEquals": "Success",
+          "Next": "ReportCard"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.substrate_check_poll.Status",
+              "StringEquals": "InProgress"
+            },
+            {
+              "Variable": "$.substrate_check_poll.Status",
+              "StringEquals": "Pending"
+            },
+            {
+              "Variable": "$.substrate_check_poll.Status",
+              "StringEquals": "Delayed"
+            }
+          ],
+          "Next": "SubstrateHealthCheckPollWait"
+        }
+      ],
+      "Default": "SubstrateHealthCheckDegraded"
+    },
+    "SubstrateHealthCheckPollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForWeeklySubstrateHealthCheck"
+    },
+    "SubstrateHealthCheckDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2276: the substrate health check (or its constituents-drift sub-step) could not run to Success. Mirrors SaturdayHealthCheckDegraded / the LibPinGateDegraded shape (config#2278) — SF-controlled boolean into the completion-email selection. Shares $.health_check_degraded with the freshness twin DELIBERATELY (one flag family, one degraded Subject — which check degraded lives on the execution record: $.substrate_check_error / $.substrate_check_poll vs $.health_check_error / $.health_check_poll — avoiding a per-check combinatorial notifier explosion). Continues to ReportCard: the advisory Lambda tail is independent of the dashboard box and must not be skipped because an EC2 health command failed.",
+      "Result": true,
+      "ResultPath": "$.health_check_degraded",
       "Next": "ReportCard"
     },
     "ReportCard": {
@@ -3843,8 +3924,29 @@
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
-      "Comment": "config#2278: a green run that could not run its pre-spend gates must SAY SO in the completion email. gate_degraded is set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states (an SF-controlled boolean; IsPresent-guarded per config#2275). Routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing the flag into NotifyComplete — preserving config#1819's Subject/Message-are-constants invariant.",
+      "Comment": "config#2278 + config#2276: a green run that could not run its pre-spend gates (gate_degraded — set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states) and/or its tail health checks (health_check_degraded — set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states) must SAY SO in the completion email. Both are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first (both → gates-only → health-only); each routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete — preserving config#1819's Subject/Message-are-constants invariant. Composition note (config#2276): the two health checks share ONE flag (which check degraded lives on the execution record), so the enumeration is bounded at 3 degraded notifiers for the 2 flag families; a THIRD flag family should trigger a refactor to a data-driven degraded notifier, not a 7-way enumeration. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) — read it as the degraded-completion selector.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteGatesAndHealthDegraded"
+        },
         {
           "And": [
             {
@@ -3857,6 +3959,19 @@
             }
           ],
           "Next": "NotifyCompleteGatesDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.health_check_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteHealthDegraded"
         }
       ],
       "Default": "NotifyComplete"
@@ -3869,6 +3984,50 @@
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (pre-spend gates DEGRADED)",
         "Message": "All steps completed successfully — BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "End": true
+    },
+    "NotifyCompleteHealthDegraded": {
+      "Type": "Task",
+      "Comment": "config#2276: SUCCESS notifier for a run whose tail health checks were DEGRADED (crashed, timed out, or finished non-Success — including a fail-visible constituents-drift exit). Mirrors NotifyCompleteGatesDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (health checks DEGRADED)",
+        "Message": "All steps completed successfully — BUT a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "End": true
+    },
+    "NotifyCompleteGatesAndHealthDegraded": {
+      "Type": "Task",
+      "Comment": "config#2278 + config#2276: SUCCESS notifier for a run where BOTH the pre-spend gates failed open unchecked AND the tail health checks degraded — the Subject reflects both. Mirrors NotifyCompleteGatesDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (gates + health checks DEGRADED)",
+        "Message": "All steps completed successfully — BUT (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
