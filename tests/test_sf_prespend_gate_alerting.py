@@ -120,7 +120,16 @@ def test_gate_degraded_threads_into_completion_email(states):
     assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
 
     choice = states["CheckGateDegradedNotify"]
-    (rule,) = choice["Choices"]
+    # config#2276 extended this Choice with health_check_degraded rules
+    # (most-specific-first ordering, pinned in
+    # tests/test_sf_health_check_honesty_wiring.py). The gates-ONLY rule —
+    # exactly the two gate_degraded operands — must still exist and still
+    # route to the gates-degraded notifier.
+    rule = next(
+        r for r in choice["Choices"]
+        if [c["Variable"] for c in r.get("And", [])]
+        == ["$.gate_degraded", "$.gate_degraded"]
+    )
     guard, comparison = rule["And"]
     assert guard == {"Variable": "$.gate_degraded", "IsPresent": True}
     assert comparison == {"Variable": "$.gate_degraded", "BooleanEquals": True}
