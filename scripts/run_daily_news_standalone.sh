@@ -28,10 +28,22 @@ trap 'aws s3 cp "$LOG" "s3://alpha-engine-research/_ssm_logs/daily-news-standalo
 
 {
   echo "=== daily-news standalone run $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
-  # Refresh code + slim deps (best-effort).
-  git pull --ff-only origin main || true
-  git -C "$CONFIG_REPO" pull --ff-only origin main || true
-  .venv/bin/pip install -q -r requirements-daily-news.txt || true
+  # Refresh code + slim deps (fail-loud on checkout divergence, pip install failure).
+  # A diverged checkout makes ff-only fail forever with zero signal — must not
+  # silently continue. Use reset --hard after fetch to align with origin/main.
+  git fetch origin
+  git reset --hard origin/main
+
+  git -C "$CONFIG_REPO" fetch origin
+  git -C "$CONFIG_REPO" reset --hard origin/main
+
+  .venv/bin/pip install -q -r requirements-daily-news.txt
+
+  # Verify HEAD matches origin/main (divergence guard)
+  if ! git diff --quiet HEAD origin/main; then
+    echo "ERROR: post-reset HEAD does not match origin/main — checkout divergence detected" >&2
+    exit 1
+  fi
 } > "$LOG" 2>&1
 
 # Load runtime env (Polygon key, AWS creds, etc.). bash `source` handles both

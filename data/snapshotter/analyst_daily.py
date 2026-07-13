@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from nousergon_lib.sources import AnalystSnapshot, AnalystSource
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 
 logger = logging.getLogger(__name__)
 
@@ -177,28 +178,36 @@ def snapshot_universe(
         "n_source_calls_succeeded": 0,
         "n_tickers_with_zero_coverage": 0,
     }
-    for ticker in tickers:
-        snapshots = snapshot_one_ticker(ticker, sources)
-        stats["n_source_calls_attempted"] += len(sources)
-        stats["n_source_calls_succeeded"] += len(snapshots)
-        if not snapshots:
-            stats["n_tickers_with_zero_coverage"] += 1
-        if dry_run:
-            logger.info(
-                "[DRY RUN] would snapshot %s with %d sources",
-                ticker, len(snapshots),
+    # ``quiet_yfinance`` is pure-stdlib and demotes only the "yfinance"
+    # logger, so wrapping here is safe regardless of which adapters are in
+    # ``sources``. Without it, a delisted/unpriceable ticker anywhere in the
+    # universe makes yfinance log its own per-symbol ERROR — the same storm
+    # bug class fixed in ``collectors/prices.py`` (nousergon-data#455) and
+    # ``collectors/metron_market_data.py`` (config#1029); ``stats`` above
+    # (returned to the caller to log) is the aggregated coverage surface.
+    with quiet_yfinance():
+        for ticker in tickers:
+            snapshots = snapshot_one_ticker(ticker, sources)
+            stats["n_source_calls_attempted"] += len(sources)
+            stats["n_source_calls_succeeded"] += len(snapshots)
+            if not snapshots:
+                stats["n_tickers_with_zero_coverage"] += 1
+            if dry_run:
+                logger.info(
+                    "[DRY RUN] would snapshot %s with %d sources",
+                    ticker, len(snapshots),
+                )
+                stats["n_documents_written"] += 1
+                continue
+            write_snapshot_document(
+                ticker=ticker,
+                snapshot_date=snapshot_date,
+                snapshots=snapshots,
+                s3_client=s3_client,
+                bucket=bucket,
+                prefix=prefix,
             )
             stats["n_documents_written"] += 1
-            continue
-        write_snapshot_document(
-            ticker=ticker,
-            snapshot_date=snapshot_date,
-            snapshots=snapshots,
-            s3_client=s3_client,
-            bucket=bucket,
-            prefix=prefix,
-        )
-        stats["n_documents_written"] += 1
     return stats
 
 

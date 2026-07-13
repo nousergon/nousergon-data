@@ -52,6 +52,7 @@ import pandas as pd
 import requests
 
 from nousergon_lib.secrets import get_secret
+from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
 
@@ -1229,6 +1230,43 @@ def collect(
                 run_date, merge_stats["overwritten"], merge_stats["new_only"], len(records),
             )
 
+    # ── L1 cross-source OBSERVER annotation (config#1277 Option A) ───────────
+    # Additively tag each settled cell with its cross-source agreement status +
+    # provenance WITHOUT changing the value the source-priority coalesce chose:
+    # single-source-per-mode cells record SINGLE_SOURCE_PROVISIONAL; a bounded
+    # high-value set (default SPY) gets a real 2nd-source cross-check
+    # (AGREED/QUARANTINED). Quarantines are surfaced loudly for L4/paging but the
+    # value is NOT withheld here (observer-only per the operator's 2026-07-08
+    # Option-A ruling). Fully fail-soft: never raises into ingestion, never
+    # mutates Close/source — the recorded disagreement rate sizes the cost of
+    # full L1 enforcement (the deferred Option B/C decision).
+    xsource_summary: dict = {}
+    try:
+        from sources.cross_source_gate import gate_settled_close
+        from collectors.cross_source_observer import annotate_records
+        records, xsource_summary = annotate_records(
+            records, run_date, source_mode=source,
+            cross_check_fetch=(None if dry_run else gate_settled_close),
+        )
+        if xsource_summary.get("quarantined"):
+            logger.error(
+                "L1 OBSERVER: %d cross-checked cell(s) QUARANTINED for %s (source=%s) "
+                "— recorded observer-only (value NOT withheld per config#1277 Option A); "
+                "investigate before downstream NAV/PnL trusts these: %s",
+                len(xsource_summary["quarantined"]), run_date, source,
+                xsource_summary["quarantined"],
+            )
+        logger.info(
+            "L1 OBSERVER %s (source=%s): status_counts=%s cross_checked=%d errors=%d",
+            run_date, source, xsource_summary.get("status_counts"),
+            xsource_summary.get("cross_checked", 0), xsource_summary.get("errors", 0),
+        )
+    except Exception as exc:  # observer must never break ingestion
+        logger.warning(
+            "L1 OBSERVER annotation skipped for %s (source=%s): %s", run_date, source, exc
+        )
+        xsource_summary = {"error": str(exc)}
+
     closes_df = pd.DataFrame(records).set_index("ticker")
     logger.info(
         "Daily closes: %d tickers for %s source=%s (polygon=%d, fred=%d, yfinance=%d)",
@@ -1262,6 +1300,7 @@ def collect(
             "source": source,
             "corporate_actions": explained_actions,
             "unexplained_discrepancies": unexplained_discrepancies,
+            "xsource_observer": xsource_summary,
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1288,6 +1327,7 @@ def collect(
             "source": source,
             "corporate_actions": explained_actions,
             "unexplained_discrepancies": unexplained_discrepancies,
+            "xsource_observer": xsource_summary,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -2166,12 +2206,22 @@ def _fetch_fred_closes(
     return count
 
 
+@yf_quiet
 def _fetch_yfinance_closes(
     tickers: list[str],
     date_str: str,
     records: list[dict],
 ) -> int:
-    """Fetch closes from yfinance for tickers not covered by polygon."""
+    """Fetch closes from yfinance for tickers not covered by polygon.
+
+    Runs under ``yf_quiet`` (nousergon_lib.yfinance_quiet): a delisted/renamed
+    ticker (e.g. JHG, BLD 2026-07-10) makes yfinance log its own per-symbol
+    "possibly delisted" ERROR, which Flow Doctor turns into one report per
+    symbol per worded variant — the same recurring bug class already fixed in
+    ``collectors/prices.py`` (nousergon-data#455) and
+    ``collectors/metron_market_data.py`` (config#1029). The replacement
+    recording surface is the aggregated ``log_yf_coverage`` call below.
+    """
     try:
         import yfinance as yf
     except ImportError:
@@ -2179,6 +2229,7 @@ def _fetch_yfinance_closes(
         return 0
 
     count = 0
+    covered: set[str] = set()
     batches = [tickers[i:i + _YFINANCE_BATCH_SIZE]
                for i in range(0, len(tickers), _YFINANCE_BATCH_SIZE)]
 
@@ -2235,10 +2286,12 @@ def _fetch_yfinance_closes(
                         "source": "yfinance",
                     })
                     count += 1
+                    covered.add(ticker)
                 except Exception as e:
                     logger.warning("yfinance close extract failed for %s: %s", ticker, e)
         except Exception as e:
             logger.warning("yfinance batch failed: %s", e)
 
     logger.info("yfinance fallback: %d/%d tickers captured", count, len(tickers))
+    log_yf_coverage(logger, "daily_closes", tickers, covered)
     return count

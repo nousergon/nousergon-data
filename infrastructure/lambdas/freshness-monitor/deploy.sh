@@ -109,21 +109,10 @@ fi
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PKG=$(mktemp -d)
-TEST_PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 echo "Installing runtime deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
-
-# Host-side pytest imports the handler against real lib code — must use
-# macOS wheels. Docker pip targets linux/amd64 for Lambda only (#621).
-echo "Installing host test deps into ${TEST_PKG} (macOS pip for pytest gate)..."
-python3 -m pip install \
-  --quiet \
-  --target "${TEST_PKG}" \
-  --upgrade \
-  -r "${SCRIPT_DIR}/requirements.txt"
 
 # ----- 1a. Validate registry locally before upload --------------------------
 # Runs AFTER step 1's pip install — the validator imports yaml which isn't
@@ -136,18 +125,12 @@ if ! $CODE_ONLY; then
 fi
 
 # ----- 1b. Preflight handler unit tests with runtime deps available --------
-# Runs AFTER step 1's pip install so the test's `import index` succeeds
-# (index imports yaml + boto3 + nousergon_lib.{alerts,artifact_freshness}
-# — none of which are guaranteed in the caller's bare python). pytest +
-# its deps install into $TEST_DEPS (separate from $PKG) so they don't
-# get bundled into the Lambda zip.
-
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
-  echo "Running handler unit tests (PYTHONPATH=${TEST_PKG}:${TEST_DEPS})..."
-  PYTHONPATH="${TEST_PKG}:${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# The test does a REAL `import index` (yaml + boto3 + nousergon_lib.{alerts,
+# artifact_freshness}), so the shared gate provisions the lambda's own
+# requirements.txt alongside pytest into its own scratch dir (config#2381) —
+# host wheels, NOT bundled into the Lambda zip.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" -r "${SCRIPT_DIR}/requirements.txt"
 
 # ----- 1c. Copy handler + zip Lambda package -------------------------------
 

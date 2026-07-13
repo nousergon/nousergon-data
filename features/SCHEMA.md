@@ -212,6 +212,29 @@ re-standardization follow the Barra USE4 / AQR convention so a single
 outlier ticker cannot dominate the downstream factor-return regression
 (C.2, alpha-engine-predictor).
 
+**`roe_zscore` known-degenerate (config#1765, open).** Live `roe` is
+clip-saturated at its `[-1, 1]` bound for ~98% of the universe (median
+`roe` == 1.0), which collapses `roe_zscore` to all-NaN everywhere
+(`apply_factor_zscores`'s MAD-degeneracy guard correctly refuses to
+fabricate a z-score from a near-constant cross-section — this is NOT a
+bug in this module). Root cause traced to `collectors/fundamentals.py`
+(`_fetch_single_ticker`): its Finnhub field mapping assumes `roeTTM` /
+`roeRfy` (and several other fields — `gross_margin`, `revenue_growth_yoy`,
+`revenue_growth_3y`, `eps_growth_3y`, `payout_ratio`, `dividend_yield`
+show the same saturation pattern) are 0–1 fractions, but the live
+`archive/fundamentals/{date}.json` payloads are consistent with Finnhub
+returning those fields as raw percentages (e.g. `62` meaning 62%, not
+`0.62`) — every one of them saturates at its declared clip bound for
+the bulk of the 903-ticker universe. Fixing the unit scaling needs a
+live Finnhub payload to confirm the exact conversion per field (not
+done here — out of scope for the config#1765 groom pass, which only
+covers the predictor-side symptom). Until this collector bug is fixed,
+`alpha-engine-predictor/training/risk_model_persist.py` pins a 7-factor
+`FACTOR_LOADING_COLUMNS` set that excludes `roe_zscore` (QUALITY
+loading) so the weekly F/D persistence isn't blocked on a permanently
+all-NaN column. Re-add `roe_zscore` to that set once `roe` is a real,
+non-degenerate cross-section again.
+
 | Field | Units | Compute | Consumers |
 |---|---|---|---|
 | `momentum_20d_zscore` | z-score (`_zscore` suffix) | Cross-sectional z of `momentum_20d`, ±3σ winsorized | executor (Barra MOMENTUM short-horizon, C.3) |

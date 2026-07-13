@@ -1,5 +1,0 @@
-# boto3 is provided by the Lambda python3.12 runtime; pinned here for an
-# explicit, reproducible package build (mirrors the watch-dispatcher sibling).
-# No alpha-engine/nousergon lib dependency — this Lambda only reads one SSM
-# parameter and POSTs a repository_dispatch via urllib.
-boto3>=1.34.0

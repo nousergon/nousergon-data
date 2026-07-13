@@ -84,6 +84,7 @@ from collectors import constituents, historical_constituents, prices, macro, uni
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
+    write_price_cache_freshness_sentinel as _write_price_cache_freshness_sentinel,
 )
 from dates import default_run_date  # config#1014: trading-day-axis default
 
@@ -366,6 +367,18 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 ),
                 supports_auto_skip=False,
             )
+            # config#2350 — reference/price_cache/ is variable cardinality
+            # (grandfathered in ARTIFACT_REGISTRY.yaml) so this unconditional
+            # sentinel is the ordinary-S3-ArtifactSpec proxy the freshness
+            # monitor actually probes (price_cache_freshness_sentinel row),
+            # mirroring the config#1787 feature-store sentinel. Written on
+            # every successful (non-dry-run) weekly refresh, independent of
+            # how many tickers were actually stale.
+            if not dry_run and results["collectors"]["prices"].get("status") == "ok":
+                _write_price_cache_freshness_sentinel(
+                    boto3.client("s3"), bucket,
+                    writer="nousergon-data:weekly_collector.py",
+                )
 
     # ── 3. Slim cache — REMOVED (Wave-4) ─────────────────────────────────────
     # predictor/price_cache_slim/ deleted: every consumer (data macro-breadth

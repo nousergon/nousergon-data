@@ -20,15 +20,17 @@ not a hypothetical one):
   * `infrastructure/cloudformation/alpha-engine-orchestration.yaml` —
     declares `LoggingConfiguration` for the two CFN-owned state machines
     (`SaturdayPipeline` / `ne-weekly-freshness-pipeline` and
-    `WeekdayPipeline` / `ne-preopen-trading-pipeline`). The CFN comment on
-    those resources spells out why this is safe from the deploy-vs-drift
-    trap: the deploy script's `update-state-machine` call passes only
-    `--definition`, so it never wipes this CFN-set config.
+    `WeekdayPipeline` / `ne-preopen-trading-pipeline`). Since config#2273
+    the deploy scripts ALSO pass `--logging-configuration` explicitly on
+    every `update-state-machine` call, mirroring these CFN-declared shapes
+    — so an update self-heals a recreate-dropped config rather than
+    relying on partial-update preservation; this script remains the
+    backstop for out-of-band drift.
   * `infrastructure/deploy-infrastructure.sh` — the EOD SF
     (`ne-postclose-trading-pipeline`) is NOT in CloudFormation (script-
     managed); its `EOD_LOGGING_CONFIG` literal there is the source of truth,
     passed explicitly on every `update-state-machine` / `create-state-machine`
-    call. The backlog-groom SF (`alpha-engine-groom-pipeline`) is also
+    call. The backlog-groom SF (`alpha-engine-groom-dispatch`) is also
     script-managed but its `update_or_create` call deliberately omits a
     logging arg ("preserving its current no-logging behavior exactly", per
     that script's comment) — so this guard's codified expectation for groom

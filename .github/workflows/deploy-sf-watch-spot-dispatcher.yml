@@ -1,0 +1,87 @@
+name: Deploy sf-watch-spot-dispatcher
+
+# Auto-deploy the alpha-engine-sf-watch-spot-dispatcher Lambda CODE on merge
+# to main. Mirrors deploy-ci-watch-dispatcher.yml — same gap, same fix: a
+# merged code fix must not sit inert until someone remembers to run deploy.sh
+# by hand. This closes that gap for the CODE path only.
+#
+# Separation of concerns: this deploys CODE only (deploy.sh with NO flag —
+# this script's default/flagless run IS already code-only; --bootstrap is
+# what ADDS the IAM-role-creation + Lambda-function-creation on top, not the
+# reverse). Same shape as ci-watch-dispatcher's: no Step Function and no
+# EventBridge Scheduler rules to keep operator-only — it's invoked
+# synchronously by a GHA job in alpha-engine-config's sf-watch.yml, so there
+# is no schedule/cadence surface for this workflow to ever need to touch. The
+# github-actions-lambda-deploy OIDC role deliberately has no iam:CreateRole /
+# iam:PutRolePolicy (fleet-wide policy after 4 IAM-clobber incidents in 2
+# months; see infrastructure/iam/README.md) — an IAM/profile change still
+# requires an operator to run `deploy.sh --bootstrap` by hand.
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# deploy.json), which already includes this function.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/sf-watch-spot-dispatcher/**'
+      - '.github/workflows/deploy-sf-watch-spot-dispatcher.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-sf-watch-spot-dispatcher-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy sf-watch-spot-dispatcher Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Deploy sf-watch-spot-dispatcher (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/sf-watch-spot-dispatcher/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-sf-watch-spot-dispatcher \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-sf-watch-spot-dispatcher.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
