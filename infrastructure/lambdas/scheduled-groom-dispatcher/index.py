@@ -324,7 +324,7 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
 def _resolve_pr_budget(event: dict) -> int | None:
     """Optional per-schedule PR budget override (config#1769).
 
-    Only the Opus high-only schedule sets this today; missing/invalid → None
+    Only the dedicated high-only schedule sets this today; missing/invalid → None
     (groom_spot_bootstrap.sh's GROOM_PR_BUDGET default of 50 applies).
     """
     raw = event.get("pr_budget")
@@ -468,12 +468,25 @@ def _running_tier_instance_ids(tier_tag: str) -> list[str]:
     for a lane is still running when the next trigger re-evaluates the same
     lane. Fail-safe: any API error returns ``[]`` (never blocks a launch on a
     broken check — this guard is an optimization, not a correctness gate,
-    mirroring every other pre-launch gate in this file)."""
-    return spot_dispatch.running_instance_ids(
-        "alpha-engine-groom-spot",
-        {GROOM_TIER_TAG_KEY: tier_tag},
-        region=REGION,
-    )
+    mirroring every other pre-launch gate in this file). config#2267 (lib
+    v0.106.0): ``spot_dispatch.running_instance_ids`` now RAISES
+    ``SpotProbeError`` instead of fail-open-returning ``[]`` itself (closing a
+    different gap for callers that want to KNOW a probe failed); this caller
+    still wants fail-SAFE for launch-blocking purposes, so it catches here and
+    logs loudly instead of silently swallowing."""
+    try:
+        return spot_dispatch.running_instance_ids(
+            "alpha-engine-groom-spot",
+            {GROOM_TIER_TAG_KEY: tier_tag},
+            region=REGION,
+        )
+    except spot_dispatch.SpotProbeError as exc:
+        logger.warning(
+            "concurrency probe failed for tier_tag=%s — failing safe, NOT "
+            "blocking this launch (guard is an optimization, not a "
+            "correctness gate): %s", tier_tag, exc,
+        )
+        return []
 
 
 def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
@@ -932,11 +945,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
+    "claude-sonnet-5", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
     (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
-    `pr_budget` is set only on the Opus high-only schedule (config#1769).
+    `pr_budget` is set only on the dedicated high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
     `queue_manifest_key` (config#2152/#2175) marks an explicit operator queue
@@ -1106,7 +1119,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 return {"groom": skip}
             # Launch with the DECIDED bundle + cheapest adequate model — the
             # schedule's model is only the slot default; high never runs
-            # below Opus, and a bundle without high never pays for it.
+            # below its own tier's model, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
             model = decision.model
             logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",

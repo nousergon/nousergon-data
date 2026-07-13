@@ -99,8 +99,9 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.104.0",
-        "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129)",
+        "v0.109.0",
+        "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
+        "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409)",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",
