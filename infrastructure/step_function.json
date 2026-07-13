@@ -923,6 +923,43 @@
                 }
               ],
               "ResultPath": "$.scanner_result",
+              "Next": "ThinkTankCoverage"
+            },
+            "ThinkTankCoverage": {
+              "Type": "Task",
+              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-60 coverage gaps (new theses for uncovered names + stalest refresh). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-thinktank:live",
+                "Payload": {
+                  "mode": "sf_cover",
+                  "sf_cover_target": 60,
+                  "sf_cover_ceiling": 60,
+                  "run_date.$": "$.run_date"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion.",
+                  "Next": "CheckSkipRAGIngestion",
+                  "ResultPath": "$.thinktank_error"
+                }
+              ],
+              "ResultPath": "$.thinktank_result",
               "Next": "CheckSkipRAGIngestion"
             },
             "CheckSkipRAGIngestion": {
