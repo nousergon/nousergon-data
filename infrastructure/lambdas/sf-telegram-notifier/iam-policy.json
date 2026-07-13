@@ -27,7 +27,10 @@
       "Sid": "DescribeExecutionForFailureCause",
       "Effect": "Allow",
       "Action": ["states:DescribeExecution", "states:GetExecutionHistory"],
-      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-*:*"
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-*:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-*:*"
+      ]
     },
     {
       "Sid": "ArtifactAttestationRead",
