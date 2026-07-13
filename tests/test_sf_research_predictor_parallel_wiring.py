@@ -60,7 +60,7 @@ _BRANCH_A_STATES = {
     # RegimeRetrospectiveEval chain was relocated FROM top level INTO
     # Branch A's head (Scanner is Branch A's StartAt) so PredictorTraining
     # (Branch B) forks parallel to it directly after DataPhase1.
-    "Scanner", "CheckSkipRAGIngestion", "RAGIngestion",
+    "Scanner", "ThinkTankCoverage", "CheckSkipRAGIngestion", "RAGIngestion",
     "WaitForRAGIngestion", "CheckRAGIngestionStatus", "RAGIngestionWait",
     "RAGIngestionRetryGate", "RAGIngestionReissue", "ExtractRAGIngestionError",
     "CheckSkipRegimeSubstrate", "RegimeSubstrate",
@@ -840,7 +840,7 @@ class TestInboundRewireAndDownstreamUnchanged:
         (and its skip-gate + non-blocking Catch) continue to
         CheckSkipResearch IN-BRANCH — never the parent Parallel (invalid
         branch→parent) nor top-level HandleFailure (cross-branch cancel)."""
-        assert branch_a["Scanner"]["Next"] == "CheckSkipRAGIngestion"
+        assert branch_a["Scanner"]["Next"] == "ThinkTankCoverage"
         assert (
             branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
         )
