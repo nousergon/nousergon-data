@@ -261,20 +261,33 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-weekday
-      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC). At the old
-      # 06:00 start the daemon was ready ~31–32 min later (06:31–06:32 PT)
-      # even on SUCCESSFUL runs — i.e. the order book/daemon was ~1–2 min
-      # LATE for the 06:30 PT open every single day. Combined with the
-      # alpha-engine-data#264 MorningEnrich speedup (~−12 min, no longer
-      # flirting with the 30-min SSM timeout), a 05:45 start gives ~22 min
-      # expected / ~32 min P99 to daemon-ready → ready ≤ 06:17 PT at the
-      # 99th percentile, comfortably before the 06:30 open with margin.
-      # NOTE (pre-existing, unchanged here): the UTC expression assumes
-      # PDT (UTC−7); during PST the effective PT start shifts an hour.
-      # That DST caveat predates this change and is intentionally left
-      # as-is — out of scope for the start-time fix.
-      Description: Weekday 12:45 UTC (5:45 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
-      ScheduleExpression: 'cron(45 12 ? * MON-FRI *)'
+      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC) — bought a
+      # 13-min P99 buffer (daemon-ready ≤06:17 PT vs 06:30 open). That buffer
+      # has since been consumed by added stages (CodeFreshnessGate, predictor
+      # health/drift checks, chronic-gap self-heal): live SF history for
+      # 2026-07-09/07-10/07-13 (all SUCCEEDED on the first scheduled attempt)
+      # shows RunDaemon completing 06:31:45–06:34:15 PT — 2–4 min AFTER the
+      # 06:30 PT open every time, not a one-off. State-level breakdown shows
+      # PollMorningArcticAppendSpot alone consuming ~36–38 min (~75% of the
+      # ~46–49 min total run) — a known/expected duration already documented
+      # in alpha-engine-data's data-spot-dispatcher MAX_RUNTIME_SECONDS
+      # comment, not a defect to fix here. 2026-07-13: moved 05:45 → 05:15 PT
+      # (30-min buffer above the observed ceiling vs the 13-min buffer the
+      # 05:45 change relied on) to absorb the same kind of stage-creep
+      # without needing another manual bump every ~2 months. See
+      # nousergon/alpha-engine-config#2412 (tracked follow-up: early-warning
+      # canary so buffer erosion pages automatically instead of being
+      # noticed anecdotally) and #2413 (migrate this rule to
+      # AWS::Scheduler::Schedule for real DST-timezone awareness, matching
+      # StopTradingSchedule below).
+      # NOTE (pre-existing, unchanged here): AWS::Events::Rule cron
+      # expressions are UTC-only (no ScheduleExpressionTimezone support,
+      # unlike AWS::Scheduler::Schedule) — the UTC expression assumes PDT
+      # (UTC−7); during PST the effective PT start shifts an hour earlier
+      # (i.e. MORE buffer, not less). That DST caveat predates this change;
+      # #2413 is the tracked fix.
+      Description: Weekday 12:15 UTC (5:15 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
+      ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
       State: ENABLED
       Targets:
         # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
