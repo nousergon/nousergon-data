@@ -62,7 +62,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # rag/pipelines/ ingest-side scripts are scope-exempt — they write
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
-    "builders/_price_cache_writeboth.py": 1,
+    # 2nd PUT site (config#2350): write_price_cache_freshness_sentinel's
+    # put_object → reference/price_cache/_freshness.json, the producer-written
+    # freshness-monitor proxy for the variable-cardinality reference/price_cache/
+    # prefix. Registered as price_cache_freshness_sentinel in alpha-engine-config
+    # private-docs/ARTIFACT_REGISTRY.yaml. Mirrors the feature_store_freshness_sentinel
+    # addition to builders/daily_append.py (config#1787).
+    "builders/_price_cache_writeboth.py": 2,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
