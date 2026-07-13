@@ -124,6 +124,14 @@
       }
     },
     {
+      "Sid": "HeadPredictorWeightsManifest",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/predictor/weights/meta/manifest.json"
+    },
+    {
       "Sid": "AgentTelemetryMetrics",
       "Effect": "Allow",
       "Action": [

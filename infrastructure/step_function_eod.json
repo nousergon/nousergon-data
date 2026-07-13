@@ -215,7 +215,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $.run_date))",
           "executionTimeout": [
             "120"
           ]
@@ -261,6 +261,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],
@@ -337,7 +346,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'set -a && source /home/ec2-user/.alpha-engine.env && set +a', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $.run_date))",
           "executionTimeout": [
             "600"
           ]
@@ -382,6 +391,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],
@@ -452,7 +470,7 @@
     },
     "DailySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 → 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (alerts on failure but does not halt pipeline) — same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed.",
+      "Comment": "Phase 2 → 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (a failure degrades visibly — see SubstrateHealthCheckDegraded — it does not halt the cost-guard tail) — same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed. config#2326 — NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync — infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. config#2326 timeout convention (mirrors config#2276's weekly-SF fix): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout — time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call). Budget: executionTimeout kept at 180 (daily-cadence subset of rows; observed comparable to or faster than the Sat SF's --cadence weekly sweep now that pip is removed) — the previous 180/180/240 set conflated the delivery timeout with an execution ceiling (the same inversion config#2276 flagged on the weekly SF).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -463,7 +481,6 @@
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
-            "pip install --quiet --upgrade -r requirements.txt",
             "trap 'aws s3 cp /var/log/substrate-health-check-daily.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check-daily/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
             "python -m nousergon_lib.transparency --cadence daily --alert 2>&1 | tee /var/log/substrate-health-check-daily.log"
           ],
@@ -471,16 +488,16 @@
             "180"
           ]
         },
-        "TimeoutSeconds": 180
+        "TimeoutSeconds": 60
       },
-      "TimeoutSeconds": 240,
+      "TimeoutSeconds": 210,
       "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Substrate check failure is non-blocking — continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement: trading EC2 must always stop, regardless of substrate-check outcome.",
-          "Next": "StopTradingInstance",
+          "Comment": "config#2326: substrate-check failure is non-blocking but VISIBLE — set health_check_degraded and publish a best-effort alert (SubstrateHealthCheckDegraded), then continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement UNCHANGED: trading EC2 must always stop, regardless of substrate-check outcome — the degraded path still terminates at StopTradingInstance, never HandleFailure.",
+          "Next": "SubstrateHealthCheckDegraded",
           "ResultPath": "$.substrate_check_error"
         }
       ],
@@ -503,6 +520,15 @@
           "MaxAttempts": 5,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -510,8 +536,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Non-blocking — continue to StopTradingInstance even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
-          "Next": "StopTradingInstance",
+          "Comment": "config#2326: non-blocking but VISIBLE — a substrate-poll infra failure sets health_check_degraded (via SubstrateHealthCheckDegraded) then continues to StopTradingInstance. Row-level alarms still page on failure regardless of polling outcome.",
+          "Next": "SubstrateHealthCheckDegraded",
           "ResultPath": "$.substrate_check_error"
         }
       ],
@@ -523,6 +549,69 @@
         "InstanceId.$": "$.InstanceId"
       },
       "ResultPath": "$.substrate_check_poll",
+      "Next": "CheckDailySubstrateHealthCheckStatus"
+    },
+    "CheckDailySubstrateHealthCheckStatus": {
+      "Type": "Choice",
+      "Comment": "config#2326: poll the daily substrate check to a TERMINAL status (mirrors the weekly SF's CheckSubstrateHealthCheckStatus / config#2276 CheckMorningEnrichStatus idiom, minus the re-issue gate — observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved straight to StopTradingInstance, so a hung/failing health checker was invisible (green cost-guard shutdown regardless). Terminal non-Success (Failed / TimedOut / Cancelled — incl. executionTimeout expiry) → SubstrateHealthCheckDegraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds backstops SSM control-plane pathology. $.substrate_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForDailySubstrateHealthCheck pins Status via its ResultSelector.",
+      "Choices": [
+        {
+          "Variable": "$.substrate_check_poll.Status",
+          "StringEquals": "Success",
+          "Next": "StopTradingInstance"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.substrate_check_poll.Status",
+              "StringEquals": "InProgress"
+            },
+            {
+              "Variable": "$.substrate_check_poll.Status",
+              "StringEquals": "Pending"
+            },
+            {
+              "Variable": "$.substrate_check_poll.Status",
+              "StringEquals": "Delayed"
+            }
+          ],
+          "Next": "DailySubstrateHealthCheckPollWait"
+        }
+      ],
+      "Default": "SubstrateHealthCheckDegraded"
+    },
+    "DailySubstrateHealthCheckPollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForDailySubstrateHealthCheck"
+    },
+    "SubstrateHealthCheckDegraded": {
+      "Type": "Pass",
+      "Comment": "config#2326 (mirrors the weekly SF's SubstrateHealthCheckDegraded / config#2276): the daily substrate health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckDailySubstrateHealthCheckStatus.Default). An SF-controlled boolean recorded on the execution record. Unlike the weekly SF, the EOD SF has NO success-path SNS notifier to thread this flag into (audited in test_sf_notifier_totality_wiring.py — PipelineComplete-equivalent tail here is just the cost-guard instance stop), so visibility here is a DEDICATED best-effort SNS publish (PublishSubstrateHealthCheckDegradedAlert) mirroring the existing fail-open PublishDataSpotFailureImmediate idiom in this same file, rather than silence. Continues to StopTradingInstance — the cost-guard shutdown must never be delayed or skipped by a health-check degradation.",
+      "Result": true,
+      "ResultPath": "$.health_check_degraded",
+      "Next": "PublishSubstrateHealthCheckDegradedAlert"
+    },
+    "PublishSubstrateHealthCheckDegradedAlert": {
+      "Type": "Task",
+      "Comment": "config#2326: best-effort SNS alert that the EOD daily substrate health check degraded (crashed, timed out, or finished non-Success) — surfaces the miss WITHOUT blocking the cost-guard instance stop. Message is a HARDCODED CONSTANT (config#1819 convention: never States.Format a Subject; here Message is also kept constant rather than conditionally dereferencing $.substrate_check_error / $.substrate_check_poll, which are set by DIFFERENT predecessors — a Catch path sets only the former, a terminal-status path only the latter, and States.Format on a field absent from a given path's payload raises States.Runtime, which would itself dodge the cost-guard). The execution record still carries whichever of the two fields fired; operators cross-reference the SF console. Its own Catch also routes to StopTradingInstance so even an SNS-side failure cannot delay/block the cost-guard.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Substrate Health Check — DEGRADED (fail-open, shutdown continues)",
+        "Message": "The EOD daily substrate health check (nousergon_lib.transparency --cadence daily) degraded — it crashed, timed out, or its SSM command finished non-Success — but the pipeline continued to instance-stop (fail-open, config#2326). Per-row CloudWatch alarms independently page on row-level failures; this alert covers the SSM/infra-level failure class those alarms don't see. Detail is on the execution record ($.substrate_check_error and/or $.substrate_check_poll) — view at https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.substrate_health_check_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819-style: a best-effort alert publish failure must never delay/block the cost-guard instance stop.",
+          "ResultPath": "$.substrate_health_check_degraded_notify_error",
+          "Next": "StopTradingInstance"
+        }
+      ],
       "Next": "StopTradingInstance"
     },
     "CheckSkipRefreshExecutorDeploy": {
@@ -555,7 +644,7 @@
     },
     "RefreshExecutorDeploy": {
       "Type": "Task",
-      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status → HandleFailure → ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765).",
+      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status → HandleFailure → ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against — this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here — mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly — keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -564,7 +653,8 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
-            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1"
+            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1",
+            "sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'"
           ],
           "executionTimeout": [
             "600"
@@ -611,6 +701,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],
@@ -771,6 +870,15 @@
           "MaxAttempts": 10,
           "IntervalSeconds": 10,
           "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
         }
       ],
       "Catch": [
@@ -886,6 +994,15 @@
           ],
           "MaxAttempts": 10,
           "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
           "BackoffRate": 1.5
         }
       ],

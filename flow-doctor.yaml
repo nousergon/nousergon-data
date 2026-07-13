@@ -27,8 +27,18 @@ notify:
     subsystem: data_pipeline
     default_root_cause_category: code_bug
 store:
-  type: sqlite
-  path: /tmp/flow_doctor.db
+  # DynamoDB, not local SQLite — dedup cooldowns must survive across
+  # separate process/instance/Lambda invocations, which /tmp SQLite
+  # cannot. Without this, every fresh invocation starts with an empty
+  # dedup store and re-alerts on the same signature (observed 2026-07-13:
+  # 8 duplicate L1-observer quarantine emails for one cell in 2 minutes).
+  # Table provisioned out-of-band (PAY_PER_REQUEST, matches
+  # flow_doctor.storage.dynamodb.DynamoDBStorage.init_schema's schema);
+  # runtime role only needs CRUD, not CreateTable — see
+  # infrastructure/iam/alpha-engine-data-role.json.
+  type: dynamodb
+  table_name: flow-doctor-store
+  region: us-east-1
 dedup_cooldown_minutes: 60
 rate_limits:
   max_alerts_per_day: 10

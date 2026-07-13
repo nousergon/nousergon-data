@@ -22,6 +22,7 @@ import io
 import json
 import os
 import sys
+import types
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -31,6 +32,108 @@ import pytest
 # Make the Lambda handler importable.
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# ── Hermetic guard (config#2208) ────────────────────────────────────────────
+# 2026-07-11 incident: this suite's per-test `monkeypatch.setattr(index,
+# "notify_via_flow_doctor", ...)` convention had one gap —
+# test_handler_per_spec_exception_does_not_sink_pass enables
+# FRESHNESS_MONITOR_ENABLED=true but never re-stubbed the notifier after its
+# `importlib.reload(index)`, so the REAL flow_doctor_telegram.notify_via_
+# flow_doctor ran whenever this file was exercised with live AWS/Telegram
+# credentials ambient (laptop, EC2 box) — paging the live ops-health
+# Telegram channel with fixture data (probe_bad_template / probe_missing).
+#
+# Fix, mirroring scheduled-groom-dispatcher's `_install_stubs` fleet
+# pattern: replace `flow_doctor_telegram` in sys.modules with a safe no-op
+# BEFORE any test's `import index` (or `importlib.reload(index)`) runs. Since
+# index.py re-executes `from flow_doctor_telegram import
+# notify_via_flow_doctor` on every reload, every reload re-binds to this
+# no-op — a test can no longer reach the real notifier just by forgetting a
+# monkeypatch. Individual tests still layer their own tracked Mock on top via
+# `monkeypatch.setattr(index, "notify_via_flow_doctor", ...)` to assert on
+# call args (dedup_key, severity, ...); that is a deliberate override for
+# assertions, not a gap this stub needs to anticipate.
+#
+# `_real_flow_doctor_telegram` keeps a handle on the REAL module (captured
+# before it's replaced below) so the deterministic owner_repo backstop added
+# alongside this fix can be tested directly, in isolation from this file's
+# stub.
+import flow_doctor_telegram as _real_flow_doctor_telegram  # noqa: E402
+
+_fdt_stub = types.ModuleType("flow_doctor_telegram")
+_fdt_stub.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+sys.modules["flow_doctor_telegram"] = _fdt_stub
+
+
+# ── Hermetic guard regression coverage (config#2208) ────────────────────────
+
+
+def test_notify_via_flow_doctor_is_hermetically_stubbed_by_default():
+    """Regression guard for the 2026-07-11 incident: even a fresh
+    ``importlib.reload(index)`` — with no per-test monkeypatch applied at
+    all — must bind ``index.notify_via_flow_doctor`` to this file's no-op
+    stub, never to the real ``flow_doctor_telegram.notify_via_flow_doctor``
+    (which reaches live Telegram). This is what makes every test in this
+    file safe by construction, not by every author remembering to stub."""
+    import importlib
+    import index
+
+    importlib.reload(index)
+    assert index.notify_via_flow_doctor is _fdt_stub.notify_via_flow_doctor
+    assert index.notify_via_flow_doctor is not _real_flow_doctor_telegram.notify_via_flow_doctor
+
+
+def test_real_notify_via_flow_doctor_refuses_test_namespace_owner_repo(monkeypatch):
+    """Deterministic belt (config#2208 optional backstop): the REAL
+    ``notify_via_flow_doctor`` — exercised directly here via the reference
+    saved before this file's module stub replaced ``sys.modules
+    ["flow_doctor_telegram"]`` — refuses to dispatch when ``context
+    ["owner_repo"]`` is a test-fixture namespace, before it ever reaches
+    flow-doctor init or the ``send_message`` fallback. Covers both fixture
+    owner_repo values seen in the 2026-07-11 incident."""
+    get_fd_mock = mock.Mock(side_effect=AssertionError("must not init flow-doctor"))
+    send_message_mock = mock.Mock(side_effect=AssertionError("must not fall back to send_message"))
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", get_fd_mock)
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", send_message_mock)
+
+    for owner_repo in ("ae-test", "alpha-engine-test"):
+        result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+            "artifact_id=probe_bad_template owner_repo=%s state=probe_failed" % owner_repo,
+            silent=False,
+            severity="critical",
+            dedup_key="freshness_probe_bad_template_2026-W28",
+            flow_name="freshness-monitor",
+            topics=(),
+            db_basename="flow_doctor_freshness_monitor",
+            context={"artifact_id": "probe_bad_template", "owner_repo": owner_repo},
+        )
+        assert result is False
+
+    get_fd_mock.assert_not_called()
+    send_message_mock.assert_not_called()
+
+
+def test_real_notify_via_flow_doctor_does_not_refuse_real_owner_repo(monkeypatch):
+    """The backstop is scoped to the known test namespaces — a real
+    owner_repo must still reach flow-doctor init, not be silently
+    swallowed."""
+    get_fd_mock = mock.Mock(return_value=None)
+    send_message_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", get_fd_mock)
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", send_message_mock)
+
+    result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+        "artifact_id=pit_parity owner_repo=alpha-engine-data state=missing",
+        silent=False,
+        severity="critical",
+        dedup_key="freshness_pit_parity_2026-W28",
+        flow_name="freshness-monitor",
+        topics=(),
+        db_basename="flow_doctor_freshness_monitor",
+        context={"artifact_id": "pit_parity", "owner_repo": "alpha-engine-data"},
+    )
+    assert result is True
+    get_fd_mock.assert_called_once()
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -181,9 +284,11 @@ artifacts:
 
 
 def test_load_registry_threads_active_window_fields(fake_s3):
-    """Continuous active-window fields (nousergon-lib >=0.63.0) must survive
+    """The continuous active-window bound (nousergon-lib >=0.63.0) must survive
     the _SPEC_FIELDS strip and thread through to ArtifactSpec, with
-    active_hours_utc coerced from a YAML list to a tuple."""
+    active_hours_utc coerced from a YAML list to a tuple. A deprecated
+    active_trading_days_only key (removed in lib v0.102.0 / config#1334) is a
+    now-unknown field and must be silently stripped, not error."""
     fake_s3._registry_body = b"""\
 schema_version: 1
 defaults:
@@ -202,7 +307,6 @@ artifacts:
 """
     import index
     spec = index.load_registry(fake_s3, "buck", "key")[0]
-    assert spec.active_trading_days_only is True
     assert spec.active_hours_utc == (14, 21)
 
 

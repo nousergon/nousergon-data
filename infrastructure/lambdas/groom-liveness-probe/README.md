@@ -18,8 +18,8 @@ Schedule-aware, per-trigger accounting:
 1. Enumerate every scheduled groom trigger in the last `GROOM_LOOKBACK_HOURS`
    that has had `GROOM_CEILING_MIN + GROOM_MARGIN_MIN` to finish (so a still-running
    groom never false-alarms). The schedule mirrors the dispatcher's crons
-   (01:00 daily Opus high-only, 07:00 daily Sonnet mid-only, 19:00 daily Haiku
-   low-only) and is overridable via
+   (01:00 daily Sonnet high-only — config#2409, moved off Opus 2026-07-13;
+   07:00 daily Sonnet mid-only; 19:00 daily Haiku low-only) and is overridable via
    `GROOM_SCHEDULE` (JSON).
 2. Fetch recent `groom-digest`-labeled issues from `nousergon/alpha-engine-config`
    (success digests **and** loud-failure issues both carry the label).

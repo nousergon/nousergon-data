@@ -62,7 +62,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # rag/pipelines/ ingest-side scripts are scope-exempt — they write
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
-    "builders/_price_cache_writeboth.py": 1,
+    # 2nd PUT site (config#2350): write_price_cache_freshness_sentinel's
+    # put_object → reference/price_cache/_freshness.json, the producer-written
+    # freshness-monitor proxy for the variable-cardinality reference/price_cache/
+    # prefix. Registered as price_cache_freshness_sentinel in alpha-engine-config
+    # private-docs/ARTIFACT_REGISTRY.yaml. Mirrors the feature_store_freshness_sentinel
+    # addition to builders/daily_append.py (config#1787).
+    "builders/_price_cache_writeboth.py": 2,
     # builders/backfill_delisted_audit/{date}-{ts}.json — the delisted-OHLCV
     # backfill run summary (config#1943 Leg 3 backfill clause). Like the prune /
     # migration audits below, this is an EVENT-DRIVEN operator-run artifact (a
@@ -138,6 +144,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "data/snapshotter/analyst_daily.py": 2,
     "features/compute.py": 1,
     "features/registry.py": 1,
+    # features/metron_supplemental/{date}/sectors.json sidecar (metron-ops#177) —
+    # the module's parquet writes reuse features/writer.py's existing PUT site
+    # (already pinned above); this is the ONE new site, the sectors sidecar.
+    # Covered by the already-grandfathered "features/" path_prefix in
+    # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
+    # retired the S3 mirror) — no new registry row needed.
+    "features/metron_supplemental.py": 1,
     "features/writer.py": 1,
     "lambda/handler.py": 1,
     "preflight.py": 1,

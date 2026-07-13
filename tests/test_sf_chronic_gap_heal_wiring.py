@@ -227,6 +227,27 @@ class TestSsmCommandShape:
         assert "export FLOW_DOCTOR_ENABLED=1" in joined
         assert "export ALPHA_ENGINE_DEPLOYED=1" in joined
 
+    def test_heal_exports_aws_region(self, states):
+        # 2026-07-10: ChronicGapSelfHeal is the one on-trading inline-SSM Task
+        # that runs weekly_collector.py directly (not through spot_data_weekly.sh's
+        # ENV_SOURCE or the data-spot-dispatcher's bootstrap command, both of
+        # which already carry the #247 fix). ae-trading's SSM shell has no .env /
+        # ~/.aws/config, so without an explicit export here
+        # nousergon_lib.preflight.check_env_vars("AWS_REGION") hard-fails before
+        # any collection work runs. Because the state is fail-soft (Catch below),
+        # this silently broke the daily heal without failing the pipeline —
+        # surfaced only via daily flow-doctor CONFIG alerts (nousergon-data#710,
+        # #722). Same regression class as test_spot_env_source_aws_region.py.
+        joined = "\n".join(extract_commands(states[_HEAL]))
+        assert "export AWS_REGION=" in joined, (
+            f"{_HEAL} must export AWS_REGION before invoking weekly_collector.py "
+            "— see nousergon-data#710/#722."
+        )
+        assert "export AWS_DEFAULT_REGION=" in joined, (
+            f"{_HEAL} must also export AWS_DEFAULT_REGION for boto3 clients that "
+            "read the default-region var."
+        )
+
     def test_heal_has_bounded_execution_timeout(self, states):
         et = states[_HEAL]["Parameters"]["Parameters"]["executionTimeout"]
         # SSM executionTimeout is a single-element string list.

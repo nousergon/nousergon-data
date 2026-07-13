@@ -1,0 +1,13 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# nousergon_lib.spot_dispatch (config#2106) wraps krepis.ec2_spot (the
+# spot-launch capacity-resilience chokepoint) — SAME pin as
+# sf-watch-spot-dispatcher. v0.106.0 is the first version whose
+# running_instance_ids raises SpotProbeError instead of failing open
+# (config#2267 site 1) — index.py imports and handles that exception, so
+# this pin GATES on the nousergon-lib v0.106.0 tag existing (lib PR must
+# merge + tag before this deploys). No [flow-doctor] extra needed — this
+# Lambda sends no Telegram of its own (the synchronous GHA caller reads the
+# return value directly; see index.py docstring).
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.106.0
+krepis>=0.10.2

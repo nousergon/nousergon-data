@@ -38,7 +38,9 @@
 # the groom cadence needing to track it.
 # Off-peak tier-split cadence (2026-07-07): avoid Anthropic Max weekday peak
 # (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
-#   01:00 daily     cron(0 1 * * ? *)         FULL   Opus,   high-only      # 6pm PT, every day
+# config#2409 (2026-07-13): the 01:00 high-only slot moved off Opus onto Sonnet
+# — dedicated queue/budget/off-peak schedule, no longer a distinct model tier.
+#   01:00 daily     cron(0 1 * * ? *)         FULL   Sonnet, high-only      # 6pm PT, every day
 #   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
 #   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
 #   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
@@ -143,14 +145,12 @@ run() {
   fi
 }
 
-# ----- 0. Scratch dirs + validate handler syntax -----------------------------
-# PKG and TEST_DEPS are both created up front (mirrors freshness-monitor/
-# deploy.sh) so ONE trap covers both — a pytest-install failure below still
-# cleans up.
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
 
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast
@@ -164,17 +164,13 @@ print('index.py syntax OK')
 # before `import index` (see test_handler.py). nousergon_lib.flow_doctor_fleet
 # is pure stdlib — install the REAL pinned enum from requirements.txt so the
 # hand-maintained FleetTelegramTopic fake cannot drift (config#1772). krepis
-# (pre-boot pace gate math) is also installed for real. Both land in a scratch
-# TEST_DEPS dir — NOT the caller's global site-packages, not bundled into the
-# Lambda zip.
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  echo "Installing pytest + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# (pre-boot pace gate math) is also installed for real. Both are passed to the
+# shared gate, which lands them in its own scratch dir — NOT the caller's global
+# site-packages, not bundled into the Lambda zip.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
