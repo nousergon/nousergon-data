@@ -252,19 +252,20 @@ def test_sweep_run_mode_is_forwarded(monkeypatch):
 
 
 def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
-    # The Opus (6pm PT) schedule's event carries model + issue_filter —
-    # these must reach the box as exported env vars ahead of the bootstrap exec.
+    # The high-only (01:00 UTC / 6pm PT) schedule's event carries model +
+    # issue_filter — these must reach the box as exported env vars ahead of
+    # the bootstrap exec.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
-        {"run_mode": "full", "model": "claude-opus-4-8", "issue_filter": "high-only",
+        {"run_mode": "full", "model": "claude-sonnet-5", "issue_filter": "high-only",
          "schedule": "0 1 * * *"},
         None,
     )
     g = out["groom"]
-    assert g["model"] == "claude-opus-4-8"
+    assert g["model"] == "claude-sonnet-5"
     assert g["issue_filter"] == "high-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_MODEL=claude-opus-4-8" in cmd
+    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
     assert "export GROOM_ISSUE_FILTER=high-only" in cmd
     assert cmd.index("export GROOM_MODEL") < cmd.index("groom_spot_bootstrap.sh")
 
@@ -274,7 +275,7 @@ def test_high_only_schedule_forwards_pr_budget(monkeypatch):
     out = idx.handler(
         {
             "run_mode": "full",
-            "model": "claude-opus-4-8",
+            "model": "claude-sonnet-5",
             "issue_filter": "high-only",
             "schedule": "0 1 * * *",
             "pr_budget": 100,
@@ -291,7 +292,7 @@ def test_deploy_schedule_high_only_carries_pr_budget():
         Path(__file__).resolve().parent / "deploy.sh"
     ).read_text()
     assert '"pr_budget":100' in deploy_sh or '"pr_budget": 100' in deploy_sh
-    # Haiku/Sonnet schedules must NOT inherit the Opus override.
+    # Haiku/Sonnet-mid schedules must NOT inherit the high-only override.
     low_line = next(
         line for line in deploy_sh.splitlines()
         if "low-only" in line and "SCHED_INPUTS" not in line
@@ -666,10 +667,10 @@ def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
 
 
 def test_demand_gate_bundles_and_downgrades_model(monkeypatch):
-    # Opus slot, no high issues, starving low+mid -> ONE Sonnet run.
+    # high slot, no high issues, starving low+mid -> ONE Sonnet run.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
-    out = idx.handler({"run_mode": "full", "model": "claude-opus-4-8",
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
                        "issue_filter": "high-only", "schedule": "0 1 * * *"}, None)
     g = out["groom"]
     assert g["launched"] and g["issue_filter"] == "mid+low"
@@ -758,7 +759,7 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
     g = out["groom"]
     assert g["trigger"] == "demand-all"
     launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
-    assert launched == {("high-only", "claude-opus-4-8"),
+    assert launched == {("high-only", "claude-sonnet-5"),
                         ("mid-only", "claude-sonnet-5"),
                         ("low-only", "claude-haiku-4-5")}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
@@ -952,7 +953,7 @@ def test_launch_decided_bypasses_pace_gate(monkeypatch):
     monkeypatch.setattr(idx, "datetime", type("D", (), {
         "now": staticmethod(lambda tz=None: fixed_now)}))
     out = idx.handler({
-        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-opus-4-8",
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-sonnet-5",
         "issue_filter": "high-only", "launch_decided": True,
     }, None)
     assert out["groom"]["launched"] is True

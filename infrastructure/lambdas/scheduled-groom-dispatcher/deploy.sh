@@ -38,7 +38,9 @@
 # the groom cadence needing to track it.
 # Off-peak tier-split cadence (2026-07-07): avoid Anthropic Max weekday peak
 # (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
-#   01:00 daily     cron(0 1 * * ? *)         FULL   Opus,   high-only      # 6pm PT, every day
+# config#2409 (2026-07-13): the 01:00 high-only slot moved off Opus onto Sonnet
+# — dedicated queue/budget/off-peak schedule, no longer a distinct model tier.
+#   01:00 daily     cron(0 1 * * ? *)         FULL   Sonnet, high-only      # 6pm PT, every day
 #   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
 #   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
 #   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
