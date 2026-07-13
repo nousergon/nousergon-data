@@ -3,10 +3,15 @@ name: IAM Drift Check
 # Catches drift between codified inline policies under
 # infrastructure/iam/<role>.json and the live state on AWS.
 #
-# This repo's codified IAM covers the cross-cutting orchestration roles:
-#   - alpha-engine-step-functions-role (assumed by all 3 SFs)
-#   - alpha-engine-eventbridge-sfn-role (assumed by EventBridge cron rules)
-#   - github-actions-lambda-deploy (assumed by every Lambda deploy workflow)
+# This repo's codified IAM covers:
+#   - the cross-cutting orchestration roles under infrastructure/iam/<role>.json:
+#       * alpha-engine-step-functions-role (assumed by all 3 SFs)
+#       * alpha-engine-eventbridge-sfn-role (assumed by EventBridge cron rules)
+#       * github-actions-lambda-deploy (assumed by every Lambda deploy workflow)
+#   - every lambda exec role under infrastructure/lambdas/*/iam-policy.json
+#     (config#2340 surface 3) — discovered in place from each deploy.sh's
+#     ROLE_NAME/POLICY_NAME. See infrastructure/iam/README.md for the
+#     inline-scheduler-policy follow-up still out of scope.
 #
 # Module-specific roles (executor, predictor, OIDC drift-check) live in
 # their owning repo's infrastructure/iam/ directory and are checked there.
@@ -24,6 +29,10 @@ on:
   pull_request:
     paths:
       - 'infrastructure/iam/**'
+      # A lambda policy edit must re-run drift at PR time too — its role is
+      # discovered from deploy.sh (config#2340 surface 3), so both matter.
+      - 'infrastructure/lambdas/*/iam-policy.json'
+      - 'infrastructure/lambdas/*/deploy.sh'
       - '.github/workflows/iam-drift-check.yml'
   schedule:
     - cron: '30 9 * * *'
