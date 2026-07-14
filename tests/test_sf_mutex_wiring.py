@@ -259,9 +259,15 @@ class TestMutexWiring:
         # config#693: the pipeline-contract preflight gate now sits between
         # LibPinDriftGate and CheckMutexRole (see
         # test_sf_pipeline_contract_wiring.py); its own pass-through Default
-        # still lands on CheckMutexRole, one gate further down.
+        # used to land on CheckMutexRole directly.
         assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "PipelineContractCheck"
-        assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "CheckMutexRole"
+        # config#2348: the evaluator Lambda-SHA drift gate pair now sits
+        # between PipelineContractGate and CheckMutexRole — the mutex is
+        # still the entry point's next gate-free state, two gates further
+        # down (see test_sf_prespend_gate_alerting.py for the full quartet).
+        assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "EvaluatorDeployDriftCheck"
+        assert saturday_sf["States"]["EvaluatorDeployDriftGate"]["Default"] == "EvaluatorDirectorDeployDriftCheck"
+        assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"

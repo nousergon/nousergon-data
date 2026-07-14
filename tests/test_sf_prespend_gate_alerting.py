@@ -45,6 +45,18 @@ GATES = [
      "LibPinGateDegraded", "PublishLibPinGateDegraded", "PipelineContractCheck"),
     ("PipelineContractCheck", "$.pipeline_contract_result.Payload.has_violation",
      "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",
+     "EvaluatorDeployDriftCheck"),
+    # config#2348: third pre-spend sibling gate — evaluator's 2 Lambdas,
+    # checked in sequence (grading, then director). Each has its own
+    # Check/Gate/Degraded/Publish quartet; both mirror the shape above.
+    # The grading gate's degraded chain proceeds to the director gate's
+    # Check (NOT straight to CheckMutexRole) — same "don't skip the sibling
+    # gate" fix config#2278 applied to LibPinGateDegraded.
+    ("EvaluatorDeployDriftCheck", "$.evaluator_deploy_drift_result.Payload.has_drift",
+     "EvaluatorGateDegraded", "PublishEvaluatorGateDegraded",
+     "EvaluatorDirectorDeployDriftCheck"),
+    ("EvaluatorDirectorDeployDriftCheck", "$.evaluator_director_deploy_drift_result.Payload.has_drift",
+     "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
      "CheckMutexRole"),
 ]
 
@@ -99,11 +111,22 @@ def test_libpin_degraded_chain_no_longer_skips_sibling_gate(states):
     assert states["PublishLibPinGateDegraded"]["Next"] == "PipelineContractCheck"
 
 
+def test_evaluator_degraded_chain_no_longer_skips_sibling_gate(states):
+    """config#2348: same fix applied to the evaluator gate pair — the grading
+    Lambda's degraded chain must not silently skip the director Lambda's
+    check."""
+    assert states["PublishEvaluatorGateDegraded"]["Next"] == "EvaluatorDirectorDeployDriftCheck"
+
+
 @pytest.mark.parametrize(("gate", "field", "degraded"), [
     ("LibPinDriftGate", "$.libpin_drift_result.Payload.has_drift",
      "LibPinGateDegraded"),
     ("PipelineContractGate", "$.pipeline_contract_result.Payload.has_violation",
      "PipelineContractGateDegraded"),
+    ("EvaluatorDeployDriftGate", "$.evaluator_deploy_drift_result.Payload.has_drift",
+     "EvaluatorGateDegraded"),
+    ("EvaluatorDirectorDeployDriftGate", "$.evaluator_director_deploy_drift_result.Payload.has_drift",
+     "EvaluatorDirectorGateDegraded"),
 ])
 def test_malformed_gate_payload_routes_to_degraded_chain(states, gate, field, degraded):
     """The config#2275 absence route: a payload WITHOUT the verdict field is
@@ -148,10 +171,16 @@ def test_gate_degraded_threads_into_completion_email(states):
 
 
 def test_only_degraded_passes_set_gate_degraded(states):
-    """The completion-email marker must be SF-controlled: exactly the two
-    gate-degraded Pass states may write $.gate_degraded."""
+    """The completion-email marker must be SF-controlled: exactly the four
+    gate-degraded Pass states (config#2348 added the evaluator pair) may
+    write $.gate_degraded."""
     writers = [
         name for name, st in states.items()
         if st.get("ResultPath") == "$.gate_degraded"
     ]
-    assert sorted(writers) == ["LibPinGateDegraded", "PipelineContractGateDegraded"]
+    assert sorted(writers) == [
+        "EvaluatorDirectorGateDegraded",
+        "EvaluatorGateDegraded",
+        "LibPinGateDegraded",
+        "PipelineContractGateDegraded",
+    ]

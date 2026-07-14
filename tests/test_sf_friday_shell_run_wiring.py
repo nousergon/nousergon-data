@@ -1016,6 +1016,10 @@ class TestHappyPathTraversal:
         # composed directly after LibPinDriftGate's pass-through (no drift ->
         # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
         # violation) — two extra states in the visited order.
+        # config#2348: the evaluator Lambda-SHA drift gate pair (grading Lambda
+        # then director Lambda) is now composed directly after
+        # PipelineContractGate's pass-through, before CheckMutexRole — four
+        # extra states in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1025,6 +1029,10 @@ class TestHappyPathTraversal:
             "LibPinDriftGate",
             "PipelineContractCheck",
             "PipelineContractGate",
+            "EvaluatorDeployDriftCheck",
+            "EvaluatorDeployDriftGate",
+            "EvaluatorDirectorDeployDriftCheck",
+            "EvaluatorDirectorDeployDriftGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",

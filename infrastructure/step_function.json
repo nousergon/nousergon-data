@@ -332,7 +332,7 @@
           "Next": "PipelineContractGateDegraded"
         }
       ],
-      "Default": "CheckMutexRole"
+      "Default": "EvaluatorDeployDriftCheck"
     },
     "ExtractPipelineContractError": {
       "Type": "Pass",
@@ -398,10 +398,10 @@
           ],
           "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
           "ResultPath": "$.pipeline_contract_gate_degraded_notify_error",
-          "Next": "CheckMutexRole"
+          "Next": "EvaluatorDeployDriftCheck"
         }
       ],
-      "Next": "CheckMutexRole"
+      "Next": "EvaluatorDeployDriftCheck"
     },
     "CheckMutexRole": {
       "Type": "Choice",
@@ -953,7 +953,9 @@
               ],
               "Catch": [
                 {
-                  "ErrorEquals": ["States.ALL"],
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
                   "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion.",
                   "Next": "CheckSkipRAGIngestion",
                   "ResultPath": "$.thinktank_error"
@@ -4325,6 +4327,234 @@
       "Type": "Fail",
       "Error": "PipelineFailure",
       "Cause": "One or more pipeline steps failed. Check CloudWatch logs for details. Do NOT redrive-execution: every Task Catch in this pipeline routes to this shared FailExecution state, so redrive is a deterministic no-op (it re-enters FailExecution and re-fails immediately with the same stale input). To retry, start a fresh execution with skip_* input flags set true for stages already completed (e.g. skip_morning_enrich, skip_data_phase1, skip_backtester) -- see infrastructure/README.md for the full flag list and rationale."
+    },
+    "EvaluatorDeployDriftCheck": {
+      "Type": "Task",
+      "Comment": "config#2348 (2026-07-13 operator ruling): NEW, INDEPENDENT pre-boot Lambda-SHA drift gate for the evaluator's 2 Lambdas, added as a Saturday SF sibling to LibPinDriftCheck/PipelineContractCheck. Deliberately NOT wired through the weekday pipeline's existing DeployDriftCheck/Gate (alpha-engine-predictor Lambda, a separate load-bearing trading invariant covering different Lambdas) — this is a standalone check scoped only to alpha-engine-evaluator + alpha-engine-evaluator-director. Checks the grading Lambda first; EvaluatorDirectorDeployDriftCheck checks the director Lambda second — catches either alias independently stuck on a stale :live version (a failed/skipped post-merge deploy can leave just ONE of the two behind main). FAIL-OPEN like every sibling preflight gate: a GitHub-fetch miss or missing GIT_SHA stamp sets has_drift=false, and the Catch below routes any Lambda failure straight through (degraded + alert) — this checker never blocks the weekly run on its own failure, only on a CONFIRMED sha_mismatch.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-evaluator:live",
+        "Payload": {
+          "action": "check_deploy_drift"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2278-style transient tier: two backed-off retries before the fail-open+alert Catch below engages.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 10,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open: the probe's own failure must not halt the weekly run, but must be VISIBLE (degraded flag + SNS alert), mirroring LibPinDriftCheck/PipelineContractCheck's Catch shape exactly.",
+          "Next": "EvaluatorGateDegraded",
+          "ResultPath": "$.evaluator_deploy_drift_result_error"
+        }
+      ],
+      "ResultPath": "$.evaluator_deploy_drift_result",
+      "Next": "EvaluatorDeployDriftGate"
+    },
+    "EvaluatorDeployDriftGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the grading Lambda's probe reports has_drift=true (confirmed sha_mismatch). Routes via ExtractEvaluatorDeployDriftError (NOT straight to HandleFailure) — mirrors LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch does. On a clean pass, proceeds to EvaluatorDirectorDeployDriftCheck (the director Lambda's own check) rather than CheckMutexRole — composing all THREE pre-spend probes (lib-pin, pipeline-contract, evaluator) before any spot spend, per the sibling-gate convention this SF already establishes.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_deploy_drift_result.Payload.has_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.evaluator_deploy_drift_result.Payload.has_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "IsPresent-guarded per config#2275's convention — a partial gate payload must not throw States.Runtime here.",
+          "Next": "ExtractEvaluatorDeployDriftError"
+        },
+        {
+          "Not": {
+            "Variable": "$.evaluator_deploy_drift_result.Payload.has_drift",
+            "IsPresent": true
+          },
+          "Comment": "A gate payload WITHOUT has_drift means the probe could not check — fail open VISIBLY (degraded flag + SNS alert), mirrors LibPinDriftGate/PipelineContractGate's config#2278 convention.",
+          "Next": "EvaluatorGateDegraded"
+        }
+      ],
+      "Default": "EvaluatorDirectorDeployDriftCheck"
+    },
+    "ExtractEvaluatorDeployDriftError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed evaluator Lambda-SHA drift (EvaluatorDeployDriftGate has_drift==true) into $.error for HandleFailure's template. Mirrors ExtractLibPinDriftError's convention exactly, including the config#1819 chokepoint: hands off to NormalizeFailureContext, not HandleFailure directly.",
+      "Parameters": {
+        "phase": "EvaluatorDeployDriftGate",
+        "source": "EvaluatorDeployDriftGate.has_drift",
+        "drift.$": "$.evaluator_deploy_drift_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorGateDegraded": {
+      "Type": "Pass",
+      "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open — availability over gating for a weekly pipeline — but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishEvaluatorGateDegraded"
+    },
+    "PublishEvaluatorGateDegraded": {
+      "Type": "Task",
+      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) — mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Evaluator Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
+        "Message": "The evaluator Lambda-SHA drift probe could not verify alpha-engine-evaluator and/or alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run is NOT protected against a stale :live alias this gate exists to catch. The completion email will carry the gates-degraded marker. config#2348."
+      },
+      "ResultPath": "$.evaluator_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.evaluator_gate_degraded_notify_error",
+          "Next": "EvaluatorDirectorDeployDriftCheck"
+        }
+      ],
+      "Next": "EvaluatorDirectorDeployDriftCheck"
+    },
+    "EvaluatorDirectorDeployDriftCheck": {
+      "Type": "Task",
+      "Comment": "config#2348: second half of the pair — checks alpha-engine-evaluator-director's :live alias independently of the grading Lambda's check above (same image, but the two aliases can drift independently if only one got promoted).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-evaluator-director:live",
+        "Payload": {
+          "action": "check_deploy_drift"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2278-style transient tier: two backed-off retries before the fail-open+alert Catch below engages.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 10,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open: the probe's own failure must not halt the weekly run, but must be VISIBLE (degraded flag + SNS alert), mirroring LibPinDriftCheck/PipelineContractCheck's Catch shape exactly.",
+          "Next": "EvaluatorDirectorGateDegraded",
+          "ResultPath": "$.evaluator_director_deploy_drift_result_error"
+        }
+      ],
+      "ResultPath": "$.evaluator_director_deploy_drift_result",
+      "Next": "EvaluatorDirectorDeployDriftGate"
+    },
+    "EvaluatorDirectorDeployDriftGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the director Lambda's probe reports has_drift=true. Mirrors EvaluatorDeployDriftGate exactly; on a clean pass this is the last of the three pre-spend gates, proceeding to CheckMutexRole.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_director_deploy_drift_result.Payload.has_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.evaluator_director_deploy_drift_result.Payload.has_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "IsPresent-guarded, mirrors EvaluatorDeployDriftGate.",
+          "Next": "ExtractEvaluatorDirectorDeployDriftError"
+        },
+        {
+          "Not": {
+            "Variable": "$.evaluator_director_deploy_drift_result.Payload.has_drift",
+            "IsPresent": true
+          },
+          "Comment": "Fail open VISIBLY on a malformed/missing payload, mirrors EvaluatorDeployDriftGate.",
+          "Next": "EvaluatorDirectorGateDegraded"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "ExtractEvaluatorDirectorDeployDriftError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed director-Lambda drift into $.error. Mirrors ExtractEvaluatorDeployDriftError exactly.",
+      "Parameters": {
+        "phase": "EvaluatorDirectorDeployDriftGate",
+        "source": "EvaluatorDirectorDeployDriftGate.has_drift",
+        "drift.$": "$.evaluator_director_deploy_drift_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorDirectorGateDegraded": {
+      "Type": "Pass",
+      "Comment": "The director Lambda's drift gate could not CHECK. Fail-open + VISIBLE, mirrors EvaluatorGateDegraded.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishEvaluatorDirectorGateDegraded"
+    },
+    "PublishEvaluatorDirectorGateDegraded": {
+      "Type": "Task",
+      "Comment": "Fail-open + alert, mirrors PublishEvaluatorGateDegraded.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Evaluator-Director Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
+        "Message": "The evaluator-director Lambda-SHA drift probe could not verify alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN. The completion email will carry the gates-degraded marker. config#2348."
+      },
+      "ResultPath": "$.evaluator_director_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.evaluator_director_gate_degraded_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
     }
   }
 }
