@@ -106,16 +106,24 @@ _RESEARCH_BUCKET = "alpha-engine-research"
 # Kill-switch independent of GROOM_DISPATCH_ENABLED — lets ops disable JUST the
 # pace gate (e.g. during a known burst) without touching the dispatch trigger.
 PACE_GATE_ENABLED = os.environ.get("GROOM_PACE_GATE_ENABLED", "true").lower() == "true"
-# Calibrated 2026-07-08 — MUST track alpha-engine-config/scripts/groom_budget.py's
-# WEEKLY_WET_CEILING; re-calibrate both together against /usage every few days.
+# FALLBACK ONLY (config-I2461) — used iff the S3 SSoT read below fails. The
+# live ceiling/anchor come from ``s3://alpha-engine-research/config/usage_pacing.json``
+# (``_load_pacing_config``), the SAME object ``groom_budget.py``'s
+# ``read_pacing_config()`` and the ``usage-pace-alert`` Lambda's
+# ``_load_pacing_config()`` already read — this Lambda was, until now, the one
+# consumer still pinned to this literal/env-var regardless of recalibration,
+# which silently diverged from the SSoT and false-tripped the pace gate.
 WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "850000000"))
 _PT = ZoneInfo("America/Los_Angeles")
-# MUST match groom_budget.py's WEEKLY_RESET_ANCHOR/WEEKLY_PERIOD exactly — both
-# derive the SAME reset-aligned window from one observed reset instant.
+# FALLBACK ONLY — same S3-read-failure posture as WEEKLY_WET_CEILING above.
 WEEKLY_RESET_ANCHOR = datetime(2026, 7, 12, 21, 0)   # PT, naive — Sunday 9pm PT
 WEEKLY_PERIOD = timedelta(days=7)
 CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
 CCUSAGE_PREFIX = "claude_code_usage/"
+# SSoT (config#2043) — written by alpha-engine-config's set_usage_pacing_config.py,
+# also read by that repo's groom_budget.py, the usage-pace-alert Lambda, and
+# alpha-engine-dashboard view 36. See _load_pacing_config().
+PACING_CONFIG_KEY = os.environ.get("PACING_CONFIG_KEY", "config/usage_pacing.json")
 # Self-expiring operator override — MUST track groom_budget.py::OVERRIDE_UNTIL_PARAM.
 OVERRIDE_UNTIL_PARAM = "/alpha-engine/groom/dynamic_budget_override_until"
 
@@ -215,6 +223,21 @@ def _read_weekly_wet(window_start: datetime) -> float:
     return total
 
 
+def _load_pacing_config() -> "tuple[float, datetime]":
+    """(weekly_wet_ceiling, weekly_reset_anchor_pt) from the SSoT S3 object
+    (config-I2461). RAISES on any read/parse failure — callers must catch and
+    fall back to WEEKLY_WET_CEILING/WEEKLY_RESET_ANCHOR (this function does NOT
+    fall back itself, mirroring groom_budget.py::read_pacing_config and the
+    usage-pace-alert Lambda's ``_load_pacing_config``, both of which read this
+    SAME object)."""
+    s3 = boto3.client("s3", region_name=REGION)
+    obj = s3.get_object(Bucket=CCUSAGE_BUCKET, Key=PACING_CONFIG_KEY)
+    doc = json.loads(obj["Body"].read())
+    ceiling = float(doc["weekly_wet_ceiling"])
+    anchor = datetime.fromisoformat(doc["weekly_reset_anchor_pt"])
+    return ceiling, anchor
+
+
 def _parse_override_until(raw: str) -> "datetime | None":
     """PT-naive datetime from the SSM value; None if blank/unparseable."""
     raw = (raw or "").strip()
@@ -253,16 +276,28 @@ def _pace_gate_status() -> dict:
                 "override_until": override_until.isoformat(),
                 "reason": "operator override active — pace gate suspended",
             }
-        window_start, _next_reset = reset_window(now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
+
+        try:
+            ceiling, anchor = _load_pacing_config()
+            ceiling_source = "ssot"
+        except Exception as e:  # noqa: BLE001 — config-I2461 fallback path
+            ceiling, anchor = WEEKLY_WET_CEILING, WEEKLY_RESET_ANCHOR
+            ceiling_source = f"fallback ({type(e).__name__})"
+            logger.warning("pacing SSoT read failed, using fallback ceiling %.0f: %s: %s",
+                           ceiling, type(e).__name__, e)
+
+        window_start, _next_reset = reset_window(now_pt, anchor, WEEKLY_PERIOD)
         wet = _read_weekly_wet(window_start)
-        used_frac = wet / WEEKLY_WET_CEILING if WEEKLY_WET_CEILING else 0.0
-        status = pace_check(used_frac, now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
+        used_frac = wet / ceiling if ceiling else 0.0
+        status = pace_check(used_frac, now_pt, anchor, WEEKLY_PERIOD)
         return {
             "exceeded": status.exceeded,
             "used_frac": round(status.used_frac, 4),
             "elapsed_frac": round(status.elapsed_frac, 4),
             "overrun": round(status.overrun, 4),
             "wet": round(wet, 1),
+            "ceiling": ceiling,
+            "ceiling_source": ceiling_source,
         }
     except Exception as e:  # noqa: BLE001 — fail-safe: never block a scheduled groom
         logger.warning("pace gate check failed (non-fatal, launching anyway): %s: %s",
