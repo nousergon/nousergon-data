@@ -79,7 +79,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
-    "ThinkTankCoverage": frozenset({"mode", "sf_cover_target", "sf_cover_ceiling", "run_date.$"}),
+    "ThinkTankCoverage": frozenset({"mode", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
     "Research": frozenset({"dry_run_llm.$", "force", "weekly_run", "skip_dry_run_gate"}),

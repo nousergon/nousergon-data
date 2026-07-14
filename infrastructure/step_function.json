@@ -927,14 +927,12 @@
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-150 coverage gaps (new theses for uncovered names + stalest refresh) — the entire rank_ceiling universe, in one weekly run. 2026-07-14 cadence consolidation: this is now the ONLY invocation path for the thinktank Lambda — the standalone EventBridge schedule is retired entirely (sf_cover mode's run_daily() already does theme reconciliation + a full events sweep over every covered name unconditionally, so a separate weekday invocation was pure duplicated work; the universe board this state's Scanner predecessor produces is itself Saturday-only, so a weekday intake pass never had new ranking data to act on). A full 150-name run can approach the 900s Lambda ceiling (observed 525-880s at only ~60 covered names, 2026-07-14 live-verify) — the States.Timeout/Lambda.Unknown retry below mirrors the sibling Research state's timeout bridge (no headroom lever left on Lambda at 900s; worst case on a retried run is a duplicate thesis version, never a silent skip, per thinktank_handler.py's documented failure contract — safe because the coverage ledger only persists once at the end of a run, so a mid-run timeout never partially commits). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
+              "Comment": "Think Tank observe-mode coverage top-up (alpha-engine-config-I2467). 2026-07-14 cadence design: the daily EventBridge cadence (alpha-research-thinktank-daily) is the primary coverage-growth mechanism (5/day toward the full rank_ceiling=150 universe, handling staleness refresh gradually) and stays unchanged. This state's job is a narrower, reactive top-up — mode=gap_fill shores up whatever of the CURRENT top-60 the daily cadence hasn't caught up to yet by the time the fresh weekly scan lands, sized to the EXACT measured coverage_gap.uncovered_count (never a fixed constant, never padded with stale-refill — see crucible-research thinktank/run.py's gap_fill_only). Small and bounded by construction, so no sf_cover_target/sf_cover_ceiling numbers to keep in sync across repos. Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step. The Retry below (States.Timeout/Lambda.Unknown, mirroring the sibling Research state's bridge) stays as cheap defense-in-depth even though the gap-fill workload is now small.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-thinktank:live",
                 "Payload": {
-                  "mode": "sf_cover",
-                  "sf_cover_target": 150,
-                  "sf_cover_ceiling": 150,
+                  "mode": "gap_fill",
                   "run_date.$": "$.run_date"
                 }
               },
