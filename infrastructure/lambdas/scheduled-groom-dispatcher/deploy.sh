@@ -163,14 +163,13 @@ print('index.py syntax OK')
 # Hermetic for AWS: boto3 + nousergon_lib.ec2_spot are stubbed in sys.modules
 # before `import index` (see test_handler.py). nousergon_lib.flow_doctor_fleet
 # is pure stdlib — install the REAL pinned enum from requirements.txt so the
-# hand-maintained FleetTelegramTopic fake cannot drift (config#1772). krepis
-# (pre-boot pace gate math) is also installed for real. Both are passed to the
-# shared gate, which lands them in its own scratch dir — NOT the caller's global
-# site-packages, not bundled into the Lambda zip.
+# hand-maintained FleetTelegramTopic fake cannot drift (config#1772). It is
+# passed to the shared gate, which lands it in its own scratch dir — NOT the
+# caller's global site-packages, not bundled into the Lambda zip. (krepis was
+# removed 2026-07-14 with the pace gate — usage pacing dismantled.)
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
-run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
+run_handler_tests "${SCRIPT_DIR}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
