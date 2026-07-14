@@ -14,7 +14,6 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only"
   ],
   "DriftDetection": [
@@ -40,7 +39,6 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only"
   ],
   "Parity": [
@@ -87,7 +85,6 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only"
   ],
   "Research": [

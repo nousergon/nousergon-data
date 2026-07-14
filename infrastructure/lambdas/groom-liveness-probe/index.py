@@ -93,17 +93,16 @@ _PAT_TIMEOUT_SEC = 15
 # clean-stop case: groom_driver.py files a groom-digest issue even on a
 # total==0 clean shutdown, so _missed()'s presence-in-window check (it never
 # inspects digest CONTENT) already treats that correctly as "not missed."
-#   cron(0 7 * * ? *)  → 07:00 daily
-#   cron(0 15 * * ? *) → 15:00 daily (Opus, complexity:high only)
-#   cron(0 23 * * ? *) → 23:00 daily
-# The three windows [T, T+CEILING+MARGIN] never overlap at the default
-# CEILING_MIN=360/MARGIN_MIN=45 (6h45m): 07:00+6:45=13:45 (< 15:00),
-# 15:00+6:45=21:45 (< 23:00), 23:00+6:45=05:45 next day (< 07:00) — so
-# per-trigger attribution stays 1:1 (see _missed's docstring).
+#   cron(0 1 * * ? *)  → 01:00 daily (Sonnet, complexity:high only — config#2409, moved off Opus 2026-07-13)
+#   cron(0 7 * * ? *)  → 07:00 daily (Sonnet, complexity:mid only)
+#   cron(0 19 * * ? *) → 19:00 daily (Haiku, complexity:low only)
+# At CEILING_MIN=360/MARGIN_MIN=45 (6h45m) the windows can overlap slightly
+# (01:00→07:45 vs 07:00 Sonnet; 19:00→01:45 vs next-day 01:00 high-only) — _missed
+# attributes by trigger timestamp, not by exclusive window.
 _DEFAULT_SCHEDULE = [
-    {"hour": 7, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "07:00 daily"},
-    {"hour": 15, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "15:00 daily (Opus high-only)"},
-    {"hour": 23, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "23:00 daily"},
+    {"hour": 1, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "01:00 daily (Sonnet high-only)"},
+    {"hour": 7, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "07:00 daily (Sonnet mid-only)"},
+    {"hour": 19, "minute": 0, "dows": [0, 1, 2, 3, 4, 5, 6], "label": "19:00 daily (Haiku low-only)"},
 ]
 
 

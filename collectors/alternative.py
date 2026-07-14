@@ -1406,7 +1406,18 @@ def _fetch_insider(ticker: str, run_date: str) -> dict:
 # ---- 5. Institutional 13F ----
 
 def _fetch_institutional(ticker: str) -> dict:
-    """Fetch institutional accumulation signal from 13F filings."""
+    """DEPRECATED 2026-07-13 — ``inst_ownership`` derived table replaces this.
+
+    ``Company(ticker)`` resolves to the stock's CIK, but 13F-HR is filed
+    by the fund manager's CIK — this always returns empty for operating
+    companies. See ``alpha-engine-data/data/derived/inst_ownership.py``
+    (SEC quarterly bulk data, CUSIP→ticker resolved via yfinance).
+    """
+    logger.warning(
+        "DEPRECATED _fetch_institutional: use data.derived.inst_ownership "
+        "(SEC quarterly bulk) instead. CIK-mismatch bug renders this "
+        "always-empty for operating companies."
+    )
     result = {
         "accumulation": False,
         "funds_increasing": 0,

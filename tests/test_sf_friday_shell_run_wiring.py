@@ -483,7 +483,10 @@ class TestStrictSuperset:
         assert nc["End"] is True
 
     def test_success_notify_gate_default_is_notify_complete(self, states):
-        assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
+        # config#2278: the real-run success edge now passes through the
+        # gate-degraded completion Choice before NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
 
 class TestApplyShellRunDefaults:
@@ -722,21 +725,36 @@ class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
         # The substrate check flows into two non-fatal advisory states (evaluator
         # Report Card v2, then the Director) before the notify gate. ReportCard's
-        # SUCCESS Next feeds the Director; its Catch skips straight to
-        # CheckShellRunNotify. The Director's own Next AND Catch both land on
-        # CheckShellRunNotify, so the path to the notify gate is preserved whether
-        # grading/advisory succeed or fail. On the Friday preflight the states
-        # still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) — they are
-        # not skipped — so the success edge is identical on real + preflight runs.
+        # SUCCESS Next feeds the Director; its Catch routes to
+        # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
+        # failed silently for 9 days pre-fix) which then continues to
+        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify;
+        # its Catch routes to PublishDirectorDegraded (same config#2302 shape) which
+        # then continues to CheckShellRunNotify. The path to the notify gate is
+        # preserved whether grading/advisory succeed or fail. On the Friday preflight
+        # the states still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) —
+        # they are not skipped — so the success edge is identical on real + preflight
+        # runs.
+        # config#2276: the substrate poll resolves to a terminal status
+        # first; its Success edge is what feeds ReportCard.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckSubstrateHealthCheckStatus"
         )
+        substrate_success = next(
+            r
+            for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
+            if r.get("StringEquals") == "Success"
+        )
+        assert substrate_success["Next"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "Director"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in report_card["Catch"])
+        assert all(c["Next"] == "PublishReportCardDegraded" for c in report_card["Catch"])
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in director["Catch"])
+        assert all(c["Next"] == "PublishDirectorDegraded" for c in director["Catch"])
+        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
 
     def test_advisory_tail_runs_dry_on_preflight(self, states):
         """ROADMAP L4504: ReportCard + Director were added after the shell-run
@@ -1005,6 +1023,10 @@ class TestHappyPathTraversal:
         # to CheckSkipLibPinDriftCheck — one extra Choice in the visited order.
         # config#1824: the run-day gate is the first hop; a role-less input
         # takes its Default straight to CheckRunMode — one extra Choice.
+        # config#693 (L4595): the pipeline-contract preflight gate is now
+        # composed directly after LibPinDriftGate's pass-through (no drift ->
+        # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
+        # violation) — two extra states in the visited order.
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1012,6 +1034,8 @@ class TestHappyPathTraversal:
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",
             "LibPinDriftGate",
+            "PipelineContractCheck",
+            "PipelineContractGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",

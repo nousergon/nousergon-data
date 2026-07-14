@@ -12,17 +12,32 @@ failed with no predictions / planner / daemon that day.
 The fix (per the standing rule — a best-effort downstream step must never
 force re-running a completed upstream task; the same rule that split
 MorningEnrich out of DataPhase1) moves the heal into its OWN fail-soft SF
-state, ``ChronicGapSelfHeal``, that runs AFTER MorningEnrich and routes to
+state, ``ChronicGapSelfHeal``, that runs AFTER the data phase and routes to
 PredictorInference on EVERY terminal outcome (success, failure, timeout).
 
+config#1767 (Phase 2): MorningEnrich + MorningArcticAppend were relocated OFF
+the always-on trading box onto TWO independent ephemeral spot boxes via the
+data-spot-dispatcher Lambda. ChronicGapSelfHeal stays on the trading box (it
+is a small, fail-soft, best-effort heal — 300s timeout — not the load-bearing
+data fetch config#1767 exists to move off-box) but was upgraded (config#1811)
+to the liveness-aware SSM poll pattern (an independent SSM PingStatus check
+alongside command status) so a wedged trading box is detected in ~1 minute
+instead of blindly polling a frozen ``InProgress`` status for up to an hour
+(the exact 2026-07-06 config#1807 incident shape).
+
 This test catches regressions like:
-- Someone reroutes CheckMorningEnrichStatus(Success) straight back to
-  PredictorInference, dropping the ChronicGapSelfHeal state.
+- Someone reroutes the data-phase success straight back to PredictorInference,
+  dropping the ChronicGapSelfHeal state.
 - Someone makes ChronicGapSelfHeal (or its poll) fatal by routing a
-  failure to HandleFailure instead of PredictorInference.
-- Someone drops ``--skip-chronic-heal`` from the weekday MorningEnrich
-  command, re-introducing the inline (un-isolated) heal.
+  COMMAND_FAILED/POLL_BUDGET_EXHAUSTED verdict to HandleFailure instead of
+  PredictorInference.
+- Someone drops ``--skip-chronic-heal`` from the data-spot-dispatcher's
+  morning-enrich workload, re-introducing the inline (un-isolated) heal.
 - Someone points the heal state at the wrong entrypoint.
+- Someone routes INSTANCE_UNRESPONSIVE fail-soft instead of stamp+force-stop
+  (config#1811 carve-out — a wedged HOST is not a heal failure).
+- Someone terminates the (persistent, reserved) trading box instead of
+  stopping it on an unresponsive verdict.
 """
 
 from __future__ import annotations
@@ -38,6 +53,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 
 _HEAL = "ChronicGapSelfHeal"
+_INIT = "InitChronicGapPoll"
 _POLL = "WaitForChronicGap"
 _CHECK = "CheckChronicGapStatus"
 _WAIT = "ChronicGapWait"
@@ -54,75 +70,68 @@ def states(sf) -> dict:
 
 
 class TestStatePresence:
-    @pytest.mark.parametrize("name", [_HEAL, _POLL, _CHECK, _WAIT])
+    @pytest.mark.parametrize("name", [_HEAL, _INIT, _POLL, _CHECK, _WAIT])
     def test_state_exists(self, states, name):
         assert name in states, f"{name} missing from weekday SF States"
 
 
 class TestChainOrdering:
-    """CheckMorningEnrichStatus(Success) → ChronicGapSelfHeal →
-    WaitForChronicGap → CheckChronicGapStatus(terminal) → PredictorInference."""
+    """CheckMorningArcticAppendSpotStatus(Success) → CheckSkipChronicGapHeal →
+    ChronicGapSelfHeal → InitChronicGapPoll → WaitForChronicGap →
+    CheckChronicGapStatus(terminal) → PredictorInference (via
+    CheckSkipPredictorInference)."""
 
-    def test_heal_runs_after_morning_enrich_and_append(self, states):
-        # Since L4608 the load-bearing daily_append (CheckSkipMorningArcticAppend
-        # → MorningArcticAppend) sits between MorningEnrich and the heal. The
-        # heal still runs (behind its skip-gate) AFTER both, before predictions.
-        success = [
-            c["Next"]
-            for c in states["CheckMorningEnrichStatus"]["Choices"]
-            if c.get("StringEquals") == "SUCCESS"
-        ]
-        assert success == ["CheckSkipMorningArcticAppend"], (
-            "MorningEnrich success must hand off to the arctic-append gate"
-        )
-        # Append success → the chronic-gap skip-gate → (no flag) the heal.
+    def test_heal_runs_after_data_spot_phase(self, states):
+        # config#1767 (Phase 2): the enrich + daily_append were relocated OFF the
+        # trading box onto two independent ephemeral spot boxes. The heal still
+        # runs (behind its skip-gate) AFTER the spot data phase, before
+        # predictions. The Arctic append spot's Success rejoins the trading path
+        # at CheckSkipChronicGapHeal.
         append_success = [
             c["Next"]
-            for c in states["CheckMorningArcticAppendStatus"]["Choices"]
-            if c.get("StringEquals") == "SUCCESS"
+            for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
         ]
         assert append_success == ["CheckSkipChronicGapHeal"]
         assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL
+        # The old on-trading enrich/append states are gone.
+        assert "MorningEnrich" not in states
+        assert "MorningArcticAppend" not in states
 
     def test_heal_routes_to_poll(self, states):
         # config#1811: an Init pass seeds the liveness-poll counters first.
-        assert states[_HEAL]["Next"] == "InitChronicGapPoll"
-        assert states["InitChronicGapPoll"]["Next"] == _POLL
+        assert states[_HEAL]["Next"] == _INIT
+        assert states[_INIT]["Next"] == _POLL
 
     def test_poll_routes_to_status_check(self, states):
         assert states[_POLL]["Next"] == _CHECK
 
-    def test_status_inprogress_and_pending_loop_via_wait(self, states):
-        # config#1811: the poller folds Pending/Delayed/registering into a
-        # single IN_PROGRESS verdict; only that verdict keeps polling.
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states[_CHECK]["Choices"]
-        }
+    def test_status_inprogress_loops_via_wait(self, states):
+        # config#1811: the ssm-liveness-poller folds Pending/Delayed/registering
+        # into a single IN_PROGRESS verdict; only that verdict keeps polling.
+        nexts = {c["StringEquals"]: c["Next"] for c in states[_CHECK]["Choices"]}
         assert nexts["IN_PROGRESS"] == _WAIT
         assert states[_WAIT]["Next"] == _POLL
 
     def test_unresponsive_host_is_not_fail_soft(self, states):
         """config#1811 carve-out: INSTANCE_UNRESPONSIVE is a HOST failure,
-        not a heal failure — the same wedged box every later step (planner,
+        not a heal failure — the same trading box every later step (planner,
         daemon) needs. Proceeding fail-soft would just fail at
         RunMorningPlanner after burning PredictorInference. It must route
         to the stamp → force-stop → HandleFailure chain instead."""
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states[_CHECK]["Choices"]
-        }
+        nexts = {c["StringEquals"]: c["Next"] for c in states[_CHECK]["Choices"]}
         assert nexts["INSTANCE_UNRESPONSIVE"] == "StampChronicGapUnresponsive"
         assert (
-            # config#1807: the heal runs on the daily data spot — an
-            # unresponsive host terminates the SPOT, not the trading box.
+            # ChronicGapSelfHeal runs on the persistent, reserved trading box
+            # (not an ephemeral spot) — an unresponsive host is STOPPED, never
+            # terminated.
             states["StampChronicGapUnresponsive"]["Next"]
-            == "ForceTerminateUnresponsiveDataSpot"
+            == "ForceStopUnresponsiveInstance"
         )
 
     def test_heal_precedes_predictor_inference(self, sf, states):
-        """Walk the happy path from MorningEnrich success and assert
-        ChronicGapSelfHeal is visited strictly before PredictorInference."""
+        """Walk the happy path from ChronicGapSelfHeal and assert
+        PredictorInference is visited strictly after it."""
         order: list[str] = []
         seen: set[str] = set()
         cur = _HEAL
@@ -131,8 +140,8 @@ class TestChainOrdering:
             order.append(cur)
             st = states[cur]
             if st.get("Type") == "Choice":
-                # Status check: only InProgress/Pending loop; the terminal
-                # path is the Default (= proceed to PredictorInference).
+                # Status check: only IN_PROGRESS loops; the terminal path is
+                # the Default (= proceed toward PredictorInference).
                 cur = st.get("Default")
             else:
                 cur = st.get("Next")
@@ -146,46 +155,42 @@ class TestChainOrdering:
 
 class TestFailSoft:
     """A heal failure / hang / timeout must NEVER fail the pipeline — every
-    terminal edge routes to PredictorInference, never HandleFailure."""
+    terminal edge routes toward PredictorInference, never HandleFailure."""
 
     # Since L4606 the forward target is the CheckSkipPredictorInference rerun
     # gate (whose Default runs PredictorInference) rather than PredictorInference
     # directly — still fail-soft: it proceeds toward predictions, never to
     # HandleFailure.
     _FWD = "CheckSkipPredictorInference"
-    # config#1807: data-phase exits route through the spot-terminate hook
-    # first; its Default (and TerminateDailyDataSpot both ways) proceed to
-    # _FWD, so the fail-soft guarantee is unchanged.
-    _HOOK = "CheckDataSpotToTerminate"
 
     def test_check_default_proceeds_toward_predictions_not_handlefailure(self, states):
-        # Inverse of CheckMorningEnrichStatus, whose Default is HandleFailure.
-        assert states[_CHECK]["Default"] == self._HOOK, (
+        assert states[_CHECK]["Default"] == self._FWD, (
             "Chronic-gap heal is best-effort: any terminal status (incl. "
             "failure) must proceed toward PredictorInference, not HandleFailure."
         )
-        assert states[self._HOOK]["Default"] == self._FWD
-        # And the gate it hands to must actually run PredictorInference.
         assert states[self._FWD]["Default"] == "PredictorInference"
 
     def test_heal_catch_proceeds_toward_predictions(self, states):
         catches = states[_HEAL].get("Catch", [])
         assert catches, f"{_HEAL} must have a fail-soft Catch"
         for c in catches:
-            assert c["Next"] == self._HOOK, (
+            assert c["Next"] == self._FWD, (
                 f"{_HEAL} Catch must proceed toward PredictorInference via "
-                f"{self._HOOK} (fail-soft through the spot-terminate hook), got {c['Next']}"
+                f"{self._FWD} (fail-soft), got {c['Next']}"
             )
 
     def test_poll_catch_proceeds_toward_predictions(self, states):
         catches = states[_POLL].get("Catch", [])
         assert catches, f"{_POLL} must have a fail-soft Catch"
         for c in catches:
-            assert c["Next"] == self._HOOK
+            assert c["Next"] == self._FWD
 
     def test_no_heal_state_routes_to_handlefailure(self, states):
-        """No Next/Default/Catch target across the heal quartet may be
-        HandleFailure (checks routing edges, not comment text)."""
+        """No Next/Default/Catch target across the heal quintet may be
+        HandleFailure (checks routing edges, not comment text). The
+        INSTANCE_UNRESPONSIVE host-failure path is exempt — it legitimately
+        alerts via ForceStopUnresponsiveInstance -> HandleFailure, since a
+        wedged trading box is a real incident, not a heal failure."""
         def _targets(o):
             out = []
             if isinstance(o, dict):
@@ -199,7 +204,7 @@ class TestFailSoft:
                     out.extend(_targets(x))
             return out
 
-        for name in (_HEAL, _POLL, _CHECK, _WAIT):
+        for name in (_HEAL, _INIT, _POLL, _CHECK, _WAIT):
             targets = _targets(states[name])
             assert "HandleFailure" not in targets, (
                 f"{name} routes to HandleFailure {targets} — the heal is fail-soft."
@@ -222,6 +227,27 @@ class TestSsmCommandShape:
         assert "export FLOW_DOCTOR_ENABLED=1" in joined
         assert "export ALPHA_ENGINE_DEPLOYED=1" in joined
 
+    def test_heal_exports_aws_region(self, states):
+        # 2026-07-10: ChronicGapSelfHeal is the one on-trading inline-SSM Task
+        # that runs weekly_collector.py directly (not through spot_data_weekly.sh's
+        # ENV_SOURCE or the data-spot-dispatcher's bootstrap command, both of
+        # which already carry the #247 fix). ae-trading's SSM shell has no .env /
+        # ~/.aws/config, so without an explicit export here
+        # nousergon_lib.preflight.check_env_vars("AWS_REGION") hard-fails before
+        # any collection work runs. Because the state is fail-soft (Catch below),
+        # this silently broke the daily heal without failing the pipeline —
+        # surfaced only via daily flow-doctor CONFIG alerts (nousergon-data#710,
+        # #722). Same regression class as test_spot_env_source_aws_region.py.
+        joined = "\n".join(extract_commands(states[_HEAL]))
+        assert "export AWS_REGION=" in joined, (
+            f"{_HEAL} must export AWS_REGION before invoking weekly_collector.py "
+            "— see nousergon-data#710/#722."
+        )
+        assert "export AWS_DEFAULT_REGION=" in joined, (
+            f"{_HEAL} must also export AWS_DEFAULT_REGION for boto3 clients that "
+            "read the default-region var."
+        )
+
     def test_heal_has_bounded_execution_timeout(self, states):
         et = states[_HEAL]["Parameters"]["Parameters"]["executionTimeout"]
         # SSM executionTimeout is a single-element string list.
@@ -232,11 +258,25 @@ class TestSsmCommandShape:
             f"got {secs}s"
         )
 
-    def test_weekday_morning_enrich_skips_inline_heal(self, states):
-        cmds = extract_commands(states["MorningEnrich"])
-        joined = "\n".join(cmds)
-        assert "--morning-enrich --skip-chronic-heal" in joined, (
-            "The weekday MorningEnrich must pass --skip-chronic-heal so the "
-            "inline heal is not double-run alongside the ChronicGapSelfHeal "
-            "state (and MorningEnrich stays fully isolated from the heal)."
+    def test_heal_runs_on_trading_box(self, states):
+        # ChronicGapSelfHeal stays on the persistent trading box (unlike
+        # MorningEnrich/MorningArcticAppend, which moved to ephemeral spots).
+        assert states[_HEAL]["Parameters"]["InstanceIds.$"] == "$.trading_instance_id"
+
+    def test_data_spot_morning_enrich_workload_skips_inline_heal(self, states):
+        # config#1767: the enrich command moved from an on-trading SSM state into
+        # the data-spot-dispatcher Lambda's workload map. It must STILL pass
+        # --skip-chronic-heal so the inline heal is not double-run alongside the
+        # on-trading ChronicGapSelfHeal state (which stays on the trading box).
+        disp = (
+            _REPO_ROOT / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+        ).read_text()
+        assert "--morning-enrich " in disp
+        assert "--skip-chronic-heal" in disp, (
+            "The data-spot morning-enrich workload must pass --skip-chronic-heal "
+            "so the inline heal is not double-run with the on-trading heal state."
+        )
+        assert "--skip-arctic-append" in disp, (
+            "The morning-enrich workload must also pass --skip-arctic-append — "
+            "the Arctic append is its own separate spot workload."
         )

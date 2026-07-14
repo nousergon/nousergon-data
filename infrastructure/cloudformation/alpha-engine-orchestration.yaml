@@ -81,7 +81,8 @@ Resources:
   # `universe_writer_lock` covers for manual `daily_append` invocations —
   # that lock guards the data writer; this table guards the SF entry point.
   # Together they cover both halves of "exactly one cron-fired execution of
-  # each SF per minute bucket."
+  # each SF per slot" (run-date slot for the weekly SF, minute bucket for
+  # the weekday/EOD SFs — see Schema note below).
   #
   # Trigger of record: the 2026-05-26 duplicate-EventBridge-target incident
   # (PR #322), where two parallel SF executions raced 321 unique-symbol
@@ -92,13 +93,25 @@ Resources:
   # throttle, cross-region replay coincidence, any future shape the CI
   # chokepoint misses).
   #
-  # Schema: mutex_key (S) PK only — no TTL attribute and no auto-release.
-  # The mutex_key encodes `{state-machine-name}#{pipeline_role}#{minute-bucket}`,
-  # so a successfully-acquired key is naturally single-use: no future
-  # execution can land in the same minute-bucket of a past UTC date. Item
-  # accumulation is ~12 items/week × cadence runs ≈ <1000/yr; PAY_PER_REQUEST
-  # storage cost is negligible (sub-cent annual). Periodic sweeper deferred —
-  # operationally meaningful staleness is a non-issue.
+  # Schema: mutex_key (S) PK, plus (config#2280) an OPTIONAL ttl_epoch (N)
+  # attribute with table TTL enabled.
+  # - WEEKLY SF (step_function.json): mutex_key encodes
+  #   `{state-machine-name}#{pipeline_role}#{run_date}` — the RUN-SLOT — so
+  #   staggered duplicate triggers of the same run-slot conflict at ANY
+  #   minute distance (the old minute bucket only caught same-minute dups).
+  #   A run-date key has no natural expiry, so the weekly AcquireMutex
+  #   stamps ttl_epoch (~24h) as the crashed-holder BACKSTOP; the PRIMARY
+  #   stale-item mechanism is scripts/weekly_sf_rerun.py's verified steal
+  #   (delete only after the holder execution is confirmed terminal).
+  # - WEEKDAY/EOD SFs still key on the minute bucket and write NO ttl_epoch;
+  #   items without the attribute never expire (DynamoDB TTL ignores them),
+  #   so this TimeToLiveSpecification is a purely ADDITIVE, backward-
+  #   compatible change — enabling TTL on a live table is a safe in-place
+  #   UpdateTimeToLive, no table replacement.
+  # Item accumulation is ~12 items/week × cadence runs ≈ <1000/yr;
+  # PAY_PER_REQUEST storage cost is negligible (sub-cent annual). TTL
+  # supersedes the config#730 stale-item sweeper for weekly items; the
+  # weekday/eod minute-bucket items remain permanent-but-benign as before.
   ExecutionMutexTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -110,6 +123,9 @@ Resources:
       KeySchema:
         - AttributeName: mutex_key
           KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl_epoch
+        Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: false
 
@@ -136,16 +152,24 @@ Resources:
       DefinitionS3Location:
         Bucket: alpha-engine-research
         Key: infrastructure/step_function.json
-      # Alternative: inline definition via DefinitionString
-      # Using S3 location so the JSON files in the repo are the source of truth.
-      # Deploy script uploads JSON to S3 then updates the state machine.
-      # LoggingConfiguration is OWNED HERE (declarative SoT). The deploy
-      # script's update-state-machine call passes only --definition, which is a
-      # partial update (omitted loggingConfiguration is left unchanged), so this
-      # CFN-set logging is NOT wiped on each deploy. Logging the SF execution
-      # FailedEvents (level=ERROR) is what carries the L274 MutexConflict Cause
-      # into the log group for the metric filter below. The ne-* rename
-      # (config#1381) re-created these SFs without logging — this restores it.
+      # SINGLE-WRITER CONTRACT (config#2273): the repo file
+      # infrastructure/step_function.json is the sole source of truth for
+      # this definition. DefinitionS3Location is only READ at stack-create /
+      # resource-replacement time; both deploy paths
+      # (deploy-infrastructure.sh on merge, deploy_step_function.sh for
+      # manual/bootstrap) upload the stamped repo bytes to this exact S3
+      # key BEFORE update-state-machine, so a CFN restamp can only ever
+      # re-deploy the same bytes — CFN is not an independent writer in
+      # practice. Drift backstop across all three copies (repo / S3 / live):
+      # infrastructure/step-functions/check-definition-drift.py.
+      # LoggingConfiguration is DECLARED here (declarative SoT for the
+      # shape) and ASSERTED explicitly (--logging-configuration) by the
+      # deploy scripts on every update since config#2273 — never left to
+      # partial-update preservation (the recreate-drops-logging class is
+      # config#1464). Logging the SF execution FailedEvents (level=ERROR)
+      # is what carries the L274 MutexConflict Cause into the log group
+      # for the metric filter below. The ne-* rename (config#1381)
+      # re-created these SFs without logging — this restores it.
       LoggingConfiguration:
         Level: ERROR
         IncludeExecutionData: true
@@ -237,20 +261,33 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-weekday
-      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC). At the old
-      # 06:00 start the daemon was ready ~31–32 min later (06:31–06:32 PT)
-      # even on SUCCESSFUL runs — i.e. the order book/daemon was ~1–2 min
-      # LATE for the 06:30 PT open every single day. Combined with the
-      # alpha-engine-data#264 MorningEnrich speedup (~−12 min, no longer
-      # flirting with the 30-min SSM timeout), a 05:45 start gives ~22 min
-      # expected / ~32 min P99 to daemon-ready → ready ≤ 06:17 PT at the
-      # 99th percentile, comfortably before the 06:30 open with margin.
-      # NOTE (pre-existing, unchanged here): the UTC expression assumes
-      # PDT (UTC−7); during PST the effective PT start shifts an hour.
-      # That DST caveat predates this change and is intentionally left
-      # as-is — out of scope for the start-time fix.
-      Description: Weekday 12:45 UTC (5:45 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
-      ScheduleExpression: 'cron(45 12 ? * MON-FRI *)'
+      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC) — bought a
+      # 13-min P99 buffer (daemon-ready ≤06:17 PT vs 06:30 open). That buffer
+      # has since been consumed by added stages (CodeFreshnessGate, predictor
+      # health/drift checks, chronic-gap self-heal): live SF history for
+      # 2026-07-09/07-10/07-13 (all SUCCEEDED on the first scheduled attempt)
+      # shows RunDaemon completing 06:31:45–06:34:15 PT — 2–4 min AFTER the
+      # 06:30 PT open every time, not a one-off. State-level breakdown shows
+      # PollMorningArcticAppendSpot alone consuming ~36–38 min (~75% of the
+      # ~46–49 min total run) — a known/expected duration already documented
+      # in alpha-engine-data's data-spot-dispatcher MAX_RUNTIME_SECONDS
+      # comment, not a defect to fix here. 2026-07-13: moved 05:45 → 05:15 PT
+      # (30-min buffer above the observed ceiling vs the 13-min buffer the
+      # 05:45 change relied on) to absorb the same kind of stage-creep
+      # without needing another manual bump every ~2 months. See
+      # nousergon/alpha-engine-config#2412 (tracked follow-up: early-warning
+      # canary so buffer erosion pages automatically instead of being
+      # noticed anecdotally) and #2413 (migrate this rule to
+      # AWS::Scheduler::Schedule for real DST-timezone awareness, matching
+      # StopTradingSchedule below).
+      # NOTE (pre-existing, unchanged here): AWS::Events::Rule cron
+      # expressions are UTC-only (no ScheduleExpressionTimezone support,
+      # unlike AWS::Scheduler::Schedule) — the UTC expression assumes PDT
+      # (UTC−7); during PST the effective PT start shifts an hour earlier
+      # (i.e. MORE buffer, not less). That DST caveat predates this change;
+      # #2413 is the tracked fix.
+      Description: Weekday 12:15 UTC (5:15 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
+      ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
       State: ENABLED
       Targets:
         # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
@@ -673,6 +710,67 @@ Resources:
         duplicate-trigger source.
       Namespace: AlphaEngine/StepFunctions
       MetricName: WeeklyFreshnessMutexConflictFails
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # config#1819 (2026-07-06/07): SNS-publish TaskFailed alarm on the weekly
+  # SF. Motivating incident (2026-06-12): NotifyComplete (a SUCCESS-path
+  # notifier) threw SNS.InvalidParameterException (Subject >100 chars / a
+  # newline / empty), failing an otherwise-succeeded pipeline. The SF fix
+  # (step_function.json) wraps NotifyComplete + NotifyShellRunComplete in
+  # their own Catch so a publish failure no longer fails the execution —
+  # but a silently-caught failure needs its own visibility surface so it
+  # doesn't just vanish. Step Functions logs a TaskFailed history event at
+  # LoggingConfiguration Level:ERROR REGARDLESS of whether a Catch handles
+  # it (confirmed against the AWS docs event-level table), so this filter
+  # sees the caught failure even though the execution itself still shows
+  # SUCCEEDED. SCOPE / KNOWN LIMITATION: TaskFailed's logged fields
+  # (resource/resourceType/error/cause) do NOT include the state name —
+  # CloudWatch Logs Metric Filters match a single line and cannot
+  # correlate across the separate TaskStateEntered event that DOES carry
+  # the name, so this filter matches ANY sns:publish TaskFailed on this SF
+  # (all 7 sns:publish states), not NotifyComplete specifically. That is
+  # an acceptable trade for this alarm's purpose (today, on the weekly SF,
+  # the only sns:publish sites with a Catch that swallows the failure
+  # entirely — i.e. that could otherwise go silent — are NotifyComplete /
+  # NotifyShellRunComplete; every other sns:publish site either has no
+  # Catch (so a failure already fails the execution -> the existing
+  # HandleFailure email path) or is itself a best-effort early-signal alert
+  # inside ResearchPredictorParallel whose branch still ends up visible via
+  # CheckBranchOutcomes). Same string-match-precision trade the existing
+  # MutexConflict filters above already accept.
+  SnsPublishFailedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: WeeklyFreshnessLogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-weekly-freshness-pipeline
+      FilterPattern: '"TaskFailed" "sns:publish"'
+      MetricTransformations:
+        - MetricNamespace: AlphaEngine/StepFunctions
+          MetricName: WeeklyFreshnessSnsPublishFails
+          MetricValue: '1'
+
+  SnsPublishFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ne-weekly-freshness-sns-publish-failed
+      AlarmDescription: >-
+        config#1819: an sns:publish Task failed on the weekly-freshness
+        (Saturday) pipeline (caught or uncaught). If this fires with the
+        execution otherwise SUCCEEDED, NotifyComplete/NotifyShellRunComplete
+        caught a publish failure (best-effort, per config#1819) — check
+        CloudWatch Logs for the TaskFailed cause (commonly
+        SNS.InvalidParameterException) and the SNS delivery status; the
+        pipeline result itself is NOT in question. If the execution FAILED,
+        this fired alongside the existing HandleFailure email.
+      Namespace: AlphaEngine/StepFunctions
+      MetricName: WeeklyFreshnessSnsPublishFails
       Statistic: Sum
       Period: 86400
       EvaluationPeriods: 1

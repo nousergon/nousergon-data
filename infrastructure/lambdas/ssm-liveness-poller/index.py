@@ -28,11 +28,23 @@ Verdicts (the Choice states branch on exactly these):
                           Delayed, or invocation not yet registered),
                           instance responsive, budgets not exhausted.
   COMMAND_FAILED        — command reached a terminal non-success status
-                          (Failed / TimedOut / Cancelled / Cancelling).
-  INSTANCE_UNRESPONSIVE — >= max_ping_misses consecutive polls saw
+                          (Failed / TimedOut / Cancelled / Cancelling)
+                          AFTER actually executing on the box: a script
+                          that ran and exited non-zero (real exit code,
+                          agent still Online).
+  INSTANCE_UNRESPONSIVE — the host is gone/unreachable. Two shapes:
+                          (a) >= max_ping_misses consecutive polls saw
                           PingStatus != Online while the command was
-                          nominally running. The 2026-07-06 shape:
-                          detection in ~1 minute instead of 62.
+                          nominally running (the 2026-07-06 wedged-box
+                          shape: detection in ~1 minute instead of 62);
+                          (b) the command reached a terminal status but
+                          NEVER EXECUTED — a delivery StatusDetails
+                          (Undeliverable / Terminated / DeliveryTimedOut)
+                          or no exit code (rc == -1) with PingStatus off
+                          Online. Shape (b) is a spot interruption /
+                          reclaim mid-command (2026-07-07 incident):
+                          the box vanished, so it is a liveness event, not
+                          a command failure.
   POLL_BUDGET_EXHAUSTED — attempts >= max_attempts without a terminal
                           status (the #970 stuck-InProgress shape).
 
@@ -64,6 +76,16 @@ _ssm = boto3.client("ssm")
 _RUNNING_STATUSES = {"Pending", "InProgress", "Delayed"}
 # Terminal, non-success.
 _FAILED_STATUSES = {"Failed", "TimedOut", "Cancelled", "Cancelling"}
+# Terminal StatusDetails that mean the command NEVER EXECUTED on the box:
+# SSM could not deliver it / the invocation was reaped because the instance
+# was gone or unreachable. These are HOST/DELIVERY failures (a spot
+# interruption / reclaim), NOT a script that ran and exited non-zero.
+# Per config#1724 (independent observation beats self-report) they carry
+# the liveness verdict, not COMMAND_FAILED — otherwise a vanished box reads
+# as a stale-artifact command failure, points the operator at a logfile on
+# a host that no longer exists, and skips the terminate-the-spot remediation.
+# (SSM's non-execution StatusDetails; see get_command_invocation docs.)
+_DELIVERY_FAILURE_DETAILS = {"Undeliverable", "Terminated", "DeliveryTimedOut"}
 
 _STDERR_TAIL_CHARS = 1500
 
@@ -147,12 +169,40 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if cmd["status"] == "Success":
         result["verdict"] = "SUCCESS"
     elif cmd["status"] in _FAILED_STATUSES:
-        result["verdict"] = "COMMAND_FAILED"
-        result["detail"] = (
-            f"[{step}] SSM command {command_id} terminal status "
-            f"{cmd['status']} (rc={cmd['response_code']}): "
-            f"{cmd['status_details']}"
+        # A terminal non-success status is ambiguous: it can mean the
+        # script RAN and exited non-zero (a genuine command failure) OR
+        # the command NEVER RAN because the host vanished mid-command (a
+        # spot interruption / reclaim — a liveness event). The independent
+        # signals distinguish them: a non-execution failure carries an SSM
+        # delivery StatusDetails, or captured no exit code (rc == -1) while
+        # the agent's PingStatus is no longer Online. Classify the host-death
+        # case as INSTANCE_UNRESPONSIVE so the Choice routes it to the
+        # terminate-spot-and-alert remediation (the box is gone; there is no
+        # stale artifact and no logfile to read on it) rather than the
+        # COMMAND_FAILED "stale artifact" path. Still fail-loud: both verdicts
+        # terminate the run via HandleFailure — this only corrects the cause.
+        host_death = cmd["status_details"] in _DELIVERY_FAILURE_DETAILS or (
+            cmd["response_code"] == -1 and ping != "Online"
         )
+        if host_death:
+            result["verdict"] = "INSTANCE_UNRESPONSIVE"
+            result["detail"] = (
+                f"[{step}] SSM command {command_id} reached terminal "
+                f"{cmd['status']} WITHOUT executing on {instance_id} "
+                f"(StatusDetails={cmd['status_details']!r}, "
+                f"rc={cmd['response_code']}, PingStatus={ping}) — the host "
+                f"vanished mid-command (spot interruption / reclaim), not a "
+                f"script failure. Remediate as an unresponsive instance "
+                f"(terminate the spot + alert); do not treat as a command "
+                f"failure (no exit code was produced, the box is gone)."
+            )
+        else:
+            result["verdict"] = "COMMAND_FAILED"
+            result["detail"] = (
+                f"[{step}] SSM command {command_id} terminal status "
+                f"{cmd['status']} (rc={cmd['response_code']}): "
+                f"{cmd['status_details']}"
+            )
     else:
         # Still running (or registering). Liveness + budget accounting.
         if ping != "Online":

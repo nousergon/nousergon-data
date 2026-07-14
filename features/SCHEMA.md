@@ -143,6 +143,8 @@ parity.
 | `mom_12_1_pct` | decimal return | `close.shift(21) / close.shift(252) - 1` (12-1 skip-month momentum) | predictor (W2) |
 | `sector_mom_pct` | decimal return | sector-ETF `close.shift(21) / close.shift(252) - 1` (absolute industry momentum) | predictor (W2) |
 | `factor_momentum_ratio` | dimensionless projection | `Σ_f zscore(loading_{i,f,t}) × factor_momentum_{f,t}` (Gupta-Kelly factor momentum) — **second-pass** column materialized over the full universe panel by `factor_momentum.materialize_factor_momentum` (not per-ticker `compute_features`); backward-only | predictor (W2.3, observe) |
+| `vwap_divergence_pct` | decimal pct (`_pct` suffix) | `(Close - VWAP) / VWAP` | predictor (config#939 — VWAP divergence). NaN when VWAP is unavailable (yfinance-fallback rows; the documented 2026-04-17→23 Polygon outage) or when VWAP is 0 (guarded via `.replace(0, nan)`) |
+| `cmf_20_ratio` | dimensionless ratio, bounded ~[-1, 1] (`_ratio` suffix) | Chaikin Money Flow: `rolling_sum(MFM * Volume, 20) / rolling_sum(Volume, 20)` where `MFM = ((Close-Low)-(High-Close))/(High-Low)` | predictor (config#939 — buying/selling pressure). `High == Low` guarded to NaN via `.replace(0, nan)`, mirroring `volume_trend` / `obv_slope_10d` |
 
 ### Macro (one row per date — `per_ticker=False`)
 
@@ -155,6 +157,7 @@ parity.
 | `oil_mom_5d` | decimal return | `uso / uso.shift(5) - 1` | predictor |
 | `vix_term_slope` | normalized | `(vix - vix3m) / vix_baseline` | predictor |
 | `xsect_dispersion` | stdev of universe returns | precomputed series | predictor |
+| `hy_oas_credit_spread_pct` | percent (FRED native units, `_pct` suffix) | ICE BofA US HY Index OAS, FRED series `BAMLH0A0HYM2`, ffilled onto the trading-day index | predictor (config#939 — credit spreads). License-gated to 2023+ on FRED; pre-2023 / missing rows fall back to neutral `0.0` (same pattern as `gold_mom_5d` / `oil_mom_5d`), never hard-fail. **Distinct from** crucible-predictor's `model/regime_predictor.py` `hy_oas_level` / `hy_oas_change_21d` — that is a separate market-wide regime-substrate feature family (own `HYOAS.parquet` source, consumed only via `cfg.MACRO_NORM_FEATURES`), not a `feature_engineer.FEATURES` / `registry.CATALOG` entry. Same underlying FRED series, deliberately different name/namespace to avoid collision. |
 
 ### Regime interactions (per-ticker × macro)
 
@@ -208,6 +211,29 @@ column, computed POST-assembly in `features/compute.py` via
 re-standardization follow the Barra USE4 / AQR convention so a single
 outlier ticker cannot dominate the downstream factor-return regression
 (C.2, alpha-engine-predictor).
+
+**`roe_zscore` known-degenerate (config#1765, open).** Live `roe` is
+clip-saturated at its `[-1, 1]` bound for ~98% of the universe (median
+`roe` == 1.0), which collapses `roe_zscore` to all-NaN everywhere
+(`apply_factor_zscores`'s MAD-degeneracy guard correctly refuses to
+fabricate a z-score from a near-constant cross-section — this is NOT a
+bug in this module). Root cause traced to `collectors/fundamentals.py`
+(`_fetch_single_ticker`): its Finnhub field mapping assumes `roeTTM` /
+`roeRfy` (and several other fields — `gross_margin`, `revenue_growth_yoy`,
+`revenue_growth_3y`, `eps_growth_3y`, `payout_ratio`, `dividend_yield`
+show the same saturation pattern) are 0–1 fractions, but the live
+`archive/fundamentals/{date}.json` payloads are consistent with Finnhub
+returning those fields as raw percentages (e.g. `62` meaning 62%, not
+`0.62`) — every one of them saturates at its declared clip bound for
+the bulk of the 903-ticker universe. Fixing the unit scaling needs a
+live Finnhub payload to confirm the exact conversion per field (not
+done here — out of scope for the config#1765 groom pass, which only
+covers the predictor-side symptom). Until this collector bug is fixed,
+`alpha-engine-predictor/training/risk_model_persist.py` pins a 7-factor
+`FACTOR_LOADING_COLUMNS` set that excludes `roe_zscore` (QUALITY
+loading) so the weekly F/D persistence isn't blocked on a permanently
+all-NaN column. Re-add `roe_zscore` to that set once `roe` is a real,
+non-degenerate cross-section again.
 
 | Field | Units | Compute | Consumers |
 |---|---|---|---|
@@ -268,7 +294,14 @@ Before opening a PR that adds a column to `compute_features`:
 5. If the field has a NEW consumer (e.g., backtester reads it for
    parity), add the consumer to §2 AND add a consumer-contract test in
    the consuming repo that pins the expected units.
-6. `pytest tests/test_schema_contract.py` must pass.
+6. **Name the universe-library restate step in the PR body** per the
+   column-add rollout contract in §6 — widening `FEATURES` does NOT
+   migrate the ~900 existing static-schema ArcticDB symbols on its own,
+   so the PR that widens the schema must also schedule the full-history
+   restate that lays down the new descriptor. Omitting it breaks the
+   next `daily_append` per-ticker (config#2006).
+7. `pytest tests/test_schema_contract.py
+   tests/test_daily_append_schema_evolution_2006.py` must pass.
 
 ### 4b. PR checklist for a NEW private-pack column (alpha-engine-config#1032)
 
@@ -302,3 +335,51 @@ Before landing a new alpha-bearing column through the private pack:
 | 2026-05-25 | This SCHEMA.md + additive `avg_volume_20d_raw` + naming-convention rule shipped as the institutional substrate (alpha-engine-data Phase 1). |
 | 2026-05-26 | C.1 of optimizer-sota-upgrades-260526 — 8 factor-loading `*_zscore` columns added (cross-sectional ±3σ-winsorized z-scores) as substrate for the executor's Σ = B·F·Bᵀ + D risk decomposition. |
 | 2026-07-01 | alpha-engine-config#1032 (private-edge divergence policy, config#1031) — private feature-pack loading mechanism (`features/private_pack.py`) + `compute=PRIVATE_PACK_COMPUTE` schema-contract sentinel (§3b) shipped. No alpha-bearing column has landed through it yet; only the throwaway fixture in `tests/fixtures/dummy_private_pack.py` exercises the mechanism. |
+| 2026-07-08 | alpha-engine-config#939 — 3 of the 7 originally-listed feature gaps shipped (the other 4 had already landed): `vwap_divergence_pct` (VWAP divergence), `cmf_20_ratio` (Chaikin Money Flow — buying/selling pressure, chosen over MFI-14 / Chaikin A/D for its bounded range and fewest edge cases), `hy_oas_credit_spread_pct` (credit spreads, FRED `BAMLH0A0HYM2` / `HYOAS`, deliberately named distinct from crucible-predictor's separate regime-substrate `hy_oas_level`). All 3 computed from already-ingested data; no new data source. |
+| 2026-07-08 | config#2006 — the config#939 widening (92→95 cols) shipped with no restate for the existing static-schema universe symbols; the first live `daily_append` failed per-ticker with `StreamDescriptorMismatch`. Fix: full-history restate + the §6 column-add rollout contract + the `test_daily_append_schema_evolution_2006.py` CI tripwire that reproduces the failure against a real old-schema library and pins the restate recovery. |
+
+---
+
+## 6. Column-add rollout contract (config#2006) — STANDING DIRECTIVE
+
+The universe ArcticDB library is **static-schema**: a symbol's column set
+is frozen at write time, and an `update_batch` / `write` whose descriptor
+adds a column is rejected with `StreamDescriptorMismatch` until that
+symbol is rewritten at the new schema. `to_arctic_canonical`
+(`store/arctic_store.py`) makes a `FEATURES` widening a safe *additive
+column-ORDER* change at the write chokepoint, **but it does not migrate
+already-stored symbols** — the ~900 existing universe symbols keep their
+old descriptor until a full-history rewrite lands the new one.
+
+**Contract (option A — chosen, the default going forward):** every PR
+that widens `features/feature_engineer.py::FEATURES` (or otherwise changes
+the persisted universe column set) MUST, in the same PR body, name the
+scheduled **full-history restate** that migrates the existing library to
+the new schema, and that restate MUST run before the next `daily_append`
+against the affected library. The restate is the existing
+`builders/backfill.py` full-symbol rewrite (it recomputes features and
+`write_batch`es full history — establishing the new descriptor);
+`builders/migrate_universe_crsp_basis.py` is the precedent for a scoped
+one-off universe migration. Run it on a data-spot box
+(`infrastructure/spot_data_weekly.sh` pattern), never multi-hour compute
+on the trading box.
+
+**Why not option B (`dynamic_schema=True`):** flipping the universe
+library to dynamic schema would make column additions absorb without a
+restate, but it is a **deliberate, non-casual** change — it alters
+read-path performance and type-inference behaviour across every consumer
+(predictor training + inference read the full panel), and would need its
+own shadow-read parity gate + benchmark before cutover. It is recorded
+here as the explicit alternative, NOT the current contract; do not flip it
+as a shortcut to skip a restate.
+
+**Enforcement.** `tests/test_daily_append_schema_evolution_2006.py` is the
+CI tripwire for the bug class: it reproduces the mismatch against a real
+old-schema LMDB library through the real `to_arctic_canonical` →
+`update_batch` path, asserts the failure is SURFACED (per-symbol
+`DataError` → `n_err`, never a silent success or silent column-drop), and
+pins that a full-history restate is what makes the append green again. A
+future change that routes universe appends through a schema-narrowing
+helper (dropping the new column to force a false-green write) turns that
+test red — that silent-partial-coverage regression is precisely what the
+contract forbids.

@@ -11,6 +11,7 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-rationale-clustering*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-aggregate-costs*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-scanner*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-thinktank*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-concordance*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-counterfactual*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector*",
@@ -19,7 +20,8 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-substrate*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator*",
-        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*"
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*"
       ]
     },
     {
@@ -121,6 +123,33 @@
           "s3:prefix": "ops/daily_data_spot/*"
         }
       }
+    },
+    {
+      "Sid": "HeadPredictorWeightsManifest",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/predictor/weights/meta/manifest.json"
+    },
+    {
+      "Sid": "AgentTelemetryMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine/Agents"
+        }
+      }
+    },
+    {
+      "Sid": "PollDataSpotSsmCommand",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
     }
   ]
 }

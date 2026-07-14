@@ -49,6 +49,8 @@ from datetime import datetime, timezone
 
 import boto3
 
+from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,45 +126,58 @@ def collect(
     payload: dict[str, dict] = {}
     ok_count = 0
     err_count = 0
+    covered: set[str] = set()
     started = time.time()
 
-    for i, ticker in enumerate(fetch_list):
-        if i > 0 and inter_request_delay > 0:
-            time.sleep(inter_request_delay)
-        row = {
-            "short_pct_float": None,
-            "short_ratio": None,
-            "shares_short": None,
-        }
-        try:
-            info = yf.Ticker(ticker).info
-            short_pct = info.get("shortPercentOfFloat")
-            short_ratio = info.get("shortRatio")
-            shares_short = info.get("sharesShort")
+    # yfinance logs its own per-symbol ERROR ("possibly delisted", etc.) on a
+    # failed ``Ticker.info`` fetch, independent of this loop's own try/except.
+    # At an expected ~50% ok-ratio across a ~900-ticker universe (see
+    # ``_MIN_OK_RATIO`` docstring above), that is up to ~450 ERROR log lines
+    # per run, each a distinct Flow Doctor report (the same storm bug class
+    # fixed in ``collectors/prices.py`` (nousergon-data#455) and
+    # ``collectors/metron_market_data.py`` (config#1029) — see
+    # ``krepis.yfinance_quiet`` for the full history). ``quiet_yfinance``
+    # demotes those internal records; ``log_yf_coverage`` below is the
+    # replacement aggregated recording surface.
+    with quiet_yfinance():
+        for i, ticker in enumerate(fetch_list):
+            if i > 0 and inter_request_delay > 0:
+                time.sleep(inter_request_delay)
+            row = {
+                "short_pct_float": None,
+                "short_ratio": None,
+                "shares_short": None,
+            }
+            try:
+                info = yf.Ticker(ticker).info
+                short_pct = info.get("shortPercentOfFloat")
+                short_ratio = info.get("shortRatio")
+                shares_short = info.get("sharesShort")
 
-            # yfinance exposes shortPercentOfFloat as a 0-1 ratio; convert
-            # to percent for the executor / scoring layer's threshold semantics.
-            if short_pct is not None:
-                row["short_pct_float"] = round(float(short_pct) * 100, 2)
-            if short_ratio is not None:
-                row["short_ratio"] = round(float(short_ratio), 2)
-            if shares_short is not None:
-                row["shares_short"] = int(shares_short)
+                # yfinance exposes shortPercentOfFloat as a 0-1 ratio; convert
+                # to percent for the executor / scoring layer's threshold semantics.
+                if short_pct is not None:
+                    row["short_pct_float"] = round(float(short_pct) * 100, 2)
+                if short_ratio is not None:
+                    row["short_ratio"] = round(float(short_ratio), 2)
+                if shares_short is not None:
+                    row["shares_short"] = int(shares_short)
 
-            if any(v is not None for v in row.values()):
-                ok_count += 1
-        except Exception as exc:
-            err_count += 1
-            logger.debug("short interest fetch failed for %s: %s", ticker, exc)
+                if any(v is not None for v in row.values()):
+                    ok_count += 1
+                    covered.add(ticker)
+            except Exception as exc:
+                err_count += 1
+                logger.debug("short interest fetch failed for %s: %s", ticker, exc)
 
-        payload[ticker] = row
+            payload[ticker] = row
 
-        if (i + 1) % 100 == 0:
-            elapsed = time.time() - started
-            logger.info(
-                "short interest progress: %d/%d (%d ok, %d err) in %.0fs",
-                i + 1, len(fetch_list), ok_count, err_count, elapsed,
-            )
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - started
+                logger.info(
+                    "short interest progress: %d/%d (%d ok, %d err) in %.0fs",
+                    i + 1, len(fetch_list), ok_count, err_count, elapsed,
+                )
 
     elapsed = time.time() - started
     ok_ratio = ok_count / max(len(fetch_list), 1)
@@ -170,6 +185,7 @@ def collect(
         "short interest done: %d/%d ok (%.1f%%), %d errors, %.0fs",
         ok_count, len(fetch_list), ok_ratio * 100, err_count, elapsed,
     )
+    log_yf_coverage(logger, "short_interest", fetch_list, covered)
 
     result = {
         "date": run_date,

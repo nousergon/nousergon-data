@@ -84,6 +84,7 @@ from collectors import constituents, historical_constituents, prices, macro, uni
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
+    write_price_cache_freshness_sentinel as _write_price_cache_freshness_sentinel,
 )
 from dates import default_run_date  # config#1014: trading-day-axis default
 
@@ -366,6 +367,18 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 ),
                 supports_auto_skip=False,
             )
+            # config#2350 — reference/price_cache/ is variable cardinality
+            # (grandfathered in ARTIFACT_REGISTRY.yaml) so this unconditional
+            # sentinel is the ordinary-S3-ArtifactSpec proxy the freshness
+            # monitor actually probes (price_cache_freshness_sentinel row),
+            # mirroring the config#1787 feature-store sentinel. Written on
+            # every successful (non-dry-run) weekly refresh, independent of
+            # how many tickers were actually stale.
+            if not dry_run and results["collectors"]["prices"].get("status") == "ok":
+                _write_price_cache_freshness_sentinel(
+                    boto3.client("s3"), bucket,
+                    writer="nousergon-data:weekly_collector.py",
+                )
 
     # ── 3. Slim cache — REMOVED (Wave-4) ─────────────────────────────────────
     # predictor/price_cache_slim/ deleted: every consumer (data macro-breadth
@@ -1332,7 +1345,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             tickers = []
         if not tickers:
             try:
-                tickers, _, _, _, _ = constituents._fetch_constituents()
+                tickers, _, _, _, _, _ = constituents._fetch_constituents()
             except Exception as exc:
                 logger.error("Wikipedia constituents fallback failed: %s", exc)
 
@@ -1827,7 +1840,7 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
-            tickers, _, _, _, _ = constituents._fetch_constituents()
+            tickers, _, _, _, _, _ = constituents._fetch_constituents()
             logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
         except Exception as exc:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
@@ -2063,7 +2076,7 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
         logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
-            tickers, _, _, _, _ = constituents._fetch_constituents()
+            tickers, _, _, _, _, _ = constituents._fetch_constituents()
             logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
         except Exception as exc:
             logger.error("Wikipedia constituents fallback failed: %s", exc)

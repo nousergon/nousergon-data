@@ -1,0 +1,148 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sf-watch-spot-dispatcher:*"
+    },
+    {
+      "Sid": "RunInstancesInstanceScopedByTagAndType",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/Name": "alpha-engine-sf-watch-spot",
+          "ec2:InstanceType": [
+            "t3.medium",
+            "t3a.medium",
+            "t2.medium"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "RunInstancesConfiguredAmiOnly",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-1::image/ami-0c421724a94bba6d6"
+    },
+    {
+      "Sid": "RunInstancesLaunchDependencies",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-a61ec0fb",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-1e58307a",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-789d3857",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-c670118d",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-7cff7c43",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-e07166ec",
+        "arn:aws:ec2:us-east-1:711398986525:security-group/sg-03cd3c4bd91e610b0",
+        "arn:aws:ec2:us-east-1:711398986525:key-pair/alpha-engine-key",
+        "arn:aws:ec2:us-east-1:711398986525:network-interface/*",
+        "arn:aws:ec2:us-east-1:711398986525:volume/*"
+      ]
+    },
+    {
+      "Sid": "CreateTagsAtLaunchOnly",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:*/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": "RunInstances"
+        }
+      }
+    },
+    {
+      "Sid": "CreateDiscriminatorTagsOnOwnBoxesOnly",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "alpha-engine-sf-watch-spot"
+        }
+      }
+    },
+    {
+      "Sid": "DescribeIsNotResourceScopable",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassSfWatchExecutorRoleToEc2",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-sf-watch-executor-role",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "SsmRunSfWatchBootstrap",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand",
+        "ssm:DescribeInstanceInformation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TerminateSfWatchSpotOnError",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "alpha-engine-sf-watch-spot"
+        }
+      }
+    },
+    {
+      "Sid": "DeferNotDropOneShotSchedules",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:CreateSchedule",
+        "scheduler:GetSchedule"
+      ],
+      "Resource": "arn:aws:scheduler:*:*:schedule/default/sf-watch-defer-*"
+    },
+    {
+      "Sid": "PassDeferSchedulerRoleToScheduler",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-sf-watch-defer-scheduler-role",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "scheduler.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DeferReevaluationListExecutions",
+      "Effect": "Allow",
+      "Action": "states:ListExecutions",
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
+    }
+  ]
+}

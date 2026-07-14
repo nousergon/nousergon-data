@@ -48,6 +48,16 @@ sys.modules.setdefault("nousergon_lib", _ng)
 sys.modules.setdefault("nousergon_lib.telegram", _ng_telegram)
 sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
 
+# config#2208 fleet-pattern hardening: stub the whole sibling module wholesale
+# (mirrors scheduled-groom-dispatcher/pipeline-watchdog) so `index.notify_via_
+# flow_doctor` is a safe no-op by construction on every `import`/`reload`, not
+# only when each handler-calling test remembers its own `_wire()` monkeypatch.
+# hermetic_import_guard treats an already-stubbed sibling as satisfied (its
+# own imports become irrelevant), so this is additive, not a guard conflict.
+_fdt = types.ModuleType("flow_doctor_telegram")
+_fdt.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+sys.modules["flow_doctor_telegram"] = _fdt
+
 # Derive the stub requirement from index.py's live (transitive) import graph and
 # fail loud here if it has drifted, rather than as a cryptic ModuleNotFoundError
 # at deploy time. See _shared/hermetic_import_guard.py (config#1746).
@@ -74,13 +84,14 @@ def test_only_mature_triggers_returned(monkeypatch):
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
-    # Tue 14:00 UTC. The 07:00 Tue trigger matured (7h ago); a hypothetical recent
-    # one would not. 23:00 Mon (prev day) also mature.
+    # Tue 14:00 UTC. The 07:00 Tue trigger matured (7h ago); 01:00 Tue matured
+    # (13h ago). 19:00 Mon (prev day) also mature.
     now = _dt(2026, 6, 30, 14, 0)  # 2026-06-30 is a Tuesday
     trigs = index._expected_triggers(now)
     ats = {t["at"] for t in trigs}
-    assert _dt(2026, 6, 30, 7, 0) in ats   # 07:00 Tue, matured
-    assert _dt(2026, 6, 29, 23, 0) in ats  # 23:00 Mon, matured
+    assert _dt(2026, 6, 30, 7, 0) in ats   # 07:00 Tue Sonnet, matured
+    assert _dt(2026, 6, 30, 1, 0) in ats   # 01:00 Tue high-only, matured
+    assert _dt(2026, 6, 29, 19, 0) in ats  # 19:00 Mon Haiku, matured
     # Nothing in the immature zone (now - 6.75h .. now).
     assert all(t["at"] <= now - timedelta(minutes=405) for t in trigs)
 
@@ -98,34 +109,28 @@ def test_saturday_0700_included(monkeypatch):
     assert _dt(2026, 6, 27, 7, 0) in {t["at"] for t in trigs}
 
 
-def test_1500_opus_schedule_included(monkeypatch):
-    """config#1571: the 15:00 UTC Opus/complexity:high schedule must be tracked
-    too, not just the two Sonnet schedules — its silent death was previously
-    invisible to this probe (the schedule existed since 2026-07-01, config#1495
-    follow-up, but was never added here)."""
+def test_0100_high_only_schedule_included(monkeypatch):
+    """The 01:00 UTC dedicated complexity:high schedule must be tracked."""
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
-    # Wed 2026-07-01 22:00 UTC -> 15:00 Wed matured (7h ago).
-    now = _dt(2026, 7, 1, 22, 0)
+    # Wed 2026-07-01 10:00 UTC -> 01:00 Wed matured (9h ago).
+    now = _dt(2026, 7, 1, 10, 0)
     trigs = index._expected_triggers(now)
-    assert _dt(2026, 7, 1, 15, 0) in {t["at"] for t in trigs}
+    assert _dt(2026, 7, 1, 1, 0) in {t["at"] for t in trigs}
 
 
-def test_three_daily_triggers_dont_overlap_in_one_day(monkeypatch):
-    """The three windows [T, T+CEILING+MARGIN] must stay disjoint so per-trigger
-    attribution remains 1:1 (see _missed's docstring) now that a 3rd schedule
-    shares the day with the original two."""
+def test_three_daily_triggers_returned(monkeypatch):
+    """All three tier-split schedules appear in a single day's lookback."""
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 24)
-    now = _dt(2026, 7, 2, 6, 0)
+    now = _dt(2026, 7, 2, 14, 0)
     trigs = index._expected_triggers(now)
-    ats = sorted(t["at"] for t in trigs)
-    assert len(ats) == 3
-    window = timedelta(minutes=360 + 45)
-    for a, b in zip(ats, ats[1:]):
-        assert a + window <= b, f"{a} window overlaps {b}"
+    ats = {t["at"] for t in trigs}
+    assert _dt(2026, 7, 2, 1, 0) in ats
+    assert _dt(2026, 7, 2, 7, 0) in ats
+    assert _dt(2026, 7, 1, 19, 0) in ats
 
 
 # ---- _missed ---------------------------------------------------------------

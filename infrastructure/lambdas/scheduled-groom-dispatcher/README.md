@@ -25,9 +25,10 @@ then self-terminates (~$2/mo).
 
 ```
 EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
-  alpha-engine-scheduled-groom-0700-daily-low           ─┐      1. nousergon_lib.ec2_spot.launch()
-  alpha-engine-scheduled-groom-1500-daily-opus-high     ─┼───▶     (spot; on-demand fallback)
-  alpha-engine-scheduled-groom-2300-daily-mid           ─┘      2. wait instance running + SSM Online
+  alpha-engine-scheduled-groom-0100-daily-opus-high     ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-0700-daily-mid           ─┼───▶     (spot; on-demand fallback)
+  alpha-engine-scheduled-groom-1900-daily-low           ─┘      2. wait instance running + SSM Online
+  alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify  (Sun 09:00 UTC, Haiku gated-reverify)
                                                              3. async ssm send-command (detached):
                                                                    │
                                                                    ▼
@@ -49,13 +50,23 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
 | Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
 |---|---|---|---|---|---|---|
-| `…-0700-daily-low` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-haiku-4-5 | low-only |
-| `…-1500-daily-opus-high` | `cron(0 15 * * ? *)` | 8am | daily (all 7) | full | claude-opus-4-8 | high-only |
-| `…-2300-daily-mid` | `cron(0 23 * * ? *)` | 4pm | daily (all 7) | full | claude-sonnet-5 | mid-only |
+| `…-0100-daily-opus-high`¹ | `cron(0 1 * * ? *)` | 6pm | daily (all 7) | full | claude-sonnet-5 | high-only |
+| `…-0700-daily-mid` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | mid-only |
+| `…-1900-daily-low` | `cron(0 19 * * ? *)` | 12pm | daily (all 7) | full | claude-haiku-4-5 | low-only |
+| `…-sun0900-weekly-gated-reverify` | `cron(0 9 ? * SUN *)` | 2am | Sun only | full | claude-haiku-4-5 | gated-reverify |
 
-> **Tier-split cadence (config#1760, 2026-07-05):** three disjoint queues — Haiku
-> on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled), Opus on
-> `complexity:high`. Requires `alpha-engine-config` driver filters (#1761) on
+> ¹ config#2409 (2026-07-13): the high-only slot's MODEL moved off Opus onto
+> Sonnet; the Scheduler rule NAME is left as `-opus-high` deliberately — a
+> rename would require an operator-run `--bootstrap` (see the warning above)
+> purely for a cosmetic AWS identifier, which isn't worth the live-schedule
+> churn. Rename opportunistically the next time this cadence table changes
+> for a substantive reason.
+
+> **Tier-split cadence (config#1760/#2409):** three disjoint queues — Haiku
+> on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled) and on
+> `complexity:high` (moved off Opus 2026-07-13 — see config#2409; the split
+> is queue-isolation/dedicated-attention, not a model-capability step up).
+> Requires `alpha-engine-config` driver filters (#1761) on
 > the box's cloned `main` before `--bootstrap` deploys these schedules live.
 
 > **Sat-skip removed 2026-07-02, uniform 3x/day/7-days, no exceptions.** The
@@ -81,15 +92,15 @@ day-of-week year)` with `?` for an unspecified day field.
 ## Schedule-input routing
 
 Each schedule passes a JSON input, e.g. `{"run_mode": "full", "model":
-"claude-opus-4-8", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 15 * * *"}`.
-The Opus schedule alone carries `pr_budget: 100` (config#1769) — forwarded as
-`GROOM_PR_BUDGET` on the spot box; Haiku/Sonnet stay at the bootstrap default (50).
+"claude-sonnet-5", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 1 * * *"}`.
+The dedicated high-only schedule alone carries `pr_budget: 100` (config#1769) — forwarded as
+`GROOM_PR_BUDGET` on the spot box; Haiku/mid-Sonnet stay at the bootstrap default (50).
 The Lambda resolves each field (unknown/missing values degrade to a safe
 default — `full` / `claude-sonnet-5` / `default`) and exports `GROOM_MODEL` +
 `GROOM_ISSUE_FILTER` in the SSM bootstrap prelude ahead of invoking
 `groom_spot_bootstrap.sh --mode <run_mode>`, which forwards them into
 `scripts/groom_run.sh` → `scripts/groom_driver.py` (`--issue-filter` selects
-the Sonnet default queue vs. the Opus `complexity:high`-only queue; `--model`
+the mid default queue vs. the dedicated `complexity:high`-only queue; `--model`
 is passed straight to the `claude -p` invocation). `model` is validated against
 a conservative allowlist regex before being embedded in the shell command
 (defense-in-depth — the event is Lambda-config-controlled, not raw user input,

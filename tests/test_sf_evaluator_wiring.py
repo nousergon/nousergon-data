@@ -147,21 +147,30 @@ class TestEvaluatorTask:
         assert states["Evaluator"]["TimeoutSeconds"] == 3660
 
     def test_retry_mirrors_backtester_posture(self, states):
-        # Spot interruption handling: 2 attempts, 180s initial backoff,
-        # 2.0x multiplier — matches Backtester for symmetry.
+        # config#2279: both Evaluator and Backtester now carry the declared
+        # spot-stage gold ladder (4+2 jittered) — symmetry preserved; the
+        # exact ladder shape is pinned centrally in
+        # test_sf_retry_ladder_convention.py.
+        def _sig(state):
+            return [
+                {k: v for k, v in rule.items() if k != "Comment"}
+                for rule in state["Retry"]
+            ]
+        assert _sig(states["Evaluator"]) == _sig(states["Backtester"])
         retry = states["Evaluator"]["Retry"][0]
-        assert retry["MaxAttempts"] == 2
-        assert retry["IntervalSeconds"] == 180
-        assert retry["BackoffRate"] == 2.0
+        assert retry["MaxAttempts"] == 4
+        assert retry["JitterStrategy"] == "FULL"
 
     def test_catch_routes_to_handle_failure(self, states):
         # Evaluator failure halts the pipeline (unlike eval-judge which
         # is observability-only). The optimizer auto-apply contract
         # means a silent evaluator failure could leave stale configs in
-        # production — fail loud.
+        # production — fail loud. config#1819: routes through
+        # NormalizeFailureContext (the single chokepoint in front of
+        # HandleFailure) rather than HandleFailure directly.
         catch = states["Evaluator"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "HandleFailure"
+        assert catch["Next"] == "NormalizeFailureContext"
 
 
 # ── Poll loop ─────────────────────────────────────────────────────────────
@@ -218,4 +227,6 @@ class TestExtractEvaluatorError:
         assert params["poll.$"] == "$.evaluator_poll"
 
     def test_routes_to_handle_failure(self, states):
-        assert states["ExtractEvaluatorError"]["Next"] == "HandleFailure"
+        # config#1819: routes through NormalizeFailureContext, not HandleFailure
+        # directly (was HandleFailure pre-fix).
+        assert states["ExtractEvaluatorError"]["Next"] == "NormalizeFailureContext"

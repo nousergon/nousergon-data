@@ -63,6 +63,8 @@ from datetime import datetime, timezone
 
 import boto3
 
+from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
@@ -151,32 +153,42 @@ def collect(
     payload: dict[str, dict] = {}
     ok_count = 0
     err_count = 0
+    covered: set[str] = set()
     started = time.time()
 
-    for i, ticker in enumerate(fetch_list):
-        if i > 0 and inter_request_delay > 0:
-            time.sleep(inter_request_delay)
-        row = {field: None for field in _INFO_FIELDS.values()}
-        try:
-            info = yf.Ticker(ticker).info or {}
-            for info_key, field in _INFO_FIELDS.items():
-                v = info.get(info_key)
-                if v:
-                    row[field] = str(v)
-            if any(v is not None for v in row.values()):
-                ok_count += 1
-        except Exception as exc:
-            err_count += 1
-            logger.debug("classification fetch failed for %s: %s", ticker, exc)
+    # See collectors/short_interest.py for the full rationale: yfinance logs
+    # its own per-symbol ERROR on a failed ``Ticker.info`` fetch regardless of
+    # this loop's own try/except, which storms Flow Doctor across a
+    # ~900-ticker universe (the bug class fixed in ``collectors/prices.py``
+    # (nousergon-data#455) / ``collectors/metron_market_data.py``
+    # (config#1029)). ``quiet_yfinance`` demotes those records;
+    # ``log_yf_coverage`` below is the replacement aggregated surface.
+    with quiet_yfinance():
+        for i, ticker in enumerate(fetch_list):
+            if i > 0 and inter_request_delay > 0:
+                time.sleep(inter_request_delay)
+            row = {field: None for field in _INFO_FIELDS.values()}
+            try:
+                info = yf.Ticker(ticker).info or {}
+                for info_key, field in _INFO_FIELDS.items():
+                    v = info.get(info_key)
+                    if v:
+                        row[field] = str(v)
+                if any(v is not None for v in row.values()):
+                    ok_count += 1
+                    covered.add(ticker)
+            except Exception as exc:
+                err_count += 1
+                logger.debug("classification fetch failed for %s: %s", ticker, exc)
 
-        payload[ticker] = row
+            payload[ticker] = row
 
-        if (i + 1) % 100 == 0:
-            elapsed = time.time() - started
-            logger.info(
-                "universe classification progress: %d/%d (%d ok, %d err) in %.0fs",
-                i + 1, len(fetch_list), ok_count, err_count, elapsed,
-            )
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - started
+                logger.info(
+                    "universe classification progress: %d/%d (%d ok, %d err) in %.0fs",
+                    i + 1, len(fetch_list), ok_count, err_count, elapsed,
+                )
 
     elapsed = time.time() - started
     ok_ratio = ok_count / max(len(fetch_list), 1)
@@ -184,6 +196,7 @@ def collect(
         "universe classification done: %d/%d ok (%.1f%%), %d errors, %.0fs",
         ok_count, len(fetch_list), ok_ratio * 100, err_count, elapsed,
     )
+    log_yf_coverage(logger, "universe_classification", fetch_list, covered)
 
     artifact = {
         "schema_version": UNIVERSE_CLASSIFICATION_SCHEMA_VERSION,
