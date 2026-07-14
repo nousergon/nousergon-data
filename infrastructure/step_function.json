@@ -927,14 +927,14 @@
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-60 coverage gaps (new theses for uncovered names + stalest refresh). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
+              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-150 coverage gaps (new theses for uncovered names + stalest refresh) — the entire rank_ceiling universe, in one weekly run (2026-07-14 cadence split: the non-Saturday EventBridge 'maintenance' run no longer does intake at all, since the universe board this state's Scanner predecessor produces is itself Saturday-only; this state is now the SOLE coverage-growth/refresh owner). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-thinktank:live",
                 "Payload": {
                   "mode": "sf_cover",
-                  "sf_cover_target": 60,
-                  "sf_cover_ceiling": 60,
+                  "sf_cover_target": 150,
+                  "sf_cover_ceiling": 150,
                   "run_date.$": "$.run_date"
                 }
               },
