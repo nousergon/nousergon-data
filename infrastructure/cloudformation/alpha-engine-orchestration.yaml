@@ -309,7 +309,7 @@ Resources:
   # Lambda still supplies {"shell_run": true, "pipeline_role": "shell-run"}.
 
   WeekdayTrigger:
-    Type: AWS::Events::Rule
+    Type: AWS::Scheduler::Schedule
     Properties:
       Name: alpha-engine-weekday
       # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC) — bought a
@@ -328,36 +328,48 @@ Resources:
       # without needing another manual bump every ~2 months. See
       # nousergon/alpha-engine-config#2412 (tracked follow-up: early-warning
       # canary so buffer erosion pages automatically instead of being
-      # noticed anecdotally) and #2413 (migrate this rule to
-      # AWS::Scheduler::Schedule for real DST-timezone awareness, matching
-      # StopTradingSchedule below).
-      # NOTE (pre-existing, unchanged here): AWS::Events::Rule cron
-      # expressions are UTC-only (no ScheduleExpressionTimezone support,
-      # unlike AWS::Scheduler::Schedule) — the UTC expression assumes PDT
-      # (UTC−7); during PST the effective PT start shifts an hour earlier
-      # (i.e. MORE buffer, not less). That DST caveat predates this change;
-      # #2413 is the tracked fix.
-      Description: Weekday 12:15 UTC (5:15 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
+      # noticed anecdotally).
+      # RESOLVED 2026-07-14 (config#2413): migrated this trigger from
+      # AWS::Events::Rule to AWS::Scheduler::Schedule so
+      # ScheduleExpressionTimezone can carry real IANA-timezone/DST-aware PT
+      # scheduling, matching StopTradingSchedule below. Previously, the bare
+      # UTC cron on AWS::Events::Rule (no ScheduleExpressionTimezone support)
+      # silently assumed PDT (UTC−7); during PST the effective PT start would
+      # have shifted an hour earlier (i.e. MORE buffer, not less — benign,
+      # but not the documented 5:15 AM PT contract). EventBridge Scheduler
+      # now resolves the cron against America/Los_Angeles directly, so the
+      # 12:15 UTC-equivalent cron expression below auto-adjusts across the
+      # DST boundary and always fires at 5:15 AM PT.
+      Description: Weekday 5:15 AM PT (DST-aware) — daily data + predictor + executor; daemon ready before 06:30 PT open
       ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: 'America/Los_Angeles'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
       State: ENABLED
-      Targets:
-        # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
+      Target:
+        # SINGLE TARGET PER SCHEDULE. See the SaturdayTrigger Targets
         # comment for the 2026-05-26 duplicate-target incident that
-        # codified this invariant. SoT for this rule is THIS FILE;
-        # the deploy scripts no longer touch EventBridge.
-        - Id: weekday-pipeline
-          Arn: !Ref WeekdayPipeline
-          RoleArn: !Ref EventBridgeSfnRoleArn
-          # pipeline_role="daily" (Option-D 2026-05-25): identifies this as
-          # the canonical weekday trading-cadence run. Page 25 filters to
-          # role="daily" by default for the Weekday section.
-          Input: !Sub |
-            {
-              "ec2_instance_id": ["${MicroInstanceId}"],
-              "trading_instance_id": ["${TradingInstanceId}"],
-              "sns_topic_arn": "${AlertsTopic}",
-              "pipeline_role": "daily"
-            }
+        # codified the analogous EventBridge-Rule invariant. SoT for
+        # this schedule is THIS FILE; the deploy scripts no longer
+        # touch EventBridge/Scheduler.
+        #
+        # EventBridge Scheduler's Step-Functions integration
+        # (arn:aws:scheduler:::aws-sdk:sfn:startExecution) wraps the
+        # SFN StartExecution call: StateMachineArn is the target state
+        # machine, and Input is a JSON STRING (not a nested object)
+        # holding the payload passed through to the execution's own
+        # input — the same payload the old AWS::Events::Rule target's
+        # top-level Input carried verbatim.
+        Arn: 'arn:aws:scheduler:::aws-sdk:sfn:startExecution'
+        RoleArn: !Ref EventBridgeSfnRoleArn
+        # pipeline_role="daily" (Option-D 2026-05-25): identifies this as
+        # the canonical weekday trading-cadence run. Page 25 filters to
+        # role="daily" by default for the Weekday section.
+        Input: !Sub |
+          {
+            "StateMachineArn": "${WeekdayPipeline}",
+            "Input": "{\"ec2_instance_id\": [\"${MicroInstanceId}\"], \"trading_instance_id\": [\"${TradingInstanceId}\"], \"sns_topic_arn\": \"${AlertsTopic}\", \"pipeline_role\": \"daily\"}"
+          }
 
   # alpha-engine-config-I2545: ModelZoo Sunday trigger. Brian-ruled
   # 2026-07-14 — 09:00 UTC gives a full day of retry headroom before Monday

@@ -80,7 +80,8 @@ def orchestration_text() -> str:
 
 
 def _trigger_block(text: str, name: str) -> str:
-    """Extract a single ``AWS::Events::Rule`` block from the CFN text."""
+    """Extract a single cron-trigger resource block from the CFN text
+    (``AWS::Events::Rule`` or, since config#2413, ``AWS::Scheduler::Schedule``)."""
     head = text.split(f"{name}:", 1)
     assert len(head) == 2, f"{name} block not found in orchestration CFN"
     successor = _TRIGGER_SUCCESSORS[name]
@@ -152,16 +153,49 @@ class TestCFNTargetUniqueness:
     executions, which then race at any shared downstream resource
     (the 2026-05-26 ArcticDB race; see module docstring).
 
-    Constraint: every cron-triggered ``AWS::Events::Rule`` in the
-    orchestration CFN template has EXACTLY ONE entry under
-    ``Targets:``. If you have a legitimate reason to fan one rule to
-    multiple targets, document the rationale + update this test in
-    the same PR.
+    Constraint: every cron-triggered trigger resource in the
+    orchestration CFN template has EXACTLY ONE target. If you have a
+    legitimate reason to fan one trigger to multiple targets, document
+    the rationale + update this test in the same PR.
+
+    Two resource shapes are in play here:
+
+    - ``AWS::Events::Rule`` (e.g. SaturdayTrigger) declares targets as
+      a ``Targets:`` list of ``- Id: ...`` entries — EventBridge fans
+      the trigger event to EVERY entry, so we count ``- Id:`` markers
+      and require exactly 1.
+    - ``AWS::Scheduler::Schedule`` (e.g. WeekdayTrigger, migrated
+      config#2413) declares a single ``Target:`` mapping — the CFN
+      schema only permits one Target per Schedule, so "exactly one
+      target" is structurally guaranteed and there is no list to
+      count. We just assert the ``Target:`` block exists and contains
+      no second ``Arn:``/``- Id:`` list (which would indicate someone
+      hand-rolled a second target shape into the same block).
     """
 
     @pytest.mark.parametrize("trigger", list(_TRIGGER_SUCCESSORS.keys()))
     def test_exactly_one_target_per_trigger(self, orchestration_text, trigger):
         block = _trigger_block(orchestration_text, trigger)
+        resource_type_match = re.search(r"Type:\s*(\S+)", block)
+        assert resource_type_match, f"{trigger} block missing ``Type:``"
+        resource_type = resource_type_match.group(1)
+
+        if resource_type == "AWS::Scheduler::Schedule":
+            # Singular ``Target:`` mapping — the schema permits only one,
+            # so uniqueness is structural. Just confirm it's present and
+            # that the plural ``Targets:`` (Events::Rule) shape wasn't
+            # left behind by a partial migration.
+            assert re.search(r"^\s*Target:\s*$", block, re.MULTILINE), (
+                f"{trigger} is an AWS::Scheduler::Schedule but has no "
+                f"``Target:`` block."
+            )
+            assert not re.search(r"^\s*Targets:\s*$", block, re.MULTILINE), (
+                f"{trigger} is an AWS::Scheduler::Schedule but still has "
+                f"a plural ``Targets:`` block — looks like a leftover "
+                f"from the AWS::Events::Rule shape."
+            )
+            return
+
         # ``Targets:`` is followed by one or more ``- Id: ...`` entries
         # at the same indent. Count the ``- Id:`` markers between
         # ``Targets:`` and the end of the block.
@@ -191,19 +225,29 @@ class TestOrchestrationCFNPipelineRoles:
     ``pipeline_role`` tag so page 25 / Slack / CLI consumers filter
     smoke / recovery / operator-replay executions out of the cadence
     section.
+
+    WeekdayTrigger (config#2413, AWS::Scheduler::Schedule) nests its
+    payload inside the ``aws-sdk:sfn:startExecution`` call shape, so
+    the inner JSON is backslash-escaped (``\\"pipeline_role\\"``)
+    inside the outer ``Input`` string. The pattern below tolerates an
+    optional backslash before each quote so it matches both the plain
+    (SaturdayTrigger, AWS::Events::Rule) and escaped (WeekdayTrigger)
+    forms.
     """
+
+    _PIPELINE_ROLE_RE = r'\\?"pipeline_role\\?"\s*:\s*\\?"{}\\?"'
 
     def test_saturday_trigger_has_weekly_role(self, orchestration_text):
         block = _trigger_block(orchestration_text, "SaturdayTrigger")
         assert re.search(
-            r'"pipeline_role"\s*:\s*"weekly"',
+            self._PIPELINE_ROLE_RE.format("weekly"),
             block,
         ), 'SaturdayTrigger Input must carry pipeline_role="weekly".'
 
     def test_weekday_trigger_has_daily_role(self, orchestration_text):
         block = _trigger_block(orchestration_text, "WeekdayTrigger")
         assert re.search(
-            r'"pipeline_role"\s*:\s*"daily"',
+            self._PIPELINE_ROLE_RE.format("daily"),
             block,
         ), 'WeekdayTrigger Input must carry pipeline_role="daily".'
 
