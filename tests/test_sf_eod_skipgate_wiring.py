@@ -43,7 +43,11 @@ _CHAIN = [
     # FIRST (right after the SSM-readiness gate), so the entire EOD run executes
     # latest origin/main by construction. Skipping it resumes at the first work gate.
     ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipPostMarketData"),
-    ("CheckSkipPostMarketData", "LaunchPostMarketDataSpot", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
+    # 2026-07-14: CheckSkipPostMarketData's Default now runs through
+    # InitDataSpotRetryCounter (the new spot-interruption retry-budget init)
+    # before LaunchPostMarketDataSpot — pinned separately in
+    # TestEODDataSpotRetryBudget (test_sf_data_spot_relocation_wiring.py).
+    ("CheckSkipPostMarketData", "InitDataSpotRetryCounter", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
     ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "CheckSkipEODReconcile"),
     ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckSkipDailySubstrateHealthCheck"),
     ("CheckSkipDailySubstrateHealthCheck", "DailySubstrateHealthCheck", "skip_daily_substrate_health_check", "StopTradingInstance"),
@@ -102,10 +106,12 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_post_market_spot_success_enters_arctic_append_spot(self, states):
         # config#1767: the post-market fetch now runs on spot; its poll Success
-        # enters the Arctic-append spot launch (both run on spot).
+        # enters the Arctic-append retry-counter init (2026-07-14), which then
+        # launches the Arctic-append spot workload (both run on spot).
         succ = [c["Next"] for c in states["CheckPostMarketDataSpotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["LaunchPostMarketArcticAppendSpot"]
+        assert succ == ["InitDataSpotArcticRetryCounter"]
+        assert states["InitDataSpotArcticRetryCounter"]["Next"] == "LaunchPostMarketArcticAppendSpot"
 
     def test_arctic_append_spot_success_enters_snapshot_gate(self, states):
         # config#1767: the EOD Arctic append also runs on spot; its Success
@@ -180,10 +186,12 @@ class TestPaths:
     def test_skip_refresh_resumes_at_data_spot(self, states):
         # config#1549: skipping only the deploy refresh (e.g. an operator rerun
         # on a box already known fresh) resumes at the first work task, which is
-        # now the spot data-phase launch (config#1767).
+        # now the spot data-phase retry-counter init (config#1767; counter init
+        # added 2026-07-14) then the spot launch itself.
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
         assert "RefreshExecutorDeploy" not in order
-        assert order[0] == "LaunchPostMarketDataSpot"
+        assert order[0] == "InitDataSpotRetryCounter"
+        assert order[1] == "LaunchPostMarketDataSpot"
         assert order[-1] == "StopTradingInstance"
 
     def test_skip_data_phase_resumes_at_snapshot(self, states):
