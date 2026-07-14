@@ -233,6 +233,15 @@
         "TimeoutSeconds": 300
       },
       "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5,
+          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: this fires only when the SendCommand API call itself failed (BEFORE the launcher ran, so re-issue is a fresh dispatch, not a re-run of partial work), and the state is already declared FAIL-SOFT/best-effort — a re-issued heal is idempotent by the state's own design."
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": [
@@ -504,6 +513,15 @@
         "TimeoutSeconds": 300
       },
       "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5,
+          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: fires only when the SendCommand API call itself failed (BEFORE the script ran), and the script is idempotent by construction (git fetch / checkout -f / reset --hard, all serialized under the .ae-git-sync.lock flock) — re-issue just re-runs the same freshness check."
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": [
@@ -1075,6 +1093,15 @@
         "TimeoutSeconds": 30
       },
       "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5,
+          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: fires only when the SendCommand API call itself failed (BEFORE the command ran), and the dispatched command (`sudo systemctl restart alpha-engine-daemon.service`) is idempotent at the OS level — re-issuing a restart cannot start a second daemon process."
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": [

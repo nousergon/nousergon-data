@@ -2221,12 +2221,31 @@ def _fetch_yfinance_closes(
     ``collectors/prices.py`` (nousergon-data#455) and
     ``collectors/metron_market_data.py`` (config#1029). The replacement
     recording surface is the aggregated ``log_yf_coverage`` call below.
+
+    Bounded to the close **on-or-before** ``date_str`` (mirrors
+    ``_fetch_fred_closes``'s ``observation_end=date_str`` semantics), NOT
+    ``period="5d"`` anchored to wall-clock now. The unbounded form always
+    returned yfinance's most-recent bar regardless of the requested date —
+    the identical defect fixed in ``_fetch_fred_window``/``_fetch_fred_closes``
+    (2026-05, L4492) for FRED, which "clobbered every historical date in the
+    rolling window with today's latest close." This function had the same
+    bug: every historical (non-today) caller — chiefly the L1 cross-source
+    observer's per-window-date SPY check (``sources/cross_source_gate.py``,
+    config#1277) — got today's yfinance close mislabeled with the requested
+    historical date, producing a false QUARANTINE on nearly every date in the
+    56-business-day window (alpha-engine-config#2475).
     """
     try:
         import yfinance as yf
     except ImportError:
         logger.warning("yfinance not available for daily closes fallback")
         return 0
+
+    requested = datetime.strptime(date_str, "%Y-%m-%d").date()
+    # 9 calendar days comfortably spans any weekend/holiday gap back to the
+    # nearest prior trading day, matching FRED's on-or-before resolution.
+    window_start = requested - timedelta(days=9)
+    window_end = requested + timedelta(days=1)  # yfinance ``end`` is exclusive
 
     count = 0
     covered: set[str] = set()
@@ -2240,7 +2259,8 @@ def _fetch_yfinance_closes(
             tickers_arg = batch[0] if len(batch) == 1 else batch
             raw = yf.download(
                 tickers=tickers_arg,
-                period="5d",
+                start=window_start.isoformat(),
+                end=window_end.isoformat(),
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
@@ -2256,6 +2276,9 @@ def _fetch_yfinance_closes(
                     if df.index.tz is not None:
                         df.index = df.index.tz_convert("UTC").tz_localize(None)
                     df = df.dropna(subset=["Close"])
+                    # On-or-before ``date_str`` — a batched/backfilled fetch
+                    # must never resolve to a bar AFTER the requested date.
+                    df = df[df.index <= pd.Timestamp(requested)]
                     if df.empty:
                         continue
 

@@ -90,7 +90,7 @@ def test_only_mature_triggers_returned(monkeypatch):
     trigs = index._expected_triggers(now)
     ats = {t["at"] for t in trigs}
     assert _dt(2026, 6, 30, 7, 0) in ats   # 07:00 Tue Sonnet, matured
-    assert _dt(2026, 6, 30, 1, 0) in ats   # 01:00 Tue Opus, matured
+    assert _dt(2026, 6, 30, 1, 0) in ats   # 01:00 Tue high-only, matured
     assert _dt(2026, 6, 29, 19, 0) in ats  # 19:00 Mon Haiku, matured
     # Nothing in the immature zone (now - 6.75h .. now).
     assert all(t["at"] <= now - timedelta(minutes=405) for t in trigs)
@@ -109,8 +109,8 @@ def test_saturday_0700_included(monkeypatch):
     assert _dt(2026, 6, 27, 7, 0) in {t["at"] for t in trigs}
 
 
-def test_0100_opus_schedule_included(monkeypatch):
-    """The 01:00 UTC Opus/complexity:high schedule must be tracked."""
+def test_0100_high_only_schedule_included(monkeypatch):
+    """The 01:00 UTC dedicated complexity:high schedule must be tracked."""
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)

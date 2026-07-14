@@ -1,0 +1,13 @@
+# pip-audit ignore list (nousergon/alpha-engine-config#2342)
+# Every entry below MUST carry a dated rationale comment directly above it.
+# No blanket suppression — each accepted advisory is named individually.
+# Format:
+#   # <rationale> — accepted 2026-07-12, revisit <YYYY-MM-DD or "when a fix is released">
+#   <VULN-ID>
+#
+# No entries as of 2026-07-12: `pip-audit` against the fully-resolved
+# requirements.txt (127 packages, including arcticdb and the git-pinned
+# nousergon-lib[arcticdb,flow-doctor,rag,contracts]@v0.86.0) reported zero
+# known vulnerabilities. This file exists so the ignore-file plumbing in
+# ci.yml has something to read; add entries here if/when pip-audit finds
+# something that can't be safely bumped.

@@ -99,18 +99,27 @@ class TestChainOrdering:
         # Two non-fatal advisory states (evaluator Report Card v2, then the
         # Director) sit between the substrate poll and the notify gate. ReportCard's
         # SUCCESS edge feeds the Director (which weighs the fresh card); ReportCard's
-        # Catch skips the Director straight to notify (no card to weigh). The
-        # Director's own Next AND Catch both land on CheckShellRunNotify, so every
-        # path still preserves the success edge. On the Friday preflight both states
-        # RUN (dry, via dry_run.$=$.research_dry — ROADMAP L4504), they are not
-        # skipped, so the wiring is identical on real + preflight runs.
+        # Catch routes to PublishReportCardDegraded (config#2302: a WARNING alert —
+        # advisory grading failed silently for 9 days pre-fix) which then continues to
+        # notify (no card to weigh). The Director's own Next lands on CheckShellRunNotify;
+        # its Catch routes to PublishDirectorDegraded (same config#2302 WARNING-alert
+        # shape) which then continues to notify. Every path still preserves the success
+        # edge. On the Friday preflight both states RUN (dry, via
+        # dry_run.$=$.research_dry — ROADMAP L4504), they are not skipped, so the wiring
+        # is identical on real + preflight runs.
         # config#2276: the substrate poll now resolves to a terminal status
         # first; its Success edge is what feeds ReportCard (pinned below in
         # test_wait_for_substrate_routes_via_status_choice).
         assert states["ReportCard"]["Next"] == "Director"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
+        assert all(
+            c["Next"] == "PublishReportCardDegraded" for c in states["ReportCard"]["Catch"]
+        )
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         assert states["Director"]["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in states["Director"]["Catch"])
+        assert all(
+            c["Next"] == "PublishDirectorDegraded" for c in states["Director"]["Catch"]
+        )
+        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
         # config#2278: the real-run success edge now passes through the
         # gate-degraded completion Choice before NotifyComplete.
         assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"

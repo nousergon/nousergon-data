@@ -923,6 +923,43 @@
                 }
               ],
               "ResultPath": "$.scanner_result",
+              "Next": "ThinkTankCoverage"
+            },
+            "ThinkTankCoverage": {
+              "Type": "Task",
+              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-60 coverage gaps (new theses for uncovered names + stalest refresh). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-thinktank:live",
+                "Payload": {
+                  "mode": "sf_cover",
+                  "sf_cover_target": 60,
+                  "sf_cover_ceiling": 60,
+                  "run_date.$": "$.run_date"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion.",
+                  "Next": "CheckSkipRAGIngestion",
+                  "ResultPath": "$.thinktank_error"
+                }
+              ],
+              "ResultPath": "$.thinktank_result",
               "Next": "CheckSkipRAGIngestion"
             },
             "CheckSkipRAGIngestion": {
@@ -3858,13 +3895,35 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Advisory grading is non-fatal — continue to the terminal notify regardless.",
-          "Next": "CheckShellRunNotify",
+          "Comment": "Advisory grading is non-fatal — continue to the terminal notify regardless. config#2302: the run must still PAGE on entry (silent for 9 days pre-fix), so route through PublishReportCardDegraded before the terminal notify rather than swallowing the error.",
+          "Next": "PublishReportCardDegraded",
           "ResultPath": "$.report_card_error"
         }
       ],
       "ResultPath": "$.report_card_result",
       "Next": "Director"
+    },
+    "PublishReportCardDegraded": {
+      "Type": "Task",
+      "Comment": "config#2302: ReportCard's Catch(States.ALL) used to route straight to CheckShellRunNotify with no alert — the 2026-07 incident where the evaluator Lambda died silently for 9 days. Mirrors PublishLibPinGateDegraded's shape exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal advisory-grading path this alert decorates). WARNING severity, not FAILED — the weekly run's real trading artifacts are unaffected; only the advisory grading layer degraded.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — ReportCard WARNING (Advisory Grading Degraded)",
+        "Message": "ReportCard (the Evaluator Report Card v2 Lambda) failed — see $.report_card_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.report_card_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not block the non-fatal advisory path this alert decorates.",
+          "ResultPath": "$.report_card_degraded_notify_error",
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Next": "CheckShellRunNotify"
     },
     "Director": {
       "Type": "Task",
@@ -3894,12 +3953,34 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Advisory Director is non-fatal — continue to the terminal notify regardless.",
-          "Next": "CheckShellRunNotify",
+          "Comment": "Advisory Director is non-fatal — continue to the terminal notify regardless. config#2302: the run must still PAGE on entry, so route through PublishDirectorDegraded before the terminal notify rather than swallowing the error.",
+          "Next": "PublishDirectorDegraded",
           "ResultPath": "$.director_error"
         }
       ],
       "ResultPath": "$.director_result",
+      "Next": "CheckShellRunNotify"
+    },
+    "PublishDirectorDegraded": {
+      "Type": "Task",
+      "Comment": "config#2302: Director's Catch(States.ALL) used to route straight to CheckShellRunNotify with no alert — same silent-swallow class as ReportCard's pre-fix Catch (the 2026-07 9-day-silent incident). Mirrors PublishLibPinGateDegraded's shape exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal advisory path this alert decorates). WARNING severity, not FAILED — the weekly run's real trading artifacts are unaffected; only the advisory Director layer degraded.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Director WARNING (Advisory Action Plan Degraded)",
+        "Message": "Director (the Evaluator Director Lambda) failed — see $.director_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory Director layer (action_plan.json, carry-over ledger update) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.director_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not block the non-fatal advisory path this alert decorates.",
+          "ResultPath": "$.director_degraded_notify_error",
+          "Next": "CheckShellRunNotify"
+        }
+      ],
       "Next": "CheckShellRunNotify"
     },
     "CheckShellRunNotify": {
