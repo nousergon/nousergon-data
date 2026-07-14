@@ -41,7 +41,21 @@ arcticdb>=6.11
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.86.0
+# config#2480: bumped v0.86.0 -> v0.115.0 to pick up nousergon-lib#201 (EOD
+# pipeline_status.registry entries for SkipEODReconcileDataGap +
+# PublishSubstrateHealthCheckDegradedAlert) plus every registry addition in
+# between (Saturday gate/health-degraded states, PipelineContractCheck,
+# PredictorDriftCheck, ThinkTankCoverage, spot-migration states) — all
+# needed for tests/test_pipeline_status_registry_source_check.py to be a
+# true positive/negative signal rather than false-failing on states the
+# lib had already registered upstream of the stale pin. This is a
+# targeted bump of the main dependency surface only (this file +
+# requirements-daily-news.txt + Dockerfile); the per-lambda
+# infrastructure/lambdas/*/requirements.txt pins are intentionally left at
+# v0.86.0 here — each lambda is tested in its own isolated interpreter
+# with its own requirements.txt (config#1759/#2381) and a fleet-wide
+# lockstep bump (cf. config#1775) is out of scope for this PR.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.115.0
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
