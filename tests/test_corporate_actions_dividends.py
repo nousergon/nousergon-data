@@ -268,6 +268,70 @@ def test_total_return_series_independent_of_split_adjustment():
     pd.testing.assert_frame_equal(split_adj, split_adj_snapshot)
 
 
+def test_total_return_series_scales_pre_split_dividend_to_current_basis():
+    """config#1462 (alpha-engine-config#2462, WMT). A dividend's ``cash_amount``
+    is denominated in the share count AS OF ITS OWN ex-date — it is never
+    retroactively restated by a LATER split. When ``price_df[close_col]`` is
+    already on the post-split scale (e.g. a real yfinance ``auto_adjust=False``
+    pull, which restates ``Close`` for actual historical splits even though it
+    excludes dividends) but the dividend was declared pre-split, applying the
+    feed's nominal cash_amount straight against the post-split close_prev
+    manufactures an inflated back-adjust. ``split_actions`` fixes this by
+    scaling cash_amount by the SAME cumulative split factor
+    ``apply``/``restate_series_for_splits`` use.
+
+    Mirrors the live WMT case exactly: a 3-for-1 forward split whose raw-close
+    boundary shows NO evidence (config#1455 price-evidence gate — because the
+    feed's "raw" close already reflects the split) so ``apply()`` leaves
+    ``Close`` untouched, yet ``Close`` is nonetheless already on the post-split
+    scale end to end. Without this fix, an 11.5% reconciliation residual was
+    observed for WMT at exactly this scenario shape.
+    """
+    # Already on the post-split scale throughout (no boundary jump — mirrors a
+    # real historical split that yfinance's raw_df has already applied).
+    idx = pd.bdate_range("2026-06-01", periods=5)
+    already_split_adj = pd.DataFrame(
+        {"Close": [40.0, 40.0, 40.0, 40.0, 40.0], "Volume": [3e6] * 5}, index=idx,
+    )
+    # Dividend ex at index 2, BEFORE the split's ex_date (index 4) — declared
+    # pre-split, so its $3.00 cash_amount is on the PRE-split (1/3 as many
+    # post-split shares) basis.
+    ex_div = idx[2].strftime("%Y-%m-%d")
+    ex_split = idx[4].strftime("%Y-%m-%d")
+    div = ca.CorporateAction.from_dividend("WMT", ex_div, 3.00, "CD")
+    split = ca.CorporateAction.from_split("WMT", ex_split, 1, 3)
+
+    # WITHOUT split_actions (prior behavior, preserved for back-compat): the
+    # nominal $3.00 is applied straight against the post-split $40 close —
+    # factor = 1 - 3.00/40 = 0.925, a 3x-too-large back-adjust.
+    tr_unscaled = ca.total_return_series(already_split_adj, [div])
+    assert list(tr_unscaled.to_numpy()) == pytest.approx(
+        [37.0, 37.0, 40.0, 40.0, 40.0]
+    )
+
+    # WITH split_actions: cash_amount is scaled by the cumulative factor of the
+    # split BETWEEN the dividend's ex_date and the series' current (latest)
+    # scale — $3.00 / 3 = $1.00 → factor = 1 - 1.00/40 = 0.975.
+    tr_scaled = ca.total_return_series(already_split_adj, [div], split_actions=[split])
+    assert list(tr_scaled.to_numpy()) == pytest.approx([39.0, 39.0, 40.0, 40.0, 40.0])
+
+
+def test_total_return_series_split_actions_noop_for_dividend_after_split():
+    """A dividend declared AFTER the split is already on the current-scale
+    basis — split_actions must be a no-op for it (cumulative_factor over an
+    empty/irrelevant window is 1.0)."""
+    idx = pd.bdate_range("2026-06-01", periods=5)
+    df = _flat_close_frame([40.0, 40.0, 40.0, 40.0, 40.0], start="2026-06-01")
+    ex_split = idx[1].strftime("%Y-%m-%d")
+    ex_div = idx[3].strftime("%Y-%m-%d")  # after the split
+    split = ca.CorporateAction.from_split("WMT", ex_split, 1, 3)
+    div = ca.CorporateAction.from_dividend("WMT", ex_div, 1.00, "CD")
+
+    tr = ca.total_return_series(df, [div], split_actions=[split])
+    # factor = 1 - 1.00/40 = 0.975, unaffected by the earlier split.
+    assert list(tr.to_numpy()) == pytest.approx([39.0, 39.0, 39.0, 40.0, 40.0])
+
+
 # ── sync: records dividends, restates NO store, emits NO notice ──────────────
 
 
