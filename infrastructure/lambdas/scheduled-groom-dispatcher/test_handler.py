@@ -409,6 +409,82 @@ def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
     assert notified == []  # fail-safe path never trips (exceeded=False), no ping
 
 
+# ── SSoT ceiling wiring (config-I2461) ──────────────────────────────────────
+def _pacing_doc(ceiling: float, anchor_iso: str = "2026-07-12T21:00:00") -> bytes:
+    import json
+    return json.dumps({
+        "schema_version": 2, "weekly_wet_ceiling": ceiling,
+        "weekly_reset_anchor_pt": anchor_iso,
+    }).encode()
+
+
+def test_pace_gate_reads_ceiling_from_ssot_not_hardcoded_fallback(monkeypatch):
+    # Real-world regression (2026-07-13/14): the SSoT was recalibrated to
+    # ~2.06B WET, but this Lambda stayed pinned to the 850M literal and
+    # false-tripped pace_gate_skip on every trigger. Seed a WET level that
+    # is UNDER pace against the recalibrated SSoT ceiling but would be WAY
+    # over pace against the stale 850M fallback (208.6M/850M = 24.5% used
+    # at only 16% elapsed — reproduces the live config-I2461 numbers) —
+    # asserting launch proves the ceiling came from the SSoT, not the fallback.
+    wet = 208_628_197.0
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        s3_objects={
+            "claude_code_usage/groom/2026-07-14.json": _wet_doc(wet),
+            "config/usage_pacing.json": _pacing_doc(2_055_816_944.44),
+        },
+    )
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(hours=27)  # ~16% elapsed
+    # This test's own _load_pacing_config() call needs fromisoformat — unlike
+    # the other pace-gate tests, which never reach that code path when the
+    # SSoT object is absent (fallback raises before touching datetime again).
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now),
+        "fromisoformat": staticmethod(idx.datetime.fromisoformat)}))
+    notified = _spy_notify(monkeypatch, idx)
+    out = idx.handler({"run_mode": "full", "schedule": "0 7 * * *"}, None)
+    assert out["groom"]["launched"] is True
+    assert notified == []
+
+
+def test_pace_gate_falls_back_to_constant_when_ssot_object_missing(monkeypatch):
+    # No "config/usage_pacing.json" object seeded -> _load_pacing_config()
+    # raises (KeyError on the fake S3's dict lookup) -> falls back to the
+    # WEEKLY_WET_CEILING module constant, same behavior as before config-I2461.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                s3_objects={"claude_code_usage/groom/2026-07-13.json":
+                            _wet_doc(0.5 * 1_140_000_000)})
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "pace_gate_skip"
+
+
+def test_pacing_config_schema_contract_matches_shared_ssot_shape(monkeypatch):
+    # config-I2461 requirement #2: this Lambda and alpha-engine-config's
+    # groom_budget.py::read_pacing_config() / usage-pace-alert's
+    # _load_pacing_config() must all parse the IDENTICAL SSoT document shape
+    # (schema_version, weekly_wet_ceiling, weekly_reset_anchor_pt) into the
+    # SAME (ceiling, anchor) values — a schema drift in any one consumer's
+    # field names/types would silently diverge `used_frac` across consumers.
+    # This fixture is the literal live SSoT shape observed 2026-07-13.
+    idx = _load(monkeypatch, s3_objects={
+        "config/usage_pacing.json": json.dumps({
+            "schema_version": 2,
+            "weekly_wet_ceiling": 2055816944.4444444,
+            "weekly_reset_anchor_pt": "2026-07-12T21:00:00",
+            "calibrated_date": "2026-07-13",
+            "calibration_basis": "daily calibration sample",
+            "fit_method": "raw", "n_samples": 1, "cv": None, "converged": False,
+        }).encode(),
+    })
+    ceiling, anchor = idx._load_pacing_config()
+    assert ceiling == 2055816944.4444444
+    assert anchor == idx.datetime(2026, 7, 12, 21, 0)
+
+
 def test_gated_reverify_schedule_forwards_filter(monkeypatch):
     # config#1891 Sunday lane: "gated-reverify" must pass validation — it was
     # missing from _VALID_ISSUE_FILTERS (PR #681 added only the schedule), so
