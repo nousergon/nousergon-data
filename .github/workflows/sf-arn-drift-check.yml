@@ -1,0 +1,62 @@
+name: SF-ARN Drift Check
+
+# Catches drift on three config#1464 axes: EventBridge rule stateMachineArn
+# drift, Step Function LoggingConfiguration drift, and SF lambda:invoke
+# states referencing Lambdas that don't exist live (the 2026-07-08 EOD
+# incident class). Mirrors iam-drift-check.yml's trigger/auth shape exactly
+# (same OIDC role, same PR-touching-path + daily + workflow_dispatch
+# trigger set) — see that workflow's header for why this shape (PR-time
+# catch + daily out-of-band sweep).
+#
+# infrastructure/eventbridge/check-drift.py and
+# infrastructure/step-functions/check-drift.py were merged code-complete
+# and unit-tested in #607 (2026-07-03) but had nothing invoking them until
+# now — the blocker was this PAT lacking `workflow` scope (config#1372,
+# closed 2026-07-06) plus the OIDC role lacking the events:*/states:*/
+# lambda:GetFunction permissions the scripts need (companion PR in
+# crucible-executor, config#1464) to avoid failing on AccessDenied instead
+# of real drift. infrastructure/step-functions/check-lambda-existence.py is
+# new in this same PR (previously proposed, 2026-07-08, never built).
+#
+# AWS auth: OIDC -> github-actions-iam-drift-check role (defined in
+# crucible-executor; trust policy permits both crucible-executor and
+# nousergon-data). Same identity iam-drift-check.yml already uses.
+
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/eventbridge/**'
+      - 'infrastructure/step-functions/**'
+      - 'infrastructure/lambdas/**/deploy.sh'
+      - 'infrastructure/cloudformation/alpha-engine-orchestration.yaml'
+      - 'infrastructure/deploy-infrastructure.sh'
+      - 'infrastructure/step_function*.json'
+      - '.github/workflows/sf-arn-drift-check.yml'
+  schedule:
+    - cron: '30 9 * * *'   # daily, alongside the IAM sweep
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
+
+      - name: EventBridge SF-ARN drift (codified vs live)
+        run: python3 infrastructure/eventbridge/check-drift.py
+
+      - name: SF LoggingConfiguration drift (codified vs live)
+        run: python3 infrastructure/step-functions/check-drift.py
+
+      - name: SF lambda:invoke Lambda-existence check (codified vs live)
+        run: python3 infrastructure/step-functions/check-lambda-existence.py
