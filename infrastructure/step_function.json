@@ -534,7 +534,7 @@
     },
     "ApplyShellRunDefaults": {
       "Type": "Pass",
-      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire — every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob OVER the current state (States.JsonMerge($, shellDefaults, false) — second arg wins, so shellDefaults wins over $) so shell_run=true ACTUALLY enforces dry mode for every keystone control var. The prior arg order (States.JsonMerge(shellDefaults, $, false)) silently fell back to non-dry because InitializeInput unconditionally seeds preflight_args=\"\" + research_dry=false + data_phase2_dry=false + regime_action=\"produce\" into $ — so $ wins meant the seeded non-dry identities won over the dry shellDefaults, and the 2026-05-22 Friday-PM shell-run dry-pass (first execution past the prior trap break) ran full-fat instead of --preflight-only. Skip flags are unaffected (they're not in shellDefaults; the #258 Choice-gated skip_* mechanism handles {\"shell_run\": true, \"skip_backtester\": true} downstream regardless of merge order). The previously-documented user-override-from-input case ({\"shell_run\": true, \"preflight_args\": \"\"} runs spots full-fat) is now intentionally LOST: in practice nobody passes both flags together — passing shell_run=true means you want dry mode for ALL keystone control vars; the comment line saying otherwise was a footgun masking the actual semantic intent. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): Research + the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process — dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). The skip-exception rewire flipped the prior 5 skip→dry via the commands.$/States.Format($.preflight_args) Option-C mechanism (config#902 later collapsed the standalone DriftDetection spot state — drift is now bundled onto the PredictorTraining spot, so its Friday --preflight-only dry path folds into spot_train.sh --preflight-only rather than a separate drift state); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
+      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire — every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob OVER the current state (States.JsonMerge($, shellDefaults, false) — second arg wins, so shellDefaults wins over $) so shell_run=true ACTUALLY enforces dry mode for every keystone control var. The prior arg order (States.JsonMerge(shellDefaults, $, false)) silently fell back to non-dry because InitializeInput unconditionally seeds preflight_args=\"\" + research_dry=false + data_phase2_dry=false + regime_action=\"produce\" into $ — so $ wins meant the seeded non-dry identities won over the dry shellDefaults, and the 2026-05-22 Friday-PM shell-run dry-pass (first execution past the prior trap break) ran full-fat instead of --preflight-only. Skip flags are unaffected (they're not in shellDefaults; the #258 Choice-gated skip_* mechanism handles {\"shell_run\": true, \"skip_backtester\": true} downstream regardless of merge order). The previously-documented user-override-from-input case ({\"shell_run\": true, \"preflight_args\": \"\"} runs spots full-fat) is now intentionally LOST: in practice nobody passes both flags together — passing shell_run=true means you want dry mode for ALL keystone control vars; the comment line saying otherwise was a footgun masking the actual semantic intent. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command — data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process — dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true — alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run — produce_*(write=False) returns payload before any put_object). alpha-engine-config-I2515 Phase B removed the multi-agent Research state entirely (it was also routed dry via this same $.research_dry signal); its replacements SignalsEnvelope/ChallengerShadow carry no dry-run signal in their Payloads at all, mirroring ThinkTankCoverage's own no-dry-flag convention (both are cheap/idempotent enough — and date-keyed on $.run_date, which differs Friday-vs-Saturday — that a Friday shell-run invocation does not collide with the real Saturday artifact). The skip-exception rewire flipped the prior 5 skip→dry via the commands.$/States.Format($.preflight_args) Option-C mechanism (config#902 later collapsed the standalone DriftDetection spot state — drift is now bundled onto the PredictorTraining spot, so its Friday --preflight-only dry path folds into spot_train.sh --preflight-only rather than a separate drift state); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) — their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
       "Parameters": {
         "merged.$": "States.JsonMerge($,States.StringToJson('{\"preflight_args\":\" --preflight-only\",\"research_dry\":true,\"data_phase2_dry\":true,\"regime_action\":\"dry_run\",\"pipeline_label\":\" Preflight\"}'),false)"
       },
@@ -890,7 +890,7 @@
           "States": {
             "Scanner": {
               "Type": "Task",
-              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 — alpha-engine-research #235). Reads constituents.json + feature store, runs the same run_quant_filter as Research Lambda's internal scanner, writes the candidates.json artifact for THIS run_date. Phase 2 posture: observe-only — runs UNCONDITIONALLY on every Saturday SF firing (the prior CheckEnableStandaloneScanner Choice gate was removed 2026-05-28 per feedback_observe_mode_unconditional_gates_govern_cutover — observation must not be flag-gated; absence-of-artifact is itself the failure mode the soak is meant to detect). Failure is NON-BLOCKING (Catch routes to CheckSkipRAGIngestion). The artifact is parallel-observe only; no consumer reads it yet (Phase 4 will switch RAG to read it, Phase 5 will switch Research) — the Phase 4/5 consumer-cutover flag belongs at the consumer side. Status contract OK / ERROR — no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true. First post-fix Saturday SF (2026-05-30) lands candidates.json structurally; compare candidates.json::scanner_tickers against signals.json::universe (minus population). Zero divergence is the Phase 3 → Phase 4 transition signal.",
+              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 — alpha-engine-research #235). Reads constituents.json + feature store, runs run_quant_filter, writes the candidates.json universe-board artifact for THIS run_date (crucible-research PR425, merged). alpha-engine-config-I2515 Phase B: this write is now LOAD-BEARING — SignalsEnvelope, ChallengerShadow, and the relocated (post-RAG) ThinkTankCoverage all read the SAME-DAY board, closing the no-week-old-data invariant (config#1580 ruling). The multi-agent Research graph runner that previously consumed this artifact has been REMOVED from this SF; the champion path is scanner → predictor direct. Status contract OK / ERROR — no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-scanner:live",
@@ -917,32 +917,86 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Phase 2 observe-only contract — scanner failure must NOT halt the pipeline. Research Lambda's internal scanner still runs in parallel and provides the load-bearing scanner output downstream; this artifact is parallel-observe and consumer-less today (Phase 4 will flip RAG to read it). Routes forward to CheckSkipRAGIngestion so the pipeline continues exactly as it would on flag=false.",
-                  "Next": "CheckSkipRAGIngestion",
+                  "Comment": "Scanner failure must NOT halt the pipeline at the SF layer — Catch and Next now converge sensibly on the SAME state (CheckSkipRegimeSubstrate) under the config-I2515 Phase B reorder, since RegimeSubstrate is an independent macro/HMM fit with no scanner-board dependency. Genuine downstream impact of a missing board surfaces properly (not silently) at SignalsEnvelope, which is LOAD-BEARING and has NO non-blocking Catch — a scanner failure that leaves the board stale/missing will fail SignalsEnvelope's own invoke and correctly hard-fail Branch A instead of being swallowed here.",
+                  "Next": "CheckSkipRegimeSubstrate",
                   "ResultPath": "$.scanner_error"
                 }
               ],
               "ResultPath": "$.scanner_result",
-              "Next": "ThinkTankCoverage"
+              "Next": "CheckSkipRegimeSubstrate"
             },
-            "ThinkTankCoverage": {
+            "CheckSkipRegimeSubstrate": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps straight to SignalsEnvelope (config-I2515 Phase B: RAG/ThinkTank/RegimeRetrospectiveEval/DataPhase2 all now sit AFTER SignalsEnvelope in the reordered chain, so skipping substrate-compute must not skip the envelope itself — SignalsEnvelope reads whatever regime artifact already exists). Independent of skip flags for the rest of the chain — operators can skip the HMM refit while everything else still runs.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_regime_substrate",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_regime_substrate",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "SignalsEnvelope"
+                }
+              ],
+              "Default": "RegimeSubstrate"
+            },
+            "RegimeSubstrate": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage top-up (alpha-engine-config-I2467). 2026-07-14 cadence design: the daily EventBridge cadence (alpha-research-thinktank-daily) is the primary coverage-growth mechanism (5/day toward the full rank_ceiling=150 universe, handling staleness refresh gradually) and stays unchanged. This state's job is a narrower, reactive top-up — mode=gap_fill shores up whatever of the CURRENT top-60 the daily cadence hasn't caught up to yet by the time the fresh weekly scan lands, sized to the EXACT measured coverage_gap.uncovered_count (never a fixed constant, never padded with stale-refill — see crucible-research thinktank/run.py's gap_fill_only). Small and bounded by construction, so no sf_cover_target/sf_cover_ceiling numbers to keep in sync across repos. Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step. The Retry below (States.Timeout/Lambda.Unknown, mirroring the sibling Research state's bridge) stays as cheap defense-in-depth even though the gap-fill workload is now small.",
+              "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. config-I2515 Phase B: now runs BEFORE SignalsEnvelope (moved ahead of RAG/ThinkTank) so the envelope's market_regime field reads a SAME-DAY regime label rather than a stale one. Observe-only at this stage — no production consumer besides the envelope reads the artifact yet. Failure is non-blocking (Catch routes to SignalsEnvelope, not HandleFailure) — a regime substrate failure must not halt the pipeline; SignalsEnvelope will read whatever regime artifact already exists.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "alpha-engine-research-thinktank:live",
+                "FunctionName": "alpha-engine-predictor-regime-substrate:live",
                 "Payload": {
-                  "mode": "gap_fill",
-                  "run_date.$": "$.run_date"
+                  "action.$": "$.regime_action"
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 360,
               "Retry": [
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException",
                     "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "SignalsEnvelope",
+                  "ResultPath": "$.regime_substrate_error"
+                }
+              ],
+              "ResultPath": "$.regime_substrate_result",
+              "Next": "SignalsEnvelope"
+            },
+            "SignalsEnvelope": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I2515 Phase B: thin envelope producer replacing the removed multi-agent Research graph runner as the signals.json producer. Runs AFTER RegimeSubstrate (rationale b: same-day regime freshness) and BEFORE RAG/ThinkTankCoverage (rationale a: Scanner's universe-board write is now load-bearing for this and every downstream consumer — the no-week-old-data invariant, config#1580 ruling). Sources fields from the scanner board (universe membership + sector facts), the regime substrate (regime label), and neutral per-name defaults (mirrors the champion.py no_agent path) — same S3 key as the old signals.json for contract safety. The champion (scanner -> predictor direct) is the production path per config#1580; Think Tank is the challenger (observe-only, see ChallengerShadow). LOAD-BEARING: the executor hard-fails Monday without signals.json, so unlike ThinkTankCoverage/ChallengerShadow this Catch is NOT non-blocking — it routes to the Branch A failure path exactly as the removed Research state's hard-Catch did. IAM: alpha-engine-step-functions-role needs lambda:InvokeFunction on alpha-engine-research-signals-envelope* before first run — granted separately by the parent orchestrating session with operator consent, NOT part of this PR.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-signals-envelope:live",
+                "Payload": {
+                  "run_date.$": "$.run_date",
+                  "target": "production"
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
@@ -960,18 +1014,55 @@
               ],
               "Catch": [
                 {
-                  "ErrorEquals": ["States.ALL"],
-                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion.",
-                  "Next": "CheckSkipRAGIngestion",
-                  "ResultPath": "$.thinktank_error"
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ExtractSignalsEnvelopeError",
+                  "ResultPath": "$.error"
                 }
               ],
-              "ResultPath": "$.thinktank_result",
+              "ResultPath": "$.signals_envelope_result",
+              "Next": "ChallengerShadow"
+            },
+            "ChallengerShadow": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline shadow (signals_shadow/no_agent/{trading_day}/signals.json, written by producers/runner.py::run_challengers) alive for the producer leaderboard (scoring/leaderboard_producers.py, hosted in the eval_rolling_mean Lambda, which survives this graph-runner removal) now that the weekly SF no longer hosts the multi-agent Research Lambda invocation that used to fire this mode as a side effect. The research-runner Lambda stays deployed for this + operator modes even though its weekly_run graph invocation is gone. NON-BLOCKING by design: _run_challengers_only (crucible-research lambda/handler.py:287) may carry preconditions tied to graph-run state (e.g. 'only valid for the latest run') that have not been re-verified for the envelope era — a precondition failure here must surface in logs without harming the pipeline, since this shadow feed is observe-only and never read by the executor or the live gate. Verifying/fixing those envelope-era preconditions is tracked follow-up work, not part of this PR.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-runner:live",
+                "Payload": {
+                  "mode": "challengers_only",
+                  "date.$": "$.run_date"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Observe-mode non-blocking: a ChallengerShadow failure (including a stale graph-run precondition inside _run_challengers_only) must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion exactly like ThinkTankCoverage's own non-blocking Catch.",
+                  "Next": "CheckSkipRAGIngestion",
+                  "ResultPath": "$.challenger_shadow_error"
+                }
+              ],
+              "ResultPath": "$.challenger_shadow_result",
               "Next": "CheckSkipRAGIngestion"
             },
             "CheckSkipRAGIngestion": {
               "Type": "Choice",
-              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipRegimeSubstrate. Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
+              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to ThinkTankCoverage (config-I2515 Phase B: ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh corpus). Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
               "Choices": [
                 {
                   "And": [
@@ -984,7 +1075,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "CheckSkipRegimeSubstrate"
+                  "Next": "ThinkTankCoverage"
                 }
               ],
               "Default": "RAGIngestion"
@@ -1092,7 +1183,7 @@
                 {
                   "Variable": "$.rag_ingestion_poll.Status",
                   "StringEquals": "Success",
-                  "Next": "CheckSkipRegimeSubstrate"
+                  "Next": "ThinkTankCoverage"
                 },
                 {
                   "Variable": "$.rag_ingestion_poll.Status",
@@ -1139,43 +1230,44 @@
               "ResultPath": "$.rag_ingestion_attempts",
               "Next": "RAGIngestion"
             },
-            "CheckSkipRegimeSubstrate": {
-              "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps to CheckSkipRegimeRetrospectiveEval (which independently honors its own skip flag). Independent of skip_research — operators can skip the HMM refit while still running research (or vice versa).",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.skip_regime_substrate",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.skip_regime_substrate",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "CheckSkipRegimeRetrospectiveEval"
-                }
-              ],
-              "Default": "RegimeSubstrate"
+            "ExtractRAGIngestionError": {
+              "Type": "Pass",
+              "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error — the soft-failure path from CheckRAGIngestionStatus.Default does not populate $.error, only Task Catch blocks do.",
+              "Parameters": {
+                "phase": "RAGIngestion",
+                "source": "CheckRAGIngestionStatus.Default",
+                "poll.$": "$.rag_ingestion_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishResearchFailureImmediate"
             },
-            "RegimeSubstrate": {
+            "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. The macro economist agent (Stage C) will consume this as a strong prior; macro agent remains the final regime authority. Observe-only at this stage — no production consumer reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipRegimeRetrospectiveEval, not HandleFailure) per the Stage A observe-only contract — a regime substrate failure during the 4-week observation period must not halt Research.",
+              "Comment": "Think Tank observe-mode coverage top-up (alpha-engine-config-I2467). config-I2515 Phase B: MOVED to run AFTER the RAG ingestion chain (was between Scanner and RAG) so Think Tank's theses read the FRESH corpus instead of the week-old one — this also resolves alpha-engine-config-I2511. The daily EventBridge cadence (alpha-research-thinktank-daily) is the primary coverage-growth mechanism (5/day toward the full rank_ceiling=150 universe, handling staleness refresh gradually) and stays unchanged. This state's job is a narrower, reactive top-up — mode=gap_fill shores up whatever of the CURRENT top-60 the daily cadence hasn't caught up to yet by the time the fresh weekly scan lands, sized to the EXACT measured coverage_gap.uncovered_count (never a fixed constant, never padded with stale-refill — see crucible-research thinktank/run.py's gap_fill_only). Small and bounded by construction, so no sf_cover_target/sf_cover_ceiling numbers to keep in sync across repos. Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step. The Retry below (States.Timeout/Lambda.Unknown) stays as cheap defense-in-depth even though the gap-fill workload is small.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "alpha-engine-predictor-regime-substrate:live",
+                "FunctionName": "alpha-engine-research-thinktank:live",
                 "Payload": {
-                  "action.$": "$.regime_action"
+                  "mode": "gap_fill",
+                  "run_date.$": "$.run_date"
                 }
               },
-              "TimeoutSeconds": 360,
+              "TimeoutSeconds": 900,
               "Retry": [
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException",
                     "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                },
+                {
+                  "ErrorEquals": [
+                    "States.Timeout",
+                    "Lambda.Unknown"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
@@ -1187,16 +1279,17 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
+                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRegimeRetrospectiveEval (ThinkTankCoverage's new post-RAG successor, config-I2515 Phase B).",
                   "Next": "CheckSkipRegimeRetrospectiveEval",
-                  "ResultPath": "$.regime_substrate_error"
+                  "ResultPath": "$.thinktank_error"
                 }
               ],
-              "ResultPath": "$.regime_substrate_result",
+              "ResultPath": "$.thinktank_result",
               "Next": "CheckSkipRegimeRetrospectiveEval"
             },
             "CheckSkipRegimeRetrospectiveEval": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_regime_retrospective_eval\": true} bypasses the T1 retrospective HMM smoothing eval and jumps to CheckSkipResearch. Independent of skip_regime_substrate — operator can run substrate without eval (or vice versa during ad-hoc replays).",
+              "Comment": "Skip-gate. {\"skip_regime_retrospective_eval\": true} bypasses the T1 retrospective HMM smoothing eval and jumps to CheckSkipDataPhase2 (config-I2515 Phase B: the removed multi-agent Research state used to sit between this chain and DataPhase2 — CheckSkipDataPhase2 is now the direct successor). Independent of skip_regime_substrate — operator can run substrate without eval (or vice versa during ad-hoc replays).",
               "Choices": [
                 {
                   "And": [
@@ -1209,14 +1302,14 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "CheckSkipResearch"
+                  "Next": "CheckSkipDataPhase2"
                 }
               ],
               "Default": "RegimeRetrospectiveEval"
             },
             "RegimeRetrospectiveEval": {
               "Type": "Task",
-              "Comment": "Stage C.2 T1 retrospective HMM smoothing eval — pairs the macro agent's historical regime calls against the HMM forward-backward smoother's labels (8-week lag, asymmetric loss penalizing bear-misses 2×). Writes s3://alpha-engine-research/regime/retrospective/{YYMMDDHHMM}.json + latest.json sidecar carrying n_pairings + rolling 26-week agreement rate. Observe-only — feeds the dashboard's Regime page, does NOT gate anything. Failure is non-blocking (Catch routes to CheckSkipResearch) — a retrospective-eval failure must not halt Research. Returns n_pairings=0 cleanly during the cold-start window (~8 weeks after substrate Lambda starts running).",
+              "Comment": "Stage C.2 T1 retrospective HMM smoothing eval — pairs the macro agent's historical regime calls against the HMM forward-backward smoother's labels (8-week lag, asymmetric loss penalizing bear-misses 2×). Writes s3://alpha-engine-research/regime/retrospective/{YYMMDDHHMM}.json + latest.json sidecar carrying n_pairings + rolling 26-week agreement rate. Observe-only — feeds the dashboard's Regime page, does NOT gate anything. Failure is non-blocking (Catch routes to CheckSkipDataPhase2, config-I2515 Phase B's new direct successor) — a retrospective-eval failure must not halt the pipeline. Returns n_pairings=0 cleanly during the cold-start window (~8 weeks after substrate Lambda starts running).",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
@@ -1241,123 +1334,12 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "CheckSkipResearch",
+                  "Next": "CheckSkipDataPhase2",
                   "ResultPath": "$.regime_retrospective_eval_error"
                 }
               ],
               "ResultPath": "$.regime_retrospective_eval_result",
-              "Next": "CheckSkipResearch"
-            },
-            "ExtractRAGIngestionError": {
-              "Type": "Pass",
-              "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error — the soft-failure path from CheckRAGIngestionStatus.Default does not populate $.error, only Task Catch blocks do.",
-              "Parameters": {
-                "phase": "RAGIngestion",
-                "source": "CheckRAGIngestionStatus.Default",
-                "poll.$": "$.rag_ingestion_poll"
-              },
-              "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
-            },
-            "CheckSkipResearch": {
-              "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_research\": true} bypasses the research Lambda and jumps to DataPhase2's skip-gate.",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.skip_research",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.skip_research",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "CheckSkipDataPhase2"
-                }
-              ],
-              "Default": "Research"
-            },
-            "Research": {
-              "Type": "Task",
-              "Comment": "Research Lambda — generates signals.json. skip_dry_run_gate=true (L4464 perf): the scheduled production path skips the in-handler stub-LLM dry-run gate, which ran a FULL second graph pass (incl. a real ~4-min fetch_data) before the real pass — ~8 min of the 900s budget. Wiring is validated by CI + the Friday shell-run preflight; the gate stays available for manual/dev invokes (default off-skip). Composes with the L1995 Phase 5 universe reduction (research #256) which is the load-bearing timeout fix. TIMEOUT RETRY = CHECKPOINT-RESUME (config#1650, 2026-07-06): the runner persists per-node state (archive/agent_runs + sector_team_runs) and RESUMEs completed nodes at near-zero LLM cost, so one retry on States.Timeout/Lambda.Unknown converts the manual watch-rerun into the automatic contract (the 7/3 timeout's rerun finished in ~5.9 min). IntervalSeconds=60 is LOAD-BEARING: it guarantees the first invocation is dead past its own 900s Lambda ceiling before the retry fires (runner has reserved-concurrency=1 — an overlapping invoke would throttle). Bridge until the config#1687 spot-EC2 migration removes the 900s ceiling entirely.",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "alpha-engine-research-runner:live",
-                "Payload": {
-                  "weekly_run": true,
-                  "force": true,
-                  "skip_dry_run_gate": true,
-                  "dry_run_llm.$": "$.research_dry"
-                }
-              },
-              "TimeoutSeconds": 900,
-              "Retry": [
-                {
-                  "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
-                  ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
-                },
-                {
-                  "ErrorEquals": [
-                    "States.Timeout",
-                    "Lambda.Unknown"
-                  ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
-                }
-              ],
-              "Catch": [
-                {
-                  "ErrorEquals": [
-                    "States.ALL"
-                  ],
-                  "Next": "BranchAFailed",
-                  "ResultPath": "$.error"
-                }
-              ],
-              "ResultPath": "$.research_result",
-              "Next": "CheckResearchStatus"
-            },
-            "CheckResearchStatus": {
-              "Type": "Choice",
-              "Comment": "Verify research returned OK (not ERROR)",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.research_result.Payload.status",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.research_result.Payload.status",
-                      "StringEquals": "OK"
-                    }
-                  ],
-                  "Next": "CheckSkipDataPhase2"
-                },
-                {
-                  "And": [
-                    {
-                      "Variable": "$.research_result.Payload.status",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.research_result.Payload.status",
-                      "StringEquals": "SKIPPED"
-                    }
-                  ],
-                  "Comment": "config#2275: both rules IsPresent-guarded so a research Lambda returning a payload WITHOUT status (e.g. {}) falls to Default=ExtractResearchError -> HandleFailure with real context, instead of throwing a bare States.Runtime that bypasses the whole failure chain (the 2026-07-03 incident class).",
-                  "Next": "CheckSkipDataPhase2"
-                }
-              ],
-              "Default": "ExtractResearchError"
+              "Next": "CheckSkipDataPhase2"
             },
             "CheckSkipDataPhase2": {
               "Type": "Choice",
@@ -1974,25 +1956,25 @@
               "ResultPath": "$.aggregate_costs_result",
               "Next": "BranchAComplete"
             },
-            "ExtractResearchError": {
+            "ExtractSignalsEnvelopeError": {
               "Type": "Pass",
-              "Comment": "Normalize Research Lambda soft-failure payload (status != OK) into $.error. Research handler always returns {status, date, error} on the ERROR path so copying the whole Payload is safe and preserves the real traceback string.",
+              "Comment": "Normalize a SignalsEnvelope Catch (hard invoke failure) into the same structured $.error shape the rest of Branch A's Extract*Error states use (phase/source tagging), then hand off to the shared early-SNS-alert state. Renamed from ExtractResearchError (config-I2515 Phase B removed the multi-agent Research state entirely; SignalsEnvelope is its load-bearing replacement producer, so its failure gets the SAME early-alert treatment the old Research hard-Catch skipped straight past).",
               "Parameters": {
-                "phase": "Research",
-                "source": "CheckResearchStatus.Default",
-                "payload.$": "$.research_result.Payload"
+                "phase": "SignalsEnvelope",
+                "source": "SignalsEnvelope.Catch",
+                "error.$": "$.error"
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
             },
             "PublishResearchFailureImmediate": {
               "Type": "Task",
-              "Comment": "Fire an immediate SNS failure alert when the Research branch fails, BEFORE the sibling PredictorTraining branch completes its full ~12-min train + the parent SF's parallel-join aggregation. Closes the 2026-05-24 operator-confusion gap where a mid-parallel failure surfaced only after the sibling branch's work completed (the salvage-at-join design is correct; the visibility lag was the actual problem). Branch terminus is still BranchAFailed (Pass) so the salvage semantics are preserved: SF still fails at the join via CheckBranchOutcomes; the sibling branch's completed work still persists for the next redrive's skip-set. SNS publish failure is caught and routed forward — best-effort alert must NEVER prevent the branch from properly terminating.",
+              "Comment": "Fire an immediate SNS failure alert when Branch A hard-fails (RAGIngestion or SignalsEnvelope), BEFORE the sibling PredictorTraining branch completes its full ~12-min train + the parent SF's parallel-join aggregation. Closes the 2026-05-24 operator-confusion gap where a mid-parallel failure surfaced only after the sibling branch's work completed (the salvage-at-join design is correct; the visibility lag was the actual problem). Shared across both RAG ingestion failures and SignalsEnvelope failures (config-I2515 Phase B: previously also shared with the now-removed Research state). Branch terminus is still BranchAFailed (Pass) so the salvage semantics are preserved: SF still fails at the join via CheckBranchOutcomes; the sibling branch's completed work still persists for the next redrive's skip-set. SNS publish failure is caught and routed forward — best-effort alert must NEVER prevent the branch from properly terminating.",
               "Resource": "arn:aws:states:::sns:publish",
               "Parameters": {
                 "TopicArn.$": "$.sns_topic_arn",
-                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — Research FAILED (early signal — SF will fail at join)', $.pipeline_label)",
-                "Message.$": "States.Format('Research branch hard-failed inside ResearchPredictorParallel. The sibling PredictorTraining branch is still running and will complete its own work; the SF will fail at the parallel-join aggregation via CheckBranchOutcomes once both branches terminate. This is an EARLY-SIGNAL alert so you do not have to wait for the join. Error: {}', States.JsonToString($.error))"
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — Branch A FAILED (early signal — SF will fail at join)', $.pipeline_label)",
+                "Message.$": "States.Format('Branch A (RAGIngestion or SignalsEnvelope) hard-failed inside ResearchPredictorParallel. The sibling PredictorTraining branch is still running and will complete its own work; the SF will fail at the parallel-join aggregation via CheckBranchOutcomes once both branches terminate. This is an EARLY-SIGNAL alert so you do not have to wait for the join. Error: {}', States.JsonToString($.error))"
               },
               "ResultPath": null,
               "Next": "BranchAFailed",
@@ -2009,7 +1991,7 @@
             },
             "BranchAComplete": {
               "Type": "Pass",
-              "Comment": "Branch A (Research → DataPhase2 → eval-judge chain → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual) completed. Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS — it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics).",
+              "Comment": "Branch A (Scanner → RegimeSubstrate → SignalsEnvelope → ChallengerShadow → RAG chain → ThinkTankCoverage → RegimeRetrospectiveEval → DataPhase2 → eval-judge chain → EvalRollingMean → RationaleClustering → ReplayConcordance → Counterfactual → AggregateCosts) completed (config-I2515 Phase B reorder — the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS — it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics).",
               "Result": {
                 "branch_a_status": "OK"
               },
@@ -2018,7 +2000,7 @@
             },
             "BranchAFailed": {
               "Type": "Pass",
-              "Comment": "Branch A hard-failed (strict-Research no-partial-output failure, DataPhase2 failure, or a soft-fail status normalized by ExtractResearchError). Records branch_a_status=FAILED + the captured $.error as DATA and End:true — the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A.",
+              "Comment": "Branch A hard-failed (SignalsEnvelope failure — the LOAD-BEARING signals.json producer post config-I2515 Phase B — RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true — the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A.",
               "Parameters": {
                 "branch_a_status": "FAILED",
                 "branch_a_error.$": "$.error"
@@ -2430,7 +2412,7 @@
             },
             "ExtractModelZooResolveError": {
               "Type": "Pass",
-              "Comment": "Normalize ResolveZooSpecs SSM non-Success poll into $.model_zoo_error. Mirrors ExtractPredictorError/ExtractResearchError/ExtractRAGIngestionError — CheckResolveZooStatus.Default does not populate $.model_zoo_error the way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's Message calls States.JsonToString($.model_zoo_error): a direct Choice->Task jump on this edge died with States.Runtime ('$.model_zoo_error could not be found'), masking the real zoo-resolve failure behind an opaque meta-error (observed live 2026-07-10, execution offcycle-shell-20260710-220932; config#2160 arc).",
+              "Comment": "Normalize ResolveZooSpecs SSM non-Success poll into $.model_zoo_error. Mirrors ExtractPredictorError/ExtractSignalsEnvelopeError/ExtractRAGIngestionError — CheckResolveZooStatus.Default does not populate $.model_zoo_error the way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's Message calls States.JsonToString($.model_zoo_error): a direct Choice->Task jump on this edge died with States.Runtime ('$.model_zoo_error could not be found'), masking the real zoo-resolve failure behind an opaque meta-error (observed live 2026-07-10, execution offcycle-shell-20260710-220932; config#2160 arc).",
               "Parameters": {
                 "phase": "ModelZooResolve",
                 "source": "CheckResolveZooStatus.Default",
@@ -2756,7 +2738,7 @@
             },
             "ExtractModelZooSelectError": {
               "Type": "Pass",
-              "Comment": "Normalize ModelZooSelect SSM non-Success poll into $.model_zoo_error. Mirrors ExtractPredictorError/ExtractResearchError/ExtractRAGIngestionError — CheckModelZooStatus.Default does not populate $.model_zoo_error the way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's Message calls States.JsonToString($.model_zoo_error): a direct Choice->Task jump on this edge died with States.Runtime ('$.model_zoo_error could not be found'), masking the real zoo-select failure behind an opaque meta-error (observed live 2026-07-10, execution offcycle-shell-20260710-220932; config#2160 arc).",
+              "Comment": "Normalize ModelZooSelect SSM non-Success poll into $.model_zoo_error. Mirrors ExtractPredictorError/ExtractSignalsEnvelopeError/ExtractRAGIngestionError — CheckModelZooStatus.Default does not populate $.model_zoo_error the way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's Message calls States.JsonToString($.model_zoo_error): a direct Choice->Task jump on this edge died with States.Runtime ('$.model_zoo_error could not be found'), masking the real zoo-select failure behind an opaque meta-error (observed live 2026-07-10, execution offcycle-shell-20260710-220932; config#2160 arc).",
               "Parameters": {
                 "phase": "ModelZooSelect",
                 "source": "CheckModelZooStatus.Default",
