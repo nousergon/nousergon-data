@@ -224,6 +224,9 @@ class TestEODSpotStatesPresent:
         assert st["Parameters"]["Payload"]["workload"] in {
             "post-market-data", "post-market-arctic-append"
         }
+        # 2026-07-14: force_on_demand.$ threads the retry-budget's on-demand
+        # override into the dispatcher (see TestEODDataSpotRetryBudget).
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, eod, name):
@@ -334,14 +337,25 @@ class TestEODDataSpotRetryBudget:
         assert eod["CheckSkipPostMarketData"]["Default"] == "InitDataSpotRetryCounter"
         assert eod["InitDataSpotRetryCounter"]["Type"] == "Pass"
         assert eod["InitDataSpotRetryCounter"]["ResultPath"] == "$.data_spot_retry"
-        assert eod["InitDataSpotRetryCounter"]["Result"] == {"attempts": 0}
+        assert eod["InitDataSpotRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
         assert eod["InitDataSpotRetryCounter"]["Next"] == "LaunchPostMarketDataSpot"
 
         assert eod["CheckPostMarketDataSpotStatus"]["Choices"][0]["Next"] == "InitDataSpotArcticRetryCounter"
         assert eod["InitDataSpotArcticRetryCounter"]["Type"] == "Pass"
         assert eod["InitDataSpotArcticRetryCounter"]["ResultPath"] == "$.data_spot_arctic_retry"
-        assert eod["InitDataSpotArcticRetryCounter"]["Result"] == {"attempts": 0}
+        assert eod["InitDataSpotArcticRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
         assert eod["InitDataSpotArcticRetryCounter"]["Next"] == "LaunchPostMarketArcticAppendSpot"
+
+    @pytest.mark.parametrize(
+        "launch_state,counter_field",
+        [
+            ("LaunchPostMarketDataSpot", "data_spot_retry"),
+            ("LaunchPostMarketArcticAppendSpot", "data_spot_arctic_retry"),
+        ],
+    )
+    def test_launch_threads_force_on_demand_from_retry_counter(self, eod, launch_state, counter_field):
+        payload = eod[launch_state]["Parameters"]["Payload"]
+        assert payload["force_on_demand.$"] == f"$.{counter_field}.force_on_demand"
 
     @pytest.mark.parametrize(
         "budget_state,counter_field,increment_state,relaunch_state",
@@ -369,6 +383,8 @@ class TestEODDataSpotRetryBudget:
         assert inc["Type"] == "Pass"
         assert inc["ResultPath"] == counter_field.rsplit(".", 1)[0]
         assert inc["Parameters"]["attempts.$"] == f"States.MathAdd({counter_field}, 1)"
+        # The one retry must never gamble on spot a second time.
+        assert inc["Parameters"]["force_on_demand"] is True
         # The retry relaunches on a FRESH box — same launch state, not a
         # separate "retry launch" — a plain Lambda invoke each time.
         assert inc["Next"] == relaunch_state

@@ -808,21 +808,23 @@
     },
     "InitDataSpotRetryCounter": {
       "Type": "Pass",
-      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload — e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling.",
+      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload — e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling. force_on_demand starts false; IncrementDataSpotRetry flips it true so the one retry never gambles on spot a second time.",
       "Result": {
-        "attempts": 0
+        "attempts": 0,
+        "force_on_demand": false
       },
       "ResultPath": "$.data_spot_retry",
       "Next": "LaunchPostMarketDataSpot"
     },
     "LaunchPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (2026-07-14 incident) — the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
-          "workload": "post-market-data"
+          "workload": "post-market-data",
+          "force_on_demand.$": "$.data_spot_retry.force_on_demand"
         }
       },
       "TimeoutSeconds": 420,
@@ -949,8 +951,10 @@
     },
     "IncrementDataSpotRetry": {
       "Type": "Pass",
+      "Comment": "force_on_demand flips to true for the retry — a box already lost to spot interruption once must not gamble on spot again.",
       "Parameters": {
-        "attempts.$": "States.MathAdd($.data_spot_retry.attempts, 1)"
+        "attempts.$": "States.MathAdd($.data_spot_retry.attempts, 1)",
+        "force_on_demand": true
       },
       "ResultPath": "$.data_spot_retry",
       "Next": "LaunchPostMarketDataSpot"
@@ -962,21 +966,23 @@
     },
     "InitDataSpotArcticRetryCounter": {
       "Type": "Pass",
-      "Comment": "Retry budget for the Arctic-append sub-phase — the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter.",
+      "Comment": "Retry budget for the Arctic-append sub-phase — the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter, including force_on_demand.",
       "Result": {
-        "attempts": 0
+        "attempts": 0,
+        "force_on_demand": false
       },
       "ResultPath": "$.data_spot_arctic_retry",
       "Next": "LaunchPostMarketArcticAppendSpot"
     },
     "LaunchPostMarketArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the EOD ArcticDB append on the spot box. Arctic/S3 write runs ON THE SPOT via its executor profile, not the trading box.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the EOD ArcticDB append on the spot box. Arctic/S3 write runs ON THE SPOT via its executor profile, not the trading box. force_on_demand.$ mirrors LaunchPostMarketDataSpot's post-interruption-retry behavior.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
-          "workload": "post-market-arctic-append"
+          "workload": "post-market-arctic-append",
+          "force_on_demand.$": "$.data_spot_arctic_retry.force_on_demand"
         }
       },
       "TimeoutSeconds": 420,
@@ -1103,8 +1109,10 @@
     },
     "IncrementDataSpotArcticRetry": {
       "Type": "Pass",
+      "Comment": "force_on_demand flips to true for the retry — mirrors IncrementDataSpotRetry.",
       "Parameters": {
-        "attempts.$": "States.MathAdd($.data_spot_arctic_retry.attempts, 1)"
+        "attempts.$": "States.MathAdd($.data_spot_arctic_retry.attempts, 1)",
+        "force_on_demand": true
       },
       "ResultPath": "$.data_spot_arctic_retry",
       "Next": "LaunchPostMarketArcticAppendSpot"
