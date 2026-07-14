@@ -151,6 +151,12 @@
       "Effect": "Allow",
       "Action": "ssm:GetCommandInvocation",
       "Resource": "*"
+    },
+    {
+      "Sid": "StartAdvisoryChildPipeline",
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-advisory-pipeline"
     }
   ]
 }
