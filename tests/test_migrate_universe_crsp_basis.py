@@ -119,11 +119,18 @@ def test_reconstruct_basis_close_is_split_adjusted_level():
 def test_reconstruct_basis_total_return_close_back_adjusts_dividend():
     raw, splits, divs = _raw_split_div_frame()
     out, _ = reconstruct_basis("X", raw, splits, divs)
-    # total_return_close = split-adjusted close, rows<ex_div (0,1) ×0.99
-    # (close_prev = split-adj 50, $0.50 div → 1 - 0.5/50 = 0.99).
+    # The $0.50 dividend (ex at index 2) is declared BEFORE the 2-for-1 split
+    # (ex at index 4) — its cash_amount is nominal on the PRE-split share
+    # basis. reconstruct_basis passes split_actions through to
+    # total_return_series (config#1462), which scales it onto the SAME
+    # post-split basis Close is already on: $0.50 / 2 = $0.25. total_return_close
+    # = split-adjusted close, rows<ex_div (0,1) ×0.995 (close_prev = split-adj
+    # 50, scaled $0.25 div → 1 - 0.25/50 = 0.995). Feeding the UNSCALED $0.50
+    # against the post-split $50 close (the config#1462 WMT bug) would instead
+    # give 0.99 — double the correct back-adjust.
     assert TOTAL_RETURN_COL in out.columns
     assert list(out[TOTAL_RETURN_COL].to_numpy()) == pytest.approx(
-        [49.5, 49.5, 50.0, 50.0, 50.0, 50.0]
+        [49.75, 49.75, 50.0, 50.0, 50.0, 50.0]
     )
     # Close (the LEVEL) is NOT mutated by the dividend back-adjust.
     assert list(out["Close"].to_numpy()) == pytest.approx([50.0] * 6)
@@ -312,11 +319,17 @@ def _patch_orchestration(monkeypatch, *, old_closes: dict, scratch_lib=None):
 
 
 def _clean_setup():
-    """A single clean ticker whose reconstruction matches its old yfinance Close."""
+    """A single clean ticker whose reconstruction matches its old yfinance Close.
+
+    49.75 (not 49.5) — the $0.50 dividend is declared BEFORE the 2-for-1 split,
+    so its nominal cash_amount is scaled to the post-split $0.25 basis before
+    back-adjusting (config#1462); see
+    test_reconstruct_basis_total_return_close_back_adjusts_dividend.
+    """
     raw, splits, divs = _raw_split_div_frame()
     raw_frames = {"X": raw}
     idx = raw.index
-    old_closes = {"X": pd.Series([49.5, 49.5, 50.0, 50.0, 50.0, 50.0], index=idx)}
+    old_closes = {"X": pd.Series([49.75, 49.75, 50.0, 50.0, 50.0, 50.0], index=idx)}
     client = _FakePolygon(
         splits={"X": [{"execution_date": idx[4].strftime("%Y-%m-%d"),
                        "split_from": 1, "split_to": 2}]},
@@ -450,9 +463,12 @@ def test_orchestration_apply_writes_scratch_lib_only(monkeypatch, tmp_path):
     stored = scratch.read("X").data
     assert TOTAL_RETURN_COL in stored.columns
     # Close is the split-adjusted LEVEL; total_return_close is dividend-adjusted.
+    # (see test_reconstruct_basis_total_return_close_back_adjusts_dividend for
+    # why 49.75, not 49.5 — the pre-split $0.50 dividend is scaled to the
+    # post-split $0.25 basis before the back-adjust, config#1462.)
     assert list(stored["Close"].to_numpy()) == pytest.approx([50.0] * 6)
     assert list(stored[TOTAL_RETURN_COL].to_numpy()) == pytest.approx(
-        [49.5, 49.5, 50.0, 50.0, 50.0, 50.0]
+        [49.75, 49.75, 50.0, 50.0, 50.0, 50.0]
     )
     # ...and NEVER the live universe lib.
     live_lib.write.assert_not_called()
