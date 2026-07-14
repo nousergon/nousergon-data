@@ -193,10 +193,16 @@ def _parse_ccusage_key(key: str) -> "str | None":
 
 
 def _read_weekly_wet(window_start: datetime) -> float:
-    """Sum WET (all sources) at/after the PT datetime ``window_start``, hour-precise.
+    """Sum Anthropic-only WET at/after the PT datetime ``window_start``, hour-precise.
 
-    Boto3 mirror of groom_budget.py::read_weekly_wet (same S3 layout, same
-    hour-boundary trim on the window's start day)."""
+    Filtered to ``provider == "anthropic"`` (config#2374): Brian's in-app
+    ``/usage`` percentage — the ground truth the pace gate's ceiling is
+    calibrated against — only reflects Anthropic (Claude Max) consumption, so
+    non-Anthropic WET must not count toward ``used_frac`` or it silently
+    inflates the pace-gate's skip decision. A record with no ``provider`` field
+    (older docs predating the field) defaults to "anthropic", matching
+    ``groom_budget.py::read_weekly_wet``'s convention and ``record_usage_pacing_sample
+    .read_weekly_anthropic_wet``'s behavior."""
     s3 = boto3.client("s3", region_name=REGION)
     total = 0.0
     start_date = window_start.date().isoformat()
@@ -212,7 +218,8 @@ def _read_weekly_wet(window_start: datetime) -> float:
             for hr, models in (doc.get("by_hour") or {}).items():
                 if d == start_date and int(hr) < window_start.hour:
                     continue
-                total += sum(r.get("wet", 0) for r in models.values())
+                total += sum(r.get("wet", 0) for r in models.values()
+                             if r.get("provider", "anthropic") == "anthropic")
     return total
 
 

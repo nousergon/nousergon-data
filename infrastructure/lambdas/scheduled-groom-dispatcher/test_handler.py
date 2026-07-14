@@ -306,6 +306,16 @@ def _wet_doc(wet: float) -> bytes:
     return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
 
 
+def _mixed_provider_wet_doc(anthropic_wet: float, non_anthropic_wet: float) -> bytes:
+    import json
+    return json.dumps({"by_hour": {
+        "10": {
+            "claude-opus": {"wet": anthropic_wet, "provider": "anthropic"},
+            "gpt-4": {"wet": non_anthropic_wet, "provider": "openai"}
+        }
+    }}).encode()
+
+
 def _spy_notify(monkeypatch, idx):
     """Replace notify_via_flow_doctor with a recorder."""
     calls = []
@@ -395,6 +405,31 @@ def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert notified == []  # kill-switch disables the ping too — the gate never ran
+
+
+def test_pace_gate_filters_to_anthropic_only_wet(monkeypatch):
+    # config#2484: WET reader must filter to Anthropic-only, matching
+    # groom_budget.py's filter. Mixed-provider fixture: 100M Anthropic + 500M
+    # OpenAI. On pace if only Anthropic (0.088% of 850M ceiling at 1 day).
+    # Over pace if total (0.7% inflates to pace check failure).
+    anthropic_wet = 0.1 * 1_140_000_000 * 0.088
+    openai_wet = 500_000_000
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        s3_objects={
+            "claude_code_usage/groom/2026-07-13.json":
+            _mixed_provider_wet_doc(anthropic_wet, openai_wet)
+        }
+    )
+    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
+    monkeypatch.setattr(idx, "datetime", type("D", (), {
+        "now": staticmethod(lambda tz=None: fixed_now)}))
+    notified = _spy_notify(monkeypatch, idx)
+    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
+    # Should launch because Anthropic-only WET is low, NOT fail because of the
+    # non-Anthropic inflated total.
+    assert out["groom"]["launched"] is True
+    assert notified == []
 
 
 def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
