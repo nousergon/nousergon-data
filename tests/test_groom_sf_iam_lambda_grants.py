@@ -43,28 +43,44 @@ def _collect_invoked_lambda_arns(sf_doc: dict) -> set[str]:
     """Extract every Lambda ARN any Task state in the SF would invoke.
 
     Same two invocation-shape handling as test_sf_iam_lambda_grants.py
-    (bare-ARN Resource + FunctionName param, short-name fallback), without
-    the Parallel-branch walk since the groom SF defn has no Parallel states
-    today — kept as a plain top-level walk to match the SF's actual shape
-    rather than speculatively generalizing.
+    (bare-ARN Resource + FunctionName param, short-name fallback). Recurses
+    into Map states' ItemProcessor (config#2129 introduced MapLaunches,
+    whose ItemProcessor nests its own LaunchGroomSpot lambda:invoke Task) and
+    Parallel branches, mirroring test_sf_iam_lambda_grants.py's walker —
+    a flat top-level-only walk would silently miss a Lambda invocation added
+    inside a Map/Parallel later, exactly the drift class this test exists to
+    catch (config#2010).
     """
     found: set[str] = set()
-    for state in sf_doc.get("States", {}).values():
-        if state.get("Type") != "Task":
-            continue
-        resource = state.get("Resource", "")
-        if "lambda:invoke" not in resource and "lambda:Invoke" not in resource:
-            continue
-        params = state.get("Parameters", {})
-        fn = params.get("FunctionName") or params.get("FunctionName.$")
-        if not fn or not isinstance(fn, str):
-            continue
-        if fn.startswith("arn:aws:lambda:"):
-            base = ":".join(fn.split(":")[:7])
-            found.add(base)
-        else:
-            short = fn.split(":")[0]
-            found.add(f"arn:aws:lambda:us-east-1:711398986525:function:{short}")
+
+    def _walk(states: dict) -> None:
+        for state in states.values():
+            state_type = state.get("Type")
+            if state_type == "Parallel":
+                for branch in state.get("Branches", []):
+                    _walk(branch.get("States", {}))
+                continue
+            if state_type == "Map":
+                processor = state.get("ItemProcessor") or state.get("Iterator") or {}
+                _walk(processor.get("States", {}))
+                continue
+            if state_type != "Task":
+                continue
+            resource = state.get("Resource", "")
+            if "lambda:invoke" not in resource and "lambda:Invoke" not in resource:
+                continue
+            params = state.get("Parameters", {})
+            fn = params.get("FunctionName") or params.get("FunctionName.$")
+            if not fn or not isinstance(fn, str):
+                continue
+            if fn.startswith("arn:aws:lambda:"):
+                base = ":".join(fn.split(":")[:7])
+                found.add(base)
+            else:
+                short = fn.split(":")[0]
+                found.add(f"arn:aws:lambda:us-east-1:711398986525:function:{short}")
+
+    _walk(sf_doc.get("States", {}))
     return found
 
 

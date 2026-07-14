@@ -41,6 +41,16 @@ sys.modules.setdefault("nousergon_lib", _ng)
 sys.modules.setdefault("nousergon_lib.telegram", _ng_telegram)
 sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
 
+# config#2208 fleet-pattern hardening: stub the whole sibling module wholesale
+# (mirrors scheduled-groom-dispatcher/pipeline-watchdog) so `index.notify_via_
+# flow_doctor` is a safe no-op by construction on every `import`/`reload`, not
+# only when each handler-calling test remembers its own `_wire()` monkeypatch.
+# hermetic_import_guard treats an already-stubbed sibling as satisfied (its
+# own imports become irrelevant), so this is additive, not a guard conflict.
+_fdt = types.ModuleType("flow_doctor_telegram")
+_fdt.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+sys.modules["flow_doctor_telegram"] = _fdt
+
 from _shared.hermetic_import_guard import (  # noqa: E402
     assert_hermetic_imports_satisfied,
 )

@@ -364,17 +364,21 @@ class TestEvalJudgePollChoice:
     Lambda invocation per poll cycle for hours."""
 
     def test_empty_routes_directly_to_process(self, states):
+        # config#2275: rules are And:[{IsPresent}, {StringEquals}] guarded.
         choice = next(
             c for c in states["EvalJudgePollChoice"]["Choices"]
-            if c.get("StringEquals") == "EMPTY"
+            if any(leaf.get("StringEquals") == "EMPTY" for leaf in c.get("And", []))
         )
         assert choice["Next"] == "EvalJudgeProcess"
-        assert choice["Variable"] == "$.eval_judge_submit.Payload.status"
+        assert all(
+            leaf["Variable"] == "$.eval_judge_submit.Payload.status"
+            for leaf in choice["And"]
+        )
 
     def test_ok_routes_to_poll_wait(self, states):
         choice = next(
             c for c in states["EvalJudgePollChoice"]["Choices"]
-            if c.get("StringEquals") == "OK"
+            if any(leaf.get("StringEquals") == "OK" for leaf in c.get("And", []))
         )
         assert choice["Next"] == "EvalJudgePollWait"
 
@@ -406,11 +410,18 @@ class TestEvalJudgePollLoop:
         assert payload["max_wait_seconds"] == 21600
 
     def test_poll_decision_ended_routes_to_process(self, states):
+        # config#2275: the rule is And:[{IsPresent}, {Or: [...]}] guarded.
+        def _or_clauses(rule):
+            for operand in rule.get("And", []):
+                if "Or" in operand:
+                    return operand["Or"]
+            return rule.get("Or", [])
+
         ended_choice = next(
             c for c in states["EvalJudgePollDecision"]["Choices"]
-            if "Or" in c and any(
+            if any(
                 clause.get("StringEquals") == "ended"
-                for clause in c["Or"]
+                for clause in _or_clauses(c)
             )
         )
         assert ended_choice["Next"] == "EvalJudgeProcess"
@@ -419,15 +430,22 @@ class TestEvalJudgePollLoop:
         # in Process.
         assert any(
             clause.get("StringEquals") == "ended_empty"
-            for clause in ended_choice["Or"]
+            for clause in _or_clauses(ended_choice)
         )
 
     def test_poll_decision_max_wait_routes_to_rolling_mean(self, states):
+        # config#2275: the rule is And:[{IsPresent}, {BooleanEquals}] guarded.
         max_wait_choice = next(
             c for c in states["EvalJudgePollDecision"]["Choices"]
-            if c.get("Variable", "").endswith("exceeded_max_wait")
+            if any(
+                leaf.get("Variable", "").endswith("exceeded_max_wait")
+                and "BooleanEquals" in leaf
+                for leaf in c.get("And", [])
+            )
         )
-        assert max_wait_choice["BooleanEquals"] is True
+        assert any(
+            leaf.get("BooleanEquals") is True for leaf in max_wait_choice["And"]
+        )
         # Fail-soft — Anthropic retains batch results for 29 days, so
         # operator can re-run Process offline against the same batch_id.
         assert max_wait_choice["Next"] == "EvalRollingMean"

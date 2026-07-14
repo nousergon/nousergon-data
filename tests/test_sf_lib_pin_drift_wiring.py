@@ -76,15 +76,26 @@ def test_check_fails_open_via_catch(states):
     # proceed into the pipeline, NOT halt the weekly run.
     catch = states["LibPinDriftCheck"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "CheckMutexRole"  # the pipeline, not HandleFailure
+    # config#2278: still fail-open (the pipeline, not HandleFailure) — but
+    # through the visible degraded chain (flag + SNS alert), re-entering the
+    # SIBLING contract gate instead of skipping it (the old direct
+    # CheckMutexRole jump); full topology in test_sf_prespend_gate_alerting.
+    assert catch["Next"] == "LibPinGateDegraded"
 
 
 def test_gate_halts_only_on_confirmed_drift(states):
     gate = states["LibPinDriftGate"]
     assert gate["Type"] == "Choice"
     c = gate["Choices"][0]
-    assert c["Variable"] == "$.libpin_drift_result.Payload.has_drift"
-    assert c["BooleanEquals"] is True
+    # config#2275: the dereference is IsPresent-guarded (And short-circuit)
+    # so a partial gate payload falls to Default instead of States.Runtime.
+    guard, comparison = c["And"]
+    assert guard == {
+        "Variable": "$.libpin_drift_result.Payload.has_drift",
+        "IsPresent": True,
+    }
+    assert comparison["Variable"] == "$.libpin_drift_result.Payload.has_drift"
+    assert comparison["BooleanEquals"] is True
     # Confirmed drift halts, but routes through the $.error normalizer FIRST
     # (not straight to HandleFailure) — see test_drift_halt_normalizes_error.
     assert c["Next"] == "ExtractLibPinDriftError"

@@ -171,8 +171,8 @@ class TestEdges:
         par = sf["States"]["ResearchPredictorParallel"]
         assert par["Branches"][0]["StartAt"] == "Scanner"
 
-    def test_scanner_success_routes_to_check_skip_rag(self, states):
-        assert states["Scanner"]["Next"] == "CheckSkipRAGIngestion"
+    def test_scanner_success_routes_to_thinktank_coverage(self, states):
+        assert states["Scanner"]["Next"] == "ThinkTankCoverage"
 
 
 # ── Result paths (state-merge contract) ───────────────────────────────────

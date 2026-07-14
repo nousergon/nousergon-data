@@ -26,6 +26,20 @@ Read-only, schedule-aware config-drift check:
    failure to expose it.
 4. The target dispatcher Lambda is `Active` with a successful last code
    update.
+5. **EC2-spot dispatch leg** (the LIVE repair path since the 2026-07-10 spot
+   migration, config#2001/#2106): `alpha-engine-sf-watch-spot-dispatcher` and
+   `alpha-engine-ci-watch-dispatcher` exist and are `Active`. Their
+   kill-switch env values (`SF_WATCH_DISPATCH_ENABLED` /
+   `CI_WATCH_DISPATCH_ENABLED`) are read and **reported** in the probe
+   record/log — never alerted on: a deliberate operator disable is state, not
+   an incident.
+6. **Launch-config existence** (the deregistered-AMI silent-break guard,
+   config#2265): the AMI, security group, and subnets the spot dispatcher
+   would launch with — read from its DEPLOYED live env (`SF_WATCH_AMI_ID` /
+   `SF_WATCH_SECURITY_GROUP` / `SF_WATCH_SUBNETS`, pinned by that Lambda's
+   `deploy.sh` and lockstep-tested against its in-code defaults) — still
+   exist in EC2. A missing expected env key is itself a loud finding, never a
+   skip.
 
 Silent-unless-broken (mirrors the groom-liveness-probe's philosophy, one
 layer up): a clean check logs and returns, no Telegram noise. Any problem
@@ -33,24 +47,56 @@ fires a LOUD alert, deduplicated by the **content** of the problem set (a
 hash, not a timestamp) — a standing issue doesn't re-ping every run, and the
 alert state clears automatically once the check is clean again.
 
+## Mid-run spot-reclaim checker (config#2270)
+
+This Lambda is **also** the EventBridge target for `EC2 Spot Instance
+Interruption Warning` and `EC2 Instance State-change Notification`
+(state=terminated) — the handler branches on event shape (the scheduled probe
+payload is `{}`). The EC2 events carry only an instance-id (the rules cannot
+be tag-scoped), so the checker `DescribeTags` the instance (tags stay
+queryable post-termination for a while):
+
+- `Name` tag ≠ `alpha-engine-sf-watch-spot` → quiet exit (log only).
+- Watch box **with** its completion marker
+  (`s3://…/sf_watch/_control/completed/{cadence}-{pipeline}-{run_date}.json`,
+  the spot-orphan-reaper's key shape) → clean run, exit.
+- Watch box **without** a marker → died mid-repair: re-invoke
+  `alpha-engine-sf-watch-spot-dispatcher` **once** (async) with the dispatch
+  fields reconstructed from the discriminator tags + the newest watch-log
+  event, plus `force_on_demand: "true"` (a reclaim already proved spot
+  unreliable for this run). The decision is recorded FIRST as an
+  `action: reclaim_relaunch` watch-log event — the exactly-one bound, and the
+  event the saturday dispatcher's config#2269 mechanical attempt ceiling
+  counts — then a **silent** Telegram note fires ("watch box reclaimed
+  mid-repair — relaunched on-demand").
+- A **second** death for the same (cadence, pipeline, run_date), an untagged
+  watch-box death, or an unreconstructable dispatch → **LOUD** escalation
+  (human needed), never a second relaunch.
+
+The interruption warning and the terminated notification both fire for one
+reclaim — the second notification of the **same** instance is recognized via
+the recorded `dead_instance_id` and exits quietly.
+
 **Fail-loud:** every AWS describe/list call is the PRIMARY input — an error
 code other than the specific "doesn't exist" ones being checked for RAISES,
-surfacing via the Lambda error metric + a CW alarm rather than silently
-skipping the one check that verifies nothing else is silently broken. The
-Telegram send and dedup-state write are best-effort.
+surfacing via the Lambda `Errors` metric, alarmed by the watch-plane
+CloudWatch alarms provisioned in `infrastructure/setup_watch_plane_alarms.sh`
+(the dead-probe backstop) — rather than silently skipping the one check that
+verifies nothing else is silently broken. The Telegram send and dedup-state
+write are best-effort.
 
 ## Deploy (operator-gated, outside CloudFormation)
 
 ```
 bash deploy.sh --dry-run     # show actions
-bash deploy.sh --bootstrap   # first-time: create role + Lambda + 2 Scheduler rules
+bash deploy.sh --bootstrap   # first-time: role + Lambda + 2 Scheduler rules + 2 EC2 reclaim EventBridge rules (config#2270)
 bash deploy.sh               # update code only
 bash deploy.sh --smoke       # invoke once (read-only; pings only on a REAL problem)
 ```
 
 Merging the PR has **zero** live effect until an operator runs `--bootstrap`.
-Recommend wiring a CloudWatch alarm on this function's `Errors` metric (the
-fail-loud contract assumes one).
+The CloudWatch alarm on this function's `Errors` metric (which the fail-loud
+contract assumes) is provisioned by `infrastructure/setup_watch_plane_alarms.sh`.
 
 Cadence (UTC): `cron(45 6 * * ? *)` and `cron(45 14 * * ? *)` — offset 15 min
 from the groom-liveness-probe's cadence purely to avoid simultaneous

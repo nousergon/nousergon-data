@@ -62,7 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # rag/pipelines/ ingest-side scripts are scope-exempt — they write
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
-    "builders/_price_cache_writeboth.py": 1,
+    "builders/_price_cache_writeboth.py": 2,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
@@ -145,6 +145,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "rag/pipelines/ingest_form4.py": 2,
     # config#1727: _write_module_health delegates to nousergon_lib.health (1 fewer
     # local put_object); health/{module}.json still written via lib.
+    # alpha-engine-config-I2428: SEC quarterly Form 13F bulk data pipeline.
+    # Writes inst_ownership/{quarter}/result.parquet (artifact_key),
+    # inst_ownership/{quarter}/latest.parquet (per-quarter mirror),
+    # data/inst_ownership/latest.json (sidecar), and
+    # data/crosswalks/cusip_to_ticker.json (CUSIP→ticker cache).
+    # ARTIFACT_REGISTRY.yaml row: thinktank_inst_ownership.
+    "data/derived/inst_ownership.py": 4,
     "weekly_collector.py": 5,
 }
 
