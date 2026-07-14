@@ -15,15 +15,26 @@ This restructures the sequential
   ... -> Research -> DataPhase2 -> eval-judge chain -> ... ->
       Counterfactual -> PredictorTraining -> DriftDetection -> ...
 into an SF Parallel:
-  Branch A = CheckSkipResearch -> Research -> DataPhase2 -> eval-judge
-             chain -> EvalRollingMean -> RationaleClustering ->
-             ReplayConcordance -> Counterfactual
+  Branch A (as of the 2026-05-16 origin) = CheckSkipResearch -> Research ->
+             DataPhase2 -> eval-judge chain -> EvalRollingMean ->
+             RationaleClustering -> ReplayConcordance -> Counterfactual
   Branch B = CheckSkipPredictorTraining -> PredictorTraining quartet
   join    -> AggregateBranchOutcomes -> CheckBranchOutcomes ->
              CheckSkipBacktester (config#902: the standalone DriftDetection
              state was collapsed — drift is now bundled onto the
              PredictorTraining spot inside Branch B — so the join routes
              straight to the backtester skip-gate)
+
+UPDATE (alpha-engine-config-I2515 Phase B): the multi-agent Research graph
+runner (CheckSkipResearch/Research/CheckResearchStatus) was REMOVED from
+Branch A. Current Branch A head: Scanner -> CheckSkipRegimeSubstrate ->
+RegimeSubstrate -> SignalsEnvelope (new load-bearing signals.json
+producer) -> ChallengerShadow (new, non-blocking) -> CheckSkipRAGIngestion
+-> RAG chain -> ThinkTankCoverage (moved here, post-RAG) ->
+CheckSkipRegimeRetrospectiveEval -> RegimeRetrospectiveEval ->
+CheckSkipDataPhase2 -> DataPhase2 -> eval-judge chain -> ... ->
+Counterfactual. The Parallel/Branch-B/join structure and the
+sibling-branch decoupling invariant this file pins are unchanged.
 
 CORRECTNESS-CRITICAL: SF Parallel's default semantics cancel sibling
 branches when one branch errors. With strict-Research hard-failing and
@@ -60,12 +71,21 @@ _BRANCH_A_STATES = {
     # RegimeRetrospectiveEval chain was relocated FROM top level INTO
     # Branch A's head (Scanner is Branch A's StartAt) so PredictorTraining
     # (Branch B) forks parallel to it directly after DataPhase1.
-    "Scanner", "ThinkTankCoverage", "CheckSkipRAGIngestion", "RAGIngestion",
+    #
+    # alpha-engine-config-I2515 Phase B: the multi-agent Research graph
+    # runner (CheckSkipResearch/Research/CheckResearchStatus) was REMOVED.
+    # RegimeSubstrate now runs BEFORE the RAG chain (moved ahead of RAG/
+    # ThinkTank), followed by the new SignalsEnvelope (thin envelope
+    # producer replacing Research as the signals.json producer) and
+    # ChallengerShadow (keeps the no_agent champion-baseline shadow alive).
+    # ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh
+    # corpus. ExtractResearchError was renamed ExtractSignalsEnvelopeError.
+    "Scanner", "CheckSkipRegimeSubstrate", "RegimeSubstrate",
+    "SignalsEnvelope", "ChallengerShadow",
+    "ThinkTankCoverage", "CheckSkipRAGIngestion", "RAGIngestion",
     "WaitForRAGIngestion", "CheckRAGIngestionStatus", "RAGIngestionWait",
     "RAGIngestionRetryGate", "RAGIngestionReissue", "ExtractRAGIngestionError",
-    "CheckSkipRegimeSubstrate", "RegimeSubstrate",
     "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
-    "CheckSkipResearch", "Research", "CheckResearchStatus",
     "CheckSkipDataPhase2", "DataPhase2", "CheckSkipEvalJudge",
     "ComputeEvalCadence", "CheckMonthlyCadence",
     "EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly",
@@ -73,7 +93,7 @@ _BRANCH_A_STATES = {
     "EvalJudgePollDecision", "EvalJudgeProcess", "EvalRollingMean",
     "CheckSkipRationaleClustering", "RationaleClustering",
     "CheckSkipReplayConcordance", "ReplayConcordance",
-    "CheckSkipCounterfactual", "Counterfactual", "ExtractResearchError",
+    "CheckSkipCounterfactual", "Counterfactual", "ExtractSignalsEnvelopeError",
     "PublishResearchFailureImmediate",
     "BranchAComplete", "BranchAFailed",
 }
@@ -164,13 +184,16 @@ class TestParallelStatePresence:
         assert len(parallel["Branches"]) == 2
 
     def test_branch_a_starts_at_scanner(self, parallel):
-        # config#885: Branch A now leads with the relocated Scanner chain
-        # (Scanner → RAG → RegimeSubstrate → RegimeRetrospectiveEval →
-        # CheckSkipResearch → ...). CheckSkipResearch is no longer the
-        # StartAt — it is the chain's continuation inside Branch A.
+        # config#885: Branch A now leads with the relocated Scanner chain.
+        # alpha-engine-config-I2515 Phase B: the chain is now Scanner →
+        # RegimeSubstrate → SignalsEnvelope → ChallengerShadow → RAG →
+        # ThinkTankCoverage → RegimeRetrospectiveEval → DataPhase2 → ...
+        # (the multi-agent Research state and CheckSkipResearch were
+        # removed; SignalsEnvelope is the chain's continuation inside
+        # Branch A).
         assert parallel["Branches"][0]["StartAt"] == "Scanner"
         branch_a = parallel["Branches"][0]["States"]
-        assert "CheckSkipResearch" in branch_a
+        assert "SignalsEnvelope" in branch_a
 
     def test_branch_b_starts_at_check_skip_predictor_training(self, parallel):
         assert (
@@ -197,17 +220,20 @@ class TestParallelStatePresence:
 
 
 class TestResearchAndPredictorAreSiblingBranches:
-    """The core decoupling: Research and PredictorTraining must be in
-    SIBLING Parallel branches, never serialized."""
+    """The core decoupling: the research module's Branch A work and
+    PredictorTraining must be in SIBLING Parallel branches, never
+    serialized. alpha-engine-config-I2515 Phase B removed the multi-agent
+    Research state entirely; SignalsEnvelope is its load-bearing successor
+    and stands in as the proof-point here."""
 
-    def test_research_in_branch_a(self, branch_a):
-        assert "Research" in branch_a
+    def test_signals_envelope_in_branch_a(self, branch_a):
+        assert "SignalsEnvelope" in branch_a
 
     def test_predictor_training_in_branch_b(self, branch_b):
         assert "PredictorTraining" in branch_b
 
-    def test_research_not_in_branch_b(self, branch_b):
-        assert "Research" not in branch_b
+    def test_signals_envelope_not_in_branch_b(self, branch_b):
+        assert "SignalsEnvelope" not in branch_b
 
     def test_predictor_training_not_in_branch_a(self, branch_a):
         assert "PredictorTraining" not in branch_a
@@ -238,27 +264,17 @@ class TestBranchAContents:
     def test_branch_a_state_present(self, branch_a, name):
         assert name in branch_a
 
-    def test_data_phase2_after_research_in_branch_a(self, branch_a):
-        # Research success → CheckSkipDataPhase2 → DataPhase2
-        # config#2275: rules are And:[{IsPresent}, {StringEquals}] guarded.
-        ok = [
-            c["Next"]
-            for c in branch_a["CheckResearchStatus"]["Choices"]
-            if any(leaf.get("StringEquals") == "OK" for leaf in c.get("And", []))
-        ]
-        assert ok == ["CheckSkipDataPhase2"]
+    def test_data_phase2_after_regime_retrospective_eval_in_branch_a(self, branch_a):
+        # alpha-engine-config-I2515 Phase B: the removed multi-agent
+        # Research state (and CheckResearchStatus) used to sit between the
+        # regime chain and DataPhase2. RegimeRetrospectiveEval's success
+        # path now goes straight to CheckSkipDataPhase2 → DataPhase2.
+        assert branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
 
     def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
         assert branch_a["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
         assert branch_a["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
-
-    def test_skip_research_still_routes_into_branch(self, branch_a):
-        """skip_research must still bypass to DataPhase2's skip-gate
-        (preserved skip-gate semantics) — and stay INSIDE Branch A."""
-        c = branch_a["CheckSkipResearch"]["Choices"][0]
-        assert c["Next"] == "CheckSkipDataPhase2"
-        assert c["Next"] in branch_a
 
     def test_eval_judge_quartet_preserved(self, branch_a):
         assert branch_a["EvalJudgePollChoice"]["Type"] == "Choice"
@@ -476,7 +492,7 @@ class TestBranchBContents:
         rnexts = {c["StringEquals"]: c["Next"] for c in check_resolve["Choices"]}
         assert rnexts["Success"] == "ParseZooSpecs"
         # Default routes through ExtractModelZooResolveError (mirrors
-        # ExtractPredictorError/ExtractResearchError/ExtractRAGIngestionError)
+        # ExtractPredictorError/ExtractSignalsEnvelopeError/ExtractRAGIngestionError)
         # — a Choice.Default transition does not populate $.model_zoo_error the
         # way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's
         # Message calls States.JsonToString($.model_zoo_error); a direct
@@ -661,19 +677,22 @@ class TestPerBranchErrorIsolation:
                         f"Branch{bi} {n} -> {t} dangles within the branch"
                     )
 
-    def test_research_hardfail_routes_to_branch_a_failed(self, branch_a):
-        """strict-Research hard-fail (Task Catch) + the soft-fail status
-        path (ExtractResearchError → PublishResearchFailureImmediate) must
-        record FAILED, not halt the SF. The PublishResearchFailureImmediate
-        intermediate is the fast-SNS-alert state added 2026-05-24; both
-        success and failure paths through it terminate at BranchAFailed."""
+    def test_signals_envelope_hardfail_routes_to_branch_a_failed(self, branch_a):
+        """alpha-engine-config-I2515 Phase B: SignalsEnvelope replaces the
+        removed multi-agent Research state as Branch A's load-bearing
+        producer. Its hard-fail (Task Catch) routes through
+        ExtractSignalsEnvelopeError (renamed from ExtractResearchError) →
+        PublishResearchFailureImmediate (the fast-SNS-alert state added
+        2026-05-24, shared with RAGIngestion failures) → BranchAFailed —
+        NO non-blocking Catch-to-continue, unlike ThinkTankCoverage/
+        ChallengerShadow."""
         catch_targets = [
-            c["Next"] for c in branch_a["Research"]["Catch"]
+            c["Next"] for c in branch_a["SignalsEnvelope"]["Catch"]
         ]
-        assert catch_targets == ["BranchAFailed"]
+        assert catch_targets == ["ExtractSignalsEnvelopeError"]
         # ExtractError → PublishImmediate → BranchAFailed
         assert (
-            branch_a["ExtractResearchError"]["Next"]
+            branch_a["ExtractSignalsEnvelopeError"]["Next"]
             == "PublishResearchFailureImmediate"
         )
         publish = branch_a["PublishResearchFailureImmediate"]
@@ -683,11 +702,16 @@ class TestPerBranchErrorIsolation:
         # SNS-publish-fails escape hatch also lands at BranchAFailed
         for c in publish.get("Catch", []):
             assert c["Next"] == "BranchAFailed"
-        # CheckResearchStatus non-OK/SKIPPED → ExtractResearchError
-        assert (
-            branch_a["CheckResearchStatus"]["Default"]
-            == "ExtractResearchError"
-        )
+
+    def test_challenger_shadow_is_non_blocking(self, branch_a):
+        """alpha-engine-config-I2515 Phase B: unlike SignalsEnvelope,
+        ChallengerShadow is observe-only (producer leaderboard shadow feed)
+        and must never hard-fail Branch A."""
+        catch_targets = [
+            c["Next"] for c in branch_a["ChallengerShadow"]["Catch"]
+        ]
+        assert catch_targets == ["CheckSkipRAGIngestion"]
+        assert "BranchAFailed" not in catch_targets
 
     def test_dataphase2_failure_routes_to_branch_a_failed(self, branch_a):
         assert [c["Next"] for c in branch_a["DataPhase2"]["Catch"]] == [
@@ -838,18 +862,22 @@ class TestInboundRewireAndDownstreamUnchanged:
     def test_relocated_chain_threads_through_branch_a(self, branch_a):
         """The relocated Scanner chain's terminal RegimeRetrospectiveEval
         (and its skip-gate + non-blocking Catch) continue to
-        CheckSkipResearch IN-BRANCH — never the parent Parallel (invalid
-        branch→parent) nor top-level HandleFailure (cross-branch cancel)."""
-        assert branch_a["Scanner"]["Next"] == "ThinkTankCoverage"
+        CheckSkipDataPhase2 IN-BRANCH — never the parent Parallel (invalid
+        branch→parent) nor top-level HandleFailure (cross-branch cancel).
+        alpha-engine-config-I2515 Phase B: Scanner's successor is now
+        CheckSkipRegimeSubstrate (RegimeSubstrate moved ahead of RAG/
+        ThinkTank), and the removed multi-agent Research state's
+        CheckSkipResearch successor is replaced by CheckSkipDataPhase2."""
+        assert branch_a["Scanner"]["Next"] == "CheckSkipRegimeSubstrate"
         assert (
-            branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
+            branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
         )
         assert [
             c["Next"]
             for c in branch_a["RegimeRetrospectiveEval"]["Catch"]
-        ] == ["CheckSkipResearch"]
+        ] == ["CheckSkipDataPhase2"]
         c = branch_a["CheckSkipRegimeRetrospectiveEval"]
-        assert c["Choices"][0]["Next"] == "CheckSkipResearch"
+        assert c["Choices"][0]["Next"] == "CheckSkipDataPhase2"
         assert c["Default"] == "RegimeRetrospectiveEval"
 
     def test_relocated_chain_gone_from_top_level(self, states):
@@ -867,8 +895,8 @@ class TestInboundRewireAndDownstreamUnchanged:
         """The relocated RAGIngestion error edges that USED to hit the
         top-level HandleFailure must now route to the branch-fail path
         (PublishResearchFailureImmediate → BranchAFailed), mirroring
-        ExtractResearchError — a branch state pointing at the non-branch
-        HandleFailure is an invalid ASL transition AND would re-introduce
+        ExtractSignalsEnvelopeError — a branch state pointing at the
+        non-branch HandleFailure is an invalid ASL transition AND would re-introduce
         cross-branch cancellation."""
         assert [c["Next"] for c in branch_a["RAGIngestion"]["Catch"]] == [
             "PublishResearchFailureImmediate"

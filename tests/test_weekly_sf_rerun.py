@@ -84,7 +84,8 @@ class TestDerivePlan:
             "skip_rag_ingestion",
             "skip_regime_substrate",
             "skip_regime_retrospective_eval",
-            "skip_research",
+            # skip_research retired: alpha-engine-config-I2515 Phase B
+            # removed the multi-agent Research state entirely.
             "skip_data_phase2",
             "skip_eval_judge",
             "skip_rationale_clustering",

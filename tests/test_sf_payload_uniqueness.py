@@ -82,7 +82,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "ThinkTankCoverage": frozenset({"mode", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
-    "Research": frozenset({"dry_run_llm.$", "force", "weekly_run", "skip_dry_run_gate"}),
+    # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
+    # Research state as the signals.json producer.
+    "SignalsEnvelope": frozenset({"run_date.$", "target"}),
+    # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
+    # shadow alive for the producer leaderboard post graph-runner removal.
+    "ChallengerShadow": frozenset({"mode", "date.$"}),
     "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}

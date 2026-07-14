@@ -32,8 +32,11 @@ The SF is a STRICT SUPERSET of the pre-spine Saturday SF:
   spot_drift_detection.sh, converting it from a literal `commands` array to
   the same `commands.$`/`States.Format($.preflight_args)` Option-C
   mechanism); the LAMBDA states run dry via their handler's no-write dry
-  flag: Research/DataPhase2/RegimeSubstrate/RegimeRetrospectiveEval from
-  the keystone, PLUS the eval-judge chain
+  flag: DataPhase2/RegimeSubstrate/RegimeRetrospectiveEval from
+  the keystone (the multi-agent Research state was also dry from the
+  keystone but was removed entirely by alpha-engine-config-I2515 Phase B;
+  its replacements SignalsEnvelope/ChallengerShadow carry no dry-run
+  signal, mirroring ThinkTankCoverage's own convention), PLUS the eval-judge chain
   (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process), RationaleClustering
   (research #202), ReplayConcordance + Counterfactual (backtester #225) —
   all reusing the canonical `$.research_dry` shell-run-dry signal via
@@ -90,7 +93,12 @@ _EXPECTED_SKIPS = {
     "skip_rag_ingestion",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",
-    "skip_research",
+    # skip_research retired: alpha-engine-config-I2515 Phase B removed the
+    # multi-agent Research state (and its CheckSkipResearch gate) entirely
+    # — there is no longer a Lambda invocation to skip. SignalsEnvelope,
+    # its load-bearing replacement, has no skip gate (mirrors Scanner's
+    # own unconditional posture — it is now a same-day-freshness producer,
+    # not an ad-hoc-rerun-optional step).
     "skip_data_phase2",
     "skip_eval_judge",
     "skip_rationale_clustering",
@@ -172,16 +180,20 @@ _SPOT_STATES = {
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
 # skipped) via an input-var ref so the absent path is behaviourally
-# identical. Research/DataPhase2/Regime* were dry from the keystone; the
+# identical. DataPhase2/Regime* were dry from the keystone; the
 # skip-exception rewire ADDED the eval-judge chain + rationale-clustering
 # (research #202 added dry_run_llm) + replay-concordance + counterfactual
 # (backtester #225 added dry_run_llm) — all reusing the canonical
 # $.research_dry shell-run-dry signal (already true under shell_run / false
 # on the real run). DriftDetection is NOT here — it is a SPOT state (see
 # _SPOT_STATES) routed dry via --preflight-only, not a Lambda dry flag.
+# alpha-engine-config-I2515 Phase B removed the multi-agent Research state
+# entirely — its "Research" entry here is retired along with it.
+# SignalsEnvelope/ChallengerShadow (its replacements) do NOT thread
+# $.research_dry (their Payloads carry no dry-run signal, mirroring
+# ThinkTankCoverage's own no-dry-flag convention), so neither is added here.
 # state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
-    "Research": ("dry_run_llm.$", "$.research_dry"),
     "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
     "RegimeSubstrate": ("action.$", "$.regime_action"),
     "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),

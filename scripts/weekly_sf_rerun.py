@@ -148,24 +148,30 @@ STAGES: tuple[Stage, ...] = (
     # NOTE: Scanner (branch A's StartAt) has NO skip gate and re-runs
     # unconditionally on any branch-A rerun; it is fail-soft/observe-only
     # by SF design. Surfaced as a warning when branch A re-runs.
-    Stage(
-        "rag_ingestion", "skip_rag_ingestion",
-        "CheckSkipRAGIngestion", "RAGIngestion",
-        frozenset({"CheckSkipRegimeSubstrate"}),
-    ),
+    #
+    # alpha-engine-config-I2515 Phase B reorder: RegimeSubstrate now runs
+    # BEFORE the RAG chain (moved ahead of RAG/ThinkTank so SignalsEnvelope
+    # reads a same-day regime label); the multi-agent Research state (and
+    # its "research" Stage / skip_research flag / CheckSkipResearch gate)
+    # was REMOVED entirely. SignalsEnvelope (its load-bearing replacement)
+    # and ChallengerShadow (observe-only) have NO skip gates either — like
+    # Scanner and ThinkTankCoverage, they re-run unconditionally on any
+    # branch-A rerun. SignalsEnvelope gets its own explicit warning below
+    # (mirrors Scanner's) since it OVERWRITES the live signals.json — more
+    # consequential than Scanner's/ThinkTankCoverage's observe-only writes.
     Stage(
         "regime_substrate", "skip_regime_substrate",
         "CheckSkipRegimeSubstrate", "RegimeSubstrate",
-        frozenset({"CheckSkipRegimeRetrospectiveEval"}),
+        frozenset({"SignalsEnvelope"}),
+    ),
+    Stage(
+        "rag_ingestion", "skip_rag_ingestion",
+        "CheckSkipRAGIngestion", "RAGIngestion",
+        frozenset({"ThinkTankCoverage"}),
     ),
     Stage(
         "regime_retrospective_eval", "skip_regime_retrospective_eval",
         "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
-        frozenset({"CheckSkipResearch"}),
-    ),
-    Stage(
-        "research", "skip_research",
-        "CheckSkipResearch", "Research",
         frozenset({"CheckSkipDataPhase2"}),
     ),
     Stage(
@@ -259,8 +265,11 @@ STAGES: tuple[Stage, ...] = (
 
 STAGES_BY_NAME = {s.name: s for s in STAGES}
 BRANCH_A_STAGES = frozenset({
+    # alpha-engine-config-I2515 Phase B: "research" removed (the
+    # multi-agent Research state — and its skip_research flag /
+    # CheckSkipResearch gate — no longer exists).
     "rag_ingestion", "regime_substrate", "regime_retrospective_eval",
-    "research", "data_phase2", "eval_judge", "rationale_clustering",
+    "data_phase2", "eval_judge", "rationale_clustering",
     "replay_concordance", "counterfactual", "aggregate_costs",
 })
 # Stages whose gate is only reachable THROUGH CheckSkipBacktester's run path
@@ -437,6 +446,15 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
         "Scanner (branch A's StartAt) has no skip gate and re-executes on "
         "EVERY rerun regardless of flags; it is fail-soft/observe-only by "
         "SF design (Phase 2 observe contract)."
+    )
+    plan.warnings.append(
+        "SignalsEnvelope and ChallengerShadow (alpha-engine-config-I2515 "
+        "Phase B) have no skip gate and re-execute on EVERY branch-A "
+        "rerun regardless of flags. SignalsEnvelope OVERWRITES the live "
+        "signals.json at the same S3 key for run_date — idempotent given "
+        "unchanged board/regime state, but re-runs the load-bearing "
+        "producer every time. ChallengerShadow is observe-only (no_agent "
+        "leaderboard shadow feed)."
     )
 
     orig_role = original_input.get("pipeline_role")

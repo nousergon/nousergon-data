@@ -289,10 +289,14 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
 @pytest.mark.parametrize(
     ("choice", "partial_input", "expected_route"),
     [
-        # THE issue drill: research Lambda returns {} — must route into the
-        # Extract*Error normalizer (→ …→ HandleFailure), never States.Runtime.
-        ("CheckResearchStatus", {"research_result": {"Payload": {}}},
-         "ExtractResearchError"),
+        # NOTE: the pre-existing "research Lambda returns {}" drill against
+        # CheckResearchStatus was retired here — alpha-engine-config-I2515
+        # Phase B removed the multi-agent Research state (and
+        # CheckResearchStatus) entirely. SignalsEnvelope, its load-bearing
+        # replacement, detects failure via a plain Task Catch (which always
+        # populates $.error deterministically) rather than a payload-status
+        # Choice, so this specific {} ambiguity class no longer applies to
+        # Branch A's producer.
         ("WeeklyRunDayGateChoice", {"weekly_run_day_gate": {"Payload": {}}},
          "WeeklyRunDayGateMalformed"),
         ("LibPinDriftGate", {"libpin_drift_result": {"Payload": {}}},
@@ -304,9 +308,6 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},
          "EvalRollingMean"),  # malformed poll payload — fail-soft, no Wait loop
         # Healthy-path sanity: the guards must not change live semantics.
-        ("CheckResearchStatus",
-         {"research_result": {"Payload": {"status": "OK"}}},
-         "CheckSkipDataPhase2"),
         ("WeeklyRunDayGateChoice",
          {"weekly_run_day_gate": {"Payload": {"is_weekly_run_day": False}}},
          "WeeklyRunDaySkip"),
@@ -323,9 +324,10 @@ def test_partial_payload_routes_to_explicit_path(choice, partial_input, expected
     assert _choice_target(definition, choice, partial_input) == expected_route
 
 
-def test_research_error_route_reaches_handle_failure():
-    """The {} drill's full promise: ExtractResearchError marks branch A
-    failed; CheckBranchOutcomes routes a failed branch into
+def test_branch_a_failed_route_reaches_handle_failure():
+    """A FAILED Branch A (e.g. via ExtractSignalsEnvelopeError, config-
+    I2515 Phase B's renamed successor to the retired ExtractResearchError)
+    marks branch A failed; CheckBranchOutcomes routes a failed branch into
     ExtractParallelBranchError, whose Next-chain lands on HandleFailure via
     the NormalizeFailureContext chokepoint (config#1819)."""
     definition = _load()
