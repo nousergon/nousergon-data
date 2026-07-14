@@ -119,10 +119,6 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.97.0",
         "telegram alert shape for CI-watch (config#2106)",
     ),
-    "usage-pace-alert": (
-        "v0.83.0",
-        "flow-doctor forum-topic routing + weekly-pace math (config#2043)",
-    ),
 }
 
 
