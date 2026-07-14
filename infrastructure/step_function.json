@@ -927,7 +927,7 @@
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-150 coverage gaps (new theses for uncovered names + stalest refresh) — the entire rank_ceiling universe, in one weekly run (2026-07-14 cadence split: the non-Saturday EventBridge 'maintenance' run no longer does intake at all, since the universe board this state's Scanner predecessor produces is itself Saturday-only; this state is now the SOLE coverage-growth/refresh owner). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
+              "Comment": "Think Tank observe-mode coverage fill (alpha-engine-config-I2467). Invokes the thinktank Lambda in sf_cover mode to fill top-150 coverage gaps (new theses for uncovered names + stalest refresh) — the entire rank_ceiling universe, in one weekly run. 2026-07-14 cadence consolidation: this is now the ONLY invocation path for the thinktank Lambda — the standalone EventBridge schedule is retired entirely (sf_cover mode's run_daily() already does theme reconciliation + a full events sweep over every covered name unconditionally, so a separate weekday invocation was pure duplicated work; the universe board this state's Scanner predecessor produces is itself Saturday-only, so a weekday intake pass never had new ranking data to act on). A full 150-name run can approach the 900s Lambda ceiling (observed 525-880s at only ~60 covered names, 2026-07-14 live-verify) — the States.Timeout/Lambda.Unknown retry below mirrors the sibling Research state's timeout bridge (no headroom lever left on Lambda at 900s; worst case on a retried run is a duplicate thesis version, never a silent skip, per thinktank_handler.py's documented failure contract — safe because the coverage ledger only persists once at the end of a run, so a mid-run timeout never partially commits). Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-thinktank:live",
@@ -945,6 +945,15 @@
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException",
                     "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                },
+                {
+                  "ErrorEquals": [
+                    "States.Timeout",
+                    "Lambda.Unknown"
                   ],
                   "MaxAttempts": 1,
                   "IntervalSeconds": 60,
