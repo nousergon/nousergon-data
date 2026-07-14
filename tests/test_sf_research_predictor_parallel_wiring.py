@@ -239,14 +239,19 @@ class TestBranchAContents:
         assert name in branch_a
 
     def test_data_phase2_after_research_in_branch_a(self, branch_a):
-        # Research success → CheckSkipDataPhase2 → DataPhase2
-        # config#2275: rules are And:[{IsPresent}, {StringEquals}] guarded.
+        # Research success → ThinkTankCoverage → CheckSkipDataPhase2 →
+        # DataPhase2. config#1042 / alpha-engine-config#2511 (2026-07-14):
+        # ThinkTankCoverage moved downstream of Research so its gap_fill
+        # coverage measures against the FRESH universe/latest.json board
+        # Research just wrote, not last week's. config#2275: rules are
+        # And:[{IsPresent}, {StringEquals}] guarded.
         ok = [
             c["Next"]
             for c in branch_a["CheckResearchStatus"]["Choices"]
             if any(leaf.get("StringEquals") == "OK" for leaf in c.get("And", []))
         ]
-        assert ok == ["CheckSkipDataPhase2"]
+        assert ok == ["ThinkTankCoverage"]
+        assert branch_a["ThinkTankCoverage"]["Next"] == "CheckSkipDataPhase2"
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
 
     def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
@@ -840,7 +845,12 @@ class TestInboundRewireAndDownstreamUnchanged:
         (and its skip-gate + non-blocking Catch) continue to
         CheckSkipResearch IN-BRANCH — never the parent Parallel (invalid
         branch→parent) nor top-level HandleFailure (cross-branch cancel)."""
-        assert branch_a["Scanner"]["Next"] == "ThinkTankCoverage"
+        # config#1042 / alpha-engine-config#2511 (2026-07-14): ThinkTankCoverage
+        # moved downstream of Research (see
+        # test_data_phase2_after_research_in_branch_a below), so Scanner's
+        # success path now goes straight to CheckSkipRAGIngestion —
+        # matching its Catch target exactly.
+        assert branch_a["Scanner"]["Next"] == "CheckSkipRAGIngestion"
         assert (
             branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
         )

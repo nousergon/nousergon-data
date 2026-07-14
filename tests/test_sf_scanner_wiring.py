@@ -17,6 +17,12 @@ Pin the chain between DataPhase1 and CheckSkipRAGIngestion:
     CheckDataPhase1Status.Success ──┘    │
                                          └─(Catch)──→ CheckSkipRAGIngestion
 
+Scanner's normal Next and its Catch target now converge on
+CheckSkipRAGIngestion directly (config#1042 / alpha-engine-config#2511,
+2026-07-14): ThinkTankCoverage moved downstream of Research so its
+gap_fill coverage measures against the FRESH scanner/universe/latest.json
+board Research is about to write, not last week's.
+
 Scanner failure must NOT halt the pipeline (Research Lambda's internal
 scanner still produces the load-bearing universe today; the standalone
 artifact is parallel-observe and consumer-less until Phase 4).
@@ -171,8 +177,11 @@ class TestEdges:
         par = sf["States"]["ResearchPredictorParallel"]
         assert par["Branches"][0]["StartAt"] == "Scanner"
 
-    def test_scanner_success_routes_to_thinktank_coverage(self, states):
-        assert states["Scanner"]["Next"] == "ThinkTankCoverage"
+    def test_scanner_success_routes_to_check_skip_rag_ingestion(self, states):
+        # config#1042 / alpha-engine-config#2511 (2026-07-14): ThinkTankCoverage
+        # moved downstream of Research, so Scanner's success path now goes
+        # straight to CheckSkipRAGIngestion — matching its Catch target exactly.
+        assert states["Scanner"]["Next"] == "CheckSkipRAGIngestion"
 
 
 # ── Result paths (state-merge contract) ───────────────────────────────────

@@ -917,17 +917,17 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Phase 2 observe-only contract — scanner failure must NOT halt the pipeline. Research Lambda's internal scanner still runs in parallel and provides the load-bearing scanner output downstream; this artifact is parallel-observe and consumer-less today (Phase 4 will flip RAG to read it). Routes forward to CheckSkipRAGIngestion so the pipeline continues exactly as it would on flag=false.",
+                  "Comment": "Phase 2 observe-only contract — scanner failure must NOT halt the pipeline. Research Lambda's internal scanner still runs in parallel and provides the load-bearing scanner output downstream; this artifact is parallel-observe and consumer-less today (Phase 4 will flip RAG to read it). Routes forward to CheckSkipRAGIngestion so the pipeline continues exactly as it would on flag=false — this now matches the normal (non-Catch) path exactly, since ThinkTankCoverage moved downstream of Research (config#1042/alpha-engine-config#2511) so its gap_fill coverage runs against the FRESH universe/latest.json Research is about to write, not last week's.",
                   "Next": "CheckSkipRAGIngestion",
                   "ResultPath": "$.scanner_error"
                 }
               ],
               "ResultPath": "$.scanner_result",
-              "Next": "ThinkTankCoverage"
+              "Next": "CheckSkipRAGIngestion"
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage top-up (alpha-engine-config-I2467). 2026-07-14 cadence design: the daily EventBridge cadence (alpha-research-thinktank-daily) is the primary coverage-growth mechanism (5/day toward the full rank_ceiling=150 universe, handling staleness refresh gradually) and stays unchanged. This state's job is a narrower, reactive top-up — mode=gap_fill shores up whatever of the CURRENT top-60 the daily cadence hasn't caught up to yet by the time the fresh weekly scan lands, sized to the EXACT measured coverage_gap.uncovered_count (never a fixed constant, never padded with stale-refill — see crucible-research thinktank/run.py's gap_fill_only). Small and bounded by construction, so no sf_cover_target/sf_cover_ceiling numbers to keep in sync across repos. Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step. The Retry below (States.Timeout/Lambda.Unknown, mirroring the sibling Research state's bridge) stays as cheap defense-in-depth even though the gap-fill workload is now small.",
+              "Comment": "Think Tank observe-mode coverage top-up (alpha-engine-config-I2467). 2026-07-14 cadence design: the daily EventBridge cadence (alpha-research-thinktank-daily) is the primary coverage-growth mechanism (5/day toward the full rank_ceiling=150 universe, handling staleness refresh gradually) and stays unchanged. This state's job is a narrower, reactive top-up — mode=gap_fill shores up whatever of the CURRENT top-60 the daily cadence hasn't caught up to yet by the time the fresh weekly scan lands, sized to the EXACT measured coverage_gap.uncovered_count (never a fixed constant, never padded with stale-refill — see crucible-research thinktank/run.py's gap_fill_only). Small and bounded by construction, so no sf_cover_target/sf_cover_ceiling numbers to keep in sync across repos. Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step. The Retry below (States.Timeout/Lambda.Unknown, mirroring the sibling Research state's bridge) stays as cheap defense-in-depth even though the gap-fill workload is now small. Runs AFTER CheckResearchStatus resolves (config#1042/alpha-engine-config#2511, fixed 2026-07-14): previously this ran before Research and computed gap_fill against LAST week's scanner/universe/latest.json board — the archive_writer only refreshes that board as part of the Research state it now follows, so coverage is measured against the fresh board Research just wrote, on both the OK and SKIPPED research outcomes (this state stays non-blocking either way).",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-thinktank:live",
@@ -961,13 +961,13 @@
               "Catch": [
                 {
                   "ErrorEquals": ["States.ALL"],
-                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion.",
-                  "Next": "CheckSkipRAGIngestion",
+                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipDataPhase2.",
+                  "Next": "CheckSkipDataPhase2",
                   "ResultPath": "$.thinktank_error"
                 }
               ],
               "ResultPath": "$.thinktank_result",
-              "Next": "CheckSkipRAGIngestion"
+              "Next": "CheckSkipDataPhase2"
             },
             "CheckSkipRAGIngestion": {
               "Type": "Choice",
@@ -1340,7 +1340,7 @@
                       "StringEquals": "OK"
                     }
                   ],
-                  "Next": "CheckSkipDataPhase2"
+                  "Next": "ThinkTankCoverage"
                 },
                 {
                   "And": [
@@ -1354,7 +1354,7 @@
                     }
                   ],
                   "Comment": "config#2275: both rules IsPresent-guarded so a research Lambda returning a payload WITHOUT status (e.g. {}) falls to Default=ExtractResearchError -> HandleFailure with real context, instead of throwing a bare States.Runtime that bypasses the whole failure chain (the 2026-07-03 incident class).",
-                  "Next": "CheckSkipDataPhase2"
+                  "Next": "ThinkTankCoverage"
                 }
               ],
               "Default": "ExtractResearchError"

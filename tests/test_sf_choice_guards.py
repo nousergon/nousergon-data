@@ -304,9 +304,12 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},
          "EvalRollingMean"),  # malformed poll payload — fail-soft, no Wait loop
         # Healthy-path sanity: the guards must not change live semantics.
+        # config#1042 / alpha-engine-config#2511 (2026-07-14): ThinkTankCoverage
+        # moved downstream of Research, so the OK route is now ThinkTankCoverage
+        # (which itself falls through to CheckSkipDataPhase2 afterward).
         ("CheckResearchStatus",
          {"research_result": {"Payload": {"status": "OK"}}},
-         "CheckSkipDataPhase2"),
+         "ThinkTankCoverage"),
         ("WeeklyRunDayGateChoice",
          {"weekly_run_day_gate": {"Payload": {"is_weekly_run_day": False}}},
          "WeeklyRunDaySkip"),
