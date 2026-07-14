@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily installed-vs-repo systemd unit drift check — once a day (config#2352)
+Requires=systemd-unit-drift-check.service
+
+[Timer]
+Unit=systemd-unit-drift-check.service
+# Once daily is enough to satisfy the issue's "pages within a day"
+# acceptance bar for a deliberate on-box unit edit, without adding
+# meaningful load. Offset from the top of the hour to avoid piling onto
+# other :00 timers on the same box.
+OnCalendar=*-*-* 06:17:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
