@@ -4,6 +4,11 @@ pyarrow>=14.0
 yfinance>=0.2.36
 requests>=2.31
 pyyaml>=6.0
+# setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
+# started failing 2026-07-14 against the default 79.0.1 bundled by the
+# GH Actions Python 3.11 image). Not a build-backend requirement here — direct
+# pin exists solely to satisfy the security-audit gate.
+setuptools>=83.0.0
 # Bitcoin HD-wallet (xpub/ypub/zpub) derivation for the crypto-balances producer
 # (collectors/crypto_balances.py). Pure-Python-capable (ships a prebuilt linux libsecp256k1
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
