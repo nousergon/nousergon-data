@@ -804,7 +804,16 @@
           "Next": "CheckSkipCaptureSnapshot"
         }
       ],
-      "Default": "LaunchPostMarketDataSpot"
+      "Default": "InitDataSpotRetryCounter"
+    },
+    "InitDataSpotRetryCounter": {
+      "Type": "Pass",
+      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload — e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling.",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.data_spot_retry",
+      "Next": "LaunchPostMarketDataSpot"
     },
     "LaunchPostMarketDataSpot": {
       "Type": "Task",
@@ -901,12 +910,12 @@
     },
     "CheckPostMarketDataSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open: an EOD data failure must not block reconcile + instance-stop, config#1767 #4). Inverse of the OLD on-trading CheckPostMarketStatus which HandleFailure'd.",
+      "Comment": "Success -> the Arctic append spot workload retry-counter init; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotRetryBudget (one relaunch retry before the existing fail-open path). Inverse of the OLD on-trading CheckPostMarketStatus which HandleFailure'd.",
       "Choices": [
         {
           "Variable": "$.postmarket_poll.Status",
           "StringEquals": "Success",
-          "Next": "LaunchPostMarketArcticAppendSpot"
+          "Next": "InitDataSpotArcticRetryCounter"
         },
         {
           "Variable": "$.postmarket_poll.Status",
@@ -924,12 +933,41 @@
           "Next": "PostMarketDataSpotWait"
         }
       ],
+      "Default": "CheckDataSpotRetryBudget"
+    },
+    "CheckDataSpotRetryBudget": {
+      "Type": "Choice",
+      "Comment": "A terminal non-Success status on the post-market-data spot poll (Failed/Cancelled/TimedOut/the SSM Undeliverable class an already-reclaimed spot instance produces) is presumed transient AWS spot interruption until proven otherwise — retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption is no longer 'transient blip' territory and falls through to the existing fail-open path rather than looping indefinitely. $.data_spot_retry is always initialized by InitDataSpotRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementDataSpotRetry"
+        }
+      ],
       "Default": "ExtractDataSpotError"
+    },
+    "IncrementDataSpotRetry": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.data_spot_retry.attempts, 1)"
+      },
+      "ResultPath": "$.data_spot_retry",
+      "Next": "LaunchPostMarketDataSpot"
     },
     "PostMarketDataSpotWait": {
       "Type": "Wait",
       "Seconds": 15,
       "Next": "PollPostMarketDataSpot"
+    },
+    "InitDataSpotArcticRetryCounter": {
+      "Type": "Pass",
+      "Comment": "Retry budget for the Arctic-append sub-phase — the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter.",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.data_spot_arctic_retry",
+      "Next": "LaunchPostMarketArcticAppendSpot"
     },
     "LaunchPostMarketArcticAppendSpot": {
       "Type": "Task",
@@ -1026,7 +1064,7 @@
     },
     "CheckPostMarketArcticAppendSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open).",
+      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotArcticRetryBudget (one relaunch retry before the existing fail-open path).",
       "Choices": [
         {
           "Variable": "$.postmarket_arctic_poll.Status",
@@ -1049,7 +1087,27 @@
           "Next": "PostMarketArcticAppendSpotWait"
         }
       ],
+      "Default": "CheckDataSpotArcticRetryBudget"
+    },
+    "CheckDataSpotArcticRetryBudget": {
+      "Type": "Choice",
+      "Comment": "Same one-retry-then-give-up policy as CheckDataSpotRetryBudget, applied to the Arctic-append sub-phase. $.data_spot_arctic_retry is always initialized by InitDataSpotArcticRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot_arctic_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementDataSpotArcticRetry"
+        }
+      ],
       "Default": "ExtractDataSpotError"
+    },
+    "IncrementDataSpotArcticRetry": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.data_spot_arctic_retry.attempts, 1)"
+      },
+      "ResultPath": "$.data_spot_arctic_retry",
+      "Next": "LaunchPostMarketArcticAppendSpot"
     },
     "PostMarketArcticAppendSpotWait": {
       "Type": "Wait",
@@ -1117,7 +1175,7 @@
     },
     "CheckSkipEODReconcile": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work. EXTENDED 2026-07-14: a $.data_spot_error present at this point means the post-market data-spot phase failed even after its retry budget (CheckDataSpotRetryBudget / CheckDataSpotArcticRetryBudget) was exhausted — today's SPY/OHLCV close was never written to ArcticDB, so eod_reconcile.py's _spy_close hard-fail (by design, no fallback — see executor/eod_reconcile.py in alpha-engine) is GUARANTEED, not merely possible. Route to SkipEODReconcileDataGap instead of letting that guaranteed crash fall through HandleFailure -> FailExecution, which mislabels a known, retry-exhausted, self-healing data gap as a pipeline defect (root-caused 2026-07-14: AWS spot reclaim mid-job, Server.SpotInstanceTermination, previously paged as a misleading generic 'EOD Pipeline — FAILED').",
       "Choices": [
         {
           "And": [
@@ -1139,9 +1197,36 @@
             }
           ],
           "Next": "CheckSkipDailySubstrateHealthCheck"
+        },
+        {
+          "Variable": "$.data_spot_error",
+          "IsPresent": true,
+          "Next": "SkipEODReconcileDataGap"
         }
       ],
       "Default": "EODReconcile"
+    },
+    "SkipEODReconcileDataGap": {
+      "Type": "Task",
+      "Comment": "Loud, distinctly-labeled alert for a known/self-healing condition — NOT a silent swallow (feedback_no_silent_fails): the data-spot phase exhausted its retry budget, so today's SPY close is genuinely absent from ArcticDB and EODReconcile is skipped rather than left to crash into the generic HandleFailure/FailExecution path. Recovery is expected to be automatic/operator-driven: alpha-engine-data's chronic-gap-heal backfills the missing daily bar on its next run, after which an operator-replay execution with skip_post_market_data=true reruns EODReconcile alone.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile SKIPPED (data gap, self-healing)",
+        "Message.$": "States.Format('EOD reconcile SKIPPED for {}: post-market data-spot phase failed after its retry budget was exhausted (most likely an AWS spot interruption) — no NAV/alpha row will be written today. Detail: {}. Chronic-gap-heal will backfill the missing ArcticDB close; then rerun EODReconcile via an operator-replay execution with skip_post_market_data=true.', $.run_date, States.JsonToString($.data_spot_error))"
+      },
+      "ResultPath": "$.eod_skip_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Defense-in-depth, mirrors HandleFailure's own Catch: an SNS-side failure must not block the substrate check + instance-stop cost-guard.",
+          "ResultPath": null,
+          "Next": "CheckSkipDailySubstrateHealthCheck"
+        }
+      ],
+      "Next": "CheckSkipDailySubstrateHealthCheck"
     },
     "CheckSkipDailySubstrateHealthCheck": {
       "Type": "Choice",
