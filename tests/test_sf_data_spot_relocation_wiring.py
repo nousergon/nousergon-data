@@ -224,6 +224,9 @@ class TestEODSpotStatesPresent:
         assert st["Parameters"]["Payload"]["workload"] in {
             "post-market-data", "post-market-arctic-append"
         }
+        # 2026-07-14: force_on_demand.$ threads the retry-budget's on-demand
+        # override into the dispatcher (see TestEODDataSpotRetryBudget).
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, eod, name):
@@ -280,8 +283,14 @@ class TestEODFailureIsolation:
                 assert c["Next"] not in _HALT
 
     def test_status_default_is_fail_open_not_handlefailure(self, eod):
-        for name in ("CheckPostMarketDataSpotStatus", "CheckPostMarketArcticAppendSpotStatus"):
-            assert eod[name]["Default"] == "ExtractDataSpotError"
+        # 2026-07-14 (root cause: AWS spot reclaim mid-job, Server.SpotInstanceTermination):
+        # a terminal non-Success poll status now routes through a one-shot
+        # retry-budget Choice BEFORE falling through to the fail-open
+        # ExtractDataSpotError normalizer — see TestEODDataSpotRetryBudget.
+        assert eod["CheckPostMarketDataSpotStatus"]["Default"] == "CheckDataSpotRetryBudget"
+        assert eod["CheckPostMarketArcticAppendSpotStatus"]["Default"] == "CheckDataSpotArcticRetryBudget"
+        assert eod["CheckDataSpotRetryBudget"]["Default"] == "ExtractDataSpotError"
+        assert eod["CheckDataSpotArcticRetryBudget"]["Default"] == "ExtractDataSpotError"
 
     def test_error_normalizer_continues_to_reconcile_path(self, eod):
         assert eod["ExtractDataSpotError"]["Next"] == "PublishDataSpotFailureImmediate"
@@ -295,9 +304,12 @@ class TestEODFailureIsolation:
         data_states = [
             "LaunchPostMarketDataSpot", "CheckPostMarketDataSpotLaunched",
             "PollPostMarketDataSpot", "CheckPostMarketDataSpotStatus", "PostMarketDataSpotWait",
+            "CheckDataSpotRetryBudget", "IncrementDataSpotRetry",
+            "InitDataSpotArcticRetryCounter",
             "LaunchPostMarketArcticAppendSpot", "CheckPostMarketArcticAppendSpotLaunched",
             "PollPostMarketArcticAppendSpot", "CheckPostMarketArcticAppendSpotStatus",
             "PostMarketArcticAppendSpotWait",
+            "CheckDataSpotArcticRetryBudget", "IncrementDataSpotArcticRetry",
             "ExtractDataSpotError", "PublishDataSpotFailureImmediate",
         ]
         for name in data_states:
@@ -311,6 +323,123 @@ class TestEODFailureIsolation:
         assert eod["CheckSkipPostMarketData"]["Choices"][0]["Next"] == self._CONTINUE
         for gate in ("CheckPostMarketDataSpotLaunched", "CheckPostMarketArcticAppendSpotLaunched"):
             assert eod[gate]["Default"] == self._CONTINUE
+
+
+class TestEODDataSpotRetryBudget:
+    """2026-07-14 incident fix: a spot-reclaimed data-spot workload (AWS
+    Server.SpotInstanceTermination — first observed 2026-07-14, ~22min into a
+    post-market-data run) gets ONE relaunch-on-a-fresh-box retry before the
+    pipeline accepts the failure and falls through to the pre-existing
+    fail-open path. Bounded, not unbounded — a second consecutive
+    interruption still falls through, so this can never loop indefinitely."""
+
+    def test_retry_counters_initialized_before_first_launch(self, eod):
+        assert eod["CheckSkipPostMarketData"]["Default"] == "InitDataSpotRetryCounter"
+        assert eod["InitDataSpotRetryCounter"]["Type"] == "Pass"
+        assert eod["InitDataSpotRetryCounter"]["ResultPath"] == "$.data_spot_retry"
+        assert eod["InitDataSpotRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
+        assert eod["InitDataSpotRetryCounter"]["Next"] == "LaunchPostMarketDataSpot"
+
+        assert eod["CheckPostMarketDataSpotStatus"]["Choices"][0]["Next"] == "InitDataSpotArcticRetryCounter"
+        assert eod["InitDataSpotArcticRetryCounter"]["Type"] == "Pass"
+        assert eod["InitDataSpotArcticRetryCounter"]["ResultPath"] == "$.data_spot_arctic_retry"
+        assert eod["InitDataSpotArcticRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
+        assert eod["InitDataSpotArcticRetryCounter"]["Next"] == "LaunchPostMarketArcticAppendSpot"
+
+    @pytest.mark.parametrize(
+        "launch_state,counter_field",
+        [
+            ("LaunchPostMarketDataSpot", "data_spot_retry"),
+            ("LaunchPostMarketArcticAppendSpot", "data_spot_arctic_retry"),
+        ],
+    )
+    def test_launch_threads_force_on_demand_from_retry_counter(self, eod, launch_state, counter_field):
+        payload = eod[launch_state]["Parameters"]["Payload"]
+        assert payload["force_on_demand.$"] == f"$.{counter_field}.force_on_demand"
+
+    @pytest.mark.parametrize(
+        "budget_state,counter_field,increment_state,relaunch_state",
+        [
+            ("CheckDataSpotRetryBudget", "$.data_spot_retry.attempts",
+             "IncrementDataSpotRetry", "LaunchPostMarketDataSpot"),
+            ("CheckDataSpotArcticRetryBudget", "$.data_spot_arctic_retry.attempts",
+             "IncrementDataSpotArcticRetry", "LaunchPostMarketArcticAppendSpot"),
+        ],
+    )
+    def test_one_retry_then_give_up(
+        self, eod, budget_state, counter_field, increment_state, relaunch_state
+    ):
+        st = eod[budget_state]
+        assert st["Type"] == "Choice"
+        assert len(st["Choices"]) == 1
+        cond = st["Choices"][0]
+        assert cond["Variable"] == counter_field
+        assert cond["NumericLessThan"] == 1
+        assert cond["Next"] == increment_state
+        # Retry budget exhausted -> the pre-existing fail-open path, never a HALT.
+        assert st["Default"] == "ExtractDataSpotError"
+
+        inc = eod[increment_state]
+        assert inc["Type"] == "Pass"
+        assert inc["ResultPath"] == counter_field.rsplit(".", 1)[0]
+        assert inc["Parameters"]["attempts.$"] == f"States.MathAdd({counter_field}, 1)"
+        # The one retry must never gamble on spot a second time.
+        assert inc["Parameters"]["force_on_demand"] is True
+        # The retry relaunches on a FRESH box — same launch state, not a
+        # separate "retry launch" — a plain Lambda invoke each time.
+        assert inc["Next"] == relaunch_state
+
+
+class TestEODReconcileSkippedOnDataGap:
+    """2026-07-14 incident fix, part 2: even with the retry budget above, the
+    data-spot phase can still end in $.data_spot_error (retry exhausted). That
+    condition GUARANTEES eod_reconcile.py's _spy_close hard-fail (no fallback
+    by design — today's SPY close was never written to ArcticDB), so
+    CheckSkipEODReconcile must route around EODReconcile entirely instead of
+    letting a guaranteed crash fall through to the generic HandleFailure ->
+    FailExecution path (which mislabels a known, self-healing data gap as a
+    pipeline defect — the false 'EOD Pipeline — FAILED' page from 2026-07-14)."""
+
+    def test_data_gap_branch_precedes_default(self, eod):
+        st = eod["CheckSkipEODReconcile"]
+        assert st["Type"] == "Choice"
+        gap_choices = [c for c in st["Choices"] if c.get("Variable") == "$.data_spot_error"]
+        assert len(gap_choices) == 1
+        assert gap_choices[0]["IsPresent"] is True
+        assert gap_choices[0]["Next"] == "SkipEODReconcileDataGap"
+        # The pre-existing operator-replay skip_eod_reconcile branch is untouched.
+        assert st["Default"] == "EODReconcile"
+
+    def test_skip_state_is_sns_publish_not_a_swallow(self, eod):
+        # feedback_no_silent_fails: a skip must still be LOUD — a distinct,
+        # accurately-worded SNS publish, not a bare Pass-through.
+        st = eod["SkipEODReconcileDataGap"]
+        assert st["Type"] == "Task"
+        assert st["Resource"] == "arn:aws:states:::sns:publish"
+        subject = st["Parameters"]["Subject"]
+        assert 0 < len(subject) <= 100
+        assert "\n" not in subject
+        assert "SKIPPED" in subject
+        assert "FAILED" not in subject, (
+            "must read as a known/self-healing skip, not the generic pipeline-"
+            "failed alert it replaces"
+        )
+        message_fmt = st["Parameters"]["Message.$"]
+        assert "States.JsonToString($.data_spot_error)" in message_fmt
+
+    def test_skip_state_never_reaches_a_halt(self, eod):
+        for tgt in _all_targets(eod["SkipEODReconcileDataGap"]):
+            assert tgt not in _HALT
+        assert eod["SkipEODReconcileDataGap"]["Next"] == "CheckSkipDailySubstrateHealthCheck"
+
+    def test_skip_states_own_sns_failure_still_continues(self, eod):
+        # Mirrors HandleFailure's defense-in-depth: an SNS-side failure here
+        # must not block the substrate check + instance-stop cost-guard.
+        catches = eod["SkipEODReconcileDataGap"].get("Catch", [])
+        assert any(
+            c["ErrorEquals"] == ["States.ALL"] and c["Next"] == "CheckSkipDailySubstrateHealthCheck"
+            for c in catches
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -489,6 +489,14 @@ class TestEODSFTopLevelFieldsClosed:
             "postmarket_arctic_launch",
             "data_spot_error",
             "data_spot_failure_notify",
+            # 2026-07-14 incident fix: bounded (1x) relaunch-on-a-fresh-box
+            # retry for a spot-reclaimed data-spot workload, plus a distinct
+            # loud skip of EODReconcile when the retry is exhausted (today's
+            # SPY close genuinely never landed in ArcticDB, so eod_reconcile.py's
+            # _spy_close hard-fail would otherwise be guaranteed).
+            "data_spot_retry",
+            "data_spot_arctic_retry",
+            "eod_skip_notify",
             "snapshot_poll",
             "snapshot_result",
             "stop_result",
