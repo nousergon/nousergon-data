@@ -629,7 +629,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine ModelZoo Sunday Pipeline \u2014 FAILED",
-        "Message.$": "States.Format('ModelZoo Sunday Pipeline failed at the SF-engine level (this is a backstop path \u2014 the rotation'\\''s own stages are individually best-effort by design). Error: {}. Full-day retry headroom exists before Monday 12:45 UTC preopen (Brian'\\''s 2026-07-14 trigger-time ruling). View pipeline status: https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
+        "Message.$": "States.Format('ModelZoo Sunday Pipeline failed at the SF-engine level (this is a backstop path \u2014 the rotation stages are individually best-effort by design). Error: {}. Full-day retry headroom exists before Monday 12:45 UTC preopen (trigger-time ruling 2026-07-14). View pipeline status: https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "ModelZooFailExecution"

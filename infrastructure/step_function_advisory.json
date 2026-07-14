@@ -758,7 +758,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Advisory Pipeline \u2014 FAILED",
-        "Message.$": "States.Format('Weekly Advisory Pipeline (eval-judge chain / ReportCard / Director) failed at the SF-engine level (this is a backstop path \u2014 the advisory chain'\\''s own stages are individually non-fatal by design). Error: {}. This pipeline was started fire-and-forget by the main Saturday SF and does NOT block trading-critical artifacts. View pipeline status: https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
+        "Message.$": "States.Format('Weekly Advisory Pipeline (eval-judge chain / ReportCard / Director) failed at the SF-engine level (this is a backstop path \u2014 the advisory stages are individually non-fatal by design). Error: {}. This pipeline was started fire-and-forget by the main Saturday SF and does NOT block trading-critical artifacts. View pipeline status: https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "AdvisoryFailExecution"
