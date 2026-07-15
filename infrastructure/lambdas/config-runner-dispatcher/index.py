@@ -597,8 +597,15 @@ def _reconcile() -> dict:
         logger.error("reconcile: failed to list queued runs: %s: %s", type(exc).__name__, exc)
         return {"reconciled": 0, "reason": "list_runs_failed", "error": str(exc)}
 
-    dispatched = []
-    skipped = []
+    # Collect ALL stale queued jobs first, then dispatch OLDEST-FIRST.
+    # GitHub lists runs newest-first; dispatching in listing order let a
+    # constant churn of fresh runs (e.g. the 2026-07-15 Dependabot-drain
+    # rebase wave) win every quota-constrained launch race while the oldest
+    # job starved indefinitely (PR2690's pytest sat queued 95+ min while
+    # newer jobs got every available spot slot). FIFO makes quota pressure
+    # degrade to bounded latency for everyone instead of unbounded latency
+    # for the unluckiest.
+    stale_jobs: list[tuple[float, str]] = []
     for run in runs_resp.get("workflow_runs", []):
         try:
             jobs_resp = _gh_api_get(
@@ -615,18 +622,22 @@ def _reconcile() -> dict:
             age_seconds = (now - created_at).total_seconds()
             if age_seconds < RECONCILE_STALE_SECONDS:
                 continue  # still within the reactive path's normal dispatch latency
-            job_id = str(job["id"])
-            try:
-                existing = _running_config_runner_instance_ids(job_id)
-            except SpotProbeError:
-                existing = []  # degrade to "dispatch anyway" — the launch's own dedup/tag logic is authoritative
-            if existing:
-                skipped.append(job_id)
-                continue
-            logger.info("reconcile: job %s queued %.0fs with no in-flight box — dispatching",
-                       job_id, age_seconds)
-            dispatched.append({"job_id": job_id, "age_seconds": age_seconds,
-                               "result": _launch_config_runner_spot(job_id)})
+            stale_jobs.append((age_seconds, str(job["id"])))
+
+    dispatched = []
+    skipped = []
+    for age_seconds, job_id in sorted(stale_jobs, reverse=True):  # oldest first
+        try:
+            existing = _running_config_runner_instance_ids(job_id)
+        except SpotProbeError:
+            existing = []  # degrade to "dispatch anyway" — the launch's own dedup/tag logic is authoritative
+        if existing:
+            skipped.append(job_id)
+            continue
+        logger.info("reconcile: job %s queued %.0fs with no in-flight box — dispatching",
+                   job_id, age_seconds)
+        dispatched.append({"job_id": job_id, "age_seconds": age_seconds,
+                           "result": _launch_config_runner_spot(job_id)})
 
     logger.info("reconcile: dispatched=%d skipped=%d bootstrap_and_reap=%s",
                 len(dispatched), len(skipped), br_stats)
