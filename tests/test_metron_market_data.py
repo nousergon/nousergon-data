@@ -9,7 +9,7 @@ the dry-run no-write path, and the fail-soft empty-universe skip.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -293,7 +293,10 @@ class TestCloseHistoryPriceCacheSource:
         import yfinance as yf
         monkeypatch.setattr(yf, "download", _fail_download)
 
-        source = mmd._price_cache_close_history(s3, "b", period="10y")
+        # reference_day == the cached snapshot's latest bar → 0 trading days stale, well
+        # within PRICE_CACHE_MAX_STALE_TRADING_DAYS, so this exercises the coverage logic
+        # in isolation from the staleness fallback (covered by TestPriceCacheStaleness below).
+        source = mmd._price_cache_close_history(s3, "b", period="10y", reference_day=date(2026, 6, 11))
         out = source(["AAPL"])
         assert out["AAPL"] == [("2026-06-10", 200.0), ("2026-06-11", 201.5)]
 
@@ -364,6 +367,89 @@ class TestCloseHistoryPriceCacheSource:
         result = mmd.collect_history(bucket="b", s3_client=s3, fx_history_source=lambda c: {})
         assert result["status"] == "ok"
         assert result["close_series"] > 0
+
+
+class TestPriceCacheStaleness(TestCloseHistoryPriceCacheSource):
+    """config#1865-followup (Brian ruling, 2026-07-15 triage): price_cache only refreshes
+    weekly, so "parquet exists" alone is not "current" — the CRWD regression this closes
+    was a 4-trading-day-stale cached snapshot missing a +12.58% earnings move, producing a
+    -19.9pp security_performance diff unrelated to the dividend-adjustment basis change.
+    A cached bar more than PRICE_CACHE_MAX_STALE_TRADING_DAYS trading days behind
+    reference_day must be treated as NOT covered and routed to the yfinance gap-fill —
+    same fallback path as genuine no-coverage. Inherits ``_parquet_bytes``/``_price_cache_s3``
+    from TestCloseHistoryPriceCacheSource."""
+
+    # 2026-06-08 (Mon), 06-09 (Tue), 06-10 (Wed) are consecutive NYSE trading days.
+    _STALE_BAR_DATE = "2026-06-08"
+    _REFERENCE_2_SESSIONS_LATER = date(2026, 6, 10)  # 2 trading days after the cached bar
+    _REFERENCE_1_SESSION_LATER = date(2026, 6, 9)  # 1 trading day after the cached bar
+
+    def test_stale_price_cache_snapshot_falls_back_to_yfinance(self, monkeypatch):
+        # CRWD-class regression: price_cache has AAPL, but its latest bar is 2 trading
+        # days behind reference_day — beyond PRICE_CACHE_MAX_STALE_TRADING_DAYS(=1) — so
+        # it must be treated as uncovered and gap-filled fresh from yfinance rather than
+        # silently publishing the stale cached close.
+        s3 = self._price_cache_s3({
+            "AAPL": self._parquet_bytes({self._STALE_BAR_DATE: 150.0}),
+        })
+
+        def _fake_download(*_a, **kw):
+            import pandas as pd
+            assert kw.get("auto_adjust") is True  # fallback keeps the dividend-adjusted basis
+            idx = pd.to_datetime([self._REFERENCE_2_SESSIONS_LATER.isoformat()])
+            return pd.DataFrame({"Close": [168.78]}, index=idx)  # e.g. a +12.58% earnings move
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "download", _fake_download)
+
+        source = mmd._price_cache_close_history(s3, "b", period="10y", reference_day=self._REFERENCE_2_SESSIONS_LATER)
+        out = source(["AAPL"])
+        assert out["AAPL"] == [(self._REFERENCE_2_SESSIONS_LATER.isoformat(), 168.78)]
+
+    def test_fresh_within_threshold_still_uses_price_cache(self, monkeypatch):
+        # 1 trading day behind reference_day is within PRICE_CACHE_MAX_STALE_TRADING_DAYS —
+        # must still use price_cache, not fall back (the threshold tolerates the ordinary
+        # weekly-refresh-timing lag, it isn't a same-day-only gate).
+        s3 = self._price_cache_s3({
+            "AAPL": self._parquet_bytes({self._STALE_BAR_DATE: 150.0}),
+        })
+
+        def _fail_download(*_a, **_kw):
+            raise AssertionError("yfinance must not be called — AAPL is within the staleness threshold")
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "download", _fail_download)
+
+        source = mmd._price_cache_close_history(s3, "b", period="10y", reference_day=self._REFERENCE_1_SESSION_LATER)
+        out = source(["AAPL"])
+        assert out["AAPL"] == [(self._STALE_BAR_DATE, 150.0)]
+
+    def test_price_cache_close_series_stale_returns_none_directly(self):
+        # Unit-level check on the primitive itself (independent of the _source composition
+        # layer above): a stale symbol's series call returns None, the exact signal
+        # _price_cache_close_history's gap-fill routing depends on.
+        s3 = self._price_cache_s3({
+            "AAPL": self._parquet_bytes({self._STALE_BAR_DATE: 150.0}),
+        })
+        result = mmd._price_cache_close_series(
+            s3, "b", "AAPL", "10y", reference_day=self._REFERENCE_2_SESSIONS_LATER,
+        )
+        assert result is None
+
+    def test_default_reference_day_uses_last_closed_trading_day(self, monkeypatch):
+        # No reference_day injected → must fall back to nousergon_lib.dates.last_closed_
+        # trading_day() (the fleet's canonical "as-of" date), never date.today() or a bare
+        # calendar-day comparison (root CLAUDE.md date-conventions rule). _price_cache_
+        # close_series does `from nousergon_lib.dates import last_closed_trading_day` at
+        # call time, so patching the nousergon_lib.dates module attribute is observed.
+        from nousergon_lib import dates as lib_dates
+        monkeypatch.setattr(lib_dates, "last_closed_trading_day", lambda *_a, **_kw: self._REFERENCE_2_SESSIONS_LATER)
+
+        s3 = self._price_cache_s3({
+            "AAPL": self._parquet_bytes({self._STALE_BAR_DATE: 150.0}),
+        })
+        result = mmd._price_cache_close_series(s3, "b", "AAPL", "10y")
+        assert result is None  # stale relative to the patched last_closed_trading_day()
 
 
 class TestMacro:

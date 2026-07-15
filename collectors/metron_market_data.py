@@ -534,19 +534,39 @@ def _period_to_timedelta(period: str) -> Any:
     return pd.Timedelta(days=365 * 10)
 
 
+# config#1865-followup (Brian ruling, 2026-07-15 triage): reference/price_cache/ only
+# refreshes weekly (collectors/prices.py), so "the parquet exists" is NOT the same claim
+# as "the parquet is current" — a covered symbol's cached bar can be several trading days
+# stale relative to the daily-fresh yfinance fetch it replaced. Concrete regression this
+# guards against: CRWD's cached snapshot was 4 trading days stale and missed a +12.58%
+# earnings move, producing a -19.9pp security_performance diff with nothing to do with the
+# dividend-adjustment basis change. A symbol whose latest cached bar is stale beyond this
+# many trading days is treated as NOT covered by price_cache for this run and routed
+# through the SAME yfinance gap-fill path as a genuine no-coverage symbol, rather than
+# silently publishing a week-old price. Start conservative at 1 (tolerate the ordinary T+0/
+# T+1 refresh-timing lag, nothing more); revisit only with an explicit written rationale.
+PRICE_CACHE_MAX_STALE_TRADING_DAYS = 1
+
+
 def _price_cache_close_series(
-    s3_client: Any, bucket: str, yf_symbol: str, period: str,
+    s3_client: Any, bucket: str, yf_symbol: str, period: str, *, reference_day: date | None = None,
 ) -> list[tuple[str, float]] | None:
     """Read one symbol's dividend-adjusted close series from the price_cache parquet
     (``reference/price_cache/{ticker}.parquet`` — ``builders/_price_cache_writeboth.py``
     owns the read-prefix fallback chain), trimmed to ``period`` lookback. Returns ``None``
     when the parquet is absent in every active read prefix (genuine no-coverage — e.g. a
-    foreign/OTC/fund symbol outside price_cache's SP1500-overlap universe) or unreadable/
-    malformed, so the caller gap-fills via yfinance rather than aborting the run (module
-    posture: best-effort, one symbol's irregularity never blocks the rest)."""
+    foreign/OTC/fund symbol outside price_cache's SP1500-overlap universe), unreadable/
+    malformed, OR when the cached snapshot's latest bar is more than
+    ``PRICE_CACHE_MAX_STALE_TRADING_DAYS`` NYSE trading sessions behind ``reference_day``
+    (config#1865-followup — see the constant's docstring for the CRWD regression this
+    closes). All three cases route the caller to the yfinance gap-fill fallback rather than
+    aborting the run or silently publishing a stale price (module posture: best-effort, one
+    symbol's irregularity never blocks the rest). ``reference_day`` defaults to
+    ``nousergon_lib.dates.last_closed_trading_day()`` — injectable for tests/determinism."""
     from botocore.exceptions import ClientError
 
     from builders._price_cache_writeboth import PRICE_CACHE_LEGACY_PREFIX, price_cache_read_prefixes
+    from nousergon_lib.dates import is_fresh_in_trading_days, last_closed_trading_day, trading_days_stale
     from store.parquet_loader import load_parquet_from_s3
 
     df = None
@@ -574,18 +594,33 @@ def _price_cache_close_series(
     trimmed = df.loc[df.index >= cutoff, "Close"].dropna()
     if trimmed.empty:
         return None
+
+    latest_date = trimmed.index.max().date()
+    ref_day = reference_day or last_closed_trading_day()
+    if not is_fresh_in_trading_days(latest_date, ref_day, max_stale=PRICE_CACHE_MAX_STALE_TRADING_DAYS):
+        logger.info(
+            "[metron_market_data] price_cache stale for %s: latest cached bar %s is %d "
+            "trading day(s) behind %s (max=%d) — routing to yfinance gap-fill instead of "
+            "publishing a stale snapshot",
+            yf_symbol, latest_date.isoformat(), trading_days_stale(latest_date, ref_day),
+            ref_day.isoformat(), PRICE_CACHE_MAX_STALE_TRADING_DAYS,
+        )
+        return None
+
     return [(d.date().isoformat(), round(float(c), 6)) for d, c in trimmed.items()]
 
 
 def _price_cache_close_history(
-    s3_client: Any, bucket: str, period: str = DEFAULT_HISTORY_PERIOD,
+    s3_client: Any, bucket: str, period: str = DEFAULT_HISTORY_PERIOD, *, reference_day: date | None = None,
 ) -> "CloseHistorySource":
     """Build ``collect_history``'s default ``close_history_source`` (config#1865): prefer
     the already-refreshed ``reference/price_cache/`` parquet (``collectors/prices.py``'s
     weekly ~903-symbol SP1500-overlap refresh) over an independent yfinance fetch, cutting
     the duplicate yfinance fan-out ``collect_history`` used to make for every symbol
-    price_cache already covers. yfinance is only called for the gap (symbols price_cache
-    doesn't carry).
+    price_cache already covers. yfinance is only called for the gap: symbols price_cache
+    doesn't carry at all, AND (config#1865-followup) symbols price_cache carries but whose
+    cached bar has gone stale (see ``PRICE_CACHE_MAX_STALE_TRADING_DAYS``) — both are
+    "not usably covered this run" and share one fallback path.
 
     Basis change (Operator decision 2026-07-08, config#1865, resolving the ask in
     https://github.com/nousergon/alpha-engine-config/issues/1865#issuecomment-4912376677):
@@ -597,13 +632,25 @@ def _price_cache_close_history(
     risk / attribution) will see return/YTD/volatility/drawdown figures shift on
     dividend-paying names. The gap-fill fallback uses
     ``_yfinance_close_history_dividend_adjusted`` (``auto_adjust=True``) — the SAME basis —
-    so a published close_history series is never a split-only/dividend-adjusted chimera."""
+    so a published close_history series is never a split-only/dividend-adjusted chimera.
+
+    Staleness fallback (config#1865-followup, Brian ruling 2026-07-15): price_cache's
+    weekly refresh means a "covered" symbol can silently carry up to a week-old close —
+    unlike the daily-fresh yfinance fetch it replaced. Every symbol's cached bar is checked
+    against ``reference_day`` (defaults to ``nousergon_lib.dates.last_closed_trading_day()``,
+    computed once per call so every symbol in the run is judged against the same session —
+    injectable for tests) and routed to the yfinance gap-fill fallback when stale beyond
+    ``PRICE_CACHE_MAX_STALE_TRADING_DAYS`` trading days, rather than accepting a stale
+    price_cache value with no signal that it happened."""
+    from nousergon_lib.dates import last_closed_trading_day
+
+    ref_day = reference_day or last_closed_trading_day()
 
     def _source(yf_symbols: list[str]) -> dict[str, list[tuple[str, float]]]:
         from_cache: dict[str, list[tuple[str, float]]] = {}
         gaps: list[str] = []
         for sym in yf_symbols:
-            series = _price_cache_close_series(s3_client, bucket, sym, period)
+            series = _price_cache_close_series(s3_client, bucket, sym, period, reference_day=ref_day)
             if series:
                 from_cache[sym] = series
             else:
@@ -611,8 +658,9 @@ def _price_cache_close_history(
         gap_filled = _yfinance_close_history_dividend_adjusted(gaps, period) if gaps else {}
         logger.info(
             "[metron_market_data] close_history: %d/%d symbols from price_cache, "
-            "%d yfinance gap-fill (dividend-adjusted basis, config#1865)",
-            len(from_cache), len(yf_symbols), len(gap_filled),
+            "%d yfinance gap-fill (dividend-adjusted basis, config#1865; includes "
+            "staleness-triggered fallback beyond %d trading day(s), config#1865-followup)",
+            len(from_cache), len(yf_symbols), len(gap_filled), PRICE_CACHE_MAX_STALE_TRADING_DAYS,
         )
         return {**from_cache, **gap_filled}
 
@@ -993,13 +1041,17 @@ def collect_history(
 
     close_history basis (config#1865): sourced primarily from ``reference/price_cache/``
     (dividend-adjusted — ``auto_adjust=True``), gap-filled via yfinance for symbols
-    price_cache doesn't cover (same dividend-adjusted basis, so the series is never a
-    split-only/dividend-adjusted chimera). This dedups the independent yfinance fetch
+    price_cache doesn't cover, OR whose cached bar has gone stale beyond
+    ``PRICE_CACHE_MAX_STALE_TRADING_DAYS`` trading days (config#1865-followup — price_cache
+    only refreshes weekly, so "covered" alone is not "current"; a stale symbol is routed to
+    the same gap-fill path as a genuinely uncovered one rather than silently publishing a
+    week-old close). Both use the same dividend-adjusted basis, so the series is never a
+    split-only/dividend-adjusted chimera. This dedups the independent yfinance fetch
     ``collect_history`` used to make for every symbol against the SP1500-overlap universe
     ``collectors/prices.py`` already refreshes weekly. Pre-#1865 this was an independent
     yfinance fetch at ``auto_adjust=False`` (split-only) — see
-    ``_price_cache_close_history``'s docstring for the full basis-change rationale
-    (Operator decision 2026-07-08 on the issue).
+    ``_price_cache_close_history``'s docstring for the full basis-change and
+    staleness-fallback rationale (Operator decision 2026-07-08 + Brian ruling 2026-07-15).
 
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
     if s3_client is None:
