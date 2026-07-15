@@ -308,6 +308,75 @@ def _write_feature_store_freshness_sentinel(
     return sentinel
 
 
+# Verify-by-artifact precondition sentinel for the EOD self-heal loop
+# (alpha-engine-config-I2702 deliverable #1/#2). Deliberately a SEPARATE S3
+# key from FEATURE_STORE_FRESHNESS_SENTINEL_KEY above, not a second `library`
+# value written to the SAME key: the universe sentinel (written once per
+# ticker-loop pass, deep in the per-symbol loop) and this macro sentinel
+# (written once per run, right after the macro/SPY readback-verification
+# block below) fire on different code paths and different cadences — sharing
+# one S3 key would let whichever write lands LAST silently overwrite/mask the
+# other's information, defeating the whole point of a per-artifact freshness
+# signal. This key is read by infrastructure/lambdas/eod-precondition-probe,
+# which is the ONLY thing that ever reads it — it is not a general freshness
+# API, and unlike the universe sentinel (`timestamp`-only recency check) it
+# carries `run_date` explicitly: the EOD probe needs to confirm THIS
+# SPECIFIC trading day's SPY close was verified present, not merely "some
+# macro write happened recently" (a stale sentinel from an old run, or a
+# backfill of an unrelated older date, would otherwise false-positive).
+MACRO_FRESHNESS_SENTINEL_KEY = "feature_store/_macro_freshness.json"
+
+
+def _write_macro_freshness_sentinel(
+    s3, bucket: str, *, run_date: str, verified_keys: list[str],
+) -> dict:
+    """Write the ArcticDB macro/SPY freshness sentinel (config-I2702).
+
+    Called ONLY after the macro readback-verification block below confirms
+    (via `verification_failures`) that every key in ``verified_keys`` is
+    genuinely queryable in ArcticDB for ``run_date`` — this sentinel is the
+    ARTIFACT the EOD precondition probe checks, so it must never be written
+    optimistically ahead of that verification.
+
+    Best-effort, matching `_write_feature_store_freshness_sentinel`'s
+    posture: a sentinel-write failure is an observability gap for the probe
+    (which then correctly reports precondition_met=False and the self-heal
+    loop retries — never a silent false-green), NOT a reason to fail a
+    daily_append run whose real ArcticDB writes already succeeded and were
+    already verified above. Swallow rationale (feedback_no_silent_fails):
+    (a) failure mode swallowed = S3 PutObject error on the freshness
+    sentinel only, never the ArcticDB write/verification itself; (c) logged
+    at WARN here, and the resulting probe-reported precondition_met=False
+    is itself the recording surface (drives the self-heal loop / pages on
+    non-convergence) rather than a silent no-op.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_date": run_date,
+        "verified_keys": sorted(verified_keys),
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=MACRO_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB macro-freshness sentinel to s3://%s/%s (run_date=%s, keys=%s)",
+            bucket, MACRO_FRESHNESS_SENTINEL_KEY, run_date, sentinel["verified_keys"],
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB macro-freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE — the EOD precondition probe will correctly "
+            "report precondition_met=False and the self-heal loop will retry): %s",
+            exc,
+        )
+    return sentinel
+
+
 def _load_block_anomaly_types() -> frozenset[str]:
     """Read ``DAILY_APPEND_BLOCK_ANOMALY_TYPES`` env var or fall back to defaults.
 
@@ -1366,6 +1435,18 @@ def _daily_append_impl(
                 f"exception but readback shows the row is missing. Investigate "
                 f"ArcticDB commit / consistency semantics."
             )
+
+        # config-I2702 deliverable #1/#2: only reachable when every key in
+        # macro_updated + sector_updated has just been readback-verified
+        # present for date_str (the raise above is unconditional on any
+        # failure) — this is the artifact-asserting checkpoint the EOD
+        # precondition probe reads. Fires even when macro_updated is a
+        # subset of macro_keys was never possible (macro_missing_from_closes
+        # hard-raised earlier in this function for any missing macro key) —
+        # SPY is always in verified_keys whenever this line executes.
+        _write_macro_freshness_sentinel(
+            s3, bucket, run_date=date_str, verified_keys=macro_updated + sector_updated,
+        )
 
     # ── 2b. Detect tickers that exist in ArcticDB universe but are missing
     #        from today's daily_closes parquet ─────────────────────────────────
