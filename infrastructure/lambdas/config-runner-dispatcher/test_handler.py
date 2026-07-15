@@ -1,13 +1,17 @@
-"""Unit tests for the two-phase (webhook receiver / worker) config-runner
-spot dispatcher.
+"""Unit tests for the three-phase (webhook receiver / worker / reconcile)
+config-runner spot dispatcher.
 
 Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
 before importing index (mirrors ci-watch-dispatcher/test_handler.py). Covers:
 webhook HMAC signature verification, event/action/label/repo filtering, the
-async self-invoke on a matching queued job, the kill-switch, and the worker
+async self-invoke on a matching queued job, the kill-switch, the worker
 phase's launch/dedup/tag/SSM-dispatch behavior (spot-first with on-demand
 fallback, job-id-scoped concurrency lock, terminate-on-post-launch-failure,
-config#2267-style dedupe_degraded on a probe failure).
+config#2267-style dedupe_degraded on a probe failure), and the reconcile
+backstop (config-I2653 — dispatches a fresh runner for any queued job
+matching our label that's sat stale with no in-flight box; ``urllib.request``
+is monkeypatched per-test rather than stubbed in sys.modules, since it's
+stdlib and always resolvable).
 """
 
 from __future__ import annotations
@@ -84,7 +88,10 @@ class _FakeEc2:
 class _FakeSsm:
     def __init__(self):
         self.sent = []
-        self.params = {"/alpha-engine/config_runner/webhook_secret": WEBHOOK_SECRET}
+        self.params = {
+            "/alpha-engine/config_runner/webhook_secret": WEBHOOK_SECRET,
+            "/alpha-engine/config_runner/github_read_pat": "test-read-only-pat",
+        }
 
     def get_parameter(self, Name, WithDecryption=True):  # noqa: N803
         return {"Parameter": {"Value": self.params[Name]}}
@@ -377,3 +384,132 @@ def test_worker_missing_job_id_returns_invalid_event(monkeypatch):
     out = idx.handler({}, None)
     assert out["launched"] is False
     assert out["reason"] == "invalid_event"
+
+
+# ── Phase 3: reconcile backstop (config-I2653) ───────────────────────────────
+
+
+class _FakeHttpResponse:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _install_gh_api_stub(idx, monkeypatch, runs_by_path):
+    """runs_by_path: {url_path_suffix: response_dict}. Any request whose URL
+    ends with a registered suffix returns that canned response."""
+    def _fake_urlopen(req, timeout=10):  # noqa: ARG001
+        url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        for suffix, payload in runs_by_path.items():
+            if url.endswith(suffix):
+                return _FakeHttpResponse(payload)
+        raise AssertionError(f"unexpected GH API call: {url}")
+
+    monkeypatch.setattr(idx.urllib.request, "urlopen", _fake_urlopen)
+
+
+def _iso(seconds_ago: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_reconcile_dispatches_stale_orphaned_job(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-rescued",  # noqa: E731
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+    )
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {
+            "workflow_runs": [{"id": 555}],
+        },
+        "/actions/runs/555/jobs": {
+            "jobs": [{
+                "id": 999, "status": "queued",
+                "labels": ["self-hosted", "alpha-engine-config-spot"],
+                "created_at": _iso(200),
+            }],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    assert out["reconciled"] == 1
+    assert out["dispatched"][0]["job_id"] == "999"
+    assert out["dispatched"][0]["result"]["launched"] is True
+
+
+def test_reconcile_skips_job_within_normal_dispatch_window(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 1}]},
+        "/actions/runs/1/jobs": {
+            "jobs": [{
+                "id": 1, "status": "queued",
+                "labels": ["self-hosted", "alpha-engine-config-spot"],
+                "created_at": _iso(10),  # well under the 90s default threshold
+            }],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    assert out["reconciled"] == 0
+    assert out["dispatched"] == []
+
+
+def test_reconcile_skips_job_already_covered_by_an_in_flight_box(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        running_job_ids={"777": ["i-already-covering-it"]},
+    )
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 2}]},
+        "/actions/runs/2/jobs": {
+            "jobs": [{
+                "id": 777, "status": "queued",
+                "labels": ["self-hosted", "alpha-engine-config-spot"],
+                "created_at": _iso(200),
+            }],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    assert out["reconciled"] == 0
+    assert out["skipped"] == ["777"]
+
+
+def test_reconcile_ignores_jobs_without_our_label(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 3}]},
+        "/actions/runs/3/jobs": {
+            "jobs": [{
+                "id": 3, "status": "queued", "labels": ["ubuntu-latest"],
+                "created_at": _iso(200),
+            }],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    assert out["reconciled"] == 0
+
+
+def test_reconcile_disabled_flag_short_circuits(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "false"})
+    out = idx.handler({"reconcile": True}, None)
+    assert out == {"reconciled": 0, "reason": "disabled"}
+
+
+def test_reconcile_list_runs_failure_returns_clean_result_not_raise(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+
+    def _boom(req, timeout=10):  # noqa: ARG001
+        raise idx.urllib.error.URLError("network blip")
+
+    monkeypatch.setattr(idx.urllib.request, "urlopen", _boom)
+    out = idx.handler({"reconcile": True}, None)
+    assert out["reconciled"] == 0
+    assert out["reason"] == "list_runs_failed"
