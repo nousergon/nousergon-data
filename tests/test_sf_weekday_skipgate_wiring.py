@@ -91,8 +91,15 @@ class TestGateShape:
 
     @pytest.mark.parametrize("gate,task,flag,nxt", _CHAIN)
     def test_default_runs_the_task(self, states, gate, task, flag, nxt):
-        assert states[gate]["Default"] == task, (
-            f"{gate} Default must run {task} (missing flag = run as normal)"
+        default = states[gate]["Default"]
+        # config#2542: CheckSkipMorningEnrich's Default now threads through the
+        # InitMorningEnrichRetryCounter Pass state (seeds the spot-retry budget)
+        # before LaunchMorningEnrichSpot — follow at most one Pass-state hop so
+        # the gate/skip invariant this test pins still holds.
+        if default != task and states[default]["Type"] == "Pass":
+            default = states[default]["Next"]
+        assert default == task, (
+            f"{gate} Default must (eventually) run {task} (missing flag = run as normal)"
         )
 
 
@@ -138,11 +145,14 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_morning_enrich_spot_success_enters_append_spot(self, states):
         # config#1767: the enrich fetch now runs on its own ephemeral spot. Its
-        # poll-status Success enters the Arctic-append spot launch (both run on
+        # poll-status Success enters the Arctic-append retry-budget init
+        # (config#2542), which immediately seeds $.morning_arctic_append_retry
+        # and hands off to the Arctic-append spot launch (both run on
         # independent spots).
         success = [c["Next"] for c in states["CheckMorningEnrichSpotStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
-        assert success == ["LaunchMorningArcticAppendSpot"]
+        assert success == ["InitMorningArcticAppendRetryCounter"]
+        assert states["InitMorningArcticAppendRetryCounter"]["Next"] == "LaunchMorningArcticAppendSpot"
 
     def test_arctic_append_spot_success_enters_heal_gate(self, states):
         # config#1767: the Arctic append also runs on its own spot; its Success
