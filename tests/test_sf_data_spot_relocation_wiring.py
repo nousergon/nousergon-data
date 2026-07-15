@@ -90,11 +90,13 @@ class TestWeekdaySpotStatesPresent:
         assert st["Type"] == "Task"
         assert st["Resource"] == _LAMBDA_INVOKE
         assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
-        # Each launch selects exactly one workload.
-        assert set(st["Parameters"]["Payload"]) == {"workload"}
         assert st["Parameters"]["Payload"]["workload"] in {
             "morning-enrich", "morning-arctic-append"
         }
+        # config#2542: force_on_demand.$ threads the retry-budget's on-demand
+        # override into the dispatcher (see TestWeekdayDataSpotRetryBudget),
+        # mirroring the EOD launch states.
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, daily, name):
@@ -166,8 +168,11 @@ class TestWeekdayFailureIsolation:
 
     def test_status_default_is_fail_open_not_handlefailure(self, daily):
         # The OLD on-trading CheckMorningEnrichStatus Default was HandleFailure.
-        # The spot status check Default must be the fail-open normalizer instead.
-        for name in ("CheckMorningEnrichSpotStatus", "CheckMorningArcticAppendSpotStatus"):
+        # The spot status check Default must route to the retry-budget check
+        # (config#2542) — itself always fail-open, never HandleFailure.
+        assert daily["CheckMorningEnrichSpotStatus"]["Default"] == "CheckMorningEnrichRetryBudget"
+        assert daily["CheckMorningArcticAppendSpotStatus"]["Default"] == "CheckMorningArcticAppendRetryBudget"
+        for name in ("CheckMorningEnrichRetryBudget", "CheckMorningArcticAppendRetryBudget"):
             assert daily[name]["Default"] == "ExtractDataSpotError"
             assert daily[name]["Default"] not in _HALT
 
@@ -186,11 +191,15 @@ class TestWeekdayFailureIsolation:
         """Exhaustive: walking every data-spot state's targets, none escapes to a
         HALT state (HandleFailure/FailExecution)."""
         data_states = [
+            "InitMorningEnrichRetryCounter",
             "LaunchMorningEnrichSpot", "CheckMorningEnrichSpotLaunched",
             "PollMorningEnrichSpot", "CheckMorningEnrichSpotStatus", "MorningEnrichSpotWait",
+            "CheckMorningEnrichRetryBudget", "IncrementMorningEnrichRetry",
+            "InitMorningArcticAppendRetryCounter",
             "LaunchMorningArcticAppendSpot", "CheckMorningArcticAppendSpotLaunched",
             "PollMorningArcticAppendSpot", "CheckMorningArcticAppendSpotStatus",
             "MorningArcticAppendSpotWait",
+            "CheckMorningArcticAppendRetryBudget", "IncrementMorningArcticAppendRetry",
             "ExtractDataSpotError", "PublishDataSpotFailureImmediate",
         ]
         for name in data_states:
@@ -206,6 +215,70 @@ class TestWeekdayFailureIsolation:
         assert daily["CheckSkipMorningEnrich"]["Choices"][0]["Next"] == self._CONTINUE
         for gate in ("CheckMorningEnrichSpotLaunched", "CheckMorningArcticAppendSpotLaunched"):
             assert daily[gate]["Default"] == self._CONTINUE
+
+
+class TestWeekdayDataSpotRetryBudget:
+    """config#2542: audit of the SAME spot-reclaim/hard-fail bug class fixed for
+    EOD by PR813 (2026-07-14 incident) — a spot-reclaimed morning-enrich or
+    morning-arctic-append workload gets ONE relaunch-on-a-fresh-box retry
+    before the pipeline accepts the failure and falls through to the
+    pre-existing fail-open path. Mirrors TestEODDataSpotRetryBudget exactly."""
+
+    def test_retry_counters_initialized_before_first_launch(self, daily):
+        assert daily["CheckSkipMorningEnrich"]["Default"] == "InitMorningEnrichRetryCounter"
+        assert daily["InitMorningEnrichRetryCounter"]["Type"] == "Pass"
+        assert daily["InitMorningEnrichRetryCounter"]["ResultPath"] == "$.morning_enrich_retry"
+        assert daily["InitMorningEnrichRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
+        assert daily["InitMorningEnrichRetryCounter"]["Next"] == "LaunchMorningEnrichSpot"
+
+        assert daily["CheckMorningEnrichSpotStatus"]["Choices"][0]["Next"] == "InitMorningArcticAppendRetryCounter"
+        assert daily["InitMorningArcticAppendRetryCounter"]["Type"] == "Pass"
+        assert daily["InitMorningArcticAppendRetryCounter"]["ResultPath"] == "$.morning_arctic_append_retry"
+        assert daily["InitMorningArcticAppendRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
+        assert daily["InitMorningArcticAppendRetryCounter"]["Next"] == "LaunchMorningArcticAppendSpot"
+
+    @pytest.mark.parametrize(
+        "launch_state,counter_field",
+        [
+            ("LaunchMorningEnrichSpot", "morning_enrich_retry"),
+            ("LaunchMorningArcticAppendSpot", "morning_arctic_append_retry"),
+        ],
+    )
+    def test_launch_threads_force_on_demand_from_retry_counter(self, daily, launch_state, counter_field):
+        payload = daily[launch_state]["Parameters"]["Payload"]
+        assert payload["force_on_demand.$"] == f"$.{counter_field}.force_on_demand"
+
+    @pytest.mark.parametrize(
+        "budget_state,counter_field,increment_state,relaunch_state",
+        [
+            ("CheckMorningEnrichRetryBudget", "$.morning_enrich_retry.attempts",
+             "IncrementMorningEnrichRetry", "LaunchMorningEnrichSpot"),
+            ("CheckMorningArcticAppendRetryBudget", "$.morning_arctic_append_retry.attempts",
+             "IncrementMorningArcticAppendRetry", "LaunchMorningArcticAppendSpot"),
+        ],
+    )
+    def test_one_retry_then_give_up(
+        self, daily, budget_state, counter_field, increment_state, relaunch_state
+    ):
+        st = daily[budget_state]
+        assert st["Type"] == "Choice"
+        assert len(st["Choices"]) == 1
+        cond = st["Choices"][0]
+        assert cond["Variable"] == counter_field
+        assert cond["NumericLessThan"] == 1
+        assert cond["Next"] == increment_state
+        # Retry budget exhausted -> the pre-existing fail-open path, never a HALT.
+        assert st["Default"] == "ExtractDataSpotError"
+
+        inc = daily[increment_state]
+        assert inc["Type"] == "Pass"
+        assert inc["ResultPath"] == counter_field.rsplit(".", 1)[0]
+        assert inc["Parameters"]["attempts.$"] == f"States.MathAdd({counter_field}, 1)"
+        # The one retry must never gamble on spot a second time.
+        assert inc["Parameters"]["force_on_demand"] is True
+        # The retry relaunches on a FRESH box — same launch state, not a
+        # separate "retry launch" — a plain Lambda invoke each time.
+        assert inc["Next"] == relaunch_state
 
 
 # ══════════════════════════════════════════════════════════════════════════
