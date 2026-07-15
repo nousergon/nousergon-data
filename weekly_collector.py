@@ -34,6 +34,7 @@ from pathlib import Path
 
 import boto3
 import yaml
+from botocore.exceptions import ClientError
 
 def _load_dotenv() -> None:
     """Load .env file into os.environ (lightweight, no dependency).
@@ -168,6 +169,23 @@ def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "Phase
     )
 
 
+def _s3_object_exists(bucket: str, key: str) -> bool:
+    """HEAD-check an S3 object. Any non-404/NoSuchKey ClientError (IAM drift,
+    throttling, etc.) RAISES — fail-loud per feedback_no_silent_fails; a
+    verification check that silently treats "couldn't check" as "doesn't
+    exist" would produce nondeterministic spurious failures, and treating it
+    as "exists" would defeat the whole point of verify-by-artifact."""
+    s3 = boto3.client("s3")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return False
+        raise
+
+
 def _phase_collect(
     reg: "PhaseRegistry | None",
     name: str,
@@ -175,6 +193,8 @@ def _phase_collect(
     *,
     artifact_key: str | None = None,
     supports_auto_skip: bool = True,
+    verify_artifact_exists: bool = False,
+    bucket: str | None = None,
 ) -> dict:
     """Run a collector under the phase registry (markers + L4524 artifact-validated
     auto-skip + watchdog), preserving the module's best-effort-continue posture.
@@ -191,6 +211,18 @@ def _phase_collect(
 
     ``supports_auto_skip=False`` (multi-file / shared-DB / ArcticDB producers with no
     single stable S3 key) → markers + watchdog only, the phase always runs.
+
+    ``verify_artifact_exists=True`` (config-I2702 deliverable #2, "verify-by-artifact
+    workloads"): after a collector reports ``status="ok"``, HEAD-check that
+    ``artifact_key`` actually exists on S3 BEFORE recording success — a collector's own
+    internal ``status="ok"`` reflects "the fetch/write call didn't raise", not "the
+    contracted output is queryable". A missing artifact downgrades the phase to
+    ``error``, which _CollectorError already routes to main()'s existing
+    ``results["status"] not in ("ok", "skipped") -> SystemExit(1)`` contract — no new
+    exit-code plumbing needed, just a stricter success predicate. Skipped for
+    ``status="ok_dry_run"`` (dry-run collectors write nothing real to verify) and for
+    auto-skip cache hits (the L4524 auto-skip check already re-verified the artifact's
+    presence via its own S3 probe before returning the cache hit).
     """
     if reg is None:
         try:
@@ -208,6 +240,19 @@ def _phase_collect(
             result = run_fn() or {}
             if result.get("status") == "error":
                 raise _CollectorError(name, result.get("error"))
+            if verify_artifact_exists and artifact_key and result.get("status") == "ok":
+                if bucket is None:
+                    raise _CollectorError(
+                        name, "verify_artifact_exists=True but bucket was not supplied to _phase_collect"
+                    )
+                if not _s3_object_exists(bucket, artifact_key):
+                    raise _CollectorError(
+                        name,
+                        f"collector reported status=ok but its contracted artifact "
+                        f"s3://{bucket}/{artifact_key} does not exist (verify-by-artifact, "
+                        f"config-I2702 deliverable #2 — rc=0 must mean the artifact exists, "
+                        f"never just 'the process did not crash')",
+                    )
             if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
                 ctx.record_artifact(artifact_key)
             return result
@@ -2248,6 +2293,14 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             skip_if_canonical=skip_if_canonical,
         ),
         artifact_key=f"{_dc_prefix}{run_date}.parquet",
+        # config-I2702 deliverable #2: this collector's artifact is the EOD
+        # post-market-data data-spot workload's whole contracted output — the
+        # PostMarketArcticAppend state (and the reconcile-only replay's
+        # skip_post_market_data=false path) read this exact parquet. A
+        # collector that reports status=ok without the file actually landing
+        # on S3 must not be treated as success.
+        verify_artifact_exists=True,
+        bucket=bucket,
     )
 
     # Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
