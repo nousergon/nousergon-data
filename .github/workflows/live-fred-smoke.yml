@@ -13,6 +13,8 @@ name: Live FRED Smoke
 # secret get a clean skip rather than a failing CI status.
 
 on:
+
+permissions: {}
   pull_request:
     branches: [main]
     paths:

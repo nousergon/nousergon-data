@@ -16,6 +16,8 @@ name: Live Polygon Smoke
 # unset) rather than a failing CI status.
 
 on:
+
+permissions: {}
   pull_request:
     branches: [main]
     paths:
