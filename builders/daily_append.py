@@ -596,6 +596,24 @@ def _scan_universe_and_emit_freshness_receipt(
     scan tripped on the same 8 stragglers (one 25d stale) and halted
     the SF.
 
+    ``_UNIVERSE_EXTRA`` members (currently: SPY) are HARD-PINNED benchmark
+    symbols, never churn-eligible — they are excluded from ``_SKIP_TICKERS``
+    membership here via the same ``(... not in _SKIP_TICKERS or ... in
+    _UNIVERSE_EXTRA)`` carve-out the write-path predicate
+    (``_daily_append_admits`` in tests/test_spy_universe_member.py; see
+    ``stock_tickers`` below) already uses. 2026-07-15 P0 (config-I2703):
+    this scan (and the missing-from-closes check below) had DRIFTED from
+    that write-path predicate — they filtered on bare ``_SKIP_TICKERS``
+    with no ``_UNIVERSE_EXTRA`` carve-out, so SPY (in ``_SKIP_TICKERS`` by
+    design, see features/compute.py) was silently excluded from BOTH
+    freshness accounting paths every run, logged as an "S&P churn-out
+    straggler, awaiting prune" — even though SPY is a permanent member,
+    never a prune candidate, and is the executor's benchmark hard-fail
+    dependency (eod_reconcile._spy_close). A genuine SPY write failure
+    would have gone undetected by this gate. Fixed by aligning all three
+    ``expected_tickers``-scoping call sites (write / missing-from-closes /
+    freshness-scan) on the identical predicate.
+
     Returns scan metadata (also embedded in the receipt) for logging
     by the caller. Skipped automatically on dry_run.
     """
@@ -609,7 +627,7 @@ def _scan_universe_and_emit_freshness_receipt(
     if expected_tickers is not None:
         expected_set = {
             t.lstrip("^") for t in expected_tickers
-            if t.lstrip("^") not in _SKIP_TICKERS
+            if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)
             and not _is_sector_etf(t.lstrip("^"))
         }
         syms = [s for s in all_syms if s in expected_set]
@@ -1477,10 +1495,17 @@ def _daily_append_impl(
         # closes contains everything: stocks + macro keys + sector ETFs.
         # Reduce to the stock set so the diff is apples-to-apples with
         # universe_lib's contents (which holds only stocks). Same predicate
-        # as the line ~274 stock_tickers filter — keep them in lockstep.
+        # as the ``stock_tickers`` write-path filter below — keep them in
+        # lockstep (the ``_UNIVERSE_EXTRA`` carve-out is REQUIRED here: SPY
+        # is in ``_SKIP_TICKERS`` but IS written to `universe`, so without
+        # the carve-out SPY would always compute as "missing from closes"
+        # even on days it's genuinely present — config-I2703 fixed the
+        # sibling gap where this same omission made the freshness scan
+        # blind to SPY entirely).
         closes_stock_keys = {
             t for t in closes
-            if t not in _SKIP_TICKERS and not _is_sector_etf(t)
+            if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
+            and not _is_sector_etf(t)
         }
         # Scope "expected" to the intersection of ArcticDB universe and the
         # caller's request list. A ticker dropped from S&P this week (still
@@ -1489,11 +1514,15 @@ def _daily_append_impl(
         # design, not a data gap. Without this, every S&P churn week trips
         # the threshold (2026-05-02: 8 churn-out tickers + 4 chronic =
         # 12 > 5 → SF halt). With it, only tickers we both want to track
-        # AND have history for can flag the alarm.
+        # AND have history for can flag the alarm. ``_UNIVERSE_EXTRA``
+        # members are excepted from the ``_SKIP_TICKERS`` exclusion (same
+        # carve-out as ``closes_stock_keys`` above and the write-path
+        # ``stock_tickers`` filter) — SPY is a hard-pinned benchmark, never
+        # a churn-eligible S&P straggler (config-I2703).
         if expected_tickers is not None:
             expected_stocks = {
                 t.lstrip("^") for t in expected_tickers
-                if t.lstrip("^") not in _SKIP_TICKERS
+                if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)
                 and not _is_sector_etf(t.lstrip("^"))
             }
             relevant_arctic = arctic_stock_symbols & expected_stocks
