@@ -1,10 +1,10 @@
 {
-  "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
+  "Comment": "Alpha Engine EOD Pipeline — post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "CheckMutexRole",
   "States": {
     "CheckMutexRole": {
       "Type": "Choice",
-      "Comment": "L274 SF MutualExclusionGuard \u2014 gate at SF entry point. Allowlist cadence-roles (daily / weekly / eod / shell-run) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Daemon-triggered EOD launches set pipeline_role='eod' (executor/daemon.py:1092); operator-launched replays MUST set their own pipeline_role per the taxonomy in pipeline-reporting-revamp-260524.md \u00a76. Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations \u2014 that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell.",
+      "Comment": "L274 SF MutualExclusionGuard — gate at SF entry point. Allowlist cadence-roles (daily / weekly / eod / shell-run) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Daemon-triggered EOD launches set pipeline_role='eod' (executor/daemon.py:1092); operator-launched replays MUST set their own pipeline_role per the taxonomy in pipeline-reporting-revamp-260524.md §6. Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations — that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell.",
       "Choices": [
         {
           "And": [
@@ -40,7 +40,7 @@
     },
     "AcquireMutex": {
       "Type": "Task",
-      "Comment": "L274 \u2014 DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException \u2192 MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
+      "Comment": "L274 — DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException → MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
       "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
       "Parameters": {
         "TableName": "alpha-engine-sf-execution-mutex",
@@ -68,7 +68,7 @@
           "ErrorEquals": [
             "DynamoDB.ConditionalCheckFailedException"
           ],
-          "Comment": "Mutex held by another concurrent execution in the same minute bucket \u2014 the duplicate-trigger case we are explicitly protecting against. Fail loud (EOD has its own ForceStopInstance cost-guard on the failure path, so a MutexConflict still releases the trading instance).",
+          "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud (EOD has its own ForceStopInstance cost-guard on the failure path, so a MutexConflict still releases the trading instance).",
           "Next": "MutexConflict",
           "ResultPath": "$.mutex_conflict"
         },
@@ -87,11 +87,11 @@
     "MutexConflict": {
       "Type": "Fail",
       "Error": "MutexConflict",
-      "Cause": "L274: another EOD execution with the same pipeline_role + start-minute already holds the mutex. Cost-guard note: the EOD SF's HandleFailure \u2192 ForceStopInstance chain is unreachable from a Fail state, but a duplicate EOD execution by definition means another EOD execution IS running the cost-guard path; the trading instance still gets stopped."
+      "Cause": "L274: another EOD execution with the same pipeline_role + start-minute already holds the mutex. Cost-guard note: the EOD SF's HandleFailure → ForceStopInstance chain is unreachable from a Fail state, but a duplicate EOD execution by definition means another EOD execution IS running the cost-guard path; the trading instance still gets stopped."
     },
     "StartTradingInstance": {
       "Type": "Task",
-      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it \u2014 so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand \u2192 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 \u2192 SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Ensure the long-lived trading instance is running + SSM-registered BEFORE any EOD ssm:sendCommand. The normal daemon-shutdown-triggered run enters with the box already up, but EOD's OWN terminal StopTradingInstance and failure-path ForceStopInstance both STOP it — so any operator recovery rerun after a prior failure lands on a stopped instance and the first sendCommand dies with Ssm.InvalidInstanceIdException (observed 2026-06-30 rerun watch-rerun-2026-06-30-1: EODReconcile sendCommand → 'Instances not in a valid state', instance i-018eb3307a21329bf stopped by the prior run's ForceStopInstance). ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the EOD pipeline idempotently re-runnable. Mirrors the daily/preopen StartExecutorEC2 → SSM-readiness poll (config#1430, the same InvalidInstanceIdException class on cold-boot).",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -120,7 +120,7 @@
     },
     "WaitForInstanceReady": {
       "Type": "Wait",
-      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped\u2192running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
       "Seconds": 15,
       "Next": "InitSSMPollCounter"
     },
@@ -171,7 +171,7 @@
     },
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online \u2192 CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run \u2014 postmarket \u2192 arctic \u2192 snapshot \u2192 reconcile \u2014 executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails \u2014 the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile \u2014 an unreachable box fails the execution loud.",
+      "Comment": "PingStatus=Online → CheckSkipRefreshExecutorDeploy (enter the per-task rerun gates; the FIRST gate now hoists the executor-checkout refresh to the top of the pipeline per config#1549, so the entire EOD run — postmarket → arctic → snapshot → reconcile — executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail to HandleFailure when the budget is exhausted (per feedback_no_silent_fails — the agent not registering after 3 min is a real boot problem, not just timing; HandleFailure notifies + ForceStopInstance releases the box). This NEVER silently skips EOD reconcile — an unreachable box fails the execution loud.",
       "Choices": [
         {
           "And": [
@@ -238,7 +238,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Hard-fail: EODReconcile depends on this snapshot. No silent fallback to live IB \u2014 that's the whole point of Phase 2.",
+          "Comment": "Hard-fail: EODReconcile depends on this snapshot. No silent fallback to live IB — that's the whole point of Phase 2.",
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -321,7 +321,7 @@
     },
     "SnapshotStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result.",
+      "Comment": "Choice Default path — synthesize $.error from poll result.",
       "Parameters": {
         "source": "snapshot_status",
         "status.$": "$.snapshot_poll.Status",
@@ -340,7 +340,7 @@
     },
     "EODReconcile": {
       "Type": "Task",
-      "Comment": "Run EOD reconciliation on trading EC2 \u2014 reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Deploy-freshness is guaranteed UPSTREAM by the top-of-pipeline RefreshExecutorDeploy chokepoint (config#1549) \u2014 the whole EOD run executes latest origin/main by construction, so nousergon-data#574's per-step boot-pull is no longer carried here. eod_reconcile.py's ExecutorPreflight deploy-drift guard remains the authoritative fail-loud gate. (executionTimeout left at 600s from #574 \u2014 a safe upper bound; harmless without the inline refresh.)",
+      "Comment": "Run EOD reconciliation on trading EC2 — reads closes from ArcticDB + state from S3 snapshot (no live IB), computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask. Deploy-freshness is guaranteed UPSTREAM by the top-of-pipeline RefreshExecutorDeploy chokepoint (config#1549) — the whole EOD run executes latest origin/main by construction, so nousergon-data#574's per-step boot-pull is no longer carried here. eod_reconcile.py's ExecutorPreflight deploy-drift guard remains the authoritative fail-loud gate. (executionTimeout left at 600s from #574 — a safe upper bound; harmless without the inline refresh.)",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -451,7 +451,7 @@
     },
     "EODStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
       "Parameters": {
         "source": "eod_status",
         "status.$": "$.eod_poll.Status",
@@ -470,7 +470,7 @@
     },
     "DailySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 \u2192 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (a failure degrades visibly \u2014 see SubstrateHealthCheckDegraded \u2014 it does not halt the cost-guard tail) \u2014 same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed. config#2326 \u2014 NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync \u2014 infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. config#2326 timeout convention (mirrors config#2276's weekly-SF fix): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout \u2014 time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call). Budget: executionTimeout kept at 180 (daily-cadence subset of rows; observed comparable to or faster than the Sat SF's --cadence weekly sweep now that pip is removed) \u2014 the previous 180/180/240 set conflated the delivery timeout with an execution ceiling (the same inversion config#2276 flagged on the weekly SF).",
+      "Comment": "Phase 2 → 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (a failure degrades visibly — see SubstrateHealthCheckDegraded — it does not halt the cost-guard tail) — same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed. config#2326 — NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync — infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. config#2326 timeout convention (mirrors config#2276's weekly-SF fix): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout — time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call). Budget: executionTimeout kept at 180 (daily-cadence subset of rows; observed comparable to or faster than the Sat SF's --cadence weekly sweep now that pip is removed) — the previous 180/180/240 set conflated the delivery timeout with an execution ceiling (the same inversion config#2276 flagged on the weekly SF).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -496,7 +496,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#2326: substrate-check failure is non-blocking but VISIBLE \u2014 set health_check_degraded and publish a best-effort alert (SubstrateHealthCheckDegraded), then continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement UNCHANGED: trading EC2 must always stop, regardless of substrate-check outcome \u2014 the degraded path still terminates at StopTradingInstance, never HandleFailure.",
+          "Comment": "config#2326: substrate-check failure is non-blocking but VISIBLE — set health_check_degraded and publish a best-effort alert (SubstrateHealthCheckDegraded), then continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement UNCHANGED: trading EC2 must always stop, regardless of substrate-check outcome — the degraded path still terminates at StopTradingInstance, never HandleFailure.",
           "Next": "SubstrateHealthCheckDegraded",
           "ResultPath": "$.substrate_check_error"
         }
@@ -536,7 +536,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#2326: non-blocking but VISIBLE \u2014 a substrate-poll infra failure sets health_check_degraded (via SubstrateHealthCheckDegraded) then continues to StopTradingInstance. Row-level alarms still page on failure regardless of polling outcome.",
+          "Comment": "config#2326: non-blocking but VISIBLE — a substrate-poll infra failure sets health_check_degraded (via SubstrateHealthCheckDegraded) then continues to StopTradingInstance. Row-level alarms still page on failure regardless of polling outcome.",
           "Next": "SubstrateHealthCheckDegraded",
           "ResultPath": "$.substrate_check_error"
         }
@@ -553,7 +553,7 @@
     },
     "CheckDailySubstrateHealthCheckStatus": {
       "Type": "Choice",
-      "Comment": "config#2326: poll the daily substrate check to a TERMINAL status (mirrors the weekly SF's CheckSubstrateHealthCheckStatus / config#2276 CheckMorningEnrichStatus idiom, minus the re-issue gate \u2014 observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved straight to StopTradingInstance, so a hung/failing health checker was invisible (green cost-guard shutdown regardless). Terminal non-Success (Failed / TimedOut / Cancelled \u2014 incl. executionTimeout expiry) \u2192 SubstrateHealthCheckDegraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds backstops SSM control-plane pathology. $.substrate_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForDailySubstrateHealthCheck pins Status via its ResultSelector.",
+      "Comment": "config#2326: poll the daily substrate check to a TERMINAL status (mirrors the weekly SF's CheckSubstrateHealthCheckStatus / config#2276 CheckMorningEnrichStatus idiom, minus the re-issue gate — observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved straight to StopTradingInstance, so a hung/failing health checker was invisible (green cost-guard shutdown regardless). Terminal non-Success (Failed / TimedOut / Cancelled — incl. executionTimeout expiry) → SubstrateHealthCheckDegraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds backstops SSM control-plane pathology. $.substrate_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForDailySubstrateHealthCheck pins Status via its ResultSelector.",
       "Choices": [
         {
           "Variable": "$.substrate_check_poll.Status",
@@ -587,19 +587,19 @@
     },
     "SubstrateHealthCheckDegraded": {
       "Type": "Pass",
-      "Comment": "config#2326 (mirrors the weekly SF's SubstrateHealthCheckDegraded / config#2276): the daily substrate health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckDailySubstrateHealthCheckStatus.Default). An SF-controlled boolean recorded on the execution record. Unlike the weekly SF, the EOD SF has NO success-path SNS notifier to thread this flag into (audited in test_sf_notifier_totality_wiring.py \u2014 PipelineComplete-equivalent tail here is just the cost-guard instance stop), so visibility here is a DEDICATED best-effort SNS publish (PublishSubstrateHealthCheckDegradedAlert) mirroring the existing fail-open PublishDataSpotFailureImmediate idiom in this same file, rather than silence. Continues to StopTradingInstance \u2014 the cost-guard shutdown must never be delayed or skipped by a health-check degradation.",
+      "Comment": "config#2326 (mirrors the weekly SF's SubstrateHealthCheckDegraded / config#2276): the daily substrate health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckDailySubstrateHealthCheckStatus.Default). An SF-controlled boolean recorded on the execution record. Unlike the weekly SF, the EOD SF has NO success-path SNS notifier to thread this flag into (audited in test_sf_notifier_totality_wiring.py — PipelineComplete-equivalent tail here is just the cost-guard instance stop), so visibility here is a DEDICATED best-effort SNS publish (PublishSubstrateHealthCheckDegradedAlert) mirroring the existing fail-open PublishDataSpotFailureImmediate idiom in this same file, rather than silence. Continues to StopTradingInstance — the cost-guard shutdown must never be delayed or skipped by a health-check degradation.",
       "Result": true,
       "ResultPath": "$.health_check_degraded",
       "Next": "PublishSubstrateHealthCheckDegradedAlert"
     },
     "PublishSubstrateHealthCheckDegradedAlert": {
       "Type": "Task",
-      "Comment": "config#2326: best-effort SNS alert that the EOD daily substrate health check degraded (crashed, timed out, or finished non-Success) \u2014 surfaces the miss WITHOUT blocking the cost-guard instance stop. Message is a HARDCODED CONSTANT (config#1819 convention: never States.Format a Subject; here Message is also kept constant rather than conditionally dereferencing $.substrate_check_error / $.substrate_check_poll, which are set by DIFFERENT predecessors \u2014 a Catch path sets only the former, a terminal-status path only the latter, and States.Format on a field absent from a given path's payload raises States.Runtime, which would itself dodge the cost-guard). The execution record still carries whichever of the two fields fired; operators cross-reference the SF console. Its own Catch also routes to StopTradingInstance so even an SNS-side failure cannot delay/block the cost-guard.",
+      "Comment": "config#2326: best-effort SNS alert that the EOD daily substrate health check degraded (crashed, timed out, or finished non-Success) — surfaces the miss WITHOUT blocking the cost-guard instance stop. Message is a HARDCODED CONSTANT (config#1819 convention: never States.Format a Subject; here Message is also kept constant rather than conditionally dereferencing $.substrate_check_error / $.substrate_check_poll, which are set by DIFFERENT predecessors — a Catch path sets only the former, a terminal-status path only the latter, and States.Format on a field absent from a given path's payload raises States.Runtime, which would itself dodge the cost-guard). The execution record still carries whichever of the two fields fired; operators cross-reference the SF console. Its own Catch also routes to StopTradingInstance so even an SNS-side failure cannot delay/block the cost-guard.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Substrate Health Check \u2014 DEGRADED (fail-open, shutdown continues)",
-        "Message": "The EOD daily substrate health check (nousergon_lib.transparency --cadence daily) degraded \u2014 it crashed, timed out, or its SSM command finished non-Success \u2014 but the pipeline continued to instance-stop (fail-open, config#2326). Per-row CloudWatch alarms independently page on row-level failures; this alert covers the SSM/infra-level failure class those alarms don't see. Detail is on the execution record ($.substrate_check_error and/or $.substrate_check_poll) \u2014 view at https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine EOD Substrate Health Check — DEGRADED (fail-open, shutdown continues)",
+        "Message": "The EOD daily substrate health check (nousergon_lib.transparency --cadence daily) degraded — it crashed, timed out, or its SSM command finished non-Success — but the pipeline continued to instance-stop (fail-open, config#2326). Per-row CloudWatch alarms independently page on row-level failures; this alert covers the SSM/infra-level failure class those alarms don't see. Detail is on the execution record ($.substrate_check_error and/or $.substrate_check_poll) — view at https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.substrate_health_check_degraded_notify",
       "Catch": [
@@ -616,7 +616,7 @@
     },
     "CheckSkipRefreshExecutorDeploy": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607) for the top-of-pipeline executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} routes past RefreshExecutorDeploy to the first work gate (CheckSkipPostMarketData); missing flag = run as normal. This is the FIRST gate the SSM-ready path enters \u2014 hoisting the refresh here (out of the per-step EODReconcile refresh added in nousergon-data#574) means the ENTIRE EOD run (PostMarketData \u2192 PostMarketArcticAppend \u2192 CaptureSnapshot \u2192 EODReconcile) executes latest origin/main by construction, closing the silent-stale-code exposure on the non-drift-guarded work steps. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4607) for the top-of-pipeline executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} routes past RefreshExecutorDeploy to the first work gate (CheckSkipPostMarketData); missing flag = run as normal. This is the FIRST gate the SSM-ready path enters — hoisting the refresh here (out of the per-step EODReconcile refresh added in nousergon-data#574) means the ENTIRE EOD run (PostMarketData → PostMarketArcticAppend → CaptureSnapshot → EODReconcile) executes latest origin/main by construction, closing the silent-stale-code exposure on the non-drift-guarded work steps. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
@@ -644,7 +644,7 @@
     },
     "RefreshExecutorDeploy": {
       "Type": "Task",
-      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07\u201308:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status \u2192 HandleFailure \u2192 ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against \u2014 this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here \u2014 mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly \u2014 keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed.",
+      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status → HandleFailure → ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against — this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here — mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly — keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -678,7 +678,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-loud: a failed executor-deploy refresh must halt EOD before any work step runs stale code. Don't paper over it \u2014 the whole point of the hoist is that non-guarded steps never run stale.",
+          "Comment": "Fail-loud: a failed executor-deploy refresh must halt EOD before any work step runs stale code. Don't paper over it — the whole point of the hoist is that non-guarded steps never run stale.",
           "Next": "HandleFailure",
           "ResultPath": "$.error"
         }
@@ -734,7 +734,7 @@
     },
     "CheckRefreshExecutorDeployStatus": {
       "Type": "Choice",
-      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed \u2014 a stale checkout must never reach the work steps.",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed — a stale checkout must never reach the work steps.",
       "Choices": [
         {
           "Variable": "$.refresh_executor_deploy_poll.Status",
@@ -766,7 +766,7 @@
     },
     "RefreshExecutorDeployStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
       "Parameters": {
         "source": "refresh_executor_deploy_status",
         "status.$": "$.refresh_executor_deploy_poll.Status",
@@ -808,7 +808,7 @@
     },
     "InitDataSpotRetryCounter": {
       "Type": "Pass",
-      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload \u2014 e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling. force_on_demand starts false; IncrementDataSpotRetry flips it true so the one retry never gambles on spot a second time.",
+      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload — e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling. force_on_demand starts false; IncrementDataSpotRetry flips it true so the one retry never gambles on spot a second time.",
       "Result": {
         "attempts": 0,
         "force_on_demand": false
@@ -818,7 +818,7 @@
     },
     "LaunchPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (2026-07-14 incident) \u2014 the dispatcher then skips spot entirely for that attempt.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (2026-07-14 incident) — the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
@@ -866,7 +866,7 @@
     },
     "PollPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "Poll the post-market data-spot SSM command; bounded by the on-box watchdog + reaper. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) \u2014 a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
+      "Comment": "Poll the post-market data-spot SSM command; bounded by the on-box watchdog + reaper. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) — a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.postmarket_launch.Payload.data_spot.command_id",
@@ -939,7 +939,7 @@
     },
     "CheckDataSpotRetryBudget": {
       "Type": "Choice",
-      "Comment": "A terminal non-Success status on the post-market-data spot poll (Failed/Cancelled/TimedOut/the SSM Undeliverable class an already-reclaimed spot instance produces) is presumed transient AWS spot interruption until proven otherwise \u2014 retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption is no longer 'transient blip' territory and falls through to the existing fail-open path rather than looping indefinitely. $.data_spot_retry is always initialized by InitDataSpotRetryCounter before this state is reachable.",
+      "Comment": "A terminal non-Success status on the post-market-data spot poll (Failed/Cancelled/TimedOut/the SSM Undeliverable class an already-reclaimed spot instance produces) is presumed transient AWS spot interruption until proven otherwise — retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption is no longer 'transient blip' territory and falls through to the existing fail-open path rather than looping indefinitely. $.data_spot_retry is always initialized by InitDataSpotRetryCounter before this state is reachable.",
       "Choices": [
         {
           "Variable": "$.data_spot_retry.attempts",
@@ -951,7 +951,7 @@
     },
     "IncrementDataSpotRetry": {
       "Type": "Pass",
-      "Comment": "force_on_demand flips to true for the retry \u2014 a box already lost to spot interruption once must not gamble on spot again.",
+      "Comment": "force_on_demand flips to true for the retry — a box already lost to spot interruption once must not gamble on spot again.",
       "Parameters": {
         "attempts.$": "States.MathAdd($.data_spot_retry.attempts, 1)",
         "force_on_demand": true
@@ -966,7 +966,7 @@
     },
     "InitDataSpotArcticRetryCounter": {
       "Type": "Pass",
-      "Comment": "Retry budget for the Arctic-append sub-phase \u2014 the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter, including force_on_demand.",
+      "Comment": "Retry budget for the Arctic-append sub-phase — the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter, including force_on_demand.",
       "Result": {
         "attempts": 0,
         "force_on_demand": false
@@ -1024,7 +1024,7 @@
     },
     "PollPostMarketArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "Poll the EOD Arctic-append data-spot SSM command. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) \u2014 a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
+      "Comment": "Poll the EOD Arctic-append data-spot SSM command. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) — a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.postmarket_arctic_launch.Payload.data_spot.command_id",
@@ -1109,7 +1109,7 @@
     },
     "IncrementDataSpotArcticRetry": {
       "Type": "Pass",
-      "Comment": "force_on_demand flips to true for the retry \u2014 mirrors IncrementDataSpotRetry.",
+      "Comment": "force_on_demand flips to true for the retry — mirrors IncrementDataSpotRetry.",
       "Parameters": {
         "attempts.$": "States.MathAdd($.data_spot_arctic_retry.attempts, 1)",
         "force_on_demand": true
@@ -1124,7 +1124,7 @@
     },
     "ExtractDataSpotError": {
       "Type": "Pass",
-      "Comment": "FAIL-OPEN normalizer (config#1767 #4). An EOD data-spot launch/poll failure or non-Success terminal status lands here. Record as DATA, best-effort alert, then CONTINUE to snapshot/reconcile/instance-stop \u2014 a data-phase failure must NOT block the EOD close-out. Mirrors Saturday ResearchPredictorParallel branch-error pattern.",
+      "Comment": "FAIL-OPEN normalizer (config#1767 #4). An EOD data-spot launch/poll failure or non-Success terminal status lands here. Record as DATA, best-effort alert, then CONTINUE to snapshot/reconcile/instance-stop — a data-phase failure must NOT block the EOD close-out. Mirrors Saturday ResearchPredictorParallel branch-error pattern.",
       "Parameters": {
         "phase": "DataSpot",
         "source": "CheckPostMarket*SpotStatus or launch Catch"
@@ -1134,11 +1134,11 @@
     },
     "PublishDataSpotFailureImmediate": {
       "Type": "Task",
-      "Comment": "Best-effort SNS alert that the EOD data spot failed \u2014 surfaces the miss WITHOUT blocking reconcile/stop. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline.",
+      "Comment": "Best-effort SNS alert that the EOD data spot failed — surfaces the miss WITHOUT blocking reconcile/stop. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Data Spot \u2014 FAILED (fail-open, reconcile continues)",
+        "Subject": "Alpha Engine EOD Data Spot — FAILED (fail-open, reconcile continues)",
         "Message.$": "States.Format('EOD data-spot phase failed but the pipeline continued to reconcile + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
       },
       "ResultPath": "$.data_spot_failure_notify",
@@ -1183,7 +1183,7 @@
     },
     "ProbeEODReconcilePrecondition": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #1: verify-by-artifact EOD-reconcile precondition probe. Replaces the old $.data_spot_error launch-phase flag test with a fresh S3 read (via alpha-engine-eod-precondition-probe) of the macro-freshness sentinel builders/daily_append.py writes only AFTER readback-verifying run_date's SPY close is queryable in ArcticDB \u2014 the actual precondition eod_reconcile.py's _spy_close hard-depends on, not merely 'did the launch/poll path see an error'. Called fresh at every reconcile-gate entry (including each HealReProbe iteration in the heal loop below) \u2014 never cached, never trusted from an earlier point in the execution.",
+      "Comment": "config-I2702 deliverable #1: verify-by-artifact EOD-reconcile precondition probe. Replaces the old $.data_spot_error launch-phase flag test with a fresh S3 read (via alpha-engine-eod-precondition-probe) of the macro-freshness sentinel builders/daily_append.py writes only AFTER readback-verifying run_date's SPY close is queryable in ArcticDB — the actual precondition eod_reconcile.py's _spy_close hard-depends on, not merely 'did the launch/poll path see an error'. Called fresh at every reconcile-gate entry (including each HealReProbe iteration in the heal loop below) — never cached, never trusted from an earlier point in the execution.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-eod-precondition-probe",
@@ -1208,7 +1208,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "SWALLOW (feedback_no_silent_fails): (a) failure mode swallowed = the precondition-probe Lambda itself errored (IAM drift, S3 outage, malformed sentinel JSON) \u2014 NOT a data-gap signal; (c) recording surface = $.precondition_probe is left ABSENT on this path, so CheckSkipEODReconcile's BooleanEquals-false test does not match and control falls through to its Default (EODReconcile) rather than silently skipping a possibly-fine reconcile. This is deliberately fail-SAFE-toward-reconcile, not fail-open: eod_reconcile.py's own _spy_close hard-fail (no fallback, by design) remains the authoritative backstop if the data is genuinely absent \u2014 a probe-infra failure can at worst cause one more HandleFailure page, never a silent false-green.",
+          "Comment": "SWALLOW (feedback_no_silent_fails): (a) failure mode swallowed = the precondition-probe Lambda itself errored (IAM drift, S3 outage, malformed sentinel JSON) — NOT a data-gap signal; (c) recording surface = $.precondition_probe is left ABSENT on this path, so CheckSkipEODReconcile's BooleanEquals-false test does not match and control falls through to its Default (EODReconcile) rather than silently skipping a possibly-fine reconcile. This is deliberately fail-SAFE-toward-reconcile, not fail-open: eod_reconcile.py's own _spy_close hard-fail (no fallback, by design) remains the authoritative backstop if the data is genuinely absent — a probe-infra failure can at worst cause one more HandleFailure page, never a silent false-green.",
           "ResultPath": null,
           "Next": "CheckSkipEODReconcile"
         }
@@ -1218,7 +1218,7 @@
     },
     "CheckSkipEODReconcile": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work. REPLACED 2026-07-15 (config-I2702 deliverable #1): the old $.data_spot_error IsPresent test decided skip/run from a LAUNCH-PHASE flag, which the 2026-07-15 incident proved can be stale (a transient poll-side SDK hiccup stamped the flag while the collector was still running and later finished rc=0, but the flag test skipped reconcile anyway). Now gates on $.precondition_probe.Payload.precondition_met \u2014 a FRESH S3 read of the readback-verified macro-freshness sentinel, taken immediately before this Choice by the new ProbeEODReconcilePrecondition state. IsPresent+BooleanEquals(false) (not merely absent) \u2014 a probe that never ran (its own Catch swallow) falls through to Default (EODReconcile), deliberately fail-safe-toward-reconcile; see ProbeEODReconcilePrecondition's Catch comment.",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work. REPLACED 2026-07-15 (config-I2702 deliverable #1): the old $.data_spot_error IsPresent test decided skip/run from a LAUNCH-PHASE flag, which the 2026-07-15 incident proved can be stale (a transient poll-side SDK hiccup stamped the flag while the collector was still running and later finished rc=0, but the flag test skipped reconcile anyway). Now gates on $.precondition_probe.Payload.precondition_met — a FRESH S3 read of the readback-verified macro-freshness sentinel, taken immediately before this Choice by the new ProbeEODReconcilePrecondition state. IsPresent+BooleanEquals(false) (not merely absent) — a probe that never ran (its own Catch swallow) falls through to Default (EODReconcile), deliberately fail-safe-toward-reconcile; see ProbeEODReconcilePrecondition's Catch comment.",
       "Choices": [
         {
           "And": [
@@ -1259,12 +1259,12 @@
     },
     "SkipEODReconcileDataGap": {
       "Type": "Task",
-      "Comment": "Loud, distinctly-labeled alert for a known/self-healing condition \u2014 NOT a silent swallow (feedback_no_silent_fails): the precondition probe confirmed run_date's SPY close is not yet verified-present in ArcticDB, so EODReconcile is skipped rather than left to guarantee-crash into the generic HandleFailure/FailExecution path. UPDATED config-I2702 deliverable #3: recovery is no longer a documented MANUAL operator-replay step \u2014 control proceeds into the closed self-heal loop (SetDegradedFlag -> CheckHealLoopEligible -> InitHealLoop -> ...) which dispatches the missing data-spot workload(s), re-probes, and auto-starts a reconcile-only replay execution (I2700's proven skip_post_market_data + skip_capture_snapshot shape) the moment the precondition lands \u2014 paging only if it fails to converge within 2 attempts or by the probe-computed 09:00 UTC deadline (HealNonConvergent).",
+      "Comment": "Loud, distinctly-labeled alert for a known/self-healing condition — NOT a silent swallow (feedback_no_silent_fails): the precondition probe confirmed run_date's SPY close is not yet verified-present in ArcticDB, so EODReconcile is skipped rather than left to guarantee-crash into the generic HandleFailure/FailExecution path. UPDATED config-I2702 deliverable #3: recovery is no longer a documented MANUAL operator-replay step — control proceeds into the closed self-heal loop (SetDegradedFlag -> CheckHealLoopEligible -> InitHealLoop -> ...) which dispatches the missing data-spot workload(s), re-probes, and auto-starts a reconcile-only replay execution (I2700's proven skip_post_market_data + skip_capture_snapshot shape) the moment the precondition lands — paging only if it fails to converge within 2 attempts or by the probe-computed 09:00 UTC deadline (HealNonConvergent).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Reconcile SKIPPED (data gap, self-healing)",
-        "Message.$": "States.Format('EOD reconcile SKIPPED for {}: post-market data-spot phase failed after its retry budget was exhausted (most likely an AWS spot interruption) \u2014 no NAV/alpha row will be written today. Detail: {}. Chronic-gap-heal will backfill the missing ArcticDB close; then rerun EODReconcile via an operator-replay execution with skip_post_market_data=true.', $.run_date, States.JsonToString($.data_spot_error))"
+        "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) — no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
       },
       "ResultPath": "$.eod_skip_notify",
       "Catch": [
@@ -1277,12 +1277,11 @@
           "Next": "SetDegradedFlag"
         }
       ],
-      "Next": "SetDegradedFlag",
-      "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) \u2014 no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
+      "Next": "SetDegradedFlag"
     },
     "SetDegradedFlag": {
       "Type": "Pass",
-      "Comment": "config-I2702 deliverable #4: an execution that skips ANY load-bearing state (here: EODReconcile) must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary flag, checked once by CheckDegradedOutcome AFTER the cost-guard tail (StopTradingInstance) always completes, to route to the distinct DegradedSucceeded terminal instead of NormalSucceeded. The DISTINCT NOTIFICATION half of deliverable #4 already fired above (SkipEODReconcileDataGap) and will fire again from HealConvergedNotify or HealNonConvergent below \u2014 this flag only controls the terminal state's shape/output, mirroring how SubstrateHealthCheckDegraded already threads $.health_check_degraded through this same file for an analogous (lower-severity) condition.",
+      "Comment": "config-I2702 deliverable #4: an execution that skips ANY load-bearing state (here: EODReconcile) must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary flag, checked once by CheckDegradedOutcome AFTER the cost-guard tail (StopTradingInstance) always completes, to route to the distinct DegradedSucceeded terminal instead of NormalSucceeded. The DISTINCT NOTIFICATION half of deliverable #4 already fired above (SkipEODReconcileDataGap) and will fire again from HealConvergedNotify or HealNonConvergent below — this flag only controls the terminal state's shape/output, mirroring how SubstrateHealthCheckDegraded already threads $.health_check_degraded through this same file for an analogous (lower-severity) condition.",
       "Parameters": {
         "degraded": true,
         "reason": "eod_reconcile_skipped_data_gap",
@@ -1293,7 +1292,7 @@
     },
     "CheckHealLoopEligible": {
       "Type": "Choice",
-      "Comment": "config-I2702 deliverable #3: recursion guard. An operator-replay execution (pipeline_role=operator-replay \u2014 including a heal-dispatched replay itself, HealDispatchReplay below) that STILL finds the precondition unmet must not spawn a further self-heal loop (replays run with skip_post_market_data=true, so they have no data-spot phase to retry \u2014 looping here would just burn the 2-attempt budget doing nothing). Page immediately instead. A live/daemon/backstop-triggered execution (the normal case) enters the loop.",
+      "Comment": "config-I2702 deliverable #3: recursion guard. An operator-replay execution (pipeline_role=operator-replay — including a heal-dispatched replay itself, HealDispatchReplay below) that STILL finds the precondition unmet must not spawn a further self-heal loop (replays run with skip_post_market_data=true, so they have no data-spot phase to retry — looping here would just burn the 2-attempt budget doing nothing). Page immediately instead. A live/daemon/backstop-triggered execution (the normal case) enters the loop.",
       "Choices": [
         {
           "Variable": "$.pipeline_role",
@@ -1305,7 +1304,7 @@
     },
     "InitHealLoop": {
       "Type": "Pass",
-      "Comment": "config-I2702 deliverable #3: attempts counter for the closed self-heal loop. Mirrors the InitDataSpotRetryCounter/InitSSMPollCounter idiom already used elsewhere in this file. Bound at 2 attempts (issue's suggested default) \u2014 combined with the 09:00-UTC-next-day deadline the precondition probe computes, whichever gate trips first ends the loop (HealLoopGate).",
+      "Comment": "config-I2702 deliverable #3: attempts counter for the closed self-heal loop. Mirrors the InitDataSpotRetryCounter/InitSSMPollCounter idiom already used elsewhere in this file. Bound at 2 attempts (issue's suggested default) — combined with the 09:00-UTC-next-day deadline the precondition probe computes, whichever gate trips first ends the loop (HealLoopGate).",
       "Result": {
         "attempts": 0
       },
@@ -1314,7 +1313,7 @@
     },
     "HealLoopGate": {
       "Type": "Choice",
-      "Comment": "config-I2702 deliverable #3(d): stop the loop and page loudly (never silently) once EITHER bound trips \u2014 2 attempts exhausted, or the probe-computed 09:00 UTC deadline has passed (checked against the MOST RECENT probe result; $.precondition_probe is always present here because SkipEODReconcileDataGap is only reachable after a successful ProbeEODReconcilePrecondition call).",
+      "Comment": "config-I2702 deliverable #3(d): stop the loop and page loudly (never silently) once EITHER bound trips — 2 attempts exhausted, or the probe-computed 09:00 UTC deadline has passed (checked against the MOST RECENT probe result; $.precondition_probe is always present here because SkipEODReconcileDataGap is only reachable after a successful ProbeEODReconcilePrecondition call).",
       "Choices": [
         {
           "Or": [
@@ -1334,7 +1333,7 @@
     },
     "HealLaunchPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(a): dispatch the missing post-market-data workload. force_on_demand=true unconditionally \u2014 we are already in a degraded-recovery context (the upstream CheckDataSpotRetryBudget single-retry-on-spot already ran and this loop is a step beyond that), so gambling on spot capacity again is not worth the risk of a second interruption burning a heal-loop attempt.",
+      "Comment": "config-I2702 deliverable #3(a): dispatch the missing post-market-data workload. force_on_demand=true unconditionally — we are already in a degraded-recovery context (the upstream CheckDataSpotRetryBudget single-retry-on-spot already ran and this loop is a step beyond that), so gambling on spot capacity again is not worth the risk of a second interruption burning a heal-loop attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
@@ -1360,7 +1359,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "A launch failure this heal attempt is not fatal to the loop \u2014 HealLoopIncrement retries (bounded by HealLoopGate).",
+          "Comment": "A launch failure this heal attempt is not fatal to the loop — HealLoopIncrement retries (bounded by HealLoopGate).",
           "ResultPath": "$.heal_error",
           "Next": "HealLoopIncrement"
         }
@@ -1382,7 +1381,7 @@
     },
     "HealPollPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #5: poll the SSM command's OWN authoritative state to a terminal status \u2014 no arbitrary attempt cap on the InProgress/Pending/Delayed branch (bounded only by the data-spot box's own MAX_RUNTIME_SECONDS=7200 watchdog). The transient-SDK-error Retry budget below mirrors the widened PollPostMarketDataSpot budget.",
+      "Comment": "config-I2702 deliverable #5: poll the SSM command's OWN authoritative state to a terminal status — no arbitrary attempt cap on the InProgress/Pending/Delayed branch (bounded only by the data-spot box's own MAX_RUNTIME_SECONDS=7200 watchdog). The transient-SDK-error Retry budget below mirrors the widened PollPostMarketDataSpot budget.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.heal_postmarket_launch.Payload.data_spot.command_id",
@@ -1507,7 +1506,7 @@
     },
     "HealPollArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #5: poll the SSM command's own authoritative state to a terminal status \u2014 unbounded on InProgress, bounded only by the box's own watchdog.",
+      "Comment": "config-I2702 deliverable #5: poll the SSM command's own authoritative state to a terminal status — unbounded on InProgress, bounded only by the box's own watchdog.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.heal_arctic_launch.Payload.data_spot.command_id",
@@ -1585,7 +1584,7 @@
     },
     "HealReProbe": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(b): re-probe after the dispatched workloads complete. Overwrites $.precondition_probe with the FRESH result (never trusts the earlier probe) \u2014 HealCheckConverged and, on the next iteration, HealLoopGate's deadline check both read this latest value.",
+      "Comment": "config-I2702 deliverable #3(b): re-probe after the dispatched workloads complete. Overwrites $.precondition_probe with the FRESH result (never trusts the earlier probe) — HealCheckConverged and, on the next iteration, HealLoopGate's deadline check both read this latest value.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-eod-precondition-probe",
@@ -1610,7 +1609,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "A re-probe infra failure is not a convergence signal either way \u2014 try again next iteration rather than guessing.",
+          "Comment": "A re-probe infra failure is not a convergence signal either way — try again next iteration rather than guessing.",
           "ResultPath": "$.heal_error",
           "Next": "HealLoopIncrement"
         }
@@ -1641,7 +1640,7 @@
     },
     "HealDispatchReplay": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution, reusing I2700's PROVEN input shape EXACTLY (pipeline_role=operator-replay + skip_post_market_data=true + skip_capture_snapshot=true \u2014 the shape that ran successfully as 'operator-replay-eodreconcile-2026-07-15' and its 2026-07-13 precedent). Deliberately a SEPARATE execution rather than looping this one back through CaptureSnapshot: CaptureSnapshot already ran ONCE earlier in THIS execution (it sits upstream of the precondition probe in the pipeline order), so re-entering the data-spot phase in-place would re-trigger a second live-IB snapshot capture \u2014 exactly what I2700's skip_capture_snapshot flag exists to avoid. skip_refresh_executor_deploy=true because RefreshExecutorDeploy already ran at the top of THIS execution and re-froze .frozen_executor_sha \u2014 the box is already known-fresh. Fire-and-forget (non-.sync): this execution's own terminal state does not wait for the replay's outcome \u2014 the replay's own SUCCEEDED/FAILED status is independently observable (execution name eod-heal-replay-{run_date}-*) and IS the 'convergence notification' this issue's closes-when criteria describes.",
+      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution, reusing I2700's PROVEN input shape EXACTLY (pipeline_role=operator-replay + skip_post_market_data=true + skip_capture_snapshot=true — the shape that ran successfully as 'operator-replay-eodreconcile-2026-07-15' and its 2026-07-13 precedent). Deliberately a SEPARATE execution rather than looping this one back through CaptureSnapshot: CaptureSnapshot already ran ONCE earlier in THIS execution (it sits upstream of the precondition probe in the pipeline order), so re-entering the data-spot phase in-place would re-trigger a second live-IB snapshot capture — exactly what I2700's skip_capture_snapshot flag exists to avoid. skip_refresh_executor_deploy=true because RefreshExecutorDeploy already ran at the top of THIS execution and re-froze .frozen_executor_sha — the box is already known-fresh. Fire-and-forget (non-.sync): this execution's own terminal state does not wait for the replay's outcome — the replay's own SUCCEEDED/FAILED status is independently observable (execution name eod-heal-replay-{run_date}-*) and IS the 'convergence notification' this issue's closes-when criteria describes.",
       "Resource": "arn:aws:states:::states:startExecution",
       "Parameters": {
         "StateMachineArn.$": "$$.StateMachine.Id",
@@ -1663,7 +1662,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "The data healed but the StartExecution API call itself failed (IAM drift, throttling) \u2014 this is NOT a silent success; page immediately rather than pretending convergence.",
+          "Comment": "The data healed but the StartExecution API call itself failed (IAM drift, throttling) — this is NOT a silent success; page immediately rather than pretending convergence.",
           "ResultPath": "$.heal_replay_dispatch_error",
           "Next": "HealReplayDispatchFailed"
         }
@@ -1673,11 +1672,11 @@
     },
     "HealReplayDispatchFailed": {
       "Type": "Task",
-      "Comment": "Loud page: the precondition converged but the auto-replay StartExecution call itself failed \u2014 requires a MANUAL operator-replay using I2700's shape (skip_post_market_data + skip_capture_snapshot).",
+      "Comment": "Loud page: the precondition converged but the auto-replay StartExecution call itself failed — requires a MANUAL operator-replay using I2700's shape (skip_post_market_data + skip_capture_snapshot).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Self-Heal \u2014 CONVERGED BUT REPLAY DISPATCH FAILED (operator action required)",
+        "Subject": "Alpha Engine EOD Self-Heal — CONVERGED BUT REPLAY DISPATCH FAILED (operator action required)",
         "Message.$": "States.Format('EOD self-heal for {} converged (SPY close now verified present) but the auto-replay StartExecution call itself failed: {}. Run a manual operator-replay: pipeline_role=operator-replay, skip_post_market_data=true, skip_capture_snapshot=true (I2700 shape).', $.run_date, States.JsonToString($.heal_replay_dispatch_error))"
       },
       "ResultPath": "$.heal_replay_dispatch_failed_notify",
@@ -1694,11 +1693,11 @@
     },
     "HealConvergedNotify": {
       "Type": "Task",
-      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal succeeded without any operator action; the replay execution named here does the actual EODReconcile.",
+      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) — the self-heal succeeded without any operator action; the replay execution named here does the actual EODReconcile.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Self-Heal \u2014 CONVERGED (replay dispatched, no operator action needed)",
+        "Subject": "Alpha Engine EOD Self-Heal — CONVERGED (replay dispatched, no operator action needed)",
         "Message.$": "States.Format('EOD self-heal for {} converged after {} attempt(s): the missing data-spot workload(s) were re-dispatched, SPY close is now verified present in ArcticDB, and a reconcile-only replay execution has been started automatically ({}). No operator action required.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
       },
       "ResultPath": "$.heal_converged_notify",
@@ -1715,12 +1714,12 @@
     },
     "HealNonConvergent": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(d): THE loud page. Fires only when the heal loop exhausted its 2-attempt budget, passed the probe-computed 09:00 UTC deadline, or this is a replay execution that still can't converge (CheckHealLoopEligible). Genuinely requires operator attention \u2014 the automatic path has been exhausted.",
+      "Comment": "config-I2702 deliverable #3(d): THE loud page. Fires only when the heal loop exhausted its 2-attempt budget, passed the probe-computed 09:00 UTC deadline, or this is a replay execution that still can't converge (CheckHealLoopEligible). Genuinely requires operator attention — the automatic path has been exhausted.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Self-Heal \u2014 DID NOT CONVERGE (operator action required)",
-        "Message.$": "States.Format('EOD self-heal for {} did NOT converge: the automatic heal loop (dispatch missing data-spot workload(s) -> re-probe) exhausted its attempt budget and/or passed its deadline without SPY close landing in ArcticDB. pipeline_role={}, latest probe: {}. Manual intervention needed \u2014 investigate the data-spot dispatch failures, then run an operator-replay (I2700 shape: skip_post_market_data=true, skip_capture_snapshot=true) once the underlying data issue is fixed.', $.run_date, $.pipeline_role, States.JsonToString($.precondition_probe))"
+        "Subject": "Alpha Engine EOD Self-Heal — DID NOT CONVERGE (operator action required)",
+        "Message.$": "States.Format('EOD self-heal for {} did NOT converge: the automatic heal loop (dispatch missing data-spot workload(s) -> re-probe) exhausted its attempt budget and/or passed its deadline without SPY close landing in ArcticDB. pipeline_role={}, latest probe: {}. Manual intervention needed — investigate the data-spot dispatch failures, then run an operator-replay (I2700 shape: skip_post_market_data=true, skip_capture_snapshot=true) once the underlying data issue is fixed.', $.run_date, $.pipeline_role, States.JsonToString($.precondition_probe))"
       },
       "ResultPath": "$.heal_nonconvergent_notify",
       "Catch": [
@@ -1764,7 +1763,7 @@
     },
     "StopTradingInstance": {
       "Type": "Task",
-      "Comment": "Stop trading EC2 instance after EOD completes EXTENDED config-I2702 deliverable #4: no longer a bare execution terminal (End:true) \u2014 routes to CheckDegradedOutcome so a run that skipped EODReconcile ends in the distinct DegradedSucceeded terminal instead of the same plain ExecutionSucceeded a fully-green day gets.",
+      "Comment": "Stop trading EC2 instance after EOD completes EXTENDED config-I2702 deliverable #4: no longer a bare execution terminal (End:true) — routes to CheckDegradedOutcome so a run that skipped EODReconcile ends in the distinct DegradedSucceeded terminal instead of the same plain ExecutionSucceeded a fully-green day gets.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1793,7 +1792,7 @@
     },
     "CheckDegradedOutcome": {
       "Type": "Choice",
-      "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set (by SetDegradedFlag) iff the precondition probe ever found the SPY close not-yet-verified-present this execution \u2014 regardless of whether the self-heal loop subsequently converged (HealConvergedNotify) or paged (HealNonConvergent): EODReconcile was skipped IN THIS EXECUTION either way, so 'plain ExecutionSucceeded' would still be a lie about THIS execution's own work, even when the system as a whole self-healed via a replay.",
+      "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set (by SetDegradedFlag) iff the precondition probe ever found the SPY close not-yet-verified-present this execution — regardless of whether the self-heal loop subsequently converged (HealConvergedNotify) or paged (HealNonConvergent): EODReconcile was skipped IN THIS EXECUTION either way, so 'plain ExecutionSucceeded' would still be a lie about THIS execution's own work, even when the system as a whole self-healed via a replay.",
       "Choices": [
         {
           "Variable": "$.degraded_summary.degraded",
@@ -1805,19 +1804,19 @@
     },
     "NormalSucceeded": {
       "Type": "Succeed",
-      "Comment": "The ordinary, fully-green terminal \u2014 EODReconcile ran (or was validly skipped via an operator-replay skip_eod_reconcile flag), nothing degraded."
+      "Comment": "The ordinary, fully-green terminal — EODReconcile ran (or was validly skipped via an operator-replay skip_eod_reconcile flag), nothing degraded."
     },
     "DegradedSucceeded": {
       "Type": "Succeed",
-      "Comment": "config-I2702 deliverable #4: distinct terminal for a run that skipped EODReconcile. Still reports AWS execution status SUCCEEDED (a Step Functions Succeed state cannot do otherwise) \u2014 the 'never report plain green' guarantee is carried by (a) this being a DIFFERENT named state than NormalSucceeded, visible in the SF console/execution history and in $.degraded_summary on the execution output, and (b) the distinctly-labeled SNS/Telegram notifications that already fired earlier in this execution (SkipEODReconcileDataGap, and HealConvergedNotify or HealNonConvergent) \u2014 mirroring this file's OWN established pattern for exactly this kind of signal (PublishDataSpotFailureImmediate, SubstrateHealthCheckDegraded + PublishSubstrateHealthCheckDegradedAlert) rather than relying on sf-telegram-notifier's generic execution-status rendering, which does not special-case Succeed-state names."
+      "Comment": "config-I2702 deliverable #4: distinct terminal for a run that skipped EODReconcile. Still reports AWS execution status SUCCEEDED (a Step Functions Succeed state cannot do otherwise) — the 'never report plain green' guarantee is carried by (a) this being a DIFFERENT named state than NormalSucceeded, visible in the SF console/execution history and in $.degraded_summary on the execution output, and (b) the distinctly-labeled SNS/Telegram notifications that already fired earlier in this execution (SkipEODReconcileDataGap, and HealConvergedNotify or HealNonConvergent) — mirroring this file's OWN established pattern for exactly this kind of signal (PublishDataSpotFailureImmediate, SubstrateHealthCheckDegraded + PublishSubstrateHealthCheckDegradedAlert) rather than relying on sf-telegram-notifier's generic execution-status rendering, which does not special-case Succeed-state names."
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS \u2014 instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
+      "Comment": "Failure alert via SNS — instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Pipeline \u2014 FAILED",
+        "Subject": "Alpha Engine EOD Pipeline — FAILED",
         "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
@@ -1835,7 +1834,7 @@
     },
     "ForceStopInstance": {
       "Type": "Task",
-      "Comment": "Always stop trading instance even on failure \u2014 avoid cost overrun",
+      "Comment": "Always stop trading instance even on failure — avoid cost overrun",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1846,7 +1845,7 @@
     "FailExecution": {
       "Type": "Fail",
       "Error": "EODPipelineFailure",
-      "Cause": "EOD pipeline failed \u2014 trading instance stopped, check logs."
+      "Cause": "EOD pipeline failed — trading instance stopped, check logs."
     }
   }
 }
