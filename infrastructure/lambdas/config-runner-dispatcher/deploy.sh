@@ -28,7 +28,7 @@
 # This script's FLAGLESS run is code-only; --bootstrap is operator-only.
 #
 # POST-BOOTSTRAP MANUAL STEPS (cannot be automated via this script — see
-# alpha-engine-config-I2572 for the full sequencing):
+# alpha-engine-config-I2572/I2653 for the full sequencing):
 #   1. Create the SSM params this Lambda/box read:
 #        /alpha-engine/config_runner/webhook_secret  (random string, shared
 #          with the GitHub webhook config below)
@@ -38,6 +38,13 @@
 #          runner registration tokens; the Actions permission does NOT cover
 #          this. Fine-grained PAT creation/scoping is a GitHub web-UI-only,
 #          human action — cannot be done via this script or the API.)
+#        /alpha-engine/config_runner/github_read_pat  (SEPARATE fine-grained
+#          PAT, owner=nousergon, repo=alpha-engine-config, Actions: Read
+#          ONLY — deliberately NOT the same PAT as above. This one is read
+#          by the Lambda's own execution role (behind a public Function URL)
+#          for the reconcile phase's read-only "list queued jobs" calls;
+#          keeping it separate and minimally-scoped means a Lambda-side
+#          issue can never expose Administration:write.)
 #   2. Register the GitHub webhook on nousergon/alpha-engine-config:
 #        event: workflow_job, content type: json, secret: (the same value as
 #        the SSM param above), URL: this script's printed Function URL.
@@ -45,9 +52,10 @@
 #
 # Usage:
 #   bash .../config-runner-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
-#   bash .../config-runner-dispatcher/deploy.sh --bootstrap # operator-only: create/update the IAM role + Lambda + Function URL
+#   bash .../config-runner-dispatcher/deploy.sh --bootstrap # operator-only: create/update the IAM role + Lambda + Function URL + reconcile schedule
 #   bash .../config-runner-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../config-runner-dispatcher/deploy.sh --smoke     # invoke the WORKER phase once with a synthetic job id (fires a REAL spot box)
+#   bash .../config-runner-dispatcher/deploy.sh --reconcile-test # invoke the RECONCILE phase once directly (read-only unless it finds a genuinely stale job)
 
 set -euo pipefail
 
@@ -66,11 +74,13 @@ source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
 DRY_RUN=false
 BOOTSTRAP=false
 SMOKE=false
+RECONCILE_TEST=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
     --smoke) SMOKE=true ;;
+    --reconcile-test) RECONCILE_TEST=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
 done
@@ -198,6 +208,59 @@ if $BOOTSTRAP; then
     echo "     header for the full remaining manual steps."
     echo ""
   fi
+
+  # --- 2c. Reconcile backstop schedule (config-I2653) ---
+  # A self-hosted runner registered via a plain registration token binds to
+  # the repo's WHOLE label pool, not the specific job that triggered its
+  # launch (GitHub has no per-job reservation API — verified against
+  # GitHub's own docs; an earlier JIT-runner-config fix attempt for this
+  # issue was wrong, JIT mints the same kind of "any matching job"
+  # registration, just more securely). Under concurrent load a dispatched
+  # runner can grab an unrelated queued job, permanently stranding the job
+  # that triggered its launch — GitHub sends `queued` exactly once per job.
+  # This EventBridge Scheduler rule invokes the Lambda's RECONCILE phase
+  # every 60s as a self-healing backstop; see index.py's module docstring
+  # phase 3 for the full mechanism.
+  RECONCILE_SCHED_ROLE_NAME="alpha-engine-config-runner-reconcile-scheduler-role"
+  RECONCILE_SCHED_POLICY_NAME="invoke-config-runner-dispatcher"
+  RECONCILE_SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${RECONCILE_SCHED_ROLE_NAME}"
+  RECONCILE_SCHED_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${RECONCILE_SCHED_ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  Creating Scheduler execution role: ${RECONCILE_SCHED_ROLE_NAME}"
+    run aws iam create-role --role-name "${RECONCILE_SCHED_ROLE_NAME}" \
+      --assume-role-policy-document "${RECONCILE_SCHED_TRUST}" \
+      --description "EventBridge Scheduler role: invoke ${FUNCTION_NAME}'s reconcile phase every 60s (config-I2653)" \
+      --query 'Role.RoleName' --output text
+  else
+    echo "  Scheduler execution role exists: ${RECONCILE_SCHED_ROLE_NAME}"
+  fi
+  FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+  RECONCILE_INVOKE_POLICY="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":[\"${FN_ARN}\",\"${FN_ARN}:*\"]}]}"
+  echo "  Applying Scheduler invoke policy: ${RECONCILE_SCHED_POLICY_NAME}"
+  run aws iam put-role-policy --role-name "${RECONCILE_SCHED_ROLE_NAME}" \
+    --policy-name "${RECONCILE_SCHED_POLICY_NAME}" \
+    --policy-document "${RECONCILE_INVOKE_POLICY}"
+  if ! $DRY_RUN; then echo "  Waiting 10s for Scheduler role propagation..."; sleep 10; fi
+
+  RECONCILE_SCHED_NAME="alpha-engine-config-runner-reconcile"
+  RECONCILE_TARGET="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${RECONCILE_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"reconcile\\\":true}\"}"
+  if aws scheduler get-schedule --name "${RECONCILE_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
+    echo "  Updating Scheduler rule: ${RECONCILE_SCHED_NAME} -> every 60s"
+    run aws scheduler update-schedule --name "${RECONCILE_SCHED_NAME}" \
+      --schedule-expression "rate(1 minute)" \
+      --flexible-time-window '{"Mode":"OFF"}' --target "${RECONCILE_TARGET}" \
+      --region "${REGION}" --query 'ScheduleArn' --output text
+  else
+    echo "  Creating Scheduler rule: ${RECONCILE_SCHED_NAME} -> every 60s"
+    run aws scheduler create-schedule --name "${RECONCILE_SCHED_NAME}" \
+      --schedule-expression "rate(1 minute)" \
+      --flexible-time-window '{"Mode":"OFF"}' --target "${RECONCILE_TARGET}" \
+      --region "${REGION}" --query 'ScheduleArn' --output text
+  fi
+  if ! $DRY_RUN; then
+    aws scheduler get-schedule --name "${RECONCILE_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null \
+      || { echo "ERROR: Scheduler rule ${RECONCILE_SCHED_NAME} not found after create/update" >&2; exit 1; }
+  fi
 fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
@@ -246,5 +309,23 @@ if $SMOKE; then
     --region "${REGION}" \
     "${RESP}" >/dev/null
   cat "${RESP}"
+  echo ""
+fi
+
+# ----- 5. Reconcile test (synthetic reconcile-phase event, direct invoke) ---
+
+if $RECONCILE_TEST; then
+  echo ""
+  echo "Testing the RECONCILE phase via direct invoke..."
+  echo "Read-only unless it finds a genuinely stale (>90s) queued job with no in-flight box — in which case it dispatches a REAL spot box for it (which is the correct/intended behavior, not a side effect to worry about)."
+  RESP2=$(mktemp)
+  trap "rm -f '${RESP2}'" EXIT
+  aws lambda invoke \
+    --function-name "${FUNCTION_NAME}" \
+    --payload '{"reconcile":true}' \
+    --cli-binary-format raw-in-base64-out \
+    --region "${REGION}" \
+    "${RESP2}" >/dev/null
+  cat "${RESP2}"
   echo ""
 fi

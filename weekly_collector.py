@@ -1581,6 +1581,77 @@ def _detect_missing_universe_days(
     return [d.strftime("%Y-%m-%d") for d in missing]
 
 
+def _detect_fallback_quality_universe_days(
+    bucket: str,
+    target_date: str,
+    lookback_trading_days: int = _UNIVERSE_GAP_HEAL_LOOKBACK_TD,
+) -> list[str]:
+    """Trading days strictly before ``target_date`` PRESENT in ArcticDB but
+    still on EOD's yfinance-fallback quality — never received the next
+    morning's Polygon VWAP-corrected overwrite (alpha-engine-config#2664).
+
+    Every trading day is written twice: EOD same-evening writes a
+    yfinance-sourced row (``source="yfinance"``, ``VWAP=NaN``); the next
+    morning's MorningArcticAppend is supposed to overwrite it with a
+    Polygon-sourced row (``source="polygon"``). ``_detect_missing_universe_days``
+    only catches a day with NO row at all — if the Polygon overwrite fails
+    (e.g. a rate limit; 2026-07-15 incident) the day is PRESENT, so that
+    detector never flags it, and nothing else in the pipeline ever revisits
+    a day that already has a row. This closes that hole using the same
+    fixed-key SPY proxy as the missing-day detector (avoids
+    reconstitution-churn false positives) — but reads it from the
+    **universe** library, not macro. SPY exists in both: ``macro_lib`` holds
+    only a bare ``Close`` reference copy (no ``source``/OHLCV — that's all
+    ``_detect_missing_universe_days`` needs, since it only checks index
+    presence); the full ``OHLCV_COLS + [PROVENANCE_COL] + FEATURES`` schema
+    with ``source`` lives in ``universe_lib`` (verified live 2026-07-15:
+    ``macro_lib.tail("SPY").data`` columns == ``['Close']`` only — reading
+    ``source`` off it would silently always return ``[]``).
+
+    Returns the affected days as ``YYYY-MM-DD`` strings, newest first.
+    Best-effort: any read failure, or a schema without a ``source`` column
+    (pre-provenance-tagging history), returns ``[]`` — degrades to
+    missing-day-only healing rather than mis-flagging.
+    """
+    from datetime import date as _date
+
+    import pandas as pd
+
+    from nousergon_lib.trading_calendar import previous_trading_day
+
+    target = _date.fromisoformat(target_date)
+    expected: list[_date] = []
+    d = previous_trading_day(target)
+    for _ in range(lookback_trading_days):
+        expected.append(d)
+        d = previous_trading_day(d)
+
+    try:
+        from store.arctic_store import get_universe_lib
+
+        universe_lib = get_universe_lib(bucket)
+        df = universe_lib.tail("SPY", n=lookback_trading_days + 6).data
+    except Exception as exc:  # best-effort reference read
+        logger.warning(
+            "universe-gap detect: universe/SPY source read failed (%s) — "
+            "skipping fallback-quality heal; freshness monitor remains the backstop.",
+            exc,
+        )
+        return []
+
+    if "source" not in df.columns:
+        return []
+
+    by_date = {pd.Timestamp(ix).date(): src for ix, src in df["source"].items()}
+
+    fallback_days = [
+        d for d in expected
+        if d in by_date and pd.notna(by_date[d]) and str(by_date[d]).lower() != "polygon"
+    ]
+    fallback_days.sort(reverse=True)  # newest first
+    return [d.strftime("%Y-%m-%d") for d in fallback_days]
+
+
 def _self_heal_missing_universe_days(
     bucket: str,
     target_date: str,
@@ -1589,9 +1660,20 @@ def _self_heal_missing_universe_days(
     lookback_trading_days: int = _UNIVERSE_GAP_HEAL_LOOKBACK_TD,
     max_heal_days: int = _UNIVERSE_GAP_HEAL_MAX_PER_RUN,
 ) -> dict:
-    """Backfill trading days missing from the ArcticDB universe (config#1228).
+    """Backfill trading days missing OR fallback-quality in the ArcticDB
+    universe (config#1228; fallback-quality healing added config#2664).
 
-    For each missing day (newest first, capped at ``max_heal_days`` per run):
+    Two distinct conditions are healed through the same path, most-severe
+    first (missing days, then present-but-fallback-quality days), each
+    newest-first within its own group, capped at ``max_heal_days`` combined
+    per run:
+      - **Missing**: no row at all for that day (a skipped weekday/EOD SF).
+      - **Fallback-quality**: EOD wrote a yfinance-sourced row, but the next
+        morning's Polygon VWAP-correction pass never landed (e.g. a rate
+        limit) — the day is present, so nothing else ever revisits it
+        (see :func:`_detect_fallback_quality_universe_days`).
+
+    For each day to heal:
       1. Resolve that day's constituents via ``load_constituents_for_run_date``
          (run_date-direct, #468-correct — never the latest_weekly pointer),
          plus the fixed macro keys.
@@ -1599,8 +1681,10 @@ def _self_heal_missing_universe_days(
          (``daily_closes.collect``; ``auto`` source so FRED/yfinance backfill
          any Polygon gaps — completeness matters more than VWAP purity here).
       3. Splice the day into ArcticDB via ``daily_append(date_str=day)`` — an
-         idempotent mid-series insert (re-running a partially-healed day is a
-         no-op-equivalent rewrite).
+         idempotent mid-series insert. ``skip_if_exists`` defaults to False
+         (not passed here), so a fallback-quality day's existing row is
+         overwritten exactly like MorningEnrich's own polygon-over-yfinance
+         overwrite — no separate write path needed for the two conditions.
 
     Best-effort and per-day isolated: one day's failure is recorded and the
     loop continues. NEVER raises — returns a summary the caller logs. The
@@ -1611,23 +1695,38 @@ def _self_heal_missing_universe_days(
         "scan_window_td": lookback_trading_days,
         "max_per_run": max_heal_days,
         "missing_days": [],
+        "fallback_quality_days": [],
         "healed_days": [],
         "deferred_days": [],
         "errors": [],
     }
 
     missing = _detect_missing_universe_days(bucket, target_date, lookback_trading_days)
+    fallback_quality = _detect_fallback_quality_universe_days(
+        bucket, target_date, lookback_trading_days
+    )
     summary["missing_days"] = missing
-    if not missing:
-        logger.info("universe-gap heal: no prior trading-day gaps before %s.", target_date)
+    summary["fallback_quality_days"] = fallback_quality
+
+    # Mutually exclusive by construction (fallback-quality requires an
+    # existing row; missing requires none) — de-dup is defensive only.
+    # Missing days are the more severe gap, so they get healed first.
+    combined = missing + [d for d in fallback_quality if d not in missing]
+    if not combined:
+        logger.info(
+            "universe-gap heal: no prior trading-day gaps or fallback-quality "
+            "rows before %s.",
+            target_date,
+        )
         return summary
 
-    to_heal = missing[:max_heal_days]
-    summary["deferred_days"] = missing[max_heal_days:]
+    to_heal = combined[:max_heal_days]
+    summary["deferred_days"] = combined[max_heal_days:]
     logger.warning(
-        "universe-gap heal: %d trading day(s) missing from ArcticDB before %s (%s); "
-        "healing %s this run%s.",
-        len(missing), target_date, missing, to_heal,
+        "universe-gap heal: %d day(s) need healing before %s — %d missing (%s), "
+        "%d fallback-quality (%s); healing %s this run%s.",
+        len(combined), target_date, len(missing), missing,
+        len(fallback_quality), fallback_quality, to_heal,
         f", deferring {summary['deferred_days']} to subsequent runs" if summary["deferred_days"] else "",
     )
 
@@ -1640,6 +1739,7 @@ def _self_heal_missing_universe_days(
     s3 = boto3.client("s3")
 
     for day in to_heal:
+        kind = "missing" if day in missing else "fallback_quality"
         try:
             try:
                 tickers_set, weekly_date = load_constituents_for_run_date(
@@ -1658,7 +1758,9 @@ def _self_heal_missing_universe_days(
             # Mirror MorningEnrich's universe scope: constituents + macro keys.
             tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
             if not tickers:
-                summary["errors"].append({"date": day, "reason": "no constituents resolved"})
+                summary["errors"].append(
+                    {"date": day, "kind": kind, "reason": "no constituents resolved"}
+                )
                 continue
 
             # 1+2: stage the day's OHLCV (Polygon T+1, auto-chain fallback).
@@ -1680,22 +1782,28 @@ def _self_heal_missing_universe_days(
             status = append_result.get("status", "unknown")
             if status in ("ok", "ok_dry_run"):
                 summary["healed_days"].append(
-                    {"date": day, "tickers": len(tickers), "weekly_date": str(weekly_date)}
+                    {
+                        "date": day,
+                        "kind": kind,
+                        "tickers": len(tickers),
+                        "weekly_date": str(weekly_date),
+                    }
                 )
                 logger.info(
-                    "universe-gap heal: backfilled %s (%d tickers, status=%s).",
-                    day, len(tickers), status,
+                    "universe-gap heal: backfilled %s (%s, %d tickers, status=%s).",
+                    day, kind, len(tickers), status,
                 )
             else:
                 summary["errors"].append(
-                    {"date": day, "reason": f"daily_append status={status}"}
+                    {"date": day, "kind": kind, "reason": f"daily_append status={status}"}
                 )
                 logger.warning(
-                    "universe-gap heal: daily_append for %s returned status=%s.", day, status
+                    "universe-gap heal: daily_append for %s (%s) returned status=%s.",
+                    day, kind, status,
                 )
         except Exception as exc:
-            logger.warning("universe-gap heal: failed to backfill %s (%s).", day, exc)
-            summary["errors"].append({"date": day, "reason": str(exc)})
+            logger.warning("universe-gap heal: failed to backfill %s (%s, %s).", day, kind, exc)
+            summary["errors"].append({"date": day, "kind": kind, "reason": str(exc)})
 
     return summary
 
