@@ -62,6 +62,11 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.106.0",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling)",
     ),
+    "config-runner-dispatcher": (
+        "v0.110.0",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2572: same SpotProbeError "
+        "handling as ci-watch-dispatcher, pinned to the latest tag at time of writing)",
+    ),
     "data-spot-dispatcher": (
         "v0.83.0",
         "ec2_spot launch chokepoint (config#1767)",
@@ -118,10 +123,6 @@ _LAMBDA_PIN_EXEMPTIONS = {
     "spot-orphan-reaper": (
         "v0.97.0",
         "telegram alert shape for CI-watch (config#2106)",
-    ),
-    "usage-pace-alert": (
-        "v0.83.0",
-        "flow-doctor forum-topic routing + weekly-pace math (config#2043)",
     ),
 }
 

@@ -78,13 +78,16 @@ def fake_repo(cd, tmp_path, monkeypatch):
 # ── codified map against the real repo ──────────────────────────────────────
 
 
-def test_map_covers_all_four_orchestrated_state_machines(cd):
+def test_map_covers_all_six_orchestrated_state_machines(cd):
     names = {e["sf_name"] for e in cd.SF_DEFINITIONS}
     assert names == {
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
         "alpha-engine-groom-pipeline",
+        # alpha-engine-config-I2544/I2545: advisory + Sunday-modelzoo child SFs.
+        "ne-weekly-advisory-pipeline",
+        "ne-modelzoo-sunday-pipeline",
     }
 
 
