@@ -144,11 +144,12 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "WaitForMorningPlanner": _LIVENESS_POLLER_KEYS,
     # config#1767 (Phase 2): the data phase (enrich + Arctic append) was relocated
     # onto two independent ephemeral spot boxes via the alpha-engine-data-spot-
-    # dispatcher Lambda. Each launch state passes a single {"workload": <key>}
-    # selecting the collector invocation; the dispatcher returns
+    # dispatcher Lambda. Each launch state passes {"workload": <key>,
+    # "force_on_demand.$"} selecting the collector invocation + threading the
+    # config#2542 retry-budget's on-demand override; the dispatcher returns
     # {data_spot:{launched,instance_id,...}}.
-    "LaunchMorningEnrichSpot": frozenset({"workload"}),
-    "LaunchMorningArcticAppendSpot": frozenset({"workload"}),
+    "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$"}),
+    "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$"}),
 }
 
 
