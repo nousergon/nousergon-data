@@ -79,6 +79,11 @@ SF_DEFINITIONS: tuple[dict, ...] = (
     {"sf_name": "ne-preopen-trading-pipeline", "definition_file": "step_function_daily.json"},
     {"sf_name": "ne-postclose-trading-pipeline", "definition_file": "step_function_eod.json"},
     {"sf_name": "alpha-engine-groom-pipeline", "definition_file": "step_function_groom.json"},
+    # alpha-engine-config-I2544/I2545: advisory + Sunday-modelzoo child SFs,
+    # split out of step_function.json (config#2273 single-writer contract
+    # applies to these two files identically — see deploy_step_function.sh).
+    {"sf_name": "ne-weekly-advisory-pipeline", "definition_file": "step_function_advisory.json"},
+    {"sf_name": "ne-modelzoo-sunday-pipeline", "definition_file": "step_function_modelzoo.json"},
 )
 
 _GIT_STAMP_RE = re.compile(r"^\[git:[0-9a-fA-F]{7,40}\]\s*")

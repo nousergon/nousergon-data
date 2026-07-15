@@ -61,10 +61,23 @@ jobs:
       - name: SSM re-run install-daily-news.sh on the dashboard box
         id: send
         run: |
+          # Refresh the box's checkout to origin/main BEFORE running the
+          # install script — the box only pulls lazily at daily-news.service
+          # run time (git reset --hard in run_daily_news_standalone.sh), so a
+          # freshly-merged install script / unit file is NOT yet on the box at
+          # deploy-on-merge time. Without this the very first deploy fails with
+          # "install-daily-news.sh: No such file or directory" (exit 127), and
+          # every later deploy would copy STALE unit files. Refresh as ec2-user
+          # (the checkout owner — matches run_daily_news_standalone.sh's own
+          # `git fetch origin && git reset --hard origin/main`); running the git
+          # ops as root would break the ec2-user self-refresh via ownership
+          # drift. `&&`-chained so any step failing aborts fail-loud (the run
+          # document does not set -e). install-daily-news.sh still runs under
+          # sudo for the /etc/systemd/system writes.
           CMD_ID=$(aws ssm send-command \
             --instance-ids "${DASHBOARD_INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["sudo bash /home/ec2-user/alpha-engine-data/infrastructure/install-daily-news.sh"]' \
+            --parameters 'commands=["cd /home/ec2-user/alpha-engine-data && sudo -u ec2-user git fetch origin && sudo -u ec2-user git reset --hard origin/main && sudo bash /home/ec2-user/alpha-engine-data/infrastructure/install-daily-news.sh"]' \
             --comment "config#2352 deploy-on-merge: daily-news unit refresh (${{ github.sha }})" \
             --query "Command.CommandId" --output text)
           echo "command_id=${CMD_ID}" >> "$GITHUB_OUTPUT"

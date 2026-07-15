@@ -201,6 +201,33 @@ PIPELINES: dict[str, dict[str, object]] = {
         "dispatch_event_type": "eod-sf-failure",
         "has_listener": True,
     },
+    # alpha-engine-config-I2544: async advisory child of ne-weekly-freshness-
+    # pipeline (eval-judge chain / ReportCard / Director), split out so a
+    # hang there no longer risks the Saturday critical path. has_listener:
+    # False (onboarding default, mirrors how a brand-new pipeline registers
+    # here BEFORE its alpha-engine-config repository_dispatch agent charter
+    # exists) — the watch-log artifact + Telegram receipt still fire
+    # unconditionally; only the AUTONOMOUS-AGENT dispatch is deferred until a
+    # charter for "weekly-advisory-sf-failure" is added and this flips to
+    # True. Non-trading-critical (advisory/observability tail only).
+    "ne-weekly-advisory-pipeline": {
+        "cadence_slug": "weekly-advisory",
+        "label": "Weekly Advisory (eval-judge/ReportCard/Director)",
+        "watch_prefix": "consolidated/weekly-advisory_sf_watch",
+        "dispatch_event_type": "weekly-advisory-sf-failure",
+        "has_listener": False,
+    },
+    # alpha-engine-config-I2545: ModelZoo rotation moved off Saturday to its
+    # own Sunday 09:00 UTC trigger. Same onboarding posture as the advisory
+    # pipeline above (has_listener: False until a dedicated agent charter
+    # exists) — watch-log + Telegram receipt fire unconditionally.
+    "ne-modelzoo-sunday-pipeline": {
+        "cadence_slug": "modelzoo-sunday",
+        "label": "ModelZoo Sunday Rotation",
+        "watch_prefix": "consolidated/modelzoo-sunday_sf_watch",
+        "dispatch_event_type": "modelzoo-sunday-sf-failure",
+        "has_listener": False,
+    },
     # The transitional `alpha-engine-eod-pipeline` alias (config#1408) was
     # retired 2026-07-11 (config#2272) after the dormant old state machine was
     # DELETED live — zero executions since the 2026-06-29 ne-rename.
