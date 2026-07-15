@@ -512,7 +512,13 @@ class TestEODReconcileSkippedOnDataGap:
             "failed alert it replaces"
         )
         message_fmt = st["Parameters"]["Message.$"]
-        assert "States.JsonToString($.data_spot_error)" in message_fmt
+        # I2702: the skip is now decided by the precondition PROBE (verify-by-
+        # artifact), not the launch-phase $.data_spot_error flag — the message
+        # must reference the probe result and the closed-loop self-heal, and
+        # must NOT resurrect the retired manual-operator-replay instruction.
+        assert "States.JsonToString($.precondition_probe)" in message_fmt
+        assert "self-heal" in message_fmt
+        assert "operator-replay" not in message_fmt
 
     def test_skip_state_never_reaches_a_halt(self, eod):
         # config-I2702: SkipEODReconcileDataGap now enters the closed
