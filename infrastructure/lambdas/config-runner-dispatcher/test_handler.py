@@ -80,6 +80,12 @@ class _FakeEc2:
 
     def describe_instances(self, Filters):  # noqa: N803
         by_name = {f["Name"]: f["Values"] for f in Filters}
+        # _bootstrap_and_reap enumerates by tag:Name WITHOUT a job-id filter
+        # (I2692); tests populate self.boxes with full instance dicts. The
+        # dedupe probe filters by job-id (with or without tag:Name) and must
+        # keep hitting the legacy branch below.
+        if "tag:Name" in by_name and "tag:config-runner-job-id" not in by_name:
+            return {"Reservations": [{"Instances": list(getattr(self, "boxes", []))}]}
         job_id = by_name.get("tag:config-runner-job-id", [None])[0]
         ids = self._running_job_ids.get(job_id, [])
         return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
@@ -97,7 +103,14 @@ class _FakeSsm:
         return {"Parameter": {"Value": self.params[Name]}}
 
     def describe_instance_information(self, **kw):
-        return {"InstanceInformationList": [{"PingStatus": "Online"}]}
+        # _bootstrap_and_reap (I2692) matches entries by InstanceId; tests
+        # populate self.online_ids. Legacy default (no online_ids) keeps the
+        # old anonymous-Online shape for any pre-I2692 call sites.
+        online = getattr(self, "online_ids", None)
+        if online is None:
+            return {"InstanceInformationList": [{"PingStatus": "Online"}]}
+        return {"InstanceInformationList": [
+            {"InstanceId": i, "PingStatus": "Online"} for i in online]}
 
     def send_command(self, **kw):
         self.sent.append(kw)
@@ -255,7 +268,11 @@ def test_webhook_disabled_flag_skips_invoke(monkeypatch):
 # ── Phase 2: worker (async self-invoked) ─────────────────────────────────────
 
 
-def test_worker_valid_job_launches_spot_and_sends_async_ssm(monkeypatch):
+def test_worker_valid_job_launches_tags_and_defers_bootstrap(monkeypatch):
+    # I2692 two-phase contract: the worker phase launches + tags and returns
+    # in seconds — NO in-Lambda SSM wait/send (that wait used to blow the
+    # 60s Lambda timeout and manufacture zombie boxes). The bootstrap is
+    # delivered by _bootstrap_and_reap on a later reconcile pass.
     calls = {}
 
     def _launch(types_, subnets, **kw):
@@ -267,17 +284,15 @@ def test_worker_valid_job_launches_spot_and_sends_async_ssm(monkeypatch):
     idx = _load(monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
     out = idx.handler({"config_runner_job_id": "987654321"}, None)
     assert out["launched"] is True
+    assert out["reason"] == "launched_bootstrap_pending"
     assert out["instance_id"] == "i-abc"
     assert out["market"] == "spot"
-    assert out["command_id"] == "cmd-123"
     assert calls["profile"] == "alpha-engine-config-runner-executor-profile"
     assert calls["tag_name"] == "alpha-engine-config-runner-spot"
     assert idx._test_ec2.tags_created == [
         (["i-abc"], [{"Key": "config-runner-job-id", "Value": "987654321"}])
     ]
-    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "exec bash infrastructure/config_runner_spot_bootstrap.sh --job-id \"987654321\"" in cmd
-    assert "export HOME=/root" in cmd
+    assert idx._test_ssm.sent == [], "worker phase must never send SSM commands (I2692)"
 
 
 def test_worker_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
@@ -363,20 +378,107 @@ def test_worker_persistent_tag_write_failure_terminates_and_fails(monkeypatch):
     assert idx._test_ssm.sent == []
 
 
-def test_worker_post_launch_ssm_failure_terminates_instance(monkeypatch):
-    idx = _load(
-        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-orphan",  # noqa: E731
-        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
-    )
+def test_worker_quota_exhaustion_pages_loudly(monkeypatch):
+    # I2692: MaxSpotInstanceCountExceeded used to be ERROR-log-only while
+    # fleet CI silently queued for an hour — it must page now.
+    from nousergon_lib.spot_dispatch import SpotLaunchError
+
+    def _launch(types_, subnets, **kw):
+        raise SpotLaunchError(
+            "RunInstances failed with non-capacity error "
+            "MaxSpotInstanceCountExceeded (t3.medium@subnet-x): "
+            "Max spot instance count exceeded")
+
+    idx = _load(monkeypatch, launch_impl=_launch,
+                env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    pages = []
+    monkeypatch.setattr(idx, "_page", lambda msg: pages.append(msg))
+    out = idx.handler({"config_runner_job_id": "1"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "launch_failed"
+    assert len(pages) == 1 and "QUOTA EXHAUSTED" in pages[0]
+
+
+# ── _bootstrap_and_reap (I2692 two-phase state machine) ──────────────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def _box(iid, *, age_seconds, job_id="j1", bootstrapped=False):
+    tags = [{"Key": "Name", "Value": "alpha-engine-config-runner-spot"}]
+    if job_id:
+        tags.append({"Key": "config-runner-job-id", "Value": job_id})
+    if bootstrapped:
+        tags.append({"Key": "config-runner-bootstrap-sent", "Value": "2026-01-01T00:00:00Z"})
+    return {"InstanceId": iid, "Tags": tags,
+            "LaunchTime": datetime.now(timezone.utc) - timedelta(seconds=age_seconds)}
+
+
+def test_bootstrap_and_reap_sends_bootstrap_to_online_untagged_box(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [_box("i-new", age_seconds=70, job_id="42")]
+    idx._test_ssm.online_ids = ["i-new"]
+    stats = idx._bootstrap_and_reap()
+    assert stats["bootstrapped"] == 1
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert 'exec bash infrastructure/config_runner_spot_bootstrap.sh --job-id "42"' in cmd
+    assert any(r == ["i-new"] and tags[0]["Key"] == "config-runner-bootstrap-sent"
+               for r, tags in idx._test_ec2.tags_created)
+
+
+def test_bootstrap_and_reap_waits_on_young_offline_box(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [_box("i-booting", age_seconds=60)]
+    idx._test_ssm.online_ids = []
+    stats = idx._bootstrap_and_reap()
+    assert stats["waiting_ssm"] == 1
+    assert idx._test_ec2.terminated == []
+    assert idx._test_ssm.sent == []
+
+
+def test_bootstrap_and_reap_reaps_box_ssm_never_came_up(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [_box("i-zombie", age_seconds=400)]
+    idx._test_ssm.online_ids = []
+    stats = idx._bootstrap_and_reap()
+    assert stats["reaped_no_ssm"] == 1
+    assert idx._test_ec2.terminated == ["i-zombie"]
+
+
+def test_bootstrap_and_reap_reaps_over_lifetime_box_even_if_bootstrapped(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [_box("i-leak", age_seconds=6000, bootstrapped=True)]
+    idx._test_ssm.online_ids = []
+    stats = idx._bootstrap_and_reap()
+    assert stats["reaped_lifetime"] == 1
+    assert idx._test_ec2.terminated == ["i-leak"]
+
+
+def test_bootstrap_and_reap_healthy_bootstrapped_box_untouched(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [_box("i-working", age_seconds=600, bootstrapped=True)]
+    idx._test_ssm.online_ids = ["i-working"]
+    stats = idx._bootstrap_and_reap()
+    assert stats["healthy"] == 1
+    assert idx._test_ec2.terminated == []
+    assert idx._test_ssm.sent == []
+
+
+def test_bootstrap_and_reap_send_failure_leaves_untagged_for_retry(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [_box("i-flaky", age_seconds=100, job_id="7")]
+    idx._test_ssm.online_ids = ["i-flaky"]
 
     def _boom_send(**kw):
         raise RuntimeError("SSM SendCommand failed")
 
     idx._test_ssm.send_command = _boom_send
-    out = idx.handler({"config_runner_job_id": "1"}, None)
-    assert out["launched"] is False
-    assert out["reason"] == "post_launch_failed"
-    assert idx._test_ec2.terminated == ["i-orphan"]
+    stats = idx._bootstrap_and_reap()
+    assert stats["errors"] == 1
+    assert stats["bootstrapped"] == 0
+    # No bootstrap-sent tag written — the next reconcile pass retries.
+    assert all(tags[0]["Key"] != "config-runner-bootstrap-sent"
+               for _, tags in idx._test_ec2.tags_created)
 
 
 def test_worker_missing_job_id_returns_invalid_event(monkeypatch):
