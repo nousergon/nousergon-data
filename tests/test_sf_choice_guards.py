@@ -47,10 +47,17 @@ import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _WEEKLY = _REPO_ROOT / "infrastructure" / "step_function.json"
+# alpha-engine-config-I2544/I2545: the two child SFs split out of the
+# weekly SF carry their own Choice states (the eval-judge chain's
+# CheckSkipEvalJudge/EvalJudgePollChoice/etc. and the modelzoo fan-out's
+# CheckResolveZooStatus/CheckModelZooStatus/etc.) and are in scope for the
+# SAME config#2275 guard-or-floor discipline.
+_ADVISORY = _REPO_ROOT / "infrastructure" / "step_function_advisory.json"
+_MODELZOO = _REPO_ROOT / "infrastructure" / "step_function_modelzoo.json"
 
 
-def _load() -> dict:
-    return json.loads(_WEEKLY.read_text())
+def _load(path: pathlib.Path = _WEEKLY) -> dict:
+    return json.loads(path.read_text())
 
 
 # ---------------------------------------------------------------------------
@@ -75,18 +82,21 @@ def _iter_scopes(definition: dict):
 
 
 def _initialize_input_floors(definition: dict) -> set[str]:
-    """Keys InitializeInput guarantees on $ for every execution: the embedded
-    JsonMerge defaults literal, plus the States.Format-injected run_date.
-    Parsed MECHANICALLY from the state so the floor set can never drift from
-    the definition."""
-    params = definition["States"]["InitializeInput"]["Parameters"]["merged.$"]
+    """Keys the SF's initializer Pass state (its StartAt — InitializeInput
+    on the weekly SF, InitializeAdvisoryInput / InitializeModelZooInput on
+    the two I2544/I2545 child SFs) guarantees on $ for every execution: the
+    FIRST embedded JsonMerge defaults literal, plus any States.Format-
+    injected run_date. Parsed MECHANICALLY from the state so the floor set
+    can never drift from the definition."""
+    init_state_name = definition["StartAt"]
+    params = definition["States"][init_state_name]["Parameters"]["merged.$"]
     start = params.index("States.StringToJson('") + len("States.StringToJson('")
     end = params.index("')", start)
     literal = params[start:end].replace('\\"', '"')
     floors = set(json.loads(literal))
     if "run_date" in params:
         floors.add("run_date")
-    assert "sns_topic_arn" in floors, "InitializeInput defaults parse failed"
+    assert "sns_topic_arn" in floors, f"{init_state_name} defaults parse failed"
     return floors
 
 
@@ -182,8 +192,22 @@ def _leaf_violations(rule: dict, guards: frozenset[str], context: str,
     return violations
 
 
-def test_every_choice_variable_is_guarded_or_floored():
-    definition = _load()
+# alpha-engine-config-I2544/I2545 (2026-07-14): the weekly SF's Choice count
+# dropped from 51 -> 40 when the eval-judge chain (8 Choices:
+# CheckSkipEvalJudge/CheckMonthlyCadence/EvalJudgePollChoice/
+# EvalJudgePollDecision/CheckSkipRationaleClustering/
+# CheckSkipReplayConcordance/CheckSkipCounterfactual/CheckSkipAggregateCosts)
+# and the modelzoo fan-out (3 Choices: CheckResolveZooStatus/
+# CheckModelZooStatus/CheckTrainSpecStatus — the last inside
+# ModelZooTrainMap's Map iterator) moved to the two new child SFs, which
+# carry the SAME config#2275 guard-or-floor discipline (see
+# _MIN_CHOICES_SEEN below and the two new per-file tests).
+_MIN_CHOICES_SEEN = {_WEEKLY: 35, _ADVISORY: 8, _MODELZOO: 3}
+
+
+@pytest.mark.parametrize("sf_path", [_WEEKLY, _ADVISORY, _MODELZOO], ids=lambda p: p.stem)
+def test_every_choice_variable_is_guarded_or_floored(sf_path):
+    definition = _load(sf_path)
     top_floors = _initialize_input_floors(definition)
     violations: list[str] = []
     choices_seen = 0
@@ -206,11 +230,15 @@ def test_every_choice_variable_is_guarded_or_floored():
                 violations.extend(
                     _leaf_violations(rule, frozenset(), context, floored)
                 )
-    assert choices_seen >= 40, f"walker regressed: only {choices_seen} Choice states found"
+    min_expected = _MIN_CHOICES_SEEN[sf_path]
+    assert choices_seen >= min_expected, (
+        f"walker regressed on {sf_path.name}: only {choices_seen} Choice "
+        f"states found (expected >= {min_expected})"
+    )
     assert not violations, (
-        "config#2275 regression — Choice dereferences that can States.Runtime "
-        "on an absent field (guard with And:[{IsPresent}, ...] or floor "
-        "upstream):\n" + "\n".join(violations)
+        f"config#2275 regression on {sf_path.name} — Choice dereferences "
+        "that can States.Runtime on an absent field (guard with "
+        "And:[{IsPresent}, ...] or floor upstream):\n" + "\n".join(violations)
     )
 
 
@@ -289,33 +317,31 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
 @pytest.mark.parametrize(
     ("choice", "partial_input", "expected_route"),
     [
-        # THE issue drill: research Lambda returns {} — must route into the
-        # Extract*Error normalizer (→ …→ HandleFailure), never States.Runtime.
-        ("CheckResearchStatus", {"research_result": {"Payload": {}}},
-         "ExtractResearchError"),
+        # NOTE: the pre-existing "research Lambda returns {}" drill against
+        # CheckResearchStatus was retired here — alpha-engine-config-I2515
+        # Phase B removed the multi-agent Research state (and
+        # CheckResearchStatus) entirely. SignalsEnvelope, its load-bearing
+        # replacement, detects failure via a plain Task Catch (which always
+        # populates $.error deterministically) rather than a payload-status
+        # Choice, so this specific {} ambiguity class no longer applies to
+        # Branch A's producer.
         ("WeeklyRunDayGateChoice", {"weekly_run_day_gate": {"Payload": {}}},
          "WeeklyRunDayGateMalformed"),
         ("LibPinDriftGate", {"libpin_drift_result": {"Payload": {}}},
          "LibPinGateDegraded"),  # fail-open, VISIBLY (config#2278)
         ("PipelineContractGate", {"pipeline_contract_result": {"Payload": {}}},
          "PipelineContractGateDegraded"),  # fail-open, VISIBLY (config#2278)
-        ("EvalJudgePollChoice", {"eval_judge_submit": {"Payload": {}}},
-         "EvalRollingMean"),  # eval is observability — fail-soft
-        ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},
-         "EvalRollingMean"),  # malformed poll payload — fail-soft, no Wait loop
+        # NOTE: the EvalJudgePollChoice/EvalJudgePollDecision drill cases
+        # moved to test_partial_payload_routes_to_explicit_path_advisory
+        # below — alpha-engine-config-I2544 lifted the eval-judge chain into
+        # step_function_advisory.json.
         # Healthy-path sanity: the guards must not change live semantics.
-        ("CheckResearchStatus",
-         {"research_result": {"Payload": {"status": "OK"}}},
-         "CheckSkipDataPhase2"),
         ("WeeklyRunDayGateChoice",
          {"weekly_run_day_gate": {"Payload": {"is_weekly_run_day": False}}},
          "WeeklyRunDaySkip"),
         ("LibPinDriftGate",
          {"libpin_drift_result": {"Payload": {"has_drift": True}}},
          "ExtractLibPinDriftError"),
-        ("EvalJudgePollDecision",
-         {"eval_judge_poll": {"Payload": {"processing_status": "polling"}}},
-         "EvalJudgePollWait"),
     ],
 )
 def test_partial_payload_routes_to_explicit_path(choice, partial_input, expected_route):
@@ -323,9 +349,30 @@ def test_partial_payload_routes_to_explicit_path(choice, partial_input, expected
     assert _choice_target(definition, choice, partial_input) == expected_route
 
 
-def test_research_error_route_reaches_handle_failure():
-    """The {} drill's full promise: ExtractResearchError marks branch A
-    failed; CheckBranchOutcomes routes a failed branch into
+@pytest.mark.parametrize(
+    ("choice", "partial_input", "expected_route"),
+    [
+        ("EvalJudgePollChoice", {"eval_judge_submit": {"Payload": {}}},
+         "EvalRollingMean"),  # eval is observability — fail-soft
+        ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},
+         "EvalRollingMean"),  # malformed poll payload — fail-soft, no Wait loop
+        # Healthy-path sanity: the guards must not change live semantics.
+        ("EvalJudgePollDecision",
+         {"eval_judge_poll": {"Payload": {"processing_status": "polling"}}},
+         "EvalJudgePollWait"),
+    ],
+)
+def test_partial_payload_routes_to_explicit_path_advisory(choice, partial_input, expected_route):
+    """alpha-engine-config-I2544: same drill, re-pointed at the advisory
+    child SF the eval-judge chain now lives in."""
+    definition = _load(_ADVISORY)
+    assert _choice_target(definition, choice, partial_input) == expected_route
+
+
+def test_branch_a_failed_route_reaches_handle_failure():
+    """A FAILED Branch A (e.g. via ExtractSignalsEnvelopeError, config-
+    I2515 Phase B's renamed successor to the retired ExtractResearchError)
+    marks branch A failed; CheckBranchOutcomes routes a failed branch into
     ExtractParallelBranchError, whose Next-chain lands on HandleFailure via
     the NormalizeFailureContext chokepoint (config#1819)."""
     definition = _load()

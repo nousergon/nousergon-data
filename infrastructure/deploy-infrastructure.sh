@@ -67,7 +67,9 @@ SAT_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 DAILY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 EOD_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 GROOM_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$GROOM_STAMPED'" EXIT
+ADVISORY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
+MODELZOO_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
+trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$GROOM_STAMPED' '$ADVISORY_STAMPED' '$MODELZOO_STAMPED'" EXIT
 python3 -c "
 import json, sys
 path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -109,6 +111,26 @@ if orig.startswith('[git:'):
 d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
 json.dump(d, open(path_out, 'w'), indent=2)
 " "$SCRIPT_DIR/step_function_groom.json" "$GROOM_STAMPED" "$GIT_SHA"
+python3 -c "
+import json, sys
+path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path_in))
+orig = d.get('Comment', '')
+if orig.startswith('[git:'):
+    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
+d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
+json.dump(d, open(path_out, 'w'), indent=2)
+" "$SCRIPT_DIR/step_function_advisory.json" "$ADVISORY_STAMPED" "$GIT_SHA"
+python3 -c "
+import json, sys
+path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path_in))
+orig = d.get('Comment', '')
+if orig.startswith('[git:'):
+    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
+d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
+json.dump(d, open(path_out, 'w'), indent=2)
+" "$SCRIPT_DIR/step_function_modelzoo.json" "$MODELZOO_STAMPED" "$GIT_SHA"
 
 echo ""
 echo "==> Uploading Step Function definitions to S3..."
@@ -116,6 +138,8 @@ aws s3 cp "$SAT_STAMPED" "s3://$BUCKET/infrastructure/step_function.json" --quie
 aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json" --quiet
 aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
 aws s3 cp "$GROOM_STAMPED" "s3://$BUCKET/infrastructure/step_function_groom.json" --quiet
+aws s3 cp "$ADVISORY_STAMPED" "s3://$BUCKET/infrastructure/step_function_advisory.json" --quiet
+aws s3 cp "$MODELZOO_STAMPED" "s3://$BUCKET/infrastructure/step_function_modelzoo.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
 # ── 3. Update Step Function definitions (existence-aware) ────────────────────
@@ -135,6 +159,11 @@ SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-p
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
 GROOM_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-dispatch"
+# alpha-engine-config-I2544/I2545: CFN-managed pair, same update-if-present/
+# defer-to-CFN-if-absent pattern as SAT_ARN/DAILY_ARN (both are
+# AWS::StepFunctions::StateMachine resources in the CFN template now).
+ADVISORY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-advisory-pipeline"
+MODELZOO_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-modelzoo-sunday-pipeline"
 # Shared SF execution role (the CFN StepFunctionsRoleArn default; all three
 # orchestration SFs run under it). Used only for the EOD create-if-absent path.
 SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-step-functions-role"
@@ -214,9 +243,13 @@ EOD_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":
 # includeExecutionData=true, the CFN-owned per-SF log groups).
 SAT_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-weekly-freshness-pipeline:*"}}]}'
 DAILY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-preopen-trading-pipeline:*"}}]}'
+ADVISORY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-weekly-advisory-pipeline:*"}}]}'
+MODELZOO_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-modelzoo-sunday-pipeline:*"}}]}'
 
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline" "$SAT_LOGGING_CONFIG"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline" "$DAILY_LOGGING_CONFIG"
+update_or_defer_to_cfn "$ADVISORY_ARN" "$ADVISORY_STAMPED" "Weekly advisory child pipeline" "$ADVISORY_LOGGING_CONFIG"
+update_or_defer_to_cfn "$MODELZOO_ARN" "$MODELZOO_STAMPED" "ModelZoo Sunday child pipeline" "$MODELZOO_LOGGING_CONFIG"
 update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline" "$EOD_LOGGING_CONFIG"
 # CORRECTED 2026-07-12: was alpha-engine-groom-pipeline (the OLD name) — the EventBridge
 # Scheduler targets alpha-engine-groom-dispatch (created by the scheduled-groom-dispatcher
