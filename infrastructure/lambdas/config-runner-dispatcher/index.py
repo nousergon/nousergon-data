@@ -154,6 +154,58 @@ VOLUME_SIZE_GB = int(os.environ.get("CONFIG_RUNNER_VOLUME_SIZE_GB", "30"))
 CONFIG_RUNNER_TAG_NAME = "alpha-engine-config-runner-spot"
 CONFIG_RUNNER_JOB_ID_TAG_KEY = "config-runner-job-id"
 
+# ── Two-phase bootstrap state machine (2026-07-15 zombie-leak incident,
+# alpha-engine-config-I2692) ─────────────────────────────────────────────────
+# The launch path previously did wait_ssm_online (60-200s) + send_command
+# INSIDE this Lambda's 60s timeout — the Lambda died mid-wait, the box never
+# received its bootstrap, never registered a runner, and never self-
+# terminated (the terminate-on-failure except died with the Lambda). Under
+# the reconcile loop that manufactured a zombie box per minute until the
+# spot quota exhausted and ALL fleet CI queued (2026-07-15 17:33-18:40 UTC).
+# Now: launch TAGS the box and returns in seconds; every ~60s reconcile pass
+# delivers the bootstrap to any SSM-online box that lacks it (single
+# describe, zero waiting), reaps boxes whose bootstrap can't be delivered by
+# BOOTSTRAP_DEADLINE, and reaps any box alive past RUNNER_MAX_LIFETIME
+# regardless of state (the janitor: no leak class can ever eat the quota
+# silently again).
+CONFIG_RUNNER_BOOTSTRAP_SENT_TAG_KEY = "config-runner-bootstrap-sent"
+BOOTSTRAP_DEADLINE_SECONDS = int(os.environ.get("CONFIG_RUNNER_BOOTSTRAP_DEADLINE_SECONDS", "300"))
+RUNNER_MAX_LIFETIME_SECONDS = int(os.environ.get("CONFIG_RUNNER_MAX_LIFETIME_SECONDS", "5400"))
+
+# Loud page on quota exhaustion (the incident's silent failure mode: an hour
+# of CI paralysis visible only as ERROR log lines). Fleet-standard params.
+TELEGRAM_BOT_TOKEN_SSM = os.environ.get("CONFIG_RUNNER_TELEGRAM_BOT_TOKEN_SSM",
+                                        "/alpha-engine/TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID_SSM = os.environ.get("CONFIG_RUNNER_TELEGRAM_CHAT_ID_SSM",
+                                      "/alpha-engine/TELEGRAM_CHAT_ID")
+_page_sent_this_invocation = False
+
+
+def _page(message: str) -> None:
+    """Best-effort LOUD Telegram page (disable_notification=False — the
+    config-I2461 lesson: silent notifications get missed). Degrades to
+    log-only on any failure; at most one page per invocation to avoid a
+    reconcile loop spamming one page per queued job."""
+    global _page_sent_this_invocation
+    if _page_sent_this_invocation:
+        return
+    _page_sent_this_invocation = True
+    try:
+        ssm = boto3.client("ssm", region_name=REGION)
+        token = ssm.get_parameter(Name=TELEGRAM_BOT_TOKEN_SSM, WithDecryption=True)["Parameter"]["Value"]
+        chat_id = ssm.get_parameter(Name=TELEGRAM_CHAT_ID_SSM, WithDecryption=True)["Parameter"]["Value"]
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps({"chat_id": chat_id, "text": message,
+                             "disable_notification": False}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:  # noqa: BLE001 — paging is best-effort; the log line below is the fallback surface
+        logger.error("telegram page FAILED (%s): %s — message was: %s",
+                     type(exc).__name__, exc, message)
+
 # This Lambda's OWN secret (unlike ci-watch-dispatcher, which needs none) —
 # the webhook HMAC secret, read once per cold start and cached at module
 # scope (same pattern as every fleet Lambda that reads a param once, not
@@ -178,7 +230,9 @@ CONFIG_RUNNER_GH_PAT_SSM = os.environ.get(
 )
 CONFIG_RUNNER_CONFIG_BRANCH = os.environ.get("CONFIG_RUNNER_CONFIG_BRANCH", "main")
 MAX_RUNTIME_SECONDS = int(os.environ.get("CONFIG_RUNNER_MAX_RUNTIME_SECONDS", "1800"))
-SSM_ONLINE_BUDGET_SEC = int(os.environ.get("CONFIG_RUNNER_SSM_ONLINE_BUDGET_SEC", "180"))
+# (SSM_ONLINE_BUDGET_SEC removed with the in-Lambda wait, I2692 — the
+# reconcile-driven bootstrap never waits; BOOTSTRAP_DEADLINE_SECONDS above
+# is its replacement bound.)
 CW_LOG_GROUP = os.environ.get("CONFIG_RUNNER_CW_LOG_GROUP", "/alpha-engine/config-runner-spot")
 
 # Reconcile backstop (config-I2653): a queued job older than this with no
@@ -365,6 +419,14 @@ def _launch_config_runner_spot(job_id: str) -> dict:
     except SpotLaunchError as exc:
         logger.error("config-runner spot launch failed for job %s: %s: %s",
                      job_id, type(exc).__name__, exc)
+        if "MaxSpotInstanceCountExceeded" in str(exc):
+            _page("🔴 config-runner: spot QUOTA EXHAUSTED "
+                  "(MaxSpotInstanceCountExceeded) — CI dispatch for "
+                  f"{TARGET_REPO_FULL_NAME} is stalling. Check for leaked "
+                  "runner boxes (aws ec2 describe-instances "
+                  f"Name={CONFIG_RUNNER_TAG_NAME}) — the reconcile janitor "
+                  "should be reaping them; if this page repeats, it isn't. "
+                  "alpha-engine-config-I2692.")
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
 
     logger.info("launched config-runner box %s (%s) for job %s%s", instance_id, market, job_id,
@@ -383,36 +445,124 @@ def _launch_config_runner_spot(job_id: str) -> dict:
         return {"launched": False, "reason": "tag_write_failed", "instance_id": instance_id,
                 "error": str(exc), "dedupe_degraded": dedupe_degraded}
 
-    try:
-        spot_dispatch.wait_ssm_online(
-            instance_id, region=REGION, ssm_online_budget_sec=SSM_ONLINE_BUDGET_SEC
-        )
-        command_id = spot_dispatch.send_async_command(
-            instance_id,
-            _bootstrap_command(job_id),
-            comment=f"config-runner (job {job_id})",
-            region=REGION,
-            cw_log_group=CW_LOG_GROUP,
-            execution_timeout_seconds=MAX_RUNTIME_SECONDS,
-        )
-    except Exception as exc:  # noqa: BLE001 — post-launch failure; terminate the orphan
-        spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="config-runner")
-        logger.error("config-runner post-launch step failed for %s (job %s): %s: %s",
-                     instance_id, job_id, type(exc).__name__, exc)
-        return {"launched": False, "reason": "post_launch_failed", "instance_id": instance_id,
-                "error": str(exc), "dedupe_degraded": dedupe_degraded}
-
-    logger.info("config-runner dispatched: instance=%s market=%s command=%s job_id=%s",
-               instance_id, market, command_id, job_id)
+    # Two-phase contract (I2692): launch + tag ONLY — this function must
+    # return in seconds. NO wait_ssm_online, NO send_command here: the old
+    # in-line wait blew this Lambda's 60s timeout, killing the bootstrap AND
+    # the terminate-on-failure handler with it (the 2026-07-15 zombie-leak
+    # incident). _bootstrap_and_reap() (every reconcile pass, ~60s) delivers
+    # the bootstrap once the box's SSM agent is online — which takes 40-90s
+    # after launch anyway, so this adds ~zero real latency.
+    logger.info("config-runner launched (bootstrap deferred to reconcile): "
+                "instance=%s market=%s job_id=%s", instance_id, market, job_id)
     return {
         "launched": True,
-        "reason": "launched",
+        "reason": "launched_bootstrap_pending",
         "instance_id": instance_id,
         "market": market,
-        "command_id": command_id,
         "job_id": job_id,
         "dedupe_degraded": dedupe_degraded,
     }
+
+
+def _bootstrap_and_reap() -> dict:
+    """The reconcile-driven bootstrap deliverer + janitor (I2692). For every
+    running config-runner box, exactly one of:
+
+      - no bootstrap-sent tag + SSM Online   -> send bootstrap, tag it
+      - no bootstrap-sent tag + SSM not up   -> reap once older than
+        BOOTSTRAP_DEADLINE_SECONDS (SSM never came up / undeliverable)
+      - any box older than RUNNER_MAX_LIFETIME_SECONDS -> reap (leak
+        backstop: an ephemeral runner that hasn't self-terminated by then is
+        a zombie regardless of how it got wedged)
+
+    Every step is a single fast API call — no waiting anywhere, so any
+    number of boxes fits inside the Lambda budget. Never raises: one box's
+    failure must not strand the rest."""
+    ec2 = boto3.client("ec2", region_name=REGION)
+    ssm = boto3.client("ssm", region_name=REGION)
+    stats = {"bootstrapped": 0, "reaped_no_ssm": 0, "reaped_lifetime": 0,
+             "waiting_ssm": 0, "healthy": 0, "errors": 0}
+    now = datetime.now(timezone.utc)
+
+    try:
+        resp = ec2.describe_instances(Filters=[
+            {"Name": "tag:Name", "Values": [CONFIG_RUNNER_TAG_NAME]},
+            {"Name": "instance-state-name", "Values": ["running", "pending"]},
+        ])
+        boxes = [i for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
+    except Exception as exc:  # noqa: BLE001 — enumeration failure: nothing to do this pass, retry next
+        logger.error("bootstrap_and_reap: describe_instances failed: %s: %s",
+                     type(exc).__name__, exc)
+        stats["errors"] += 1
+        return stats
+
+    online_ids: set[str] = set()
+    if boxes:
+        try:
+            info = ssm.describe_instance_information(Filters=[
+                {"Key": "InstanceIds", "Values": [b["InstanceId"] for b in boxes]},
+            ]).get("InstanceInformationList", [])
+            online_ids = {i["InstanceId"] for i in info if i.get("PingStatus") == "Online"}
+        except Exception as exc:  # noqa: BLE001 — degrade to "none online"; young boxes wait, old ones still reap
+            logger.error("bootstrap_and_reap: SSM describe failed: %s: %s",
+                         type(exc).__name__, exc)
+
+    for box in boxes:
+        iid = box["InstanceId"]
+        tags = {t["Key"]: t["Value"] for t in box.get("Tags", [])}
+        age = (now - box["LaunchTime"]).total_seconds()
+
+        if age > RUNNER_MAX_LIFETIME_SECONDS:
+            try:
+                ec2.terminate_instances(InstanceIds=[iid])
+                logger.warning("bootstrap_and_reap: REAPED %s (lifetime %ds > %ds — leaked box)",
+                               iid, int(age), RUNNER_MAX_LIFETIME_SECONDS)
+                stats["reaped_lifetime"] += 1
+            except Exception as exc:  # noqa: BLE001 — retried next pass
+                logger.error("bootstrap_and_reap: reap %s failed: %s", iid, exc)
+                stats["errors"] += 1
+            continue
+
+        if CONFIG_RUNNER_BOOTSTRAP_SENT_TAG_KEY in tags:
+            stats["healthy"] += 1
+            continue
+
+        job_id = tags.get(CONFIG_RUNNER_JOB_ID_TAG_KEY, "")
+        if iid in online_ids and job_id:
+            try:
+                spot_dispatch.send_async_command(
+                    iid,
+                    _bootstrap_command(job_id),
+                    comment=f"config-runner (job {job_id})",
+                    region=REGION,
+                    cw_log_group=CW_LOG_GROUP,
+                    execution_timeout_seconds=MAX_RUNTIME_SECONDS,
+                )
+                ec2.create_tags(Resources=[iid], Tags=[{
+                    "Key": CONFIG_RUNNER_BOOTSTRAP_SENT_TAG_KEY,
+                    "Value": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }])
+                logger.info("bootstrap_and_reap: bootstrapped %s (job %s, %ds after launch)",
+                            iid, job_id, int(age))
+                stats["bootstrapped"] += 1
+            except Exception as exc:  # noqa: BLE001 — send/tag failure: untagged, retried next pass
+                logger.error("bootstrap_and_reap: bootstrap %s failed (retry next pass): %s: %s",
+                             iid, type(exc).__name__, exc)
+                stats["errors"] += 1
+        elif age > BOOTSTRAP_DEADLINE_SECONDS:
+            try:
+                ec2.terminate_instances(InstanceIds=[iid])
+                logger.warning("bootstrap_and_reap: REAPED %s (no SSM/job-id after %ds — "
+                               "bootstrap undeliverable)", iid, int(age))
+                stats["reaped_no_ssm"] += 1
+            except Exception as exc:  # noqa: BLE001 — retried next pass
+                logger.error("bootstrap_and_reap: reap %s failed: %s", iid, exc)
+                stats["errors"] += 1
+        else:
+            stats["waiting_ssm"] += 1
+
+    logger.info("bootstrap_and_reap: %s", stats)
+    return stats
 
 
 def _reconcile() -> dict:
@@ -426,6 +576,11 @@ def _reconcile() -> dict:
     if not DISPATCH_ENABLED:
         logger.info("reconcile: CONFIG_RUNNER_DISPATCH_ENABLED=false — skipping")
         return {"reconciled": 0, "reason": "disabled"}
+
+    # Bootstrap-deliverer + janitor FIRST (I2692): serve boxes already up
+    # before launching new ones, and reap zombies so the queued-job scan
+    # below never launches into an exhausted quota that leaked boxes caused.
+    br_stats = _bootstrap_and_reap()
 
     now = datetime.now(timezone.utc)
     try:
@@ -473,8 +628,10 @@ def _reconcile() -> dict:
             dispatched.append({"job_id": job_id, "age_seconds": age_seconds,
                                "result": _launch_config_runner_spot(job_id)})
 
-    logger.info("reconcile: dispatched=%d skipped=%d", len(dispatched), len(skipped))
-    return {"reconciled": len(dispatched), "dispatched": dispatched, "skipped": skipped}
+    logger.info("reconcile: dispatched=%d skipped=%d bootstrap_and_reap=%s",
+                len(dispatched), len(skipped), br_stats)
+    return {"reconciled": len(dispatched), "dispatched": dispatched,
+            "skipped": skipped, "bootstrap_and_reap": br_stats}
 
 
 def handler(event: dict, context) -> dict:
