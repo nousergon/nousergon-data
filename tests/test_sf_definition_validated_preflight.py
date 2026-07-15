@@ -32,8 +32,18 @@ _DEPLOY = _INFRA / "deploy-infrastructure.sh"
 _GHA_DEPLOY_POLICY = _INFRA / "iam" / "github-actions-lambda-deploy.json"
 
 # The stamped SF definition variables the deploy script builds + applies. Every
-# one of these must be fed to the validate preflight.
-_STAMPED_VARS = ("$SAT_STAMPED", "$DAILY_STAMPED", "$EOD_STAMPED", "$GROOM_STAMPED")
+# one of these must be fed to the validate preflight. Includes the
+# config#1897/I2544/I2545 advisory + modelzoo child pipelines added to main
+# after this preflight was first written — a subset here repeats exactly the
+# 2026-07-07 gap class this test guards against.
+_STAMPED_VARS = (
+    "$SAT_STAMPED",
+    "$DAILY_STAMPED",
+    "$EOD_STAMPED",
+    "$GROOM_STAMPED",
+    "$ADVISORY_STAMPED",
+    "$MODELZOO_STAMPED",
+)
 
 
 def _script_text() -> str:
@@ -57,7 +67,7 @@ def test_preflight_calls_validate_state_machine_definition() -> None:
 
 
 def test_every_stamped_definition_is_validated() -> None:
-    """The preflight must cover ALL four SF definitions, not a subset — the
+    """The preflight must cover ALL SIX SF definitions, not a subset — the
     2026-07-07 gap was exactly a subset (unbalanced intrinsic slipped through)."""
     text = _script_text()
     # Restrict to the validate helper call sites so we assert the preflight

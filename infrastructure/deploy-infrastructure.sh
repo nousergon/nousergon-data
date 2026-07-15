@@ -143,8 +143,12 @@ json.dump(d, open(path_out, 'w'), indent=2)
 # step 3 — means a bad definition fails the deploy while NOTHING has been applied
 # yet, so the fleet's SFs are never left stamped at mixed SHAs (the 2026-07-07
 # incident, #676 → #677, where the weekly SF updated before the daily SF was
-# rejected). We validate ALL four and only then abort, so one run surfaces every
-# bad definition rather than one-at-a-time.
+# rejected). We validate ALL SIX and only then abort, so one run surfaces every
+# bad definition rather than one-at-a-time. (Rebased onto main's
+# config#1897/I2544/I2545 child-pipeline split 2026-07-15: the advisory and
+# modelzoo children are stamped/uploaded/applied by this same script, so they
+# must be covered by the same all-or-nothing gate — a subset here would repeat
+# exactly the class of gap this preflight exists to close.)
 #
 # Per the AWS API contract we key the pass/fail decision ONLY on the `result`
 # field (OK | FAIL) — AWS explicitly documents that diagnostic codes/wording may
@@ -180,10 +184,12 @@ for d in json.load(sys.stdin).get('diagnostics', []):
 }
 
 VALIDATION_FAILED=false
-validate_sf_definition "$SAT_STAMPED"   "Weekly-freshness pipeline"   || VALIDATION_FAILED=true
-validate_sf_definition "$DAILY_STAMPED" "Pre-open trading pipeline"    || VALIDATION_FAILED=true
-validate_sf_definition "$EOD_STAMPED"   "Post-close trading pipeline"  || VALIDATION_FAILED=true
-validate_sf_definition "$GROOM_STAMPED" "Backlog groom pipeline"       || VALIDATION_FAILED=true
+validate_sf_definition "$SAT_STAMPED"      "Weekly-freshness pipeline"      || VALIDATION_FAILED=true
+validate_sf_definition "$DAILY_STAMPED"    "Pre-open trading pipeline"       || VALIDATION_FAILED=true
+validate_sf_definition "$EOD_STAMPED"      "Post-close trading pipeline"     || VALIDATION_FAILED=true
+validate_sf_definition "$GROOM_STAMPED"    "Backlog groom pipeline"          || VALIDATION_FAILED=true
+validate_sf_definition "$ADVISORY_STAMPED" "Weekly advisory child pipeline"  || VALIDATION_FAILED=true
+validate_sf_definition "$MODELZOO_STAMPED" "ModelZoo Sunday child pipeline"  || VALIDATION_FAILED=true
 if $VALIDATION_FAILED; then
     echo ""
     echo "  ERROR: one or more Step Function definitions failed validation (see above)."
