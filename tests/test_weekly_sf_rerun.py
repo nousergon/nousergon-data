@@ -84,13 +84,15 @@ class TestDerivePlan:
             "skip_rag_ingestion",
             "skip_regime_substrate",
             "skip_regime_retrospective_eval",
-            "skip_research",
+            # skip_research retired: alpha-engine-config-I2515 Phase B
+            # removed the multi-agent Research state entirely.
             "skip_data_phase2",
-            "skip_eval_judge",
-            "skip_rationale_clustering",
-            "skip_replay_concordance",
-            "skip_counterfactual",
-            "skip_aggregate_costs",
+            # skip_eval_judge/skip_rationale_clustering/
+            # skip_replay_concordance/skip_counterfactual/
+            # skip_aggregate_costs retired here: alpha-engine-config-I2544
+            # lifted that whole chain into the async
+            # ne-weekly-advisory-pipeline child SF — this (main-SF-only)
+            # rerun helper no longer tracks or emits those flags at all.
             "skip_predictor_training",
             "skip_predictor_backtest",
             "skip_portfolio_optimizer_backtest",

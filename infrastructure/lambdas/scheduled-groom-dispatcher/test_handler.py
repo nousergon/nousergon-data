@@ -119,10 +119,10 @@ class _FakeS3Paginator:
 
 
 class _FakeS3:
-    """Fake S3 client for the pace gate's boto3-native WET reader.
+    """Fake S3 client for the dispatcher's boto3-native S3 reads/writes.
 
-    ``objects`` maps a full S3 key to its raw JSON bytes content — mirrors the
-    real ``claude_code_usage/{source}/{date}[/{run}].json`` layout.
+    ``objects`` maps a full S3 key to its raw JSON bytes content (usage docs,
+    queue manifests, decision records).
     """
 
     def __init__(self, objects: dict | None = None):
@@ -300,20 +300,15 @@ def test_deploy_schedule_high_only_carries_pr_budget():
     assert "pr_budget" not in low_line
 
 
-# ── Pre-boot pace gate (2026-07-04) ─────────────────────────────────────────
+# ── Usage pacing dismantled (Brian ruling 2026-07-14) ───────────────────────
+# The pre-boot pace gate, its SSoT ceiling wiring (config-I2461), the SSM
+# operator override, and the Anthropic-only WET reader were all REMOVED with
+# the rest of usage pacing. These tests pin the dismantle: no amount of
+# recorded usage may block or defer a scheduled launch anymore, and the env
+# kill-switch is inert (the gate it disabled no longer exists).
 def _wet_doc(wet: float) -> bytes:
     import json
     return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
-
-
-def _mixed_provider_wet_doc(anthropic_wet: float, non_anthropic_wet: float) -> bytes:
-    import json
-    return json.dumps({"by_hour": {
-        "10": {
-            "claude-opus": {"wet": anthropic_wet, "provider": "anthropic"},
-            "gpt-4": {"wet": non_anthropic_wet, "provider": "openai"}
-        }
-    }}).encode()
 
 
 def _spy_notify(monkeypatch, idx):
@@ -327,197 +322,65 @@ def _spy_notify(monkeypatch, idx):
     return calls
 
 
-def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
-    # 1 day into the window (elapsed_frac ~= 1/7 ~= 0.143): 50% of the weekly
-    # ceiling already consumed is way ahead of pace -> skip BEFORE any launch.
+def test_heavy_recorded_usage_never_blocks_launch(monkeypatch):
+    # Pre-dismantle this fixture (50% of the old ceiling consumed 1 day into
+    # the window) skipped the launch with reason=pace_gate_skip. Now: launch.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_notify(monkeypatch, idx)
-
-    def _launch(types_, subnets, **kw):
-        raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
-
-    # index.py now delegates through nousergon_lib.spot_dispatch (config#2106)
-    # rather than calling nousergon_lib.ec2_spot directly — patch the entry
-    # point it actually calls.
-    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    g = out["groom"]
-    assert g["launched"] is False
-    assert g["reason"] == "pace_gate_skip"
-    assert g["exceeded"] is True
-    assert idx._test_ssm.sent == []  # no bootstrap command ever sent
-    # The pre-boot skip must notify — it's the ONLY place this outcome is ever
-    # visible (a run that never boots has no on-box groom_run.sh to ping).
-    assert len(notified) == 1
-    assert notified[0][1]["silent"] is True
-    assert notified[0][1]["severity"] == "info"
-    assert notified[0][1]["silent_topic"] is not None
-    assert "SKIPPED" in notified[0][0]
-    assert "soft budget threshold passed before boot" in notified[0][0]
-    assert "never launched" in notified[0][0]
-
-
-def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
-    # 50% elapsed, only 10% of the ceiling used -> well under pace -> launches.
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-15.json":
-                            _wet_doc(0.1 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
     notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
-    assert notified == []  # no ping when nothing was skipped
+    assert notified == []  # nothing skipped -> nothing to ping
 
 
-def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
-    # Way over pace, but SSM override is active -> still launch.
-    idx = _load(
-        monkeypatch,
-        env={"GROOM_DISPATCH_ENABLED": "true"},
-        s3_objects={"claude_code_usage/groom/2026-07-13.json":
-                    _wet_doc(0.9 * 1_140_000_000)},
-        ssm_parameters={"/alpha-engine/groom/dynamic_budget_override_until": "2099-01-01T00:00"},
-    )
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    assert out["groom"]["launched"] is True
-
-
-def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
+def test_legacy_pace_gate_env_flag_is_inert(monkeypatch):
+    # A stale GROOM_PACE_GATE_ENABLED=true in the live Lambda env (deploys
+    # don't prune unknown env vars) must have zero effect.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
-                                   "GROOM_PACE_GATE_ENABLED": "false"},
+                                   "GROOM_PACE_GATE_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.99 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
-    assert notified == []  # kill-switch disables the ping too — the gate never ran
 
 
-def test_pace_gate_filters_to_anthropic_only_wet(monkeypatch):
-    # config#2484: WET reader must filter to Anthropic-only, matching
-    # groom_budget.py's filter. Mixed-provider fixture: 100M Anthropic + 500M
-    # OpenAI. On pace if only Anthropic (0.088% of 850M ceiling at 1 day).
-    # Over pace if total (0.7% inflates to pace check failure).
-    anthropic_wet = 0.1 * 1_140_000_000 * 0.088
-    openai_wet = 500_000_000
-    idx = _load(
-        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-        s3_objects={
-            "claude_code_usage/groom/2026-07-13.json":
-            _mixed_provider_wet_doc(anthropic_wet, openai_wet)
-        }
-    )
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_notify(monkeypatch, idx)
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    # Should launch because Anthropic-only WET is low, NOT fail because of the
-    # non-Anthropic inflated total.
-    assert out["groom"]["launched"] is True
-    assert notified == []
-
-
-def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
+def test_demand_all_failure_writes_skip_decision_record(monkeypatch):
+    # config-I2540: an enumeration failure must leave a decision record with
+    # skip_reason=demand_all_failed (empty decisions list), so a MISSING
+    # record file unambiguously means "the scheduler never invoked the
+    # Lambda" — the 2026-07-14 incident class where the console could not
+    # distinguish an outage from a quiet early exit.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    notified = _spy_notify(monkeypatch, idx)
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("github down")))
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["reason"] == "demand_all_failed"
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/")}
+    assert len(records) == 1, f"exactly one skip record expected, got {list(records)}"
+    doc = json.loads(list(records.values())[0])
+    assert doc["skip_reason"] == "demand_all_failed"
+    assert doc["decisions"] == []
+    assert "github down" in doc["error"]
+    assert doc["schema_version"] == 2
 
+
+def test_demand_all_failure_skip_record_write_error_never_masks_the_skip(monkeypatch):
+    # The record write is best-effort: an S3 failure there must not turn the
+    # (already-notified) skip into a crash — no-silent-swallows carve-out,
+    # recorded via the CW warning log.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("github down")))
     def _boom(**kw):
-        raise RuntimeError("S3 unreachable")
-    monkeypatch.setattr(idx._test_s3, "get_paginator", _boom)
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    assert out["groom"]["launched"] is True
-    assert notified == []  # fail-safe path never trips (exceeded=False), no ping
-
-
-# ── SSoT ceiling wiring (config-I2461) ──────────────────────────────────────
-def _pacing_doc(ceiling: float, anchor_iso: str = "2026-07-12T21:00:00") -> bytes:
-    import json
-    return json.dumps({
-        "schema_version": 2, "weekly_wet_ceiling": ceiling,
-        "weekly_reset_anchor_pt": anchor_iso,
-    }).encode()
-
-
-def test_pace_gate_reads_ceiling_from_ssot_not_hardcoded_fallback(monkeypatch):
-    # Real-world regression (2026-07-13/14): the SSoT was recalibrated to
-    # ~2.06B WET, but this Lambda stayed pinned to the 850M literal and
-    # false-tripped pace_gate_skip on every trigger. Seed a WET level that
-    # is UNDER pace against the recalibrated SSoT ceiling but would be WAY
-    # over pace against the stale 850M fallback (208.6M/850M = 24.5% used
-    # at only 16% elapsed — reproduces the live config-I2461 numbers) —
-    # asserting launch proves the ceiling came from the SSoT, not the fallback.
-    wet = 208_628_197.0
-    idx = _load(
-        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-        s3_objects={
-            "claude_code_usage/groom/2026-07-14.json": _wet_doc(wet),
-            "config/usage_pacing.json": _pacing_doc(2_055_816_944.44),
-        },
-    )
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(hours=27)  # ~16% elapsed
-    # This test's own _load_pacing_config() call needs fromisoformat — unlike
-    # the other pace-gate tests, which never reach that code path when the
-    # SSoT object is absent (fallback raises before touching datetime again).
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now),
-        "fromisoformat": staticmethod(idx.datetime.fromisoformat)}))
-    notified = _spy_notify(monkeypatch, idx)
-    out = idx.handler({"run_mode": "full", "schedule": "0 7 * * *"}, None)
-    assert out["groom"]["launched"] is True
-    assert notified == []
-
-
-def test_pace_gate_falls_back_to_constant_when_ssot_object_missing(monkeypatch):
-    # No "config/usage_pacing.json" object seeded -> _load_pacing_config()
-    # raises (KeyError on the fake S3's dict lookup) -> falls back to the
-    # WEEKLY_WET_CEILING module constant, same behavior as before config-I2461.
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-13.json":
-                            _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    assert out["groom"]["launched"] is False
-    assert out["groom"]["reason"] == "pace_gate_skip"
-
-
-def test_pacing_config_schema_contract_matches_shared_ssot_shape(monkeypatch):
-    # config-I2461 requirement #2: this Lambda and alpha-engine-config's
-    # groom_budget.py::read_pacing_config() / usage-pace-alert's
-    # _load_pacing_config() must all parse the IDENTICAL SSoT document shape
-    # (schema_version, weekly_wet_ceiling, weekly_reset_anchor_pt) into the
-    # SAME (ceiling, anchor) values — a schema drift in any one consumer's
-    # field names/types would silently diverge `used_frac` across consumers.
-    # This fixture is the literal live SSoT shape observed 2026-07-13.
-    idx = _load(monkeypatch, s3_objects={
-        "config/usage_pacing.json": json.dumps({
-            "schema_version": 2,
-            "weekly_wet_ceiling": 2055816944.4444444,
-            "weekly_reset_anchor_pt": "2026-07-12T21:00:00",
-            "calibrated_date": "2026-07-13",
-            "calibration_basis": "daily calibration sample",
-            "fit_method": "raw", "n_samples": 1, "cv": None, "converged": False,
-        }).encode(),
-    })
-    ceiling, anchor = idx._load_pacing_config()
-    assert ceiling == 2055816944.4444444
-    assert anchor == idx.datetime(2026, 7, 12, 21, 0)
+        raise RuntimeError("S3 down too")
+    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["reason"] == "demand_all_failed"
 
 
 def test_gated_reverify_schedule_forwards_filter(monkeypatch):
@@ -748,7 +611,7 @@ def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
     idx._test_ec2.describe_instances = _boom
     out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
     # A broken check must never block a launch — it's an optimization, not a
-    # correctness gate (mirrors the pace gate / demand gate fail-safe posture).
+    # correctness gate (mirrors the demand gate fail-safe posture).
     assert out["groom"]["launched"] is True
 
 
@@ -1017,21 +880,6 @@ def test_decide_only_demand_all_failure_shape(monkeypatch):
     assert out["decide"]["reason"] == "demand_all_failed"
 
 
-def test_decide_only_respects_pace_gate_skip(monkeypatch):
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-13.json":
-                            _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *",
-                       "decide_only": True}, None)
-    d = out["decide"]
-    assert d["launches"] == []
-    assert d["reason"] == "pace_gate_skip"
-    assert idx._test_ssm.sent == []
-
-
 def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     # A launch_decided event must NEVER touch demand-gate/fresh-stat enumeration
@@ -1052,17 +900,13 @@ def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
     assert "export GROOM_ISSUE_FILTER=low-only" in cmd
 
 
-def test_launch_decided_bypasses_pace_gate(monkeypatch):
-    # A relaunch of an already-decided box must not be re-blocked by the
-    # pre-boot pace gate — that gate is a per-TRIGGER decision, made once by
-    # decide_only; re-checking it per-box would let a mid-run pace shift
-    # cancel a box the trigger already committed to.
+def test_launch_decided_launches_regardless_of_recorded_usage(monkeypatch):
+    # A relaunch of an already-decided box launches unconditionally — no
+    # usage-derived gate applies (the pace gate that once could re-block this
+    # path pre-config#2129 was dismantled 2026-07-14).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.9 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
     out = idx.handler({
         "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-sonnet-5",
         "issue_filter": "high-only", "launch_decided": True,
@@ -1084,7 +928,7 @@ _SWEEP_SF_EVENT = {
 
 def test_sweep_launch_decided_launches_haiku_sweep_box(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    # Unconditional by design: no demand/pace enumeration on the sweep path.
+    # Unconditional by design: no demand enumeration on the sweep path.
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
                         lambda token: (_ for _ in ()).throw(
                             AssertionError("sweep launch_decided must not enumerate")))
@@ -1360,21 +1204,18 @@ def test_manifest_key_skips_demand_all_block(monkeypatch):
     assert len(idx._test_ssm.sent) == 1  # ONE box, not a demand-all fan-out
 
 
-def test_manifest_key_still_honors_pace_gate(monkeypatch):
-    """Deliberate (config#2175): the weekly WET pace gate applies to drains
-    too — a manifest bypasses the demand-COUNT gates only, never the budget."""
+def test_manifest_key_launches_regardless_of_recorded_usage(monkeypatch):
+    """Post-dismantle (2026-07-14): a manifest drain launches even with heavy
+    recorded usage — the weekly WET pace gate that used to apply to drains
+    (config#2175) is gone with the rest of usage pacing."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
     out = idx.handler({"run_mode": "full", "schedule": "manual",
                        "model": "claude-haiku-4-5", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
-    assert out["groom"]["launched"] is False
-    assert out["groom"]["reason"] == "pace_gate_skip"
-    assert idx._test_ssm.sent == []
+    assert out["groom"]["launched"] is True
+    assert len(idx._test_ssm.sent) == 1
 
 
 def test_scheduled_demand_all_without_manifest_key_still_enumerates(monkeypatch):

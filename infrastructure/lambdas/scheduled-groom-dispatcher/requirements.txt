@@ -17,4 +17,3 @@ boto3>=1.34.0
 # ge.decide_slot()/decide_trigger()'s SlotDecision.model; no code change here,
 # behavior change only (see test_handler.py updates in this same commit).
 nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.109.0
-krepis>=0.10.2
