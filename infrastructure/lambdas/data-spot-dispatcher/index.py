@@ -231,11 +231,12 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     force_on_demand=True skips the spot attempt entirely. Set by the EOD SF's
     bounded retry-on-relaunch (2026-07-14 incident: a data-spot box was
     reclaimed by AWS — Server.SpotInstanceTermination — ~22min into a
-    post-market-data run, which the SF now retries once). A workload that
-    already lost one box to a spot interruption should not gamble on spot
-    again for its one retry attempt — the cost delta is a few cents for a
-    sub-hour c5.large-class box, negligible against the reconcile-reliability
-    this buys."""
+    post-market-data run, which the SF now retries once) and, identically
+    (config#2542), by the weekday SF's morning-enrich/morning-arctic-append
+    retry-on-relaunch. A workload that already lost one box to a spot
+    interruption should not gamble on spot again for its one retry attempt —
+    the cost delta is a few cents for a sub-hour c5.large-class box,
+    negligible against the reconcile-reliability this buys."""
     common = dict(
         image_id=AMI_ID,
         key_name=KEY_NAME,
@@ -329,8 +330,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     `event` carries {"workload": "morning-enrich" | "morning-arctic-append" |
     "post-market-data" | "post-market-arctic-append", "force_on_demand": bool}.
     `force_on_demand` (default False) is set by the EOD SF's post-interruption
-    retry (2026-07-14 incident) so the one retry attempt never gambles on spot
-    a second time. Returns, wrapped under a `data_spot` key (mirrors the groom
+    retry (2026-07-14 incident) and the weekday SF's identical retry
+    (config#2542) so the one retry attempt never gambles on spot a second
+    time. Returns, wrapped under a `data_spot` key (mirrors the groom
     dispatcher's `groom` wrap so the SF's JSONPath is
     $.<result>.Payload.data_spot.*):
 
