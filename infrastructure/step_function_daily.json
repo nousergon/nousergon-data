@@ -1133,7 +1133,17 @@
           "Next": "CheckSkipChronicGapHeal"
         }
       ],
-      "Default": "LaunchMorningEnrichSpot"
+      "Default": "InitMorningEnrichRetryCounter"
+    },
+    "InitMorningEnrichRetryCounter": {
+      "Type": "Pass",
+      "Comment": "config#2542: retry budget for a genuinely-interrupted (not merely slow) morning-enrich spot workload, e.g. an AWS spot reclaim mid-job. Mirrors InitDataSpotRetryCounter in step_function_eod.json (PR813, the 2026-07-14 EOD incident fix). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. force_on_demand starts false; IncrementMorningEnrichRetry flips it true so the one retry never gambles on spot a second time.",
+      "Result": {
+        "attempts": 0,
+        "force_on_demand": false
+      },
+      "ResultPath": "$.morning_enrich_retry",
+      "Next": "LaunchMorningEnrichSpot"
     },
     "CheckSkipChronicGapHeal": {
       "Type": "Choice",
@@ -1237,12 +1247,13 @@
     },
     "LaunchMorningEnrichSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run MorningEnrich (polygon daily_closes fetch + prune) on an ephemeral spot box, NOT on ae-trading. Returns {data_spot:{launched,instance_id,command_id,...}}. The Arctic write of the enriched row happens in the following MorningArcticAppend spot workload — both run on the spot box (S3/ArcticDB), never the trading box.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run MorningEnrich (polygon daily_closes fetch + prune) on an ephemeral spot box, NOT on ae-trading. Returns {data_spot:{launched,instance_id,command_id,...}}. The Arctic write of the enriched row happens in the following MorningArcticAppend spot workload — both run on the spot box (S3/ArcticDB), never the trading box. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (config#2542) — the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
-          "workload": "morning-enrich"
+          "workload": "morning-enrich",
+          "force_on_demand.$": "$.morning_enrich_retry.force_on_demand"
         }
       },
       "TimeoutSeconds": 420,
@@ -1330,12 +1341,12 @@
     },
     "CheckMorningEnrichSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open: a data fetch failure must not block daemon start, config#1767 #4). NOTE this is the inverse of the OLD on-trading CheckMorningEnrichStatus, which HandleFailure'd — the data phase is now decoupled/fail-open, no longer gating the daemon.",
+      "Comment": "Success -> init the Arctic-append retry counter then the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckMorningEnrichRetryBudget (one relaunch retry, config#2542, before ExtractDataSpotError -> CONTINUE fail-open: a data fetch failure must not block daemon start, config#1767 #4). NOTE this is the inverse of the OLD on-trading CheckMorningEnrichStatus, which HandleFailure'd — the data phase is now decoupled/fail-open, no longer gating the daemon.",
       "Choices": [
         {
           "Variable": "$.morning_enrich_poll.Status",
           "StringEquals": "Success",
-          "Next": "LaunchMorningArcticAppendSpot"
+          "Next": "InitMorningArcticAppendRetryCounter"
         },
         {
           "Variable": "$.morning_enrich_poll.Status",
@@ -1353,21 +1364,54 @@
           "Next": "MorningEnrichSpotWait"
         }
       ],
+      "Default": "CheckMorningEnrichRetryBudget"
+    },
+    "CheckMorningEnrichRetryBudget": {
+      "Type": "Choice",
+      "Comment": "config#2542: mirrors step_function_eod.json's CheckDataSpotRetryBudget (PR813). A terminal non-Success status on the morning-enrich spot poll is presumed transient AWS spot interruption until proven otherwise — retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption falls through to the existing fail-open path rather than looping indefinitely. $.morning_enrich_retry is always initialized by InitMorningEnrichRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.morning_enrich_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementMorningEnrichRetry"
+        }
+      ],
       "Default": "ExtractDataSpotError"
+    },
+    "IncrementMorningEnrichRetry": {
+      "Type": "Pass",
+      "Comment": "config#2542: force_on_demand flips to true for the retry — a box already lost to spot interruption once must not gamble on spot again. Mirrors IncrementDataSpotRetry.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.morning_enrich_retry.attempts, 1)",
+        "force_on_demand": true
+      },
+      "ResultPath": "$.morning_enrich_retry",
+      "Next": "LaunchMorningEnrichSpot"
     },
     "MorningEnrichSpotWait": {
       "Type": "Wait",
       "Seconds": 15,
       "Next": "PollMorningEnrichSpot"
     },
+    "InitMorningArcticAppendRetryCounter": {
+      "Type": "Pass",
+      "Comment": "config#2542: retry budget for the Arctic-append sub-phase — the actual write price_cache.py's load_atr_14_pct/load_daily_vwap depend on. Mirrors InitMorningEnrichRetryCounter and step_function_eod.json's InitDataSpotArcticRetryCounter (PR813), including force_on_demand.",
+      "Result": {
+        "attempts": 0,
+        "force_on_demand": false
+      },
+      "ResultPath": "$.morning_arctic_append_retry",
+      "Next": "LaunchMorningArcticAppendSpot"
+    },
     "LaunchMorningArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the ArcticDB daily_append (builders/daily_append.py via weekly_collector --morning-arctic-append) on the ephemeral spot box. The Arctic/S3 write runs ON THE SPOT via its alpha-engine-executor-profile, NOT on the trading box (config#1767 #1).",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the ArcticDB daily_append (builders/daily_append.py via weekly_collector --morning-arctic-append) on the ephemeral spot box. The Arctic/S3 write runs ON THE SPOT via its alpha-engine-executor-profile, NOT on the trading box (config#1767 #1). force_on_demand.$ is false on the first attempt and true on the post-interruption retry (config#2542) — the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
-          "workload": "morning-arctic-append"
+          "workload": "morning-arctic-append",
+          "force_on_demand.$": "$.morning_arctic_append_retry.force_on_demand"
         }
       },
       "TimeoutSeconds": 420,
@@ -1455,7 +1499,7 @@
     },
     "CheckMorningArcticAppendSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> continue to the predictor path; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open).",
+      "Comment": "Success -> continue to the predictor path; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckMorningArcticAppendRetryBudget (one relaunch retry, config#2542) -> ExtractDataSpotError -> CONTINUE (fail-open).",
       "Choices": [
         {
           "Variable": "$.arctic_append_poll.Status",
@@ -1478,7 +1522,29 @@
           "Next": "MorningArcticAppendSpotWait"
         }
       ],
+      "Default": "CheckMorningArcticAppendRetryBudget"
+    },
+    "CheckMorningArcticAppendRetryBudget": {
+      "Type": "Choice",
+      "Comment": "config#2542: same one-retry-then-give-up policy as CheckMorningEnrichRetryBudget, applied to the Arctic-append sub-phase. Mirrors step_function_eod.json's CheckDataSpotArcticRetryBudget (PR813). $.morning_arctic_append_retry is always initialized by InitMorningArcticAppendRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.morning_arctic_append_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementMorningArcticAppendRetry"
+        }
+      ],
       "Default": "ExtractDataSpotError"
+    },
+    "IncrementMorningArcticAppendRetry": {
+      "Type": "Pass",
+      "Comment": "config#2542: force_on_demand flips to true for the retry. Mirrors IncrementMorningEnrichRetry.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.morning_arctic_append_retry.attempts, 1)",
+        "force_on_demand": true
+      },
+      "ResultPath": "$.morning_arctic_append_retry",
+      "Next": "LaunchMorningArcticAppendSpot"
     },
     "MorningArcticAppendSpotWait": {
       "Type": "Wait",
