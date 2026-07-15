@@ -69,6 +69,19 @@ class TestPolygonReachable:
             with pytest.raises(RuntimeError, match="auth failed"):
                 pf._check_polygon_reachable()
 
+    def test_429_rate_limited_passes(self):
+        # config#2662: a 429 is PROOF of reachability (service answered, auth
+        # not rejected) — the probe must NOT abort the workload; the
+        # collector's client (polygon_client._get) owns Retry-After pacing.
+        # The 2026-07-15 incident: this exact status killed the DataSpot
+        # phase twice for a condition the collector absorbs in seconds.
+        pf = self._setup()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(
+                status_code=429, text='{"error": "max requests per minute"}'
+            )
+            pf._check_polygon_reachable()  # must not raise
+
     def test_500_outage(self):
         pf = self._setup()
         with patch("requests.get") as mock_get:
@@ -99,6 +112,36 @@ class TestPolygonReachable:
         assert mock_get.call_count == 2
 
 
+# ── FMP /stable reachability ─────────────────────────────────────────────────
+
+class TestFmpStableReachable:
+    def _setup(self):
+        env_patch = patch.dict("os.environ", {"FMP_API_KEY": "fake_key"}, clear=False)
+        env_patch.start()
+        self._env_patch = env_patch
+        return _make()
+
+    def teardown_method(self):
+        if hasattr(self, "_env_patch"):
+            self._env_patch.stop()
+
+    def test_200_with_list_body_passes(self):
+        pf = self._setup()
+        resp = MagicMock(status_code=200, text='[{"symbol": "AAPL"}]')
+        resp.json.return_value = [{"symbol": "AAPL"}]
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = resp
+            pf._check_fmp_stable_reachable()
+
+    def test_429_rate_limited_passes(self):
+        # config#2662: same contract as the polygon probe — 429 proves
+        # reachability; quota pressure is the collector's to pace.
+        pf = self._setup()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=429, text="Limit Reach")
+            pf._check_fmp_stable_reachable()  # must not raise
+
+
 # ── FRED reachability ────────────────────────────────────────────────────────
 
 class TestFredReachable:
@@ -126,6 +169,14 @@ class TestFredReachable:
             )
             with pytest.raises(RuntimeError, match="auth failed.*invalid"):
                 pf._check_fred_reachable()
+
+    def test_429_rate_limited_passes(self):
+        # config#2662: same contract as the polygon probe — 429 proves
+        # reachability; _fred_get_with_retry owns pacing at fetch time.
+        pf = self._setup()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=429, text="Too Many Requests")
+            pf._check_fred_reachable()  # must not raise
 
     def test_500_outage(self):
         pf = self._setup()
