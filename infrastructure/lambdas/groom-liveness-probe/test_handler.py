@@ -136,27 +136,27 @@ def test_three_daily_triggers_returned(monkeypatch):
 # ---- _missed ---------------------------------------------------------------
 
 
-def test_trigger_with_digest_in_window_is_not_missed(monkeypatch):
+def test_trigger_with_artifact_in_window_is_not_missed(monkeypatch):
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     trig = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
-    # Digest filed 6 min into the run → inside [23:00, 05:45].
+    # Artifact's run_start is 6 min into the run → inside [23:00, 05:45].
     stamps = [_dt(2026, 6, 29, 23, 6)]
     assert index._missed([trig], stamps) == []
 
 
-def test_trigger_with_no_digest_is_missed(monkeypatch):
+def test_trigger_with_no_artifact_is_missed(monkeypatch):
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     trig = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
-    # Only digest is from a DIFFERENT run window (the next morning's groom).
+    # Only artifact is from a DIFFERENT run window (the next morning's groom).
     stamps = [_dt(2026, 6, 30, 7, 10)]
     assert [m["at"] for m in index._missed([trig], stamps)] == [trig["at"]]
 
 
 def test_single_silent_death_not_masked_by_later_success(monkeypatch):
     """The key property: a missed 23:00 run is still flagged even though the next
-    07:00 run filed a digest (per-trigger windows, not latest-age)."""
+    07:00 run wrote an artifact (per-trigger windows, not latest-age)."""
     monkeypatch.setattr(index, "CEILING_MIN", 360)
     monkeypatch.setattr(index, "MARGIN_MIN", 45)
     t_dead = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
@@ -164,6 +164,61 @@ def test_single_silent_death_not_masked_by_later_success(monkeypatch):
     stamps = [_dt(2026, 6, 30, 7, 8)]  # only the 07:00 run reported
     misses = index._missed([t_dead, t_ok], stamps)
     assert [m["at"] for m in misses] == [t_dead["at"]]
+
+
+# ---- _lookback_dates / _fetch_run_artifact_timestamps ----------------------
+
+
+def test_lookback_dates_spans_horizon_to_now(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    now = _dt(2026, 7, 2, 14, 0)  # horizon = 2026-07-01 08:00
+    assert index._lookback_dates(now) == ["2026-07-01", "2026-07-02"]
+
+
+class _FakeArtifactS3:
+    """Fakes list_objects_v2 (single page) + get_object for the artifact fetch."""
+
+    def __init__(self, objects_by_prefix):
+        self._objects = objects_by_prefix  # {prefix: [(key, body_dict), ...]}
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+        items = self._objects.get(Prefix, [])
+        return {"Contents": [{"Key": k} for k, _ in items], "IsTruncated": False}
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        import io
+
+        for items in self._objects.values():
+            for k, body in items:
+                if k == Key:
+                    return {"Body": io.BytesIO(index.json.dumps(body).encode())}
+        raise AssertionError(f"unexpected key {Key}")
+
+
+def test_fetch_run_artifact_timestamps_reads_run_start(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 6)
+    monkeypatch.setattr(index, "RUN_ARTIFACT_PREFIX", "groom/")
+    now = _dt(2026, 7, 2, 10, 0)
+    s3 = _FakeArtifactS3({
+        "groom/2026-07-02/": [
+            ("groom/2026-07-02/run1.json", {"run_start": "2026-07-02T07:00:05+00:00"}),
+        ],
+    })
+    stamps = index._fetch_run_artifact_timestamps(s3, now)
+    assert stamps == [datetime(2026, 7, 2, 7, 0, 5, tzinfo=UTC)]
+
+
+def test_fetch_run_artifact_timestamps_skips_non_json_and_missing_run_start(monkeypatch):
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 6)
+    monkeypatch.setattr(index, "RUN_ARTIFACT_PREFIX", "groom/")
+    now = _dt(2026, 7, 2, 10, 0)
+    s3 = _FakeArtifactS3({
+        "groom/2026-07-02/": [
+            ("groom/2026-07-02/marker.txt", {}),
+            ("groom/2026-07-02/empty.json", {}),
+        ],
+    })
+    assert index._fetch_run_artifact_timestamps(s3, now) == []
 
 
 # ---- handler (dedup + fail-loud) -------------------------------------------
@@ -195,8 +250,7 @@ def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 
     # the trigger dates the other tests share.
     monkeypatch.setattr(index, "_now", lambda: now)
     monkeypatch.setattr(index, "_expected_triggers", lambda now: triggers)
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "pat")
-    monkeypatch.setattr(index, "_fetch_digest_timestamps", lambda pat: stamps)
+    monkeypatch.setattr(index, "_fetch_run_artifact_timestamps", lambda s3, now: stamps)
     monkeypatch.setattr(index, "_s3_client", lambda: s3)
     sends = []
     monkeypatch.setattr(
@@ -235,17 +289,17 @@ def test_handler_all_reported_no_alert(monkeypatch):
     assert out["missed"] == 0 and out["alerted"] is False and sends == []
 
 
-def test_handler_fail_loud_on_github_error(monkeypatch):
-    """The PRIMARY input (digest fetch) RAISES — a silently-skipped check is the
-    exact failure this guards against."""
+def test_handler_fail_loud_on_s3_error(monkeypatch):
+    """The PRIMARY input (S3 run-artifact fetch) RAISES — a silently-skipped
+    check is the exact failure this guards against."""
     trig = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
     monkeypatch.setattr(index, "_expected_triggers", lambda now: [trig])
-    monkeypatch.setattr(index, "_get_github_pat", lambda: "pat")
+    monkeypatch.setattr(index, "_s3_client", lambda: _FakeS3())
 
-    def _boom(pat):
-        raise RuntimeError("github 500")
+    def _boom(s3, now):
+        raise RuntimeError("s3 500")
 
-    monkeypatch.setattr(index, "_fetch_digest_timestamps", _boom)
+    monkeypatch.setattr(index, "_fetch_run_artifact_timestamps", _boom)
     with pytest.raises(RuntimeError):
         index.handler({}, None)
 

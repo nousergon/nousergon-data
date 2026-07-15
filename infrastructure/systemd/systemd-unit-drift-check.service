@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily installed-vs-repo systemd unit drift check (config#2352)
+
+[Service]
+Type=oneshot
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine-data
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report
+# Reads /etc/systemd/system/*, no writes — runs as ec2-user like the units
+# it checks, not root.
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

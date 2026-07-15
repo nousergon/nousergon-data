@@ -38,7 +38,7 @@ def _fake_run(returncode=0, stdout="", stderr=""):
 # ── Discovery against the real repo state ───────────────────────────────────
 
 
-def test_discovers_all_four_orchestrated_state_machines(cd):
+def test_discovers_all_six_orchestrated_state_machines(cd):
     entries = cd._discover_expected_logging_configs()
     names = {e["sf_name"] for e in entries}
     assert names == {
@@ -46,6 +46,13 @@ def test_discovers_all_four_orchestrated_state_machines(cd):
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
         "alpha-engine-groom-dispatch",
+        # alpha-engine-config-I2544/I2545: both are CFN
+        # AWS::StepFunctions::StateMachine resources with a
+        # LoggingConfiguration block, auto-discovered via
+        # _discover_expected_from_cfn's regex walk of the CFN template —
+        # no code change needed in check-drift.py itself.
+        "ne-weekly-advisory-pipeline",
+        "ne-modelzoo-sunday-pipeline",
     }
 
 

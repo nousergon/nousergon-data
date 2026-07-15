@@ -10,16 +10,21 @@ Phase 4/5 consumer-cutover flag (Research / RAG reading
 ``candidates.json`` load-bearingly) belongs at the consumer side, not
 the producer side.
 
-Pin the chain between DataPhase1 and CheckSkipRAGIngestion:
+Pin the chain between DataPhase1 and CheckSkipRegimeSubstrate:
 
     DataPhase1 (skip path)        ──┐
-                                    ├──→ Scanner ──→ CheckSkipRAGIngestion
+                                    ├──→ Scanner ──→ CheckSkipRegimeSubstrate
     CheckDataPhase1Status.Success ──┘    │
-                                         └─(Catch)──→ CheckSkipRAGIngestion
+                                         └─(Catch)──→ CheckSkipRegimeSubstrate
 
-Scanner failure must NOT halt the pipeline (Research Lambda's internal
-scanner still produces the load-bearing universe today; the standalone
-artifact is parallel-observe and consumer-less until Phase 4).
+alpha-engine-config-I2515 Phase B: Scanner's candidates.json write is now
+LOAD-BEARING (SignalsEnvelope/ChallengerShadow/ThinkTankCoverage all read
+the same-day board; the multi-agent Research state that used to be the
+"load-bearing universe producer" is removed). Scanner's own Catch stays
+non-blocking at the SF layer — Catch and Next converge on the same state
+(CheckSkipRegimeSubstrate, which has no scanner-board dependency); genuine
+downstream impact of a missing board surfaces at SignalsEnvelope's own
+(blocking) Catch instead of here.
 """
 
 from __future__ import annotations
@@ -107,14 +112,16 @@ class TestLambdaTarget:
 
 
 class TestFailureIsolation:
-    def test_catch_routes_to_check_skip_rag(self, states):
-        # Phase 2 observe-only contract — scanner failure must NOT halt
-        # the pipeline. Research Lambda's internal scanner still runs
-        # in parallel and the artifact is consumer-less today.
+    def test_catch_routes_to_check_skip_regime_substrate(self, states):
+        # config-I2515 Phase B: Scanner failure must NOT halt the pipeline.
+        # Catch and Next now converge on the SAME state
+        # (CheckSkipRegimeSubstrate), since RegimeSubstrate has no
+        # scanner-board dependency; genuine downstream impact of a missing
+        # board surfaces at SignalsEnvelope's own (blocking) Catch instead.
         catches = states["Scanner"]["Catch"]
         assert len(catches) >= 1
         assert any(
-            c["Next"] == "CheckSkipRAGIngestion"
+            c["Next"] == "CheckSkipRegimeSubstrate"
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
@@ -171,8 +178,11 @@ class TestEdges:
         par = sf["States"]["ResearchPredictorParallel"]
         assert par["Branches"][0]["StartAt"] == "Scanner"
 
-    def test_scanner_success_routes_to_thinktank_coverage(self, states):
-        assert states["Scanner"]["Next"] == "ThinkTankCoverage"
+    def test_scanner_success_routes_to_regime_substrate_skip_gate(self, states):
+        # config-I2515 Phase B: ThinkTankCoverage moved to run AFTER the RAG
+        # ingestion chain (reads the fresh corpus); Scanner's direct successor
+        # is now CheckSkipRegimeSubstrate.
+        assert states["Scanner"]["Next"] == "CheckSkipRegimeSubstrate"
 
 
 # ── Result paths (state-merge contract) ───────────────────────────────────
