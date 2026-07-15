@@ -18,6 +18,12 @@
       "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/config_runner/webhook_secret"
     },
     {
+      "Sid": "ReadGithubReadOnlyPatForReconcileListing",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/config_runner/github_read_pat"
+    },
+    {
       "Sid": "SelfInvokeAsyncForTwoPhaseDispatch",
       "Effect": "Allow",
       "Action": "lambda:InvokeFunction",

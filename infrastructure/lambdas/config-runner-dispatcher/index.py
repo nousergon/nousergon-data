@@ -18,7 +18,7 @@ setup-python, pytest, etc.) is untouched, only `runs-on:` changes, and
 GitHub's own Actions service handles job dispatch + Check Run status
 natively, exactly as it does for hosted runners.
 
-MECHANISM (two-phase single Lambda, self-invoked async — see module-level
+MECHANISM (three-phase single Lambda, self-invoked async — see module-level
 `handler` for the branch):
   1. WEBHOOK RECEIVER phase: GitHub calls this Lambda's Function URL directly
      on every `workflow_job` event for alpha-engine-config (repo-level
@@ -42,6 +42,23 @@ MECHANISM (two-phase single Lambda, self-invoked async — see module-level
      on-box watchdog). Mirrors `ci-watch-dispatcher/index.py`'s
      launch/wait/dispatch shape via the shared `nousergon_lib.spot_dispatch`
      primitives (config#2106) — NOT reinvented here.
+  3. RECONCILE phase (EventBridge Scheduler, ~every 60s — config-I2653): a
+     self-hosted runner registered via a plain registration token binds to
+     the repo's WHOLE label pool, not the specific job that triggered its
+     launch — GitHub has no API to reserve a job for a not-yet-connected
+     runner (confirmed against GitHub's own docs before implementing this;
+     an earlier JIT-runner-config diagnosis for this issue was WRONG — JIT
+     is a more secure way to mint the same "any matching job" registration,
+     it does not bind to one job either). Under concurrent load a dispatched
+     runner can grab an unrelated queued job, leaving the job that triggered
+     its launch permanently stuck — GitHub sends the `queued` webhook exactly
+     ONCE per job, so there is no other path back to it without this backstop.
+     `_reconcile()` lists queued jobs matching our label that have sat queued
+     longer than `CONFIG_RUNNER_RECONCILE_STALE_SECONDS` with no in-flight
+     box (the existing job-id-tag dedup check), and dispatches a fresh runner
+     for each. Same "coverage beats dedupe" posture as the SpotProbeError
+     handling below — doesn't prevent the occasional mismatch, guarantees no
+     job stays stranded indefinitely.
 
 CONCURRENCY LOCK: keyed on `Name=alpha-engine-config-runner-spot` +
 `config-runner-job-id=<workflow_job.id>` — one job, one box, 1:1 (unlike
@@ -83,6 +100,9 @@ import hmac
 import json
 import logging
 import os
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 
 import boto3
 from nousergon_lib import spot_dispatch
@@ -160,6 +180,49 @@ CONFIG_RUNNER_CONFIG_BRANCH = os.environ.get("CONFIG_RUNNER_CONFIG_BRANCH", "mai
 MAX_RUNTIME_SECONDS = int(os.environ.get("CONFIG_RUNNER_MAX_RUNTIME_SECONDS", "1800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("CONFIG_RUNNER_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("CONFIG_RUNNER_CW_LOG_GROUP", "/alpha-engine/config-runner-spot")
+
+# Reconcile backstop (config-I2653): a queued job older than this with no
+# in-flight box (per the same job-id-tag dedup check the reactive path uses)
+# gets a fresh dispatch. ~2-3x the typical observed dispatch+SSM-online
+# latency (15-40s) — comfortably past normal in-flight dispatches, without
+# waiting so long that a genuinely-orphaned job sits stuck for minutes.
+RECONCILE_STALE_SECONDS = int(os.environ.get("CONFIG_RUNNER_RECONCILE_STALE_SECONDS", "90"))
+RECONCILE_MAX_QUEUED_RUNS = int(os.environ.get("CONFIG_RUNNER_RECONCILE_MAX_QUEUED_RUNS", "50"))
+
+CONFIG_RUNNER_READ_PAT_SSM = os.environ.get(
+    "CONFIG_RUNNER_READ_PAT_SSM", "/alpha-engine/config_runner/github_read_pat"
+)
+_gh_read_pat_cache: str | None = None
+
+
+def _gh_read_pat() -> str:
+    """A SEPARATE, dedicated, least-privilege PAT (Actions: Read ONLY —
+    cannot register runners, cannot touch repo settings) — deliberately NOT
+    the Administration:write PAT the box uses to register runners. This
+    Lambda sits behind a public, unauthenticated Function URL (HMAC
+    verification protects the WEBHOOK path, not a credential the Lambda's
+    own execution role can read); granting it read access to the powerful
+    registration PAT would widen blast radius for no reason the reconcile
+    logic actually needs (it only ever lists queued runs/jobs)."""
+    global _gh_read_pat_cache
+    if _gh_read_pat_cache is None:
+        _gh_read_pat_cache = boto3.client("ssm", region_name=REGION).get_parameter(
+            Name=CONFIG_RUNNER_READ_PAT_SSM, WithDecryption=True  # gitleaks:allow — SSM param path, not a secret value
+        )["Parameter"]["Value"]
+    return _gh_read_pat_cache
+
+
+def _gh_api_get(path: str) -> dict:
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={
+            "Authorization": f"Bearer {_gh_read_pat()}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 - fixed https://api.github.com host
+        return json.loads(resp.read())
 
 
 def _verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
@@ -352,11 +415,77 @@ def _launch_config_runner_spot(job_id: str) -> dict:
     }
 
 
+def _reconcile() -> dict:
+    """Scheduled backstop (~every 60s, config-I2653): dispatch a fresh runner
+    for any queued job matching our label that's had no in-flight box for
+    RECONCILE_STALE_SECONDS. See module docstring phase 3 for the full
+    rationale — this is NOT redundant with the reactive webhook path; it is
+    the only mechanism that can recover a job whose one-shot `queued`
+    webhook already fired but whose dispatched runner grabbed a different
+    job instead."""
+    if not DISPATCH_ENABLED:
+        logger.info("reconcile: CONFIG_RUNNER_DISPATCH_ENABLED=false — skipping")
+        return {"reconciled": 0, "reason": "disabled"}
+
+    now = datetime.now(timezone.utc)
+    try:
+        runs_resp = _gh_api_get(
+            f"/repos/{TARGET_REPO_FULL_NAME}/actions/runs"
+            f"?status=queued&per_page={RECONCILE_MAX_QUEUED_RUNS}"
+        )
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+        # Best-effort: a failed reconcile pass just means "no backstop this
+        # minute" — the NEXT scheduled invocation tries again. Never raise
+        # (this is EventBridge-invoked; an unhandled exception would just
+        # generate a Lambda-error-metric page for a transient GitHub API
+        # blip with no actionable fix).
+        logger.error("reconcile: failed to list queued runs: %s: %s", type(exc).__name__, exc)
+        return {"reconciled": 0, "reason": "list_runs_failed", "error": str(exc)}
+
+    dispatched = []
+    skipped = []
+    for run in runs_resp.get("workflow_runs", []):
+        try:
+            jobs_resp = _gh_api_get(
+                f"/repos/{TARGET_REPO_FULL_NAME}/actions/runs/{run['id']}/jobs"
+            )
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+            logger.error("reconcile: failed to list jobs for run %s: %s: %s",
+                         run.get("id"), type(exc).__name__, exc)
+            continue
+        for job in jobs_resp.get("jobs", []):
+            if job.get("status") != "queued" or TARGET_LABEL not in (job.get("labels") or []):
+                continue
+            created_at = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+            age_seconds = (now - created_at).total_seconds()
+            if age_seconds < RECONCILE_STALE_SECONDS:
+                continue  # still within the reactive path's normal dispatch latency
+            job_id = str(job["id"])
+            try:
+                existing = _running_config_runner_instance_ids(job_id)
+            except SpotProbeError:
+                existing = []  # degrade to "dispatch anyway" — the launch's own dedup/tag logic is authoritative
+            if existing:
+                skipped.append(job_id)
+                continue
+            logger.info("reconcile: job %s queued %.0fs with no in-flight box — dispatching",
+                       job_id, age_seconds)
+            dispatched.append({"job_id": job_id, "age_seconds": age_seconds,
+                               "result": _launch_config_runner_spot(job_id)})
+
+    logger.info("reconcile: dispatched=%d skipped=%d", len(dispatched), len(skipped))
+    return {"reconciled": len(dispatched), "dispatched": dispatched, "skipped": skipped}
+
+
 def handler(event: dict, context) -> dict:
-    """Two-phase entrypoint — see module docstring. A Function URL delivery
-    carries `requestContext` (the API Gateway v2-shaped proxy event); the
-    async self-invoked worker payload does not."""
+    """Three-phase entrypoint — see module docstring. A Function URL
+    delivery carries `requestContext` (the API Gateway v2-shaped proxy
+    event); the EventBridge-scheduled reconcile trigger carries
+    `{"reconcile": true}`; the async self-invoked worker payload carries
+    `config_runner_job_id`."""
     event = event or {}
+    if event.get("reconcile"):
+        return _reconcile()
     if "requestContext" in event:
         return _handle_webhook(event)
 
