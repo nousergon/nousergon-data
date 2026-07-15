@@ -56,27 +56,6 @@
       }
     },
     {
-      "Sid": "ReadClaudeCodeUsageForPaceGate",
-      "Effect": "Allow",
-      "Action": [
-        "s3:ListBucket"
-      ],
-      "Resource": "arn:aws:s3:::alpha-engine-research",
-      "Condition": {
-        "StringLike": {
-          "s3:prefix": "claude_code_usage/*"
-        }
-      }
-    },
-    {
-      "Sid": "ReadClaudeCodeUsageObjectsForPaceGate",
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject"
-      ],
-      "Resource": "arn:aws:s3:::alpha-engine-research/claude_code_usage/*"
-    },
-    {
       "Sid": "ListGroomRunArtifactsForFreshSkip",
       "Effect": "Allow",
       "Action": [
@@ -110,14 +89,6 @@
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_GROOM"
       ]
-    },
-    {
-      "Sid": "ReadGroomBudgetOverrideParam",
-      "Effect": "Allow",
-      "Action": [
-        "ssm:GetParameter"
-      ],
-      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/dynamic_budget_override_until"
     },
     {
       "Sid": "ReadGroomPatForDemandGate",

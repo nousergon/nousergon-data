@@ -148,70 +148,69 @@ STAGES: tuple[Stage, ...] = (
     # NOTE: Scanner (branch A's StartAt) has NO skip gate and re-runs
     # unconditionally on any branch-A rerun; it is fail-soft/observe-only
     # by SF design. Surfaced as a warning when branch A re-runs.
-    Stage(
-        "rag_ingestion", "skip_rag_ingestion",
-        "CheckSkipRAGIngestion", "RAGIngestion",
-        frozenset({"CheckSkipRegimeSubstrate"}),
-    ),
+    #
+    # alpha-engine-config-I2515 Phase B reorder: RegimeSubstrate now runs
+    # BEFORE the RAG chain (moved ahead of RAG/ThinkTank so SignalsEnvelope
+    # reads a same-day regime label); the multi-agent Research state (and
+    # its "research" Stage / skip_research flag / CheckSkipResearch gate)
+    # was REMOVED entirely. SignalsEnvelope (its load-bearing replacement)
+    # and ChallengerShadow (observe-only) have NO skip gates either — like
+    # Scanner and ThinkTankCoverage, they re-run unconditionally on any
+    # branch-A rerun. SignalsEnvelope gets its own explicit warning below
+    # (mirrors Scanner's) since it OVERWRITES the live signals.json — more
+    # consequential than Scanner's/ThinkTankCoverage's observe-only writes.
     Stage(
         "regime_substrate", "skip_regime_substrate",
         "CheckSkipRegimeSubstrate", "RegimeSubstrate",
-        frozenset({"CheckSkipRegimeRetrospectiveEval"}),
+        frozenset({"SignalsEnvelope"}),
+    ),
+    Stage(
+        "rag_ingestion", "skip_rag_ingestion",
+        "CheckSkipRAGIngestion", "RAGIngestion",
+        frozenset({"ThinkTankCoverage"}),
     ),
     Stage(
         "regime_retrospective_eval", "skip_regime_retrospective_eval",
         "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
-        frozenset({"CheckSkipResearch"}),
-    ),
-    Stage(
-        "research", "skip_research",
-        "CheckSkipResearch", "Research",
         frozenset({"CheckSkipDataPhase2"}),
     ),
     Stage(
         "data_phase2", "skip_data_phase2",
         "CheckSkipDataPhase2", "DataPhase2",
-        frozenset({"CheckSkipEvalJudge"}),
-    ),
-    Stage(
-        "eval_judge", "skip_eval_judge",
-        "CheckSkipEvalJudge", "ComputeEvalCadence",
-        frozenset({"CheckSkipRationaleClustering"}),
-    ),
-    Stage(
-        "rationale_clustering", "skip_rationale_clustering",
-        "CheckSkipRationaleClustering", "RationaleClustering",
-        frozenset({"CheckSkipReplayConcordance"}),
-    ),
-    Stage(
-        "replay_concordance", "skip_replay_concordance",
-        "CheckSkipReplayConcordance", "ReplayConcordance",
-        frozenset({"CheckSkipCounterfactual"}),
-    ),
-    Stage(
-        "counterfactual", "skip_counterfactual",
-        "CheckSkipCounterfactual", "Counterfactual",
-        frozenset({"CheckSkipAggregateCosts"}),
-    ),
-    Stage(
-        "aggregate_costs", "skip_aggregate_costs",
-        "CheckSkipAggregateCosts", "AggregateCosts",
-        frozenset({"BranchAComplete"}),
+        # alpha-engine-config-I2544: DataPhase2's witness used to be
+        # CheckSkipEvalJudge (the eval-judge chain's own skip-gate, entered
+        # unconditionally right after DataPhase2). That whole chain — plus
+        # ReportCard/Director — was LIFTED into the async
+        # ne-weekly-advisory-pipeline child SF; DataPhase2's successor in
+        # THIS SF is now StartAdvisoryPipeline (fire-and-forget dispatch).
+        # The eval_judge/rationale_clustering/replay_concordance/
+        # counterfactual/aggregate_costs Stage entries that used to follow
+        # are REMOVED — their skip_* flags govern a state machine
+        # (step_function_advisory.json) this script does not rerun; a
+        # StartExecution of the CHILD SF is a separate, not-yet-built
+        # recovery surface (the child re-derives its own defaults on every
+        # fresh dispatch, so there is nothing here to "skip re-running").
+        frozenset({"StartAdvisoryPipeline"}),
     ),
     # --- ResearchPredictorParallel branch B -------------------------------
     Stage(
         "predictor_training", "skip_predictor_training",
         "CheckSkipPredictorTraining", "PredictorTraining",
-        # ResolveZooSpecs entered <=> training succeeded (model-zoo rotation
-        # downstream is best-effort and cannot hard-fail the branch);
-        # PredictorTrainingSkipped <=> skip flag honored after the
-        # ValidatePredictorSkipWeightsFresh freshness proof. On the rerun
-        # the SF re-proves weights/meta freshness for run_date before
-        # honoring the flag — the helper does not need to.
-        frozenset({"ResolveZooSpecs", "PredictorTrainingSkipped"}),
+        # alpha-engine-config-I2545: BranchBComplete entered <=> training
+        # succeeded (the model-zoo rotation that used to run right after,
+        # ResolveZooSpecs, was moved to its OWN Sunday-triggered child SF —
+        # it no longer sits between CheckPredictorStatus's Success edge and
+        # BranchBComplete in THIS SF); PredictorTrainingSkipped <=> skip
+        # flag honored after the ValidatePredictorSkipWeightsFresh
+        # freshness proof. On the rerun the SF re-proves weights/meta
+        # freshness for run_date before honoring the flag — the helper
+        # does not need to.
+        frozenset({"BranchBComplete", "PredictorTrainingSkipped"}),
         note=(
-            "skip_predictor_training also skips the best-effort model-zoo"
-            " rotation (the flag ends branch B; zoo has no separate gate)."
+            "skip_predictor_training ends branch B directly at"
+            " BranchBComplete — the model-zoo rotation now runs"
+            " independently on ne-modelzoo-sunday-pipeline and has no gate"
+            " in this SF at all."
         ),
     ),
     # --- post-parallel tail ------------------------------------------------
@@ -259,9 +258,15 @@ STAGES: tuple[Stage, ...] = (
 
 STAGES_BY_NAME = {s.name: s for s in STAGES}
 BRANCH_A_STAGES = frozenset({
+    # alpha-engine-config-I2515 Phase B: "research" removed (the
+    # multi-agent Research state — and its skip_research flag /
+    # CheckSkipResearch gate — no longer exists).
+    # alpha-engine-config-I2544: eval_judge/rationale_clustering/
+    # replay_concordance/counterfactual/aggregate_costs removed — that
+    # chain now lives in the async ne-weekly-advisory-pipeline child SF,
+    # out of scope for this (main-SF-only) rerun helper.
     "rag_ingestion", "regime_substrate", "regime_retrospective_eval",
-    "research", "data_phase2", "eval_judge", "rationale_clustering",
-    "replay_concordance", "counterfactual", "aggregate_costs",
+    "data_phase2",
 })
 # Stages whose gate is only reachable THROUGH CheckSkipBacktester's run path
 # (the skip route overshoots them — see Stage("backtester").note).
@@ -437,6 +442,15 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
         "Scanner (branch A's StartAt) has no skip gate and re-executes on "
         "EVERY rerun regardless of flags; it is fail-soft/observe-only by "
         "SF design (Phase 2 observe contract)."
+    )
+    plan.warnings.append(
+        "SignalsEnvelope and ChallengerShadow (alpha-engine-config-I2515 "
+        "Phase B) have no skip gate and re-execute on EVERY branch-A "
+        "rerun regardless of flags. SignalsEnvelope OVERWRITES the live "
+        "signals.json at the same S3 key for run_date — idempotent given "
+        "unchanged board/regime state, but re-runs the load-bearing "
+        "producer every time. ChallengerShadow is observe-only (no_agent "
+        "leaderboard shadow feed)."
     )
 
     orig_role = original_input.get("pipeline_role")
