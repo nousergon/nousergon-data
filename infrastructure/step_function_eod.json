@@ -1277,8 +1277,7 @@
           "Next": "SetDegradedFlag"
         }
       ],
-      "Next": "SetDegradedFlag",
-      "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) \u2014 no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
+      "Next": "SetDegradedFlag"
     },
     "SetDegradedFlag": {
       "Type": "Pass",
