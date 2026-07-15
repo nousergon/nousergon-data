@@ -1598,9 +1598,15 @@ def _detect_fallback_quality_universe_days(
     (e.g. a rate limit; 2026-07-15 incident) the day is PRESENT, so that
     detector never flags it, and nothing else in the pipeline ever revisits
     a day that already has a row. This closes that hole using the same
-    fixed-key macro/SPY proxy as the missing-day detector (avoids
-    reconstitution-churn false positives, and costs no extra ArcticDB read —
-    reads the ``source`` column off the same ``tail`` call).
+    fixed-key SPY proxy as the missing-day detector (avoids
+    reconstitution-churn false positives) — but reads it from the
+    **universe** library, not macro. SPY exists in both: ``macro_lib`` holds
+    only a bare ``Close`` reference copy (no ``source``/OHLCV — that's all
+    ``_detect_missing_universe_days`` needs, since it only checks index
+    presence); the full ``OHLCV_COLS + [PROVENANCE_COL] + FEATURES`` schema
+    with ``source`` lives in ``universe_lib`` (verified live 2026-07-15:
+    ``macro_lib.tail("SPY").data`` columns == ``['Close']`` only — reading
+    ``source`` off it would silently always return ``[]``).
 
     Returns the affected days as ``YYYY-MM-DD`` strings, newest first.
     Best-effort: any read failure, or a schema without a ``source`` column
@@ -1621,13 +1627,13 @@ def _detect_fallback_quality_universe_days(
         d = previous_trading_day(d)
 
     try:
-        from store.arctic_store import get_macro_lib
+        from store.arctic_store import get_universe_lib
 
-        macro_lib = get_macro_lib(bucket)
-        df = macro_lib.tail("SPY", n=lookback_trading_days + 6).data
+        universe_lib = get_universe_lib(bucket)
+        df = universe_lib.tail("SPY", n=lookback_trading_days + 6).data
     except Exception as exc:  # best-effort reference read
         logger.warning(
-            "universe-gap detect: macro/SPY index read failed (%s) — "
+            "universe-gap detect: universe/SPY source read failed (%s) — "
             "skipping fallback-quality heal; freshness monitor remains the backstop.",
             exc,
         )
