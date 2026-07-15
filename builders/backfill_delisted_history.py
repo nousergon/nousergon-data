@@ -65,6 +65,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
@@ -206,10 +207,12 @@ def _normalize_bars(yf_df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(index=pd.DatetimeIndex(df.index).normalize())
     for col in OHLCV_COLS:
-        out[col] = df[col].to_numpy() if col in df.columns else pd.NA
+        # np.nan (not pd.NA) keeps the column float64 — pd.NA broadcasts to
+        # object dtype, which ArcticDB's write() refuses to normalize.
+        out[col] = df[col].to_numpy() if col in df.columns else np.nan
     # VWAP is not provided by yfinance daily bars (matches weekly_collector's
     # daily pass, which also writes OHLCV with no VWAP).
-    out["VWAP"] = pd.NA
+    out["VWAP"] = np.nan
     out[PROVENANCE_COL] = BACKFILL_PROVENANCE
     out = out[~out.index.duplicated(keep="last")].sort_index()
     # Drop rows with no usable close (a delisted stub can carry all-NaN tails).

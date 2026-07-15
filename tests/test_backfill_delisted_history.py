@@ -2,7 +2,11 @@
 
 The module imports light (pandas only); all heavy deps (arcticdb / boto3 /
 yfinance) are behind module-level seams that these tests patch, so the suite
-runs with no ArcticDB / network / AWS creds.
+runs with no ArcticDB / network / AWS creds. The one exception is
+``test_normalize_bars_writes_through_real_arcticdb`` below, which exercises a
+real local (lmdb) ArcticDB instance to catch dtype/normalization regressions
+the mocked orchestrator tests structurally cannot see (config#2676) — it
+skips cleanly if ``arcticdb`` isn't installed.
 """
 
 from __future__ import annotations
@@ -80,6 +84,26 @@ def test_normalize_bars_drops_nan_close_rows():
 
 def test_normalize_bars_empty():
     assert _mod._normalize_bars(pd.DataFrame()).empty
+
+
+def test_normalize_bars_writes_through_real_arcticdb(tmp_path):
+    """Regression test for config#2676: a mocked ``delisted_lib.write()`` always
+    "succeeds", so the mocked orchestrator tests above cannot catch ArcticDB's
+    normalize-time dtype rejection. Write a real ``_normalize_bars`` output frame
+    to a real (local lmdb) ArcticDB library and assert it succeeds and that
+    VWAP round-trips as float64, not object dtype."""
+    adb = pytest.importorskip("arcticdb")
+
+    df = _mod._normalize_bars(_yf_frame(["2020-01-02", "2020-01-03"], [10.0, 11.0]))
+    assert df["VWAP"].dtype == "float64"  # would be object dtype pre-fix
+
+    ac = adb.Arctic(f"lmdb://{tmp_path}/arctic")
+    lib = ac.get_library("test_delisted_history", create_if_missing=True)
+    lib.write("TESTSYM", df)  # raises arcticdb.exceptions.NormalizationException pre-fix
+
+    read_back = lib.read("TESTSYM").data
+    assert read_back["VWAP"].dtype == "float64"
+    assert read_back["VWAP"].isna().all()
 
 
 # ── metadata contract ─────────────────────────────────────────────────────────
