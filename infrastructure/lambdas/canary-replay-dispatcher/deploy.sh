@@ -163,9 +163,12 @@ if $BOOTSTRAP; then
     --query 'RuleArn' --output text
 
   FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+  # JSON array form, not shorthand — shorthand's `Input={...}` cannot embed
+  # nested JSON (the CLI's shorthand parser chokes on the unescaped `"`,
+  # live-caught on first bootstrap: config#2246).
   run aws events put-targets \
     --rule "${RULE_NAME}" \
-    --targets "Id=1,Arn=${FN_ARN},Input={\"mode\":\"scheduled\"}" \
+    --targets "[{\"Id\":\"1\",\"Arn\":\"${FN_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"scheduled\\\"}\"}]" \
     --region "${REGION}"
 
   RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
