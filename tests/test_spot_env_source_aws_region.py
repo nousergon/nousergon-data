@@ -41,17 +41,31 @@ _SCRIPTS = [
 # exporting AWS_REGION / AWS_DEFAULT_REGION, which lib preflight + boto3
 # hard-require in the otherwise-minimal SSM shell.
 #
-# step_function.json (the WEEKLY SF) added 2026-07-10: its 9 predictor-
+# step_function.json (the WEEKLY SF) added 2026-07-10: its predictor-
 # training/model-zoo/backtester command blocks sourced .env the same way the
 # daily/eod trading-box blocks did. Its MorningEnrich/DataPhase1/RAGIngestion
 # states are NOT part of that population — they invoke spot_data_weekly.sh,
 # which self-exports the region via its own ENV_SOURCE heredoc (see
 # test_env_source_exports_region above) and never sourced .env directly. The
 # two dashboard health-check states likewise never sourced .env.
+#
+# Rebased 2026-07-15 onto the config#832/I2515 weekly-SF reshape: of the
+# original 9 sourcing sites, 6 (PredictorTraining, Backtester,
+# PredictorBacktest, PortfolioOptimizerBacktest, Parity, Evaluator) remain in
+# step_function.json; the other 3 (ResolveZooSpecs, TrainSpecDispatch,
+# ModelZooSelect) were lifted verbatim into the new
+# step_function_modelzoo.json child SF (ne-modelzoo-sunday-pipeline,
+# alpha-engine-config-I2545) and still sourced .env there pre-rebase, so that
+# file is added here too. step_function_advisory.json (the other child SF
+# split out the same day) never sourced .env — its lifted states are the
+# eval-judge/ReportCard/Director chain, none of which ran a spot_train.sh/
+# spot_backtest.sh/training.model_zoo shell — so it is intentionally NOT
+# added.
 _STEP_FUNCTIONS = [
     _REPO_ROOT / "infrastructure" / "step_function_daily.json",
     _REPO_ROOT / "infrastructure" / "step_function_eod.json",
     _REPO_ROOT / "infrastructure" / "step_function.json",
+    _REPO_ROOT / "infrastructure" / "step_function_modelzoo.json",
 ]
 
 
