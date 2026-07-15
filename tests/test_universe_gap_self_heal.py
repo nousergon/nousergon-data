@@ -108,20 +108,27 @@ class TestDetectMissingUniverseDays:
 
 class TestDetectFallbackQualityUniverseDays:
     """config#2664: a day PRESENT in ArcticDB but stuck on EOD's yfinance
-    fallback because the next-morning Polygon overwrite never landed."""
+    fallback because the next-morning Polygon overwrite never landed.
+
+    Reads SPY's ``source`` column from the UNIVERSE library (not macro) —
+    verified live 2026-07-15 that ``macro_lib.tail("SPY").data`` carries
+    only a bare ``Close`` column with no ``source``/OHLCV, so an earlier
+    version of this detector that read macro_lib silently always returned
+    ``[]``. Only ``store.arctic_store.get_universe_lib`` is patched here.
+    """
 
     def test_yfinance_sourced_day_flagged(self):
         tds = _recent_tds(TARGET, 5)
         stale = tds[0]
         sources = {d: ("yfinance" if d == stale else "polygon") for d in tds}
-        with patch("store.arctic_store.get_macro_lib", return_value=_macro_lib_with_sources(sources)):
+        with patch("store.arctic_store.get_universe_lib", return_value=_macro_lib_with_sources(sources)):
             flagged = _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5)
         assert flagged == [stale.strftime("%Y-%m-%d")]
 
     def test_all_polygon_returns_empty(self):
         tds = _recent_tds(TARGET, 5)
         sources = {d: "polygon" for d in tds}
-        with patch("store.arctic_store.get_macro_lib", return_value=_macro_lib_with_sources(sources)):
+        with patch("store.arctic_store.get_universe_lib", return_value=_macro_lib_with_sources(sources)):
             assert _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5) == []
 
     def test_absent_day_not_flagged_here(self):
@@ -130,17 +137,17 @@ class TestDetectFallbackQualityUniverseDays:
         tds = _recent_tds(TARGET, 5)
         present = tds[1:]  # drop the newest
         sources = {d: "polygon" for d in present}
-        with patch("store.arctic_store.get_macro_lib", return_value=_macro_lib_with_sources(sources)):
+        with patch("store.arctic_store.get_universe_lib", return_value=_macro_lib_with_sources(sources)):
             flagged = _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5)
         assert tds[0].strftime("%Y-%m-%d") not in flagged
 
     def test_missing_source_column_is_noop(self):
         tds = _recent_tds(TARGET, 5)
-        with patch("store.arctic_store.get_macro_lib", return_value=_macro_lib_with_present(tds)):
+        with patch("store.arctic_store.get_universe_lib", return_value=_macro_lib_with_present(tds)):
             assert _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5) == []
 
     def test_reference_read_failure_is_noop(self):
-        with patch("store.arctic_store.get_macro_lib", side_effect=RuntimeError("arctic down")):
+        with patch("store.arctic_store.get_universe_lib", side_effect=RuntimeError("arctic down")):
             assert _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5) == []
 
     def test_multiple_stale_days_newest_first(self):
@@ -148,9 +155,24 @@ class TestDetectFallbackQualityUniverseDays:
         sources = {d: "polygon" for d in tds}
         sources[tds[2]] = "yfinance"
         sources[tds[0]] = "fred"
-        with patch("store.arctic_store.get_macro_lib", return_value=_macro_lib_with_sources(sources)):
+        with patch("store.arctic_store.get_universe_lib", return_value=_macro_lib_with_sources(sources)):
             flagged = _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5)
         assert flagged == [tds[0].strftime("%Y-%m-%d"), tds[2].strftime("%Y-%m-%d")]
+
+    def test_does_not_touch_macro_lib(self):
+        """Regression guard for the exact bug caught 2026-07-15 live-testing:
+        this detector must never read macro_lib (Close-only, no source)."""
+        tds = _recent_tds(TARGET, 5)
+        sources = {d: "polygon" for d in tds}
+        sources[tds[0]] = "yfinance"
+        with (
+            patch("store.arctic_store.get_universe_lib", return_value=_macro_lib_with_sources(sources)) as p_uni,
+            patch("store.arctic_store.get_macro_lib") as p_macro,
+        ):
+            flagged = _detect_fallback_quality_universe_days("bkt", TARGET, lookback_trading_days=5)
+        assert flagged == [tds[0].strftime("%Y-%m-%d")]
+        p_uni.assert_called_once()
+        p_macro.assert_not_called()
 
 
 # ── Heal orchestration ───────────────────────────────────────────────────────
