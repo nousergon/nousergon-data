@@ -1354,13 +1354,16 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         results["status"] = "failed"
         return results
 
-    MACRO_DAILY_TICKERS = [
-        "SPY", "GLD", "USO",
-        "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
-        "XLP", "XLRE", "XLU", "XLV", "XLY",
-        "^VIX", "^VIX3M", "^TNX", "^IRX",
-    ]
-    tickers = list(dict.fromkeys(tickers + MACRO_DAILY_TICKERS))
+    # Shared with _load_daily_universe_tickers / _run_daily_arctic_append
+    # (the EOD PostMarketArcticAppend twin of this weekday MorningEnrich
+    # path) — was a SEPARATE inline copy of the same 17-symbol list until
+    # config-I2703 (2026-07-15): two independently-editable literals of
+    # "the macro/benchmark daily tickers" is exactly the duplicate-pin
+    # drift class (one copy gets updated, the other silently doesn't).
+    # Both call sites now derive from the single module-level
+    # _MACRO_DAILY_TICKERS constant so SPY (and any future addition) can't
+    # drift out of one path while staying in the other.
+    tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
     logger.info("=" * 60)
     logger.info("MORNING ENRICH: polygon overwrite for %s (prior trading day)", target_date)
