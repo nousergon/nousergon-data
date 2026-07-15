@@ -615,3 +615,36 @@ def test_reconcile_list_runs_failure_returns_clean_result_not_raise(monkeypatch)
     out = idx.handler({"reconcile": True}, None)
     assert out["reconciled"] == 0
     assert out["reason"] == "list_runs_failed"
+
+
+def test_reconcile_dispatches_oldest_job_first(monkeypatch):
+    # FIFO fairness: under quota pressure the OLDEST stale job must get the
+    # first launch attempt — newest-first listing order let fresh churn
+    # starve old jobs indefinitely (PR2690, 2026-07-15).
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        return f"i-{len(launched)}"
+
+    idx = _load(monkeypatch, launch_impl=_launch,
+                env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+
+    old = (datetime.now(timezone.utc) - timedelta(seconds=5000)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    newer = (datetime.now(timezone.utc) - timedelta(seconds=200)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fake_get(path):
+        if path.endswith("&per_page=50") or "/actions/runs?" in path:
+            return {"workflow_runs": [{"id": 1}, {"id": 2}]}
+        if "/runs/1/jobs" in path:
+            # newest-first listing: run 1 (listed first) has the NEWER job
+            return {"jobs": [{"id": 111, "status": "queued", "created_at": newer,
+                              "labels": ["self-hosted", "alpha-engine-config-spot"]}]}
+        if "/runs/2/jobs" in path:
+            return {"jobs": [{"id": 222, "status": "queued", "created_at": old,
+                              "labels": ["self-hosted", "alpha-engine-config-spot"]}]}
+        raise AssertionError(f"unexpected GH GET {path}")
+
+    monkeypatch.setattr(idx, "_gh_api_get", fake_get)
+    out = idx.handler({"reconcile": True}, None)
+    order = [d["job_id"] for d in out["dispatched"]]
+    assert order == ["222", "111"], f"oldest job must dispatch first, got {order}"
