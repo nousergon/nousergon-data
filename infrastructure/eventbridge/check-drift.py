@@ -8,7 +8,7 @@ freshness-pipeline`` / ``ne-preopen-trading-pipeline``) silently orphaned
 several EventBridge rules that reference an SF ARN/name in their
 ``EventPattern`` — they kept matching the OLD name, so they simply stopped
 firing (no error, no alert). The two CFN-managed cron rules
-(``SaturdayTrigger`` / ``WeekdayTrigger`` in
+(``SaturdayTrigger`` / ``WeekdayPipelineSchedule`` in
 ``infrastructure/cloudformation/alpha-engine-orchestration.yaml``) are safe
 from this because ``deploy-infrastructure.yml`` reconciles them on every
 push to main. The bitten rules were all managed OUTSIDE CloudFormation by

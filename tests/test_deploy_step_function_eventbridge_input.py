@@ -60,16 +60,16 @@ _DEPLOY_SCRIPTS = (
 # (CFN's ``!Sub`` / ``!Ref`` tags require a custom loader).
 # FridayShellRunTrigger retired 2026-05-29 (ROADMAP L4055) — superseded by the
 # event-driven alpha-engine-eod-success-friday-shell-trigger Lambda. SaturdayTrigger
-# now flows directly into WeekdayTrigger.
+# now flows directly into WeekdayPipelineSchedule.
 _TRIGGER_SUCCESSORS = {
-    "SaturdayTrigger": "WeekdayTrigger",
+    "SaturdayTrigger": "WeekdayPipelineSchedule",
     # alpha-engine-config-I2545: ModelZooSundayTrigger was inserted between
-    # WeekdayTrigger and ResearchAlerts in the CFN template — update this
+    # WeekdayPipelineSchedule and ResearchAlerts in the CFN template — update this
     # chain in the SAME PR as any future insertion between two entries here
     # (an unregistered gap silently merges the two neighboring blocks and
     # masks a genuine multi-target regression, exactly the failure mode
     # this successor-chain exists to prevent).
-    "WeekdayTrigger": "ModelZooSundayTrigger",
+    "WeekdayPipelineSchedule": "ModelZooSundayTrigger",
     "ModelZooSundayTrigger": "ResearchAlerts",
 }
 
@@ -164,7 +164,7 @@ class TestCFNTargetUniqueness:
       a ``Targets:`` list of ``- Id: ...`` entries — EventBridge fans
       the trigger event to EVERY entry, so we count ``- Id:`` markers
       and require exactly 1.
-    - ``AWS::Scheduler::Schedule`` (e.g. WeekdayTrigger, migrated
+    - ``AWS::Scheduler::Schedule`` (e.g. WeekdayPipelineSchedule, migrated
       config#2413) declares a single ``Target:`` mapping — the CFN
       schema only permits one Target per Schedule, so "exactly one
       target" is structurally guaranteed and there is no list to
@@ -226,12 +226,12 @@ class TestOrchestrationCFNPipelineRoles:
     smoke / recovery / operator-replay executions out of the cadence
     section.
 
-    WeekdayTrigger (config#2413, AWS::Scheduler::Schedule) nests its
+    WeekdayPipelineSchedule (config#2413, AWS::Scheduler::Schedule) nests its
     payload inside the ``aws-sdk:sfn:startExecution`` call shape, so
     the inner JSON is backslash-escaped (``\\"pipeline_role\\"``)
     inside the outer ``Input`` string. The pattern below tolerates an
     optional backslash before each quote so it matches both the plain
-    (SaturdayTrigger, AWS::Events::Rule) and escaped (WeekdayTrigger)
+    (SaturdayTrigger, AWS::Events::Rule) and escaped (WeekdayPipelineSchedule)
     forms.
     """
 
@@ -245,11 +245,11 @@ class TestOrchestrationCFNPipelineRoles:
         ), 'SaturdayTrigger Input must carry pipeline_role="weekly".'
 
     def test_weekday_trigger_has_daily_role(self, orchestration_text):
-        block = _trigger_block(orchestration_text, "WeekdayTrigger")
+        block = _trigger_block(orchestration_text, "WeekdayPipelineSchedule")
         assert re.search(
             self._PIPELINE_ROLE_RE.format("daily"),
             block,
-        ), 'WeekdayTrigger Input must carry pipeline_role="daily".'
+        ), 'WeekdayPipelineSchedule Input must carry pipeline_role="daily".'
 
 
 class TestSaturdayCFNTargetHasNoScannerGateFlag:

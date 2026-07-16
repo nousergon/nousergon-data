@@ -308,7 +308,17 @@ Resources:
   # (InitializeInput→CheckShellRun/ApplyShellRunDefaults) is UNCHANGED — the
   # Lambda still supplies {"shell_run": true, "pipeline_role": "shell-run"}.
 
-  WeekdayTrigger:
+  # RENAMED 2026-07-16 (config#2413 live-verification finding): CloudFormation
+  # refuses to change a resource's Type under the same logical ID in an
+  # update ("Update of resource type is not permitted") — confirmed via a
+  # real --no-execute-changeset dry run. WeekdayTrigger existed as
+  # AWS::Events::Rule; renaming the logical ID to WeekdayPipelineSchedule
+  # makes CFN treat this as a replacement (delete the old Rule, create the
+  # new Schedule) instead of an illegal in-place type transform. The
+  # `Name: alpha-engine-weekday` PHYSICAL resource name is unchanged, so
+  # nothing outside this template (EventBridge target ARNs, IAM references)
+  # needs updating — only this logical ID.
+  WeekdayPipelineSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: alpha-engine-weekday
