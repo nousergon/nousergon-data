@@ -134,6 +134,17 @@
           "ec2:ResourceTag/Name": "alpha-engine-config-runner-spot"
         }
       }
+    },
+    {
+      "Sid": "EmitLaunchRateMetricConfig2697",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine/Infra"
+        }
+      }
     }
   ]
 }
