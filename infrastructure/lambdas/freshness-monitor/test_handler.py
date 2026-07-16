@@ -861,6 +861,152 @@ def test_handler_dispatches_to_historical_on_mode_flag(monkeypatch, fixed_now):
     index.load_registry.assert_not_called()  # current-state path NOT taken
 
 
+# ── Intraday-mode probe (config#1297) ───────────────────────────────────────
+
+
+def test_handler_dispatches_to_intraday_on_mode_flag(monkeypatch, fixed_now):
+    """event={'mode': 'intraday'} routes to _handle_intraday without
+    touching the current-state (daily full-sweep) path."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(
+        index, "_handle_intraday",
+        mock.Mock(return_value={"mode": "intraday", "n_entries_checked": 0,
+                                 "alerts_enabled": False, "alerted": 0,
+                                 "dispatched": 0, "per_spec_exceptions": 0,
+                                 "duration_seconds": 0.0}),
+    )
+    monkeypatch.setattr(index, "load_registry_with_recovery", mock.Mock())  # would fail otherwise
+    monkeypatch.setattr(
+        index, "datetime", mock.Mock(
+            now=mock.Mock(return_value=fixed_now),
+        ),
+    )
+    result = index.handler({"mode": "intraday"}, None)
+    assert result["mode"] == "intraday"
+    index._handle_intraday.assert_called_once()
+    index.load_registry_with_recovery.assert_not_called()  # daily full-sweep path NOT taken
+
+
+@pytest.fixture
+def intraday_registry_body() -> bytes:
+    """A registry with the two intraday artifacts plus one unrelated
+    daily artifact — the intraday pass must check only the former two."""
+    return b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  severity: warning
+artifacts:
+  - artifact_id: open_orders_latest
+    s3_key_template: "trades/open_orders/latest.json"
+    cadence: continuous
+    interval_minutes: 30
+    sla_minutes_after_cron: 15
+    severity: warning
+    owner_repo: alpha-engine
+    created_at: "2025-01-01"
+    run_calendar: market_hours
+    active_hours_utc: [14, 21]
+  - artifact_id: freshness_monitor_heartbeat
+    s3_key_template: "_freshness_monitor/heartbeat.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 15
+    severity: critical
+    owner_repo: alpha-engine-data
+    created_at: "2025-01-01"
+    run_calendar: all_days
+  - artifact_id: probe_missing
+    s3_key_template: "path/{date}/missing.json"
+    cadence: saturday_sf
+    sla_minutes_after_cron: 60
+    severity: critical
+    owner_repo: alpha-engine-test
+    created_at: "2025-01-01"
+"""
+
+
+def test_handle_intraday_scopes_to_intraday_artifact_ids_only(
+    monkeypatch, intraday_registry_body, fake_s3, fixed_now
+):
+    """The intraday pass must check exactly INTRADAY_ARTIFACT_IDS, never the
+    rest of the registry (probe_missing here) — that's the daily sweep's job."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = intraday_registry_body
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({"mode": "intraday"}, None)
+
+    assert result["mode"] == "intraday"
+    assert result["n_entries_checked"] == 2  # open_orders_latest + heartbeat only
+
+
+def test_handle_intraday_does_not_write_shared_dashboard_surfaces(
+    monkeypatch, intraday_registry_body, fake_s3, fixed_now
+):
+    """The intraday pass alerts but must NOT write check_results/heartbeat/
+    cycle_verdict — those full-registry surfaces are owned solely by the
+    daily sweep; a partial write would clobber them with a 2-artifact view."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = intraday_registry_body
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    index.handler({"mode": "intraday"}, None)
+
+    put_keys = [k for (_, k, _) in fake_s3._put_calls]
+    assert index.CHECK_RESULTS_KEY not in put_keys
+    assert index.HEARTBEAT_KEY not in put_keys
+    assert index.CYCLE_VERDICT_KEY not in put_keys
+
+
+def test_handle_intraday_warns_on_missing_expected_artifact_id(
+    monkeypatch, fake_s3, fixed_now
+):
+    """A registry missing one of the two hardcoded intraday ids logs a
+    warning rather than silently checking zero/one artifact."""
+    fake_s3._registry_body = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+artifacts:
+  - artifact_id: open_orders_latest
+    s3_key_template: "trades/open_orders/latest.json"
+    cadence: continuous
+    interval_minutes: 30
+    sla_minutes_after_cron: 15
+    severity: warning
+    owner_repo: alpha-engine
+    created_at: "2025-01-01"
+    run_calendar: market_hours
+    active_hours_utc: [14, 21]
+"""
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({"mode": "intraday"}, None)
+
+    assert result["n_entries_checked"] == 1  # only open_orders_latest present
+
+
 # ── Trading-day-axis historical-probe tests ─────────────────────────────────
 
 

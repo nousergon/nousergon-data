@@ -1,35 +1,30 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the alpha-engine-ssm-liveness-poller Lambda.
+# deploy.sh — Create or update the alpha-engine-eod-precondition-probe Lambda.
 #
-# config#1811: liveness-aware SSM poll iteration for the weekday pipeline's
-# SSM command loops (RunMorningPlanner / CodeFreshnessGate — ChronicGapSelfHeal
-# REMOVED per alpha-engine-config-I2717 2026-07-16, moved to the standalone
-# --daily-heal job off the trading box entirely; MorningEnrich/
-# MorningArcticAppend moved off-box even earlier, config#1767 Phase 2, onto
-# their own bare-ssm-poll ephemeral spots). One invocation = one poll: command
-# status + independent SSM-agent PingStatus + bounded attempt/ping-miss
-# accounting. See index.py for the full rationale (2026-07-06 incident: the
-# in-box executionTimeout cannot fire when the box itself is wedged).
+# alpha-engine-config-I2702 deliverable #1: verify-by-artifact precondition
+# probe for the EOD Step Function's ``ProbeEODReconcilePrecondition`` state.
+# Invoked synchronously by the EOD SF (infrastructure/step_function_eod.json)
+# — no EventBridge trigger, no standalone cron; this Lambda has no life
+# outside being called as a Step Function Task.
 #
-# No EventBridge trigger — invoked ONLY by ne-preopen-trading-pipeline
-# (lambda:InvokeFunction is granted to alpha-engine-step-functions-role in
-# the codified IAM: alpha-engine/infrastructure/iam/).
-#
-# Managed outside CloudFormation — same rationale as pipeline-watchdog /
-# eod-backstop (operator-deployed only, narrow OIDC blast radius).
+# Managed OUTSIDE CloudFormation — same rationale as eod-backstop /
+# data-spot-dispatcher / scheduled-groom-dispatcher (operator-deployed only,
+# narrow OIDC blast radius). Merging the PR has ZERO live effect until this
+# Lambda + IAM are deployed AND the EOD SF is re-deployed with the new states
+# (infrastructure/deploy_step_function.json / update_eod_pipeline_sf.sh).
 #
 # Usage:
-#   bash infrastructure/lambdas/ssm-liveness-poller/deploy.sh             # update code only
-#   bash infrastructure/lambdas/ssm-liveness-poller/deploy.sh --bootstrap # first-time create
-#   bash infrastructure/lambdas/ssm-liveness-poller/deploy.sh --dry-run   # show actions, do not apply
-#   bash infrastructure/lambdas/ssm-liveness-poller/deploy.sh --smoke     # one read-only invoke against a dummy command id
+#   bash infrastructure/lambdas/eod-precondition-probe/deploy.sh             # update code only
+#   bash infrastructure/lambdas/eod-precondition-probe/deploy.sh --bootstrap # first-time create
+#   bash infrastructure/lambdas/eod-precondition-probe/deploy.sh --dry-run   # show actions, do not apply
+#   bash infrastructure/lambdas/eod-precondition-probe/deploy.sh --smoke     # invoke once with today's run_date
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FUNCTION_NAME="alpha-engine-ssm-liveness-poller"
-ROLE_NAME="alpha-engine-ssm-liveness-poller-role"
-POLICY_NAME="alpha-engine-ssm-liveness-poller-policy"
+FUNCTION_NAME="alpha-engine-eod-precondition-probe"
+ROLE_NAME="alpha-engine-eod-precondition-probe-role"
+POLICY_NAME="alpha-engine-eod-precondition-probe-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -62,11 +57,8 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-# ----- Preflight handler unit tests (shared gate — config#2381) -------------
-# Delegates to the one _shared/run_handler_tests.sh so this gate can never
-# re-drift into the naive no-install `python3 -m pytest` form (config#2295).
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}" boto3
+run_handler_tests "${SCRIPT_DIR}" boto3 -r "${SCRIPT_DIR}/requirements.txt"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
@@ -129,11 +121,6 @@ if $BOOTSTRAP; then
   else
     echo "  Lambda exists, code will be updated in step 3"
   fi
-
-  echo "  NOTE: grant lambda:InvokeFunction on this function to"
-  echo "        alpha-engine-step-functions-role via the codified IAM"
-  echo "        (alpha-engine/infrastructure/iam/ + apply.sh) before"
-  echo "        deploying the SF definition that calls it."
 fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
@@ -153,17 +140,17 @@ fi
 
 echo "✓ Code deployed."
 
-# ----- 4. Smoke (read-only — a nonexistent command id exercises the
-#          registration-window path and both SSM read calls) ----------------
+# ----- 4. Smoke (real invoke against today's UTC date) -----------------------
 
 if $SMOKE; then
+  TODAY="$(date -u +%Y-%m-%d)"
   echo ""
-  echo "Smoke: read-only invoke (nonexistent command id → IN_PROGRESS/Registering)"
+  echo "Smoke-invoking with run_date=${TODAY} (read-only S3 GetObject; no writes)."
   RESP=$(mktemp)
   aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out \
-    --payload '{"instance_id":"i-018eb3307a21329bf","command_id":"00000000-0000-0000-0000-000000000000","attempts":0,"ping_misses":0,"max_attempts":3,"max_ping_misses":3,"step":"smoke"}' \
+    --payload "{\"run_date\": \"${TODAY}\"}" \
     --region "${REGION}" \
     "${RESP}" >/dev/null
   cat "${RESP}"

@@ -41,6 +41,7 @@ ROLE_NAME="alpha-engine-freshness-monitor-role"
 POLICY_NAME="alpha-engine-freshness-monitor-policy"
 RULE_NAME="alpha-engine-freshness-monitor-cron"
 HISTORICAL_RULE_NAME="alpha-engine-freshness-monitor-historical-cron"
+INTRADAY_RULE_NAME="alpha-engine-freshness-monitor-intraday-cron"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -200,14 +201,19 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge cron: every 15 minutes. Sub-15min granularity isn't
-  # load-bearing (alerts dedup by cadence window) — this is the floor
-  # for "operator-perceived" probe cadence.
+  # EventBridge cron: daily (config#1297, Brian-directed 2026-06-27 — the
+  # prior 15-min sweep was unnecessary noise once the saturday_sf/run_calendar
+  # staleness models were fixed to be jitter-tolerant). 12:00 UTC gives an
+  # operator-visible check before US market open (13:30 UTC) while landing
+  # comfortably after every prior day's overnight/Saturday-SF producer runs.
+  # The genuinely-intraday artifacts (open_orders_latest,
+  # freshness_monitor_heartbeat) are NOT blinded by this — they're also
+  # covered by the separate 30-min mini-rule below.
   echo "  Creating EventBridge cron: ${RULE_NAME}"
   run aws events put-rule \
     --name "${RULE_NAME}" \
-    --schedule-expression "cron(*/15 * * * ? *)" \
-    --description "Every 15min probe of the artifact freshness registry" \
+    --schedule-expression "cron(0 12 * * ? *)" \
+    --description "Daily 12:00 UTC probe of the artifact freshness registry" \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
@@ -267,6 +273,47 @@ EOF
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${HIST_RULE_ARN}" \
+    --region "${REGION}" 2>/dev/null || true
+
+  # Intraday mini-rule (config#1297): 30-min, weekdays 14-21 UTC (covers US
+  # market hours 13:30-20:00 UTC with a buffer either side). Fires the same
+  # Lambda with event={"mode": "intraday"} so it probes ONLY the two
+  # genuinely-intraday artifacts (open_orders_latest,
+  # freshness_monitor_heartbeat) without touching the shared
+  # check_results/heartbeat/cycle_verdict surfaces the daily sweep owns.
+  echo "  Creating EventBridge intraday cron: ${INTRADAY_RULE_NAME}"
+  run aws events put-rule \
+    --name "${INTRADAY_RULE_NAME}" \
+    --schedule-expression "cron(0/30 14-21 ? * MON-FRI *)" \
+    --description "30-min weekday 14-21 UTC intraday probe (mode=intraday)" \
+    --region "${REGION}" \
+    --query 'RuleArn' --output text
+
+  # Same file:// dodge as the historical target above (embedded-quote JSON
+  # doesn't survive the put-targets shorthand form).
+  INTRADAY_TARGET_JSON=$(mktemp)
+  cat > "${INTRADAY_TARGET_JSON}" <<EOF
+[
+  {
+    "Id": "1",
+    "Arn": "${FN_ARN}",
+    "Input": "{\"mode\":\"intraday\"}"
+  }
+]
+EOF
+  run aws events put-targets \
+    --rule "${INTRADAY_RULE_NAME}" \
+    --targets "file://${INTRADAY_TARGET_JSON}" \
+    --region "${REGION}"
+  rm -f "${INTRADAY_TARGET_JSON}"
+
+  INTRADAY_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${INTRADAY_RULE_NAME}"
+  run aws lambda add-permission \
+    --function-name "${FUNCTION_NAME}" \
+    --statement-id "eventbridge-${INTRADAY_RULE_NAME}" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "${INTRADAY_RULE_ARN}" \
     --region "${REGION}" 2>/dev/null || true
 fi
 
