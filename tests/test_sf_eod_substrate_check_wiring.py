@@ -345,14 +345,48 @@ class TestResultPathIsolation:
 
 
 class TestStopTradingInstanceUnchanged:
-    """StopTradingInstance must remain a terminal state — no rewiring
-    that defers it past the substrate check or makes it conditional."""
+    """StopTradingInstance must remain UNCONDITIONALLY reachable and must
+    never be deferred past the substrate check — the cost-guard invariant.
 
-    def test_stop_trading_instance_is_terminal(self, states):
-        # End=True means this state ends the execution (success path).
-        assert states["StopTradingInstance"].get("End") is True, (
-            "StopTradingInstance must remain a terminal End=true state on "
-            "the success path — anything else is a cost-overrun risk."
+    UPDATED config-I2702 (2026-07-15) deliverable #4: StopTradingInstance is
+    no longer a bare End=true terminal — it now routes to CheckDegradedOutcome
+    so a run that skipped EODReconcile (a data-gap self-heal) ends in a
+    DISTINCT terminal (DegradedSucceeded) rather than the same plain
+    ExecutionSucceeded a fully-green day gets. The cost-guard invariant this
+    class actually protects — "the trading EC2 always gets stopped, no
+    matter what happened upstream" — is UNCHANGED: CheckDegradedOutcome only
+    ever routes to one of two Succeed states, both AFTER StopTradingInstance
+    has already run. Neither NormalSucceeded nor DegradedSucceeded can be
+    reached without StopTradingInstance first — see the ASL wiring pinned in
+    test_sf_eod_precondition_probe_wiring.py.
+    """
+
+    def test_stop_trading_instance_routes_to_degraded_outcome_check(self, states):
+        sti = states["StopTradingInstance"]
+        assert "End" not in sti, (
+            "StopTradingInstance is no longer a bare End=true terminal "
+            "(config-I2702 deliverable #4) — it must route onward via Next."
+        )
+        assert sti["Next"] == "CheckDegradedOutcome"
+
+    def test_degraded_outcome_check_only_reaches_succeed_states(self, states):
+        cdo = states["CheckDegradedOutcome"]
+        assert cdo["Type"] == "Choice"
+        targets = {c["Next"] for c in cdo["Choices"]} | {cdo["Default"]}
+        for t in targets:
+            assert states[t]["Type"] == "Succeed", (
+                f"CheckDegradedOutcome must only ever route to a Succeed "
+                f"state (the cost-guard has already run by this point) — "
+                f"{t} is Type={states[t]['Type']}"
+            )
+
+    def test_stop_trading_instance_catch_unchanged(self, states):
+        # The failure path (Catch -> HandleFailure -> ForceStopInstance) is
+        # untouched by this change — only the SUCCESS Next moved.
+        catches = states["StopTradingInstance"].get("Catch", [])
+        assert any(
+            c["ErrorEquals"] == ["States.ALL"] and c["Next"] == "HandleFailure"
+            for c in catches
         )
 
 
