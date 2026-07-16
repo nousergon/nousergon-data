@@ -104,3 +104,64 @@ def test_yfinance_fallback_multi_ticker_vwap_none():
     assert count == 2
     for row in records:
         assert row["VWAP"] is None, f"VWAP should be None (not proxy) for {row['ticker']}"
+
+
+def test_yfinance_fetch_returns_requested_date_not_latest_bar():
+    """Regression for alpha-engine-config#2475.
+
+    ``_fetch_yfinance_closes`` must return the close ON-OR-BEFORE the
+    requested ``date_str``, not yfinance's most-recent bar. The old
+    ``period="5d"`` + ``iloc[-1]`` implementation always returned the latest
+    available close regardless of what date was requested — the same defect
+    already fixed for FRED in ``_fetch_fred_closes``/``_fetch_fred_window``
+    (2026-05, L4492). This mislabeled a later close with an earlier date,
+    which made the L1 cross-source observer (config#1277) falsely QUARANTINE
+    SPY on nearly every historical date in its rolling window.
+    """
+    records = []
+    fake_frame = _make_yf_frame([
+        ("2026-06-29", 100.0, 101.0, 99.0, 100.5, 1_000_000),
+        ("2026-06-30", 102.0, 103.0, 101.0, 102.5, 1_200_000),
+        ("2026-07-01", 200.0, 201.0, 199.0, 200.5, 900_000),  # a later "latest" bar
+    ])
+
+    mock_yf = MagicMock()
+    mock_yf.download.return_value = fake_frame
+
+    with patch.dict("sys.modules", {"yfinance": mock_yf}):
+        count = daily_closes._fetch_yfinance_closes(["SPY"], "2026-06-30", records)
+
+    assert count == 1
+    assert records[0]["Close"] == 102.5, (
+        "must return the close for the REQUESTED date (2026-06-30), not "
+        "yfinance's latest available bar (2026-07-01 close=200.5)"
+    )
+
+    call_kwargs = mock_yf.download.call_args.kwargs
+    assert "period" not in call_kwargs, (
+        "must not use period= (anchored to wall-clock now, ignores the "
+        "requested date) — use a start/end window bounded by date_str"
+    )
+    assert call_kwargs.get("start") == "2026-06-21"
+    assert call_kwargs.get("end") == "2026-07-01"
+
+
+def test_yfinance_fetch_falls_back_to_prior_trading_day():
+    """A requested date with no exact yfinance bar (weekend/holiday) resolves
+    to the nearest prior trading day, mirroring FRED's on-or-before semantics
+    — not skipped, and not a later bar."""
+    records = []
+    fake_frame = _make_yf_frame([
+        ("2026-07-02", 300.0, 301.0, 299.0, 300.5, 1_000_000),  # Thursday
+        ("2026-07-06", 305.0, 306.0, 304.0, 305.5, 1_100_000),  # next Monday
+    ])
+
+    mock_yf = MagicMock()
+    mock_yf.download.return_value = fake_frame
+
+    with patch.dict("sys.modules", {"yfinance": mock_yf}):
+        # 2026-07-04 (Saturday) has no bar — should resolve to 07-02, not 07-06.
+        count = daily_closes._fetch_yfinance_closes(["SPY"], "2026-07-04", records)
+
+    assert count == 1
+    assert records[0]["Close"] == 300.5

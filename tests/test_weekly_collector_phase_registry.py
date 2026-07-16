@@ -218,3 +218,113 @@ def test_build_registry_reads_hard_caps_from_config():
     cfg = {"bucket": "b", "full_run_hard_caps_seconds": {"prices": 1200.0}}
     reg = weekly_collector._build_registry(cfg, _args(), "2026-06-13")
     assert reg._hard_caps == {"prices": 1200.0}
+
+
+# ── verify_artifact_exists (config-I2702 deliverable #2) ─────────────────────
+#
+# rc=0 / status="ok" must mean the contracted artifact actually landed on S3,
+# never just "the collector call didn't raise". These tests drive
+# _phase_collect's NEW verify_artifact_exists gate directly against a
+# _FakeS3 substituted for boto3.client("s3") inside _s3_object_exists —
+# independent of the PhaseRegistry's OWN marker-vs-artifact auto-skip check
+# (test_marker_ok_but_artifact_missing_reruns, above), which is a different
+# mechanism (a marker recorded on a PRIOR run) than this same-run gate.
+
+
+def test_verify_artifact_exists_passes_when_artifact_present(monkeypatch):
+    art = "staging/daily_closes/2026-06-13.parquet"
+    fake = _FakeS3(artifacts={art})
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+
+    out = weekly_collector._phase_collect(
+        _reg(fake), "daily_closes", lambda: {"status": "ok"},
+        artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
+    )
+    assert out["status"] == "ok"
+
+
+def test_verify_artifact_exists_downgrades_ok_to_error_when_artifact_absent(monkeypatch):
+    # The exact 2026-07-15-class bug: the collector's own internal logic
+    # reports status="ok" but the parquet never actually landed on S3.
+    art = "staging/daily_closes/2026-06-13.parquet"
+    fake = _FakeS3()  # artifacts deliberately empty
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+
+    out = weekly_collector._phase_collect(
+        _reg(fake), "daily_closes", lambda: {"status": "ok"},
+        artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
+    )
+    assert out["status"] == "error"
+    assert "does not exist" in out["error"]
+    assert "config-I2702" in out["error"]
+
+
+def test_verify_artifact_exists_error_marker_reruns_next_attempt(monkeypatch):
+    art = "staging/daily_closes/2026-06-13.parquet"
+    fake = _FakeS3()
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+
+    weekly_collector._phase_collect(
+        _reg(fake), "daily_closes", lambda: {"status": "ok"},
+        artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
+    )
+    calls = []
+    weekly_collector._phase_collect(
+        _reg(fake), "daily_closes", lambda: calls.append(1) or {"status": "ok"},
+        artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
+    )
+    assert calls == [1], "a verify-by-artifact failure must not auto-skip the retry"
+
+
+def test_verify_artifact_exists_skips_check_on_dry_run_status(monkeypatch):
+    # ok_dry_run collectors write nothing real to S3 — the verify gate must
+    # not spuriously fail a dry-run.
+    art = "staging/daily_closes/2026-06-13.parquet"
+    fake = _FakeS3()  # no artifacts — a real check here would fail
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+
+    out = weekly_collector._phase_collect(
+        _reg(fake), "daily_closes", lambda: {"status": "ok_dry_run"},
+        artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
+    )
+    assert out["status"] == "ok_dry_run"
+
+
+def test_verify_artifact_exists_false_leaves_existing_behavior_unchanged(monkeypatch):
+    # Default (verify_artifact_exists=False, the ~19 untouched call sites)
+    # must never call _s3_object_exists at all.
+    art = "staging/daily_closes/2026-06-13.parquet"
+    fake = _FakeS3()  # no artifacts — would fail the check if it ran
+
+    def _boom_client(*a, **k):
+        raise AssertionError("boto3.client must not be called when verify_artifact_exists=False")
+
+    monkeypatch.setattr(weekly_collector.boto3, "client", _boom_client)
+
+    out = weekly_collector._phase_collect(
+        _reg(fake), "daily_closes", lambda: {"status": "ok"}, artifact_key=art,
+    )
+    assert out["status"] == "ok"
+
+
+def test_s3_object_exists_head_true(monkeypatch):
+    fake = _FakeS3(artifacts={"a/b.parquet"})
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+    assert weekly_collector._s3_object_exists("bucket", "a/b.parquet") is True
+
+
+def test_s3_object_exists_head_false_on_404(monkeypatch):
+    fake = _FakeS3()
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+    assert weekly_collector._s3_object_exists("bucket", "a/b.parquet") is False
+
+
+def test_s3_object_exists_raises_on_other_client_error(monkeypatch):
+    class _Boom(_FakeS3):
+        def head_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "HeadObject")
+
+    fake = _Boom()
+    monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
+    with pytest.raises(ClientError):
+        weekly_collector._s3_object_exists("bucket", "a/b.parquet")

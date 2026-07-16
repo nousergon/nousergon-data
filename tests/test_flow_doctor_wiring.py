@@ -59,17 +59,20 @@ def stub_flow_doctor_env(monkeypatch):
 
 @pytest.fixture
 def temp_flow_doctor_yaml(tmp_path):
-    """Write a copy of the production flow-doctor.yaml with store.path
-    redirected into the test's tmp_path. Returns the temp yaml path.
+    """Write a copy of the production flow-doctor.yaml with store forced
+    to a local sqlite file in the test's tmp_path. Returns the temp yaml path.
 
-    The production yaml hardcodes /tmp/flow_doctor.db (Lambda ephemeral
-    convention) which isn't writable in every CI/sandbox env. Tests that
-    actually invoke flow_doctor.init() need a redirectable path.
+    Production uses a shared DynamoDB store (survives across invocations,
+    unlike /tmp SQLite) so dedup cooldowns actually work fleet-wide. Tests
+    that invoke flow_doctor.init() must NOT hit live AWS — they only
+    verify handler-wiring shape, not persistence behavior — so the store
+    is overridden to an isolated sqlite file regardless of the production
+    store type.
     """
     import yaml as yamllib
     with open(REPO_ROOT / "flow-doctor.yaml") as f:
         cfg = yamllib.safe_load(f)
-    cfg["store"]["path"] = str(tmp_path / "flow_doctor_test.db")
+    cfg["store"] = {"type": "sqlite", "path": str(tmp_path / "flow_doctor_test.db")}
     yaml_path = tmp_path / "flow-doctor.yaml"
     with open(yaml_path, "w") as f:
         yamllib.safe_dump(cfg, f)

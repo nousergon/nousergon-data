@@ -22,7 +22,7 @@
 # exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
 #   06:30 daily   cron(30 6 * * ? *)   # after the 19:00 groom matures (~01:45)
 #   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45)
-#                                      #   (the 01:00 Opus run matures ~07:45 —
+#                                      #   (the 01:00 high-only run matures ~07:45 —
 #                                      #   also covered by the 14:30 pass)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC

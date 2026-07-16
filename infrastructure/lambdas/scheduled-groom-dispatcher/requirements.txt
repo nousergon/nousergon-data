@@ -12,5 +12,8 @@ boto3>=1.34.0
 # own (already-fixed) mirrored copy, which is what actually governs on-box
 # enumeration. Mechanical pin-only bump — no behavior change on this Lambda's
 # own code.
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.104.0
-krepis>=0.10.2
+# v0.109.0 (config#2409, 2026-07-13) flips TIER_MODELS["high"] claude-opus-4-8
+# -> claude-sonnet-5 — this Lambda picks it up automatically via
+# ge.decide_slot()/decide_trigger()'s SlotDecision.model; no code change here,
+# behavior change only (see test_handler.py updates in this same commit).
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.109.0

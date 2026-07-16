@@ -1,0 +1,772 @@
+{
+  "Comment": "Alpha Engine Weekly Advisory Pipeline (alpha-engine-config-I2544, Phase 2 of the weekly-SF load-reduction plan) \u2014 the eval-judge chain (EvalJudge submit/poll/process \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts), PLUS ReportCard and Director, decoupled from the Saturday critical path into an async child SF. Started fire-and-forget (states:startExecution, NOT .sync) by the main ne-weekly-freshness-pipeline's StartAdvisoryPipeline state once DataPhase2 completes, named advisory-{run_date} for idempotency (a StartExecution retry against the same run_date's already-running/completed child gets StepFunctions.ExecutionAlreadyExistsException, treated as pass-through success by the parent). Internal state order and every lifted state's Payload/Retry/Catch semantics are PRESERVED byte-for-byte from step_function.json \u2014 only the terminal edges (BranchAComplete \u2192 ReportCard; CheckShellRunNotify \u2192 AdvisoryNotifyComplete) were rewired, since this child has no Parallel join and no shell-run/preflight identity of its own. Deploy path mirrors step_function.json's single-writer contract (config#2273): infrastructure/deploy_step_function.sh / deploy-infrastructure.sh upload this file's stamped bytes to the CFN-referenced S3 key before update-state-machine. Failure visibility: TopLevel TimeoutSeconds=28800 (8h \u2014 the eval-judge poll's own 6h fail-soft cap plus headroom for the Map/Lambda stages around it) yields TIMED_OUT on a hang, matched by the same saturday-sf-watch-dispatcher registration used for the fleet's other Step Functions (see PIPELINES in infrastructure/lambdas/saturday-sf-watch-dispatcher/index.py). A genuine SF-engine-level error (vs. any lifted state's own, deliberately non-fatal failure path) is caught by the single-branch Parallel wrapper and alerted via AdvisoryHandleFailure \u2192 AdvisoryFailExecution, mirroring the parent SF's NormalizeFailureContext \u2192 HandleFailure \u2192 FailExecution shape in miniature.",
+  "StartAt": "InitializeAdvisoryInput",
+  "TimeoutSeconds": 28800,
+  "States": {
+    "InitializeAdvisoryInput": {
+      "Type": "Pass",
+      "Comment": "Layer defaults under the child execution input, mirroring the parent SF's InitializeInput idiom exactly (States.JsonMerge with user-input as the second/winning arg). run_date/research_dry/sns_topic_arn/pipeline_label are ALWAYS supplied by the parent's StartAdvisoryPipeline dispatch (Input.$ merges the parent's own $ into these floors before startExecution), but this state also makes a bare manual/console StartExecution of this child safe \u2014 the skip_* flags default false (run the full chain) and sns_topic_arn/pipeline_label get the same account-literal floor InitializeInput uses (config#2281 provenance note applies identically here).",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"research_dry\":false,\"skip_eval_judge\":false,\"skip_rationale_clustering\":false,\"skip_replay_concordance\":false,\"skip_counterfactual\":false,\"skip_aggregate_costs\":false,\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),$$.Execution.Input,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "AdvisoryPipelineWrapper"
+    },
+    "AdvisoryPipelineWrapper": {
+      "Type": "Parallel",
+      "Comment": "Single-branch wrapper giving the advisory pipeline a machine-level catch-all WITHOUT altering any lifted state's own Payload/Retry/Catch (alpha-engine-config-I2544 explicitly requires preserving those semantics \u2014 every lifted Task already routes its own failures forward as non-fatal/observability-only, by original design; this Catch exists as a backstop for a genuine SF-engine-level error, not for any state's own business-logic failure path).",
+      "Branches": [
+        {
+          "StartAt": "CheckSkipEvalJudge",
+          "States": {
+            "CheckSkipEvalJudge": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_eval_judge\": true} bypasses the LLM-as-judge eval step (typically used for ad-hoc reruns where eval cost is unwanted). Skipping the judge does NOT skip rationale clustering \u2014 they're independent observability paths (clustering reads decision_artifacts/, judge reads its own _eval/), so we route to CheckSkipRationaleClustering instead of bypassing both.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_eval_judge",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_eval_judge",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRationaleClustering"
+                }
+              ],
+              "Default": "ComputeEvalCadence"
+            },
+            "ComputeEvalCadence": {
+              "Type": "Pass",
+              "Comment": "Extract day-of-month + ISO date + submit timestamp from the SF execution start time. day_of_month <= 07 \u21d2 first Saturday of the month \u21d2 force_sonnet_pass=true (monthly Sonnet sweep per ROADMAP \u00a71626). All other Saturdays run Haiku-only batch + per-artifact Sonnet escalation tail inside the Process Lambda. submit_iso is propagated to EvalJudgePoll so it can compute elapsed-time against the 6h fail-soft cap.",
+              "Parameters": {
+                "day_of_month.$": "States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), '-'), 2)",
+                "eval_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+                "submit_iso.$": "$$.Execution.StartTime"
+              },
+              "ResultPath": "$.eval_cadence",
+              "Next": "CheckMonthlyCadence"
+            },
+            "CheckMonthlyCadence": {
+              "Type": "Choice",
+              "Comment": "First-Saturday-of-the-month detection via lexicographic compare on the zero-padded day-of-month string ('01'..'07' < '08'). Lexicographic ordering is correct here because all values are zero-padded 2-char strings.",
+              "Choices": [
+                {
+                  "Variable": "$.eval_cadence.day_of_month",
+                  "StringLessThan": "08",
+                  "Next": "EvalJudgeSubmitFirstSaturday"
+                }
+              ],
+              "Default": "EvalJudgeSubmitWeekly"
+            },
+            "EvalJudgeSubmitFirstSaturday": {
+              "Type": "Task",
+              "Comment": "Submit phase, monthly Sonnet sweep \u2014 force_sonnet_pass=true. Builds the (artifact \u00d7 judge_model) batch payload covering both Haiku and Sonnet for every mapped artifact, submits as one Anthropic Message Batches API call, and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 \u00a71642. 50% cost discount per Anthropic's batch contract; structurally bypasses the 15-min Lambda timeout class that nearly fired on the 2026-05-06 manual midweek SF run.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-eval-judge-submit:live",
+                "Payload": {
+                  "force_sonnet_pass": true,
+                  "date.$": "$.eval_cadence.eval_date",
+                  "dry_run_llm.$": "$.research_dry",
+                  "capture_lookback_days": 6
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval is observability per ROADMAP \u00a71635 \u2014 submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
+                  "Next": "EvalRollingMean",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultPath": "$.eval_judge_submit",
+              "Next": "EvalJudgePollChoice"
+            },
+            "EvalJudgeSubmitWeekly": {
+              "Type": "Task",
+              "Comment": "Submit phase, weekly Haiku-only batch + Sonnet escalation tail in Process. Submits Haiku entries for every mapped artifact in one batch; the Process Lambda runs Sonnet escalations synchronously after Haiku results arrive (typically 1-3 artifacts/run, well under Process's 15-min budget). Preserves the per-artifact <3 escalation gate so weekly cost stays bounded relative to the all-pairs first-Saturday batch.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-eval-judge-submit:live",
+                "Payload": {
+                  "force_sonnet_pass": false,
+                  "date.$": "$.eval_cadence.eval_date",
+                  "dry_run_llm.$": "$.research_dry",
+                  "capture_lookback_days": 6
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval is observability \u2014 submit failures must NOT halt the pipeline.",
+                  "Next": "EvalRollingMean",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultPath": "$.eval_judge_submit",
+              "Next": "EvalJudgePollChoice"
+            },
+            "EvalJudgePollChoice": {
+              "Type": "Choice",
+              "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) \u2192 route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK \u2192 enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "StringEquals": "EMPTY"
+                    }
+                  ],
+                  "Next": "EvalJudgeProcess"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.status",
+                      "StringEquals": "OK"
+                    }
+                  ],
+                  "Comment": "config#2275: IsPresent-guarded so a submit payload WITHOUT status actually reaches the fail-soft Default this state's own comment promises ('missing fields routes to EvalRollingMean') instead of throwing States.Runtime.",
+                  "Next": "EvalJudgePollWait"
+                }
+              ],
+              "Default": "EvalRollingMean"
+            },
+            "EvalJudgePollWait": {
+              "Type": "Wait",
+              "Comment": "60s pause between batch status polls. Anthropic's docs target sub-1h typical batch latency with 24h hard cap; 60s polls strike a balance between pickup latency and Lambda invocation cost over the typical wait.",
+              "Seconds": 60,
+              "Next": "EvalJudgePoll"
+            },
+            "EvalJudgePoll": {
+              "Type": "Task",
+              "Comment": "Poll phase. Calls anthropic.messages.batches.retrieve(batch_id) and returns processing_status + request_counts + elapsed_seconds. SF Choice that follows branches on processing_status: ended \u2192 Process; in_progress \u2192 loop back to Wait; exceeded_max_wait=true \u2192 fail-soft to EvalRollingMean.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-eval-judge-poll:live",
+                "Payload": {
+                  "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
+                  "submit_iso.$": "$.eval_cadence.submit_iso",
+                  "max_wait_seconds": 21600,
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 60,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "A poll-level failure is recoverable \u2014 Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route to EvalRollingMean so the rest of the pipeline isn't blocked.",
+                  "Next": "EvalRollingMean",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultPath": "$.eval_judge_poll",
+              "Next": "EvalJudgePollDecision"
+            },
+            "EvalJudgePollDecision": {
+              "Type": "Choice",
+              "Comment": "Branch on poll status. processing_status='ended' \u2192 run Process. exceeded_max_wait=true \u2192 fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else \u2192 loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.processing_status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_poll.Payload.processing_status",
+                          "StringEquals": "ended"
+                        },
+                        {
+                          "Variable": "$.eval_judge_poll.Payload.processing_status",
+                          "StringEquals": "ended_empty"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "EvalJudgeProcess"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "EvalRollingMean"
+                },
+                {
+                  "And": [
+                    {
+                      "Not": {
+                        "Variable": "$.eval_judge_poll.Payload.processing_status",
+                        "IsPresent": true
+                      }
+                    },
+                    {
+                      "Not": {
+                        "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
+                        "IsPresent": true
+                      }
+                    }
+                  ],
+                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed \u2014 fail-soft to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
+                  "Next": "EvalRollingMean"
+                }
+              ],
+              "Default": "EvalJudgePollWait"
+            },
+            "EvalJudgeProcess": {
+              "Type": "Task",
+              "Comment": "Process phase. Streams the completed batch's results, parses each via the existing RubricEvalLLMOutput schema, persists per-artifact eval JSONs to decision_artifacts/_eval/{date}/, emits CW metrics under AlphaEngine/Eval, and runs the small synchronous Sonnet-escalation tail for any Haiku result that flagged a borderline dimension. Returns OK/PARTIAL/ERROR mirroring the legacy single-Lambda contract \u2014 no consumer (RationaleClustering, EvalRollingMean, dashboard) changes.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-eval-judge-process:live",
+                "Payload": {
+                  "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
+                  "plan_s3_key.$": "$.eval_judge_submit.Payload.plan_s3_key",
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval is observability \u2014 Process failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
+                  "Next": "EvalRollingMean",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultPath": "$.eval_judge_result",
+              "Next": "EvalRollingMean"
+            },
+            "EvalRollingMean": {
+              "Type": "Task",
+              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) \u2014 runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP \u00a71634). Runs every Saturday \u2014 even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-eval-rolling-mean:live",
+                "Payload": {
+                  "end_time_iso.$": "$$.Execution.StartTime"
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline.",
+                  "Next": "CheckSkipRationaleClustering",
+                  "ResultPath": "$.eval_rolling_mean_error"
+                }
+              ],
+              "ResultPath": "$.eval_rolling_mean_result",
+              "Next": "CheckSkipRationaleClustering"
+            },
+            "CheckSkipRationaleClustering": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_rationale_clustering\": true} bypasses the cross-week rationale clustering Lambda (used during ad-hoc reruns where corpus is in a known-bad state, while iterating on extraction logic, or for post-incident reruns where stale outputs shouldn't hit CloudWatch). Standalone invocation of the Lambda is always available regardless of this flag.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_rationale_clustering",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_rationale_clustering",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipReplayConcordance"
+                }
+              ],
+              "Default": "RationaleClustering"
+            },
+            "RationaleClustering": {
+              "Type": "Task",
+              "Comment": "Cross-week rationale clustering Lambda (ROADMAP P0, 2026-05-05). Reads decision_artifacts/ for the trailing 8 weeks, clusters rationales per agent_id via TF-IDF char n-grams + greedy single-linkage with digit-normalization, emits CW metric agent_rationale_template_concentration (% of rationales in top-3 clusters; >0.7 indicates template-generation), and persists per-agent analysis JSON to decision_artifacts/_analysis/{agent_id}/{YYYY-WW}.json. Runs every Saturday after EvalRollingMean \u2014 same image-share + observability framing.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-rationale-clustering:live",
+                "Payload": {
+                  "end_time_iso.$": "$$.Execution.StartTime",
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline.",
+                  "Next": "CheckSkipReplayConcordance",
+                  "ResultPath": "$.rationale_clustering_error"
+                }
+              ],
+              "ResultPath": "$.rationale_clustering_result",
+              "Next": "CheckSkipReplayConcordance"
+            },
+            "CheckSkipReplayConcordance": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_replay_concordance\": true} bypasses the cheap-model concordance Lambda (used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the comparison scorers in alpha-engine-backtester replay/comparison.py). Independent of skip_rationale_clustering and skip_counterfactual \u2014 the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_replay_concordance",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_replay_concordance",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipCounterfactual"
+                }
+              ],
+              "Default": "ReplayConcordance"
+            },
+            "ReplayConcordance": {
+              "Type": "Task",
+              "Comment": "Weekly cheap-model concordance Lambda (ROADMAP P0, agent-justification gate signal #3). Replays each captured DecisionArtifact in the trailing 8-week window under the configured target model(s) via langchain_anthropic.with_structured_output against the canonical agent_schemas Pydantic contract; aggregates agreement_score per (agent_id_base, target_model); emits CW metric agent_cheap_model_concordance; persists per-target summary JSON to decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json. Default target: claude-haiku-4-5 (Sonnet\u2192Haiku concordance \u2248 \"is the larger model earning its cost?\"). Runs every Saturday after RationaleClustering.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-replay-concordance:live",
+                "Payload": {
+                  "end_time_iso.$": "$$.Execution.StartTime",
+                  "target_models": [
+                    "claude-haiku-4-5"
+                  ],
+                  "window_days": 56,
+                  "max_artifacts": 150,
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval observability layer \u2014 concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
+                  "Next": "CheckSkipCounterfactual",
+                  "ResultPath": "$.replay_concordance_error"
+                }
+              ],
+              "ResultPath": "$.replay_concordance_result",
+              "Next": "CheckSkipCounterfactual"
+            },
+            "CheckSkipCounterfactual": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_counterfactual\": true} bypasses the counterfactual rule fit Lambda (used for ad-hoc reruns while iterating on the per-agent feature extractors in alpha-engine-backtester replay/counterfactual.py). Independent of skip_rationale_clustering and skip_replay_concordance \u2014 the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag. Post-2026-05-07 reorder, exits to CheckSkipPredictorTraining (was SaturdayHealthCheck) \u2014 the judge chain now runs before predictor so its results are available to evaluator's email.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_counterfactual",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_counterfactual",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipAggregateCosts"
+                }
+              ],
+              "Default": "Counterfactual"
+            },
+            "Counterfactual": {
+              "Type": "Task",
+              "Comment": "Weekly counterfactual rule fit Lambda (ROADMAP P0, agent-justification gate signal #2 \u2014 does the agent reduce to a 3-deep decision tree?). Trains DecisionTreeClassifier(max_depth=3) per supported agent on (input \u2192 decision) pairs from the trailing 8-week decision_artifacts/ corpus; emits CW metric agent_counterfactual_rule_fit per (judged_agent_id); persists per-agent JSON to decision_artifacts/_counterfactual/{agent_id_base}/{YYYY-WW}.json including tree_text + feature_importances. v1 covers ic_cio + macro_economist; other agents emit UNSUPPORTED markers. $0 ongoing \u2014 no LLM calls. Post-2026-05-07 reorder, runs after ReplayConcordance and exits to CheckSkipPredictorTraining (was SaturdayHealthCheck), so its persisted artifacts are available to Evaluator downstream.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-replay-counterfactual:live",
+                "Payload": {
+                  "end_time_iso.$": "$$.Execution.StartTime",
+                  "window_days": 56,
+                  "max_depth": 3,
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 600,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval observability layer \u2014 counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes to CheckSkipAggregateCosts so the cost-telemetry aggregation step still runs even when counterfactual fails (the JSONLs the aggregator reads were written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual independently; a counterfactual failure doesn't invalidate the upstream cost rows).",
+                  "Next": "CheckSkipAggregateCosts",
+                  "ResultPath": "$.counterfactual_error"
+                }
+              ],
+              "ResultPath": "$.counterfactual_result",
+              "Next": "CheckSkipAggregateCosts"
+            },
+            "CheckSkipAggregateCosts": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_aggregate_costs\": true} bypasses the daily cost-telemetry aggregation Lambda (used for ad-hoc reruns where the cost parquet for the date is already current, or when iterating on the aggregator script). Standalone invocation of the Lambda is always available via the deploy.sh aggregate_costs target. Independent of skip_rationale_clustering / skip_replay_concordance / skip_counterfactual \u2014 the four are independent observability paths.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_aggregate_costs",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_aggregate_costs",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "ReportCard"
+                }
+              ],
+              "Default": "AggregateCosts"
+            },
+            "AggregateCosts": {
+              "Type": "Task",
+              "Comment": "Daily cost-telemetry aggregation Lambda (ROADMAP L1146 \u2014 SF-wire scripts/aggregate_costs.py CLI). Reads decision_artifacts/_cost_raw/{run_date}/*.jsonl (written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual during the upstream chain), writes the daily parquet at decision_artifacts/_cost/{run_date}/cost.parquet, emits per-agent CW metrics under AlphaEngine/Cost. Placed at end of Branch A so all LLM-emitting upstream states have written their cost JSONL rows by the time the aggregator runs. Failure is non-blocking (Catch routes to BranchAComplete) \u2014 cost telemetry is observability, NOT a primary deliverable; aggregator failure does NOT regress the alpha pipeline. Status contract OK / SKIPPED / ERROR mirrors data #295 + L3277 audit \u2014 SKIPPED on no _cost_raw partitions for the date is a legitimate upstream no-op and treated as success.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-aggregate-costs:live",
+                "Payload": {
+                  "date.$": "$.run_date",
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 600,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available.",
+                  "Next": "ReportCard",
+                  "ResultPath": "$.aggregate_costs_error"
+                }
+              ],
+              "ResultPath": "$.aggregate_costs_result",
+              "Next": "ReportCard"
+            },
+            "ReportCard": {
+              "Type": "Task",
+              "Comment": "Evaluator Report Card v2 (Layer B, Option B) \u2014 builds s3://alpha-engine-research/evaluator/{date}/report_card.json from the persisted per-module artifacts (the 7-tile MetricRecord substrate the Director will consume). Runs here, after the Evaluator + substrate health checks, so it reads fresh grades. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory grading failure never breaks the run that produced the real trading artifacts. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry (the canonical shell-run-dry signal \u2014 false on the real Saturday run, true on the Friday-PM Preflight Pipeline). On the preflight the handler still exercises the full read+compute path (container boot, lib/numpy/pandas imports, S3-read IAM/transport, the tile compute) but does NOT persist the degenerate, mostly-N/A preflight card \u2014 mirrors how the other advisory Lambdas (eval-judge / rationale-clustering / replay-concordance / counterfactual) run dry rather than skip, per the shell-run keystone's 'dry-execute, don't skip' principle. alpha-engine-config-I2556 (2026-07-14): Payload now carries \"snapshot\": true \u2014 this Saturday-cadence invocation is the WEEKLY FREEZE that writes the dated historical card (persistent report card with weekly snapshots). The Sunday ModelZoo child SF's re-grade tail (GradingLambdaReGrade, step_function_modelzoo.json) passes \"snapshot\": false \u2014 it only refreshes the standing latest.json, never a second same-week snapshot. Evaluator-side handler support for the flag ships separately (I2556, crucible-evaluator); an unrecognized event field is ignored harmlessly by the CURRENT handler, so wiring the payload ahead of that landing is safe and forward-correct.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-evaluator:live",
+                "Payload": {
+                  "date.$": "$.run_date",
+                  "dry_run.$": "$.research_dry",
+                  "snapshot": true
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Advisory grading is non-fatal \u2014 continue to the terminal notify regardless. config#2302: the run must still PAGE on entry (silent for 9 days pre-fix), so route through PublishReportCardDegraded before the terminal notify rather than swallowing the error.",
+                  "Next": "PublishReportCardDegraded",
+                  "ResultPath": "$.report_card_error"
+                }
+              ],
+              "ResultPath": "$.report_card_result",
+              "Next": "Director"
+            },
+            "PublishReportCardDegraded": {
+              "Type": "Task",
+              "Comment": "config#2302: ReportCard's Catch(States.ALL) used to route straight to CheckShellRunNotify with no alert \u2014 the 2026-07 incident where the evaluator Lambda died silently for 9 days. Mirrors PublishLibPinGateDegraded's shape exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal advisory-grading path this alert decorates). WARNING severity, not FAILED \u2014 the weekly run's real trading artifacts are unaffected; only the advisory grading layer degraded.",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.sns_topic_arn",
+                "Subject": "Alpha Engine Weekly Pipeline \u2014 ReportCard WARNING (Advisory Grading Degraded)",
+                "Message": "ReportCard (the Evaluator Report Card v2 Lambda) failed \u2014 see $.report_card_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+              },
+              "ResultPath": "$.report_card_degraded_notify",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal advisory path this alert decorates.",
+                  "ResultPath": "$.report_card_degraded_notify_error",
+                  "Next": "AdvisoryNotifyComplete"
+                }
+              ],
+              "Next": "AdvisoryNotifyComplete"
+            },
+            "Director": {
+              "Type": "Task",
+              "Comment": "Director (Layer C, Part II) \u2014 the FINAL Saturday-SF task. A single structured Opus call over the fresh Report Card v2 (evaluator/{date}/report_card.json) produces an advisory DirectorWeeklyActionPlan at director/{date}/action_plan.json + updates the carry-over ledger. Runs only after a SUCCESSFUL ReportCard (a failed ReportCard skips straight to notify \u2014 no card to weigh). FLAG-GATED: the alpha-engine-evaluator-director Lambda is a no-op (status=disabled) until DIRECTOR_ENABLED is flipped on. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory failure never breaks the run that produced the real trading artifacts. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry. On the Friday-PM Preflight Pipeline (research_dry=true) the handler runs a no-Opus / no-write PROBE \u2014 it constructs the real Opus client (exercising the langchain-anthropic import + the SSM ANTHROPIC_API_KEY fetch / ReadAnthropicSecret IAM grant) and reads the carry-over ledger, then STOPS short of the paid .invoke() and writes NOTHING (no action_plan, no ledger mutation). This is load-bearing: the carry-over ledger is shared + non-date-scoped (director/carryover_ledger.json), so a preflight write would pollute the real Saturday run. A broken import / revoked key grant surfaces as a caught preflight failure ~18h before the real Saturday Director would hit it.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-evaluator-director:live",
+                "Payload": {
+                  "date.$": "$.run_date",
+                  "dry_run.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Advisory Director is non-fatal \u2014 continue to the terminal notify regardless. config#2302: the run must still PAGE on entry, so route through PublishDirectorDegraded before the terminal notify rather than swallowing the error.",
+                  "Next": "PublishDirectorDegraded",
+                  "ResultPath": "$.director_error"
+                }
+              ],
+              "ResultPath": "$.director_result",
+              "Next": "AdvisoryNotifyComplete"
+            },
+            "PublishDirectorDegraded": {
+              "Type": "Task",
+              "Comment": "config#2302: Director's Catch(States.ALL) used to route straight to CheckShellRunNotify with no alert \u2014 same silent-swallow class as ReportCard's pre-fix Catch (the 2026-07 9-day-silent incident). Mirrors PublishLibPinGateDegraded's shape exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal advisory path this alert decorates). WARNING severity, not FAILED \u2014 the weekly run's real trading artifacts are unaffected; only the advisory Director layer degraded.",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.sns_topic_arn",
+                "Subject": "Alpha Engine Weekly Pipeline \u2014 Director WARNING (Advisory Action Plan Degraded)",
+                "Message": "Director (the Evaluator Director Lambda) failed \u2014 see $.director_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory Director layer (action_plan.json, carry-over ledger update) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+              },
+              "ResultPath": "$.director_degraded_notify",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal advisory path this alert decorates.",
+                  "ResultPath": "$.director_degraded_notify_error",
+                  "Next": "AdvisoryNotifyComplete"
+                }
+              ],
+              "Next": "AdvisoryNotifyComplete"
+            },
+            "AdvisoryNotifyComplete": {
+              "Type": "Task",
+              "Comment": "Advisory child SF (alpha-engine-config-I2544) success notifier. Mirrors the parent Saturday SF's NotifyComplete exactly (config#1819: constants-only Subject/Message, best-effort Catch to AdvisoryNotifyCompleteDegraded) so a publish failure can never fail an otherwise-successful advisory run. Reached whether ReportCard/Director succeeded, degraded, or (ReportCard only) were skipped by a failure.",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.sns_topic_arn",
+                "Subject": "Alpha Engine Weekly Advisory Pipeline \u2014 SUCCESS",
+                "Message": "The weekly advisory child pipeline (eval-judge chain, EvalRollingMean, RationaleClustering, ReplayConcordance, Counterfactual, AggregateCosts, ReportCard, Director) completed. Any individual-stage degradation was already alerted separately (ReportCard/Director WARNING notices) \u2014 this confirms the child execution itself reached its terminal state. View pipeline status: https://console.nousergon.ai/pipeline-status"
+              },
+              "ResultPath": "$.notify_result",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#1819 \u2014 best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded child execution.",
+                  "ResultPath": "$.notify_error",
+                  "Next": "AdvisoryNotifyCompleteDegraded"
+                }
+              ],
+              "End": true
+            },
+            "AdvisoryNotifyCompleteDegraded": {
+              "Type": "Pass",
+              "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA, mirroring the parent SF's NotifyCompleteDegraded.",
+              "Parameters": {
+                "degraded": true,
+                "source": "AdvisoryNotifyComplete",
+                "error.$": "$.notify_error"
+              },
+              "ResultPath": "$.notify_degraded",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "AdvisoryNormalizeFailureContext",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+    "AdvisoryNormalizeFailureContext": {
+      "Type": "Pass",
+      "Comment": "Single Catch/Next funnel before AdvisoryHandleFailure, mirroring the parent SF's NormalizeFailureContext (config#1819 class) \u2014 guarantees $.error/$.sns_topic_arn are present regardless of what the wrapper Parallel's Catch populated.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"phase\":\"Unknown\",\"source\":\"AdvisoryNormalizeFailureContext\",\"detail\":\"no $.error was set by the upstream Catch\"},\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),$,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "AdvisoryHandleFailure"
+    },
+    "AdvisoryHandleFailure": {
+      "Type": "Task",
+      "Comment": "Failure alert via SNS \u2014 advisory child pipeline halted on a genuine SF-engine-level error escaping the wrapper Parallel (every lifted state's OWN failure path is non-fatal by design, so this is a rare backstop, not the common case). Subject is a hardcoded constant (no user-controlled pipeline_label threading here, unlike the parent \u2014 this child has no shell-run/preflight identity of its own), so it can never violate the SNS Subject <=100-char/no-newline contract (config#1819 class).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Advisory Pipeline \u2014 FAILED",
+        "Message.$": "States.Format('Weekly Advisory Pipeline (eval-judge chain / ReportCard / Director) failed at the SF-engine level (this is a backstop path \u2014 the advisory stages are individually non-fatal by design). Error: {}. This pipeline was started fire-and-forget by the main Saturday SF and does NOT block trading-critical artifacts. View pipeline status: https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.failure_notify",
+      "Next": "AdvisoryFailExecution"
+    },
+    "AdvisoryFailExecution": {
+      "Type": "Fail",
+      "Error": "AdvisoryPipelineFailure",
+      "Cause": "The advisory child SF failed at the SF-engine level. Check CloudWatch Logs (/aws/stepfunctions/ne-weekly-advisory-pipeline) for details. This pipeline is non-trading-critical (eval-judge / ReportCard / Director advisory tail) \u2014 the main Saturday SF's trading-critical artifacts are unaffected."
+    }
+  }
+}

@@ -63,7 +63,14 @@ _DEPLOY_SCRIPTS = (
 # now flows directly into WeekdayTrigger.
 _TRIGGER_SUCCESSORS = {
     "SaturdayTrigger": "WeekdayTrigger",
-    "WeekdayTrigger": "ResearchAlerts",
+    # alpha-engine-config-I2545: ModelZooSundayTrigger was inserted between
+    # WeekdayTrigger and ResearchAlerts in the CFN template — update this
+    # chain in the SAME PR as any future insertion between two entries here
+    # (an unregistered gap silently merges the two neighboring blocks and
+    # masks a genuine multi-target regression, exactly the failure mode
+    # this successor-chain exists to prevent).
+    "WeekdayTrigger": "ModelZooSundayTrigger",
+    "ModelZooSundayTrigger": "ResearchAlerts",
 }
 
 

@@ -576,6 +576,7 @@ def total_return_series(
     dividend_actions: list["CorporateAction"],
     *,
     close_col: str = "Close",
+    split_actions: list["CorporateAction"] | None = None,
 ) -> pd.Series:
     """Build a SEPARATE total-return-adjusted close from a (split-adjusted) price
     series + the dividend events — the CRSP primitive (config#1433).
@@ -600,6 +601,30 @@ def total_return_series(
 
     Dividends whose ex-date is on/before the first row (no earlier row to adjust)
     contribute nothing and are skipped. The input series order/index is preserved.
+
+    ``split_actions`` — dividend share-basis normalization (config#1462)
+    ---------------------------------------------------------------------
+    A feed-reported ``cash_amount`` is denominated in the share count AS OF THE
+    DIVIDEND'S OWN ex-date — it is NEVER retroactively restated for a split that
+    happens later, even though ``price_df[close_col]`` (and any later dividend's
+    ``close_prev``) IS on the fully split-adjusted scale (``price_df`` already
+    reflects every split — confirmed-applied by ``apply()`` OR already baked into
+    the raw feed itself, e.g. yfinance restates ``Close`` for real historical
+    splits even under ``auto_adjust=False``). Feeding a pre-split nominal
+    ``cash_amount`` straight into ``dividend_factor`` against a post-split
+    ``close_prev`` overstates the back-adjust by exactly the intervening
+    cumulative split factor — a WMT $0.57 dividend (declared pre the 2024-02-26
+    3-for-1 split) divided by a post-split ~$51 close manufactures a ~1.1%
+    factor error, which compounds across every pre-split dividend and reproduces
+    almost exactly as a growing reconciliation residual (localized + fixed via
+    config#1462, alpha-engine-config#2462). Passing ``split_actions`` here scales
+    each dividend's ``cash_amount`` by ``cumulative_factor`` (the SAME price-level
+    convention ``apply``/``restate_series_for_splits`` use) evaluated at the
+    dividend's own ex-date against the reference scale of ``price_df``'s LAST
+    index date — i.e. "how many of today's shares was this dividend paid on."
+    ``split_actions=None`` (default) preserves the prior no-op behavior (unscaled
+    ``cash_amount``) for backward compatibility / callers already on one
+    consistent basis.
     """
     if price_df is None or getattr(price_df, "empty", True):
         return pd.Series(dtype="float64", name="tr_close")
@@ -618,17 +643,37 @@ def total_return_series(
     vals = price_df[close_col].to_numpy(dtype="float64").copy()
     ts = pd.DatetimeIndex(idx).normalize().to_numpy()
 
+    split_events_list = [
+        {
+            "execution_date": s.ex_date,
+            "split_from": s.split_from,
+            "split_to": s.split_to,
+        }
+        for s in (split_actions or [])
+        if s.type == _TYPE_SPLIT and s.split_from and s.split_to
+    ]
+    reference_date = pd.Timestamp(ts.max()) if split_events_list and len(ts) else None
+
     divs = [a for a in (dividend_actions or []) if a.type == _TYPE_DIVIDEND]
     divs.sort(key=lambda a: pd.Timestamp(a.ex_date).normalize())
     for a in divs:
         if a.cash_amount is None:
             continue
-        ex = np.datetime64(pd.Timestamp(a.ex_date).normalize())
+        ex_ts = pd.Timestamp(a.ex_date).normalize()
+        ex = np.datetime64(ex_ts)
         before = ts < ex
         if not before.any():
             continue  # ex-date at/before first row — nothing earlier to adjust
         prev_pos = int(np.nonzero(before)[0][-1])  # last row strictly before ex
-        factor = dividend_factor(a.cash_amount, vals[prev_pos])
+        cash = a.cash_amount
+        if split_events_list:
+            # Scale the nominal (as-declared) cash amount up to the SAME
+            # post-split share basis price_df[close_col] is already on, so the
+            # factor's numerator/denominator agree on share count.
+            cash *= cumulative_factor(
+                split_events_list, ex_ts, reference_date=reference_date,
+            )
+        factor = dividend_factor(cash, vals[prev_pos])
         vals[before] = vals[before] * factor
 
     return pd.Series(vals, index=price_df.index, name="tr_close")
