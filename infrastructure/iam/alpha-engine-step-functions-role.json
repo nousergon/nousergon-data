@@ -22,7 +22,8 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*",
-        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*"
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-eod-precondition-probe*"
       ]
     },
     {
@@ -157,6 +158,12 @@
       "Effect": "Allow",
       "Action": "states:StartExecution",
       "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-advisory-pipeline"
+    },
+    {
+      "Sid": "StartEodSelfHealReplay",
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
     }
   ]
 }

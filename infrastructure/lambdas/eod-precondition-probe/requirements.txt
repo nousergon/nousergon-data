@@ -1,0 +1,4 @@
+# No third-party deps beyond the Lambda runtime's built-in boto3/botocore —
+# this Lambda deliberately stays out of ArcticDB (Brian's 2026-07-08
+# config#1787 Option-B ruling; see index.py module docstring) so it never
+# needs the arcticdb package or VPC networking.

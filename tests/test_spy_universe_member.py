@@ -209,3 +209,83 @@ def test_production_filters_reference_universe_extra(rel_path, needle):
         f"filter changed; update _backfill_admits/_daily_append_admits and "
         f"re-verify the SPY-admission + prune-protection contract"
     )
+
+
+# ── D. expected_tickers-scoping predicate contract (config-I2703) ───────────
+#
+# 2026-07-15 P0: the WRITE-path predicate above (_daily_append_admits) has
+# always carved out _UNIVERSE_EXTRA correctly, but the freshness-scan and
+# missing-from-closes checks in daily_append.py — which ALSO derive an
+# "expected" scoped set from expected_tickers, to exclude genuine S&P
+# churn-out stragglers — filtered on bare `_SKIP_TICKERS` with no
+# `_UNIVERSE_EXTRA` carve-out. Net effect: SPY (in `_SKIP_TICKERS` by
+# design) was silently excluded from expected_tickers' "must be fresh /
+# must be in today's closes" scope on every run, logged identically to a
+# genuine churn-out straggler ("S&P churn-out straggler, awaiting prune").
+# A future SPY write outage would have gone undetected by the freshness
+# gate. Fixed by aligning all THREE call sites (write / missing-from-closes
+# / freshness-scan) on the identical carve-out predicate. These tests pin
+# that invariant the same way section C pins the write-path predicate.
+
+
+def _expected_set_admits(t: str) -> bool:
+    """Mirrors the `expected_set` / `expected_stocks` comprehension in both
+    `_scan_universe_and_emit_freshness_receipt` and the missing-from-closes
+    check in builders/daily_append.py (identical predicate, kept in
+    lockstep by the source-text guard below)."""
+    stripped = t.lstrip("^")
+    return (
+        stripped not in _SKIP_TICKERS or stripped in _UNIVERSE_EXTRA
+    ) and not _is_sector_etf(stripped)
+
+
+def _closes_stock_keys_admits(t: str) -> bool:
+    """Mirrors the `closes_stock_keys` comprehension (missing-from-closes
+    check) in builders/daily_append.py — same predicate as
+    `_daily_append_admits` above (write-path), kept in lockstep by the
+    source-text guard below."""
+    return (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA) and not _is_sector_etf(t)
+
+
+def test_expected_set_admits_spy_despite_skip_ticker_membership():
+    """SPY must be admitted into the expected_tickers scoping set — it is
+    a hard-pinned benchmark, never a churn-eligible S&P straggler, even
+    though it lives in `_SKIP_TICKERS` (which ALSO serves the unrelated
+    prune-protection role — see section A/B)."""
+    assert _expected_set_admits("SPY")
+    assert _expected_set_admits("^SPY")  # caret-stripped callers
+    assert not _expected_set_admits("VIX"), "VIX is macro-only, never a universe member"
+    assert not _expected_set_admits("XLK"), "sector ETFs never enter the universe scope"
+
+
+def test_closes_stock_keys_admits_spy():
+    """SPY present in today's daily_closes parquet must be recognized as
+    a stock key — otherwise it always computes as 'missing from closes'
+    even on days it's genuinely present (the inverse failure mode: a false
+    hard-fail instead of a masked real one)."""
+    assert _closes_stock_keys_admits("SPY")
+    assert not _closes_stock_keys_admits("VIX")
+    assert not _closes_stock_keys_admits("XLK")
+
+
+@pytest.mark.parametrize(
+    "needle",
+    [
+        # freshness scan's expected_set
+        'if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)',
+        # missing-from-closes's closes_stock_keys
+        "if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)",
+    ],
+)
+def test_daily_append_scoping_sites_reference_universe_extra(needle):
+    """Guard against config-I2703 regressing: both expected_tickers-scoping
+    call sites in daily_append.py (freshness scan + missing-from-closes)
+    must carry the same _UNIVERSE_EXTRA carve-out the write-path predicate
+    already had. Source-text pin, same convention as section C."""
+    src = (_REPO_ROOT / "builders" / "daily_append.py").read_text()
+    assert needle in src, (
+        f"builders/daily_append.py no longer contains {needle!r} — an "
+        f"expected_tickers-scoping site lost its _UNIVERSE_EXTRA carve-out. "
+        f"This is the exact config-I2703 regression: SPY silently excluded "
+        f"from the freshness/missing-from-closes safety net."
+    )
