@@ -249,6 +249,26 @@ def _emit_missing_from_closes_metric(count: int) -> None:
         )
 
 
+class UniverseFreshnessViolation(RuntimeError):
+    """Raised by :func:`_scan_universe_and_emit_freshness_receipt` when one or
+    more UNRELATED universe symbols are stale — i.e. the just-completed
+    target-date write itself succeeded, but the whole-universe scan that
+    runs after it found a separate symbol exceeding the staleness threshold.
+
+    Subclasses ``RuntimeError`` so every existing caller that hard-fails
+    on (or asserts) a bare ``RuntimeError`` — the weekday/EOD SF paths,
+    the existing test suite — keeps its exact current behavior unchanged.
+    ``.stale_symbols`` lets a caller that WANTS to distinguish "my target
+    date's write succeeded, an unrelated ticker is stale" from a genuine
+    write failure do so (config#2685) without weakening the hard-fail
+    safety net itself (config-I2703 / the 2026-04-21 ASGN/MOH incident).
+    """
+
+    def __init__(self, message: str, stale_symbols: list[dict]):
+        super().__init__(message)
+        self.stale_symbols = stale_symbols
+
+
 UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 # Trading-day-aware staleness threshold. 3 trading days ≈ the prior
 # 5-calendar-day threshold (which was Fri→Wed under weekend buffer);
@@ -691,11 +711,14 @@ def _scan_universe_and_emit_freshness_receipt(
     if stale:
         stale.sort(key=lambda r: -r[2])
         head = ", ".join(f"{s}({a} trading-d, last={d})" for s, d, a in stale[:10])
-        raise RuntimeError(
+        raise UniverseFreshnessViolation(
             f"Universe-freshness scan: {len(stale)} symbol(s) older than "
             f"{max_stale_trading_days} trading-day(s) threshold "
             f"(stalest first): {head}"
-            + ("…" if len(stale) > 10 else "")
+            + ("…" if len(stale) > 10 else ""),
+            stale_symbols=[
+                {"symbol": s, "last_date": d, "age_trading_days": a} for s, d, a in stale
+            ],
         )
 
     receipt = {
@@ -2257,6 +2280,14 @@ def _daily_append_impl(
 
     result = {
         "status": "ok",
+        # config#2685: always True on a normal return — the only raises
+        # between here and `return result` (error-rate gate, freshness
+        # scan) either abort the function (target date write genuinely
+        # failed) or, for an UNRELATED stale symbol elsewhere in the
+        # universe, raise UniverseFreshnessViolation instead of returning
+        # — see that class + _self_heal_missing_universe_days for the
+        # caller-side distinction this field exists to support.
+        "target_date_write_ok": True,
         "date": date_str,
         "tickers_appended": n_ok,
         "tickers_partial": n_partial,
