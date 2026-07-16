@@ -42,6 +42,16 @@ permissions:
 
 jobs:
   label:
+    # The `labeled` trigger type fires for ANY label added to the PR, not
+    # just `canary:replay` — without this guard, an unrelated label (e.g.
+    # a triage bot applying `source:groom` moments after pushing the PR's
+    # head commit) fires a SECOND, near-simultaneous workflow run for the
+    # same SHA alongside the `synchronize`-triggered run already in
+    # flight. Both reach the `canary` job and race the dispatcher's
+    # per-run-token dedupe, so one of them gets declined with
+    # `concurrent_skip` and (pre-fix) hard-failed the check even though
+    # the other run's dispatch was legitimate (alpha-engine-config#2570).
+    if: github.event.action != 'labeled' || github.event.label.name == 'canary:replay'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -111,11 +121,23 @@ jobs:
           cat "$RESP"
 
           LAUNCHED=$(jq -r '.launched' "$RESP")
+          REASON=$(jq -r '.reason' "$RESP")
           if [ "$LAUNCHED" != "true" ]; then
-            echo "::error::canary-replay-dispatcher declined to launch: $(cat "$RESP")"
-            exit 1
+            if [ "$REASON" = "concurrent_skip" ]; then
+              # Another dispatch for this exact PR+SHA is already in flight
+              # (e.g. a duplicate/near-simultaneous webhook delivery) — the
+              # dispatcher's own dedupe is authoritative that a run WILL
+              # produce this run_token's marker, so poll for it below
+              # instead of hard-failing a check the other run is already
+              # servicing.
+              echo "canary already in flight for this PR+SHA (reason=concurrent_skip) — polling its marker instead of failing"
+            else
+              echo "::error::canary-replay-dispatcher declined to launch: $(cat "$RESP")"
+              exit 1
+            fi
           fi
-          MARKER_KEY=$(jq -r '.marker_key' "$RESP")
+          RUN_TOKEN=$(jq -r '.run_token' "$RESP")
+          MARKER_KEY="tmp/canary/${RUN_TOKEN}.json"
           echo "marker_key=${MARKER_KEY}" >> "$GITHUB_OUTPUT"
 
       - name: Poll for completion marker
