@@ -10,4 +10,11 @@ boto3>=1.34.0
 # Lambda sends no Telegram of its own (the synchronous GHA caller reads the
 # return value directly; see index.py docstring).
 nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.106.0
-krepis>=0.10.2
+# v0.13.1 is the first version whose ec2_spot.launch() treats
+# MaxSpotInstanceCountExceeded (the account-wide spot request quota) as
+# fallback-eligible instead of a hard SpotLaunchError — this Lambda's own
+# 2026-07-15 launch_failed incident (alpha-engine-config#2687) was exactly
+# this gap: hitting the spot count limit killed the dispatch instead of
+# falling back to on-demand. This pin GATES on krepis v0.13.1 being
+# published to PyPI (nousergon/krepis#29 must merge first).
+krepis>=0.13.1
