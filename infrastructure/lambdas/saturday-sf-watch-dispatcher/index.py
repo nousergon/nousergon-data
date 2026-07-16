@@ -189,20 +189,18 @@ PIPELINES: dict[str, dict[str, object]] = {
             # "ChronicGapSelfHeal" removed — that state (+ its liveness-poll
             # loop) was deleted from step_function_daily.json entirely, moved
             # to the standalone --daily-heal job which is NOT part of this
-            # pipeline at all. NOTE (pre-existing drift, NOT introduced by
-            # this change, found while touching this dict): "WaitForMorningEnrich"
-            # / "WaitForMorningArcticAppend" / "MorningEnrich" /
-            # "MorningArcticAppend" are ALSO already stale — those on-trading
-            # state names were retired by the config#1767 Phase-2 spot
-            # decoupling (replaced by PollMorningEnrichSpot/
-            # PollMorningArcticAppendSpot and LaunchMorningEnrichSpot/
-            # LaunchMorningArcticAppendSpot respectively) — left AS-IS here,
-            # out of this PR's scope; tracked as alpha-engine-config-I2745.
+            # pipeline at all.
+            # alpha-engine-config-I2745 (2026-07-16): "WaitForMorningEnrich" /
+            # "WaitForMorningArcticAppend" / "MorningEnrich" / "MorningArcticAppend"
+            # were stale — those on-trading state names were retired by the
+            # config#1767 Phase-2 spot decoupling and replaced with the Spot-based
+            # polling/launch states below. Updated to the current step_function_daily.json
+            # state names (verified to exist and be correct SSM poll/spot-launch shape).
             "poll_states": frozenset(
-                {"WaitForMorningEnrich", "WaitForMorningArcticAppend"}
+                {"PollMorningEnrichSpot", "PollMorningArcticAppendSpot"}
             ),
             "data_task_states": frozenset(
-                {"MorningEnrich", "MorningArcticAppend"}
+                {"LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"}
             ),
             "veto_states": frozenset({"RunMorningPlanner", "RunDaemon"}),
         },
