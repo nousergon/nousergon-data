@@ -651,6 +651,45 @@ class TestEODSFTopLevelFieldsClosed:
             "health_check_degraded",
             "substrate_health_check_degraded_notify",
             "substrate_health_check_degraded_notify_error",
+            # config-I2702 (2026-07-15): closed-loop self-heal for post-close
+            # data gaps. "run_date" is a PRE-EXISTING top-level input field
+            # (used since day one, embedded inside States.Format() command
+            # strings like EODReconcile's) that only now gets a BARE `"$.
+            # run_date"` reference — the regex above only matches strings that
+            # START with `$.`, and Lambda Payload fields
+            # (ProbeEODReconcilePrecondition, HealReProbe, HealDispatchReplay's
+            # Input) are the first place it's referenced that way.
+            "run_date",
+            # ProbeEODReconcilePrecondition (deliverable #1): fresh verify-by-
+            # artifact read of the macro-freshness sentinel, replacing the old
+            # $.data_spot_error flag test at CheckSkipEODReconcile. Re-emitted
+            # (overwritten) by HealReProbe inside the heal loop below.
+            "precondition_probe",
+            # SetDegradedFlag (deliverable #4): persistent flag read by
+            # CheckDegradedOutcome (after the StopTradingInstance cost-guard
+            # tail) to route to the distinct DegradedSucceeded terminal instead
+            # of NormalSucceeded.
+            "degraded_summary",
+            # The closed self-heal loop (deliverable #3): InitHealLoop /
+            # HealLoopIncrement carry the attempts counter; each heal
+            # iteration's data-spot dispatch + poll emits its own launch/poll/
+            # error ResultPath (mirrors the pre-existing postmarket_launch /
+            # postmarket_poll / data_spot_error naming, prefixed heal_ to keep
+            # the original phase's fields untouched); HealDispatchReplay emits
+            # the auto-replay StartExecution result (or its Catch error); the
+            # three outcome notifications (converged / replay-dispatch-failed /
+            # non-convergent) each emit their own SNS ResultPath.
+            "heal_loop",
+            "heal_postmarket_launch",
+            "heal_postmarket_poll",
+            "heal_arctic_launch",
+            "heal_arctic_poll",
+            "heal_error",
+            "heal_replay_dispatch",
+            "heal_replay_dispatch_error",
+            "heal_replay_dispatch_failed_notify",
+            "heal_converged_notify",
+            "heal_nonconvergent_notify",
         }
     )
 
