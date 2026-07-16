@@ -117,6 +117,13 @@ _LIVENESS_POLLER_KEYS = frozenset({
 })
 
 # Weekday SF — alpha-engine-predictor Lambdas + the ssm-liveness-poller
+# alpha-engine-config-I2717/I2722 (2026-07-16): PredictorHealthCheck,
+# PredictorDriftCheck, and the WaitForChronicGap liveness-poll entry were
+# REMOVED from this SF entirely (heal -> standalone daily job; health/drift
+# checks -> their own direct EventBridge triggers, see
+# infrastructure/cloudformation/alpha-engine-orchestration.yaml). Removing
+# their registry entries here is the deliberate drift-direction check this
+# registry pattern enforces (test_no_registry_entry_missing_from_sf below).
 _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "DeployDriftCheck": frozenset({"action"}),
     # config#1430: NYSE trading-day gate, moved OFF the box into the
@@ -127,20 +134,15 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "CheckPredictorCoverage": frozenset({"action"}),
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),
     "RecheckCoverage": frozenset({"action"}),
-    "PredictorHealthCheck": frozenset({"action"}),
-    # config#1853: daily prediction-health producer — writes
-    # predictor/metrics/drift_{trading_day}.json every weekday.
-    "PredictorDriftCheck": frozenset({"action", "date.$"}),
     # config#1811: liveness-aware poll loops that stayed on the trading box
-    # (CodeFreshnessGate, ChronicGapSelfHeal, RunMorningPlanner) share the
-    # ssm-liveness-poller payload contract. WaitForMorningEnrich/
-    # WaitForMorningArcticAppend do NOT appear here — config#1767 (Phase 2)
-    # relocated those two onto independent ephemeral spot boxes whose own
-    # PollMorningEnrichSpot/PollMorningArcticAppendSpot poll directly via
-    # ssm:getCommandInvocation (a Task, not a lambda:invoke Payload), so they
-    # are out of scope for this Lambda-Payload registry.
+    # (CodeFreshnessGate, RunMorningPlanner) share the ssm-liveness-poller
+    # payload contract. WaitForMorningEnrich/WaitForMorningArcticAppend do NOT
+    # appear here — config#1767 (Phase 2) relocated those two onto independent
+    # ephemeral spot boxes whose own PollMorningEnrichSpot/
+    # PollMorningArcticAppendSpot poll directly via ssm:getCommandInvocation (a
+    # Task, not a lambda:invoke Payload), so they are out of scope for this
+    # Lambda-Payload registry.
     "WaitForCodeFreshness": _LIVENESS_POLLER_KEYS,
-    "WaitForChronicGap": _LIVENESS_POLLER_KEYS,
     "WaitForMorningPlanner": _LIVENESS_POLLER_KEYS,
     # config#1767 (Phase 2): the data phase (enrich + Arctic append) was relocated
     # onto two independent ephemeral spot boxes via the alpha-engine-data-spot-
