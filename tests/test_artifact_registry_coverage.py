@@ -95,6 +95,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/migrate_universe_feature_order.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
+    # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for
+    # the config#1943 Leg-3 backfill (data#712). Same pattern as prune_delisted_tickers.py's
+    # builders/prune_audit/ write directly above: an EVENT-DRIVEN, operator-triggered audit
+    # of a one-off/occasional manual run, NOT a periodic freshness-SLA artifact — there is no
+    # cadence to monitor (this builder has no scheduled trigger; Brian runs it by hand), so
+    # per that established precedent it is grandfathered out of ARTIFACT_REGISTRY.yaml (no
+    # freshness row, not even in grandfathered_paths — mirrors prune_delisted_tickers.py's own
+    # audit, which also carries no registry row), pinned here only to force operator review of
+    # the new PUT site.
+    "builders/backfill_delisted_history.py": 1,
     "collectors/alternative.py": 3,
     # data/sub_industry_map.json + reference/price_cache/sub_industry_map.json
     # (config#934 narrow slice, 2026-07-09): additive GICS sub-industry capture
