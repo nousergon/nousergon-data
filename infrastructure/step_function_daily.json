@@ -137,8 +137,25 @@
       "Comment": "Hard-fail when the drift probe reports has_drift=true. Surfaces deploy lag loudly instead of silently running new SF definitions against stale Lambda images (or vice versa).",
       "Choices": [
         {
-          "Variable": "$.drift_result.Payload.has_drift",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.drift_result.Payload.has_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.drift_result.Payload.has_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — an unguarded dereference of an absent has_drift threw States.Runtime, ending the run FAILED without HandleFailure context (config#2275 incident class).",
+          "Next": "HandleFailure"
+        },
+        {
+          "Not": {
+            "Variable": "$.drift_result.Payload.has_drift",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: a drift-check payload WITHOUT has_drift means the gate could not check — fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness.",
           "Next": "HandleFailure"
         }
       ],
@@ -185,9 +202,26 @@
       "Comment": "Holiday/weekend (is_trading_day=false) -> skip without ever booting the box. Trading day or any non-false result -> proceed. Fail-open to trading matches the prior fail-soft posture: missing a real trading day is worse than a wasted holiday boot.",
       "Choices": [
         {
-          "Variable": "$.trading_day_gate.Payload.is_trading_day",
-          "BooleanEquals": false,
+          "And": [
+            {
+              "Variable": "$.trading_day_gate.Payload.is_trading_day",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.trading_day_gate.Payload.is_trading_day",
+              "BooleanEquals": false
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
           "Next": "NotifyHolidaySkip"
+        },
+        {
+          "Not": {
+            "Variable": "$.trading_day_gate.Payload.is_trading_day",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: a gate payload WITHOUT is_trading_day is a contract violation from our own Lambda — fail CLOSED and loud (HandleFailure) rather than silently proceeding to trade (or silently skipping) on an unverifiable trading-day verdict.",
+          "Next": "HandleFailure"
         }
       ],
       "Default": "StartExecutorEC2"
@@ -596,9 +630,26 @@
       "Comment": "If buy_candidates have unscored tickers, re-invoke the predictor with --tickers. Otherwise advance to the morning-planner skip-gate. alpha-engine-config-I2722 (2026-07-16): PredictorHealthCheck was removed from this SF and re-homed onto its own direct EventBridge trigger (13:40 UTC weekdays) — see infrastructure/cloudformation/alpha-engine-orchestration.yaml PredictorHealthCheckTrigger.",
       "Choices": [
         {
-          "Variable": "$.coverage_result.Payload.has_gap",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.coverage_result.Payload.has_gap",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.coverage_result.Payload.has_gap",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
           "Next": "ReinvokePredictor"
+        },
+        {
+          "Not": {
+            "Variable": "$.coverage_result.Payload.has_gap",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: a coverage payload WITHOUT has_gap means prediction coverage is unverifiable — fail CLOSED and loud (HandleFailure) rather than trading on unknown coverage.",
+          "Next": "HandleFailure"
         }
       ],
       "Default": "CheckSkipMorningPlanner"
@@ -677,8 +728,25 @@
       "Comment": "After one re-invocation attempt, either coverage is complete (proceed) or we have a deeper problem (fail). No further retry loop — prevents runaway invocations if a ticker is un-scorable by the model. alpha-engine-config-I2722 (2026-07-16): the Default target moved from PredictorHealthCheck (removed from this SF) to the morning-planner skip-gate — see CoverageGapChoice's comment.",
       "Choices": [
         {
-          "Variable": "$.coverage_recheck_result.Payload.has_gap",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.coverage_recheck_result.Payload.has_gap",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.coverage_recheck_result.Payload.has_gap",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
+          "Next": "HandleFailure"
+        },
+        {
+          "Not": {
+            "Variable": "$.coverage_recheck_result.Payload.has_gap",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: recheck payload WITHOUT has_gap — same fail-closed routing as a confirmed gap.",
           "Next": "HandleFailure"
         }
       ],
@@ -1046,9 +1114,26 @@
       "Comment": "launched:true -> poll; launched:false (DATA_SPOT_DISPATCH_ENABLED kill-switch) -> skip the whole data phase to the continue path.",
       "Choices": [
         {
-          "Variable": "$.morning_enrich_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.morning_enrich_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.morning_enrich_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
           "Next": "PollMorningEnrichSpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.morning_enrich_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: a dispatcher payload WITHOUT data_spot.launched means the morning-data launch is unverifiable — route into the existing fail-open-but-LOUD data-spot failure notifier (config#1767 #4: a data-spot failure must never block daemon start), not a silent not-launched skip and not a HALT.",
+          "Next": "ExtractDataSpotError"
         }
       ],
       "Default": "CheckSkipPredictorInference"
@@ -1204,9 +1289,26 @@
       "Comment": "launched:true -> poll; launched:false kill-switch -> continue.",
       "Choices": [
         {
-          "Variable": "$.arctic_append_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.arctic_append_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.arctic_append_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
           "Next": "PollMorningArcticAppendSpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.arctic_append_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: malformed dispatcher payload — same fail-open-but-loud routing as CheckMorningEnrichSpotLaunched (config#1767 #4).",
+          "Next": "ExtractDataSpotError"
         }
       ],
       "Default": "CheckSkipPredictorInference"
