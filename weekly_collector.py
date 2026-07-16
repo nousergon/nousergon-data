@@ -1021,6 +1021,122 @@ _UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S = 1500
 _UNIVERSE_GAP_HEAL_LOOKBACK_TD = 5
 _UNIVERSE_GAP_HEAL_MAX_PER_RUN = 1
 
+# config#2672 (Brian-ratified binding design, 2026-07-15): a durable
+# desired-state ledger so a fallback-quality (yfinance-basis) trading day can
+# NEVER age out unhealed — the bug this issue exists to fix. The sliding
+# -window detectors above (``_detect_missing_universe_days``,
+# ``_detect_fallback_quality_universe_days``) only look back
+# ``lookback_trading_days`` sessions; a day that misses every heal attempt
+# within that window (e.g. repeated Polygon rate-limiting) silently ages out
+# and is never revisited again. This ledger removes that ceiling structurally
+# rather than widening the window (which would just move the ceiling, not
+# remove it): every successful yfinance-basis (fallback-quality) EOD write
+# marks its date here; every successful polygon-corrected write (morning
+# MorningArcticAppend, and the gap-heal path itself) clears it. The reader
+# (``_self_heal_missing_universe_days``) UNIONS this ledger with both
+# existing sliding-window detectors — belt-and-braces: a ledger read/write
+# failure degrades to today's in-window-only behavior, never below it.
+#
+# Single small JSON object keyed by trading_day, touched at most twice/day —
+# plain S3 read-modify-write is adequate (mirrors ARTIFACT_REGISTRY
+# conventions); no DynamoDB needed. Best-effort fail-soft on the trading
+# path: a ledger write failure must NEVER block or crash the daemon-path
+# append (wrapped in try/except, log-and-continue at every call site) — but
+# its absence is self-evident, since the sliding-window detectors above still
+# independently catch in-window days regardless of ledger health.
+_PENDING_UPGRADES_LEDGER_BUCKET = "alpha-engine-research"
+_PENDING_UPGRADES_LEDGER_KEY = "_data_quality/pending_upgrades.json"
+
+
+def _load_pending_upgrades_ledger(
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> dict:
+    """Read the pending-upgrades ledger — ``{trading_day: {reason, detected_at}}``.
+
+    Best-effort: a missing object (first-ever write) or any read/parse
+    failure returns ``{}`` so the reader degrades to sliding-window-only
+    detection rather than raising — this ledger is a belt-and-braces
+    ADDITION to the existing detectors, never a replacement dependency.
+    """
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        doc = json.loads(obj["Body"].read())
+        return doc if isinstance(doc, dict) else {}
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("NoSuchKey", "404"):
+            logger.warning("pending-upgrades ledger read failed (%s) — "
+                           "degrading to sliding-window-only detection.", exc)
+        return {}
+    except Exception as exc:  # noqa: BLE001 — best-effort read, never blocks the reader
+        logger.warning("pending-upgrades ledger read failed (%s) — "
+                       "degrading to sliding-window-only detection.", exc)
+        return {}
+
+
+def _write_pending_upgrades_ledger(
+    doc: dict,
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> None:
+    """Best-effort PUT of the full ledger document. Never raises — a write
+    failure is logged and swallowed (fail-soft on the trading path)."""
+    try:
+        s3 = boto3.client("s3")
+        s3.put_object(
+            Bucket=bucket, Key=key,
+            Body=json.dumps(doc, sort_keys=True, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-soft: never blocks the trading-path append
+        logger.warning("pending-upgrades ledger write failed (%s) — "
+                       "in-window sliding-window detection remains the backstop.", exc)
+
+
+def _mark_pending_upgrade(
+    trading_day: str,
+    reason: str = "fallback_quality",
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> None:
+    """Read-modify-write: mark ``trading_day`` as needing the Polygon-corrected
+    upgrade. Called on every successful yfinance-basis (fallback-quality) EOD
+    write (:func:`_run_daily_arctic_append`). Idempotent (overwrites any
+    existing entry for the same day) and fail-soft — never raises."""
+    try:
+        doc = _load_pending_upgrades_ledger(bucket, key)
+        doc[trading_day] = {
+            "reason": reason,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_pending_upgrades_ledger(doc, bucket, key)
+        logger.info("pending-upgrades ledger: marked %s (%s).", trading_day, reason)
+    except Exception as exc:  # noqa: BLE001 — fail-soft: never blocks the daemon-path append
+        logger.warning("pending-upgrades ledger: failed to mark %s (%s) — non-blocking.",
+                       trading_day, exc)
+
+
+def _clear_pending_upgrade(
+    trading_day: str,
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> None:
+    """Read-modify-write: clear ``trading_day`` from the ledger on a
+    successful Polygon-corrected write (the morning load-bearing append, or
+    the gap-heal path itself). A day absent from the ledger is a no-op
+    (nothing to clear). Fail-soft — never raises."""
+    try:
+        doc = _load_pending_upgrades_ledger(bucket, key)
+        if trading_day in doc:
+            del doc[trading_day]
+            _write_pending_upgrades_ledger(doc, bucket, key)
+            logger.info("pending-upgrades ledger: cleared %s.", trading_day)
+    except Exception as exc:  # noqa: BLE001 — fail-soft: never blocks the daemon-path append
+        logger.warning("pending-upgrades ledger: failed to clear %s (%s) — non-blocking.",
+                       trading_day, exc)
+
 
 class _HardTimeout(BaseException):
     """Raised by :func:`_hard_timeout` on SIGALRM expiry. Subclasses
@@ -1721,6 +1837,18 @@ def _self_heal_missing_universe_days(
         limit) — the day is present, so nothing else ever revisits it
         (see :func:`_detect_fallback_quality_universe_days`).
 
+    config#2672: the two detectors above only scan the last
+    ``lookback_trading_days`` sessions — a day that misses healing on every
+    attempt within that sliding window silently ages out and is never
+    revisited again (the bug this issue exists to fix). The durable
+    ``_data_quality/pending_upgrades.json`` ledger (best-effort marked by
+    every yfinance-basis EOD write, cleared by every polygon-corrected write)
+    is UNIONED in here as a third source — belt-and-braces: a ledger read
+    failure degrades to the two window detectors' existing (in-window)
+    coverage, never below it. A ledger day already covered by the window scan
+    is de-duplicated; a ledger day OUTSIDE the window (the actual case this
+    ledger exists for) is still healed.
+
     For each day to heal:
       1. Resolve that day's constituents via ``load_constituents_for_run_date``
          (run_date-direct, #468-correct — never the latest_weekly pointer),
@@ -1744,6 +1872,7 @@ def _self_heal_missing_universe_days(
         "max_per_run": max_heal_days,
         "missing_days": [],
         "fallback_quality_days": [],
+        "ledger_days": [],
         "healed_days": [],
         "deferred_days": [],
         "errors": [],
@@ -1756,14 +1885,29 @@ def _self_heal_missing_universe_days(
     summary["missing_days"] = missing
     summary["fallback_quality_days"] = fallback_quality
 
-    # Mutually exclusive by construction (fallback-quality requires an
-    # existing row; missing requires none) — de-dup is defensive only.
-    # Missing days are the more severe gap, so they get healed first.
-    combined = missing + [d for d in fallback_quality if d not in missing]
+    # config#2672: the durable ledger, newest-first — the third (unbounded
+    # -horizon) source. Best-effort read: a ledger failure returns {} and this
+    # degrades to the two window detectors above, never below their coverage.
+    ledger = _load_pending_upgrades_ledger(bucket)
+    ledger_days = sorted(ledger.keys(), reverse=True)
+    summary["ledger_days"] = ledger_days
+
+    # Mutually exclusive by construction between missing/fallback_quality
+    # (fallback-quality requires an existing row; missing requires none) — de
+    # -dup there is defensive only. The ledger is NOT mutually exclusive with
+    # either (a day already caught by the window scan is also very likely
+    # ledger-marked) — de-dup against both. Missing days are the more severe
+    # gap, so they get healed first; ledger-only days (already outside the
+    # window) come last since the window-scan days are the fresher signal.
+    combined = (
+        missing
+        + [d for d in fallback_quality if d not in missing]
+        + [d for d in ledger_days if d not in missing and d not in fallback_quality]
+    )
     if not combined:
         logger.info(
-            "universe-gap heal: no prior trading-day gaps or fallback-quality "
-            "rows before %s.",
+            "universe-gap heal: no prior trading-day gaps, fallback-quality "
+            "rows, or ledger-pending upgrades before %s.",
             target_date,
         )
         return summary
@@ -1772,9 +1916,9 @@ def _self_heal_missing_universe_days(
     summary["deferred_days"] = combined[max_heal_days:]
     logger.warning(
         "universe-gap heal: %d day(s) need healing before %s — %d missing (%s), "
-        "%d fallback-quality (%s); healing %s this run%s.",
+        "%d fallback-quality (%s), %d ledger-pending (%s); healing %s this run%s.",
         len(combined), target_date, len(missing), missing,
-        len(fallback_quality), fallback_quality, to_heal,
+        len(fallback_quality), fallback_quality, len(ledger_days), ledger_days, to_heal,
         f", deferring {summary['deferred_days']} to subsequent runs" if summary["deferred_days"] else "",
     )
 
@@ -1787,7 +1931,12 @@ def _self_heal_missing_universe_days(
     s3 = boto3.client("s3")
 
     for day in to_heal:
-        kind = "missing" if day in missing else "fallback_quality"
+        if day in missing:
+            kind = "missing"
+        elif day in fallback_quality:
+            kind = "fallback_quality"
+        else:
+            kind = "ledger"  # config#2672: aged out of both sliding windows, ledger-only
         try:
             try:
                 tickers_set, weekly_date = load_constituents_for_run_date(
@@ -1841,6 +1990,14 @@ def _self_heal_missing_universe_days(
                     "universe-gap heal: backfilled %s (%s, %d tickers, status=%s).",
                     day, kind, len(tickers), status,
                 )
+                # config#2672: this path always writes the polygon-corrected
+                # (auto-source) row (see daily_closes.collect(source="auto")
+                # above) — clear the ledger entry, if any, on every successful
+                # heal regardless of `kind` (a day can be ledger-marked AND
+                # independently caught by the window scan). Fail-soft, never
+                # blocks this already-successful heal.
+                if not dry_run:
+                    _clear_pending_upgrade(day, bucket)
             else:
                 summary["errors"].append(
                     {"date": day, "kind": kind, "reason": f"daily_append status={status}"}
@@ -2025,6 +2182,12 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         # verdict so a write failure halts the pipeline (predictor reads next).
         _status = arctic_result.get("status", "unknown")
         results["status"] = "ok" if _status in ("ok", "ok_dry_run") else "failed"
+        if results["status"] == "ok" and not dry_run:
+            # config#2672: this IS the polygon-corrected write — clear
+            # target_date from the pending-upgrades ledger on success (a
+            # no-op if it was never marked). Fail-soft, never blocks the
+            # already-successful load-bearing append.
+            _clear_pending_upgrade(target_date, bucket)
     except Exception as e:
         logger.exception("ArcticDB daily_append (arctic-append state) failed for %s", target_date)
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
@@ -2539,6 +2702,12 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         # verdict so a write failure halts the pipeline (reconcile reads next).
         _status = arctic_result.get("status", "unknown")
         results["status"] = "ok" if _status in ("ok", "ok_dry_run") else "failed"
+        if results["status"] == "ok" and not dry_run:
+            # config#2672: EOD is ALWAYS the yfinance-basis (fallback-quality)
+            # write — mark run_date pending the next morning's polygon
+            # -corrected overwrite. Idempotent (re-marking is harmless) and
+            # fail-soft; never blocks this already-successful append.
+            _mark_pending_upgrade(run_date, "fallback_quality", bucket)
     except Exception as e:
         logger.exception("ArcticDB daily_append (daily-arctic-append state) failed for %s", run_date)
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
