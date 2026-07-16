@@ -48,7 +48,11 @@ _CHAIN = [
     # before LaunchPostMarketDataSpot — pinned separately in
     # TestEODDataSpotRetryBudget (test_sf_data_spot_relocation_wiring.py).
     ("CheckSkipPostMarketData", "InitDataSpotRetryCounter", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
-    ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "CheckSkipEODReconcile"),
+    # config-I2702 (2026-07-15): the skip edge now lands on
+    # ProbeEODReconcilePrecondition (the new verify-by-artifact precondition
+    # probe), not directly on CheckSkipEODReconcile — every path into the
+    # reconcile gate, skip or not, must probe fresh.
+    ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "ProbeEODReconcilePrecondition"),
     ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckSkipDailySubstrateHealthCheck"),
     ("CheckSkipDailySubstrateHealthCheck", "DailySubstrateHealthCheck", "skip_daily_substrate_health_check", "StopTradingInstance"),
 ]
@@ -128,9 +132,13 @@ class TestEntryEdgesRouteThroughGates:
             assert gone not in states, f"{gone} should have moved to the spot dispatcher"
 
     def test_snapshot_success_enters_reconcile_gate(self, states):
+        # config-I2702: CaptureSnapshot's success now enters the new
+        # verify-by-artifact precondition probe, which itself feeds
+        # CheckSkipEODReconcile (pinned separately below).
         succ = [c["Next"] for c in states["CheckSnapshotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckSkipEODReconcile"]
+        assert succ == ["ProbeEODReconcilePrecondition"]
+        assert states["ProbeEODReconcilePrecondition"]["Next"] == "CheckSkipEODReconcile"
 
     def test_eod_success_enters_substrate_gate(self, states):
         succ = [c["Next"] for c in states["CheckEODStatus"]["Choices"]
@@ -174,14 +182,25 @@ class TestPaths:
         tasks = [c[1] for c in _CHAIN]
         idxs = [order.index(t) for t in tasks]
         assert idxs == sorted(idxs), order
-        assert order[-1] == "StopTradingInstance"
+        # config-I2702 deliverable #4: StopTradingInstance no longer
+        # terminates the execution directly — a fully-green run (no gap ever
+        # detected, $.degraded_summary never set) routes through
+        # CheckDegradedOutcome to the ordinary NormalSucceeded terminal.
+        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
 
     def test_full_skip_still_stops_the_instance(self, states):
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN})
         for task in (c[1] for c in _CHAIN):
             assert task not in order, f"{task} ran despite skip flag"
-        # Cost-guard cleanup must ALWAYS run.
-        assert order == ["StopTradingInstance"]
+        # Cost-guard cleanup must ALWAYS run, then reach the normal terminal.
+        # ProbeEODReconcilePrecondition still runs even on a fully-skipped
+        # path (default pipeline_role="operator-replay" here) — same
+        # unconditional-probe behavior pinned in
+        # test_operator_replay_still_honors_skips below.
+        assert order == [
+            "ProbeEODReconcilePrecondition", "StopTradingInstance",
+            "CheckDegradedOutcome", "NormalSucceeded",
+        ]
 
     def test_skip_refresh_resumes_at_data_spot(self, states):
         # config#1549: skipping only the deploy refresh (e.g. an operator rerun
@@ -192,7 +211,7 @@ class TestPaths:
         assert "RefreshExecutorDeploy" not in order
         assert order[0] == "InitDataSpotRetryCounter"
         assert order[1] == "LaunchPostMarketDataSpot"
-        assert order[-1] == "StopTradingInstance"
+        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
 
     def test_skip_data_phase_resumes_at_snapshot(self, states):
         # config#1767: skip_post_market_data now skips the ENTIRE spot data phase
@@ -202,7 +221,7 @@ class TestPaths:
         assert "LaunchPostMarketDataSpot" not in order
         assert "LaunchPostMarketArcticAppendSpot" not in order
         assert order[0] == "CaptureSnapshot"
-        assert order[-1] == "StopTradingInstance"
+        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
 
     def test_happy_path_runs_data_phase_on_spot(self, states):
         # config#1767: the EOD data phase runs as spot-launch states, in order,
@@ -223,7 +242,7 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role="eod")
         for task in (c[1] for c in _CHAIN):
             assert task in order, f"{task} was skipped despite non-replay role"
-        assert order[-1] == "StopTradingInstance"
+        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
 
     def test_all_skips_inert_when_role_absent(self, states):
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role=None)
@@ -236,6 +255,13 @@ class TestSkipFlagsInertOutsideOperatorReplay:
             skip_flags={c[2] for c in _CHAIN},
             pipeline_role="operator-replay",
         )
-        assert order == ["StopTradingInstance"]
+        # config-I2702: even a fully-skipped operator-replay run still probes
+        # the precondition fresh (ProbeEODReconcilePrecondition sits between
+        # the CheckSkipCaptureSnapshot skip edge and CheckSkipEODReconcile
+        # unconditionally) before its own skip_eod_reconcile flag takes over.
+        assert order == [
+            "ProbeEODReconcilePrecondition", "StopTradingInstance",
+            "CheckDegradedOutcome", "NormalSucceeded",
+        ]
 
     _walk = TestPaths._walk

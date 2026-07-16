@@ -270,3 +270,88 @@ class TestExpectedTickersScoping:
                 expected_tickers=["ONLY_IN_EXPECTED"],
             )
         s3.put_object.assert_not_called()
+
+
+class TestBenchmarkTickerNeverExcludedFromScan:
+    """config-I2703 (2026-07-15 P0): SPY (a hard-pinned `_UNIVERSE_EXTRA`
+    benchmark member, features/compute.py) is in `_SKIP_TICKERS` for an
+    UNRELATED reason (prune-protection — see tests/test_spy_universe_member.py
+    section B). Before this fix, the `expected_set` comprehension here
+    filtered on bare `_SKIP_TICKERS` membership with no `_UNIVERSE_EXTRA`
+    carve-out, so SPY was UNCONDITIONALLY excluded from this freshness scan
+    on every single run — logged identically to a genuine "S&P churn-out
+    straggler, awaiting prune" (e.g. SATS). A silent SPY write failure would
+    never have tripped this gate: the executor's eod_reconcile hard-fails
+    if ArcticDB has no SPY close for the day (`_spy_close`, by design,
+    correct, do-not-soften), but nothing upstream would have caught the gap
+    earlier or paged on it. These tests pin that SPY is now always IN the
+    scan's checked set, same as any other hard-pinned universe member.
+    """
+
+    def test_spy_included_in_checked_set_when_fresh(self):
+        """SPY present + fresh in arctic, and passed in expected_tickers
+        (as every real caller does via the macro-daily-tickers union) →
+        SPY must be counted in n_symbols_checked, not silently excluded."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "MSFT": _today_str(1),
+            "SPY": _today_str(0),
+        })
+
+        receipt = _scan_universe_and_emit_freshness_receipt(
+            s3, "test-bucket", lib,
+            expected_tickers=["AAPL", "MSFT", "SPY"],
+        )
+
+        assert receipt["all_fresh"] is True
+        assert receipt["n_symbols_checked"] == 3, (
+            "SPY must be included in the checked set, not treated as an "
+            "excluded churn-out straggler"
+        )
+
+    def test_stale_spy_trips_the_gate(self):
+        """The actual safety-net proof: SPY genuinely stale (e.g. its
+        append silently stopped) MUST raise, naming SPY — the exact class
+        of incident this scan exists to catch (2026-04-21 ASGN/MOH class,
+        applied to the benchmark itself)."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "SPY": _today_str(_STALE_OFFSET_DAYS),
+        })
+
+        with pytest.raises(RuntimeError, match="SPY"):
+            _scan_universe_and_emit_freshness_receipt(
+                s3, "test-bucket", lib,
+                expected_tickers=["AAPL", "SPY"],
+            )
+        s3.put_object.assert_not_called()
+
+    def test_spy_not_logged_as_excluded_straggler(self, caplog):
+        """SPY must never appear in the 'excluding ... churn-out stragglers'
+        INFO log — that log line is reserved for genuine index churn-outs
+        (e.g. SATS), and SPY appearing there is exactly what masked the
+        2026-07-15 incident (operators read the log and assumed SPY's
+        absence was an intentional, benign prune-awaiting exclusion)."""
+        import logging
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "SPY": _today_str(0),
+            "SATS": _today_str(8),  # genuine churn-out straggler, correctly excluded
+        })
+
+        with caplog.at_level(logging.INFO, logger="builders.daily_append"):
+            _scan_universe_and_emit_freshness_receipt(
+                s3, "test-bucket", lib,
+                expected_tickers=["AAPL", "SPY"],
+            )
+
+        excluded_logs = [r for r in caplog.records if "excluding" in r.message]
+        assert excluded_logs, "SATS should still be logged as an excluded straggler"
+        assert "SPY" not in excluded_logs[0].message, (
+            f"SPY must never appear in the excluded-stragglers log: "
+            f"{excluded_logs[0].message}"
+        )
+        assert "SATS" in excluded_logs[0].message
