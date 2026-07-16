@@ -187,7 +187,12 @@ def test_code_freshness_gate_front_loads_the_drift_check(states):
     assert "CODE-STALE-AFTER-HEAL" in cmds and "exit 1" in cmds, (
         "persistent drift after the one self-heal must exit non-zero (fail loud)"
     )
-    assert "ast.parse" in cmds, "executor syntax gate must run (broken main may not proceed)"
+    assert "import executor.main" in cmds and "executor.daemon" in cmds and "executor.eod_reconcile" in cmds, (
+        "executor import smoke test must run (broken main or any transitive "
+        "import may not proceed; config#2353 upgraded this from an ast.parse-only "
+        "syntax check to a real import so ImportErrors in non-entrypoint modules "
+        "are caught too)"
+    )
 
     fresh = [
         c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
