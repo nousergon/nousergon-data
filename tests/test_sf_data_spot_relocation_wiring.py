@@ -147,7 +147,11 @@ class TestWeekdayFailureIsolation:
     """Deliverable #4 (LOAD-BEARING): a data-spot failure must NOT block daemon
     start — it routes to the continue path, never HandleFailure."""
 
-    _CONTINUE = "CheckSkipChronicGapHeal"
+    # alpha-engine-config-I2717 (2026-07-16): the continue path used to be the
+    # CheckSkipChronicGapHeal gate; that gate (and the heal behind it) was
+    # removed entirely — the continue path now rejoins directly at
+    # CheckSkipPredictorInference.
+    _CONTINUE = "CheckSkipPredictorInference"
 
     def test_launch_catch_is_fail_open(self, daily):
         for name in ("LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"):
@@ -596,6 +600,29 @@ class TestDispatcherLambdaAndIam:
         # The enrich workload must still skip the inline heal + inline append.
         assert "--skip-chronic-heal" in src
         assert "--skip-arctic-append" in src
+
+    def test_daily_heal_workload_present(self):
+        # alpha-engine-config-I2717 (2026-07-16): the standalone daily-heal
+        # workload, invoked directly by its own EventBridge rule (NOT by
+        # either SF — see infrastructure/cloudformation/alpha-engine-
+        # orchestration.yaml DailyHealTrigger). Bundles the universe-gap
+        # self-heal (formerly the head of --morning-arctic-append) and the
+        # chronic-polygon-gap heal (formerly the weekday SF's own
+        # ChronicGapSelfHeal state) into one weekly_collector.py invocation.
+        src = (_DISPATCHER / "index.py").read_text()
+        assert '"daily-heal":' in src
+        assert "python weekly_collector.py --daily-heal" in src
+
+    def test_daily_heal_workload_key_satisfies_strict_allowlist_regex(self):
+        # _resolve_workload's defense-in-depth allowlist regex
+        # (^[a-z][a-z-]{0,63}$) gates every workload key against
+        # shell-metacharacter injection — "daily-heal" must satisfy it (mirrors
+        # the same check the module already applies to every other key; kept
+        # as a literal regex here rather than importing index.py directly, to
+        # match this file's existing text-only-assertion convention and avoid
+        # a real boto3/nousergon_lib import at collection time).
+        import re
+        assert re.match(r"^[a-z][a-z-]{0,63}$", "daily-heal")
 
     def test_bootstrap_clones_private_config_package(self):
         # weekly_collector.load_config resolves experiments/reference/data/config.yaml

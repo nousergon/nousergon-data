@@ -167,7 +167,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # data/crosswalks/cusip_to_ticker.json (CUSIP→ticker cache).
     # ARTIFACT_REGISTRY.yaml row: thinktank_inst_ownership.
     "data/derived/inst_ownership.py": 4,
-    "weekly_collector.py": 5,
+    # 5 -> 6 on alpha-engine-config-I2717 (2026-07-16): the new standalone
+    # --daily-heal entrypoint (_run_daily_heal) writes a heal-summary artifact
+    # to data/heal/daily/{run_date}.json — the artifact the freshness-monitor
+    # plane watches per the I2722 health-plane ruling (extend the existing
+    # Lambda watch plane, no new bundled health SF). FOLLOW-UP tracked as
+    # alpha-engine-config-I2749 (cross-repo, private): register
+    # data/heal/daily/{run_date}.json in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml.
+    "weekly_collector.py": 6,
 }
 
 
