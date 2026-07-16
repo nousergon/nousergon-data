@@ -187,8 +187,15 @@ class TestPaths:
                 succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
                 # config#1767: the spot launched-gate states branch on
                 # launched:true (BooleanEquals) — follow that on the happy path.
+                # config-I2767: the rule is now And[IsPresent, BooleanEquals]-
+                # guarded, so unwrap the And when matching.
+                def _ops(rule):
+                    merged = {}
+                    for op in rule.get("And", [rule]):
+                        merged.update(op)
+                    return merged
                 launched = (
-                    [c["Next"] for c in st.get("Choices", []) if c.get("BooleanEquals") is True]
+                    [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
                     if cur.endswith("SpotLaunched") else []
                 )
                 cur = (succ or launched or [st.get("Default")])[0]
