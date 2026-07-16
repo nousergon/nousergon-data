@@ -605,9 +605,6 @@ class TestEODSFTopLevelFieldsClosed:
             "snapshot_poll",
             "snapshot_result",
             "stop_result",
-            "substrate_check_error",
-            "substrate_check_poll",
-            "substrate_check_result",
             "trading_instance_id",
             # L274 SF MutualExclusionGuard (2026-05-27) — CheckMutexRole
             # reads $.pipeline_role; AcquireMutex emits $.mutex_result on
@@ -626,7 +623,14 @@ class TestEODSFTopLevelFieldsClosed:
             # state; skip_post_market_data now skips the whole spot data phase.
             "skip_capture_snapshot",
             "skip_eod_reconcile",
-            "skip_daily_substrate_health_check",
+            # alpha-engine-config-I2722 (2026-07-16): skip_daily_substrate_health_check
+            # + the whole DailySubstrateHealthCheck chain (and its dedicated
+            # fail-notify fields, health_check_degraded /
+            # substrate_health_check_degraded_notify[_error] / substrate_check_*)
+            # were REMOVED — the check re-homed to a standalone dashboard-box
+            # systemd timer (crucible-dashboard), genuinely consumer-free
+            # within this SF. Per-row CloudWatch alarms carry the alerting
+            # independently of the SF.
             # StartTradingInstance re-runnability guard (2026-06-30) —
             # ec2:startInstances emits $.ec2_start_result; the SSM-readiness
             # poll emits $.ssm_describe_result (describeInstanceInformation) and
@@ -647,10 +651,6 @@ class TestEODSFTopLevelFieldsClosed:
             "skip_refresh_executor_deploy",
             "refresh_executor_deploy_result",
             "refresh_executor_deploy_poll",
-            # substrate health check (EOD SF) — fail-notify paths
-            "health_check_degraded",
-            "substrate_health_check_degraded_notify",
-            "substrate_health_check_degraded_notify_error",
             # config-I2702 (2026-07-15): closed-loop self-heal for post-close
             # data gaps. "run_date" is a PRE-EXISTING top-level input field
             # (used since day one, embedded inside States.Format() command
