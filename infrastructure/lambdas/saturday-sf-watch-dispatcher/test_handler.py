@@ -647,8 +647,8 @@ def _weekday_history(payload=None, *, veto=False, task_failed_error=None, poll=T
     """Chronological weekday history ending in HandleFailure→FailExecution."""
     h = [
         {"type": "ExecutionStarted"},
-        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "MorningEnrich"}},
-        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "MorningEnrich"}},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "LaunchMorningEnrichSpot"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "LaunchMorningEnrichSpot"}},
     ]
     if veto:
         h += [
@@ -657,7 +657,7 @@ def _weekday_history(payload=None, *, veto=False, task_failed_error=None, poll=T
         ]
     if task_failed_error is not None:
         h += [
-            {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "MorningEnrich"}},
+            {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "LaunchMorningEnrichSpot"}},
             {"type": "TaskFailed", "taskFailedEventDetails": {"error": task_failed_error}},
         ]
     if poll:
