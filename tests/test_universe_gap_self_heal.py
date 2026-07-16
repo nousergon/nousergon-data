@@ -4,9 +4,18 @@ When a weekday/EOD Step Function is skipped (e.g. the 2026-06-24 halt), no
 daily_append runs for that session and the ArcticDB universe series develops
 an interior hole. The next EOD reconcile then reads a non-adjacent prior close
 and mislabels a multi-session move as one day (RGEN +14.92% on 06-25). The
-heal — run at the head of the 40-min MorningArcticAppend state — detects such
-holes (via the fixed-key macro/SPY index) and backfills them, gaplessly and
-fail-soft, so subsequent days measure against the true previous trading day.
+heal detects such holes (via the fixed-key macro/SPY index) and backfills
+them, gaplessly and fail-soft, so subsequent days measure against the true
+previous trading day.
+
+alpha-engine-config-I2717 (2026-07-16): the heal's CALLER moved — it used to
+run at the head of the 40-min preopen ``MorningArcticAppend`` SF state; it now
+runs from the standalone ``--daily-heal`` entrypoint
+(``weekly_collector._run_daily_heal``, see
+``test_weekly_collector_morning_enrich.py``), off the preopen critical path
+with a much bigger hard-timeout budget. The heal function itself
+(``_self_heal_missing_universe_days``, tested below) is UNCHANGED by that
+move — only its caller and timeout budget changed.
 """
 
 from __future__ import annotations
@@ -17,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from builders.daily_append import UniverseFreshnessViolation
 from nousergon_lib.trading_calendar import previous_trading_day
 
 import weekly_collector
@@ -293,11 +303,31 @@ class _Patched:
 
 
 class TestSelfHealMissingUniverseDays:
-    def _patches(self, missing, append_status="ok", fallback_quality=None, ledger=None):
+    def _patches(
+        self, missing, append_status="ok", fallback_quality=None,
+        ledger=None, freshness_violation_symbols=None,
+    ):
         from contextlib import ExitStack
 
+
         collect = MagicMock(return_value={"status": "ok"})
-        append = MagicMock(return_value={"status": append_status})
+        if freshness_violation_symbols is not None:
+            # config#2685: the target-date write itself succeeded, but the
+            # post-write whole-universe scan found an UNRELATED stale
+            # symbol — daily_append raises UniverseFreshnessViolation
+            # rather than returning, same as the live incident (JHG/BLD).
+            stale_symbols = [
+                {"symbol": s, "last_date": "2026-07-10", "age_trading_days": 5}
+                for s in freshness_violation_symbols
+            ]
+            append = MagicMock(
+                side_effect=UniverseFreshnessViolation(
+                    "Universe-freshness scan: unrelated stale symbol(s)",
+                    stale_symbols=stale_symbols,
+                )
+            )
+        else:
+            append = MagicMock(return_value={"status": append_status})
         loader = MagicMock(return_value=({"AAA", "BBB"}, "2026-06-19"))
         clear_ledger = MagicMock()
         stack = ExitStack()
@@ -347,6 +377,21 @@ class TestSelfHealMissingUniverseDays:
             summary = _self_heal_missing_universe_days("bkt", TARGET, config={}, max_heal_days=1)
         assert summary["healed_days"] == []
         assert summary["errors"] and "status=failed" in summary["errors"][0]["reason"]
+
+    def test_unrelated_stale_ticker_does_not_misreport_a_successful_heal(self):
+        """config#2685: daily_append()'s post-write whole-universe freshness
+        scan can find a symbol unrelated to the just-healed day's own write
+        stale (2026-07-15 live incident: JHG/BLD). That must not misreport
+        `day`'s successful write as a heal error — the day still lands in
+        `healed_days`, and no entry is added to `errors`."""
+        with self._patches(
+            ["2026-06-24"], freshness_violation_symbols=["JHG", "BLD"]
+        ):
+            summary = _self_heal_missing_universe_days(
+                "bkt", TARGET, config={}, max_heal_days=1
+            )
+        assert [h["date"] for h in summary["healed_days"]] == ["2026-06-24"]
+        assert summary["errors"] == []
 
     # ── config#2664: fallback-quality days folded into the same heal ────────
 

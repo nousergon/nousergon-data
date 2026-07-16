@@ -75,6 +75,21 @@
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
       "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
+    },
+    {
+      "Sid": "FlowDoctorDedupStore",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
+      ]
     }
   ]
 }

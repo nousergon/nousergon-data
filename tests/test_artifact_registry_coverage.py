@@ -181,7 +181,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # corporate_actions/registry.py and sub_industry_map.json precedents
     # above — pinned here only to force this operator review of the new PUT
     # site.
-    "weekly_collector.py": 6,
+    # 6 -> 7 on alpha-engine-config-I2717 (2026-07-16): the new standalone
+    # --daily-heal entrypoint (_run_daily_heal) writes a heal-summary artifact
+    # to data/heal/daily/{run_date}.json — the artifact the freshness-monitor
+    # plane watches per the I2722 health-plane ruling (extend the existing
+    # Lambda watch plane, no new bundled health SF). FOLLOW-UP tracked as
+    # alpha-engine-config-I2749 (cross-repo, private): register
+    # data/heal/daily/{run_date}.json in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml.
+    "weekly_collector.py": 7,
 }
 
 
