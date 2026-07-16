@@ -688,6 +688,72 @@ def test_reconcile_dispatches_oldest_job_first(monkeypatch):
     assert order == ["222", "111"], f"oldest job must dispatch first, got {order}"
 
 
+# ── Runner-fleet concurrency cap (I2692 item 4) ──────────────────────────────
+
+
+def test_bootstrap_and_reap_reports_running_after_reap(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [
+        _box("i-healthy", age_seconds=600, bootstrapped=True),
+        _box("i-zombie", age_seconds=6000, bootstrapped=True),  # reaped: over lifetime
+    ]
+    idx._test_ssm.online_ids = ["i-healthy"]
+    stats = idx._bootstrap_and_reap()
+    assert stats["reaped_lifetime"] == 1
+    # one box reaped this pass — only the survivor counts toward the cap
+    assert stats["running_after_reap"] == 1
+
+
+def test_reconcile_respects_concurrency_cap_leaves_job_queued(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true",
+                                    "CONFIG_RUNNER_MAX_CONCURRENT": "1"})
+    idx._test_ec2.boxes = [_box("i-existing", age_seconds=100, job_id="1", bootstrapped=True)]
+    idx._test_ssm.online_ids = ["i-existing"]
+    pages = []
+    monkeypatch.setattr(idx, "_page", lambda msg: pages.append(msg))
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 9}]},
+        "/actions/runs/9/jobs": {
+            "jobs": [{"id": 909, "status": "queued",
+                      "labels": ["self-hosted", "alpha-engine-config-spot"],
+                      "created_at": _iso(200)}],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    assert out["reconciled"] == 0
+    assert out["skipped"] == ["909"]
+    assert len(pages) == 1 and "MAX_CONCURRENT_RUNNERS=1" in pages[0]
+
+
+def test_reconcile_dispatches_up_to_available_slots_only(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(1)
+        return f"i-{len(launched)}"
+
+    idx = _load(monkeypatch, launch_impl=_launch,
+                env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true",
+                     "CONFIG_RUNNER_MAX_CONCURRENT": "1"})
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 1}, {"id": 2}]},
+        "/actions/runs/1/jobs": {
+            "jobs": [{"id": 111, "status": "queued", "created_at": _iso(200),
+                      "labels": ["self-hosted", "alpha-engine-config-spot"]}],
+        },
+        "/actions/runs/2/jobs": {
+            "jobs": [{"id": 222, "status": "queued", "created_at": _iso(300),
+                      "labels": ["self-hosted", "alpha-engine-config-spot"]}],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    # zero running boxes going in, cap=1 -> exactly one of the two stale jobs
+    # gets dispatched this pass, the other waits for the next reconcile.
+    assert out["reconciled"] == 1
+    assert len(out["skipped"]) == 1
+    assert out["dispatched"][0]["job_id"] == "222"  # oldest first
+
+
 # ── Circuit breaker + fleet cap (alpha-engine-config#2697) ───────────────────
 #
 # 2026-07-15 incident: with every runner box failing identically, _reconcile()

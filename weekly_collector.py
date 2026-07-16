@@ -1779,7 +1779,7 @@ def _self_heal_missing_universe_days(
     )
 
     from builders._constituents_loader import load_constituents_for_run_date
-    from builders.daily_append import daily_append
+    from builders.daily_append import UniverseFreshnessViolation, daily_append
     from collectors import daily_closes
 
     daily_cfg = config.get("daily_closes", {})
@@ -1827,6 +1827,35 @@ def _self_heal_missing_universe_days(
                 dry_run=dry_run,
                 expected_tickers=tickers,
             )
+        except UniverseFreshnessViolation as exc:
+            # config#2685: this is only ever raised by the post-write
+            # whole-universe freshness scan, which runs after the
+            # per-ticker append loop + error-rate gate have both already
+            # succeeded — so `day`'s own write landed. An unrelated stale
+            # ticker elsewhere in the universe must not misreport this
+            # day's heal as failed; it's a monitored signal, not a heal
+            # error (config-I2684 — the 2026-07-15 backfill's actually-
+            # successful writes were unreadable as `errors` in this exact
+            # summary because of this conflation).
+            summary["healed_days"].append(
+                {
+                    "date": day,
+                    "kind": kind,
+                    "tickers": len(tickers),
+                    "weekly_date": str(weekly_date),
+                }
+            )
+            logger.warning(
+                "universe-gap heal: backfilled %s (%s, %d tickers) — target-date "
+                "write ok, but %d unrelated universe symbol(s) elsewhere are "
+                "stale (monitored separately, not a heal failure): %s",
+                day, kind, len(tickers), len(exc.stale_symbols),
+                [s["symbol"] for s in exc.stale_symbols][:10],
+            )
+        except Exception as exc:
+            logger.warning("universe-gap heal: failed to backfill %s (%s, %s).", day, kind, exc)
+            summary["errors"].append({"date": day, "kind": kind, "reason": str(exc)})
+        else:
             status = append_result.get("status", "unknown")
             if status in ("ok", "ok_dry_run"):
                 summary["healed_days"].append(
@@ -1849,9 +1878,6 @@ def _self_heal_missing_universe_days(
                     "universe-gap heal: daily_append for %s (%s) returned status=%s.",
                     day, kind, status,
                 )
-        except Exception as exc:
-            logger.warning("universe-gap heal: failed to backfill %s (%s, %s).", day, kind, exc)
-            summary["errors"].append({"date": day, "kind": kind, "reason": str(exc)})
 
     return summary
 
