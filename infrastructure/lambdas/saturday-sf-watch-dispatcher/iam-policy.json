@@ -62,6 +62,21 @@
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
       ]
+    },
+    {
+      "Sid": "FlowDoctorDedupStore",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
+      ]
     }
   ]
 }

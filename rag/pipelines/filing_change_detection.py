@@ -273,7 +273,7 @@ def main():
     # Saturday-replay canary's spot bootstrap in particular — see
     # alpha-engine-config#2246).
     print("RESULT_JSON=" + json.dumps({
-        "status": "OK",
+        "status": "PASS",  # canary aggregator contract: literal PASS (config-I2748)
         "n_analyzed": output["n_analyzed"],
         "n_lazy": output["n_lazy"],
         "n_risk_factor_changes": output["n_risk_factor_changes"],

@@ -44,7 +44,15 @@ def build_flow_doctor_config(
         "repo": repo,
         "owner": "@brianmcmahon",
         "notify": fleet_telegram_notifier_dicts(topics),
-        "store": {"type": "sqlite", "path": f"/tmp/{db_basename}.db"},
+        # DynamoDB, not local SQLite — dedup cooldowns must survive across
+        # separate Lambda invocations (a fresh cold start gets an empty /tmp
+        # every time, so SQLite there can never dedup cross-invocation;
+        # config#2418, mirrors the data-collector flow-doctor.yaml fix in
+        # #790/I2417). Table provisioned out-of-band (PAY_PER_REQUEST);
+        # runtime role only needs CRUD, not CreateTable — see
+        # infrastructure/iam/alpha-engine-data-role.json and each fleet
+        # Lambda's own iam-policy.json FlowDoctorDedupStore statement.
+        "store": {"type": "dynamodb", "table_name": "flow-doctor-store", "region": "us-east-1"},
         "dedup_cooldown_minutes": 1,
         "rate_limits": {"max_alerts_per_day": 100},
     }
