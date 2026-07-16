@@ -3,7 +3,7 @@ pandas>=3.0.3
 pyarrow>=14.0
 yfinance>=0.2.36
 requests>=2.31
-pyyaml>=6.0
+pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
@@ -13,7 +13,7 @@ setuptools>=83.0.0
 # (collectors/crypto_balances.py). Pure-Python-capable (ships a prebuilt linux libsecp256k1
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
 embit>=0.8.0
-numpy>=1.24
+numpy>=2.4.6
 feedparser>=6.0.12
 beautifulsoup4>=4.12
 lxml>=6.1.1
@@ -45,8 +45,8 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
-# present only in krepis>=0.6.0 — an older krepis rejects the YAML. Pinned
+# present only in krepis>=0.14.0 — an older krepis rejects the YAML. Pinned
 # directly (not via a nousergon-lib bump, which would drag the in-flight,
 # 7/3-cutover SF-rename refs in lib 0.74.0 into this repo). Floor guarantees
 # the upgrade even on a non-fresh venv.
-krepis>=0.6.0
+krepis>=0.14.0
