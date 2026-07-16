@@ -3,7 +3,7 @@ pandas>=2.0
 pyarrow>=14.0
 yfinance>=0.2.36
 requests>=2.31
-pyyaml>=6.0
+pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
