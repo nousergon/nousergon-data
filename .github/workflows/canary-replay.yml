@@ -1,0 +1,100 @@
+name: Canary Replay
+
+# Per-PR gate for alpha-engine-config#2246 (Saturday-replay canary). Gated
+# on the `canary:replay` label (auto-applied by label-canary-replay.yml on
+# weekly-critical paths). Thin GHA shim on this PUBLIC repo (free/unmetered
+# hosted runner) — the actual probe workload runs on EC2 spot, dispatched
+# via alpha-engine-canary-replay-dispatcher (this repo). Brian's binding
+# ruling: the canary ALWAYS runs all 3 probes together regardless of which
+# repo's PR triggered it, so this shim supplies ITS OWN branch as data_ref
+# and lets research_ref default to main on the dispatcher side.
+#
+# Fork PRs have no OIDC trust to this account — configure-aws-credentials
+# fails cleanly and the job exits 0 rather than failing a check a fork
+# contributor cannot fix.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  canary:
+    if: contains(github.event.pull_request.labels.*.name, 'canary:replay')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Configure AWS credentials
+        id: aws_creds
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-canary-replay-dispatch
+          aws-region: us-east-1
+
+      - name: Skip (no OIDC trust — fork PR)
+        if: steps.aws_creds.outcome == 'failure'
+        run: |
+          echo "No OIDC trust available (fork PR) — skipping canary replay gate."
+
+      - name: Dispatch canary
+        if: steps.aws_creds.outcome == 'success'
+        id: dispatch
+        env:
+          # Passed via env (shell-escaped), never spliced directly into the
+          # run: script — head.ref/head.sha are attacker-controlled on a
+          # pull_request trigger (fork branch names/commits), and direct
+          # ${{ }} interpolation into a run: block is a script-injection
+          # vector CodeQL flags (github.com/nousergon/crucible-research
+          # code-scanning finding on the sibling workflow's first draft).
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_DATA_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg mode "pr" \
+            --arg repo "nousergon/nousergon-data" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg sha "$PR_SHA" \
+            --arg data_ref "$PR_DATA_REF" \
+            '{mode: $mode, repo: $repo, pr_number: $pr_number, sha: $sha, data_ref: $data_ref}')
+
+          RESP=$(mktemp)
+          aws lambda invoke --function-name alpha-engine-canary-replay-dispatcher \
+            --payload "$PAYLOAD" --cli-binary-format raw-in-base64-out \
+            --region us-east-1 "$RESP" >/dev/null
+          cat "$RESP"
+
+          LAUNCHED=$(jq -r '.launched' "$RESP")
+          if [ "$LAUNCHED" != "true" ]; then
+            echo "::error::canary-replay-dispatcher declined to launch: $(cat "$RESP")"
+            exit 1
+          fi
+          MARKER_KEY=$(jq -r '.marker_key' "$RESP")
+          echo "marker_key=${MARKER_KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Poll for completion marker
+        if: steps.aws_creds.outcome == 'success'
+        run: |
+          MARKER_KEY="${{ steps.dispatch.outputs.marker_key }}"
+          DEADLINE=$((SECONDS + 1200))
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            if aws s3api head-object --bucket alpha-engine-research --key "$MARKER_KEY" --region us-east-1 >/dev/null 2>&1; then
+              aws s3 cp "s3://alpha-engine-research/${MARKER_KEY}" marker.json --region us-east-1 --quiet
+              cat marker.json
+              STATUS=$(jq -r '.overall_status' marker.json)
+              echo "canary overall_status=${STATUS}"
+              if [ "$STATUS" = "PASS" ]; then
+                exit 0
+              else
+                echo "::error::canary replay FAILED — see marker.json above for per-probe detail"
+                exit 1
+              fi
+            fi
+            sleep 20
+          done
+          echo "::error::timed out waiting for canary completion marker at ${MARKER_KEY}"
+          exit 1

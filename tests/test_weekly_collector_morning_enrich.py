@@ -970,6 +970,54 @@ def test_daily_arctic_append_runs_daily_append_with_skip_if_exists_and_is_load_b
     assert bad["status"] == "failed"
 
 
+# ── _MACRO_DAILY_TICKERS hard-pin (config-I2703, 2026-07-15 P0) ─────────────
+#
+# SPY (the alpha-math + eod_reconcile benchmark) was found excluded from
+# daily_append's internal expected_tickers scoping — a SEPARATE bug fixed
+# in builders/daily_append.py (see tests/test_spy_universe_member.py
+# section D). While investigating, a second, independent drift risk turned
+# up here: _run_morning_enrich carried its OWN inline copy of the
+# macro/benchmark ticker list (local var, no leading underscore) instead of
+# sharing the module-level _MACRO_DAILY_TICKERS constant that
+# _load_daily_universe_tickers (the EOD PostMarketArcticAppend twin of this
+# weekday state) uses. Two independently-editable literals of "the daily
+# macro tickers" is a duplicate-pin-drift risk: SPY could be removed from
+# one copy (e.g. a churn-scoping refactor) and silently survive in the
+# other, masking exactly the kind of gap this incident was about. These
+# tests pin (a) SPY is a permanent member of the single canonical constant,
+# and (b) both call sites derive from it — no second inline copy.
+
+
+def test_macro_daily_tickers_constant_pins_spy():
+    """The canonical macro/benchmark ticker list must always include SPY —
+    this is the hard pin the freshness/missing-from-closes scoping in
+    daily_append.py relies on to never treat SPY as a churn-eligible
+    S&P straggler."""
+    assert "SPY" in weekly_collector._MACRO_DAILY_TICKERS
+
+
+def test_morning_enrich_and_daily_arctic_append_share_one_macro_ticker_list():
+    """Guard against config-I2703 regressing: _run_morning_enrich must NOT
+    reintroduce a separate inline copy of the macro-tickers list — both the
+    weekday (MorningEnrich) and EOD (_load_daily_universe_tickers) paths
+    must derive expected_tickers from the SAME module-level constant."""
+    import inspect
+
+    morning_enrich_src = inspect.getsource(weekly_collector._run_morning_enrich)
+    assert "_MACRO_DAILY_TICKERS" in morning_enrich_src, (
+        "_run_morning_enrich no longer references the shared "
+        "_MACRO_DAILY_TICKERS constant — check it hasn't reintroduced a "
+        "separate inline copy of the macro/benchmark ticker list "
+        "(the config-I2703 duplicate-pin-drift regression)."
+    )
+    assert "MACRO_DAILY_TICKERS = [" not in morning_enrich_src, (
+        "_run_morning_enrich has its own inline macro-tickers list literal "
+        "again — this must be a single shared constant "
+        "(weekly_collector._MACRO_DAILY_TICKERS), not two independently-"
+        "editable copies."
+    )
+
+
 # ── chronic-gap heal hard timeout (L4605) ───────────────────────────────────
 
 

@@ -42,7 +42,7 @@ jobs:
         # silently (continue-on-error) so downstream skip-on-no-creds
         # logic in arcticdb_smoke.py takes the clean-skip path.
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
           aws-region: us-east-1
