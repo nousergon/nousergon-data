@@ -38,14 +38,21 @@ def _fake_run(returncode=0, stdout="", stderr=""):
 # ── Discovery against the real repo state ───────────────────────────────────
 
 
-def test_discovers_all_four_orchestrated_state_machines(cd):
+def test_discovers_all_six_orchestrated_state_machines(cd):
     entries = cd._discover_expected_logging_configs()
     names = {e["sf_name"] for e in entries}
     assert names == {
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
-        "alpha-engine-groom-pipeline",
+        "alpha-engine-groom-dispatch",
+        # alpha-engine-config-I2544/I2545: both are CFN
+        # AWS::StepFunctions::StateMachine resources with a
+        # LoggingConfiguration block, auto-discovered via
+        # _discover_expected_from_cfn's regex walk of the CFN template —
+        # no code change needed in check-drift.py itself.
+        "ne-weekly-advisory-pipeline",
+        "ne-modelzoo-sunday-pipeline",
     }
 
 
@@ -81,7 +88,7 @@ def test_groom_sf_expects_no_logging(cd):
     logging arg on purpose — this guard's codified expectation must match
     that, not silently assume logging is wanted everywhere."""
     entries = {e["sf_name"]: e for e in cd._discover_expected_logging_configs()}
-    groom = entries["alpha-engine-groom-pipeline"]
+    groom = entries["alpha-engine-groom-dispatch"]
     assert groom["expected_level"] == "OFF"
 
 
@@ -204,7 +211,7 @@ def test_check_sf_missing_state_machine_on_aws(cd):
 
 def test_check_sf_groom_no_drift_when_live_is_off(cd):
     entry = {
-        "sf_name": "alpha-engine-groom-pipeline",
+        "sf_name": "alpha-engine-groom-dispatch",
         "source_file": _REPO_ROOT / "infrastructure" / "deploy-infrastructure.sh",
         "expected_level": "OFF",
         "expected_include_execution_data": None,

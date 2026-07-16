@@ -28,7 +28,15 @@ RULE_NAME="alpha-engine-sf-status-change"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
@@ -67,15 +75,17 @@ trap "rm -rf '$PKG'" EXIT
 echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    echo "Skipping unit tests on Darwin (Lambda deps are linux/amd64); CI runs them."
-  else
-    echo "Running handler unit tests..."
-    PYTHONPATH="${PKG}:${SCRIPT_DIR}:${LAMBDAS_DIR}" python3 -m pytest \
-      "${SCRIPT_DIR}/test_handler.py" "${SCRIPT_DIR}/test_execution_digest.py" -q
-  fi
-fi
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# Both test files stub nousergon_lib in sys.modules, so the shared gate only
+# provisions pytest; LAMBDAS_DIR is on PYTHONPATH for `import flow_doctor_
+# telegram`. This replaces a gate that relied on AMBIENT pytest (PYTHONPATH=$PKG
+# carried no pytest) — the same no-install drift class as config#2295. Runs on
+# Darwin too now: host pip fetches pure-python pytest, and the lib being stubbed
+# means no linux/amd64 wheel is imported, so the old Darwin skip is obsolete.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+HANDLER_TEST_PYTHONPATH="${LAMBDAS_DIR}" \
+HANDLER_TEST_TARGETS="${SCRIPT_DIR}/test_execution_digest.py" \
+  run_handler_tests "${SCRIPT_DIR}"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"

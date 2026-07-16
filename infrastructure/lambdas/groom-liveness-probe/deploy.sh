@@ -22,7 +22,7 @@
 # exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
 #   06:30 daily   cron(30 6 * * ? *)   # after the 19:00 groom matures (~01:45)
 #   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45)
-#                                      #   (the 01:00 Opus run matures ~07:45 —
+#                                      #   (the 01:00 high-only run matures ~07:45 —
 #                                      #   also covered by the 14:30 pass)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
@@ -66,7 +66,15 @@ SCHED_CRONS=(
 )
 SCHED_PREFIX="alpha-engine-groom-liveness-"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
@@ -82,14 +90,12 @@ run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
-# ----- 0. Scratch dirs + validate handler syntax -----------------------------
-# PKG and TEST_DEPS are both created up front (mirrors freshness-monitor/
-# deploy.sh) so ONE trap covers both — a pytest-install failure below still
-# cleans up.
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
 
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
@@ -100,20 +106,16 @@ python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print(
 # `import index` (see its header) — so this gate stays hermetic on bare python.
 # `index.py`'s `import boto3` is REAL, and requirements.txt deliberately omits
 # boto3 (provided by the Lambda runtime at deploy time, per its own comment),
-# so pytest's `import index` needs it installed explicitly here. Installed into
-# a scratch TEST_DEPS dir — NOT the caller's global site-packages, not bundled
-# into the Lambda zip (mirrors freshness-monitor/deploy.sh). Two prior gaps
+# so pytest's `import index` needs it installed explicitly here — passed to the
+# shared gate, which installs it into its own scratch dir, NOT the caller's
+# global site-packages, not bundled into the Lambda zip. Two prior gaps
 # here, same class (the gate's dep/stub set drifting from index.py's real
 # module-level imports): 2026-07-02 "No module named pytest" (script had only
 # run on operator laptops where pytest/boto3 were ambient); 2026-07-04 "No
 # module named nousergon_lib" (config#1742 flow-doctor cutover moved the source
 # onto nousergon_lib but the sys.modules stub was not migrated in lockstep).
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest + boto3 into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 

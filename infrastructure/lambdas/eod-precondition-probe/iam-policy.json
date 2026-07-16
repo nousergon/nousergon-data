@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-eod-precondition-probe:*"
+    },
+    {
+      "Sid": "ReadMacroFreshnessSentinel",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/feature_store/_macro_freshness.json"
+    },
+    {
+      "Sid": "ListBucketForSentinel404",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringEquals": {
+          "s3:prefix": "feature_store/_macro_freshness.json"
+        }
+      }
+    }
+  ]
+}

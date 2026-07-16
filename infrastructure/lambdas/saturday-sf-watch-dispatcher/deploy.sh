@@ -38,7 +38,15 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 # Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
 source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
@@ -58,15 +66,13 @@ run() {
   fi
 }
 
-# ----- 0. Scratch dirs + validate handler syntax -----------------------------
-# PKG and TEST_DEPS are both created up front (mirrors ci-watch-dispatcher/
-# deploy.sh) so ONE trap covers both — a pytest-install failure below still
-# cleans up.
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast
@@ -84,17 +90,13 @@ print('index.py syntax OK')
 # probe, et al). test_handler.py does a REAL `import index` (no sys.modules
 # stubs), which pulls boto3, the local flow_doctor_telegram (found via the
 # test's sys.path parent insert), and nousergon_lib.flow_doctor_fleet. pytest +
-# boto3 + the pinned nousergon-lib + krepis are installed into a scratch
-# TEST_DEPS dir — NOT the caller's global site-packages, not bundled into the
+# boto3 + the pinned nousergon-lib + krepis are installed by the shared gate into its own scratch
+# dir — NOT the caller's global site-packages, not bundled into the
 # Lambda zip.
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  echo "Installing pytest + boto3 + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3 "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" boto3 "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
@@ -152,10 +154,14 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge rule: terminal-failure statuses of ANY of the three fleet
-  # trading SFs. One rule, one target — keep the ARN list in lockstep with
+  # EventBridge rule: terminal-failure statuses of ANY registered fleet SF.
+  # One rule, one target — keep the ARN list in lockstep with
   # index.PIPELINES. (The transitional alpha-engine-eod-pipeline alias was
-  # retired 2026-07-11 — config#2272; old SF deleted live.)
+  # retired 2026-07-11 — config#2272; old SF deleted live.) Widened
+  # 2026-07-14 (alpha-engine-config-I2544/I2545) to also cover the two new
+  # child SFs split out of the weekly pipeline — both registered in
+  # index.PIPELINES with has_listener:False (watch-log + Telegram fire;
+  # autonomous-agent dispatch deferred until their own charter exists).
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -165,7 +171,9 @@ if $BOOTSTRAP; then
     "stateMachineArn": [
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-advisory-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-modelzoo-sunday-pipeline"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }

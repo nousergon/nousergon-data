@@ -34,7 +34,15 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
@@ -58,10 +66,11 @@ run() {
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# Delegates to the one _shared/run_handler_tests.sh so this gate can never
+# re-drift into the naive no-install `python3 -m pytest` form (config#2295).
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3
 
 # ----- 1. Package: deps (embit) + vendor the handler + collector + zip -------
 # embit is pure-Python-capable + ships a prebuilt linux_x86_64 libsecp256k1, so `pip install

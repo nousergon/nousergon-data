@@ -60,8 +60,14 @@ EOD_SF_ARN = os.environ.get(
     f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
 )
 # The trading box (CaptureSnapshot / EODReconcile / StopTradingInstance target)
-# and the dashboard box (DailySubstrateHealthCheck target). Mirror the daemon's
-# _trigger_eod_pipeline input shape so the SF runs identically to a normal EOD.
+# and the dashboard box. ec2_instance_id (dashboard box) no longer targets an
+# SSM InstanceIds param directly since DailySubstrateHealthCheck was spun out
+# to a standalone dashboard-box systemd timer (alpha-engine-config-I2722,
+# 2026-07-16) — it is still carried through the SF's top-level input because
+# HealDispatchReplay passes it verbatim into its own replay execution's Input
+# (schema fidelity for the closed self-heal loop, config-I2702). Mirror the
+# daemon's _trigger_eod_pipeline input shape so the SF runs identically to a
+# normal EOD.
 TRADING_INSTANCE_ID = os.environ.get("TRADING_INSTANCE_ID", "i-018eb3307a21329bf")
 DASHBOARD_INSTANCE_ID = os.environ.get("DASHBOARD_INSTANCE_ID", "i-09b539c844515d549")
 SNS_TOPIC_ARN = os.environ.get(

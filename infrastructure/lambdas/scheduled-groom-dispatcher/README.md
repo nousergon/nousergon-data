@@ -50,14 +50,23 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
 | Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
 |---|---|---|---|---|---|---|
-| `…-0100-daily-opus-high` | `cron(0 1 * * ? *)` | 6pm | daily (all 7) | full | claude-opus-4-8 | high-only |
+| `…-0100-daily-opus-high`¹ | `cron(0 1 * * ? *)` | 6pm | daily (all 7) | full | claude-sonnet-5 | high-only |
 | `…-0700-daily-mid` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | mid-only |
 | `…-1900-daily-low` | `cron(0 19 * * ? *)` | 12pm | daily (all 7) | full | claude-haiku-4-5 | low-only |
 | `…-sun0900-weekly-gated-reverify` | `cron(0 9 ? * SUN *)` | 2am | Sun only | full | claude-haiku-4-5 | gated-reverify |
 
-> **Tier-split cadence (config#1760, 2026-07-05):** three disjoint queues — Haiku
-> on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled), Opus on
-> `complexity:high`. Requires `alpha-engine-config` driver filters (#1761) on
+> ¹ config#2409 (2026-07-13): the high-only slot's MODEL moved off Opus onto
+> Sonnet; the Scheduler rule NAME is left as `-opus-high` deliberately — a
+> rename would require an operator-run `--bootstrap` (see the warning above)
+> purely for a cosmetic AWS identifier, which isn't worth the live-schedule
+> churn. Rename opportunistically the next time this cadence table changes
+> for a substantive reason.
+
+> **Tier-split cadence (config#1760/#2409):** three disjoint queues — Haiku
+> on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled) and on
+> `complexity:high` (moved off Opus 2026-07-13 — see config#2409; the split
+> is queue-isolation/dedicated-attention, not a model-capability step up).
+> Requires `alpha-engine-config` driver filters (#1761) on
 > the box's cloned `main` before `--bootstrap` deploys these schedules live.
 
 > **Sat-skip removed 2026-07-02, uniform 3x/day/7-days, no exceptions.** The
@@ -83,15 +92,15 @@ day-of-week year)` with `?` for an unspecified day field.
 ## Schedule-input routing
 
 Each schedule passes a JSON input, e.g. `{"run_mode": "full", "model":
-"claude-opus-4-8", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 1 * * *"}`.
-The Opus schedule alone carries `pr_budget: 100` (config#1769) — forwarded as
-`GROOM_PR_BUDGET` on the spot box; Haiku/Sonnet stay at the bootstrap default (50).
+"claude-sonnet-5", "issue_filter": "high-only", "pr_budget": 100, "schedule": "0 1 * * *"}`.
+The dedicated high-only schedule alone carries `pr_budget: 100` (config#1769) — forwarded as
+`GROOM_PR_BUDGET` on the spot box; Haiku/mid-Sonnet stay at the bootstrap default (50).
 The Lambda resolves each field (unknown/missing values degrade to a safe
 default — `full` / `claude-sonnet-5` / `default`) and exports `GROOM_MODEL` +
 `GROOM_ISSUE_FILTER` in the SSM bootstrap prelude ahead of invoking
 `groom_spot_bootstrap.sh --mode <run_mode>`, which forwards them into
 `scripts/groom_run.sh` → `scripts/groom_driver.py` (`--issue-filter` selects
-the Sonnet default queue vs. the Opus `complexity:high`-only queue; `--model`
+the mid default queue vs. the dedicated `complexity:high`-only queue; `--model`
 is passed straight to the `claude -p` invocation). `model` is validated against
 a conservative allowlist regex before being embedded in the shell command
 (defense-in-depth — the event is Lambda-config-controlled, not raw user input,
@@ -106,20 +115,17 @@ but injection protection is cheap).
   `Errors` metric during bootstrap-ops to page on it.)
 - **Kill-switch**: set the Lambda env `GROOM_DISPATCH_ENABLED=false` to disable
   without deleting the Scheduler rules.
-- **Pre-boot pace gate (2026-07-04)**: before launching the spot box, compares
-  reset-aligned weekly Claude usage (WET) against how much of the current
-  weekly window has elapsed (`krepis.usage_pacing.pace_check` — same gate
-  `alpha-engine-config/scripts/groom_budget.py` runs on-box); a launch running
-  ahead of pace is skipped entirely (`launched: false, reason: "pace_gate_skip"`,
-  routed through the existing `CheckLaunched`→`GroomSkipped` Step Function
-  branch, no SF changes needed) **and sends its own Telegram ping** — the only
-  place a pre-boot skip is ever visible, since a run that never boots has no
-  on-box `groom_run.sh` to notify the way the on-box budget-gate skip does.
-  Fail-safe on any S3/read error — never blocks a scheduled groom (and never
-  pings on a fail-safe pass-through either). `GROOM_PACE_GATE_ENABLED=false`
-  disables just this gate (independent of `GROOM_DISPATCH_ENABLED`);
-  `GROOM_WEEKLY_WET_CEILING` / `CCUSAGE_BUCKET` override the calibrated
-  defaults.
+- **Usage pacing DISMANTLED (2026-07-14, Brian ruling)**: the pre-boot pace
+  gate (2026-07-04 → SSoT ceiling config-I2461) is removed — no recorded usage
+  level defers or blocks a scheduled launch anymore. Its false trips and
+  SILENT skips (2026-07-14: the 01:00 and 07:00 UTC triggers both
+  pace-skipped with no decision record) cost more groom coverage than the
+  weekly-quota protection was worth. The surviving guardrail is on-box: a
+  mid-run provider usage/quota top-out winds down cleanly with a distinct
+  Telegram ping (config#1803). Trigger evaluations now ALWAYS leave a
+  decision record — including enumeration failures (`skip_reason:
+  demand_all_failed`, config-I2540) — so a missing record file unambiguously
+  means the scheduler never invoked this Lambda.
 - **Narrow IAM**: the box reads its own run secrets from SSM via its own
   instance profile — this Lambda needs none of those. Its own IAM grants are
   EC2 launch/terminate, `iam:PassRole` for the executor role, SSM

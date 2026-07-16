@@ -23,11 +23,13 @@ import pandas as pd
 import pytest
 
 from builders._price_cache_writeboth import (
+    PRICE_CACHE_FRESHNESS_SENTINEL_KEY,
     PRICE_CACHE_LEGACY_PREFIX,
     PRICE_CACHE_NEW_PREFIX,
     list_price_cache_keys,
     price_cache_read_prefixes,
     price_cache_write_prefixes,
+    write_price_cache_freshness_sentinel,
 )
 
 
@@ -353,3 +355,44 @@ def test_weekly_chronic_gap_self_heal_writes_reference_only(monkeypatch):
     assert not any(
         c["Key"].startswith(PRICE_CACHE_LEGACY_PREFIX) for c in put_calls
     )
+
+
+# ---------------------------------------------------------------------------
+# write_price_cache_freshness_sentinel — freshness-monitor proxy (config#2350)
+# ---------------------------------------------------------------------------
+
+
+def test_write_price_cache_freshness_sentinel_puts_fixed_key():
+    put_calls: list[dict] = []
+
+    class _RecordingS3:
+        def put_object(self, **kw):
+            put_calls.append(kw)
+
+    out = write_price_cache_freshness_sentinel(
+        _RecordingS3(), "test-bucket", writer="nousergon-data:weekly_collector.py",
+    )
+
+    assert len(put_calls) == 1
+    call = put_calls[0]
+    assert call["Bucket"] == "test-bucket"
+    assert call["Key"] == PRICE_CACHE_FRESHNESS_SENTINEL_KEY
+    assert call["Key"] == "reference/price_cache/_freshness.json"
+    assert out["writer"] == "nousergon-data:weekly_collector.py"
+    assert "timestamp" in out
+
+
+def test_write_price_cache_freshness_sentinel_swallows_s3_errors():
+    """Best-effort by construction — a put_object failure must never raise,
+    mirroring the config#1787 feature-store sentinel's non-fatal contract."""
+
+    class _FailingS3:
+        def put_object(self, **_kw):
+            raise RuntimeError("S3 unavailable")
+
+    out = write_price_cache_freshness_sentinel(
+        _FailingS3(), "test-bucket", writer="nousergon-data:weekly_collector.py",
+    )
+
+    # Swallowed — no raise, still returns the sentinel payload.
+    assert out["writer"] == "nousergon-data:weekly_collector.py"

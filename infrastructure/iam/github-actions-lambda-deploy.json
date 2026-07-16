@@ -123,8 +123,15 @@
       ],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-*-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-*-pipeline"
       ]
+    },
+    {
+      "Sid": "InfraDeployValidateSFDefinition",
+      "Effect": "Allow",
+      "Action": "states:ValidateStateMachineDefinition",
+      "Resource": "*"
     },
     {
       "Sid": "InfraDeployResourceCRUD",

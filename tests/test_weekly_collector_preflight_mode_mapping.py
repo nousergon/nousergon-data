@@ -70,7 +70,11 @@ def test_morning_enrich_not_mapped_to_daily():
 def test_daily_mode_mapping_unchanged():
     """The genuine --daily weekday path still maps to 'daily'. The EOD split
     (2026-06-16) also routes --daily-arctic-append through the same 'daily'
-    preflight (it reads daily_closes + the ArcticDB universe — same surface)."""
+    preflight (it reads daily_closes + the ArcticDB universe — same surface).
+    alpha-engine-config-I2717 (2026-07-16): the standalone --daily-heal
+    entrypoint shares the same 'daily' preflight surface too (S3 + ArcticDB
+    reachability — what its fail-loud posture depends on catching before any
+    heal work starts)."""
     src = _main_source()
     assert "elif args.daily" in src
     after = src[src.index("elif args.daily"):]
@@ -78,3 +82,5 @@ def test_daily_mode_mapping_unchanged():
     assert 'mode = "daily"' in branch
     # The split-out append state shares the daily preflight surface.
     assert 'daily_arctic_append' in branch
+    # The standalone daily-heal entrypoint shares it too.
+    assert 'daily_heal' in branch

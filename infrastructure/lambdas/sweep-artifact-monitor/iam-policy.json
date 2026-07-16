@@ -1,0 +1,42 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sweep-artifact-monitor:*"
+    },
+    {
+      "Sid": "ReadGroomDispatchExecution",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution"],
+      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-groom-dispatch:*"
+    },
+    {
+      "Sid": "ReadSweepArtifacts",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": { "s3:prefix": "groom/*" }
+      }
+    },
+    {
+      "Sid": "GetSweepArtifactObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/*"
+    },
+    {
+      "Sid": "PublishMissingSweepAlert",
+      "Effect": "Allow",
+      "Action": ["sns:Publish"],
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    }
+  ]
+}
