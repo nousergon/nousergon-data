@@ -19,6 +19,7 @@ fetched via yfinance with ^ prefix.
 
 from __future__ import annotations
 
+import io
 import logging
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -27,8 +28,12 @@ from pathlib import Path
 import boto3
 import pandas as pd
 import yfinance as yf
+from botocore.exceptions import ClientError
 
-from builders._price_cache_writeboth import price_cache_write_prefixes
+from builders._price_cache_writeboth import (
+    price_cache_read_prefixes,
+    price_cache_write_prefixes,
+)
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
@@ -119,6 +124,52 @@ def collect(
     return result
 
 
+def collect_daily_incremental(
+    bucket: str,
+    tickers: list[str],
+    s3_prefix: str = "reference/price_cache/",
+    fetch_period: str = "5d",
+    batch_size: int = 50,
+    dry_run: bool = False,
+) -> dict:
+    """Weekday EOD incremental refresh (config#2756).
+
+    ``collect()`` above is the weekly Saturday full-history rebuild: a
+    staleness check gates a full ``fetch_period`` (10y) auto_adjust=True
+    rewrite per stale ticker. Between Saturdays, price_cache otherwise only
+    advances when a ticker happens to be flagged stale — in practice that
+    means the whole ~965-symbol universe is 2+ trading days stale by
+    Tuesday, defeating the 1-trading-day staleness gate
+    ``metron_market_data.py::_price_cache_close_series`` relies on
+    (nousergon-data#693) for Tue-Fri EOD runs.
+
+    This is unconditional (every ticker in ``tickers``, every weekday run —
+    not gated on a staleness check) and incremental: a short recent window
+    (default 5 trading days, comfortably covering weekends/holidays) is
+    fetched and MERGED into each ticker's existing parquet rather than a
+    full 10y rewrite, so daily marginal cost stays small. See
+    ``_refresh_stale``'s ``merge=True`` docstring for the accepted
+    adjustment-basis drift this trades off against the weekly full rebuild.
+    """
+    s3 = boto3.client("s3")
+    all_tickers = list(dict.fromkeys(tickers + _ALWAYS_DOWNLOAD))
+
+    if dry_run:
+        return {"status": "ok_dry_run", "total": len(all_tickers)}
+
+    refreshed, failed_tickers = _refresh_stale(
+        s3, bucket, s3_prefix, all_tickers, fetch_period, batch_size, merge=True,
+    )
+
+    return {
+        "status": "ok" if not failed_tickers else "partial",
+        "refreshed": refreshed,
+        "failed": len(failed_tickers),
+        "failed_tickers": failed_tickers[:20],
+        "total": len(all_tickers),
+    }
+
+
 def _find_stale_fast(
     s3,
     bucket: str,
@@ -159,6 +210,28 @@ def _find_stale_fast(
     return stale
 
 
+def _read_existing_cache(s3, bucket: str, s3_prefix: str, ticker: str) -> pd.DataFrame | None:
+    """Read a ticker's existing price_cache parquet, or ``None`` if absent.
+
+    Tries the active read prefixes in order (see ``price_cache_read_prefixes``).
+    Any read failure (missing key, corrupt parquet) is treated as absent —
+    the merge path then degrades to a plain write of the newly-fetched window,
+    same as a first-time refresh.
+    """
+    for prefix in price_cache_read_prefixes(s3_prefix):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{ticker}.parquet")
+            return pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey"):
+                continue
+            logger.warning("Existing price_cache read failed for %s (%s): %s", ticker, prefix, exc)
+        except Exception as exc:
+            logger.warning("Existing price_cache parquet unreadable for %s (%s): %s", ticker, prefix, exc)
+    return None
+
+
 @yf_quiet
 def _refresh_stale(
     s3,
@@ -167,8 +240,24 @@ def _refresh_stale(
     stale: list[str],
     fetch_period: str,
     batch_size: int,
+    merge: bool = False,
 ) -> tuple[int, list[str]]:
-    """Batch-fetch stale tickers from yfinance and upload to S3.
+    """Batch-fetch tickers from yfinance and write their price_cache parquet.
+
+    ``merge=False`` (weekly full refresh, default): full ``fetch_period``
+    (10y) auto_adjust=True rewrite — the historically-correct behavior,
+    since auto_adjust retroactively re-bases the ENTIRE history on any
+    split/dividend, and appending a raw new row to an unrebased history
+    would leave a discontinuity at the splice point.
+
+    ``merge=True`` (daily incremental refresh, config#2756): ``fetch_period``
+    is a short recent window (e.g. "5d"), read the ticker's existing parquet
+    and merge the new window on top (new rows win on overlapping dates),
+    instead of overwriting the full history. This accepts the same bounded
+    adjustment-basis drift the weekly full refresh has always healed by the
+    next Saturday — the identical accepted-drift shape as
+    ``builders/daily_append.py``'s incremental ArcticDB append + weekly
+    backfill reconcile.
 
     Runs under ``yf_quiet`` (nousergon_lib.yfinance_quiet): yfinance's
     per-symbol "possibly delisted" ERROR spray is demoted so one transient/
@@ -229,6 +318,14 @@ def _refresh_stale(
                         idx = idx.tz_convert("UTC").tz_localize(None)
                     new_df.index = idx
                     new_df = new_df.sort_index()
+
+                    if merge:
+                        existing_df = _read_existing_cache(s3, bucket, s3_prefix, ticker)
+                        if existing_df is not None and not existing_df.empty:
+                            combined = pd.concat([existing_df, new_df])
+                            # New (short-window) rows win on overlapping dates —
+                            # they reflect the latest close/adjustment basis.
+                            new_df = combined[~combined.index.duplicated(keep="last")].sort_index()
 
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;

@@ -2659,6 +2659,41 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         bucket=bucket,
     )
 
+    # Price cache — daily incremental refresh (config#2756). The weekly Saturday
+    # DataPhase1 pass (prices.collect, see _run_phase1) only rewrites tickers
+    # flagged stale by its 3-business-day threshold, so Tue-Fri the entire
+    # price_cache-covered universe was 2+ trading days stale, defeating the
+    # 1-trading-day staleness gate metron_market_data.py::_price_cache_close_series
+    # relies on (nousergon-data#693). Runs unconditionally every weekday EOD,
+    # merging a short recent window per ticker rather than the weekly full
+    # 10y rewrite — see prices.collect_daily_incremental's docstring for the
+    # accepted adjustment-basis drift this trades off (self-healed every
+    # Saturday by the full rebuild).
+    price_cfg = config.get("price_cache", {})
+    if price_cfg.get("daily_incremental_enabled", True):
+        logger.info("=" * 60)
+        logger.info("REFRESHING: price cache (daily incremental)")
+        logger.info("=" * 60)
+        # supports_auto_skip=False: per-ticker parquet writes, no single stable
+        # S3 key to validate against — mirrors the weekly `prices` phase.
+        results["collectors"]["price_cache_daily"] = _phase_collect(
+            reg, "price_cache_daily",
+            lambda: prices.collect_daily_incremental(
+                bucket=bucket,
+                tickers=tickers,
+                s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
+                fetch_period=price_cfg.get("daily_fetch_period", "5d"),
+                batch_size=price_cfg.get("refresh_batch_size", 50),
+                dry_run=dry_run,
+            ),
+            supports_auto_skip=False,
+        )
+        if not dry_run and results["collectors"]["price_cache_daily"].get("status") in ("ok", "partial"):
+            _write_price_cache_freshness_sentinel(
+                boto3.client("s3"), bucket,
+                writer="nousergon-data:weekly_collector.py:daily",
+            )
+
     # Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
     # `alpha-engine-data` is the single market-data ground truth for the NE system;
     # Metron reads these artifacts (it makes no direct market-data API calls). Reads its
