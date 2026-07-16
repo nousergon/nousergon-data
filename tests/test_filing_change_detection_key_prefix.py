@@ -64,5 +64,5 @@ class TestResultJsonLine:
 
         import json
         payload = json.loads(result_lines[0][len("RESULT_JSON="):])
-        assert payload["status"] == "OK"
+        assert payload["status"] == "PASS"  # canary aggregator contract (config-I2748)
         assert payload["n_analyzed"] == 0

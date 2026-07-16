@@ -289,3 +289,66 @@ def test_daily_append_scoping_sites_reference_universe_extra(needle):
         f"This is the exact config-I2703 regression: SPY silently excluded "
         f"from the freshness/missing-from-closes safety net."
     )
+
+
+# ── E. backfill.py regression-preflight sample predicate (config-I2704) ─────
+#
+# 2026-07-16: the third, lower-severity sibling of config-I2703. The
+# universe-side sample-candidate predicate in backfill.py's
+# `_assert_no_arctic_regression` (the preflight that blocks backfill from
+# writing regressed data — see its docstring for the 2026-05-02 incident it
+# guards against) filtered on bare `_SKIP_TICKERS` with no `_UNIVERSE_EXTRA`
+# carve-out, so SPY could never be drawn into the sampled regression-check
+# pool. Unlike I2703, this was never an active masked incident — the
+# macro-side loop in the same function already checks SPY's `macro.SPY`
+# Close-only row on every run, unconditionally — but a regression isolated
+# to SPY's full-OHLCV+features `universe` row (with `macro.SPY` intact)
+# would have silently skipped this preflight. Fixed by aligning this site on
+# the identical carve-out predicate the other three sites in section C/D use.
+
+
+def _regression_preflight_candidate_admits(t: str, *, arctic_syms: set[str]) -> bool:
+    """Mirrors the `candidates` comprehension in backfill.py's
+    `_assert_no_arctic_regression` (identical predicate, kept in lockstep by
+    the source-text guard below)."""
+    return (
+        t in arctic_syms
+        and (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
+        and not _is_sector_etf(t)
+    )
+
+
+def test_regression_preflight_candidates_admit_spy():
+    """SPY must be eligible for backfill's regression-preflight sample pool
+    — it is a hard-pinned benchmark, never a churn-eligible S&P straggler,
+    even though it lives in `_SKIP_TICKERS`. This is eligibility only: the
+    check is sampled, so SPY isn't guaranteed to be drawn every run."""
+    arctic_syms = {"AAPL", "SPY", "VIX", "XLK"}
+    assert _regression_preflight_candidate_admits("SPY", arctic_syms=arctic_syms)
+    assert _regression_preflight_candidate_admits("AAPL", arctic_syms=arctic_syms)
+    assert not _regression_preflight_candidate_admits("VIX", arctic_syms=arctic_syms), (
+        "VIX is macro-only, never a universe member"
+    )
+    assert not _regression_preflight_candidate_admits("XLK", arctic_syms=arctic_syms), (
+        "sector ETFs never enter the universe scope"
+    )
+    assert not _regression_preflight_candidate_admits("SPY", arctic_syms={"AAPL"}), (
+        "not yet present in ArcticDB universe lib — can't be a regression candidate"
+    )
+
+
+def test_regression_preflight_site_references_universe_extra():
+    """Guard against config-I2704 regressing: the regression-preflight
+    sample-candidate predicate in backfill.py's `_assert_no_arctic_regression`
+    must carry the same `_UNIVERSE_EXTRA` carve-out the other three sites
+    (section C/D) already have. Source-text pin, same convention as those
+    sections."""
+    src = (_REPO_ROOT / "builders" / "backfill.py").read_text()
+    needle = "and (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)"
+    assert needle in src, (
+        f"builders/backfill.py no longer contains {needle!r} — the "
+        f"regression-preflight sample-candidate predicate lost its "
+        f"_UNIVERSE_EXTRA carve-out. This is the exact config-I2704 "
+        f"regression: SPY silently excluded from the backfill "
+        f"regression-preflight sample pool."
+    )
