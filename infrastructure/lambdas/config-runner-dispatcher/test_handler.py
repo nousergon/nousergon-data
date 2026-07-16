@@ -57,12 +57,18 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
-    def __init__(self, running_job_ids=None, create_tags_failures=0):
+    def __init__(self, running_job_ids=None, create_tags_failures=0, attempt_boxes=None):
         self.terminated = []
         self.tags_created = []
         self.create_tags_attempts = 0
         self._create_tags_failures = create_tags_failures
         self._running_job_ids = dict(running_job_ids or {})  # {job_id: [instance_ids]}
+        # {job_id: [instance dicts]} — full instance dicts (InstanceId,
+        # LaunchTime, state) for the config#2697 attempt-count probe, which
+        # (unlike the dedupe probe above) needs state/age, not just ids.
+        self._attempt_boxes = dict(attempt_boxes or {})
+        self.describe_instances_calls = 0
+        self.describe_instances_failures = 0
 
     def get_waiter(self, name):
         return _FakeWaiter()
@@ -79,14 +85,33 @@ class _FakeEc2:
         return {}
 
     def describe_instances(self, Filters):  # noqa: N803
+        self.describe_instances_calls += 1
+        if self.describe_instances_calls <= self.describe_instances_failures:
+            raise RuntimeError(f"DescribeInstances throttled (attempt {self.describe_instances_calls})")
         by_name = {f["Name"]: f["Values"] for f in Filters}
-        # _bootstrap_and_reap enumerates by tag:Name WITHOUT a job-id filter
-        # (I2692); tests populate self.boxes with full instance dicts. The
-        # dedupe probe filters by job-id (with or without tag:Name) and must
-        # keep hitting the legacy branch below.
-        if "tag:Name" in by_name and "tag:config-runner-job-id" not in by_name:
+        states = by_name.get("instance-state-name", [])
+        job_id_filter = by_name.get("tag:config-runner-job-id")
+
+        # config#2697 _job_attempt_count: tag:Name + tag:config-runner-job-id
+        # + a state list that includes "terminated" (the discriminator vs.
+        # the plain dedupe-probe job-id query below, which never asks for
+        # terminated boxes).
+        if job_id_filter is not None and "terminated" in states:
+            job_id = job_id_filter[0]
+            boxes = self._attempt_boxes.get(job_id, [])
+            return {"Reservations": [{"Instances": list(boxes)}]} if boxes else {"Reservations": []}
+
+        # _bootstrap_and_reap / config#2697 _current_fleet_size: tag:Name
+        # WITHOUT a job-id filter — tests populate self.boxes with full
+        # instance dicts (shared fixture between both call sites, since
+        # fleet-size counting has the identical filter shape as the
+        # bootstrap-and-reap enumeration).
+        if "tag:Name" in by_name and job_id_filter is None:
             return {"Reservations": [{"Instances": list(getattr(self, "boxes", []))}]}
-        job_id = by_name.get("tag:config-runner-job-id", [None])[0]
+
+        # Plain dedupe probe (spot_dispatch.running_instance_ids): filters by
+        # job-id, state restricted to pending/running only.
+        job_id = job_id_filter[0] if job_id_filter else None
         ids = self._running_job_ids.get(job_id, [])
         return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
 
@@ -126,15 +151,27 @@ class _FakeLambda:
         return {"StatusCode": 202}
 
 
+class _FakeCloudwatch:
+    def __init__(self):
+        self.put_metric_data_calls = []
+
+    def put_metric_data(self, **kw):
+        self.put_metric_data_calls.append(kw)
+        return {}
+
+
 def _load(monkeypatch, *, launch_impl=None, env=None, running_job_ids=None,
-          create_tags_failures=0):
+          create_tags_failures=0, attempt_boxes=None, describe_instances_failures=0):
     monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "alpha-engine-config-runner-dispatcher")
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
-    ec2 = _FakeEc2(running_job_ids=running_job_ids, create_tags_failures=create_tags_failures)
+    ec2 = _FakeEc2(running_job_ids=running_job_ids, create_tags_failures=create_tags_failures,
+                   attempt_boxes=attempt_boxes)
+    ec2.describe_instances_failures = describe_instances_failures
     lam = _FakeLambda()
-    clients = {"ec2": ec2, "ssm": ssm, "lambda": lam}
+    cw = _FakeCloudwatch()
+    clients = {"ec2": ec2, "ssm": ssm, "lambda": lam, "cloudwatch": cw}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
@@ -159,6 +196,7 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_job_ids=None,
     index._test_ssm = ssm
     index._test_ec2 = ec2
     index._test_lambda = lam
+    index._test_cloudwatch = cw
     return index
 
 
@@ -714,3 +752,340 @@ def test_reconcile_dispatches_up_to_available_slots_only(monkeypatch):
     assert out["reconciled"] == 1
     assert len(out["skipped"]) == 1
     assert out["dispatched"][0]["job_id"] == "222"  # oldest first
+
+
+# ── Circuit breaker + fleet cap (alpha-engine-config#2697) ───────────────────
+#
+# 2026-07-15 incident: with every runner box failing identically, _reconcile()
+# relaunched a fresh box per stuck queued job on every ~60s pass FOREVER —
+# ~150 t3.medium spot launches in 45 min, saturating the account's 32-vCPU
+# standard-spot quota and locking out the post-close trading SF's data-spot
+# launch. These tests cover the two independent bounds added to
+# _launch_config_runner_spot (the single chokepoint both the reactive
+# webhook-worker path and the reconcile path funnel through): a per-job
+# attempt limit (counting live+recently-terminated boxes) and a global
+# running+pending fleet cap — including the config#2267 dedupe_degraded
+# "proceed anyway" path, where the circuit breaker must still bind or the
+# runaway just re-opens there.
+
+
+def _attempt_box(iid, *, age_seconds, state="terminated"):
+    return {
+        "InstanceId": iid,
+        "State": {"Name": state},
+        "LaunchTime": datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+    }
+
+
+def test_attempt_limit_blocks_dispatch_at_default_threshold(monkeypatch):
+    # Default CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB=3: 3 prior (terminated)
+    # boxes for this job already exist -> the 4th attempt must be refused.
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        attempt_boxes={"999": [
+            _attempt_box("i-try1", age_seconds=1000),
+            _attempt_box("i-try2", age_seconds=800),
+            _attempt_box("i-try3", age_seconds=600),
+        ]},
+    )
+    out = idx.handler({"config_runner_job_id": "999"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "attempt_limit_exceeded"
+    assert out["attempt_count"] == 3
+    assert launched == [], "must not dispatch once the per-job attempt limit is reached"
+
+
+def test_attempt_limit_pages_exactly_once_per_job(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        attempt_boxes={"42": [
+            _attempt_box("i-a", age_seconds=100),
+            _attempt_box("i-b", age_seconds=90),
+            _attempt_box("i-c", age_seconds=80),
+        ]},
+    )
+    pages = []
+    monkeypatch.setattr(idx, "_page", lambda msg: pages.append(msg))
+    idx.handler({"config_runner_job_id": "42"}, None)
+    idx.handler({"config_runner_job_id": "42"}, None)
+    idx.handler({"config_runner_job_id": "42"}, None)
+    assert len(pages) == 1, "repeated dispatch attempts for an abandoned job must page only once"
+    assert "ABANDONED" in pages[0]
+    assert "42" in pages[0]
+
+
+def test_attempt_count_below_threshold_still_dispatches(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-ok",  # noqa: E731
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        attempt_boxes={"5": [_attempt_box("i-a", age_seconds=100)]},
+    )
+    out = idx.handler({"config_runner_job_id": "5"}, None)
+    assert out["launched"] is True
+
+
+def test_attempt_count_ignores_boxes_outside_lookback_window(monkeypatch):
+    # 3 prior boxes exist for the job, but all launched > the lookback
+    # window ago (default 3600s) — describe-instances would no longer even
+    # return a >1h-old terminated box in practice, but this also guards
+    # against counting a stale/lingering tag from a much older, unrelated
+    # incident as part of today's attempt budget.
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-fresh-attempt",  # noqa: E731
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        attempt_boxes={"7": [
+            _attempt_box("i-old1", age_seconds=999999),
+            _attempt_box("i-old2", age_seconds=999999),
+            _attempt_box("i-old3", age_seconds=999999),
+        ]},
+    )
+    out = idx.handler({"config_runner_job_id": "7"}, None)
+    assert out["launched"] is True
+
+
+def test_attempt_limit_is_env_tunable(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-x"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch,
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true", "CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB": "1"},
+        attempt_boxes={"9": [_attempt_box("i-only-prior-attempt", age_seconds=10)]},
+    )
+    out = idx.handler({"config_runner_job_id": "9"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "attempt_limit_exceeded"
+    assert launched == []
+
+
+def test_attempt_limit_binds_on_dedupe_degraded_path(monkeypatch):
+    # The gotcha this issue calls out explicitly: dedup-probe failures
+    # deliberately degrade to "dispatch anyway" (config#2267, coverage beats
+    # dedupe) — the attempt limit must STILL bind in that degraded path, or
+    # a runaway job just re-opens the loop there instead of at the dedupe
+    # probe.
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        attempt_boxes={"55": [
+            _attempt_box("i-a", age_seconds=100),
+            _attempt_box("i-b", age_seconds=90),
+            _attempt_box("i-c", age_seconds=80),
+        ]},
+    )
+
+    def _probe_down(*a, **kw):
+        raise idx.SpotProbeError("probe failed: ThrottlingException")
+
+    monkeypatch.setattr(idx.spot_dispatch, "running_instance_ids", _probe_down)
+    out = idx.handler({"config_runner_job_id": "55"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "attempt_limit_exceeded"
+    assert launched == [], "attempt limit must bind even when the dedupe probe itself is degraded"
+
+
+def test_attempt_probe_failure_is_fail_safe_not_fail_open(monkeypatch):
+    # Unlike the dedupe probe (config#2267 posture: coverage beats dedupe),
+    # the circuit breaker's OWN probe must fail closed — an unknown attempt
+    # count must never be silently treated as "0, dispatch anyway", since
+    # that would defeat the breaker on exactly the kind of degraded-API pass
+    # a runaway is likely to coincide with.
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+                describe_instances_failures=1)
+    out = idx.handler({"config_runner_job_id": "123"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "attempt_probe_failed"
+    assert launched == []
+
+
+def test_fleet_cap_blocks_dispatch_at_default_threshold(monkeypatch):
+    # Default CONFIG_RUNNER_MAX_FLEET=6: 6 running+pending boxes already
+    # exist fleet-wide (for OTHER jobs) -> a brand-new job's dispatch must
+    # still be refused.
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [
+        {"InstanceId": f"i-fleet-{n}", "Tags": []} for n in range(6)
+    ]
+    out = idx.handler({"config_runner_job_id": "888"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "fleet_cap_reached"
+    assert out["fleet_size"] == 6
+    assert launched == [], "must not dispatch once the global fleet cap is reached"
+
+
+def test_fleet_cap_pages(monkeypatch):
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [{"InstanceId": f"i-{n}", "Tags": []} for n in range(6)]
+    pages = []
+    monkeypatch.setattr(idx, "_page", lambda msg: pages.append(msg))
+    idx.handler({"config_runner_job_id": "1"}, None)
+    assert len(pages) == 1
+    assert "fleet cap" in pages[0].lower()
+
+
+def test_fleet_below_cap_still_dispatches(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-ok",  # noqa: E731
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+    )
+    idx._test_ec2.boxes = [{"InstanceId": f"i-{n}", "Tags": []} for n in range(5)]
+    out = idx.handler({"config_runner_job_id": "1"}, None)
+    assert out["launched"] is True
+
+
+def test_fleet_cap_is_env_tunable(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-x"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch,
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true", "CONFIG_RUNNER_MAX_FLEET": "1"},
+    )
+    idx._test_ec2.boxes = [{"InstanceId": "i-already-there", "Tags": []}]
+    out = idx.handler({"config_runner_job_id": "1"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "fleet_cap_reached"
+    assert launched == []
+
+
+def test_fleet_cap_checked_even_when_this_job_has_zero_prior_attempts(monkeypatch):
+    # The fleet cap is a GLOBAL backstop independent of the per-job attempt
+    # count — a brand-new job (0 attempts) must still be refused if the
+    # fleet is already full from OTHER jobs' boxes.
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [{"InstanceId": f"i-other-job-{n}", "Tags": []} for n in range(6)]
+    out = idx.handler({"config_runner_job_id": "brand-new-job"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "fleet_cap_reached"
+
+
+def test_fleet_probe_failure_is_fail_safe_not_fail_open(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+
+    def _boom(**kw):
+        raise RuntimeError("DescribeInstances throttled")
+
+    # Let the attempt-count probe succeed (no boxes) but make the SECOND
+    # describe_instances call (fleet-size) fail.
+    real_describe = idx._test_ec2.describe_instances
+    calls = {"n": 0}
+
+    def _describe(Filters):  # noqa: N803
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("DescribeInstances throttled")
+        return real_describe(Filters)
+
+    monkeypatch.setattr(idx._test_ec2, "describe_instances", _describe)
+    out = idx.handler({"config_runner_job_id": "1"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "fleet_probe_failed"
+    assert launched == []
+
+
+def test_reconcile_respects_attempt_limit_across_multiple_stale_jobs(monkeypatch):
+    # End-to-end through the reconcile path (not just the worker phase):
+    # a job already at the attempt limit must be skipped by _reconcile
+    # without ever reaching launch_with_fallback, while a fresh stale job in
+    # the same pass still gets dispatched.
+    launched_job_ids = []
+
+    def _launch(types_, subnets, **kw):
+        return "i-rescued"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+        attempt_boxes={"555": [
+            _attempt_box("i-a", age_seconds=100),
+            _attempt_box("i-b", age_seconds=90),
+            _attempt_box("i-c", age_seconds=80),
+        ]},
+    )
+    _install_gh_api_stub(idx, monkeypatch, {
+        "/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 1}]},
+        "/actions/runs/1/jobs": {
+            "jobs": [
+                {"id": 555, "status": "queued", "labels": ["self-hosted", "alpha-engine-config-spot"],
+                 "created_at": _iso(200)},
+                {"id": 556, "status": "queued", "labels": ["self-hosted", "alpha-engine-config-spot"],
+                 "created_at": _iso(150)},
+            ],
+        },
+    })
+    out = idx.handler({"reconcile": True}, None)
+    results_by_job = {d["job_id"]: d["result"] for d in out["dispatched"]}
+    assert results_by_job["555"]["launched"] is False
+    assert results_by_job["555"]["reason"] == "attempt_limit_exceeded"
+    assert results_by_job["556"]["launched"] is True
+
+
+def test_successful_launch_emits_cloudwatch_launch_metric(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-metered",  # noqa: E731
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+    )
+    idx.handler({"config_runner_job_id": "1"}, None)
+    calls = idx._test_cloudwatch.put_metric_data_calls
+    assert len(calls) == 1
+    assert calls[0]["Namespace"] == "AlphaEngine/Infra"
+    metric = calls[0]["MetricData"][0]
+    assert metric["MetricName"] == "config_runner_launches"
+    assert metric["Value"] == 1.0
+
+
+def test_blocked_dispatch_does_not_emit_launch_metric(monkeypatch):
+    # The metric counts actual LAUNCHES (the runaway signal) — a dispatch
+    # refused by the circuit breaker/fleet cap must not count as one.
+    idx = _load(monkeypatch, env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"})
+    idx._test_ec2.boxes = [{"InstanceId": f"i-{n}", "Tags": []} for n in range(6)]
+    idx.handler({"config_runner_job_id": "1"}, None)
+    assert idx._test_cloudwatch.put_metric_data_calls == []
+
+
+def test_launch_metric_emission_failure_does_not_block_dispatch(monkeypatch):
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-ok-anyway",  # noqa: E731
+        env={"CONFIG_RUNNER_DISPATCH_ENABLED": "true"},
+    )
+
+    def _boom(**kw):
+        raise RuntimeError("CloudWatch throttled")
+
+    monkeypatch.setattr(idx._test_cloudwatch, "put_metric_data", _boom)
+    out = idx.handler({"config_runner_job_id": "1"}, None)
+    assert out["launched"] is True

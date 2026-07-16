@@ -60,6 +60,25 @@ MECHANISM (three-phase single Lambda, self-invoked async — see module-level
      handling below — doesn't prevent the occasional mismatch, guarantees no
      job stays stranded indefinitely.
 
+CIRCUIT BREAKER + FLEET CAP (2026-07-15 spot-quota-starvation incident,
+config#2697): the reconcile backstop above is intentionally unbounded in
+WHEN it fires (every stale queued job, every ~60s pass, forever) — that is
+its whole point (I2653). What it lacked was a bound on repeated launches
+for a job whose boxes keep failing identically, and a global ceiling on
+total fleet size. Both live in `_launch_config_runner_spot()` (the single
+chokepoint the webhook-worker path AND the reconcile path both funnel
+through, including the config#2267 dedupe_degraded "proceed anyway" path):
+a job at/over `CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB` launches (default 3,
+counting live+recently-terminated boxes) is abandoned (paged once, no
+further dispatch until a human/code-fix intervenes); the fleet overall is
+capped at `CONFIG_RUNNER_MAX_FLEET` running+pending boxes (default 6 = 12
+vCPUs, leaving >=20 of the account's 32-vCPU standard-spot quota for
+production) regardless of per-job attempt counts. A `AlphaEngine/Infra
+config_runner_launches` custom metric + CloudWatch alarm
+(infrastructure/setup_config_runner_launch_rate_alarm.sh) is the
+independent early-warning signal on launch RATE itself, since the incident
+ran ~3h with only a single quota-exhaustion page at the very end.
+
 CONCURRENCY LOCK: keyed on `Name=alpha-engine-config-runner-spot` +
 `config-runner-job-id=<workflow_job.id>` — one job, one box, 1:1 (unlike
 ci-watch's repo+sha lock, a GitHub Actions job id is already the unique
@@ -153,6 +172,52 @@ VOLUME_SIZE_GB = int(os.environ.get("CONFIG_RUNNER_VOLUME_SIZE_GB", "30"))
 
 CONFIG_RUNNER_TAG_NAME = "alpha-engine-config-runner-spot"
 CONFIG_RUNNER_JOB_ID_TAG_KEY = "config-runner-job-id"
+
+# ── Circuit breaker + fleet cap (2026-07-15 spot-quota-starvation incident,
+# alpha-engine-config#2697) ──────────────────────────────────────────────────
+# With every runner box failing identically (a deprecated runner version —
+# tracked separately), _reconcile() relaunched a fresh box per stuck queued
+# job on every ~60s pass, FOREVER: ~150 t3.medium spot launches in 45 min,
+# ~16 concurrent boxes = 32 vCPUs = 100% of the account's standard-spot quota
+# (L-34B43A08, value 32). The post-close trading SF's data-spot launch then
+# failed MaxSpotInstanceCountExceeded at 20:00 UTC — CI must never be able to
+# starve production of spot quota. Two independent bounds, both enforced
+# inside _launch_config_runner_spot (the single chokepoint both the reactive
+# webhook-worker path AND the reconcile path funnel through — including the
+# config#2267 dedupe_degraded "proceed anyway" path, which is exactly where
+# an unbounded loop would otherwise re-open):
+#
+#   1. PER-JOB ATTEMPT LIMIT: once a job has had >= MAX_ATTEMPTS_PER_JOB boxes
+#      launched for it (live OR recently-terminated — a job whose boxes keep
+#      dying identically is exactly the runaway pattern), stop dispatching
+#      for THAT job and page once. Does not touch other jobs' dispatch, and
+#      does not disable the reconcile backstop itself (config-I2653 still
+#      recovers jobs whose one-shot `queued` webhook was consumed by a runner
+#      that grabbed a different job — this only bounds the RETRY count for a
+#      job that keeps failing).
+#   2. GLOBAL FLEET CAP: refuse to launch (for ANY job) once
+#      running+pending config-runner boxes >= MAX_FLEET, regardless of
+#      per-job attempt counts — the last-resort backstop against any launch
+#      pattern (not just the identical-failure one above) that could
+#      otherwise still saturate the account's spot quota.
+CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB = int(os.environ.get("CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB", "3"))
+# ~1h: describe-instances reliably still returns a terminated instance for
+# about this long after termination (AWS does not document an exact
+# retention SLA; this matches the window the issue's incident review
+# confirmed empirically and is env-tunable if that changes).
+CONFIG_RUNNER_ATTEMPT_LOOKBACK_SECONDS = int(
+    os.environ.get("CONFIG_RUNNER_ATTEMPT_LOOKBACK_SECONDS", "3600")
+)
+# 6 boxes = 12 vCPUs (t3/t3a/t2.medium = 2 vCPUs each), leaving >= 20 vCPUs of
+# the 32-vCPU account standard-spot quota (L-34B43A08) for production.
+CONFIG_RUNNER_MAX_FLEET = int(os.environ.get("CONFIG_RUNNER_MAX_FLEET", "6"))
+
+# Jobs that tripped the per-job attempt limit this cold start — logged/paged
+# once per job per cold start rather than once per reconcile pass (a stuck
+# job is still stale on every subsequent ~60s pass; repaging it every minute
+# forever would be exactly the "single quota page at the very end" alerting
+# failure mode this issue is also about, just for a different signal).
+_abandoned_job_ids_paged: set[str] = set()
 
 # ── Two-phase bootstrap state machine (2026-07-15 zombie-leak incident,
 # alpha-engine-config-I2692) ─────────────────────────────────────────────────
@@ -375,6 +440,91 @@ def _running_config_runner_instance_ids(job_id: str) -> list[str]:
     )
 
 
+# Any state that counts as "we already tried this" — including terminated
+# ones (a box that died is still a launch attempt against the job; that's
+# the entire point of the circuit breaker: N identical failures must stop,
+# not just N concurrently-alive boxes). shutting-down/stopping are
+# transitional states a box passes through on its way to terminated.
+_ANY_ATTEMPT_STATES = [
+    "pending", "running", "shutting-down", "stopping", "stopped", "terminated",
+]
+
+
+def _job_attempt_count(job_id: str) -> int:
+    """How many config-runner boxes have been launched for ``job_id`` within
+    the last ``CONFIG_RUNNER_ATTEMPT_LOOKBACK_SECONDS`` (live or recently-
+    terminated — describe-instances keeps a terminated instance queryable for
+    ~1h, comfortably longer than this Lambda's own dispatch cadence). A
+    DescribeInstances failure here must NOT degrade to "0 attempts, dispatch
+    anyway" — that would silently defeat the entire circuit breaker on the
+    exact kind of degraded-EC2-API pass that a runaway is most likely to
+    coincide with, so it re-raises (the caller decides the fail-safe
+    posture; see _launch_config_runner_spot)."""
+    ec2 = boto3.client("ec2", region_name=REGION)
+    resp = ec2.describe_instances(Filters=[
+        {"Name": "tag:Name", "Values": [CONFIG_RUNNER_TAG_NAME]},
+        {"Name": f"tag:{CONFIG_RUNNER_JOB_ID_TAG_KEY}", "Values": [job_id]},
+        {"Name": "instance-state-name", "Values": _ANY_ATTEMPT_STATES},
+    ])
+    now = datetime.now(timezone.utc)
+    count = 0
+    for r in resp.get("Reservations", []):
+        for i in r.get("Instances", []):
+            launch_time = i.get("LaunchTime")
+            if launch_time is not None:
+                age = (now - launch_time).total_seconds()
+                if age > CONFIG_RUNNER_ATTEMPT_LOOKBACK_SECONDS:
+                    continue
+            count += 1
+    return count
+
+
+def _current_fleet_size() -> int:
+    """Running+pending config-runner boxes, fleet-wide (across ALL jobs) —
+    the global cap backstop. Deliberately a SEPARATE query from
+    _job_attempt_count (different filter shape, different failure posture):
+    a failure here also does not degrade to "0, launch anyway" (see
+    _launch_config_runner_spot)."""
+    ec2 = boto3.client("ec2", region_name=REGION)
+    resp = ec2.describe_instances(Filters=[
+        {"Name": "tag:Name", "Values": [CONFIG_RUNNER_TAG_NAME]},
+        {"Name": "instance-state-name", "Values": ["pending", "running"]},
+    ])
+    return sum(len(r.get("Instances", [])) for r in resp.get("Reservations", []))
+
+
+CONFIG_RUNNER_LAUNCH_METRIC_NAMESPACE = "AlphaEngine/Infra"
+CONFIG_RUNNER_LAUNCH_METRIC_NAME = "config_runner_launches"
+
+
+def _emit_launch_metric() -> None:
+    """One CloudWatch custom-metric datapoint per successful launch (mirrors
+    spot-orphan-reaper's ``_emit_metric`` pattern — a namespace/metric-name
+    pair, best-effort, never raises). This is the launch-rate alarm's data
+    source (config#2697): the 2026-07-15 runaway ran ~3h at ~150 launches/45min
+    with only a single quota page at the very end — a launch-COUNT alarm
+    (independent of whether launches are currently succeeding or already
+    failing quota) catches the runaway itself, not just its terminal
+    symptom. Alarm provisioned by
+    infrastructure/setup_config_runner_launch_rate_alarm.sh (this repo has no
+    log-metric-filter precedent; every existing alarm — see
+    setup_watch_plane_alarms.sh, spot-orphan-reaper's own
+    spot_orphans_terminated metric — alarms on a Lambda-emitted custom/AWS
+    metric instead, which this follows)."""
+    try:
+        boto3.client("cloudwatch", region_name=REGION).put_metric_data(
+            Namespace=CONFIG_RUNNER_LAUNCH_METRIC_NAMESPACE,
+            MetricData=[{
+                "MetricName": CONFIG_RUNNER_LAUNCH_METRIC_NAME,
+                "Value": 1.0,
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 — observability only; must never block/fail a dispatch
+        logger.warning("CloudWatch put_metric_data (%s) failed (non-fatal): %s",
+                        CONFIG_RUNNER_LAUNCH_METRIC_NAME, exc)
+
+
 def _bootstrap_command(job_id: str) -> str:
     """The async SSM RunShellScript prelude: minimal-install, fetch the PAT,
     clone alpha-engine-config, exec its config_runner_spot_bootstrap.sh
@@ -399,6 +549,69 @@ exec bash infrastructure/config_runner_spot_bootstrap.sh --job-id "{job_id}"
 
 
 def _launch_config_runner_spot(job_id: str) -> dict:
+    # ── Circuit breaker + fleet cap (config#2697) — checked FIRST, ahead of
+    # the dedup probe, so both bind unconditionally: in particular, the
+    # per-job attempt limit MUST still apply on the config#2267
+    # dedupe_degraded "proceed anyway" path below, or a runaway job just
+    # re-opens the loop there instead. Both counts fail LOUD (re-raise) on a
+    # DescribeInstances error rather than degrade to "0, dispatch anyway" —
+    # unlike the dedup probe, coverage does NOT beat safety here: the whole
+    # point of a circuit breaker is that it must hold even when the AWS API
+    # is degraded, which is exactly when a runaway is likely to be underway.
+    try:
+        attempt_count = _job_attempt_count(job_id)
+    except Exception as exc:  # noqa: BLE001 — fail-safe: an unknown attempt count blocks the launch
+        logger.error(
+            "config-runner attempt-count probe FAILED for job %s — refusing to "
+            "dispatch (fail-safe, unlike the dedupe probe): %s: %s",
+            job_id, type(exc).__name__, exc,
+        )
+        return {"launched": False, "reason": "attempt_probe_failed", "job_id": job_id,
+                "error": str(exc)}
+
+    if attempt_count >= CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB:
+        if job_id not in _abandoned_job_ids_paged:
+            _abandoned_job_ids_paged.add(job_id)
+            _page(
+                f"🔴 config-runner: job {job_id} ABANDONED after "
+                f"{attempt_count} launch attempts (limit "
+                f"{CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB}) — every box likely "
+                "failing identically (e.g. a bad runner version/bootstrap "
+                "script). No further boxes will be dispatched for this job "
+                "until a human intervenes or ships a fix. "
+                "alpha-engine-config#2697."
+            )
+        logger.error(
+            "config-runner job %s ABANDONED — %d attempts >= limit %d, "
+            "not dispatching", job_id, attempt_count, CONFIG_RUNNER_MAX_ATTEMPTS_PER_JOB,
+        )
+        return {"launched": False, "reason": "attempt_limit_exceeded", "job_id": job_id,
+                "attempt_count": attempt_count}
+
+    try:
+        fleet_size = _current_fleet_size()
+    except Exception as exc:  # noqa: BLE001 — fail-safe: an unknown fleet size blocks the launch
+        logger.error(
+            "config-runner fleet-size probe FAILED for job %s — refusing to "
+            "dispatch (fail-safe): %s: %s", job_id, type(exc).__name__, exc,
+        )
+        return {"launched": False, "reason": "fleet_probe_failed", "job_id": job_id,
+                "error": str(exc)}
+
+    if fleet_size >= CONFIG_RUNNER_MAX_FLEET:
+        _page(
+            f"🔴 config-runner: fleet cap reached ({fleet_size} >= "
+            f"{CONFIG_RUNNER_MAX_FLEET}) — job {job_id} NOT dispatched this "
+            "pass. Refusing further launches until the fleet shrinks (global "
+            "backstop against spot-quota starvation, alpha-engine-config#2697)."
+        )
+        logger.error(
+            "config-runner FLEET CAP reached (%d >= %d) — job %s not "
+            "dispatched", fleet_size, CONFIG_RUNNER_MAX_FLEET, job_id,
+        )
+        return {"launched": False, "reason": "fleet_cap_reached", "job_id": job_id,
+                "fleet_size": fleet_size}
+
     dedupe_degraded = False
     try:
         existing = _running_config_runner_instance_ids(job_id)
@@ -442,6 +655,7 @@ def _launch_config_runner_spot(job_id: str) -> dict:
 
     logger.info("launched config-runner box %s (%s) for job %s%s", instance_id, market, job_id,
                 " dedupe_degraded=true" if dedupe_degraded else "")
+    _emit_launch_metric()
 
     try:
         boto3.client("ec2", region_name=REGION).create_tags(
