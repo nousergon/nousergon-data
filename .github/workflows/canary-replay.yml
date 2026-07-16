@@ -1,10 +1,28 @@
 name: Canary Replay
 
-# Per-PR gate for alpha-engine-config#2246 (Saturday-replay canary). Gated
-# on the `canary:replay` label (auto-applied by label-canary-replay.yml on
-# weekly-critical paths). Thin GHA shim on this PUBLIC repo (free/unmetered
-# hosted runner) — the actual probe workload runs on EC2 spot, dispatched
-# via alpha-engine-canary-replay-dispatcher (this repo). Brian's binding
+# Per-PR gate for alpha-engine-config#2246 (Saturday-replay canary). Single
+# workflow with two jobs — `label` decides (via path filter) whether this
+# PR touches weekly-critical paths and applies the `canary:replay` label;
+# `canary` dispatches the actual probe run, gated on `label`'s own output
+# OR a pre-existing label (e.g. applied manually by a human on an earlier
+# run). This used to be two separate workflow files connected by a
+# `labeled` trigger: label-canary-replay.yml applied the label with the
+# default GITHUB_TOKEN, and canary-replay.yml re-triggered on `labeled` to
+# see it. GitHub Actions' anti-recursion protection means a `labeled` event
+# caused by the default GITHUB_TOKEN never starts a new workflow run, so
+# that second run never fired — a PR opened once (no follow-up push) would
+# never get gated (alpha-engine-config#2691). Consuming the label job's
+# output directly, in the same run, makes that cross-workflow-trigger
+# dependency structurally impossible.
+#
+# Path list MUST stay in lockstep with what
+# alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh's
+# probe 1 actually exercises: a change to any of these could regress what
+# the Saturday weekly-SF's filing-change-detection step executes.
+#
+# Thin GHA shim on this PUBLIC repo (free/unmetered hosted runner) — the
+# actual probe workload runs on EC2 spot, dispatched via
+# alpha-engine-canary-replay-dispatcher (this repo). Brian's binding
 # ruling: the canary ALWAYS runs all 3 probes together regardless of which
 # repo's PR triggered it, so this shim supplies ITS OWN branch as data_ref
 # and lets research_ref default to main on the dispatcher side.
@@ -20,10 +38,34 @@ on:
 permissions:
   id-token: write
   contents: read
+  pull-requests: write
 
 jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      weekly_critical: ${{ steps.filter.outputs.weekly_critical }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        id: filter
+        with:
+          filters: |
+            weekly_critical:
+              - 'rag/pipelines/**'
+              - 'infrastructure/lambdas/canary-replay-dispatcher/**'
+              - 'infrastructure/lambdas/canary-replay-liveness-probe/**'
+              - '.github/workflows/canary-replay.yml'
+      - name: Apply canary:replay label
+        if: steps.filter.outputs.weekly_critical == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr edit "${{ github.event.pull_request.number }}" --add-label canary:replay
+
   canary:
-    if: contains(github.event.pull_request.labels.*.name, 'canary:replay')
+    needs: label
+    if: needs.label.outputs.weekly_critical == 'true' || contains(github.event.pull_request.labels.*.name, 'canary:replay')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
