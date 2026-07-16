@@ -1,0 +1,38 @@
+name: Label canary:replay
+
+# Auto-labels a PR `canary:replay` when it touches weekly-critical paths —
+# the label is what gates canary-replay.yml (alpha-engine-config#2246).
+# Path list MUST stay in lockstep with what
+# alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh's
+# probe 1 actually exercises: a change to any of these could regress what
+# the Saturday weekly-SF's filing-change-detection step executes.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        id: filter
+        with:
+          filters: |
+            weekly_critical:
+              - 'rag/pipelines/**'
+              - 'infrastructure/lambdas/canary-replay-dispatcher/**'
+              - 'infrastructure/lambdas/canary-replay-liveness-probe/**'
+              - '.github/workflows/label-canary-replay.yml'
+              - '.github/workflows/canary-replay.yml'
+      - name: Apply canary:replay label
+        if: steps.filter.outputs.weekly_critical == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr edit "${{ github.event.pull_request.number }}" --add-label canary:replay
