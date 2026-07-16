@@ -167,7 +167,21 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # data/crosswalks/cusip_to_ticker.json (CUSIP→ticker cache).
     # ARTIFACT_REGISTRY.yaml row: thinktank_inst_ownership.
     "data/derived/inst_ownership.py": 4,
-    # 5 -> 6 on alpha-engine-config-I2717 (2026-07-16): the new standalone
+    # 5 -> 6 on alpha-engine-config#2672 (2026-07-16, Brian-ratified binding
+    # design): _data_quality/pending_upgrades.json — the durable
+    # desired-state ledger so a fallback-quality (yfinance-basis) universe
+    # day can't age out unhealed past the sliding-window detectors' lookback.
+    # A single small JSON object touched at most twice/day (mark on EOD
+    # yfinance write, clear on morning polygon-corrected write / gap-heal
+    # success) — control-plane reconciliation state, not a periodic
+    # freshness-SLA data artifact consumers read on a cadence (its absence
+    # is self-evident via the sliding-window detectors that union it, not via
+    # a freshness-monitor staleness check). Grandfathered out of
+    # ARTIFACT_REGISTRY.yaml for that reason, mirroring the
+    # corporate_actions/registry.py and sub_industry_map.json precedents
+    # above — pinned here only to force this operator review of the new PUT
+    # site.
+    # 6 -> 7 on alpha-engine-config-I2717 (2026-07-16): the new standalone
     # --daily-heal entrypoint (_run_daily_heal) writes a heal-summary artifact
     # to data/heal/daily/{run_date}.json — the artifact the freshness-monitor
     # plane watches per the I2722 health-plane ruling (extend the existing
@@ -175,7 +189,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-I2749 (cross-repo, private): register
     # data/heal/daily/{run_date}.json in alpha-engine-config/private-docs/
     # ARTIFACT_REGISTRY.yaml.
-    "weekly_collector.py": 6,
+    "weekly_collector.py": 7,
 }
 
 
