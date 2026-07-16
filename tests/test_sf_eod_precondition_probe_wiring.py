@@ -186,11 +186,17 @@ class TestDegradedTerminalState:
         assert states["StopTradingInstance"]["Next"] == "CheckDegradedOutcome"
 
     def test_degraded_outcome_routes_on_the_flag(self, states):
+        # config-I2767 (2026-07-16 incident): the flag is only assigned on
+        # the degraded path, so the comparison MUST be IsPresent-guarded —
+        # an unguarded dereference threw States.Runtime on every fully-green
+        # day. Absent flag falls to Default NormalSucceeded.
         cdo = states["CheckDegradedOutcome"]
         assert cdo["Type"] == "Choice"
         c = cdo["Choices"][0]
-        assert c["Variable"] == "$.degraded_summary.degraded"
-        assert c["BooleanEquals"] is True
+        guard, comparison = c["And"]
+        assert guard == {"Variable": "$.degraded_summary.degraded", "IsPresent": True}
+        assert comparison["Variable"] == "$.degraded_summary.degraded"
+        assert comparison["BooleanEquals"] is True
         assert c["Next"] == "DegradedSucceeded"
         assert cdo["Default"] == "NormalSucceeded"
 
@@ -221,8 +227,13 @@ class TestHealLoopEligibility:
         chle = states["CheckHealLoopEligible"]
         assert chle["Type"] == "Choice"
         c = chle["Choices"][0]
-        assert c["Variable"] == "$.pipeline_role"
-        assert c["StringEquals"] == "operator-replay"
+        # config-I2767: IsPresent-guarded — $.pipeline_role is an execution-
+        # input key this SF never floors; absent falls to Default (live
+        # treatment).
+        guard, comparison = c["And"]
+        assert guard == {"Variable": "$.pipeline_role", "IsPresent": True}
+        assert comparison["Variable"] == "$.pipeline_role"
+        assert comparison["StringEquals"] == "operator-replay"
         assert c["Next"] == "HealNonConvergent"
         assert chle["Default"] == "InitHealLoop"
 
@@ -243,7 +254,17 @@ class TestHealLoopBound:
         assert gate["Type"] == "Choice"
         c = gate["Choices"][0]
         assert "Or" in c
-        variables = {cond["Variable"] for cond in c["Or"]}
+        # config-I2767: the deadline operand is IsPresent-guarded (absent →
+        # operand false, loop stays bounded by attempts); the attempts
+        # operand is provably floored by InitHealLoop/HealLoopIncrement.
+        variables = set()
+        for cond in c["Or"]:
+            if "And" in cond:
+                assert cond["And"][0]["IsPresent"] is True
+                assert cond["And"][0]["Variable"] == cond["And"][1]["Variable"]
+                variables.add(cond["And"][1]["Variable"])
+            else:
+                variables.add(cond["Variable"])
         assert variables == {"$.heal_loop.attempts", "$.precondition_probe.Payload.past_deadline"}
         assert c["Next"] == "HealNonConvergent"
         assert gate["Default"] == "HealLaunchPostMarketDataSpot"
@@ -321,8 +342,12 @@ class TestHealLoopDispatchChain:
     def test_converged_choice_dispatches_the_replay(self, states):
         hcc = states["HealCheckConverged"]
         c = hcc["Choices"][0]
-        assert c["Variable"] == "$.precondition_probe.Payload.precondition_met"
-        assert c["BooleanEquals"] is True
+        # config-I2767: IsPresent-guarded — a partial probe payload falls to
+        # Default HealLoopIncrement (bounded loop), never States.Runtime.
+        guard, comparison = c["And"]
+        assert guard == {"Variable": "$.precondition_probe.Payload.precondition_met", "IsPresent": True}
+        assert comparison["Variable"] == "$.precondition_probe.Payload.precondition_met"
+        assert comparison["BooleanEquals"] is True
         assert c["Next"] == "HealDispatchReplay"
         assert hcc["Default"] == "HealLoopIncrement"
 
