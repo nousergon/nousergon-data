@@ -13,7 +13,7 @@ setuptools>=83.0.0
 # (collectors/crypto_balances.py). Pure-Python-capable (ships a prebuilt linux libsecp256k1
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
 embit>=0.8.0
-numpy>=1.24
+numpy>=2.4.6
 feedparser>=6.0.12
 beautifulsoup4>=4.12
 lxml>=6.1.1
