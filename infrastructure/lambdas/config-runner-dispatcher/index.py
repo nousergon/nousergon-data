@@ -308,6 +308,17 @@ CW_LOG_GROUP = os.environ.get("CONFIG_RUNNER_CW_LOG_GROUP", "/alpha-engine/confi
 RECONCILE_STALE_SECONDS = int(os.environ.get("CONFIG_RUNNER_RECONCILE_STALE_SECONDS", "90"))
 RECONCILE_MAX_QUEUED_RUNS = int(os.environ.get("CONFIG_RUNNER_RECONCILE_MAX_QUEUED_RUNS", "50"))
 
+# Runner-fleet concurrency cap (config-I2692 item 4, 2026-07-15): a CI burst
+# must never be able to consume the WHOLE account spot quota by itself and
+# starve sibling workloads (groom/data/watch boxes share the same quota).
+# Default 20 concurrent config-runner boxes (t3.medium-class, 2 vCPU each =
+# 40 vCPU) leaves >half of the current 96-vCPU quota for everything else;
+# env-tunable since the right number is a fleet-wide capacity tradeoff, not
+# a fact this Lambda can derive on its own. A job that can't get a box this
+# pass because the cap is full simply stays queued — the NEXT reconcile pass
+# (~60s) retries once older boxes finish and free a slot.
+MAX_CONCURRENT_RUNNERS = int(os.environ.get("CONFIG_RUNNER_MAX_CONCURRENT", "20"))
+
 CONFIG_RUNNER_READ_PAT_SSM = os.environ.get(
     "CONFIG_RUNNER_READ_PAT_SSM", "/alpha-engine/config_runner/github_read_pat"
 )
@@ -695,7 +706,7 @@ def _bootstrap_and_reap() -> dict:
     ec2 = boto3.client("ec2", region_name=REGION)
     ssm = boto3.client("ssm", region_name=REGION)
     stats = {"bootstrapped": 0, "reaped_no_ssm": 0, "reaped_lifetime": 0,
-             "waiting_ssm": 0, "healthy": 0, "errors": 0}
+             "waiting_ssm": 0, "healthy": 0, "errors": 0, "running_after_reap": 0}
     now = datetime.now(timezone.utc)
 
     try:
@@ -775,6 +786,7 @@ def _bootstrap_and_reap() -> dict:
         else:
             stats["waiting_ssm"] += 1
 
+    stats["running_after_reap"] = len(boxes) - stats["reaped_no_ssm"] - stats["reaped_lifetime"]
     logger.info("bootstrap_and_reap: %s", stats)
     return stats
 
@@ -838,6 +850,12 @@ def _reconcile() -> dict:
                 continue  # still within the reactive path's normal dispatch latency
             stale_jobs.append((age_seconds, str(job["id"])))
 
+    # Concurrency cap (I2692 item 4): count this pass's OWN dispatches against
+    # the fleet already standing after bootstrap_and_reap's janitor pass, so a
+    # single burst of stale jobs can't blow past the cap in one reconcile.
+    available_slots = max(0, MAX_CONCURRENT_RUNNERS - br_stats.get("running_after_reap", 0))
+    capped_at_slot_zero = False
+
     dispatched = []
     skipped = []
     for age_seconds, job_id in sorted(stale_jobs, reverse=True):  # oldest first
@@ -848,10 +866,24 @@ def _reconcile() -> dict:
         if existing:
             skipped.append(job_id)
             continue
+        if available_slots <= 0:
+            logger.warning("reconcile: job %s queued %.0fs but MAX_CONCURRENT_RUNNERS=%d "
+                            "already reached — leaving queued for next pass",
+                            job_id, age_seconds, MAX_CONCURRENT_RUNNERS)
+            skipped.append(job_id)
+            capped_at_slot_zero = True
+            continue
         logger.info("reconcile: job %s queued %.0fs with no in-flight box — dispatching",
                    job_id, age_seconds)
-        dispatched.append({"job_id": job_id, "age_seconds": age_seconds,
-                           "result": _launch_config_runner_spot(job_id)})
+        result = _launch_config_runner_spot(job_id)
+        if result.get("launched"):
+            available_slots -= 1
+        dispatched.append({"job_id": job_id, "age_seconds": age_seconds, "result": result})
+
+    if capped_at_slot_zero:
+        _page(f"⚠️ config-runner: MAX_CONCURRENT_RUNNERS={MAX_CONCURRENT_RUNNERS} reached — "
+              "one or more stale jobs left queued this reconcile pass pending a free slot. "
+              "alpha-engine-config-I2692.")
 
     logger.info("reconcile: dispatched=%d skipped=%d bootstrap_and_reap=%s",
                 len(dispatched), len(skipped), br_stats)
