@@ -37,6 +37,28 @@ in favor of the S3 run artifact as groom's PRIMARY record, which this probe
 never picked up — every run false-alarmed as a silent failure regardless of
 actual health. Switched to reading the S3 artifact directly (same source
 ``groom_driver.py``'s ``write_run_artifact`` already writes).
+
+config#2667: ``_expected_triggers`` (the fixed-cron ``_DEFAULT_SCHEDULE``
+enumeration below) only ever covered ``run_mode=full`` — the 3 daily
+01:00/07:00/19:00 UTC slots. ``run_mode=sweep`` (the end-of-SF PR-sweep box,
+config#2201) fires on a variable, event-driven trigger — "after a trading
+pipeline finishes" — with NO fixed cron at all, so this probe had ZERO
+awareness of it: a sweep box that never wrote a run artifact was invisible to
+the only liveness check that exists (4 of 14 sweep cycles, 2026-07-11→15,
+confirmed silently missing with no page). Rather than guess at a sweep
+schedule (which would only re-create the same cron-vs-reality drift risk the
+``_DEFAULT_SCHEDULE`` docstring already flags), this probe now ALSO reads the
+dispatcher's own real dispatch-decision log
+(``groom/decisions/{date}/*.json`` — schema_version 2, written by
+scheduled-groom-dispatcher's ``_write_trigger_record``/``_write_skip_record``/
+``_write_sweep_decision_record`` for EVERY trigger evaluation, full or sweep)
+and treats every record with at least one ``launch=true`` decision as an
+expected trigger, using the exact same maturity + per-trigger-window miss
+logic already used for the fixed-cron full-mode schedule. The fixed-cron
+check is kept running alongside it (belt-and-braces / redundant, since every
+full-mode dispatch now ALSO appears in the decision log) rather than removed,
+so a decision-log read failure degrades to the pre-existing cron-only
+coverage rather than below it.
 """
 
 from __future__ import annotations
@@ -55,6 +77,11 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+# groom/decisions/{date}/*.json — the dispatcher's own dispatch-decision log
+# (config#1432/#2201/#2667; scheduled-groom-dispatcher's _write_trigger_record
+# / _write_skip_record / _write_sweep_decision_record). Same bucket as the run
+# artifacts below.
+DECISION_RECORD_PREFIX = os.environ.get("GROOM_DECISION_RECORD_PREFIX", "groom/decisions/")
 _FLOW_NAME = "groom-liveness-probe"
 _DB_BASENAME = "flow_doctor_groom_liveness_probe"
 _OPS_TOPICS = (
@@ -126,8 +153,17 @@ def _now() -> datetime:
 
 
 def _expected_triggers(now: datetime) -> list[dict]:
-    """Enumerate every scheduled groom trigger in the lookback window that is now
-    MATURE (had CEILING+MARGIN minutes to finish). Each → {at, label}."""
+    """Enumerate every FIXED-CRON ``run_mode=full`` groom trigger
+    (``_DEFAULT_SCHEDULE``/``GROOM_SCHEDULE``) in the lookback window that is
+    now MATURE (had CEILING+MARGIN minutes to finish). Each → {at, label}.
+
+    config#2667: this only ever covers the fixed-cron full-mode schedule — it
+    has NO awareness of ``run_mode=sweep`` (event-driven, no cron) at all. Kept
+    running as a belt-and-braces cross-check alongside
+    ``_expected_triggers_from_decisions`` (see ``_all_expected_triggers``)
+    rather than removed: a decision-log read failure there degrades to this
+    function's pre-existing (in-window) coverage, never below it.
+    """
     horizon = now - timedelta(hours=LOOKBACK_HOURS)
     mature_before = now - timedelta(minutes=CEILING_MIN + MARGIN_MIN)
     out: list[dict] = []
@@ -153,6 +189,128 @@ def _expected_triggers(now: datetime) -> list[dict]:
 
 def _s3_client():
     return boto3.client("s3", region_name=REGION)
+
+
+def _decision_record_dates(now: datetime) -> list[str]:
+    """UTC calendar dates spanning the lookback window — same shape as
+    ``_lookback_dates`` (which covers RUN artifacts), applied here to the
+    dispatcher's DECISION records (``groom/decisions/{date}/*.json``)."""
+    horizon = now - timedelta(hours=LOOKBACK_HOURS)
+    dates: list[str] = []
+    d = horizon.date()
+    last = now.date()
+    while d <= last:
+        dates.append(d.isoformat())
+        d += timedelta(days=1)
+    return dates
+
+
+def _decision_launched(record: dict) -> bool:
+    """True iff this decision record shows AT LEAST ONE launch=true decision.
+
+    Handles both the top-level ``launched`` bool some records carry directly
+    (a bare ``launch_decided`` sweep record, or a legacy single-decision
+    shape) and the ``decisions: [...]`` list schema_version-2 records use
+    (``_write_trigger_record``/``_write_skip_record``/
+    ``_write_sweep_decision_record``), where any entry's ``launch`` (or
+    ``launched``) key being true counts. A skip-only record (``decisions: []``
+    or every entry ``launch: false``) is correctly NOT expected to have a run
+    artifact — it's ignored, not flagged."""
+    if record.get("launched") is True or record.get("launch") is True:
+        return True
+    decisions = record.get("decisions")
+    if isinstance(decisions, list):
+        for d in decisions:
+            if not isinstance(d, dict):
+                continue
+            if d.get("launch") is True or d.get("launched") is True:
+                return True
+    return False
+
+
+def _expected_triggers_from_decisions(s3, now: datetime) -> list[dict]:
+    """config#2667: enumerate every MATURE expected trigger from the
+    dispatcher's OWN dispatch-decision log
+    (``groom/decisions/{date}/*.json``) rather than an assumed schedule — this
+    is how sweep-mode (event-driven, no fixed cron) dispatches become visible
+    to this probe at all, and it also naturally covers full-mode (the
+    demand-all path writes the same records), so it is not sweep-only.
+
+    Each record with at least one ``launch=true`` decision (see
+    ``_decision_launched``) contributes one expected trigger at its
+    ``decided_at`` timestamp — the same ``{at, label}`` shape
+    ``_expected_triggers`` returns, so ``_missed`` treats both sources
+    identically. A record with NO launch=true decision (a demand-gate skip, a
+    concurrent-lane skip, an enumeration failure fail-closed skip) is
+    correctly excluded — it was never expected to produce a run artifact.
+
+    Best-effort on the READ: an individual malformed/unreadable record is
+    skipped (logged) rather than raising — the fixed-cron
+    ``_expected_triggers`` cross-check (see ``_all_expected_triggers``) is the
+    fallback if the decision log itself is entirely unavailable. This mirrors
+    ``_fetch_run_artifact_timestamps``'s malformed-artifact handling but is
+    deliberately non-fatal here (unlike that PRIMARY input) because the fixed
+    -cron schedule is a redundant, independent source for full-mode misses."""
+    horizon = now - timedelta(hours=LOOKBACK_HOURS)
+    mature_before = now - timedelta(minutes=CEILING_MIN + MARGIN_MIN)
+    out: list[dict] = []
+    for date in _decision_record_dates(now):
+        prefix = f"{DECISION_RECORD_PREFIX}{date}/"
+        token = None
+        while True:
+            kwargs = {"Bucket": WATCH_BUCKET, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            try:
+                resp = s3.list_objects_v2(**kwargs)
+            except Exception as exc:  # noqa: BLE001 — redundant source; fixed-cron cross-check remains
+                logger.warning("decision-record list failed for prefix %s (%s) — "
+                               "sweep-mode coverage degraded to fixed-cron this run", prefix, exc)
+                break
+            for obj in resp.get("Contents", []) or []:
+                key = obj["Key"]
+                if not key.endswith(".json"):
+                    continue
+                try:
+                    body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
+                    record = json.loads(body)
+                except Exception as exc:  # noqa: BLE001 — one bad record must not hide the rest
+                    logger.warning("decision record %s unreadable (%s) — skipped", key, exc)
+                    continue
+                if not _decision_launched(record):
+                    continue
+                decided_at = record.get("decided_at")
+                if not decided_at:
+                    continue
+                try:
+                    t = datetime.fromisoformat(str(decided_at).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+                if not (horizon <= t <= mature_before):
+                    continue
+                label = f"decision-log:{record.get('trigger', record.get('run_mode', 'unknown'))}"
+                out.append({"at": t, "label": label})
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+    out.sort(key=lambda d: d["at"])
+    return out
+
+
+def _all_expected_triggers(s3, now: datetime) -> list[dict]:
+    """Union of the fixed-cron schedule (``_expected_triggers``) and the real
+    dispatch-decision log (``_expected_triggers_from_decisions``) — the actual
+    input ``handler()`` checks against. De-duplicated by ``at`` timestamp
+    (a full-mode trigger legitimately appears in BOTH sources once
+    scheduled-groom-dispatcher's demand-all path writes its decision record at
+    the same instant the fixed cron fired) so it is never double-counted/
+    double-alerted for the same trigger instant."""
+    merged: dict[datetime, dict] = {}
+    for trig in _expected_triggers(now):
+        merged[trig["at"]] = trig
+    for trig in _expected_triggers_from_decisions(s3, now):
+        merged.setdefault(trig["at"], trig)
+    return sorted(merged.values(), key=lambda d: d["at"])
 
 
 def _load_alerted(s3, now: datetime) -> set[str]:
@@ -294,12 +452,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Returns a structured result; raises on
     a PRIMARY-input (S3) failure so the check can never silently no-op."""
     now = _now()
-    triggers = _expected_triggers(now)
+    s3 = _s3_client()
+    # config#2667: union of the fixed-cron full-mode schedule AND the
+    # dispatcher's own dispatch-decision log (covers sweep-mode, which has no
+    # fixed cron at all — see _all_expected_triggers).
+    triggers = _all_expected_triggers(s3, now)
     logger.info("groom liveness probe: %d mature trigger(s) in last %dh", len(triggers), LOOKBACK_HOURS)
     if not triggers:
         return {"checked": 0, "missed": 0, "alerted": False, "reason": "no mature triggers in window"}
 
-    s3 = _s3_client()
     stamps = _fetch_run_artifact_timestamps(s3, now)  # PRIMARY — fail-loud
     misses = _missed(triggers, stamps)
 

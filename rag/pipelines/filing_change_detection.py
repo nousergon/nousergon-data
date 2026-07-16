@@ -213,6 +213,18 @@ def main():
     parser.add_argument("--output-s3", action="store_true", help="Write results to S3")
     parser.add_argument("--output-local", type=str, help="Write results to local file")
     parser.add_argument("--bucket", type=str, default="alpha-engine-research")
+    parser.add_argument(
+        "--key-prefix",
+        type=str,
+        default="",
+        help=(
+            "Prefix the dated S3 key with this (e.g. 'canary/{run_id}/') and "
+            "never touch the real 'latest.json' pointer. Used by the "
+            "Saturday-replay canary (alpha-engine-config#2246) to exercise "
+            "this pipeline against the live pgvector corpus without "
+            "clobbering the production pointer."
+        ),
+    )
     args = parser.parse_args()
 
     results = compute_filing_changes()
@@ -233,19 +245,23 @@ def main():
     if args.output_s3:
         import boto3
         s3 = boto3.client("s3")
-        key = f"rag/filing_changes/{date.today().isoformat()}.json"
+        key = f"rag/filing_changes/{args.key_prefix}{date.today().isoformat()}.json"
         s3.put_object(
             Bucket=args.bucket, Key=key,
             Body=json.dumps(output, indent=2).encode(),
             ContentType="application/json",
         )
-        # Also write latest pointer
-        s3.put_object(
-            Bucket=args.bucket, Key="rag/filing_changes/latest.json",
-            Body=json.dumps(output, indent=2).encode(),
-            ContentType="application/json",
-        )
-        logger.info("Written to s3://%s/%s (+ latest)", args.bucket, key)
+        if args.key_prefix:
+            # Canary/staging run — never touch the real pointer consumers read.
+            logger.info("Written to s3://%s/%s (key-prefix set, latest.json untouched)", args.bucket, key)
+        else:
+            # Also write latest pointer
+            s3.put_object(
+                Bucket=args.bucket, Key="rag/filing_changes/latest.json",
+                Body=json.dumps(output, indent=2).encode(),
+                ContentType="application/json",
+            )
+            logger.info("Written to s3://%s/%s (+ latest)", args.bucket, key)
 
     # Print summary
     print(f"\n{'='*60}")
@@ -269,6 +285,16 @@ def main():
                 rf_sim = r["section_similarities"].get("Risk Factors", "N/A")
                 print(f"  {r['ticker']} {r['doc_type']}: RF_sim={rf_sim} "
                       f"({r['prev_date']}→{r['curr_date']})")
+
+    # Grep-able single-line summary for orchestrating shell scripts (the
+    # Saturday-replay canary's spot bootstrap in particular — see
+    # alpha-engine-config#2246).
+    print("RESULT_JSON=" + json.dumps({
+        "status": "PASS",  # canary aggregator contract: literal PASS (config-I2748)
+        "n_analyzed": output["n_analyzed"],
+        "n_lazy": output["n_lazy"],
+        "n_risk_factor_changes": output["n_risk_factor_changes"],
+    }))
 
 
 if __name__ == "__main__":

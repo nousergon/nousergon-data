@@ -58,6 +58,11 @@ _LAMBDA_PIN_RE = re.compile(
 # documented in each Lambda's requirements.txt header comment.
 # Key: lambda directory name, Value: (pin version, contract reason)
 _LAMBDA_PIN_EXEMPTIONS = {
+    "canary-replay-dispatcher": (
+        "v0.106.0",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246: same SpotProbeError "
+        "handling as ci-watch-dispatcher)",
+    ),
     "ci-watch-dispatcher": (
         "v0.106.0",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling)",

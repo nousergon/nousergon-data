@@ -249,6 +249,26 @@ def _emit_missing_from_closes_metric(count: int) -> None:
         )
 
 
+class UniverseFreshnessViolation(RuntimeError):
+    """Raised by :func:`_scan_universe_and_emit_freshness_receipt` when one or
+    more UNRELATED universe symbols are stale — i.e. the just-completed
+    target-date write itself succeeded, but the whole-universe scan that
+    runs after it found a separate symbol exceeding the staleness threshold.
+
+    Subclasses ``RuntimeError`` so every existing caller that hard-fails
+    on (or asserts) a bare ``RuntimeError`` — the weekday/EOD SF paths,
+    the existing test suite — keeps its exact current behavior unchanged.
+    ``.stale_symbols`` lets a caller that WANTS to distinguish "my target
+    date's write succeeded, an unrelated ticker is stale" from a genuine
+    write failure do so (config#2685) without weakening the hard-fail
+    safety net itself (config-I2703 / the 2026-04-21 ASGN/MOH incident).
+    """
+
+    def __init__(self, message: str, stale_symbols: list[dict]):
+        super().__init__(message)
+        self.stale_symbols = stale_symbols
+
+
 UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 # Trading-day-aware staleness threshold. 3 trading days ≈ the prior
 # 5-calendar-day threshold (which was Fri→Wed under weekend buffer);
@@ -304,6 +324,75 @@ def _write_feature_store_freshness_sentinel(
         log.warning(
             "ArcticDB feature-store freshness sentinel write FAILED "
             "(non-fatal, OBSERVE): %s", exc,
+        )
+    return sentinel
+
+
+# Verify-by-artifact precondition sentinel for the EOD self-heal loop
+# (alpha-engine-config-I2702 deliverable #1/#2). Deliberately a SEPARATE S3
+# key from FEATURE_STORE_FRESHNESS_SENTINEL_KEY above, not a second `library`
+# value written to the SAME key: the universe sentinel (written once per
+# ticker-loop pass, deep in the per-symbol loop) and this macro sentinel
+# (written once per run, right after the macro/SPY readback-verification
+# block below) fire on different code paths and different cadences — sharing
+# one S3 key would let whichever write lands LAST silently overwrite/mask the
+# other's information, defeating the whole point of a per-artifact freshness
+# signal. This key is read by infrastructure/lambdas/eod-precondition-probe,
+# which is the ONLY thing that ever reads it — it is not a general freshness
+# API, and unlike the universe sentinel (`timestamp`-only recency check) it
+# carries `run_date` explicitly: the EOD probe needs to confirm THIS
+# SPECIFIC trading day's SPY close was verified present, not merely "some
+# macro write happened recently" (a stale sentinel from an old run, or a
+# backfill of an unrelated older date, would otherwise false-positive).
+MACRO_FRESHNESS_SENTINEL_KEY = "feature_store/_macro_freshness.json"
+
+
+def _write_macro_freshness_sentinel(
+    s3, bucket: str, *, run_date: str, verified_keys: list[str],
+) -> dict:
+    """Write the ArcticDB macro/SPY freshness sentinel (config-I2702).
+
+    Called ONLY after the macro readback-verification block below confirms
+    (via `verification_failures`) that every key in ``verified_keys`` is
+    genuinely queryable in ArcticDB for ``run_date`` — this sentinel is the
+    ARTIFACT the EOD precondition probe checks, so it must never be written
+    optimistically ahead of that verification.
+
+    Best-effort, matching `_write_feature_store_freshness_sentinel`'s
+    posture: a sentinel-write failure is an observability gap for the probe
+    (which then correctly reports precondition_met=False and the self-heal
+    loop retries — never a silent false-green), NOT a reason to fail a
+    daily_append run whose real ArcticDB writes already succeeded and were
+    already verified above. Swallow rationale (feedback_no_silent_fails):
+    (a) failure mode swallowed = S3 PutObject error on the freshness
+    sentinel only, never the ArcticDB write/verification itself; (c) logged
+    at WARN here, and the resulting probe-reported precondition_met=False
+    is itself the recording surface (drives the self-heal loop / pages on
+    non-convergence) rather than a silent no-op.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_date": run_date,
+        "verified_keys": sorted(verified_keys),
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=MACRO_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB macro-freshness sentinel to s3://%s/%s (run_date=%s, keys=%s)",
+            bucket, MACRO_FRESHNESS_SENTINEL_KEY, run_date, sentinel["verified_keys"],
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB macro-freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE — the EOD precondition probe will correctly "
+            "report precondition_met=False and the self-heal loop will retry): %s",
+            exc,
         )
     return sentinel
 
@@ -527,6 +616,24 @@ def _scan_universe_and_emit_freshness_receipt(
     scan tripped on the same 8 stragglers (one 25d stale) and halted
     the SF.
 
+    ``_UNIVERSE_EXTRA`` members (currently: SPY) are HARD-PINNED benchmark
+    symbols, never churn-eligible — they are excluded from ``_SKIP_TICKERS``
+    membership here via the same ``(... not in _SKIP_TICKERS or ... in
+    _UNIVERSE_EXTRA)`` carve-out the write-path predicate
+    (``_daily_append_admits`` in tests/test_spy_universe_member.py; see
+    ``stock_tickers`` below) already uses. 2026-07-15 P0 (config-I2703):
+    this scan (and the missing-from-closes check below) had DRIFTED from
+    that write-path predicate — they filtered on bare ``_SKIP_TICKERS``
+    with no ``_UNIVERSE_EXTRA`` carve-out, so SPY (in ``_SKIP_TICKERS`` by
+    design, see features/compute.py) was silently excluded from BOTH
+    freshness accounting paths every run, logged as an "S&P churn-out
+    straggler, awaiting prune" — even though SPY is a permanent member,
+    never a prune candidate, and is the executor's benchmark hard-fail
+    dependency (eod_reconcile._spy_close). A genuine SPY write failure
+    would have gone undetected by this gate. Fixed by aligning all three
+    ``expected_tickers``-scoping call sites (write / missing-from-closes /
+    freshness-scan) on the identical predicate.
+
     Returns scan metadata (also embedded in the receipt) for logging
     by the caller. Skipped automatically on dry_run.
     """
@@ -540,7 +647,7 @@ def _scan_universe_and_emit_freshness_receipt(
     if expected_tickers is not None:
         expected_set = {
             t.lstrip("^") for t in expected_tickers
-            if t.lstrip("^") not in _SKIP_TICKERS
+            if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)
             and not _is_sector_etf(t.lstrip("^"))
         }
         syms = [s for s in all_syms if s in expected_set]
@@ -604,11 +711,14 @@ def _scan_universe_and_emit_freshness_receipt(
     if stale:
         stale.sort(key=lambda r: -r[2])
         head = ", ".join(f"{s}({a} trading-d, last={d})" for s, d, a in stale[:10])
-        raise RuntimeError(
+        raise UniverseFreshnessViolation(
             f"Universe-freshness scan: {len(stale)} symbol(s) older than "
             f"{max_stale_trading_days} trading-day(s) threshold "
             f"(stalest first): {head}"
-            + ("…" if len(stale) > 10 else "")
+            + ("…" if len(stale) > 10 else ""),
+            stale_symbols=[
+                {"symbol": s, "last_date": d, "age_trading_days": a} for s, d, a in stale
+            ],
         )
 
     receipt = {
@@ -1367,6 +1477,18 @@ def _daily_append_impl(
                 f"ArcticDB commit / consistency semantics."
             )
 
+        # config-I2702 deliverable #1/#2: only reachable when every key in
+        # macro_updated + sector_updated has just been readback-verified
+        # present for date_str (the raise above is unconditional on any
+        # failure) — this is the artifact-asserting checkpoint the EOD
+        # precondition probe reads. Fires even when macro_updated is a
+        # subset of macro_keys was never possible (macro_missing_from_closes
+        # hard-raised earlier in this function for any missing macro key) —
+        # SPY is always in verified_keys whenever this line executes.
+        _write_macro_freshness_sentinel(
+            s3, bucket, run_date=date_str, verified_keys=macro_updated + sector_updated,
+        )
+
     # ── 2b. Detect tickers that exist in ArcticDB universe but are missing
     #        from today's daily_closes parquet ─────────────────────────────────
     # Without this guard, the line ~274 ``stock_tickers = [t for t in closes ...]``
@@ -1396,10 +1518,17 @@ def _daily_append_impl(
         # closes contains everything: stocks + macro keys + sector ETFs.
         # Reduce to the stock set so the diff is apples-to-apples with
         # universe_lib's contents (which holds only stocks). Same predicate
-        # as the line ~274 stock_tickers filter — keep them in lockstep.
+        # as the ``stock_tickers`` write-path filter below — keep them in
+        # lockstep (the ``_UNIVERSE_EXTRA`` carve-out is REQUIRED here: SPY
+        # is in ``_SKIP_TICKERS`` but IS written to `universe`, so without
+        # the carve-out SPY would always compute as "missing from closes"
+        # even on days it's genuinely present — config-I2703 fixed the
+        # sibling gap where this same omission made the freshness scan
+        # blind to SPY entirely).
         closes_stock_keys = {
             t for t in closes
-            if t not in _SKIP_TICKERS and not _is_sector_etf(t)
+            if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
+            and not _is_sector_etf(t)
         }
         # Scope "expected" to the intersection of ArcticDB universe and the
         # caller's request list. A ticker dropped from S&P this week (still
@@ -1408,11 +1537,15 @@ def _daily_append_impl(
         # design, not a data gap. Without this, every S&P churn week trips
         # the threshold (2026-05-02: 8 churn-out tickers + 4 chronic =
         # 12 > 5 → SF halt). With it, only tickers we both want to track
-        # AND have history for can flag the alarm.
+        # AND have history for can flag the alarm. ``_UNIVERSE_EXTRA``
+        # members are excepted from the ``_SKIP_TICKERS`` exclusion (same
+        # carve-out as ``closes_stock_keys`` above and the write-path
+        # ``stock_tickers`` filter) — SPY is a hard-pinned benchmark, never
+        # a churn-eligible S&P straggler (config-I2703).
         if expected_tickers is not None:
             expected_stocks = {
                 t.lstrip("^") for t in expected_tickers
-                if t.lstrip("^") not in _SKIP_TICKERS
+                if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)
                 and not _is_sector_etf(t.lstrip("^"))
             }
             relevant_arctic = arctic_stock_symbols & expected_stocks
@@ -2147,6 +2280,14 @@ def _daily_append_impl(
 
     result = {
         "status": "ok",
+        # config#2685: always True on a normal return — the only raises
+        # between here and `return result` (error-rate gate, freshness
+        # scan) either abort the function (target date write genuinely
+        # failed) or, for an UNRELATED stale symbol elsewhere in the
+        # universe, raise UniverseFreshnessViolation instead of returning
+        # — see that class + _self_heal_missing_universe_days for the
+        # caller-side distinction this field exists to support.
+        "target_date_write_ok": True,
         "date": date_str,
         "tickers_appended": n_ok,
         "tickers_partial": n_partial,

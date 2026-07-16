@@ -2,8 +2,11 @@
 # deploy.sh — Create or update the alpha-engine-ssm-liveness-poller Lambda.
 #
 # config#1811: liveness-aware SSM poll iteration for the weekday pipeline's
-# SSM command loops (MorningEnrich / MorningArcticAppend / ChronicGapSelfHeal /
-# RunMorningPlanner / CodeFreshnessGate). One invocation = one poll: command
+# SSM command loops (RunMorningPlanner / CodeFreshnessGate — ChronicGapSelfHeal
+# REMOVED per alpha-engine-config-I2717 2026-07-16, moved to the standalone
+# --daily-heal job off the trading box entirely; MorningEnrich/
+# MorningArcticAppend moved off-box even earlier, config#1767 Phase 2, onto
+# their own bare-ssm-poll ephemeral spots). One invocation = one poll: command
 # status + independent SSM-agent PingStatus + bounded attempt/ping-miss
 # accounting. See index.py for the full rationale (2026-07-06 incident: the
 # in-box executionTimeout cannot fire when the box itself is wedged).
