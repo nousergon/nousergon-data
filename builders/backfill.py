@@ -279,6 +279,17 @@ def _assert_no_arctic_regression(
     ``validators/postflight._UNIVERSE_SAMPLE_SIZE``) because exhaustive
     ``tail()`` over 900 symbols would dominate backfill runtime on every
     Saturday. Sample seed is the run_date so reruns hit the same tickers.
+
+    ``_UNIVERSE_EXTRA`` members (currently: SPY) are HARD-PINNED benchmark
+    symbols, never churn-eligible — they are excepted from the
+    ``_SKIP_TICKERS`` exclusion here via the same ``(... not in
+    _SKIP_TICKERS or ... in _UNIVERSE_EXTRA)`` carve-out the write-path
+    predicate and the ``daily_append.py`` scoping predicates use, so SPY
+    stays eligible for the regression-preflight sample pool (config-I2704,
+    the narrower sibling of config-I2703's daily_append.py fix — this site
+    is a sampled preflight gap, not a masked freshness-scan blind spot,
+    since the macro-side loop above already checks SPY's ``macro.SPY``
+    Close-only row unconditionally).
     """
     import random as _rand
 
@@ -306,7 +317,9 @@ def _assert_no_arctic_regression(
 
     candidates = sorted(
         t for t in planned_universe
-        if t in arctic_syms and t not in _SKIP_TICKERS and not _is_sector_etf(t)
+        if t in arctic_syms
+        and (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
+        and not _is_sector_etf(t)
     )
     if len(candidates) > sample_size:
         rng = _rand.Random(run_date)

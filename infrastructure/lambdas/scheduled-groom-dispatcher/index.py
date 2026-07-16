@@ -826,6 +826,48 @@ def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> 
         logger.warning("trigger record write failed (non-fatal): %s", exc)
 
 
+def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: dict) -> None:
+    """config#2667: the ``launch_decided`` fast-path (the end-of-SF
+    ``run_mode=sweep`` box, and any other pre-decided ``launch_decided``
+    invocation) previously wrote NO ``groom/decisions/{date}/*.json`` record at
+    all — unlike the ``demand-all`` full-mode path, which always has via
+    ``_write_trigger_record``/``_write_skip_record``. That left the dispatch
+    decision log — the ground-truth input ``groom-liveness-probe`` now reads
+    (config#2667) to detect a silently-missing run artifact — structurally
+    blind to sweep dispatches: a sweep box that died silently after this
+    Lambda logged "dispatched" left no trace for the probe to even know a
+    trigger had fired.
+
+    Own key prefix (``sweep-{HHMM}``, not ``trigger-{HHMM}``) — sweep and a
+    same-minute demand-all evaluation must never collide on one S3 key. Same
+    schema shape as ``_write_trigger_record``/``_write_skip_record`` (schema_
+    version 2, a ``decisions`` list of ``{launch, ...}`` dicts) so the probe's
+    reader treats both trigger kinds identically. Best-effort non-fatal,
+    mirroring the demand-all writers: a record-write failure must never block
+    or crash the (fire-and-forget) sweep dispatch itself."""
+    now = datetime.now(ZoneInfo("UTC"))
+    key = f"groom/decisions/{now:%Y-%m-%d}/sweep-{now:%H%M%S}.json"
+    launch_ok = bool(launched.get("launched"))
+    body = json.dumps({
+        "schema_version": 2, "trigger": "launch_decided", "run_mode": run_mode,
+        "schedule": schedule_label,
+        "decisions": [{
+            "launch": launch_ok,
+            "issue_filter": launched.get("issue_filter", ""),
+            "model": launched.get("model", ""),
+            "reason": launched.get("reason", "launch_decided"),
+            "tier_tag": launched.get("tier_tag", ""),
+        }],
+        "decided_at": now.isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — mirrors _write_trigger_record: observability only, never blocks the launch it's recording
+        logger.warning("sweep decision record write failed (non-fatal): %s", exc)
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
@@ -906,6 +948,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
         )
+        # config#2667: record this decision too — previously only the
+        # demand-all path did (_write_trigger_record/_write_skip_record),
+        # leaving sweep-mode (and any other launch_decided) dispatches with
+        # no entry in the dispatch-decision log at all.
+        _write_sweep_decision_record(schedule_label, run_mode, result)
         return {"groom": result}
 
     if (run_mode == "full" and not force_on_demand and not queue_manifest_key
@@ -943,10 +990,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     continue
                 logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
                             d.reason, d.issue_filter, d.model)
-                # config#2201: SlotDecision still carries partition_index/
-                # partition_count (lib fields kept for pin-lockstep compat —
-                # deferred lib cleanup), but they are no longer consumed:
-                # the end-of-SF sweep box replaced per-box partitioned sweeps.
+                # config#2201: SlotDecision no longer carries partition_index/
+                # partition_count at all — those fields were fully removed
+                # from nousergon-lib's SlotDecision (confirmed on the lib's
+                # current default branch, pin >= v0.109.0). The end-of-SF
+                # sweep box replaced per-box partitioned sweeps.
                 entry = {"model": d.model, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
