@@ -43,7 +43,7 @@ jobs:
           path: alpha-engine-data
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
@@ -106,5 +106,5 @@ jobs:
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@73007005b3c6e3c2b01b5cd3f14d974d3f41f42e # main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@8c40481c0e80790bda54b30af63b4a341bebcccb # main
     secrets: inherit

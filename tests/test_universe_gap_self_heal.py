@@ -4,9 +4,18 @@ When a weekday/EOD Step Function is skipped (e.g. the 2026-06-24 halt), no
 daily_append runs for that session and the ArcticDB universe series develops
 an interior hole. The next EOD reconcile then reads a non-adjacent prior close
 and mislabels a multi-session move as one day (RGEN +14.92% on 06-25). The
-heal — run at the head of the 40-min MorningArcticAppend state — detects such
-holes (via the fixed-key macro/SPY index) and backfills them, gaplessly and
-fail-soft, so subsequent days measure against the true previous trading day.
+heal detects such holes (via the fixed-key macro/SPY index) and backfills
+them, gaplessly and fail-soft, so subsequent days measure against the true
+previous trading day.
+
+alpha-engine-config-I2717 (2026-07-16): the heal's CALLER moved — it used to
+run at the head of the 40-min preopen ``MorningArcticAppend`` SF state; it now
+runs from the standalone ``--daily-heal`` entrypoint
+(``weekly_collector._run_daily_heal``, see
+``test_weekly_collector_morning_enrich.py``), off the preopen critical path
+with a much bigger hard-timeout budget. The heal function itself
+(``_self_heal_missing_universe_days``, tested below) is UNCHANGED by that
+move — only its caller and timeout budget changed.
 """
 
 from __future__ import annotations

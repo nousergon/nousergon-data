@@ -17,6 +17,19 @@ ignored, not fatal: the downstream fail-loud guards stay the enforcement.
 
 The final cost-guard `StopTradingInstance` is intentionally NOT skip-gated — it
 must always run to release the trading EC2.
+
+alpha-engine-config-I2722 (2026-07-16): the `CheckSkipDailySubstrateHealthCheck`
+gate + `DailySubstrateHealthCheck` task (and the rest of that 7-state chain)
+were REMOVED — the substrate check is genuinely consumer-free within this SF
+(verified) and moves to a standalone dashboard-box systemd timer
+(crucible-dashboard `infrastructure/systemd/substrate-health-daily.service`
++ `.timer`). `CheckSkipEODReconcile`'s skip edge and `CheckEODStatus`'s
+Success edge — the two `_CHAIN` predecessors that used to feed the deleted
+gate — now route directly to `StopTradingInstance`, same as the 3
+self-heal-outcome notifiers (`HealReplayDispatchFailed`/`HealConvergedNotify`/
+`HealNonConvergent`, pinned in test_sf_eod_precondition_probe_wiring.py).
+`TestSubstrateHealthCheckChainRemoved` below pins the chain's absence and the
+rewiring.
 """
 
 from __future__ import annotations
@@ -53,8 +66,11 @@ _CHAIN = [
     # probe), not directly on CheckSkipEODReconcile — every path into the
     # reconcile gate, skip or not, must probe fresh.
     ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "ProbeEODReconcilePrecondition"),
-    ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckSkipDailySubstrateHealthCheck"),
-    ("CheckSkipDailySubstrateHealthCheck", "DailySubstrateHealthCheck", "skip_daily_substrate_health_check", "StopTradingInstance"),
+    # alpha-engine-config-I2722 (2026-07-16): the skip edge used to land on
+    # CheckSkipDailySubstrateHealthCheck; that gate + the whole
+    # DailySubstrateHealthCheck chain were removed (spun out to a dashboard-box
+    # systemd timer), so this now routes straight to the cost-guard tail.
+    ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "StopTradingInstance"),
 ]
 
 
@@ -140,10 +156,13 @@ class TestEntryEdgesRouteThroughGates:
         assert succ == ["ProbeEODReconcilePrecondition"]
         assert states["ProbeEODReconcilePrecondition"]["Next"] == "CheckSkipEODReconcile"
 
-    def test_eod_success_enters_substrate_gate(self, states):
+    def test_eod_success_enters_stop_trading_instance(self, states):
+        # alpha-engine-config-I2722 (2026-07-16): CheckEODStatus's Success edge
+        # used to feed CheckSkipDailySubstrateHealthCheck; that gate + chain
+        # are removed, so it now routes directly to the cost-guard tail.
         succ = [c["Next"] for c in states["CheckEODStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckSkipDailySubstrateHealthCheck"]
+        assert succ == ["StopTradingInstance"]
 
 
 class TestPaths:
@@ -265,3 +284,85 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         ]
 
     _walk = TestPaths._walk
+
+
+class TestSubstrateHealthCheckChainRemoved:
+    """alpha-engine-config-I2722 (2026-07-16): the 7-state
+    DailySubstrateHealthCheck chain is removed from the EOD SF — genuinely
+    consumer-free (verified), re-homed as a standalone systemd timer on the
+    dashboard box (crucible-dashboard
+    infrastructure/systemd/substrate-health-daily.{service,timer}). Per-row
+    CloudWatch metrics (AlphaEngine/Substrate) + existing alarms carry the
+    alerting independently of the SF, so this is a pure re-homing, not a loss
+    of observability.
+
+    Pins both halves of the change so a future edit can't silently
+    reintroduce the chain or leave a predecessor's edge dangling:
+    (1) all 7 removed state names are absent, (2) every predecessor that used
+    to feed CheckSkipDailySubstrateHealthCheck now routes straight to
+    StopTradingInstance.
+    """
+
+    _REMOVED_STATES = (
+        "CheckSkipDailySubstrateHealthCheck",
+        "DailySubstrateHealthCheck",
+        "WaitForDailySubstrateHealthCheck",
+        "CheckDailySubstrateHealthCheckStatus",
+        "DailySubstrateHealthCheckPollWait",
+        "SubstrateHealthCheckDegraded",
+        "PublishSubstrateHealthCheckDegradedAlert",
+    )
+
+    @pytest.mark.parametrize("removed", _REMOVED_STATES)
+    def test_state_absent(self, states, removed):
+        assert removed not in states, (
+            f"{removed} should have been removed (alpha-engine-config-I2722 "
+            "substrate-check spin-out) — found it still in step_function_eod.json."
+        )
+
+    def test_check_eod_status_success_rewired_to_stop_trading_instance(self, states):
+        succ = [c["Next"] for c in states["CheckEODStatus"]["Choices"]
+                if c.get("StringEquals") == "Success"]
+        assert succ == ["StopTradingInstance"]
+
+    def test_check_skip_eod_reconcile_skip_edge_rewired(self, states):
+        skip_choice = states["CheckSkipEODReconcile"]["Choices"][0]
+        assert skip_choice["Next"] == "StopTradingInstance"
+
+    @pytest.mark.parametrize(
+        "heal_state",
+        ["HealReplayDispatchFailed", "HealConvergedNotify", "HealNonConvergent"],
+    )
+    def test_heal_outcome_notifiers_rewired(self, states, heal_state):
+        st = states[heal_state]
+        assert st["Next"] == "StopTradingInstance"
+        catches = [c for c in st["Catch"] if c["ErrorEquals"] == ["States.ALL"]]
+        assert len(catches) == 1
+        assert catches[0]["Next"] == "StopTradingInstance"
+
+    def test_no_dangling_reference_to_removed_states_anywhere(self, states):
+        """No Next/Default/Choices[].Next/Catch[].Next in the WHOLE SF may
+        target any of the 7 removed states — a stricter, file-wide version of
+        the per-predecessor checks above."""
+        removed = set(self._REMOVED_STATES)
+
+        def _refs(state):
+            out = []
+            if "Next" in state:
+                out.append(state["Next"])
+            if "Default" in state:
+                out.append(state["Default"])
+            for c in state.get("Choices", []) or []:
+                if "Next" in c:
+                    out.append(c["Next"])
+            for c in state.get("Catch", []) or []:
+                if "Next" in c:
+                    out.append(c["Next"])
+            return out
+
+        dangling = {
+            name: [t for t in _refs(st) if t in removed]
+            for name, st in states.items()
+            if any(t in removed for t in _refs(st))
+        }
+        assert not dangling, f"dangling reference(s) to removed substrate states: {dangling}"

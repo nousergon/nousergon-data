@@ -1,17 +1,21 @@
-"""Pins the daily prediction-health producer wiring (config#1853).
+"""Pins the REMOVAL of PredictorHealthCheck + PredictorDriftCheck from the
+WEEKDAY SF, and their re-homing onto direct EventBridge triggers.
 
-Background: predictor/metrics/drift_{trading_day}.json is registered
-``cadence: eod_sf`` in ARTIFACT_REGISTRY.yaml (artifact_id
-predictor_drift_detection), but crucible-predictor#305 (config#1282) only
-added the ``action=check_drift`` handler branch — no Step Function state
-ever invoked it, so the artifact silently stopped being produced. This adds
-a fail-soft Lambda-invoke state, PredictorDriftCheck, immediately after
-PredictorHealthCheck (predictions for trading_day must already exist before
-drift can be scored against them) mirroring the existing fail-soft Catch
-pattern used elsewhere in this SF (e.g. ChronicGapSelfHeal, and
-PredictorHealthCheck's own Catch): a Lambda failure must never block the
-morning planner / order-placement path, since this is an observability
-producer, not a trading gate.
+Origin: alpha-engine-config-I2722 (Brian ruling 2026-07-16) — approach (a)/(b)
+per state, NO new bundled health SF (ARCHITECTURE §36: "adding redundant
+scheduled paths 'for safety' is the wrong fix"). Both states were non-blocking
+observability producers (config#1853 for the drift check), never trading
+gates, so a plain scheduled Lambda invoke is the correct-weight mechanism —
+see ``PredictorHealthCheckTrigger`` / ``PredictorDriftCheckTrigger`` in
+``infrastructure/cloudformation/alpha-engine-orchestration.yaml`` (13:40 UTC
+weekdays, after the preopen SF's observed ~13:15 P99 completion).
+
+This file previously pinned PredictorDriftCheck's wiring immediately after
+PredictorHealthCheck inside this SF (see git history for that version,
+superseded here) — both states are now DELETED. Their former predecessors
+(``CoverageGapChoice`` and ``FinalCoverageGate``, both Choice states whose
+Default used to be ``PredictorHealthCheck``) now Default straight to
+``CheckSkipMorningPlanner``.
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
+_CFN_PATH = (
+    _REPO_ROOT / "infrastructure" / "cloudformation" / "alpha-engine-orchestration.yaml"
+)
 
 
 @pytest.fixture(scope="module")
@@ -30,57 +37,65 @@ def states() -> dict:
     return json.loads(_SF_PATH.read_text())["States"]
 
 
-class TestPredictorDriftCheckWiredAfterHealthCheck:
-    def test_health_check_next_is_drift_check(self, states):
-        assert states["PredictorHealthCheck"]["Next"] == "PredictorDriftCheck"
+class TestPredictorHealthAndDriftCheckRemovedFromSF:
+    @pytest.mark.parametrize("name", ["PredictorHealthCheck", "PredictorDriftCheck"])
+    def test_state_absent(self, states, name):
+        assert name not in states, (
+            f"{name} must NOT be in the weekday SF — re-homed onto its own "
+            "direct EventBridge trigger (alpha-engine-config-I2722)."
+        )
 
-    def test_health_check_catch_also_routes_to_drift_check(self, states):
-        # A PredictorHealthCheck failure must still reach the drift-check
-        # producer, not skip straight to the planner — it's the same
-        # fail-soft posture, just re-pointed at the newly-inserted state.
-        catch_targets = [c["Next"] for c in states["PredictorHealthCheck"]["Catch"]]
-        assert catch_targets == ["PredictorDriftCheck"]
+    def test_coverage_gap_choice_defaults_to_morning_planner_gate(self, states):
+        assert states["CoverageGapChoice"]["Default"] == "CheckSkipMorningPlanner"
 
+    def test_final_coverage_gate_defaults_to_morning_planner_gate(self, states):
+        assert states["FinalCoverageGate"]["Default"] == "CheckSkipMorningPlanner"
 
-class TestPredictorDriftCheckTask:
-    def test_is_lambda_invoke(self, states):
-        state = states["PredictorDriftCheck"]
-        assert state["Type"] == "Task"
-        assert state["Resource"] == "arn:aws:states:::lambda:invoke"
+    def test_no_dangling_reference_to_removed_states(self, states):
+        def _targets(o):
+            out = []
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k in ("Next", "Default") and isinstance(v, str):
+                        out.append(v)
+                    else:
+                        out.extend(_targets(v))
+            elif isinstance(o, list):
+                for x in o:
+                    out.extend(_targets(x))
+            return out
 
-    def test_targets_same_lambda_alias_as_predictor_inference(self, states):
-        drift_fn = states["PredictorDriftCheck"]["Parameters"]["FunctionName"]
-        inference_fn = states["PredictorInference"]["Parameters"]["FunctionName"]
-        assert drift_fn == inference_fn
-        assert drift_fn == "alpha-engine-predictor-inference:live"
-
-    def test_invokes_check_drift_action(self, states):
-        payload = states["PredictorDriftCheck"]["Parameters"]["Payload"]
-        assert payload["action"] == "check_drift"
-
-    def test_date_payload_threads_trading_day_not_calendar_date(self, states):
-        # Must use the SF's own trading-day gate result (the day predictions
-        # were actually produced for), not a fresh wall-clock "today" that
-        # could straddle a midnight-crossing execution.
-        payload = states["PredictorDriftCheck"]["Parameters"]["Payload"]
-        assert payload["date.$"] == "$.trading_day_gate.Payload.check_date"
-
-    def test_proceeds_to_morning_planner_gate_on_success(self, states):
-        assert states["PredictorDriftCheck"]["Next"] == "CheckSkipMorningPlanner"
+        for name, st in states.items():
+            for t in _targets(st):
+                assert t not in ("PredictorHealthCheck", "PredictorDriftCheck"), (
+                    f"{name} references removed state {t!r}"
+                )
 
 
-class TestPredictorDriftCheckFailSoft:
-    def test_catch_all_errors(self, states):
-        catches = states["PredictorDriftCheck"]["Catch"]
-        assert len(catches) == 1
-        assert catches[0]["ErrorEquals"] == ["States.ALL"]
+class TestReHomedOntoDirectEventBridgeTriggers:
+    """The two removed states' invocation shape (function alias + Payload
+    action) is preserved verbatim on their new standalone EventBridge rules —
+    only the trigger mechanism changed, not what gets invoked."""
 
-    def test_catch_routes_to_the_same_next_state_as_success(self, states):
-        # Fail-soft: whatever normally follows PredictorHealthCheck's
-        # producer chain today (CheckSkipMorningPlanner) must still run
-        # even if the drift-check Lambda errors.
-        state = states["PredictorDriftCheck"]
-        assert state["Catch"][0]["Next"] == state["Next"] == "CheckSkipMorningPlanner"
+    @pytest.fixture(scope="class")
+    def cfn_text(self) -> str:
+        return _CFN_PATH.read_text()
 
-    def test_catch_has_dedicated_resultpath(self, states):
-        assert states["PredictorDriftCheck"]["Catch"][0]["ResultPath"] == "$.predictor_drift_error"
+    def test_predictor_health_check_trigger_present(self, cfn_text):
+        assert "PredictorHealthCheckTrigger:" in cfn_text
+        assert "alpha-engine-predictor-health-check:live" in cfn_text
+        assert '"action": "check"' in cfn_text
+
+    def test_predictor_drift_check_trigger_present(self, cfn_text):
+        assert "PredictorDriftCheckTrigger:" in cfn_text
+        assert '"action": "check_drift"' in cfn_text
+
+    def test_both_triggers_fire_after_preopen_p99(self, cfn_text):
+        # 13:40 UTC — after the preopen SF's observed ~13:15 UTC P99
+        # completion, so both checks observe the same trading_day artifacts
+        # they used to score inside the SF.
+        assert cfn_text.count("cron(40 13 ? * MON-FRI *)") == 2
+
+    def test_both_triggers_grant_lambda_permission(self, cfn_text):
+        assert "PredictorHealthCheckTriggerPermission:" in cfn_text
+        assert "PredictorDriftCheckTriggerPermission:" in cfn_text
