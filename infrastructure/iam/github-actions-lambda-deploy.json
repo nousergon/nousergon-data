@@ -128,6 +128,12 @@
       ]
     },
     {
+      "Sid": "InfraDeployValidateSFDefinition",
+      "Effect": "Allow",
+      "Action": "states:ValidateStateMachineDefinition",
+      "Resource": "*"
+    },
+    {
       "Sid": "InfraDeployResourceCRUD",
       "Effect": "Allow",
       "Action": [
