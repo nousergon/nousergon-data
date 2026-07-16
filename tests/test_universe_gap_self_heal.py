@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from builders.daily_append import UniverseFreshnessViolation
 from nousergon_lib.trading_calendar import previous_trading_day
 
 from weekly_collector import (
@@ -179,9 +180,28 @@ class TestDetectFallbackQualityUniverseDays:
 
 
 class TestSelfHealMissingUniverseDays:
-    def _patches(self, missing, append_status="ok", fallback_quality=None):
+    def _patches(
+        self, missing, append_status="ok", fallback_quality=None,
+        freshness_violation_symbols=None,
+    ):
         collect = MagicMock(return_value={"status": "ok"})
-        append = MagicMock(return_value={"status": append_status})
+        if freshness_violation_symbols is not None:
+            # config#2685: the target-date write itself succeeded, but the
+            # post-write whole-universe scan found an UNRELATED stale
+            # symbol — daily_append raises UniverseFreshnessViolation
+            # rather than returning, same as the live incident (JHG/BLD).
+            stale_symbols = [
+                {"symbol": s, "last_date": "2026-07-10", "age_trading_days": 5}
+                for s in freshness_violation_symbols
+            ]
+            append = MagicMock(
+                side_effect=UniverseFreshnessViolation(
+                    "Universe-freshness scan: unrelated stale symbol(s)",
+                    stale_symbols=stale_symbols,
+                )
+            )
+        else:
+            append = MagicMock(return_value={"status": append_status})
         loader = MagicMock(return_value=({"AAA", "BBB"}, "2026-06-19"))
         return (
             patch("weekly_collector._detect_missing_universe_days", return_value=missing),
@@ -238,6 +258,22 @@ class TestSelfHealMissingUniverseDays:
             summary = _self_heal_missing_universe_days("bkt", TARGET, config={}, max_heal_days=1)
         assert summary["healed_days"] == []
         assert summary["errors"] and "status=failed" in summary["errors"][0]["reason"]
+
+    def test_unrelated_stale_ticker_does_not_misreport_a_successful_heal(self):
+        """config#2685: daily_append()'s post-write whole-universe freshness
+        scan can find a symbol unrelated to the just-healed day's own write
+        stale (2026-07-15 live incident: JHG/BLD). That must not misreport
+        `day`'s successful write as a heal error — the day still lands in
+        `healed_days`, and no entry is added to `errors`."""
+        p_det, p_fq, p_col, p_app, p_ldr, p_b3, collect, append = self._patches(
+            ["2026-06-24"], freshness_violation_symbols=["JHG", "BLD"]
+        )
+        with p_det, p_fq, p_col, p_app, p_ldr, p_b3:
+            summary = _self_heal_missing_universe_days(
+                "bkt", TARGET, config={}, max_heal_days=1
+            )
+        assert [h["date"] for h in summary["healed_days"]] == ["2026-06-24"]
+        assert summary["errors"] == []
 
     # ── config#2664: fallback-quality days folded into the same heal ────────
 
