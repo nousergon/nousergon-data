@@ -1,10 +1,28 @@
 name: Canary Replay
 
-# Per-PR gate for alpha-engine-config#2246 (Saturday-replay canary). Gated
-# on the `canary:replay` label (auto-applied by label-canary-replay.yml on
-# weekly-critical paths). Thin GHA shim on this PUBLIC repo (free/unmetered
-# hosted runner) — the actual probe workload runs on EC2 spot, dispatched
-# via alpha-engine-canary-replay-dispatcher (this repo). Brian's binding
+# Per-PR gate for alpha-engine-config#2246 (Saturday-replay canary). Single
+# workflow with two jobs — `label` decides (via path filter) whether this
+# PR touches weekly-critical paths and applies the `canary:replay` label;
+# `canary` dispatches the actual probe run, gated on `label`'s own output
+# OR a pre-existing label (e.g. applied manually by a human on an earlier
+# run). This used to be two separate workflow files connected by a
+# `labeled` trigger: label-canary-replay.yml applied the label with the
+# default GITHUB_TOKEN, and canary-replay.yml re-triggered on `labeled` to
+# see it. GitHub Actions' anti-recursion protection means a `labeled` event
+# caused by the default GITHUB_TOKEN never starts a new workflow run, so
+# that second run never fired — a PR opened once (no follow-up push) would
+# never get gated (alpha-engine-config#2691). Consuming the label job's
+# output directly, in the same run, makes that cross-workflow-trigger
+# dependency structurally impossible.
+#
+# Path list MUST stay in lockstep with what
+# alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh's
+# probe 1 actually exercises: a change to any of these could regress what
+# the Saturday weekly-SF's filing-change-detection step executes.
+#
+# Thin GHA shim on this PUBLIC repo (free/unmetered hosted runner) — the
+# actual probe workload runs on EC2 spot, dispatched via
+# alpha-engine-canary-replay-dispatcher (this repo). Brian's binding
 # ruling: the canary ALWAYS runs all 3 probes together regardless of which
 # repo's PR triggered it, so this shim supplies ITS OWN branch as data_ref
 # and lets research_ref default to main on the dispatcher side.
@@ -41,10 +59,44 @@ concurrency:
 permissions:
   id-token: write
   contents: read
+  pull-requests: write
 
 jobs:
+  label:
+    # The `labeled` trigger type fires for ANY label added to the PR, not
+    # just `canary:replay` — without this guard, an unrelated label (e.g.
+    # a triage bot applying `source:groom` moments after pushing the PR's
+    # head commit) fires a SECOND, near-simultaneous workflow run for the
+    # same SHA alongside the `synchronize`-triggered run already in
+    # flight. Both reach the `canary` job and race the dispatcher's
+    # per-run-token dedupe, so one of them gets declined with
+    # `concurrent_skip` and (pre-fix) hard-failed the check even though
+    # the other run's dispatch was legitimate (alpha-engine-config#2570).
+    if: github.event.action != 'labeled' || github.event.label.name == 'canary:replay'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      weekly_critical: ${{ steps.filter.outputs.weekly_critical }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            weekly_critical:
+              - 'rag/pipelines/**'
+              - 'infrastructure/lambdas/canary-replay-dispatcher/**'
+              - 'infrastructure/lambdas/canary-replay-liveness-probe/**'
+              - '.github/workflows/canary-replay.yml'
+      - name: Apply canary:replay label
+        if: steps.filter.outputs.weekly_critical == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr edit "${{ github.event.pull_request.number }}" --add-label canary:replay
+
   canary:
-    if: contains(github.event.pull_request.labels.*.name, 'canary:replay')
+    needs: label
+    if: needs.label.outputs.weekly_critical == 'true' || contains(github.event.pull_request.labels.*.name, 'canary:replay')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -90,29 +142,64 @@ jobs:
           cat "$RESP"
 
           LAUNCHED=$(jq -r '.launched' "$RESP")
+          REASON=$(jq -r '.reason' "$RESP")
           if [ "$LAUNCHED" != "true" ]; then
-            echo "::error::canary-replay-dispatcher declined to launch: $(cat "$RESP")"
-            exit 1
+            if [ "$REASON" = "concurrent_skip" ]; then
+              # Another dispatch for this exact PR+SHA is already in flight
+              # (e.g. a duplicate/near-simultaneous webhook delivery) — the
+              # dispatcher's own dedupe is authoritative that a run WILL
+              # produce this run_token's marker, so poll for it below
+              # instead of hard-failing a check the other run is already
+              # servicing.
+              echo "canary already in flight for this PR+SHA (reason=concurrent_skip) — polling its marker instead of failing"
+            else
+              echo "::error::canary-replay-dispatcher declined to launch: $(cat "$RESP")"
+              exit 1
+            fi
           fi
           MARKER_KEY=$(jq -r '.marker_key' "$RESP")
+          # `// 0` degrades safely if the dispatcher Lambda hasn't been
+          # redeployed with dispatched_at yet (config-I2753 rollout: this
+          # workflow and the Lambda deploy don't have to land in lockstep)
+          # — 0 makes the freshness check below always pass, matching the
+          # pre-fix behavior, rather than a bare `null` breaking the awk
+          # numeric comparison and timing out every run.
+          DISPATCHED_AT=$(jq -r '.dispatched_at // 0' "$RESP")
           echo "marker_key=${MARKER_KEY}" >> "$GITHUB_OUTPUT"
+          echo "dispatched_at=${DISPATCHED_AT}" >> "$GITHUB_OUTPUT"
 
       - name: Poll for completion marker
         if: steps.aws_creds.outcome == 'success'
         run: |
           MARKER_KEY="${{ steps.dispatch.outputs.marker_key }}"
+          DISPATCHED_AT="${{ steps.dispatch.outputs.dispatched_at }}"
           DEADLINE=$((SECONDS + 1200))
           while [ "$SECONDS" -lt "$DEADLINE" ]; do
             if aws s3api head-object --bucket alpha-engine-research --key "$MARKER_KEY" --region us-east-1 >/dev/null 2>&1; then
               aws s3 cp "s3://alpha-engine-research/${MARKER_KEY}" marker.json --region us-east-1 --quiet
-              cat marker.json
-              STATUS=$(jq -r '.overall_status' marker.json)
-              echo "canary overall_status=${STATUS}"
-              if [ "$STATUS" = "PASS" ]; then
-                exit 0
+              # config-I2753 defense-in-depth: marker_key is deterministic
+              # per (repo, PR, sha) — the dispatcher now deletes any
+              # pre-existing marker before launching (primary fix), but this
+              # is a cheap, load-bearing second check: never trust a marker
+              # OLDER than this dispatch's own launch. Root-caused live
+              # 2026-07-17 (crucible-research#444) — a poller accepted a
+              # ~23h-stale FAIL marker within 2s of dispatch while the
+              # freshly-launched box went on to genuinely PASS 5.5 minutes
+              # later, too late for anyone to see. Fail LATE (timeout)
+              # rather than fail WRONG (stale verdict).
+              FINISHED_AT=$(jq -r '.finished_at // 0' marker.json)
+              if awk -v f="$FINISHED_AT" -v d="$DISPATCHED_AT" 'BEGIN { exit !(f >= d) }'; then
+                cat marker.json
+                STATUS=$(jq -r '.overall_status' marker.json)
+                echo "canary overall_status=${STATUS}"
+                if [ "$STATUS" = "PASS" ]; then
+                  exit 0
+                else
+                  echo "::error::canary replay FAILED — see marker.json above for per-probe detail"
+                  exit 1
+                fi
               else
-                echo "::error::canary replay FAILED — see marker.json above for per-probe detail"
-                exit 1
+                echo "stale marker at ${MARKER_KEY} (finished_at=${FINISHED_AT} < dispatched_at=${DISPATCHED_AT}) — ignoring, still waiting for this dispatch's own marker"
               fi
             fi
             sleep 20

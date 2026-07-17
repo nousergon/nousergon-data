@@ -1,0 +1,102 @@
+# Nousergon Overseer playbook registry — SSoT for the fleet's failure-response
+# paths (alpha-engine-config-I2823, epic alpha-engine-config-I2821).
+#
+# Consumed by:
+#   - infrastructure/lambdas/overseer-dispatcher (bundled into its zip at
+#     deploy time) — routes dispatch requests to the executor Lambda and
+#     handles verdict escalation.
+#   - tests/test_overseer_playbook_registry.py — schema + cross-reference
+#     contract (executor lambda dirs exist, benign_reasons present on routed
+#     entries).
+#
+# Contract: playbooks.schema.json (sibling file). Additive-only evolution —
+# new OPTIONAL fields are fine; renames/removals require a schema_version bump
+# and a dispatcher release that reads both.
+#
+# `routed: false` entries are inventory-only: they appear here so the registry
+# is the ONE place the watch plane's surface is enumerated (probes/alarms/
+# dashboards can iterate it), but the overseer-dispatcher refuses to route to
+# them (they have their own trigger topology, e.g. groom's demand-driven
+# EventBridge cron — a cron→router hop would add a failure mode with zero
+# routing decisions to make).
+
+schema_version: 1
+
+playbooks:
+  sf-watch:
+    description: >-
+      Diagnose+fix+rerun agent for a fleet Step Function terminal failure.
+      Triage/suppression policy (watch-log, attempt ceilings, fast path) lives
+      UPSTREAM in alpha-engine-saturday-sf-watch-dispatcher; this playbook is
+      the launch leg it dispatches when an agent is warranted.
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-sf-watch-spot-dispatcher
+    executor_lambda_dir: sf-watch-spot-dispatcher
+    # Executor verdict `reason` values that are by-design declines — the
+    # router treats them as success (no P1, no page). Anything else with
+    # launched!=true escalates. NOTE: unlike ci-watch, this executor has no
+    # `concurrent_skip` — defer-not-drop (config#2226) replaced it with
+    # `deferred`/`recovered` (+ `drill_concurrent_skip` for drills); the
+    # registry lockstep test pins this list to the executor's literals.
+    benign_reasons: [disabled, deferred, recovered, drill_concurrent_skip]
+    charter: alpha-engine-config/.github/sf-watch-prompt.md
+    concurrency_domain: >-
+      EC2 tag lock on (cadence_slug, pipeline_name, run_date); defer-not-drop
+      via one-shot EventBridge Scheduler self-reinvoke (config#2226).
+    supports_drill: true
+    kill_switch_env: SF_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
+
+  ci-watch:
+    description: >-
+      Diagnose+fix agent for a fleet main-branch CI failure. Fired from GHA
+      (nousergon-lib notify-ci-failure.yml -> repository_dispatch ->
+      sf-watch.yml ci-watch-dispatch job -> this router).
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-ci-watch-dispatcher
+    executor_lambda_dir: ci-watch-dispatcher
+    benign_reasons: [concurrent_skip, disabled]
+    charter: alpha-engine-config/.github/ci-watch-prompt.md
+    concurrency_domain: EC2 tag lock on (repo, sha) — per-commit, not per-repo.
+    supports_drill: true
+    kill_switch_env: CI_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
+
+  alert-drain:
+    description: >-
+      Twice-daily Overseer alert-drain (epic I2821 phase 3, config-I2824):
+      consumes the nousergon-overseer-intake queue + S3 fallback, classifies
+      incidents into the T0-T3 authority tiers per the alert-drain charter,
+      acts within charter authority (v1: PRs, issues, SF reruns only), writes
+      the drain ledger. Fired by EventBridge Scheduler (10:00 + 22:00 UTC)
+      THROUGH this router.
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-alert-drain-dispatcher
+    executor_lambda_dir: alert-drain-dispatcher
+    benign_reasons: [concurrent_skip, disabled]
+    charter: alpha-engine-config/.github/alert-drain-prompt.md
+    concurrency_domain: >-
+      Single lane — EC2 tag lock on Name=alpha-engine-alert-drain-spot (one
+      drain at a time; overlap would double-process queue messages).
+    supports_drill: true
+    kill_switch_env: ALERT_DRAIN_DISPATCH_ENABLED
+
+  groom:
+    description: >-
+      Demand-driven backlog groom (three daily EventBridge cron triggers,
+      symmetric demand evaluation, pace gate). Inventory-only here: its
+      trigger topology is scheduler-driven with zero routing decisions, so it
+      keeps its direct EventBridge->Lambda path.
+    tier: T2
+    routed: false
+    enabled: true
+    executor_function: alpha-engine-scheduled-groom-dispatcher
+    executor_lambda_dir: scheduled-groom-dispatcher
+    charter: alpha-engine-config/scripts/groom_run.sh
+    concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
+    supports_drill: false
+    kill_switch_env: GROOM_DISPATCH_ENABLED

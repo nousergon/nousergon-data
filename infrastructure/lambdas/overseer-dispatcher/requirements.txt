@@ -1,0 +1,8 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# Registry parsing (playbooks.yaml bundled at deploy).
+pyyaml>=6.0
+# krepis.alerts.publish is the loud-page escalation leg; >=0.15.0 so the page
+# ALSO lands on the nousergon-alerts intake bus as a structured event
+# (Overseer phase 1, alpha-engine-config-I2822).
+krepis>=0.15.0
