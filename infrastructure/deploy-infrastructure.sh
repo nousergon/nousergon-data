@@ -340,6 +340,48 @@ update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post
 # why PRs #761 and #763's SF definition fixes had zero live effect on actual groom runs.
 update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Backlog groom dispatch" "$GROOM_LOGGING_CONFIG"
 
+# ── 3b. Ensure EventBridge Scheduler trust on the SF-target role (config#2413) ─
+# The CFN template's WeekdayPipelineSchedule (AWS::Scheduler::Schedule, migrated
+# from AWS::Events::Rule in #816) is fired by EventBridge Scheduler, which — at
+# CreateSchedule/UpdateSchedule time — validates that its RoleArn
+# (EventBridgeSfnRoleArn → alpha-engine-eventbridge-sfn-role) is assumable by
+# scheduler.amazonaws.com. Before #816 this role backed only AWS::Events::Rule
+# targets, so its trust policy listed only events.amazonaws.com. The
+# scheduler.amazonaws.com grant was added ONLY to the manual deploy_step_function.sh
+# (no CI workflow runs it) — so the FIRST post-merge run of THIS workflow deploys
+# the Scheduler resource against a role that does not yet trust it, and the CREATE
+# rolls the stack back (UPDATE_ROLLBACK_COMPLETE). A `--no-execute-changeset` dry
+# run does NOT exercise the target-role trust, which is why #816 validated clean
+# but failed on live apply.
+#
+# Ensuring the trust HERE — idempotently, before the CFN deploy, mirroring the
+# log-group prerequisites above and deploy_step_function.sh's own bootstrap —
+# makes this workflow self-sufficient: it no longer depends on a human having run
+# deploy_step_function.sh out-of-band, and it survives a role/DR rebuild. The role
+# is shared by BOTH the still-live SaturdayTrigger (events.amazonaws.com) and the
+# now-Scheduler weekday trigger (scheduler.amazonaws.com), so both principals must
+# be listed. update-assume-role-policy is idempotent (writes the full document);
+# the role always exists live (SaturdayTrigger depends on it), so no create-role
+# is attempted here — that keeps the GHA deploy role's IAM grant minimal
+# (iam:UpdateAssumeRolePolicy on this one role — see
+# infrastructure/iam/github-actions-lambda-deploy.json).
+EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
+EB_TRUST='{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"Service": ["events.amazonaws.com", "scheduler.amazonaws.com"]},
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}'
+echo "  Ensuring $EB_ROLE_NAME trusts events.amazonaws.com + scheduler.amazonaws.com (idempotent)..."
+aws iam update-assume-role-policy \
+    --role-name "$EB_ROLE_NAME" \
+    --policy-document "$EB_TRUST" \
+    --region "$REGION"
+
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""
 echo "==> Deploying CloudFormation stack..."
