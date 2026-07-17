@@ -2,12 +2,17 @@
 boto3>=1.34.0
 # nousergon_lib.spot_dispatch (config#2106) wraps krepis.ec2_spot (the
 # spot-launch capacity-resilience chokepoint) — SAME pin as
-# sf-watch-spot-dispatcher. v0.106.0 is the first version whose
-# running_instance_ids raises SpotProbeError instead of failing open
-# (config#2267 site 1) — index.py imports and handles that exception, so
-# this pin GATES on the nousergon-lib v0.106.0 tag existing (lib PR must
-# merge + tag before this deploys). No [flow-doctor] extra needed — this
-# Lambda sends no Telegram of its own (the synchronous GHA caller reads the
-# return value directly; see index.py docstring).
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.106.0
-krepis>=0.10.2
+# sf-watch-spot-dispatcher. v0.122.0 is the tag on nousergon-lib#187's merge
+# commit, the first version whose launch_with_fallback accepts extra_tags
+# (config#2292 root fix for config#2267 site 2 — discriminator tags now
+# ride the RunInstances launch call atomically instead of a separate
+# post-launch create_tags call) — index.py's _launch_instance passes them
+# that way. (v0.108.0 was claimed by an unrelated PR, config#2372, before
+# #187 merged; nousergon-lib's merge-time auto-bump landed the extra_tags
+# feature at v0.122.0 instead — this pin was updated to match.)
+# krepis>=0.12.0 is the matching floor (first version whose ec2_spot.launch
+# accepts extra_tags). No [flow-doctor] extra needed — this Lambda sends no
+# Telegram of its own (the synchronous GHA caller reads the return value
+# directly; see index.py docstring).
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.122.0
+krepis>=0.12.0
