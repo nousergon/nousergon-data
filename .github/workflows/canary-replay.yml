@@ -52,10 +52,17 @@ on:
 # data-transfer quota (config-I2780). The newest head is the only one whose
 # verdict matters; cancel the stale poll and let the dispatcher's server-side
 # dedupe decline the stale launch.
-concurrency:
-  group: canary-replay-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
+#
+# This MUST be job-level (see `concurrency:` under `label`/`canary` below),
+# NOT workflow-level. Workflow-level concurrency is evaluated the instant a
+# run is triggered, before any job `if:` condition — so a `labeled` event
+# for an UNRELATED label (e.g. a triage bot applying `source:groom` moments
+# after the PR opens) would cancel a genuinely in-flight `opened`-triggered
+# run even though the unrelated-label run's own jobs are guarded to do
+# nothing. That cancellation surfaced as permanently-red `canary`/`label`
+# required checks on PRs the groom bot labels right after opening. A
+# job-level group is only entered when that job actually runs, so a job
+# skipped by its own `if:` never cancels another run's in-flight job.
 permissions:
   id-token: write
   contents: read
@@ -73,6 +80,9 @@ jobs:
     # `concurrent_skip` and (pre-fix) hard-failed the check even though
     # the other run's dispatch was legitimate (alpha-engine-config#2570).
     if: github.event.action != 'labeled' || github.event.label.name == 'canary:replay'
+    concurrency:
+      group: canary-replay-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -97,6 +107,9 @@ jobs:
   canary:
     needs: label
     if: needs.label.outputs.weekly_critical == 'true' || contains(github.event.pull_request.labels.*.name, 'canary:replay')
+    concurrency:
+      group: canary-replay-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
