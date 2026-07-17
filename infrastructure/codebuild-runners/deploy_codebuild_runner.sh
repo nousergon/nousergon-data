@@ -71,11 +71,13 @@ PROJECT_JSON=$(cat <<JSON
 }
 JSON
 )
+PROJECT_JSON_FILE="$(mktemp)"; trap 'rm -f "$PROJECT_JSON_FILE"' EXIT
+printf '%s' "$PROJECT_JSON" > "$PROJECT_JSON_FILE"
 if aws codebuild batch-get-projects --names "$PROJECT" --query 'projects[0].name' --output text 2>/dev/null | grep -q "$PROJECT"; then
-  echo "$PROJECT_JSON" | aws codebuild update-project --cli-input-json file:///dev/stdin >/dev/null
+  aws codebuild update-project --cli-input-json "file://${PROJECT_JSON_FILE}" >/dev/null
   echo "[codebuild-runner] updated project ${PROJECT}"
 else
-  echo "$PROJECT_JSON" | aws codebuild create-project --cli-input-json file:///dev/stdin >/dev/null
+  aws codebuild create-project --cli-input-json "file://${PROJECT_JSON_FILE}" >/dev/null
   echo "[codebuild-runner] created project ${PROJECT}"
 fi
 
