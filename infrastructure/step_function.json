@@ -563,7 +563,7 @@
     },
     "SubstrateHealthGate": {
       "Type": "Task",
-      "Comment": "config#2249: fast pre-dispatch substrate health gate, immediately before MorningEnrich (the first state to actually dispatch work to the Saturday box). A dead/unhealthy dispatch box (disk full, or the SSM agent wedged/unresponsive so a command silently never registers) used to be discovered only after MorningEnrich burned its full 'gold 4+2' retry ladder (config#2279, up to ~15 min) before falling into the generic PipelineFailure path. This ONE Lambda invocation issues its own tiny SSM `df` probe command and polls it to a terminal status internally (bounded well under this Task's own TimeoutSeconds), returning verdict=HEALTHY or verdict=SUBSTRATE_UNHEALTHY with a distinct reason (disk_full / ssm_unresponsive / ssm_command_never_registered) — see infrastructure/lambdas/substrate-health-gate/index.py. Deliberately a SEPARATE fast pre-check, not a replacement for MorningEnrich's own resilience: MorningEnrich keeps its full retry ladder for real transient issues once dispatch is confirmed healthy. Adds ~10-20s to every Saturday run (accepted — the Saturday run has slack, unlike the tight weekday pre-open buffer; NOT wired into the weekday SF).",
+      "Comment": "config#2249: fast pre-dispatch substrate health gate, immediately before MorningEnrich (the first state to actually dispatch work to the Saturday box). A dead/unhealthy dispatch box (disk full, or the SSM agent wedged/unresponsive so a command silently never registers) used to be discovered only after MorningEnrich burned its full 'gold 4+2' retry ladder (config#2279, up to ~15 min) before falling into the generic PipelineFailure path. This ONE Lambda invocation issues its own tiny SSM `df` probe command and polls it to a terminal status internally (bounded well under this Task's own TimeoutSeconds), returning verdict=HEALTHY or verdict=SUBSTRATE_UNHEALTHY with a distinct reason (disk_full / ssm_unresponsive / ssm_command_never_registered) — see infrastructure/lambdas/substrate-health-gate/index.py. Deliberately a SEPARATE fast pre-check, not a replacement for MorningEnrich's own resilience: MorningEnrich keeps its full retry ladder for real transient issues once dispatch is confirmed healthy. Adds ~10-20s to every Saturday run (accepted — the Saturday run has slack, unlike the tight weekday pre-open buffer; NOT wired into the weekday SF). ResultSelector captures the WHOLE Lambda payload under .gate (verdict/message/reason/disk_used_percent/...) rather than cherry-picking $.Payload.<key>: the Lambda's documented contract emits `reason` ONLY on the SUBSTRATE_UNHEALTHY verdicts, so a prior per-key select of `reason.$: $.Payload.reason` crashed EVERY healthy run with States.Runtime '$.Payload.reason could not be found' (the gate could never pass on a healthy box — surfaced by the 2026-07-17 Friday preflight shell run). Passthrough lets each consumer read only fields the producer guarantees for its branch (Choice reads .gate.verdict; the non-HEALTHY Extract reads .gate.reason). Contract regression-guarded by tests/test_sf_substrate_gate_contract_wiring.py.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-substrate-health-gate",
@@ -595,9 +595,7 @@
         }
       ],
       "ResultSelector": {
-        "verdict.$": "$.Payload.verdict",
-        "reason.$": "$.Payload.reason",
-        "message.$": "$.Payload.message"
+        "gate.$": "$.Payload"
       },
       "ResultPath": "$.substrate_gate_result",
       "Next": "CheckSubstrateHealthGate"
@@ -607,8 +605,16 @@
       "Comment": "config#2249: branches on SubstrateHealthGate's verdict. HEALTHY -> proceed into MorningEnrich as normal. SUBSTRATE_UNHEALTHY (any reason) -> short-circuit straight to the named-failure path WITHOUT ever entering MorningEnrich's own retry ladder — the whole point is failing fast (<2 min) instead of burning ~15 min discovering the same dead box via 4 retries.",
       "Choices": [
         {
-          "Variable": "$.substrate_gate_result.verdict",
-          "StringEquals": "HEALTHY",
+          "And": [
+            {
+              "Variable": "$.substrate_gate_result.gate.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.substrate_gate_result.gate.verdict",
+              "StringEquals": "HEALTHY"
+            }
+          ],
           "Next": "MorningEnrich"
         }
       ],
@@ -620,9 +626,9 @@
       "Parameters": {
         "phase": "SubstrateHealthGate",
         "source": "SubstrateHealthGate",
-        "verdict.$": "$.substrate_gate_result.verdict",
-        "reason.$": "$.substrate_gate_result.reason",
-        "detail.$": "$.substrate_gate_result.message"
+        "verdict.$": "$.substrate_gate_result.gate.verdict",
+        "reason.$": "$.substrate_gate_result.gate.reason",
+        "detail.$": "$.substrate_gate_result.gate.message"
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
