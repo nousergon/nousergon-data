@@ -651,6 +651,44 @@ def write_inst_ownership_parquet(
     return artifact_key
 
 
+def read_inst_ownership_parquet(
+    *,
+    s3_client: Any,
+    bucket: str = DEFAULT_S3_BUCKET,
+    prefix: str = DEFAULT_S3_PREFIX,
+) -> pd.DataFrame:
+    """Consumer-side read. Resolves the canonical artifact via the
+    ``latest.json`` sidecar (same shape/convention as
+    ``news_aggregates.read_news_aggregates_parquet``).
+
+    Used by ``rag/pipelines/ingest_13f.py`` (config#2428) to source the
+    per-ticker QoQ summary it converts into RAG document chunks, and by
+    ``crucible-research``'s ``data.substrate.reader.read_inst_ownership``
+    (a separate copy of the same ``latest.json``-sidecar read, since that
+    repo consumes the parquet without importing this module directly).
+
+    Returns an empty DataFrame with the canonical schema when no
+    artifact exists (e.g. the SEC quarter hasn't been published yet, or
+    ``compute_and_write_inst_ownership`` hasn't run this quarter).
+    """
+    latest_key = f"{prefix}/latest.json"
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=latest_key)
+        sidecar = json.loads(obj["Body"].read())
+        artifact_key = sidecar.get("artifact_key")
+        if artifact_key:
+            body = s3_client.get_object(Bucket=bucket, Key=artifact_key)
+            return pd.read_parquet(io.BytesIO(body["Body"].read()), engine="pyarrow")
+    except Exception as e:
+        logger.info(
+            "[inst_ownership] canonical sidecar read failed for %s (%s)",
+            latest_key, type(e).__name__,
+        )
+
+    cols = list(InstOwnershipRow.__dataclass_fields__.keys())
+    return pd.DataFrame(columns=cols)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # End-to-end orchestrator
 # ═══════════════════════════════════════════════════════════════════

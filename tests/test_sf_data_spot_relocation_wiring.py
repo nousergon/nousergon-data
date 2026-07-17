@@ -90,11 +90,13 @@ class TestWeekdaySpotStatesPresent:
         assert st["Type"] == "Task"
         assert st["Resource"] == _LAMBDA_INVOKE
         assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
-        # Each launch selects exactly one workload.
-        assert set(st["Parameters"]["Payload"]) == {"workload"}
         assert st["Parameters"]["Payload"]["workload"] in {
             "morning-enrich", "morning-arctic-append"
         }
+        # config#2542: force_on_demand.$ threads the retry-budget's on-demand
+        # override into the dispatcher (see TestWeekdayDataSpotRetryBudget),
+        # mirroring the EOD launch states.
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, daily, name):
@@ -145,7 +147,11 @@ class TestWeekdayFailureIsolation:
     """Deliverable #4 (LOAD-BEARING): a data-spot failure must NOT block daemon
     start — it routes to the continue path, never HandleFailure."""
 
-    _CONTINUE = "CheckSkipChronicGapHeal"
+    # alpha-engine-config-I2717 (2026-07-16): the continue path used to be the
+    # CheckSkipChronicGapHeal gate; that gate (and the heal behind it) was
+    # removed entirely — the continue path now rejoins directly at
+    # CheckSkipPredictorInference.
+    _CONTINUE = "CheckSkipPredictorInference"
 
     def test_launch_catch_is_fail_open(self, daily):
         for name in ("LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"):
@@ -166,8 +172,11 @@ class TestWeekdayFailureIsolation:
 
     def test_status_default_is_fail_open_not_handlefailure(self, daily):
         # The OLD on-trading CheckMorningEnrichStatus Default was HandleFailure.
-        # The spot status check Default must be the fail-open normalizer instead.
-        for name in ("CheckMorningEnrichSpotStatus", "CheckMorningArcticAppendSpotStatus"):
+        # The spot status check Default must route to the retry-budget check
+        # (config#2542) — itself always fail-open, never HandleFailure.
+        assert daily["CheckMorningEnrichSpotStatus"]["Default"] == "CheckMorningEnrichRetryBudget"
+        assert daily["CheckMorningArcticAppendSpotStatus"]["Default"] == "CheckMorningArcticAppendRetryBudget"
+        for name in ("CheckMorningEnrichRetryBudget", "CheckMorningArcticAppendRetryBudget"):
             assert daily[name]["Default"] == "ExtractDataSpotError"
             assert daily[name]["Default"] not in _HALT
 
@@ -186,11 +195,15 @@ class TestWeekdayFailureIsolation:
         """Exhaustive: walking every data-spot state's targets, none escapes to a
         HALT state (HandleFailure/FailExecution)."""
         data_states = [
+            "InitMorningEnrichRetryCounter",
             "LaunchMorningEnrichSpot", "CheckMorningEnrichSpotLaunched",
             "PollMorningEnrichSpot", "CheckMorningEnrichSpotStatus", "MorningEnrichSpotWait",
+            "CheckMorningEnrichRetryBudget", "IncrementMorningEnrichRetry",
+            "InitMorningArcticAppendRetryCounter",
             "LaunchMorningArcticAppendSpot", "CheckMorningArcticAppendSpotLaunched",
             "PollMorningArcticAppendSpot", "CheckMorningArcticAppendSpotStatus",
             "MorningArcticAppendSpotWait",
+            "CheckMorningArcticAppendRetryBudget", "IncrementMorningArcticAppendRetry",
             "ExtractDataSpotError", "PublishDataSpotFailureImmediate",
         ]
         for name in data_states:
@@ -206,6 +219,70 @@ class TestWeekdayFailureIsolation:
         assert daily["CheckSkipMorningEnrich"]["Choices"][0]["Next"] == self._CONTINUE
         for gate in ("CheckMorningEnrichSpotLaunched", "CheckMorningArcticAppendSpotLaunched"):
             assert daily[gate]["Default"] == self._CONTINUE
+
+
+class TestWeekdayDataSpotRetryBudget:
+    """config#2542: audit of the SAME spot-reclaim/hard-fail bug class fixed for
+    EOD by PR813 (2026-07-14 incident) — a spot-reclaimed morning-enrich or
+    morning-arctic-append workload gets ONE relaunch-on-a-fresh-box retry
+    before the pipeline accepts the failure and falls through to the
+    pre-existing fail-open path. Mirrors TestEODDataSpotRetryBudget exactly."""
+
+    def test_retry_counters_initialized_before_first_launch(self, daily):
+        assert daily["CheckSkipMorningEnrich"]["Default"] == "InitMorningEnrichRetryCounter"
+        assert daily["InitMorningEnrichRetryCounter"]["Type"] == "Pass"
+        assert daily["InitMorningEnrichRetryCounter"]["ResultPath"] == "$.morning_enrich_retry"
+        assert daily["InitMorningEnrichRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
+        assert daily["InitMorningEnrichRetryCounter"]["Next"] == "LaunchMorningEnrichSpot"
+
+        assert daily["CheckMorningEnrichSpotStatus"]["Choices"][0]["Next"] == "InitMorningArcticAppendRetryCounter"
+        assert daily["InitMorningArcticAppendRetryCounter"]["Type"] == "Pass"
+        assert daily["InitMorningArcticAppendRetryCounter"]["ResultPath"] == "$.morning_arctic_append_retry"
+        assert daily["InitMorningArcticAppendRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
+        assert daily["InitMorningArcticAppendRetryCounter"]["Next"] == "LaunchMorningArcticAppendSpot"
+
+    @pytest.mark.parametrize(
+        "launch_state,counter_field",
+        [
+            ("LaunchMorningEnrichSpot", "morning_enrich_retry"),
+            ("LaunchMorningArcticAppendSpot", "morning_arctic_append_retry"),
+        ],
+    )
+    def test_launch_threads_force_on_demand_from_retry_counter(self, daily, launch_state, counter_field):
+        payload = daily[launch_state]["Parameters"]["Payload"]
+        assert payload["force_on_demand.$"] == f"$.{counter_field}.force_on_demand"
+
+    @pytest.mark.parametrize(
+        "budget_state,counter_field,increment_state,relaunch_state",
+        [
+            ("CheckMorningEnrichRetryBudget", "$.morning_enrich_retry.attempts",
+             "IncrementMorningEnrichRetry", "LaunchMorningEnrichSpot"),
+            ("CheckMorningArcticAppendRetryBudget", "$.morning_arctic_append_retry.attempts",
+             "IncrementMorningArcticAppendRetry", "LaunchMorningArcticAppendSpot"),
+        ],
+    )
+    def test_one_retry_then_give_up(
+        self, daily, budget_state, counter_field, increment_state, relaunch_state
+    ):
+        st = daily[budget_state]
+        assert st["Type"] == "Choice"
+        assert len(st["Choices"]) == 1
+        cond = st["Choices"][0]
+        assert cond["Variable"] == counter_field
+        assert cond["NumericLessThan"] == 1
+        assert cond["Next"] == increment_state
+        # Retry budget exhausted -> the pre-existing fail-open path, never a HALT.
+        assert st["Default"] == "ExtractDataSpotError"
+
+        inc = daily[increment_state]
+        assert inc["Type"] == "Pass"
+        assert inc["ResultPath"] == counter_field.rsplit(".", 1)[0]
+        assert inc["Parameters"]["attempts.$"] == f"States.MathAdd({counter_field}, 1)"
+        # The one retry must never gamble on spot a second time.
+        assert inc["Parameters"]["force_on_demand"] is True
+        # The retry relaunches on a FRESH box — same launch state, not a
+        # separate "retry launch" — a plain Lambda invoke each time.
+        assert inc["Next"] == relaunch_state
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -401,12 +478,26 @@ class TestEODReconcileSkippedOnDataGap:
     pipeline defect — the false 'EOD Pipeline — FAILED' page from 2026-07-14)."""
 
     def test_data_gap_branch_precedes_default(self, eod):
+        # config-I2702 (2026-07-15): the $.data_spot_error launch-phase flag
+        # test was REPLACED by a fresh verify-by-artifact probe result — see
+        # test_sf_eod_precondition_probe_wiring.py for the full pinning of
+        # ProbeEODReconcilePrecondition + the closed self-heal loop this
+        # branch now feeds into. This test only re-confirms the Choice shape
+        # at CheckSkipEODReconcile itself.
         st = eod["CheckSkipEODReconcile"]
         assert st["Type"] == "Choice"
-        gap_choices = [c for c in st["Choices"] if c.get("Variable") == "$.data_spot_error"]
+        gap_choices = [
+            c for c in st["Choices"]
+            if any(cond.get("Variable") == "$.precondition_probe.Payload.precondition_met"
+                   for cond in c.get("And", []))
+        ]
         assert len(gap_choices) == 1
-        assert gap_choices[0]["IsPresent"] is True
+        conds = gap_choices[0]["And"]
+        assert any(c.get("IsPresent") is True for c in conds)
+        assert any(c.get("BooleanEquals") is False for c in conds)
         assert gap_choices[0]["Next"] == "SkipEODReconcileDataGap"
+        # No leftover reference to the old flag anywhere in this Choice.
+        assert not any(c.get("Variable") == "$.data_spot_error" for c in st["Choices"])
         # The pre-existing operator-replay skip_eod_reconcile branch is untouched.
         assert st["Default"] == "EODReconcile"
 
@@ -425,19 +516,30 @@ class TestEODReconcileSkippedOnDataGap:
             "failed alert it replaces"
         )
         message_fmt = st["Parameters"]["Message.$"]
-        assert "States.JsonToString($.data_spot_error)" in message_fmt
+        # I2702: the skip is now decided by the precondition PROBE (verify-by-
+        # artifact), not the launch-phase $.data_spot_error flag — the message
+        # must reference the probe result and the closed-loop self-heal, and
+        # must NOT resurrect the retired manual-operator-replay instruction.
+        assert "States.JsonToString($.precondition_probe)" in message_fmt
+        assert "self-heal" in message_fmt
+        assert "operator-replay" not in message_fmt
 
     def test_skip_state_never_reaches_a_halt(self, eod):
+        # config-I2702: SkipEODReconcileDataGap now enters the closed
+        # self-heal loop (SetDegradedFlag) instead of jumping straight to the
+        # substrate-check gate — the loop's own reachability (never hitting
+        # _HALT, always eventually reaching StopTradingInstance) is pinned in
+        # test_sf_eod_precondition_probe_wiring.py.
         for tgt in _all_targets(eod["SkipEODReconcileDataGap"]):
             assert tgt not in _HALT
-        assert eod["SkipEODReconcileDataGap"]["Next"] == "CheckSkipDailySubstrateHealthCheck"
+        assert eod["SkipEODReconcileDataGap"]["Next"] == "SetDegradedFlag"
 
     def test_skip_states_own_sns_failure_still_continues(self, eod):
         # Mirrors HandleFailure's defense-in-depth: an SNS-side failure here
-        # must not block the substrate check + instance-stop cost-guard.
+        # must not block entry into the self-heal loop (config-I2702).
         catches = eod["SkipEODReconcileDataGap"].get("Catch", [])
         assert any(
-            c["ErrorEquals"] == ["States.ALL"] and c["Next"] == "CheckSkipDailySubstrateHealthCheck"
+            c["ErrorEquals"] == ["States.ALL"] and c["Next"] == "SetDegradedFlag"
             for c in catches
         )
 
@@ -498,6 +600,29 @@ class TestDispatcherLambdaAndIam:
         # The enrich workload must still skip the inline heal + inline append.
         assert "--skip-chronic-heal" in src
         assert "--skip-arctic-append" in src
+
+    def test_daily_heal_workload_present(self):
+        # alpha-engine-config-I2717 (2026-07-16): the standalone daily-heal
+        # workload, invoked directly by its own EventBridge rule (NOT by
+        # either SF — see infrastructure/cloudformation/alpha-engine-
+        # orchestration.yaml DailyHealTrigger). Bundles the universe-gap
+        # self-heal (formerly the head of --morning-arctic-append) and the
+        # chronic-polygon-gap heal (formerly the weekday SF's own
+        # ChronicGapSelfHeal state) into one weekly_collector.py invocation.
+        src = (_DISPATCHER / "index.py").read_text()
+        assert '"daily-heal":' in src
+        assert "python weekly_collector.py --daily-heal" in src
+
+    def test_daily_heal_workload_key_satisfies_strict_allowlist_regex(self):
+        # _resolve_workload's defense-in-depth allowlist regex
+        # (^[a-z][a-z-]{0,63}$) gates every workload key against
+        # shell-metacharacter injection — "daily-heal" must satisfy it (mirrors
+        # the same check the module already applies to every other key; kept
+        # as a literal regex here rather than importing index.py directly, to
+        # match this file's existing text-only-assertion convention and avoid
+        # a real boto3/nousergon_lib import at collection time).
+        import re
+        assert re.match(r"^[a-z][a-z-]{0,63}$", "daily-heal")
 
     def test_bootstrap_clones_private_config_package(self):
         # weekly_collector.load_config resolves experiments/reference/data/config.yaml

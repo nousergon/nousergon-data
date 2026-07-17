@@ -20,6 +20,18 @@ Sibling of `infrastructure/step-functions/check-drift.py` (the
 LoggingConfiguration drift guard, config#1464) — same shape: standalone,
 regex/JSON parsing of repo sources, live state via the AWS CLI, exit 0/1/2.
 
+**Groom-dispatch coverage (alpha-engine-config#2391).** The backlog-groom SF
+was silently orphaned from deploys for 11 days because
+`deploy-infrastructure.sh` targeted `alpha-engine-groom-pipeline` — a name
+this script's own `SF_DEFINITIONS` map ALSO carried, so drift there would
+have gone unnoticed even if this script had been running. Both the deploy
+script (config#2391-related PR#780) and this map now agree on the live
+name, `alpha-engine-groom-dispatch`. The groom SF has no
+`LoggingConfiguration` (see check-drift.py's groom entry) but that's
+orthogonal to this script: this script only ever diffs the `definition`
+JSON (repo vs. live vs. S3-staged), never `loggingConfiguration`, so the
+groom SF's lack of logging needs no special-casing here.
+
 **Normalization.** Deploys stamp the top-level ``Comment`` with a
 ``[git:<sha>] `` prefix (see deploy-infrastructure.sh); the repo file is
 unstamped. The comparison strips that stamp from both sides and compares
@@ -35,15 +47,26 @@ Drift cases (all exit non-zero):
   * The S3 staged object is missing entirely.
   * A repo definition file is missing or malformed JSON (source-error).
 
+On drift, this script also fires an `nousergon_lib.alerts.publish` (same
+`alpha-engine-alerts` SNS topic every other drift/preflight alert in this
+repo uses — see validators/constituents_drift_check.py) unless `--no-alert`
+is passed. The import is lazy and best-effort: a missing/broken
+`nousergon_lib` degrades to a logged warning, never to a false "clean"
+exit — the non-zero exit code is always the authoritative signal.
+
 Usage:
-  ./infrastructure/step-functions/check-definition-drift.py               # every codified SF
+  ./infrastructure/step-functions/check-definition-drift.py               # every codified SF, alerts on drift
   ./infrastructure/step-functions/check-definition-drift.py --name NAME   # one (by SF name)
+  ./infrastructure/step-functions/check-definition-drift.py --no-alert    # diagnostic — no SNS/Telegram
 
 Requires AWS creds with states:DescribeStateMachine on the target state
 machines and s3:GetObject on s3://alpha-engine-research/infrastructure/*.
-Wiring: standalone by design, callable from liveness sweeps / operator
-sessions — mirrors its check-drift.py siblings rather than adding a new
-GHA schedule (fleet direction is EC2-spot sweeps, not GHA-hosted crons).
+Wiring: runs as a step in `.github/workflows/deploy-infrastructure.yml`
+(every push to main, right after the deploy applies) — reuses that job's
+`github-actions-lambda-deploy` OIDC role, which already carries
+states:DescribeStateMachine on `alpha-engine-groom-dispatch` plus
+sns:Publish on `alpha-engine-alerts`. Still standalone-callable from
+liveness sweeps / operator sessions too, same as its check-drift.py sibling.
 Shape-guarded by tests/test_sf_definition_check_drift.py (mocked CLI — no
 real AWS access in CI).
 """
@@ -78,7 +101,12 @@ SF_DEFINITIONS: tuple[dict, ...] = (
     {"sf_name": "ne-weekly-freshness-pipeline", "definition_file": "step_function.json"},
     {"sf_name": "ne-preopen-trading-pipeline", "definition_file": "step_function_daily.json"},
     {"sf_name": "ne-postclose-trading-pipeline", "definition_file": "step_function_eod.json"},
-    {"sf_name": "alpha-engine-groom-pipeline", "definition_file": "step_function_groom.json"},
+    {"sf_name": "alpha-engine-groom-dispatch", "definition_file": "step_function_groom.json"},
+    # alpha-engine-config-I2544/I2545: advisory + Sunday-modelzoo child SFs,
+    # split out of step_function.json (config#2273 single-writer contract
+    # applies to these two files identically — see deploy_step_function.sh).
+    {"sf_name": "ne-weekly-advisory-pipeline", "definition_file": "step_function_advisory.json"},
+    {"sf_name": "ne-modelzoo-sunday-pipeline", "definition_file": "step_function_modelzoo.json"},
 )
 
 _GIT_STAMP_RE = re.compile(r"^\[git:[0-9a-fA-F]{7,40}\]\s*")
@@ -239,10 +267,51 @@ def _check_sf(entry: dict) -> list[str]:
     return findings
 
 
+def _alert_on_drift(total_findings: list[str], *, severity: str = "error") -> None:
+    """Best-effort SNS/Telegram page via nousergon_lib.alerts — same
+    `alpha-engine-alerts` topic every other drift/preflight alert in this
+    repo publishes to (see validators/constituents_drift_check.py). Import
+    is lazy so this script still runs (and still exits non-zero) in any
+    environment where nousergon_lib isn't installed; a broken/missing
+    alerts path is logged, never swallowed into a false-clean result."""
+    try:
+        from nousergon_lib import alerts  # noqa: PLC0415
+    except ImportError as exc:
+        sys.stderr.write(
+            f"WARNING: alerts publish skipped — nousergon_lib.alerts "
+            f"unavailable: {exc}\n"
+        )
+        return
+
+    message = (
+        f"SF definition drift detected ({len(total_findings)} finding(s)): "
+        + "; ".join(total_findings)
+    )
+    try:
+        result = alerts.publish(
+            message,
+            severity=severity,
+            source="alpha-engine-data/infrastructure/step-functions/check-definition-drift.py",
+            dedup_key=f"sf_definition_drift_{len(total_findings)}",
+            dedup_window_min=60,
+        )
+        sys.stderr.write(
+            f"Drift alert publish: sns_ok={result.sns.ok} "
+            f"telegram_ok={result.telegram.ok} any_ok={result.any_ok}\n"
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"WARNING: drift alert publish failed: {exc}\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--name", help="Check one state machine by name (default: every codified one)"
+    )
+    parser.add_argument(
+        "--no-alert",
+        action="store_true",
+        help="diagnostic mode — no SNS/Telegram alert on drift",
     )
     args = parser.parse_args()
 
@@ -265,6 +334,8 @@ def main() -> int:
         print(f"SF definition drift detected ({len(total_findings)} finding(s)):")
         for f in total_findings:
             print(f"  - {f}")
+        if not args.no_alert:
+            _alert_on_drift(total_findings)
         return 1
 
     sf_names = ", ".join(e["sf_name"] for e in entries)

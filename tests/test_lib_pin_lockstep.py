@@ -58,9 +58,19 @@ _LAMBDA_PIN_RE = re.compile(
 # documented in each Lambda's requirements.txt header comment.
 # Key: lambda directory name, Value: (pin version, contract reason)
 _LAMBDA_PIN_EXEMPTIONS = {
+    "canary-replay-dispatcher": (
+        "v0.106.0",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246: same SpotProbeError "
+        "handling as ci-watch-dispatcher)",
+    ),
     "ci-watch-dispatcher": (
         "v0.106.0",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling)",
+    ),
+    "config-runner-dispatcher": (
+        "v0.110.0",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2572: same SpotProbeError "
+        "handling as ci-watch-dispatcher, pinned to the latest tag at time of writing)",
     ),
     "data-spot-dispatcher": (
         "v0.83.0",
@@ -99,9 +109,12 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.109.0",
+        "v0.124.0",
         "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
-        "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409)",
+        "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409); "
+        "v0.124.0 for nousergon_lib.github_app — _github_token() mints the "
+        "ne-groomer App installation token first, PAT fallback (config-I2785, "
+        "nousergon-lib#220, incident config-I2784)",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",
@@ -118,10 +131,6 @@ _LAMBDA_PIN_EXEMPTIONS = {
     "spot-orphan-reaper": (
         "v0.97.0",
         "telegram alert shape for CI-watch (config#2106)",
-    ),
-    "usage-pace-alert": (
-        "v0.83.0",
-        "flow-doctor forum-topic routing + weekly-pace math (config#2043)",
     ),
 }
 

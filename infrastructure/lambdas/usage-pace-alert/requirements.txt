@@ -1,3 +1,0 @@
-# alpha-engine-config#2043 — flow-doctor forum-topic routing + weekly-pace math.
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
-krepis>=0.10.2
