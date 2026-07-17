@@ -141,6 +141,18 @@ _DEFAULT_MAX_DISPATCHES = 2
 # repository_dispatch target — the private alpha-engine-config repo hosts the
 # agent GHA workflow (on: repository_dispatch, types: [*-sf-failure]).
 DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
+
+# M2 dispatch target (alpha-engine-config-I2823). "repository_dispatch" (the
+# legacy default) round-trips through GitHub -> sf-watch.yml -> lambda invoke,
+# making SF recovery depend on GitHub availability (cf. the 2026-07-16 GitHub
+# 503 incident). "overseer" invokes alpha-engine-overseer-dispatcher directly
+# (Lambda-to-Lambda, async) — the router consults the playbook registry,
+# invokes the spot dispatcher, and owns P1-filing/paging on bad verdicts.
+# OPERATOR-OWNED runtime flag like AGENT_DISPATCH_ENABLED (deploy.sh preserves
+# it across redeploys). Flip gated on the reshaped weekly SF's first live run
+# (gate:weekly-sf) — see alpha-engine-config-I2823.
+M2_DISPATCH_TARGET = os.environ.get("M2_DISPATCH_TARGET", "repository_dispatch")
+OVERSEER_FUNCTION = os.environ.get("OVERSEER_FUNCTION", "alpha-engine-overseer-dispatcher")
 # Dedicated fine-grained PAT (SecureString) scoped to the SF-path repos, shared
 # across pipelines. Read at dispatch time only — never logged.
 GITHUB_PAT_SSM_PARAM = os.environ.get(
@@ -1012,22 +1024,47 @@ def _maybe_dispatch_agent(
         # pipeline (see _notify).
         return {"dispatched": False, "reason": "no_listener"}
     event_type = cfg["dispatch_event_type"]
+    client_payload = {
+        "pipeline_name": pipeline_name,
+        "cadence_slug": cfg["cadence_slug"],
+        "state_machine_arn": sm_arn,
+        "execution_arn": record.get("execution_arn", ""),
+        "failed_state": record.get("failed_state"),
+        "cause": record.get("cause"),
+        "run_date": run_date,
+        "status": record.get("status"),
+        "watch_log_key": key,
+        "is_preflight": record.get("is_preflight", False),
+    }
+    if M2_DISPATCH_TARGET == "overseer":
+        # Direct Lambda-to-Lambda dispatch (alpha-engine-config-I2823) — no
+        # GitHub in the loop. Async (Event): the router owns verdict handling,
+        # P1 filing, and loud paging; this Lambda's watch-log record (already
+        # written) is the local audit surface either way.
+        try:
+            resp = boto3.client("lambda", region_name=REGION).invoke(
+                FunctionName=OVERSEER_FUNCTION,
+                InvocationType="Event",
+                Payload=json.dumps(
+                    {"playbook": "sf-watch", "payload": client_payload}
+                ).encode("utf-8"),
+            )
+            status_code = int(resp.get("StatusCode", 0))
+            logger.info(
+                "agent dispatch sent via overseer router %s (http=%s)",
+                OVERSEER_FUNCTION, status_code,
+            )
+            return {"dispatched": True, "target": "overseer",
+                    "status_code": status_code, "event_type": event_type}
+        except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised (same carve-out as the repository_dispatch leg below)
+            logger.warning("overseer dispatch invoke failed (non-fatal): %s", exc)
+            return {"dispatched": False, "target": "overseer",
+                    "error": f"{type(exc).__name__}: {exc}"}
     try:
         pat = _get_github_pat()
         payload = {
             "event_type": event_type,
-            "client_payload": {
-                "pipeline_name": pipeline_name,
-                "cadence_slug": cfg["cadence_slug"],
-                "state_machine_arn": sm_arn,
-                "execution_arn": record.get("execution_arn", ""),
-                "failed_state": record.get("failed_state"),
-                "cause": record.get("cause"),
-                "run_date": run_date,
-                "status": record.get("status"),
-                "watch_log_key": key,
-                "is_preflight": record.get("is_preflight", False),
-            },
+            "client_payload": client_payload,
         }
         req = urllib.request.Request(
             f"https://api.github.com/repos/{DISPATCH_REPO}/dispatches",
