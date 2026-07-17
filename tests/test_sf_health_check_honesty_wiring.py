@@ -54,15 +54,10 @@ CHECKS = [
      "CheckSaturdayHealthCheckStatus", "SaturdayHealthCheckPollWait",
      "SaturdayHealthCheckDegraded", "$.health_check_poll",
      "WeeklySubstrateHealthCheck", 300),
-    # alpha-engine-config-I2544 (2026-07-14): "proceeds-to" was ReportCard
-    # pre-lift — ReportCard/Director now live in the async
-    # ne-weekly-advisory-pipeline child SF, dispatched earlier via
-    # StartAdvisoryPipeline. This tail has nothing left to proceed into
-    # except the notify gate.
     ("WeeklySubstrateHealthCheck", "WaitForWeeklySubstrateHealthCheck",
      "CheckSubstrateHealthCheckStatus", "SubstrateHealthCheckPollWait",
      "SubstrateHealthCheckDegraded", "$.substrate_check_poll",
-     "CheckShellRunNotify", 240),
+     "ReportCard", 240),
 ]
 _IDS = [c[0] for c in CHECKS]
 
