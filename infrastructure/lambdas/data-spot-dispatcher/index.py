@@ -123,7 +123,7 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("DATA_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("DATA_SPOT_CW_LOG_GROUP", "/alpha-engine/data-spot")
 
-# The four data-phase workloads this dispatcher can run, mapped to the EXACT
+# The five data-phase workloads this dispatcher can run, mapped to the EXACT
 # weekly_collector.py invocation the on-trading SF states ran (unchanged args =
 # unchanged M0 data contract: same paths/schemas). Any other value is rejected.
 _WORKLOADS: dict[str, str] = {
@@ -142,6 +142,13 @@ _WORKLOADS: dict[str, str] = {
     "post-market-arctic-append": (
         "python weekly_collector.py --daily-arctic-append"
     ),
+    # alpha-engine-config-I2717: standalone daily data-heal, EventBridge-triggered
+    # ~09:00 UTC weekdays (alpha-engine-daily-heal rule) — was inline in preopen's
+    # MorningArcticAppend (universe-gap self-heal head) + the weekday SF's own
+    # on-trading ChronicGapSelfHeal state, both REMOVED from
+    # step_function_daily.json entirely. Runs off the preopen critical path with
+    # a much bigger heal timeout budget (see weekly_collector._run_daily_heal).
+    "daily-heal": "python weekly_collector.py --daily-heal",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
@@ -223,10 +230,20 @@ echo "[data-spot] workload {workload} complete"
 """
 
 
-def _launch_instance() -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     """Launch the data spot box; spot first, on-demand fallback on capacity
     exhaustion (a pre-open enrich the predictor reads next must not be starved by
-    a spot-capacity dip). Mirrors _launch_instance in scheduled-groom-dispatcher."""
+    a spot-capacity dip). Mirrors _launch_instance in scheduled-groom-dispatcher.
+
+    force_on_demand=True skips the spot attempt entirely. Set by the EOD SF's
+    bounded retry-on-relaunch (2026-07-14 incident: a data-spot box was
+    reclaimed by AWS — Server.SpotInstanceTermination — ~22min into a
+    post-market-data run, which the SF now retries once) and, identically
+    (config#2542), by the weekday SF's morning-enrich/morning-arctic-append
+    retry-on-relaunch. A workload that already lost one box to a spot
+    interruption should not gamble on spot again for its one retry attempt —
+    the cost delta is a few cents for a sub-hour c5.large-class box,
+    negligible against the reconcile-reliability this buys."""
     common = dict(
         image_id=AMI_ID,
         key_name=KEY_NAME,
@@ -237,6 +254,12 @@ def _launch_instance() -> tuple[str, str]:
         tag_name="alpha-engine-data-spot",
         region=REGION,
     )
+    if force_on_demand:
+        logger.info(
+            "force_on_demand=True (spot-interruption retry) — launching ON-DEMAND directly, skipping spot"
+        )
+        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
+        return iid, "on-demand"
     try:
         iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=True, **common)
         return iid, "spot"
@@ -312,7 +335,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the data spot box for one workload.
 
     `event` carries {"workload": "morning-enrich" | "morning-arctic-append" |
-    "post-market-data" | "post-market-arctic-append"}. Returns, wrapped under a
+    "post-market-data" | "post-market-arctic-append" | "daily-heal",
+    "force_on_demand": bool}. `force_on_demand` (default False) is set by the
+    EOD SF's post-interruption retry (2026-07-14 incident) and the weekday
+    SF's identical retry (config#2542) so the one retry attempt never gambles
+    on spot a second time; the "daily-heal" workload (alpha-engine-config-
+    I2717) is invoked directly by its own EventBridge rule (NOT from either
+    SF) and omits `force_on_demand`, so it defaults to False (spot-first, no
+    retry-budget coupling to either pipeline). Returns, wrapped under a
     `data_spot` key (mirrors the groom dispatcher's `groom` wrap so the SF's
     JSONPath is $.<result>.Payload.data_spot.*):
 
@@ -325,13 +355,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     workload, collector_cmd = _resolve_workload(event)
+    force_on_demand = bool(event.get("force_on_demand", False))
 
     if not DISPATCH_ENABLED:
         logger.warning("DATA_SPOT_DISPATCH_ENABLED=false — data spot NOT launched")
         return {"data_spot": {"launched": False, "reason": "disabled", "workload": workload}}
 
     run_token = uuid.uuid4().hex
-    instance_id, market = _launch_instance()
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     logger.info("launched data-spot box %s (%s) for %s", instance_id, market, workload)
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow

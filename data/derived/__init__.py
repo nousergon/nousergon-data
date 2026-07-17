@@ -8,7 +8,8 @@ Wave 1 of the institutional data revamp uses this package for:
   revisions          — self-derived analyst estimate revisions from FMP
                        snapshots (PR C, deferred)
   insider_aggregates — Form 4 rollup per ticker (PR B)
-  inst_ownership     — 13F rollup per ticker (PR B, built 2026-07-13)
+  inst_ownership     — 13F rollup per ticker (PR B, built 2026-07-13;
+                       consumer-side reader + RAG ingest wired config#2428)
 
 Each derived module:
 

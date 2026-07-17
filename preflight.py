@@ -320,6 +320,16 @@ class DataPreflight(BasePreflight):
                 f"key-metrics-ttm — the free tier no longer covers this endpoint. "
                 f"Subscribe or move the collector to a different provider."
             )
+        if resp.status_code == 429:
+            # Rate-limited ≠ unreachable/unauthorized — same contract as the
+            # polygon probe (config#2662): the probe validates reachability +
+            # auth only; quota pressure is the collector's to pace at fetch
+            # time. Proceed.
+            log.warning(
+                "preflight: FMP /stable returned 429 (rate-limited) — endpoint "
+                "REACHABLE, auth not rejected; proceeding."
+            )
+            return
         if resp.status_code >= 500:
             raise RuntimeError(
                 f"Pre-flight: FMP /stable returned HTTP {resp.status_code} — upstream outage."
@@ -342,7 +352,14 @@ class DataPreflight(BasePreflight):
 
         Catches expired API key, polygon outage, blocked egress. Does NOT
         catch rate-limit ceiling (next collector call will retry/fail
-        loudly by design).
+        loudly by design) — and per that contract, a 429 here is treated as
+        SUCCESS: the service answered (reachable) and did not reject auth
+        (429 ≠ 401/403); ``polygon_client._get`` owns Retry-After pacing at
+        fetch time. Before 2026-07-15 the generic ``!= 200`` catch-all below
+        contradicted this contract and aborted the whole workload on a 429
+        (config#2662 — a concurrent consumer exhausted the shared per-minute
+        quota, the probe died, and the DataSpot phase failed twice for a
+        condition the collector would have absorbed in seconds).
         """
         api_key = (get_secret("POLYGON_API_KEY", required=False, default="") or "").strip()
         resp = self._reachability_get(
@@ -354,6 +371,14 @@ class DataPreflight(BasePreflight):
                 f"Pre-flight: polygon.io auth failed (HTTP {resp.status_code}): "
                 f"POLYGON_API_KEY is invalid or revoked."
             )
+        if resp.status_code == 429:
+            log.warning(
+                "preflight: polygon.io returned 429 (rate-limited) — endpoint "
+                "REACHABLE, auth not rejected; proceeding. Collector-side "
+                "pacing (polygon_client._get: Retry-After + bounded backoff) "
+                "absorbs the limit at fetch time."
+            )
+            return
         if resp.status_code >= 500:
             raise RuntimeError(
                 f"Pre-flight: polygon.io returned HTTP {resp.status_code} on a reference-data call "
@@ -389,6 +414,17 @@ class DataPreflight(BasePreflight):
                     f"Pre-flight: FRED auth failed (HTTP 400): FRED_API_KEY is invalid. "
                     f"Response: {resp.text[:200]}"
                 )
+        if resp.status_code == 429:
+            # Rate-limited ≠ unreachable/unauthorized — same contract as the
+            # polygon probe (config#2662). Doubly so here: the FRED collector
+            # already owns 429 pacing (_fred_get_with_retry, the 2026-06-01
+            # TNX-storm fix) — a probe abort on the very condition the
+            # collector was hardened against would be self-defeating. Proceed.
+            log.warning(
+                "preflight: FRED returned 429 (rate-limited) — endpoint "
+                "REACHABLE, auth not rejected; proceeding."
+            )
+            return
         if resp.status_code >= 500:
             raise RuntimeError(
                 f"Pre-flight: FRED returned HTTP {resp.status_code} on DFF call "

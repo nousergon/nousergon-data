@@ -30,8 +30,17 @@ BEFORE any of the above — it self-heals + verifies all 3 repo checkouts are on
 current main, closing the 2026-07-06 wedged/stale-box incident where the
 pipeline burned ~40 min before the old planner-time deploy-drift preflight
 finally refused. Its SUCCESS verdict is the actual entry point into the data
-phase (CheckSkipMorningEnrich). PredictorHealthCheck also now hands off to the
-PredictorDriftCheck producer (config#1853) before the planner gate.
+phase (CheckSkipMorningEnrich).
+
+alpha-engine-config-I2717/I2722 (2026-07-16): the CheckSkipChronicGapHeal gate
++ ChronicGapSelfHeal (and its liveness-poll quintet) were REMOVED entirely —
+the heal moved to a standalone EventBridge-triggered daily job, off this SF's
+critical path. CheckSkipMorningEnrich's skip edge and the data-phase spot
+success edges now route straight to CheckSkipPredictorInference. Likewise
+PredictorHealthCheck + PredictorDriftCheck were REMOVED and re-homed onto
+their own direct EventBridge triggers — CoverageGapChoice and
+FinalCoverageGate (the coverage-gap Choice states that used to Default into
+PredictorHealthCheck) now Default straight to CheckSkipMorningPlanner.
 
 Catches regressions like:
 - A skip-gate dropped, so an entry edge points straight at the task again.
@@ -40,6 +49,9 @@ Catches regressions like:
 - The happy path (no skip flags) no longer running every task in order.
 - CodeFreshnessGate's SUCCESS verdict pointing at a state that no longer
   exists (e.g. the retired single-shared-spot `CheckDataSpotLaunched`).
+- The chronic-gap-heal gate/state quintet or the predictor health/drift
+  states reappearing in this SF instead of staying on their standalone
+  EventBridge triggers.
 """
 
 from __future__ import annotations
@@ -53,9 +65,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 
 # (gate, task, skip_flag, next_gate) in pipeline order.
+# alpha-engine-config-I2717: CheckSkipChronicGapHeal + ChronicGapSelfHeal
+# removed entirely — CheckSkipMorningEnrich's skip edge now routes straight to
+# CheckSkipPredictorInference.
 _CHAIN = [
-    ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipChronicGapHeal"),
-    ("CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "skip_chronic_gap_heal", "CheckSkipPredictorInference"),
+    ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
     ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "PipelineComplete"),
@@ -91,8 +105,15 @@ class TestGateShape:
 
     @pytest.mark.parametrize("gate,task,flag,nxt", _CHAIN)
     def test_default_runs_the_task(self, states, gate, task, flag, nxt):
-        assert states[gate]["Default"] == task, (
-            f"{gate} Default must run {task} (missing flag = run as normal)"
+        default = states[gate]["Default"]
+        # config#2542: CheckSkipMorningEnrich's Default now threads through the
+        # InitMorningEnrichRetryCounter Pass state (seeds the spot-retry budget)
+        # before LaunchMorningEnrichSpot — follow at most one Pass-state hop so
+        # the gate/skip invariant this test pins still holds.
+        if default != task and states[default]["Type"] == "Pass":
+            default = states[default]["Next"]
+        assert default == task, (
+            f"{gate} Default must (eventually) run {task} (missing flag = run as normal)"
         )
 
 
@@ -111,7 +132,8 @@ class TestEntryEdgesRouteThroughGates:
         false_branch = [
             c["Next"]
             for c in states["TradingDayGateChoice"]["Choices"]
-            if c.get("BooleanEquals") is False
+            # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
+            if any(op.get("BooleanEquals") is False for op in c.get("And", [c]))
         ]
         assert false_branch == ["NotifyHolidaySkip"]
         assert states["TradingDayGateFailed"]["Next"] == "StartExecutorEC2"
@@ -138,18 +160,23 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_morning_enrich_spot_success_enters_append_spot(self, states):
         # config#1767: the enrich fetch now runs on its own ephemeral spot. Its
-        # poll-status Success enters the Arctic-append spot launch (both run on
+        # poll-status Success enters the Arctic-append retry-budget init
+        # (config#2542), which immediately seeds $.morning_arctic_append_retry
+        # and hands off to the Arctic-append spot launch (both run on
         # independent spots).
         success = [c["Next"] for c in states["CheckMorningEnrichSpotStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
-        assert success == ["LaunchMorningArcticAppendSpot"]
+        assert success == ["InitMorningArcticAppendRetryCounter"]
+        assert states["InitMorningArcticAppendRetryCounter"]["Next"] == "LaunchMorningArcticAppendSpot"
 
-    def test_arctic_append_spot_success_enters_heal_gate(self, states):
+    def test_arctic_append_spot_success_enters_predictor_gate(self, states):
         # config#1767: the Arctic append also runs on its own spot; its Success
-        # rejoins the trading path at CheckSkipChronicGapHeal.
+        # rejoins the trading path at CheckSkipPredictorInference directly
+        # (alpha-engine-config-I2717: the intermediate CheckSkipChronicGapHeal
+        # gate was removed — the heal moved to the standalone daily-heal job).
         success = [c["Next"] for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
-        assert success == ["CheckSkipChronicGapHeal"]
+        assert success == ["CheckSkipPredictorInference"]
 
     def test_data_phase_no_longer_on_trading_box(self, states):
         # config#1767 deliverable #2: the trading path retains NO data-phase SSM
@@ -164,24 +191,25 @@ class TestEntryEdgesRouteThroughGates:
         ):
             assert gone not in states, f"{gone} should have moved to the spot dispatcher"
 
-    def test_chronic_gap_terminal_enters_predictor_gate(self, states):
-        # CheckChronicGapStatus Default + both heal Catches. ChronicGapSelfHeal
-        # stays on the trading box (config#1811 upgraded it to the liveness-poll
-        # loop, but there is no shared spot left to terminate, so it never
-        # routes through a spot-terminate hook).
-        assert states["CheckChronicGapStatus"]["Default"] == "CheckSkipPredictorInference"
-        assert states["ChronicGapSelfHeal"]["Catch"][0]["Next"] == "CheckSkipPredictorInference"
-        assert states["WaitForChronicGap"]["Catch"][0]["Next"] == "CheckSkipPredictorInference"
+    def test_chronic_gap_heal_quintet_and_gate_removed(self, states):
+        # alpha-engine-config-I2717/I2722 (2026-07-16): the heal moved
+        # entirely off this SF into the standalone --daily-heal job — see
+        # test_sf_chronic_gap_heal_wiring.py for the dedicated removal pin.
+        for gone in (
+            "CheckSkipChronicGapHeal", "ChronicGapSelfHeal", "InitChronicGapPoll",
+            "WaitForChronicGap", "CheckChronicGapStatus", "ChronicGapWait",
+            "StampChronicGapUnresponsive",
+        ):
+            assert gone not in states, f"{gone} should have moved to the standalone daily-heal job"
 
-    def test_predictor_health_enters_drift_check(self, states):
-        # config#1853: PredictorHealthCheck now routes into the drift-check
-        # producer (fail-soft, both success and Catch) before the planner gate.
-        assert states["PredictorHealthCheck"]["Next"] == "PredictorDriftCheck"
-        assert states["PredictorHealthCheck"]["Catch"][0]["Next"] == "PredictorDriftCheck"
-
-    def test_drift_check_enters_planner_gate(self, states):
-        assert states["PredictorDriftCheck"]["Next"] == "CheckSkipMorningPlanner"
-        assert states["PredictorDriftCheck"]["Catch"][0]["Next"] == "CheckSkipMorningPlanner"
+    def test_coverage_gates_enter_planner_gate_directly(self, states):
+        # alpha-engine-config-I2722 (2026-07-16): PredictorHealthCheck +
+        # PredictorDriftCheck removed and re-homed onto their own direct
+        # EventBridge triggers — see test_sf_predictor_drift_check_wiring.py
+        # for the dedicated removal pin. CoverageGapChoice/FinalCoverageGate
+        # now Default straight to the morning-planner skip-gate.
+        assert states["CoverageGapChoice"]["Default"] == "CheckSkipMorningPlanner"
+        assert states["FinalCoverageGate"]["Default"] == "CheckSkipMorningPlanner"
 
     def test_planner_success_enters_daemon_gate(self, states):
         # config#1811: RunMorningPlanner's poll uses the liveness-poller verdict
@@ -222,7 +250,9 @@ class TestPaths:
                     if c.get("StringEquals") in ("Success", "SUCCESS")
                 ]
                 launched = (
-                    [c["Next"] for c in st.get("Choices", []) if c.get("BooleanEquals") is True]
+                    # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
+                    [c["Next"] for c in st.get("Choices", [])
+                     if any(op.get("BooleanEquals") is True for op in c.get("And", [c]))]
                     if cur.endswith("SpotLaunched") else []
                 )
                 cur = (succ or launched or [st.get("Default")])[0]
@@ -245,22 +275,26 @@ class TestPaths:
             assert task not in order, f"{task} ran despite its skip flag"
         assert order == ["PipelineComplete"]
 
-    def test_skip_data_phase_resumes_at_heal(self, states):
-        """config#1767: skip_morning_enrich now skips the ENTIRE spot data phase
-        (enrich + append both on independent spots) and resumes at the
-        chronic-gap heal — the old separate skip_morning_arctic_append gate is
-        gone."""
+    def test_skip_data_phase_resumes_at_predictor_inference(self, states):
+        """config#1767: skip_morning_enrich skips the ENTIRE spot data phase
+        (enrich + append both on independent spots) — the old separate
+        skip_morning_arctic_append gate is gone. alpha-engine-config-I2717
+        (2026-07-16): the intermediate chronic-gap-heal gate/state this test
+        used to resume at is ALSO gone (moved to the standalone --daily-heal
+        job), so the skip now resumes directly at PredictorInference."""
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags={"skip_morning_enrich"})
         assert "LaunchMorningEnrichSpot" not in order
         assert "LaunchMorningArcticAppendSpot" not in order
-        assert order[0] == "ChronicGapSelfHeal"
-        assert "PredictorInference" in order and order[-1] == "PipelineComplete"
+        assert order[0] == "PredictorInference"
+        assert order[-1] == "PipelineComplete"
 
     def test_happy_path_runs_data_phase_on_spot(self, states):
         """The data phase runs as spot-launch states, not on-trading SSM."""
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags=set())
         assert "LaunchMorningEnrichSpot" in order
         assert "LaunchMorningArcticAppendSpot" in order
-        # Enrich spot precedes append spot precedes the heal.
+        # Enrich spot precedes append spot precedes PredictorInference —
+        # alpha-engine-config-I2717 removed the intermediate chronic-gap-heal
+        # hop this test used to check for.
         assert order.index("LaunchMorningEnrichSpot") < order.index("LaunchMorningArcticAppendSpot")
-        assert order.index("LaunchMorningArcticAppendSpot") < order.index("ChronicGapSelfHeal")
+        assert order.index("LaunchMorningArcticAppendSpot") < order.index("PredictorInference")

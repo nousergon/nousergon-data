@@ -542,3 +542,80 @@ def test_expected_tickers_logs_straggler_count(monkeypatch, caplog):
     msg = straggler_logs[0].message
     for s in stragglers:
         assert s in msg, f"straggler {s} missing from log: {msg}"
+
+
+# ── 4. SPY / _UNIVERSE_EXTRA carve-out (config-I2703, 2026-07-15 P0) ────────
+#
+# SPY is a hard-pinned _UNIVERSE_EXTRA member (features/compute.py) — it IS
+# written to the `universe` ArcticDB library (unlike other `_SKIP_TICKERS`
+# macro/index symbols), so it must be treated as a real stock symbol by the
+# missing-from-closes diff on BOTH sides: present in arctic (relevant_arctic)
+# AND present in closes (closes_stock_keys). Before this fix, SPY was
+# excluded from BOTH sides via a bare `_SKIP_TICKERS` filter with no
+# `_UNIVERSE_EXTRA` carve-out — net effect: SPY was invisible to this check
+# entirely, masked identically to a genuine "S&P churn-out straggler,
+# awaiting prune" even though SPY is a permanent, never-pruned member.
+
+
+def test_spy_present_in_closes_and_arctic_not_flagged_missing(monkeypatch):
+    """SPY genuinely present in both ArcticDB universe and today's closes
+    (the steady-state case, every trading day) must NOT be counted as
+    missing — proves the closes_stock_keys/expected_stocks carve-out
+    doesn't introduce a FALSE positive now that SPY is in-scope."""
+    from builders.daily_append import daily_append
+
+    constituents = ["AAPL", "MSFT", "SPY"]
+    universe_symbols = ["AAPL", "MSFT", "SPY"]
+    closes_tickers = ["AAPL", "MSFT"]  # SPY reaches closes via macro_keys auto-union
+
+    _patch_targets(
+        monkeypatch,
+        universe_symbols=universe_symbols,
+        closes_tickers=closes_tickers,
+    )
+
+    result = daily_append(date_str="2026-04-28", expected_tickers=constituents)
+    assert result["status"] == "ok"
+    assert result["tickers_missing_from_closes"] == 0
+
+
+def test_spy_genuinely_missing_from_closes_is_caught_not_masked(monkeypatch):
+    """A REAL SPY data gap (SPY in ArcticDB universe + in expected_tickers,
+    but polygon/yfinance didn't return it today) must be caught by the
+    missing-from-closes check, not silently excluded as a churn-out
+    straggler. This is the config-I2703 safety-net regression test: before
+    the fix, SPY was unconditionally excluded from `expected_stocks` (via
+    `_SKIP_TICKERS` with no `_UNIVERSE_EXTRA` carve-out), so this exact
+    scenario would have passed silently.
+
+    Padded with 5 other genuinely-missing constituents to cross the default
+    threshold (5) — SPY alone (1 missing) would only WARN, not raise; the
+    point here is that SPY's name surfaces in the raise, proving it counts
+    toward the diff rather than being invisibly excluded."""
+    from builders import daily_append as _da
+    from builders.daily_append import daily_append
+
+    other_missing = [f"REAL{i}" for i in range(5)]
+    constituents = ["AAPL", "MSFT", "SPY"] + other_missing
+    universe_symbols = ["AAPL", "MSFT", "SPY"] + other_missing
+
+    _patch_targets(
+        monkeypatch,
+        universe_symbols=universe_symbols,
+        closes_tickers=["AAPL", "MSFT"],
+    )
+    # Override the stub so SPY is genuinely absent from closes (simulating
+    # polygon/yfinance dropping it), rather than reaching closes via
+    # _patch_targets' automatic macro_keys union.
+    closes_without_spy = _stub_closes(["AAPL", "MSFT"])
+    monkeypatch.setattr(_da, "_load_daily_closes", lambda *a, **k: closes_without_spy)
+
+    with pytest.raises(RuntimeError, match=r"missing from today's daily_closes") as exc_info:
+        daily_append(
+            date_str="2026-04-28",
+            expected_tickers=constituents,
+        )
+    assert "SPY" in str(exc_info.value), (
+        "SPY must be named among the missing tickers — it must not be "
+        "silently excluded from the missing-from-closes diff."
+    )

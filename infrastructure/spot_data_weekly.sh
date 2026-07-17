@@ -602,9 +602,12 @@ DEPS
 
 # ── Launch-only: hand the bootstrapped spot to the weekday SF ────────────────
 # config#1807: the weekday pre-open data phase (MorningEnrich +
-# MorningArcticAppend + ChronicGapSelfHeal) runs on this spot instead of
-# the trading box, whose 2026-07-06 swap-thrash starved its own SSM agent
-# and blocked RunDaemon at market open. This mode ends at the exact point
+# MorningArcticAppend) runs on this spot instead of the trading box, whose
+# 2026-07-06 swap-thrash starved its own SSM agent and blocked RunDaemon at
+# market open. (ChronicGapSelfHeal, formerly also on-trading, was removed
+# entirely per alpha-engine-config-I2717 2026-07-16 — it now runs as part of
+# the standalone --daily-heal workload, off both the trading box and this
+# per-workload spot lifecycle.) This mode ends at the exact point
 # the per-state workload dispatch would begin: the SF owns the workloads
 # (per-state granularity + liveness polling + skip flags preserved) and
 # the termination; the bootstrap watchdog above (MAX_RUNTIME_SECONDS,

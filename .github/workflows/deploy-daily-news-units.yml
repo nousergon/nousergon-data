@@ -1,0 +1,114 @@
+name: Deploy daily-news systemd units
+
+# Auto-reinstall the daily-news.{service,timer} systemd units on the
+# always-on dashboard box when either unit file changes on main
+# (config#2352). Same gap class as config#2295 (watch dispatcher deploy) and
+# config#2337 (dashboard flagship-units self-provision) — a merged unit-file
+# edit must not sit inert until an operator remembers to re-run the install
+# script by hand over SSM.
+#
+# Scope: unit FILES only. The daily-news.service payload (code) already
+# self-refreshes every run via `git reset --hard` in
+# scripts/run_daily_news_standalone.sh — this workflow exists only because
+# that self-refresh never touches /etc/systemd/system/.
+#
+# Box: the dashboard box is always-on (unlike the trading box), so a
+# merge-time SSM push is straightforward — no stopped-box queuing semantics
+# needed here (contrast with metron-intraday, which relies on boot-pull
+# self-healing per the 2026-07-13 operator ruling on config#2352, since the
+# trading box is off most of the day).
+#
+# IAM: no new grant needed. github-actions-lambda-deploy already carries
+# ssm:SendCommand scoped to this exact instance (Sid DashboardDeployViaSSM,
+# infrastructure/iam/github-actions-lambda-deploy.json) — added for the
+# dashboard code-deploy path and reused here since the resource scope
+# (i-09b539c844515d549) and action (AWS-RunShellScript) are identical.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/systemd/daily-news.service'
+      - 'infrastructure/systemd/daily-news.timer'
+      - 'infrastructure/install-daily-news.sh'
+      - '.github/workflows/deploy-daily-news-units.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-daily-news-units-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DASHBOARD_INSTANCE_ID: i-09b539c844515d549
+
+jobs:
+  deploy:
+    name: Reinstall daily-news systemd units (dashboard box)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: SSM re-run install-daily-news.sh on the dashboard box
+        id: send
+        run: |
+          # Refresh the box's checkout to origin/main BEFORE running the
+          # install script — the box only pulls lazily at daily-news.service
+          # run time (git reset --hard in run_daily_news_standalone.sh), so a
+          # freshly-merged install script / unit file is NOT yet on the box at
+          # deploy-on-merge time. Without this the very first deploy fails with
+          # "install-daily-news.sh: No such file or directory" (exit 127), and
+          # every later deploy would copy STALE unit files. Refresh as ec2-user
+          # (the checkout owner — matches run_daily_news_standalone.sh's own
+          # `git fetch origin && git reset --hard origin/main`); running the git
+          # ops as root would break the ec2-user self-refresh via ownership
+          # drift. `&&`-chained so any step failing aborts fail-loud (the run
+          # document does not set -e). install-daily-news.sh still runs under
+          # sudo for the /etc/systemd/system writes.
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${DASHBOARD_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cd /home/ec2-user/alpha-engine-data && sudo -u ec2-user git fetch origin && sudo -u ec2-user git reset --hard origin/main && sudo bash /home/ec2-user/alpha-engine-data/infrastructure/install-daily-news.sh"]' \
+            --comment "config#2352 deploy-on-merge: daily-news unit refresh (${{ github.sha }})" \
+            --query "Command.CommandId" --output text)
+          echo "command_id=${CMD_ID}" >> "$GITHUB_OUTPUT"
+          echo "Dispatched SSM command ${CMD_ID}"
+
+      - name: Poll for command completion
+        run: |
+          for _ in $(seq 1 20); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${{ steps.send.outputs.command_id }}" \
+              --instance-id "${DASHBOARD_INSTANCE_ID}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "status=${STATUS}"
+            case "$STATUS" in
+              Success) exit 0 ;;
+              Failed|Cancelled|TimedOut) echo "SSM command failed: ${STATUS}"; aws ssm get-command-invocation --command-id "${{ steps.send.outputs.command_id }}" --instance-id "${DASHBOARD_INSTANCE_ID}" --query "StandardErrorContent" --output text; exit 1 ;;
+              *) sleep 6 ;;
+            esac
+          done
+          echo "Timed out waiting for SSM command to complete"
+          exit 1
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-daily-news-units.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@8c40481c0e80790bda54b30af63b4a341bebcccb # main
+    secrets: inherit

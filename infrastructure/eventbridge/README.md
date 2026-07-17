@@ -36,9 +36,11 @@ Requires AWS creds with `events:DescribeRule` on the target rules.
 
 ## CI wiring
 
-Not yet wired into a workflow — the PR that added this script includes the
-intended `sf-drift-check.yml` diff in its description, marked as
-needs-manual-apply (the runner that authored it lacks the `workflow` OIDC
-scope to push workflow YAML directly). It also needs
-`events:DescribeRule` added to the `github-actions-iam-drift-check` OIDC
-role's policy (codified in `crucible-executor`, not this repo).
+Wired via `.github/workflows/sf-arn-drift-check.yml` (PR-triggered on the
+paths above, daily 09:30 UTC, `workflow_dispatch`), alongside the SF
+LoggingConfiguration guard — see `infrastructure/step-functions/README.md`'s
+"CI wiring" note. Requires `events:DescribeRule` / `events:ListRules` on the
+`github-actions-iam-drift-check` OIDC role's policy (codified in
+`crucible-executor`) — until that policy is applied live (operator-run
+`apply.sh`, not automated per that repo's IAM doctrine), this workflow's
+steps will fail on AccessDenied rather than report real drift.
