@@ -61,7 +61,11 @@ declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
   ["ci-watch-dispatcher"]="alpha-engine-ci-watch-dispatcher"
+  # sf-watch-liveness-probe now carries ONLY the reclaim/sweep ACTION paths
+  # (config#2270/#2257); its wiring checks moved to overseer-liveness-probe
+  # (alpha-engine-config-I2831). Both stay under the dead-probe backstop.
   ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
+  ["overseer-liveness-probe"]="alpha-engine-overseer-liveness-probe"
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
 )
 

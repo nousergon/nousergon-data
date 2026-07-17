@@ -1,55 +1,49 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the alpha-engine-groom-liveness-probe Lambda and
-# wire its EventBridge Scheduler rules.
+# deploy.sh — Create or update the alpha-engine-overseer-liveness-probe Lambda
+# and wire its EventBridge Scheduler rules.
 #
-# WHY: the EC2-spot backlog groom (config#1432) self-reports its terminal state
-# (a `groom-digest` issue + Telegram ping), but only when the box lives long
-# enough to run groom_run.sh's reporting trap. SILENT modes — spot reclaim
-# mid-run, OOM/panic before the trap, a lost SSM command, a broken dispatcher
-# Lambda, a disabled/misconfigured schedule (the 2026-06-29 dead-trigger class) —
-# file NOTHING. This probe is the external watchdog: schedule-aware, it asserts
-# every scheduled groom that has had time to finish filed a terminal digest, and
-# LOUD-pings Telegram for any that didn't. (The "probe now" half; the
-# Step-Function-wrap that would let the existing Fleet-SF Watch cover the groom
-# natively is the tracked "SF later" follow-up.)
+# WHY (alpha-engine-config-I2831, epic I2821): ONE registry-driven watch-plane
+# liveness probe. It iterates infrastructure/overseer/playbooks.yaml (BUNDLED
+# into the zip here, same as overseer-dispatcher) and runs each playbook's
+# declared `liveness` checks + the top-level `watch_plane_liveness` checks —
+# config-drift wiring (EventBridge rules / Step Functions / dispatcher Lambdas /
+# launch config) AND groom-style run-window accounting — replacing the two
+# per-probe enumerations (sf-watch-liveness-probe's wiring checks, migrated here;
+# groom-liveness-probe, fully migrated + deleted). Read-only + silent-unless-
+# broken. The sf-watch reclaim-checker (config#2270) + disabled-window sweep
+# (config#2257) ACTION paths STAY in the slimmed sf-watch-liveness-probe.
 #
-# IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds + the shared
-# Fleet-Watch PAT) + s3 Get/Put on the dedup state key. No EC2/SSM-send — it only
-# READS state, never launches anything.
+# IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds) + read-only
+# events:DescribeRule/ListTargetsByRule + states:DescribeStateMachine +
+# lambda:GetFunctionConfiguration + ec2:Describe{Images,SecurityGroups,Subnets}
+# + sqs:GetQueueUrl + s3 Get/List on the run-window prefixes + s3 Get/Put on the
+# dedup state key + dynamodb on the flow-doctor store. NO InvokeFunction / EC2
+# mutate — this probe never acts.
 #
-# Cadence (UTC): two runs/day, each after a groom's worst-case completion
-# (groom hard-ceiling 360 min + slack). Per-trigger windows + S3 dedup make the
-# exact times non-load-bearing (generous LOOKBACK tolerates schedule drift):
-#   06:30 daily   cron(30 6 * * ? *)   # after the 19:00 groom matures (~01:45)
-#   14:30 daily   cron(30 14 * * ? *)  # after the 07:00 groom matures (~13:45)
-#                                      #   (the 01:00 high-only run matures ~07:45 —
-#                                      #   also covered by the 14:30 pass)
+# Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
+# cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
+# config-drift + run-window check, not tied to any pipeline's own schedule:
+#   06:50 daily   cron(50 6 * * ? *)
+#   14:50 daily   cron(50 14 * * ? *)
 #
-# Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
-# blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
-# fleet-wide policy after 4 IAM-clobber incidents — infrastructure/iam/README.md).
-#
-# CODE auto-deploys on merge to main via
-# `.github/workflows/deploy-groom-liveness-probe.yml` (path-filtered to this
-# directory), which runs this script with NO flags (the default/flagless run
-# is already code-only). A SCHED_CRONS change (this probe's OWN invocation
-# cadence) still needs an operator to run `--bootstrap` by hand — merging
-# alone has ZERO live effect on it.
+# Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers/probes
+# (narrow OIDC blast radius, operator-deployed only). Merging the PR has ZERO
+# live effect until an operator runs this with --bootstrap.
 #
 # Usage:
-#   bash .../groom-liveness-probe/deploy.sh             # update code only (same command CI runs)
-#   bash .../groom-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules
-#   bash .../groom-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
-#   bash .../groom-liveness-probe/deploy.sh --smoke     # invoke once (read-only check; pings only on a real miss)
+#   bash .../overseer-liveness-probe/deploy.sh             # update code only
+#   bash .../overseer-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules
+#   bash .../overseer-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
+#   bash .../overseer-liveness-probe/deploy.sh --smoke     # invoke once (read-only; pings only on a real problem)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FUNCTION_NAME="alpha-engine-groom-liveness-probe"
-ROLE_NAME="alpha-engine-groom-liveness-probe-role"
-POLICY_NAME="alpha-engine-groom-liveness-probe-policy"
-SCHED_ROLE_NAME="alpha-engine-groom-liveness-probe-scheduler-role"
-SCHED_POLICY_NAME="invoke-groom-liveness-probe"
+FUNCTION_NAME="alpha-engine-overseer-liveness-probe"
+ROLE_NAME="alpha-engine-overseer-liveness-probe-role"
+POLICY_NAME="alpha-engine-overseer-liveness-probe-policy"
+SCHED_ROLE_NAME="alpha-engine-overseer-liveness-probe-scheduler-role"
+SCHED_POLICY_NAME="invoke-overseer-liveness-probe"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -57,20 +51,18 @@ FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 SCHED_NAMES=(
-  "alpha-engine-groom-liveness-0630-daily"
-  "alpha-engine-groom-liveness-1430-daily"
+  "alpha-engine-overseer-liveness-0650-daily"
+  "alpha-engine-overseer-liveness-1450-daily"
 )
 SCHED_CRONS=(
-  "cron(30 6 * * ? *)"
-  "cron(30 14 * * ? *)"
+  "cron(50 6 * * ? *)"
+  "cron(50 14 * * ? *)"
 )
-SCHED_PREFIX="alpha-engine-groom-liveness-"
+SCHED_PREFIX="alpha-engine-overseer-liveness-"
 
-# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
-# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
-# instead of silently running the real deploy path (alpha-engine-config-
-# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
-# here, matching other tools' convention, and triggered a real deploy).
+# DRY_RUN honors an ambient env var (true/1/yes) as well as --dry-run, so
+# DRY_RUN=1/true from a caller's shell no-ops instead of silently deploying
+# (alpha-engine-config-I2752 incident class, 2026-07-16).
 case "${DRY_RUN:-false}" in
   true|1|yes|TRUE|YES) DRY_RUN=true ;;
   *) DRY_RUN=false ;;
@@ -90,42 +82,30 @@ run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
-# ----- 0. Scratch dir + validate handler syntax -----------------------------
-# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
-# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
-
-PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
+# ----- 0. Validate handler + run unit tests ----------------------------------
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
-# ----- 0b. Preflight handler unit tests --------------------------------------
-# The git-only nousergon_lib submodules index.py imports at module scope
-# (flow_doctor_fleet.FleetTelegramTopic; telegram.send_message via
-# flow_doctor_telegram) are stubbed in sys.modules by test_handler.py BEFORE
-# `import index` (see its header) — so this gate stays hermetic on bare python.
-# `index.py`'s `import boto3` is REAL, and requirements.txt deliberately omits
-# boto3 (provided by the Lambda runtime at deploy time, per its own comment),
-# so pytest's `import index` needs it installed explicitly here — passed to the
-# shared gate, which installs it into its own scratch dir, NOT the caller's
-# global site-packages, not bundled into the Lambda zip. Two prior gaps
-# here, same class (the gate's dep/stub set drifting from index.py's real
-# module-level imports): 2026-07-02 "No module named pytest" (script had only
-# run on operator laptops where pytest/boto3 were ambient); 2026-07-04 "No
-# module named nousergon_lib" (config#1742 flow-doctor cutover moved the source
-# onto nousergon_lib but the sys.modules stub was not migrated in lockstep).
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}" boto3
+run_handler_tests "${SCRIPT_DIR}" boto3 pyyaml -r "${SCRIPT_DIR}/requirements.txt"
 
-# ----- 1. Package: pip install deps + zip handler ---------------------------
+# ----- 1. Package: pip install deps + zip handler + bundle registry ---------
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PKG=$(mktemp -d)
+trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
+# The playbook registry is this probe's check table — bundled from the repo
+# SSoT so a registry edit deploys through the normal code path (mirrors
+# overseer-dispatcher/deploy.sh; pinned by
+# tests/test_overseer_playbook_registry.py::test_liveness_probe_bundles_registry).
+cp "${SCRIPT_DIR}/../../overseer/playbooks.yaml" "${PKG}/playbooks.yaml"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -155,8 +135,8 @@ if $BOOTSTRAP; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
     run aws lambda create-function --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 --role "${ROLE_ARN}" --handler index.handler \
-      --zip-file "fileb://${ZIP}" --timeout 30 --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' --region "${REGION}" \
+      --zip-file "fileb://${ZIP}" --timeout 60 --memory-size 256 \
+      --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,ACCOUNT_ID='"${ACCOUNT_ID}"'}' --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
     echo "  Lambda exists, code will be updated in step 3"
@@ -215,6 +195,19 @@ fi
 
 # ----- 3. Update function code (always, idempotent) -------------------------
 
+# New-Lambda safety: the auto-deploy-on-merge workflow runs this flagless (no
+# --bootstrap), but the OIDC deploy role cannot create the IAM role / Lambda /
+# scheduler rules — an operator must run --bootstrap first. Until then the
+# function does not exist, and a bare update-function-code would FAIL the deploy
+# workflow (notify-main-failure). Skip gracefully instead, so merging this stays
+# GREEN and activation is cleanly deferred to the operator bootstrap.
+if ! $BOOTSTRAP && ! aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "NOTE: ${FUNCTION_NAME} is not bootstrapped yet (function does not exist)."
+  echo "      Skipping code deploy — an operator must run 'deploy.sh --bootstrap'"
+  echo "      first (creates the role + Lambda + 2 scheduler rules)."
+  exit 0
+fi
+
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
 run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
   --zip-file "fileb://${ZIP}" --region "${REGION}" --query 'LastUpdateStatus' --output text
@@ -228,18 +221,18 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment 'Variables={LOG_LEVEL=INFO,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,ACCOUNT_ID='"${ACCOUNT_ID}"'}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
 fi
 
-# ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL miss) ----
+# ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL problem) -
 
 if $SMOKE; then
   echo ""
-  echo "Smoke-testing via direct invoke (read-only liveness check)..."
+  echo "Smoke-testing via direct invoke (read-only wiring check)..."
   RESP=$(mktemp)
   aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out \
     --payload '{}' --region "${REGION}" "${RESP}" >/dev/null
