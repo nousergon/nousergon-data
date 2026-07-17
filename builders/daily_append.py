@@ -83,6 +83,20 @@ from validators.price_validator import (
     DEFAULT_BLOCK_ANOMALY_TYPES,
     validate_today_row,
 )
+# L2 per-series data-contract gates (alpha-engine-config#2456): calendar-
+# aware continuity, vol-scaled outlier, and calendar-monotonic checks that
+# validate_today_row/validate_parquet above do not cover (see
+# series_contract's module docstring for the full delta). Supplements,
+# does not replace, the existing block/warn plumbing above — schema/sanity
+# are also run for parity with a repo that has no price_validator, but
+# ``price_validator``'s OHLC/intrabar/volume checks remain this repo's
+# authoritative source for the checks it already owns.
+from nousergon_lib.series_contract import (
+    GATE_NAMES as _L2_GATE_NAMES,
+    DEFAULT_BLOCK_GATES as _L2_DEFAULT_BLOCK_GATES,
+    quarantine_decision as _l2_quarantine_decision,
+    validate_series as _l2_validate_series,
+)
 
 log = logging.getLogger(__name__)
 
@@ -425,6 +439,42 @@ def _load_block_anomaly_types() -> frozenset[str]:
         raise RuntimeError(
             f"DAILY_APPEND_BLOCK_ANOMALY_TYPES contains unknown anomaly types: "
             f"{sorted(unknown)}. Known types: {sorted(ALL_ANOMALY_TYPES)}"
+        )
+    return frozenset(parsed)
+
+
+def _load_l2_block_gates() -> frozenset[str]:
+    """Read ``DAILY_APPEND_L2_BLOCK_GATES`` env var or fall back to
+    ``nousergon_lib.series_contract.DEFAULT_BLOCK_GATES``.
+
+    Mirrors :func:`_load_block_anomaly_types`'s override contract for the
+    new L2 series-contract gates (schema / sanity / staleness / continuity
+    / outlier / calendar_monotonic). Default block set is schema / sanity /
+    calendar_monotonic (unambiguous corruption); staleness / continuity /
+    outlier default to alarm-and-allow since they can legitimately arise
+    from an operational gap or a real market event, not just corruption.
+    Format: JSON list of gate name strings. Unknown names raise.
+    """
+    raw = os.environ.get("DAILY_APPEND_L2_BLOCK_GATES", "").strip()
+    if not raw:
+        return _L2_DEFAULT_BLOCK_GATES
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"DAILY_APPEND_L2_BLOCK_GATES is not valid JSON: {exc}. "
+            f"Expected a JSON list of gate name strings."
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+        raise RuntimeError(
+            f"DAILY_APPEND_L2_BLOCK_GATES must be a JSON list of strings, "
+            f"got {parsed!r}"
+        )
+    unknown = set(parsed) - set(_L2_GATE_NAMES)
+    if unknown:
+        raise RuntimeError(
+            f"DAILY_APPEND_L2_BLOCK_GATES contains unknown gate names: "
+            f"{sorted(unknown)}. Known gates: {sorted(_L2_GATE_NAMES)}"
         )
     return frozenset(parsed)
 
@@ -1713,9 +1763,20 @@ def _daily_append_impl(
     quality_counts_by_type: dict[str, int] = {}
     quality_blocked_details: list[tuple[str, str]] = []  # (ticker, anomaly_type)
 
+    # L2 series-contract counters (alpha-engine-config#2456) — separate from
+    # the validate_today_row counters above since the two gates run
+    # independently and can each block/warn on the same row for different
+    # reasons; keeping them distinct preserves per-surface attribution in
+    # the aggregated end-of-run record.
+    n_l2_quarantined = 0  # rows refused by the L2 series-contract gate
+    n_l2_alarmed = 0      # rows written but flagged (alarm, no quarantine)
+    l2_counts_by_gate: dict[str, int] = {}
+    l2_quarantined_details: list[tuple[str, str]] = []  # (ticker, gate_name)
+
     # Read DAILY_APPEND_BLOCK_ANOMALY_TYPES once per run (raises on malformed
     # JSON / unknown types — fail fast before the chunked pass begins).
     block_anomaly_types = _load_block_anomaly_types()
+    l2_block_gates = _load_l2_block_gates()
 
     # ── Corporate-action basis-consistency guard setup (PR4, config#1433) ────
     # Build the registry + the registered splits grouped by ticker ONCE.
@@ -2104,6 +2165,58 @@ def _daily_append_impl(
                         )
                     n_quality_warned += 1
 
+                # ── L2 series-contract gate (alpha-engine-config#2456) ────
+                # Supplements validate_today_row above with the three checks
+                # it doesn't cover: calendar-aware continuity (vs.
+                # validate_parquet's naive calendar-DAY gap heuristic),
+                # vol-scaled outlier (vs. validate_today_row's fixed
+                # MAX_DAILY_RETURN=0.50), and calendar-monotonic (no
+                # existing equivalent). schema/sanity also run here for
+                # parity with the shared-lib module's full six-gate
+                # contract, even though price_validator's OHLC/negative-
+                # close checks above already cover this repo's write path
+                # for those two. Runs against hist+today_row combined so
+                # continuity/outlier/monotonic see real trailing history,
+                # not just the single new row.
+                #
+                # today_row's date REPLACES any existing hist row at the
+                # same date rather than being concatenated alongside it —
+                # the MorningEnrich overwrite contract (skip_if_exists=
+                # False, the default) intentionally re-writes today's row
+                # when it's already in hist (polygon settling yfinance's
+                # NaN-VWAP placeholder); that legitimate overwrite must not
+                # look like a duplicate-date corruption to
+                # calendar_monotonic. drop(..., errors="ignore") is a
+                # no-op on the common append-at-head case (today_ts not
+                # yet in hist.index).
+                if not hist.empty:
+                    l2_series = pd.concat(
+                        [hist.drop(index=today_row.index, errors="ignore"), today_row]
+                    ).sort_index()
+                else:
+                    l2_series = today_row
+                l2_report = _l2_validate_series(
+                    l2_series, ticker, as_of=today_ts.date(),
+                )
+                l2_decision = _l2_quarantine_decision(
+                    l2_report, block_gates=l2_block_gates,
+                )
+                if l2_decision.alarm:
+                    for r in l2_report.failing:
+                        log.warning(
+                            "L2 series-contract %s %s.%s: %s",
+                            "QUARANTINE" if r.gate in l2_decision.blocking_gates
+                            else "WARN",
+                            ticker, r.gate, r.reason,
+                        )
+                        l2_counts_by_gate[r.gate] = l2_counts_by_gate.get(r.gate, 0) + 1
+                    if l2_decision.quarantine:
+                        for gate_name in l2_decision.blocking_gates:
+                            l2_quarantined_details.append((ticker, gate_name))
+                        n_l2_quarantined += 1
+                        continue  # do not queue this row for write
+                    n_l2_alarmed += 1
+
                 # Defer the actual ArcticDB write — collected here so Phase 2
                 # can run them in parallel via a thread pool. The previous
                 # sequential per-ticker `_write_row_backfill_safe` call took
@@ -2276,6 +2389,36 @@ def _daily_append_impl(
                 n_quality_blocked, sorted(blocked_types), detail_list,
             )
 
+    # ── Aggregated L2 series-contract alert (one per run, not one per
+    # ticker) — mirrors the validate_today_row aggregation immediately
+    # above, same rationale (2026-06-11 EOD alert-storm note there): a
+    # systemic event (e.g. a shared-upstream gap that hits every S&P
+    # constituent) must fan out as ONE alert, not one per ticker.
+    # Quarantine (block-gate failures) is the load-bearing signal → ERROR.
+    # Non-quarantining alarms (warn-gate failures — staleness/continuity/
+    # outlier by default) still page per the issue's "quarantine + alarm,
+    # do not sit silent" requirement, but at WARNING severity — these can
+    # legitimately arise from an operational gap or a real market event,
+    # not just corruption, so they don't carry the same urgency as a
+    # quarantined row.
+    if n_l2_quarantined:
+        quarantined_gates = {g for _, g in l2_quarantined_details}
+        l2_detail_list = ", ".join(
+            f"{tkr}.{g}" for tkr, g in l2_quarantined_details[:20]
+        )
+        if len(l2_quarantined_details) > 20:
+            l2_detail_list += f", … +{len(l2_quarantined_details) - 20} more"
+        log.error(
+            "L2 series-contract quarantined %d row(s) this run (gates=%s): %s",
+            n_l2_quarantined, sorted(quarantined_gates), l2_detail_list,
+        )
+    elif n_l2_alarmed:
+        log.warning(
+            "L2 series-contract flagged %d row(s) this run (non-quarantining; "
+            "gate_counts=%s)",
+            n_l2_alarmed, dict(l2_counts_by_gate),
+        )
+
     t_total = time.time() - t0
 
     result = {
@@ -2299,6 +2442,10 @@ def _daily_append_impl(
         "tickers_quality_warned": n_quality_warned,
         "quality_anomaly_counts": dict(quality_counts_by_type),
         "quality_block_anomaly_types": sorted(block_anomaly_types),
+        "tickers_l2_quarantined": n_l2_quarantined,
+        "tickers_l2_alarmed": n_l2_alarmed,
+        "l2_gate_counts": dict(l2_counts_by_gate),
+        "l2_block_gates": sorted(l2_block_gates),
         "schema_drift_incidents": n_schema_drift[0],
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
@@ -2308,11 +2455,13 @@ def _daily_append_impl(
     log.info(
         "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d "
         "n_parquet_warmup=%d n_missing_from_closes=%d (of %d) "
-        "quality_blocked=%d quality_warned=%d anomaly_counts=%s | "
+        "quality_blocked=%d quality_warned=%d anomaly_counts=%s "
+        "l2_quarantined=%d l2_alarmed=%d l2_gate_counts=%s | "
         "macro_updated=%d sector_updated=%d | %.1fs total",
         n_ok, n_partial, n_skip, n_err, n_parquet_warmup,
         n_missing_from_closes, len(stock_tickers),
         n_quality_blocked, n_quality_warned, dict(quality_counts_by_type),
+        n_l2_quarantined, n_l2_alarmed, dict(l2_counts_by_gate),
         len(macro_updated) if not dry_run else 0,
         len(sector_updated) if not dry_run else 0,
         t_total,

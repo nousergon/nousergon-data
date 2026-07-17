@@ -116,9 +116,12 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "trading_calendar coherence with eod-success-friday-shell-trigger",
     ),
-    "groom-liveness-probe": (
+    "overseer-liveness-probe": (
         "v0.83.0",
-        "flow-doctor forum-topic routing (config#1742)",
+        "flow-doctor forum-topic routing (config#1742) — unified registry-driven "
+        "watch-plane liveness probe; mirrors the sf-watch/groom probes it replaces "
+        "(alpha-engine-config-I2831; groom probe deleted, sf-watch slimmed to its "
+        "reclaim/sweep action paths)",
     ),
     "pipeline-watchdog": (
         "v0.83.0",

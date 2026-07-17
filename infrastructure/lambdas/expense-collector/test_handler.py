@@ -97,7 +97,9 @@ class FakeCE:
     def get_cost_forecast(self, **kw):
         if self.fail_forecast:
             raise RuntimeError("forecast unavailable")
-        return {"Total": {"Amount": "10.00"}}
+        # MONTHLY-granularity forecast returns the FULL month-end total (already
+        # includes MTD), NOT the remainder — this is the AWS-console figure.
+        return {"Total": {"Amount": "25.00"}}
 
 
 class FakeBoto3:
@@ -204,6 +206,25 @@ class TestNeonPeriodPacing:
         assert row["quota"]["projected"] == pytest.approx(5.0)
         assert row["pace"] is None or row["pace"] == "under"  # 5.0 !> 5 GB
 
+    def test_operator_note_and_fixed_cost_surface(self, monkeypatch):
+        """A budgets note + fixed_monthly_usd (e.g. temporary paid plan) must
+        reach the row — the fixed-cost branch used to blank the note."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {"name": "nousergon",
+                "data_transfer_bytes": 8_000_000,
+                "consumption_period_start": "2026-07-01T00:00:00Z",
+                "consumption_period_end": "2026-08-01T00:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        budgets = {"providers": {"neon": {
+            "fixed_monthly_usd": 19.0, "note": "Launch plan — TEMPORARY"}}}
+        row = index.collect_neon(index._month_window(NOW), budgets,
+                                 {index.SSM_NEON: "k"})
+        assert row["mtd_cost_usd"] == 19.0
+        assert row["projected_month_end_usd"] == 19.0
+        assert row["note"] == "Launch plan — TEMPORARY"
+
 
 class TestFixedRows:
     def test_config_only_subscription_row(self):
@@ -300,10 +321,13 @@ class TestHandler:
         assert json.loads(store["expenses/latest.json"]) == doc
         rows = _rows_by_key(doc)
 
-        # AWS: grouped-service sum + CE forecast projection
+        # AWS: grouped-service sum + CE MONTHLY forecast used DIRECTLY as the
+        # month-end total (NOT mtd+forecast — that double-counted; see
+        # fix/expense-aws-forecast-double-count). Forecast 25.00 > MTD 12.34.
         assert rows["aws"]["mtd_cost_usd"] == pytest.approx(12.34)
-        assert rows["aws"]["projected_month_end_usd"] == pytest.approx(22.34)
-        assert rows["aws"]["pace"] == "under"  # 22.34 < 50 budget
+        assert rows["aws"]["projected_month_end_usd"] == pytest.approx(25.00)
+        assert rows["aws"]["detail"]["projection_source"] == "ce_forecast_monthly"
+        assert rows["aws"]["pace"] == "under"  # 25.00 < 50 budget
         assert rows["aws"]["detail"]["top_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
 
         # Anthropic: client-telemetry fallback sums cost_usd, tolerating nulls

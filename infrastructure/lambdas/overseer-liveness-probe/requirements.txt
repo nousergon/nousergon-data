@@ -1,0 +1,9 @@
+# Registry-driven unified watch-plane liveness probe (alpha-engine-config-I2831).
+# Mirrors the two probes it replaces (sf-watch/groom liveness) — same flow-doctor
+# forum-topic routing + bundled flow_doctor_telegram.py, so the same known-good
+# pin. (Routing this probe's OWN alerts onto the nousergon-alerts intake bus via
+# a krepis>=0.15.0 bump is alpha-engine-config-I2846's scope, not this refactor.)
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
+krepis>=0.10.2
+# Registry parsing (infrastructure/overseer/playbooks.yaml bundled at deploy).
+pyyaml>=6.0

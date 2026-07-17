@@ -34,31 +34,6 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _embedding_to_f32(embedding) -> np.ndarray:
-    """Coerce a pgvector ``vector`` column value to a float32 ndarray.
-
-    ``nousergon_lib.rag.db.get_connection`` registers pgvector's psycopg2
-    codec, whose contract is that ``vector`` columns come back as numpy
-    arrays. Depending on the pgvector/psycopg2 build that resolves on the
-    weekly data spot, that same codec can instead hand back a
-    ``pgvector.Vector`` object — which has NO numpy interop (no
-    ``__array__``/``__len__``/``__iter__``), so ``np.array(v, dtype=...)``
-    falls through to ``float(v)`` and raises
-    ``TypeError: float() argument must be ... not 'Vector'`` (the
-    2026-07-11 weekly-freshness break at Step 8/9, filing change detection).
-
-    Normalize via pgvector's documented ``Vector.to_numpy()`` before the
-    array cast so the "laziness" signal computes identically regardless of
-    which representation the codec returns. This stays FAIL-LOUD: a raw
-    string here means the codec silently failed to register, and
-    ``np.asarray('[...]', dtype=np.float32)`` still raises rather than
-    silently mis-parsing it.
-    """
-    if hasattr(embedding, "to_numpy"):  # pgvector.Vector — not numpy-coercible
-        embedding = embedding.to_numpy()
-    return np.asarray(embedding, dtype=np.float32)
-
-
 # Server-side centroid aggregation (config-I2780 / config-I2753 / config-I2781).
 #
 # The original query here SELECTed the raw ``c.embedding`` column for EVERY
@@ -146,7 +121,17 @@ def _load_filing_centroids(
         {ticker: [{ticker, doc_type, filed_date, centroid: np.ndarray,
                    sections: {label: np.ndarray}, n_chunks: int}, ...]}
         with each ticker's filings sorted by filed_date ascending.
+
+    pgvector ``vector`` columns (the centroid + per-section aggregates
+    returned by ``_CENTROID_SQL``) are normalized via
+    ``nousergon_lib.rag.coerce_embedding`` — the owned chokepoint that makes
+    the ndarray guarantee representation-agnostic (config#2221). The former
+    local ``_embedding_to_f32`` was the call-site-only fix (nousergon-data
+    PR #747) for the 2026-07-11 weekly-freshness break; it was lifted into
+    nousergon-lib so no future consumer of a ``vector`` column can
+    reintroduce the ``float() ... not 'Vector'`` crash.
     """
+    from nousergon_lib.rag import coerce_embedding
     from nousergon_lib.rag.db import get_connection
 
     params: list = []
@@ -178,10 +163,10 @@ def _load_filing_centroids(
                 "n_chunks": 0,
             }
         if is_overall:
-            grouped[key]["centroid"] = _embedding_to_f32(centroid)
+            grouped[key]["centroid"] = coerce_embedding(centroid)
             grouped[key]["n_chunks"] = int(n_chunks)
         elif section_label:
-            grouped[key]["sections"][section_label] = _embedding_to_f32(centroid)
+            grouped[key]["sections"][section_label] = coerce_embedding(centroid)
 
     by_ticker: dict[str, list[dict]] = defaultdict(list)
     for entry in grouped.values():

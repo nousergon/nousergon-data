@@ -727,6 +727,15 @@ def _build_event_record(
     # config#1827: a deliberate operator abort is recorded loudly but never
     # auto-dispatches a recovery agent (would waste a cycle and, once weekday/EOD
     # leave propose-only, risk an automated countermand of a human decision).
+    # 2026-07-17: preflight (Friday shell-run) failures now DISPATCH — the
+    # 2026-07-10 blanket suppression predated the charter's preflight mode;
+    # today the payload carries is_preflight, the charter's PREFLIGHT MODE
+    # section scopes the agent to shell-run reruns (weekly_sf_rerun.py
+    # preserves the original input's shell_run flag), and the whole point of
+    # the Friday rehearsal is to have failures fixed BEFORE Saturday 09:00 —
+    # observe-only left the fixing to a human on Friday night. Preflight
+    # remains gated from the deterministic FAST PATH (_fast_path_recovery):
+    # only the charter-carrying agent understands shell-run scope.
     # config#2003: two more carve-outs, checked in order (first match wins —
     # the reason string is a single value, most-specific/deliberate first):
     #   operator_abort            — an explicit human STOP marker.
@@ -751,8 +760,6 @@ def _build_event_record(
     budget_exhausted = prior_dispatches >= dispatch_ceiling
     if operator_abort:
         dispatch_suppressed = "operator_abort"
-    elif is_preflight:
-        dispatch_suppressed = "preflight"
     elif operator_recovery_rerun:
         dispatch_suppressed = "operator_recovery_rerun"
     elif already_escalated and not DISPATCH_AFTER_ESCALATION:
