@@ -1,0 +1,60 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-expense-collector:*"
+    },
+    {
+      "Sid": "ProviderKeySSM",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/OPENROUTER_API_KEY",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/symposion/DEEPSEEK_API_KEY",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/NEON_API_KEY",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/NEON_DATA_TRANSFER_QUOTA_GB",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_pat",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/expenses/*"
+      ]
+    },
+    {
+      "Sid": "CostExplorerRead",
+      "Effect": "Allow",
+      "Action": ["ce:GetCostAndUsage", "ce:GetCostForecast"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ExpenseArtifactsReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/expenses/*"
+    },
+    {
+      "Sid": "BudgetsAndCostRawRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/config/expense_budgets.json",
+        "arn:aws:s3:::alpha-engine-research/decision_artifacts/_cost_raw/*"
+      ]
+    },
+    {
+      "Sid": "PrefixList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["expenses/*", "decision_artifacts/_cost_raw/*"]
+        }
+      }
+    }
+  ]
+}

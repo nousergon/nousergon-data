@@ -1,0 +1,81 @@
+name: Deploy expense-collector
+
+# Auto-deploy the alpha-engine-expense-collector Lambda CODE on merge to main.
+# Same pattern as deploy-usage-pace-alert.yml: this script's default/flagless
+# run is already code-only (no aws iam/scheduler writes happen unless
+# --bootstrap is passed), so no new script flag was needed to make this safe.
+#
+# A change to SCHED_NAMES/SCHED_CRONS (the collector's OWN invocation cadence)
+# still requires an operator to run `deploy.sh --bootstrap` by hand, for the
+# same reason as the sibling dispatchers: the github-actions-lambda-deploy OIDC
+# role deliberately lacks iam:CreateRole / iam:PutRolePolicy (fleet-wide
+# policy, infrastructure/iam/README.md).
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# deploy.json), which already includes this function.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/expense-collector/**'
+      - '.github/workflows/deploy-expense-collector.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-expense-collector-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy expense-collector Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Deploy expense-collector (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/expense-collector/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-expense-collector \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-expense-collector.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
