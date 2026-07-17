@@ -58,6 +58,40 @@ name on AWS is `{role-name}-policy` (enforced by `apply.sh`).
 `apply.sh` calls `aws iam put-role-policy`, which is idempotent —
 re-running overwrites the existing inline policy on the role.
 
+## Lambda exec-role drift coverage (config#2340 surface 3)
+
+`check-drift.py` also covers **every lambda exec role** whose inline
+permission policy is tracked as a file — i.e. each
+`infrastructure/lambdas/<name>/iam-policy.json`. These policies were already
+tracked and already applied by each lambda's `deploy.sh --bootstrap`; the only
+missing leg was drift-check coverage.
+
+Rather than move the files (which would churn every lambda's deploy path),
+`check-drift.py` discovers each lambda's **primary role in place**: it reads the
+authoritative `ROLE_NAME=`/`POLICY_NAME=` at the top of the lambda's `deploy.sh`
+(the source of truth for what `put-role-policy … --policy-document
+file://iam-policy.json` applies) and drift-checks `(ROLE_NAME, POLICY_NAME,
+iam-policy.json)`. A tracked `iam-policy.json` whose `deploy.sh` does **not**
+define both names is a **coverage gap** and fails the sweep — a policy file can
+never silently escape drift-checking (the untracked-policy → outage class this
+surface closes).
+
+The live drift run needs the OIDC role `github-actions-iam-drift-check` to hold
+`iam:GetRolePolicy` on these lambda roles; that Resource-list extension ships in
+the paired `crucible-executor` PR and must be applied by an operator before the
+scheduled check passes for the lambda roles.
+
+### Out of scope (documented follow-up)
+
+Some lambdas define **secondary** roles (schedulers/canaries — `SCHED_ROLE_NAME`,
+`CANARY_SCHED_ROLE_NAME`, `SF_ROLE_NAME`, …) whose policies are applied from
+**inline heredoc variables** (`${SCHED_INVOKE_POLICY}`), not from
+`iam-policy.json` files. Those have no file to diff, so they are **not** yet
+drift-covered. Lifting each inline scheduler/canary policy into a tracked file
+(so `check-drift.py` covers it the same way) is the remaining surface-3
+follow-up — it touches each `deploy.sh`'s apply path and needs a live deploy to
+validate, so it is deliberately separated from this drift-coverage change.
+
 ## Single-writer rule
 
 Each codified role must have **exactly one writer** — `apply.sh` in the
