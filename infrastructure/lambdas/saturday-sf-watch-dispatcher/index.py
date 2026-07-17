@@ -185,11 +185,22 @@ PIPELINES: dict[str, dict[str, object]] = {
         # decision there belongs to the agent's Lane-D discipline, never a
         # deterministic rule).
         "fast_path": {
+            # alpha-engine-config-I2717 (2026-07-16): "WaitForChronicGap" /
+            # "ChronicGapSelfHeal" removed — that state (+ its liveness-poll
+            # loop) was deleted from step_function_daily.json entirely, moved
+            # to the standalone --daily-heal job which is NOT part of this
+            # pipeline at all.
+            # alpha-engine-config-I2745 (2026-07-16): "WaitForMorningEnrich" /
+            # "WaitForMorningArcticAppend" / "MorningEnrich" / "MorningArcticAppend"
+            # were stale — those on-trading state names were retired by the
+            # config#1767 Phase-2 spot decoupling and replaced with the Spot-based
+            # polling/launch states below. Updated to the current step_function_daily.json
+            # state names (verified to exist and be correct SSM poll/spot-launch shape).
             "poll_states": frozenset(
-                {"WaitForMorningEnrich", "WaitForMorningArcticAppend", "WaitForChronicGap"}
+                {"PollMorningEnrichSpot", "PollMorningArcticAppendSpot"}
             ),
             "data_task_states": frozenset(
-                {"MorningEnrich", "MorningArcticAppend", "ChronicGapSelfHeal"}
+                {"LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"}
             ),
             "veto_states": frozenset({"RunMorningPlanner", "RunDaemon"}),
         },

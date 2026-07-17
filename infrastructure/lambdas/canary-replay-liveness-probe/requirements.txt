@@ -1,0 +1,8 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# nousergon_lib.alerts.publish — the fleet-wide SNS+Telegram paging chokepoint,
+# with built-in dedup_key support (used here keyed on run_token, which is
+# already unique per ISO week — no hand-rolled fingerprint/clear state needed).
+# Root-pin lockstep (tests/test_lib_pin_lockstep.py) — no exemption needed,
+# this Lambda uses no spot_dispatch feature requiring a newer tag.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.86.0
