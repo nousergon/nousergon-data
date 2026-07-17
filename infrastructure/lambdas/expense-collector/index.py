@@ -259,11 +259,18 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
                detail={"top_services_usd": {k: round(v, 2) for k, v in top.items()}},
                note="Cost Explorer data lags ~24h")
     try:
+        # CE's MONTHLY-granularity forecast over a partial-month window returns
+        # the FULL month-end total (already includes actuals-to-date) — the
+        # exact figure AWS's own console "forecasted month-end" tile shows. Use
+        # it DIRECTLY; adding MTD double-counts spend-to-date (that bug made a
+        # $103.25 month-end read as $152.14). The DAILY-granularity forecast
+        # would instead return the remainder-only, but MONTHLY is what matches
+        # the console, so we anchor to the provider-authoritative number.
         fc = ce.get_cost_forecast(
             TimePeriod={"Start": end, "End": next_month.strftime("%Y-%m-%d")},
             Metric="UNBLENDED_COST", Granularity="MONTHLY")
-        row["projected_month_end_usd"] = round(mtd + float(fc["Total"]["Amount"]), 2)
-        row["detail"]["projection_source"] = "ce_forecast"
+        row["projected_month_end_usd"] = round(float(fc["Total"]["Amount"]), 2)
+        row["detail"]["projection_source"] = "ce_forecast_monthly"
     except Exception as exc:  # noqa: BLE001 — forecast is an enhancement; the
         # straight-line fallback below is the recorded degradation surface.
         logger.info("CE forecast unavailable (straight-line fallback): %s", exc)

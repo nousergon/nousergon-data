@@ -97,7 +97,9 @@ class FakeCE:
     def get_cost_forecast(self, **kw):
         if self.fail_forecast:
             raise RuntimeError("forecast unavailable")
-        return {"Total": {"Amount": "10.00"}}
+        # MONTHLY-granularity forecast returns the FULL month-end total (already
+        # includes MTD), NOT the remainder — this is the AWS-console figure.
+        return {"Total": {"Amount": "25.00"}}
 
 
 class FakeBoto3:
@@ -300,10 +302,13 @@ class TestHandler:
         assert json.loads(store["expenses/latest.json"]) == doc
         rows = _rows_by_key(doc)
 
-        # AWS: grouped-service sum + CE forecast projection
+        # AWS: grouped-service sum + CE MONTHLY forecast used DIRECTLY as the
+        # month-end total (NOT mtd+forecast — that double-counted; see
+        # fix/expense-aws-forecast-double-count). Forecast 25.00 > MTD 12.34.
         assert rows["aws"]["mtd_cost_usd"] == pytest.approx(12.34)
-        assert rows["aws"]["projected_month_end_usd"] == pytest.approx(22.34)
-        assert rows["aws"]["pace"] == "under"  # 22.34 < 50 budget
+        assert rows["aws"]["projected_month_end_usd"] == pytest.approx(25.00)
+        assert rows["aws"]["detail"]["projection_source"] == "ce_forecast_monthly"
+        assert rows["aws"]["pace"] == "under"  # 25.00 < 50 budget
         assert rows["aws"]["detail"]["top_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
 
         # Anthropic: client-telemetry fallback sums cost_usd, tolerating nulls
