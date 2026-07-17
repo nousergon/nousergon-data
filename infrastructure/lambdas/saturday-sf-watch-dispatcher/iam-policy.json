@@ -24,6 +24,12 @@
       ]
     },
     {
+      "Sid": "InvokeOverseerRouter",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-overseer-dispatcher"
+    },
+    {
       "Sid": "AgentDispatchPAT",
       "Effect": "Allow",
       "Action": ["ssm:GetParameter"],
