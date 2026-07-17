@@ -64,8 +64,9 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "handling as ci-watch-dispatcher)",
     ),
     "ci-watch-dispatcher": (
-        "v0.106.0",
-        "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling)",
+        "v0.122.0",
+        "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
+        "bumped for extra_tags atomic-launch-tagging, config#2292)",
     ),
     "config-runner-dispatcher": (
         "v0.110.0",
@@ -125,8 +126,9 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "sf-watch-spot-dispatcher": (
-        "v0.106.0",
-        "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling)",
+        "v0.122.0",
+        "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
+        "bumped for extra_tags atomic-launch-tagging, config#2292)",
     ),
     "spot-orphan-reaper": (
         "v0.97.0",
