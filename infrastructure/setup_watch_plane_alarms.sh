@@ -57,13 +57,15 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 
 # The four watch-plane Lambdas (deployed names verified against each
 # infrastructure/lambdas/<dir>/deploy.sh FUNCTION_NAME).
+# sf-watch-liveness-probe now carries ONLY its reclaim/sweep action paths
+# config#2270/#2257; the wiring checks moved to the registry-driven
+# overseer-liveness-probe per alpha-engine-config-I2831. Both stay under this
+# dead-probe backstop. (Comment kept OUT of the array literal below so the
+# tests/test_watch_plane_alarms_script.py block-parser isn't confused by a `)`.)
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
   ["ci-watch-dispatcher"]="alpha-engine-ci-watch-dispatcher"
-  # sf-watch-liveness-probe now carries ONLY the reclaim/sweep ACTION paths
-  # (config#2270/#2257); its wiring checks moved to overseer-liveness-probe
-  # (alpha-engine-config-I2831). Both stay under the dead-probe backstop.
   ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
   ["overseer-liveness-probe"]="alpha-engine-overseer-liveness-probe"
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"

@@ -52,7 +52,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All five watch-plane Lambdas must be alarmed."""
+    """All six watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -61,6 +61,10 @@ class TestWatchPlaneCoverage:
             "alpha-engine-sf-watch-spot-dispatcher",
             "alpha-engine-ci-watch-dispatcher",
             "alpha-engine-sf-watch-liveness-probe",
+            # The registry-driven unified probe (alpha-engine-config-I2831) — its
+            # own Errors metric is the dead-probe backstop the fail-loud contract
+            # assumes, same as the sibling probes.
+            "alpha-engine-overseer-liveness-probe",
             "alpha-engine-overseer-dispatcher",
         ],
     )
@@ -70,13 +74,13 @@ class TestWatchPlaneCoverage:
             "it silently reopens the 'who watches the watcher' gap (config#2266)."
         )
 
-    def test_four_functions_declared(self, script_text):
+    def test_all_functions_declared(self, script_text):
         block = script_text[
             script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(") : script_text.find(
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 5
+        assert block.count('"alpha-engine-') == 6
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
