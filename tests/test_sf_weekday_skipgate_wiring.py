@@ -132,7 +132,8 @@ class TestEntryEdgesRouteThroughGates:
         false_branch = [
             c["Next"]
             for c in states["TradingDayGateChoice"]["Choices"]
-            if c.get("BooleanEquals") is False
+            # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
+            if any(op.get("BooleanEquals") is False for op in c.get("And", [c]))
         ]
         assert false_branch == ["NotifyHolidaySkip"]
         assert states["TradingDayGateFailed"]["Next"] == "StartExecutorEC2"
@@ -249,7 +250,9 @@ class TestPaths:
                     if c.get("StringEquals") in ("Success", "SUCCESS")
                 ]
                 launched = (
-                    [c["Next"] for c in st.get("Choices", []) if c.get("BooleanEquals") is True]
+                    # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
+                    [c["Next"] for c in st.get("Choices", [])
+                     if any(op.get("BooleanEquals") is True for op in c.get("And", [c]))]
                     if cur.endswith("SpotLaunched") else []
                 )
                 cur = (succ or launched or [st.get("Default")])[0]

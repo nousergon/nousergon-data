@@ -720,9 +720,26 @@
       "Comment": "launched:true -> poll; launched:false kill-switch -> continue to snapshot/reconcile.",
       "Choices": [
         {
-          "Variable": "$.postmarket_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — a dispatcher payload without data_spot.launched previously threw States.Runtime here, ending the execution FAILED before StopTradingInstance (cost guard bypassed).",
           "Next": "PollPostMarketDataSpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: a payload WITHOUT data_spot.launched means the dispatcher could not verifiably launch (partial/malformed result) — route into the existing data-spot failure notifier instead of silently treating it as an intentional not-launched skip (Default).",
+          "Next": "ExtractDataSpotError"
         }
       ],
       "Default": "CheckSkipCaptureSnapshot"
@@ -878,9 +895,26 @@
       "Comment": "launched:true -> poll; launched:false kill-switch -> continue.",
       "Choices": [
         {
-          "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — same States.Runtime-before-cost-guard class as CheckPostMarketDataSpotLaunched.",
           "Next": "PollPostMarketArcticAppendSpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: malformed dispatcher payload — route into the existing data-spot failure notifier, never a silent skip.",
+          "Next": "ExtractDataSpotError"
         }
       ],
       "Default": "CheckSkipCaptureSnapshot"
@@ -1158,8 +1192,17 @@
       "Comment": "config-I2702 deliverable #3: recursion guard. An operator-replay execution (pipeline_role=operator-replay — including a heal-dispatched replay itself, HealDispatchReplay below) that STILL finds the precondition unmet must not spawn a further self-heal loop (replays run with skip_post_market_data=true, so they have no data-spot phase to retry — looping here would just burn the 2-attempt budget doing nothing). Page immediately instead. A live/daemon/backstop-triggered execution (the normal case) enters the loop.",
       "Choices": [
         {
-          "Variable": "$.pipeline_role",
-          "StringEquals": "operator-replay",
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — this SF has no InitializeInput floor (StartAt is CheckMutexRole), so $.pipeline_role is an execution-input key that is not provably present. Absent falls to Default InitHealLoop, i.e. the live-execution treatment, which is the correct reading for any non-replay trigger.",
           "Next": "HealNonConvergent"
         }
       ],
@@ -1185,8 +1228,17 @@
               "NumericGreaterThanEquals": 2
             },
             {
-              "Variable": "$.precondition_probe.Payload.past_deadline",
-              "BooleanEquals": true
+              "And": [
+                {
+                  "Variable": "$.precondition_probe.Payload.past_deadline",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.precondition_probe.Payload.past_deadline",
+                  "BooleanEquals": true
+                }
+              ],
+              "Comment": "config-I2767: IsPresent-guarded — a probe payload without past_deadline previously threw States.Runtime inside this Or. Absent, the operand is simply false and the loop stays bounded by the attempts operand alone (2 attempts, then HealNonConvergent pages)."
             }
           ],
           "Next": "HealNonConvergent"
@@ -1235,8 +1287,17 @@
       "Comment": "launched:true -> poll; launched:false (kill-switch) -> this heal attempt accomplished nothing, try again next iteration.",
       "Choices": [
         {
-          "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — absent launched (malformed dispatcher payload) falls to Default HealLoopIncrement: the bounded heal loop (2 attempts) retries or pages via HealNonConvergent, never States.Runtime.",
           "Next": "HealPollPostMarketDataSpot"
         }
       ],
@@ -1360,8 +1421,17 @@
       "Comment": "launched:true -> poll; launched:false (kill-switch) -> try again next iteration.",
       "Choices": [
         {
-          "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — absent launched falls to Default HealLoopIncrement (bounded heal loop), never States.Runtime.",
           "Next": "HealPollArcticAppendSpot"
         }
       ],
@@ -1485,8 +1555,17 @@
       "Comment": "config-I2702 deliverable #3(c): the precondition landed -> dispatch the reconcile-only replay. Not yet -> try again next iteration.",
       "Choices": [
         {
-          "Variable": "$.precondition_probe.Payload.precondition_met",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — a probe payload without precondition_met falls to Default HealLoopIncrement: not converged, loop stays bounded (2 attempts, then HealNonConvergent pages), never States.Runtime.",
           "Next": "HealDispatchReplay"
         }
       ],
@@ -1630,8 +1709,17 @@
       "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set (by SetDegradedFlag) iff the precondition probe ever found the SPY close not-yet-verified-present this execution — regardless of whether the self-heal loop subsequently converged (HealConvergedNotify) or paged (HealNonConvergent): EODReconcile was skipped IN THIS EXECUTION either way, so 'plain ExecutionSucceeded' would still be a lie about THIS execution's own work, even when the system as a whole self-healed via a replay.",
       "Choices": [
         {
-          "Variable": "$.degraded_summary.degraded",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on the degraded path (SetDegradedFlag) — on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
           "Next": "DegradedSucceeded"
         }
       ],

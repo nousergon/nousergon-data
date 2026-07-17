@@ -105,7 +105,10 @@
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["changelog/", "changelog/*"]
+          "s3:prefix": [
+            "changelog/",
+            "changelog/*"
+          ]
         }
       }
     },
