@@ -259,11 +259,18 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
                detail={"top_services_usd": {k: round(v, 2) for k, v in top.items()}},
                note="Cost Explorer data lags ~24h")
     try:
+        # CE's MONTHLY-granularity forecast over a partial-month window returns
+        # the FULL month-end total (already includes actuals-to-date) — the
+        # exact figure AWS's own console "forecasted month-end" tile shows. Use
+        # it DIRECTLY; adding MTD double-counts spend-to-date (that bug made a
+        # $103.25 month-end read as $152.14). The DAILY-granularity forecast
+        # would instead return the remainder-only, but MONTHLY is what matches
+        # the console, so we anchor to the provider-authoritative number.
         fc = ce.get_cost_forecast(
             TimePeriod={"Start": end, "End": next_month.strftime("%Y-%m-%d")},
             Metric="UNBLENDED_COST", Granularity="MONTHLY")
-        row["projected_month_end_usd"] = round(mtd + float(fc["Total"]["Amount"]), 2)
-        row["detail"]["projection_source"] = "ce_forecast"
+        row["projected_month_end_usd"] = round(float(fc["Total"]["Amount"]), 2)
+        row["detail"]["projection_source"] = "ce_forecast_monthly"
     except Exception as exc:  # noqa: BLE001 — forecast is an enhancement; the
         # straight-line fallback below is the recorded degradation surface.
         logger.info("CE forecast unavailable (straight-line fallback): %s", exc)
@@ -421,8 +428,12 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
                 "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
                 "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
                 "consumption_period": f"{period_start} → {period_end}"},
-        note="free plan — the binding constraint is the transfer quota, not $"
-             if not _fixed_usd(budgets, "neon") else None,
+        # Prefer an operator note from the budgets SSoT (e.g. a temporary
+        # paid-plan explanation) so what the operator recorded reaches the page;
+        # fall back to the free-plan default only when no cost is configured.
+        note=_cfg_note(budgets, "neon")
+             or ("free plan — the binding constraint is the transfer quota, not $"
+                 if not _fixed_usd(budgets, "neon") else None),
     )
     row["budget_usd"] = _budget_usd(budgets, "neon")
     return row
@@ -515,6 +526,13 @@ def _private_repo_names(account: str, kind: str, headers: dict) -> set[str]:
         if len(batch) < 100:
             break
     return names
+
+
+def _cfg_note(budgets: dict, key: str) -> str | None:
+    """Operator-authored note for a provider from the budgets SSoT (surfaced on
+    the row so a manual explanation — e.g. a temporary plan change — reaches the
+    console)."""
+    return ((budgets.get("providers") or {}).get(key) or {}).get("note")
 
 
 def _included_minutes(budgets: dict, key: str) -> float | None:
