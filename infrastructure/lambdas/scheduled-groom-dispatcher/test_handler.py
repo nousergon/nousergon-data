@@ -1010,6 +1010,81 @@ def test_sweep_launch_failure_raises_for_sf_catch(monkeypatch):
         idx.handler(dict(_SWEEP_SF_EVENT), None)
 
 
+# ── config#2667: launch_decided (sweep) dispatches now write a decision ─────
+# record too — previously ONLY the demand-all path did, leaving the
+# dispatch-decision log (groom/decisions/{date}/*.json, the ground truth
+# groom-liveness-probe reads to detect a silently-missing run artifact)
+# structurally blind to sweep-mode dispatches.
+
+
+def test_sweep_launch_writes_decision_record(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler(dict(_SWEEP_SF_EVENT), None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1, f"exactly one sweep decision record expected, got {list(idx._test_s3._objects)}"
+    doc = json.loads(list(records.values())[0])
+    assert doc["schema_version"] == 2
+    assert doc["run_mode"] == "sweep"
+    assert doc["trigger"] == "launch_decided"
+    assert doc["decisions"] == [{
+        "launch": True, "issue_filter": "mid-only", "model": "claude-haiku-4-5",
+        "reason": "launch_decided", "tier_tag": "sweep",
+    }]
+    assert "decided_at" in doc
+
+
+def test_sweep_skip_launch_writes_decision_record_with_launch_false(monkeypatch):
+    # The concurrent-lane skip path (a prior cycle's sweep box still live) is
+    # itself a launch_decided invocation that must ALSO leave a record — with
+    # launch=false, so the liveness probe correctly does NOT expect an
+    # artifact for it (see groom-liveness-probe's _decision_launched).
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"sweep": ["i-live-sweep"]},
+    )
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert out["groom"]["launched"] is False
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1
+    doc = json.loads(list(records.values())[0])
+    assert doc["decisions"][0]["launch"] is False
+    assert doc["decisions"][0]["reason"] == "concurrent_tier_skip"
+
+
+def test_sweep_decision_record_write_failure_never_blocks_dispatch(monkeypatch):
+    # Best-effort, mirrors _write_trigger_record/_write_skip_record: a record
+    # -write failure must never turn an already-successful sweep launch into
+    # a crash.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+
+    def _boom(**kw):
+        raise RuntimeError("S3 down")
+
+    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert out["groom"]["launched"] is True
+
+
+def test_full_mode_launch_decided_also_writes_sweep_style_decision_record(monkeypatch):
+    # The launch_decided fast-path is shared by sweep AND any other
+    # pre-decided relaunch (e.g. the SF's bounded-relaunch loop for a
+    # full-mode box) — the record write applies uniformly to the whole
+    # launch_decided branch, not just run_mode=sweep.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-sonnet-5",
+        "issue_filter": "high-only", "launch_decided": True,
+    }, None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1
+    doc = json.loads(list(records.values())[0])
+    assert doc["run_mode"] == "full"
+    assert doc["decisions"][0]["launch"] is True
+
+
 def test_launch_decided_never_exports_partition_envs(monkeypatch):
     # config#2201: the config#2129 partition machinery is fully retired — a
     # stale caller still sending partition fields must not resurrect the

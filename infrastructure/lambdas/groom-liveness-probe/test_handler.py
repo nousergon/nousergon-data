@@ -221,6 +221,151 @@ def test_fetch_run_artifact_timestamps_skips_non_json_and_missing_run_start(monk
     assert index._fetch_run_artifact_timestamps(s3, now) == []
 
 
+# ---- config#2667: decision-log-driven expected triggers (sweep-mode) -------
+
+
+def test_decision_launched_true_for_top_level_launched_bool():
+    assert index._decision_launched({"launched": True}) is True
+
+
+def test_decision_launched_true_for_top_level_launch_bool():
+    assert index._decision_launched({"launch": True}) is True
+
+
+def test_decision_launched_true_when_any_decision_entry_launches():
+    record = {
+        "decisions": [
+            {"launch": False, "issue_filter": "low-only"},
+            {"launch": True, "issue_filter": "high-only"},
+        ]
+    }
+    assert index._decision_launched(record) is True
+
+
+def test_decision_launched_false_for_skip_only_record():
+    """A demand-gate/concurrent-lane skip (or a failed-enumeration fail-closed
+    skip) — decisions is empty or every entry is launch=false. Must be
+    ignored, not treated as an expected trigger."""
+    assert index._decision_launched({"decisions": []}) is False
+    assert index._decision_launched({
+        "decisions": [{"launch": False, "reason": "concurrent_tier_skip"}]
+    }) is False
+    assert index._decision_launched({}) is False
+
+
+def test_expected_triggers_from_decisions_sweep_launch_true_included(monkeypatch):
+    """The actual config#2667 gap: a sweep dispatch (no fixed cron) with a
+    launch=true decision must surface as an expected trigger via the
+    decision log."""
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 12)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "DECISION_RECORD_PREFIX", "groom/decisions/")
+    now = _dt(2026, 7, 15, 12, 0)
+    s3 = _FakeArtifactS3({
+        "groom/decisions/2026-07-15/": [
+            ("groom/decisions/2026-07-15/sweep-195600.json", {
+                "schema_version": 2, "trigger": "launch_decided", "run_mode": "sweep",
+                "decisions": [{"launch": True, "issue_filter": "mid-only"}],
+                "decided_at": "2026-07-15T04:56:00+00:00",
+            }),
+        ],
+    })
+    trigs = index._expected_triggers_from_decisions(s3, now)
+    assert [t["at"] for t in trigs] == [_dt(2026, 7, 15, 4, 56)]
+
+
+def test_expected_triggers_from_decisions_skip_only_excluded(monkeypatch):
+    """A skip-only decision record (launch=false for every entry) must NOT
+    become an expected trigger — it was never supposed to produce a run
+    artifact."""
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 12)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "DECISION_RECORD_PREFIX", "groom/decisions/")
+    now = _dt(2026, 7, 15, 12, 0)
+    s3 = _FakeArtifactS3({
+        "groom/decisions/2026-07-15/": [
+            ("groom/decisions/2026-07-15/sweep-193000.json", {
+                "schema_version": 2, "trigger": "launch_decided", "run_mode": "sweep",
+                "decisions": [{"launch": False, "reason": "concurrent_tier_skip"}],
+                "decided_at": "2026-07-15T04:30:00+00:00",
+            }),
+            ("groom/decisions/2026-07-15/trigger-0700.json", {
+                "schema_version": 2, "trigger": "demand-all", "skip_reason": "demand_gate_skip",
+                "decisions": [], "decided_at": "2026-07-15T07:00:00+00:00",
+            }),
+        ],
+    })
+    assert index._expected_triggers_from_decisions(s3, now) == []
+
+
+def test_expected_triggers_from_decisions_immature_excluded(monkeypatch):
+    """A decision record decided too recently to have had CEILING+MARGIN
+    minutes to finish must not yet be checkable."""
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 12)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "DECISION_RECORD_PREFIX", "groom/decisions/")
+    now = _dt(2026, 7, 15, 12, 0)
+    s3 = _FakeArtifactS3({
+        "groom/decisions/2026-07-15/": [
+            ("groom/decisions/2026-07-15/sweep-113000.json", {
+                "schema_version": 2, "trigger": "launch_decided", "run_mode": "sweep",
+                "decisions": [{"launch": True}],
+                "decided_at": "2026-07-15T11:30:00+00:00",  # 30 min ago — not mature
+            }),
+        ],
+    })
+    assert index._expected_triggers_from_decisions(s3, now) == []
+
+
+def test_expected_triggers_from_decisions_skips_malformed_record(monkeypatch):
+    """A single unreadable/malformed record must not hide the rest — mirrors
+    _fetch_run_artifact_timestamps's malformed-artifact tolerance."""
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 12)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    monkeypatch.setattr(index, "DECISION_RECORD_PREFIX", "groom/decisions/")
+    now = _dt(2026, 7, 15, 12, 0)
+
+    class _BoomOnOneKey(_FakeArtifactS3):
+        def get_object(self, Bucket, Key):  # noqa: N803
+            if "boom" in Key:
+                raise RuntimeError("corrupt object")
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+    s3 = _BoomOnOneKey({
+        "groom/decisions/2026-07-15/": [
+            ("groom/decisions/2026-07-15/boom.json", {}),
+            ("groom/decisions/2026-07-15/sweep-195600.json", {
+                "schema_version": 2, "trigger": "launch_decided", "run_mode": "sweep",
+                "decisions": [{"launch": True}],
+                "decided_at": "2026-07-15T04:56:00+00:00",
+            }),
+        ],
+    })
+    trigs = index._expected_triggers_from_decisions(s3, now)
+    assert [t["at"] for t in trigs] == [_dt(2026, 7, 15, 4, 56)]
+
+
+def test_all_expected_triggers_dedupes_same_instant(monkeypatch):
+    """A full-mode trigger legitimately appears in BOTH the fixed-cron
+    schedule AND the decision log (demand-all writes a record too) — must not
+    be double-counted."""
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 12)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    trig = _dt(2026, 7, 15, 7, 0)
+    monkeypatch.setattr(index, "_expected_triggers", lambda now: [{"at": trig, "label": "07:00 daily"}])
+    monkeypatch.setattr(
+        index, "_expected_triggers_from_decisions",
+        lambda s3, now: [{"at": trig, "label": "decision-log:demand-all"}],
+    )
+    out = index._all_expected_triggers(object(), _dt(2026, 7, 15, 12, 0))
+    assert [t["at"] for t in out] == [trig]
+
+
 # ---- handler (dedup + fail-loud) -------------------------------------------
 
 
@@ -249,7 +394,7 @@ def _wire(monkeypatch, *, triggers, stamps, s3, sent=True, now=_dt(2026, 6, 30, 
     # change, purely from elapsed wall-clock time). Default `now` sits ~1h after
     # the trigger dates the other tests share.
     monkeypatch.setattr(index, "_now", lambda: now)
-    monkeypatch.setattr(index, "_expected_triggers", lambda now: triggers)
+    monkeypatch.setattr(index, "_all_expected_triggers", lambda s3, now: triggers)
     monkeypatch.setattr(index, "_fetch_run_artifact_timestamps", lambda s3, now: stamps)
     monkeypatch.setattr(index, "_s3_client", lambda: s3)
     sends = []
@@ -293,7 +438,7 @@ def test_handler_fail_loud_on_s3_error(monkeypatch):
     """The PRIMARY input (S3 run-artifact fetch) RAISES — a silently-skipped
     check is the exact failure this guards against."""
     trig = {"at": _dt(2026, 6, 29, 23, 0), "label": "23:00 daily"}
-    monkeypatch.setattr(index, "_expected_triggers", lambda now: [trig])
+    monkeypatch.setattr(index, "_all_expected_triggers", lambda s3, now: [trig])
     monkeypatch.setattr(index, "_s3_client", lambda: _FakeS3())
 
     def _boom(s3, now):
@@ -305,6 +450,162 @@ def test_handler_fail_loud_on_s3_error(monkeypatch):
 
 
 def test_handler_no_mature_triggers_short_circuits(monkeypatch):
-    monkeypatch.setattr(index, "_expected_triggers", lambda now: [])
+    monkeypatch.setattr(index, "_all_expected_triggers", lambda s3, now: [])
+    monkeypatch.setattr(index, "_s3_client", lambda: _FakeS3())
     out = index.handler({}, None)
     assert out["checked"] == 0 and out["alerted"] is False
+
+
+# ---- config#2667: end-to-end sweep-mode detection via the real S3 reads ----
+#
+# These three exercise the FULL real path (_all_expected_triggers →
+# _expected_triggers_from_decisions → _fetch_run_artifact_timestamps →
+# _missed → handler), with only notify_via_flow_doctor + the dedup-state
+# object stubbed — the acceptance criteria the issue calls out explicitly:
+# a sweep dispatch with launch=true + a matching artifact is NOT flagged; a
+# sweep dispatch with launch=true and NO matching artifact after maturity IS
+# flagged; a skip-only decision record is correctly ignored.
+
+
+class _FakeFullS3:
+    """One fake S3 serving decision records, run artifacts, AND the liveness
+    dedup-state blob — everything handler() touches for these end-to-end
+    tests. ``decisions``/``artifacts`` map date -> [(key, body_dict), ...];
+    ``alerted`` seeds the dedup-state GET.
+    """
+
+    def __init__(self, *, decisions=None, artifacts=None, alerted=None):
+        self._decisions = decisions or {}
+        self._artifacts = artifacts or {}
+        self._alerted = alerted or []
+        self.put_calls = []
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+        for date, items in self._decisions.items():
+            if Prefix == f"groom/decisions/{date}/":
+                return {"Contents": [{"Key": k} for k, _ in items], "IsTruncated": False}
+        for date, items in self._artifacts.items():
+            if Prefix == f"groom/{date}/":
+                return {"Contents": [{"Key": k} for k, _ in items], "IsTruncated": False}
+        return {"Contents": [], "IsTruncated": False}
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        import io
+
+        if Key == index.STATE_KEY:
+            return {"Body": io.BytesIO(index.json.dumps({"alerted": self._alerted}).encode())}
+        for items in list(self._decisions.values()) + list(self._artifacts.values()):
+            for k, body in items:
+                if k == Key:
+                    return {"Body": io.BytesIO(index.json.dumps(body).encode())}
+        raise AssertionError(f"unexpected key {Key}")
+
+    def put_object(self, Bucket, Key, Body, ContentType=None):  # noqa: N803
+        self.put_calls.append((Key, index.json.loads(Body)))
+
+
+def _sweep_decision(decided_at: str, *, launch: bool) -> dict:
+    return {
+        "schema_version": 2, "trigger": "launch_decided", "run_mode": "sweep",
+        "decisions": [{"launch": launch, "issue_filter": "mid-only"}],
+        "decided_at": decided_at,
+    }
+
+
+def test_e2e_sweep_with_matching_artifact_not_flagged(monkeypatch):
+    monkeypatch.setattr(index, "_now", lambda: _dt(2026, 7, 15, 12, 0))
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    # Isolate to the decision-log source only — the fixed-cron schedule would
+    # otherwise ALSO contribute real 01:00/07:00/19:00 triggers for this `now`,
+    # polluting the assertions below (the cron source is covered by its own
+    # dedicated test section above).
+    monkeypatch.setattr(index, "_expected_triggers", lambda now: [])
+    sends = []
+    monkeypatch.setattr(index, "notify_via_flow_doctor", lambda text, **kw: sends.append(text) or True)
+
+    s3 = _FakeFullS3(
+        decisions={
+            "2026-07-15": [
+                ("groom/decisions/2026-07-15/sweep-195600.json",
+                 _sweep_decision("2026-07-15T04:56:00+00:00", launch=True)),
+            ],
+        },
+        artifacts={
+            "2026-07-15": [
+                ("groom/2026-07-15/sweep-run1.json", {"run_start": "2026-07-15T04:56:30+00:00"}),
+            ],
+        },
+    )
+    monkeypatch.setattr(index, "_s3_client", lambda: s3)
+
+    out = index.handler({}, None)
+    assert out["missed"] == 0
+    assert out["alerted"] is False
+    assert sends == []
+
+
+def test_e2e_sweep_with_no_artifact_after_maturity_is_flagged(monkeypatch):
+    monkeypatch.setattr(index, "_now", lambda: _dt(2026, 7, 15, 12, 0))
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    # Isolate to the decision-log source only — the fixed-cron schedule would
+    # otherwise ALSO contribute real 01:00/07:00/19:00 triggers for this `now`,
+    # polluting the assertions below (the cron source is covered by its own
+    # dedicated test section above).
+    monkeypatch.setattr(index, "_expected_triggers", lambda now: [])
+    sends = []
+    monkeypatch.setattr(index, "notify_via_flow_doctor", lambda text, **kw: sends.append(text) or True)
+
+    s3 = _FakeFullS3(
+        decisions={
+            "2026-07-15": [
+                ("groom/decisions/2026-07-15/sweep-195600.json",
+                 _sweep_decision("2026-07-15T04:56:00+00:00", launch=True)),
+            ],
+        },
+        artifacts={},  # the box died silently — NO run artifact anywhere
+    )
+    monkeypatch.setattr(index, "_s3_client", lambda: s3)
+
+    out = index.handler({}, None)
+    assert out["new_missed"] == 1
+    assert out["alerted"] is True
+    assert len(sends) == 1
+    assert "SILENT FAILURE" in sends[0]
+
+
+def test_e2e_skip_only_sweep_decision_not_flagged(monkeypatch):
+    """A sweep box that skipped (concurrent-lane guard — a prior cycle's
+    sweep still live) writes launch=false. Must be ignored — it was never
+    expected to produce a run artifact, so its absence is correct, not a
+    silent failure."""
+    monkeypatch.setattr(index, "_now", lambda: _dt(2026, 7, 15, 12, 0))
+    monkeypatch.setattr(index, "LOOKBACK_HOURS", 30)
+    monkeypatch.setattr(index, "CEILING_MIN", 360)
+    monkeypatch.setattr(index, "MARGIN_MIN", 45)
+    # Isolate to the decision-log source only — the fixed-cron schedule would
+    # otherwise ALSO contribute real 01:00/07:00/19:00 triggers for this `now`,
+    # polluting the assertions below (the cron source is covered by its own
+    # dedicated test section above).
+    monkeypatch.setattr(index, "_expected_triggers", lambda now: [])
+    sends = []
+    monkeypatch.setattr(index, "notify_via_flow_doctor", lambda text, **kw: sends.append(text) or True)
+
+    s3 = _FakeFullS3(
+        decisions={
+            "2026-07-15": [
+                ("groom/decisions/2026-07-15/sweep-195600.json",
+                 _sweep_decision("2026-07-15T04:56:00+00:00", launch=False)),
+            ],
+        },
+        artifacts={},
+    )
+    monkeypatch.setattr(index, "_s3_client", lambda: s3)
+
+    out = index.handler({}, None)
+    assert out["checked"] == 0
+    assert out["alerted"] is False
+    assert sends == []

@@ -64,13 +64,26 @@ def test_known_data_entrypoints_in_scope():
     # the on-trading SSM path onto the ephemeral data spot (the spot bootstrap in
     # infrastructure/lambdas/data-spot-dispatcher/index.py clones + venvs the data
     # repo there). They are therefore no longer on-trading ssm:sendCommand
-    # entrypoints in this SF. ChronicGapSelfHeal remains on the trading box (it is
-    # a fail-soft best-effort heal, kept on the always-on box).
+    # entrypoints in this SF.
+    #
+    # alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal — the last
+    # remaining on-trading data-repo entrypoint this test used to pin — was
+    # ALSO removed (moved to the standalone --daily-heal job, on its own
+    # ephemeral spot box that clones fresh rather than pulling a persistent
+    # checkout, so it is out of scope for this detector by construction, same
+    # as the data-spot-dispatcher's other workloads). The weekday SF now has
+    # ZERO on-trading data-repo entrypoints in this detector's scope — this is
+    # the expected end state of config#1767 + I2717's cumulative decoupling,
+    # not a detection regression.
     eps = set(_data_repo_entrypoints())
-    assert {"ChronicGapSelfHeal"} <= eps, sorted(eps)
+    assert eps == set(), (
+        f"expected NO on-trading data-repo entrypoints left in the weekday SF "
+        f"(all moved to spot boxes), found: {sorted(eps)}"
+    )
     # Guard the relocation: the moved states must NOT be on-trading entrypoints.
     assert "MorningEnrich" not in eps
     assert "MorningArcticAppend" not in eps
+    assert "ChronicGapSelfHeal" not in eps
 
 
 @pytest.mark.parametrize("name", sorted(_data_repo_entrypoints()))
