@@ -528,15 +528,40 @@ class PolygonClient:
         transition; no-op pairs where old == new are dropped). A 403
         (free-tier / bad key) returns ``[]`` (mirrors :meth:`get_splits`); the
         apiKey is scrubbed from any raised error by the shared ``_get`` path.
-        Any OTHER failure (network / 5xx after retries / unexpected) PROPAGATES
-        — ``detect_renames`` catches it per-candidate and refuses to prune that
-        candidate this pass (history-safety: a detection outage must never
-        delete a symbol that might be a rename).
+
+        A 404 with ``{"status": "NOT_FOUND"}`` ALSO returns ``[]`` (config#2812
+        finding): verified live that polygon returns this — not a 5xx/timeout —
+        for a ticker whose entity record has no events at all, which is the
+        expected response for a fully-retired/delisted symbol (confirmed via
+        curl: AAPL/META 200, BLD/JHG 404 NOT_FOUND after their 2026-07-01
+        delisting). Before this fix, the 404 propagated as an unhandled
+        ``requests.HTTPError`` and ``detect_renames`` treated it as a detection
+        FAILURE (history-safety skip) — meaning ``prune_delisted_tickers`` could
+        never auto-prune the exact class of ticker (genuinely gone from
+        polygon's reference set) this check exists to clear. A 404 whose body
+        does NOT carry ``status=NOT_FOUND`` (an unexpected shape) still
+        propagates, preserving the history-safety default for anything not
+        confirmed to mean "no events".
+
+        Any OTHER failure (network / 5xx after retries / unexpected 404 body)
+        PROPAGATES — ``detect_renames`` catches it per-candidate and refuses to
+        prune that candidate this pass (history-safety: a detection outage must
+        never delete a symbol that might be a rename).
         """
         try:
             data = self._get(f"/vX/reference/tickers/{ticker}/events")
         except PolygonForbiddenError:
             return []
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None and resp.status_code == 404:
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = {}
+                if body.get("status") == "NOT_FOUND":
+                    return []
+            raise
         results_obj = data.get("results") or {}
         events = results_obj.get("events") or []
         # Collect ascending (date, new_ticker) transitions from ticker_change
