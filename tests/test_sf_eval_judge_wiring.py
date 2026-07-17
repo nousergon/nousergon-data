@@ -27,18 +27,7 @@ import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-# alpha-engine-config-I2544 (2026-07-14): the entire eval-judge chain (+
-# EvalRollingMean/RationaleClustering/ReplayConcordance/Counterfactual/
-# AggregateCosts) was LIFTED out of step_function.json's Branch A into the
-# async ne-weekly-advisory-pipeline child SF, fired fire-and-forget by the
-# main SF's StartAdvisoryPipeline state once DataPhase2 completes (see
-# test_sf_research_predictor_parallel_wiring.py for that side). Every
-# lifted state's Payload/Retry/Catch/Next semantics were preserved
-# byte-for-byte, so this file's per-state assertions are unchanged EXCEPT
-# for pointing at the new file and retiring the now-inapplicable
-# same-state-machine "before PredictorTraining" ordering claim (see
-# TestJudgeChainBeforePredictor below).
-_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_advisory.json"
+_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
 
 
 @pytest.fixture(scope="module")
@@ -48,16 +37,20 @@ def sf() -> dict:
 
 @pytest.fixture(scope="module")
 def states(sf) -> dict:
-    """Flattened state view: top-level states UNION the single-branch
-    Parallel wrapper's states.
+    """Flattened state view: top-level states UNION every Parallel
+    branch's states.
 
-    Originally (pre-I2544) the entire eval-judge + agent-justification
-    chain lived INSIDE Branch A of the main SF's ResearchPredictorParallel
-    state; flattening kept every per-state shape assertion (payload,
-    retry, timeout, Catch posture, in-chain Next edges) valid regardless
-    of nesting depth. Post-I2544 the chain lives inside
-    AdvisoryPipelineWrapper's own single-branch Parallel (the machine-
-    level catch-all retrofit) — same flattening trick, same reason.
+    Post the 2026-05-16 Research || PredictorTraining SF Parallel
+    restructure (plan
+    alpha-engine-docs/private/research-predictor-parallel-260516.md) the
+    entire eval-judge + agent-justification chain moved INSIDE Branch A
+    of the ResearchPredictorParallel state, and PredictorTraining moved
+    into Branch B. Every per-state shape assertion in this file (payload,
+    retry, timeout, Catch posture, in-chain Next edges) is still true —
+    the states just nest one level deeper. Flattening keeps those
+    assertions intact while the few tests that pinned the OLD
+    cross-boundary edges (Counterfactual → CheckSkipPredictorTraining)
+    are updated to the new branch-local terminal + post-join semantics.
     """
     flat: dict = dict(sf["States"])
     for st in sf["States"].values():
@@ -107,15 +100,116 @@ class TestStatesPresent:
 # ── Backtester success → evaluator skip-gate ──────────────────────────────
 
 
-# RETIRED (alpha-engine-config-I2544, 2026-07-14): TestBacktesterTransition
-# and TestSkipBacktesterPreservesEvalJudge used to pin that the Backtester/
-# Evaluator chain (main SF, post-Parallel-join tail) always stayed reachable
-# to / reachable from the eval-judge chain's skip gates. That invariant is
-# now MOOT — the eval-judge chain lives in a completely separate,
-# asynchronously-dispatched child SF (ne-weekly-advisory-pipeline) with no
-# ordering/reachability relationship to Backtester/Evaluator at all; the
-# main SF's Backtester->Evaluator->CheckSkipPostEval chain (unchanged by
-# this lift) is covered by tests/test_sf_evaluator_wiring.py.
+class TestBacktesterTransition:
+    def test_success_routes_to_evaluator_skip_gate(self, states):
+        # Post-2026-05-07 split: Backtester success routed to
+        # CheckSkipEvaluator (the gate in front of the standalone
+        # Evaluator state).
+        #
+        # Post-2026-05-16 preflight-task-split P1: the parity stage was
+        # split out of the combined Backtester state into its own Parity
+        # quartet, reached via CheckSkipParity.
+        #
+        # Post-2026-05-31 L4472 phase-split: the backtest stage is further
+        # decomposed by --mode into Backtester (simulate) → PredictorBacktest
+        # → PortfolioOptimizerBacktest → CheckSkipParity. CheckSkipEvaluator
+        # (the eval-judge gate) stays reachable transitively through the whole
+        # chain; pinned here by walking each status gate's Success edge.
+        # Post-config#830: skip-gates (CheckSkipPredictorBacktest /
+        # CheckSkipPortfolioOptimizerBacktest) precede the predictor + optimizer
+        # stages so mode=backtest-eval can bypass them; each defaults to running
+        # its stage, so the chain to CheckSkipEvaluator is unchanged on a normal run.
+        bt = states["CheckBacktesterStatus"]
+        success_choice = next(
+            c for c in bt["Choices"] if c.get("StringEquals") == "Success"
+        )
+        assert success_choice["Next"] == "CheckSkipPredictorBacktest"
+        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest"
+
+        def _success(check):
+            return next(
+                c for c in states[check]["Choices"]
+                if c.get("StringEquals") == "Success"
+            )["Next"]
+
+        # Walk the L4472 split chain (through the config#830 skip-gates) to the
+        # parity skip-gate.
+        assert _success("CheckPredictorBacktestStatus") == "CheckSkipPortfolioOptimizerBacktest"
+        assert states["CheckSkipPortfolioOptimizerBacktest"]["Default"] == "PortfolioOptimizerBacktest"
+        assert _success("CheckPortfolioOptimizerBacktestStatus") == "CheckSkipParity"
+
+        # skip_parity short-circuit reaches the Evaluator gate directly.
+        skip_parity = states["CheckSkipParity"]
+        assert skip_parity["Choices"][0]["Next"] == "CheckSkipEvaluator"
+        # Default = run Parity; Parity success → CheckSkipEvaluator.
+        assert skip_parity["Default"] == "Parity"
+        parity_success = next(
+            c
+            for c in states["CheckParityStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        )
+        assert parity_success["Next"] == "CheckSkipEvaluator"
+
+
+# ── Skip gate ─────────────────────────────────────────────────────────────
+
+
+class TestSkipBacktesterPreservesEvalJudge:
+    """Pins the 2026-05-03 fix (eval-judge always reachable from a
+    skip_backtester=true operator) AND the 2026-05-07 simplification
+    (skip_backtester decouples from skip_evaluator). The skip-path now
+    routes to CheckSkipEvaluator, which by construction always converges
+    to CheckSkipEvalJudge regardless of which branch it takes. So the
+    silent-bypass-to-SaturdayHealthCheck class is still impossible while
+    the operator gets independent skip flags.
+
+    Caught by SF eval-pipeline-validation-5 (2026-05-03) when Research
+    succeeded + new-format captures landed on S3 but the eval-judge state
+    silently never fired because skip_backtester=true had been
+    short-circuiting past it.
+    """
+
+    def test_skip_backtester_routes_to_evaluator_gate_not_health(self, states):
+        skip = states["CheckSkipBacktester"]
+        choice = skip["Choices"][0]
+        # The skip-true branch hits CheckSkipEvaluator (decoupled flag
+        # 2026-05-07). CheckSkipEvaluator's both branches still converge
+        # to CheckSkipEvalJudge, so eval-judge stays reachable.
+        assert choice["Next"] == "CheckSkipEvaluator"
+        # Critically NOT routed to SaturdayHealthCheck — that was the
+        # 2026-05-03 silent-bypass bug.
+        assert choice["Next"] != "SaturdayHealthCheck"
+
+    def test_evaluator_skip_gate_always_reaches_health_check(self, states):
+        """Both branches of CheckSkipEvaluator must converge into the
+        post-eval tail — the skip path and the run path
+        (Evaluator → CheckEvaluatorStatus → Success) both exit to
+        CheckSkipPostEval, the config#830 tail skip-gate, which defaults
+        to SaturdayHealthCheck (full observability tail).
+
+        Post-2026-05-07 reorder: the eval-judge chain runs UPSTREAM of
+        Evaluator (after DataPhase2, before PredictorTraining), so the
+        question this class previously asked (does eval-judge stay
+        reachable from any skip-flag combination?) is now answered at
+        the upstream junction (CheckSkipDataPhase2 → CheckSkipEvalJudge
+        regardless of skip_data_phase2). At THIS junction, both
+        branches simply exit to the tail; no judge gate downstream to protect.
+
+        config#830: CheckSkipPostEval lets a mid-week mode=backtest-eval run
+        stop after Evaluator (skip the advisory tail), but it DEFAULTS to
+        SaturdayHealthCheck so a normal Saturday run still runs the full tail.
+        """
+        gate = states["CheckSkipEvaluator"]
+        skip_choice = gate["Choices"][0]
+        assert skip_choice["Next"] == "CheckSkipPostEval"
+        assert gate["Default"] == "Evaluator"
+        # Run path success also exits to the tail gate (judge already ran upstream).
+        assert (
+            states["CheckEvaluatorStatus"]["Choices"][0]["Next"]
+            == "CheckSkipPostEval"
+        )
+        # The tail gate defaults to the full health-check tail (normal run).
+        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
 
 
 class TestSkipEvalJudge:
@@ -700,17 +794,16 @@ class TestJudgeChainBeforePredictor:
     they can be pulled into the weekly email.
     """
 
-    # NOTE (alpha-engine-config-I2544, 2026-07-14): the same-state-machine
-    # "DataPhase2 → judge chain → PredictorTraining" ordering claim this
-    # class originally pinned no longer applies — the judge chain now runs
-    # in a SEPARATE, asynchronously-dispatched child SF with no completion
-    # dependency from PredictorTraining (Branch B) at all; the main SF's
-    # DataPhase2 → StartAdvisoryPipeline → BranchAComplete wiring is
-    # covered by test_sf_research_predictor_parallel_wiring.py::
-    # TestBranchAContents::test_advisory_dispatch_after_dataphase2_in_branch_a.
-    # test_data_phase2_exits_to_judge_skip_gate_not_predictor was retired
-    # here (DataPhase2/CheckSkipDataPhase2 are main-SF-only states, out of
-    # this file's scope post-lift).
+    def test_data_phase2_exits_to_judge_skip_gate_not_predictor(self, states):
+        """DataPhase2's success path enters the judge chain, not
+        predictor training. This is the load-bearing invariant — if
+        someone ever rewires DataPhase2.Next to CheckSkipPredictorTraining
+        (the pre-reorder target), the judge chain bypass is silent."""
+        assert states["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
+        assert (
+            states["CheckSkipDataPhase2"]["Choices"][0]["Next"]
+            == "CheckSkipEvalJudge"
+        )
 
     def test_counterfactual_exits_to_aggregate_costs_gate(self, states):
         """Counterfactual's three exit edges (Next + Catch + the
@@ -736,7 +829,20 @@ class TestJudgeChainBeforePredictor:
             == "CheckSkipAggregateCosts"
         )
 
-    # test_evaluator_exits_directly_to_health_check RETIRED (alpha-engine-
-    # config-I2544): Evaluator/CheckEvaluatorStatus/CheckSkipEvaluator are
-    # main-SF-only states, out of this (advisory-SF) file's scope post-lift
-    # — covered by tests/test_sf_evaluator_wiring.py instead.
+    def test_evaluator_exits_directly_to_health_check(self, states):
+        """Evaluator's success path no longer enters the judge chain
+        (judge ran upstream). It exits to the post-eval tail gate
+        (CheckSkipPostEval, config#830), which defaults to SaturdayHealthCheck."""
+        success = next(
+            c for c in states["CheckEvaluatorStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        )
+        assert success["Next"] == "CheckSkipPostEval"
+        # And the skip-evaluator path also goes to CheckSkipPostEval
+        # (the previous pre-reorder target was CheckSkipEvalJudge).
+        assert (
+            states["CheckSkipEvaluator"]["Choices"][0]["Next"]
+            == "CheckSkipPostEval"
+        )
+        # The tail gate defaults to the full health-check tail on a normal run.
+        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
