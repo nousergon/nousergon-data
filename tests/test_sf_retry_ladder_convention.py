@@ -33,18 +33,16 @@ import pathlib
 
 import pytest
 
-_INFRA = pathlib.Path(__file__).parent.parent / "infrastructure"
-_WEEKLY = _INFRA / "step_function.json"
-# alpha-engine-config-I2545: ResolveZooSpecs/TrainSpecDispatch/ModelZooSelect
-# moved to their own Sunday-triggered child SF — same declared retry-ladder
-# convention applies there too (see MODELZOO_SPOT_STAGE_SEND_STATES below).
-_MODELZOO = _INFRA / "step_function_modelzoo.json"
+_WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
 SPOT_STAGE_SEND_STATES = {
     "MorningEnrich",
     "DataPhase1",
     "RAGIngestion",
     "PredictorTraining",
+    "ResolveZooSpecs",
+    "TrainSpecDispatch",
+    "ModelZooSelect",
     "Backtester",
     "PredictorBacktest",
     "PortfolioOptimizerBacktest",
@@ -54,14 +52,6 @@ SPOT_STAGE_SEND_STATES = {
 HEALTH_OBSERVE_SEND_STATES = {
     "SaturdayHealthCheck",
     "WeeklySubstrateHealthCheck",
-}
-# alpha-engine-config-I2545: same gold 4+2 jittered ladder, verified
-# byte-for-byte preserved by the lift — declared here as this child SF's
-# OWN closed registry.
-MODELZOO_SPOT_STAGE_SEND_STATES = {
-    "ResolveZooSpecs",
-    "TrainSpecDispatch",
-    "ModelZooSelect",
 }
 
 GOLD_LADDER = [
@@ -84,8 +74,8 @@ GOLD_LADDER = [
 ]
 
 
-def _iter_states(path: pathlib.Path = _WEEKLY):
-    definition = json.loads(path.read_text())
+def _iter_states():
+    definition = json.loads(_WEEKLY.read_text())
 
     def _walk(states):
         for name, state in states.items():
@@ -101,10 +91,10 @@ def _iter_states(path: pathlib.Path = _WEEKLY):
     yield from _walk(definition["States"])
 
 
-def _ssm_states(suffix: str, path: pathlib.Path = _WEEKLY) -> dict[str, dict]:
+def _ssm_states(suffix: str) -> dict[str, dict]:
     return {
         name: state
-        for name, state in _iter_states(path)
+        for name, state in _iter_states()
         if state.get("Resource", "").endswith(f"aws-sdk:ssm:{suffix}")
     }
 
@@ -131,38 +121,12 @@ def test_every_send_command_state_is_classified():
     assert not missing, f"declared states no longer exist: {sorted(missing)}"
 
 
-def test_every_modelzoo_send_command_state_is_classified():
-    """alpha-engine-config-I2545: same chokepoint, scoped to the ModelZoo
-    Sunday child SF's own closed registry."""
-    send_states = set(_ssm_states("sendCommand", _MODELZOO))
-    unclassified = send_states - MODELZOO_SPOT_STAGE_SEND_STATES
-    assert not unclassified, (
-        f"config#2279/I2545: new sendCommand state(s) {sorted(unclassified)} "
-        "in the ModelZoo Sunday child SF must be added to "
-        "MODELZOO_SPOT_STAGE_SEND_STATES (or a new declared class)."
-    )
-    missing = MODELZOO_SPOT_STAGE_SEND_STATES - send_states
-    assert not missing, f"declared states no longer exist: {sorted(missing)}"
-
-
 @pytest.mark.parametrize("name", sorted(SPOT_STAGE_SEND_STATES))
 def test_spot_stage_carries_gold_ladder(name):
     states = _ssm_states("sendCommand")
     assert _normalized_ladder(states[name]) == GOLD_LADDER, (
         f"config#2279: {name} drifted from the declared spot-stage 4+2 "
         "jittered ladder"
-    )
-
-
-@pytest.mark.parametrize("name", sorted(MODELZOO_SPOT_STAGE_SEND_STATES))
-def test_modelzoo_spot_stage_carries_gold_ladder(name):
-    """alpha-engine-config-I2545: verifies the lift preserved the gold
-    ladder byte-for-byte on the three states moved to the ModelZoo Sunday
-    child SF."""
-    states = _ssm_states("sendCommand", _MODELZOO)
-    assert _normalized_ladder(states[name]) == GOLD_LADDER, (
-        f"config#2279/I2545: {name} drifted from the declared spot-stage "
-        "4+2 jittered ladder"
     )
 
 
@@ -183,14 +147,11 @@ def test_health_observe_has_no_retry_but_fail_soft_catch(name):
     assert "config#2279" in state.get("Comment", "")
 
 
-@pytest.mark.parametrize("path", [_WEEKLY, _MODELZOO], ids=lambda p: p.stem)
-def test_every_poll_state_has_invocation_does_not_exist_ladder(path):
+def test_every_poll_state_has_invocation_does_not_exist_ladder():
     """SendCommand→GetCommandInvocation eventual consistency: every poll
-    state must retry the not-yet-visible-invocation error class.
-    alpha-engine-config-I2545: also covers the ModelZoo Sunday child SF's
-    own poll states (WaitResolveZoo/WaitTrainSpec/WaitForModelZoo)."""
+    state must retry the not-yet-visible-invocation error class."""
     offenders = []
-    for name, state in _ssm_states("getCommandInvocation", path).items():
+    for name, state in _ssm_states("getCommandInvocation").items():
         rules = state.get("Retry", [])
         covered = any(
             any(e.startswith("Ssm.InvocationDoesNotExist") for e in rule["ErrorEquals"])
@@ -199,15 +160,13 @@ def test_every_poll_state_has_invocation_does_not_exist_ladder(path):
         if not covered:
             offenders.append(name)
     assert not offenders, (
-        f"{path.name}: poll state(s) without the InvocationDoesNotExist "
-        f"ladder: {offenders}"
+        f"poll state(s) without the InvocationDoesNotExist ladder: {offenders}"
     )
 
 
-@pytest.mark.parametrize("path", [_WEEKLY, _MODELZOO], ids=lambda p: p.stem)
-def test_convention_is_declared_in_definition_comment(path):
-    definition = json.loads(path.read_text())
+def test_convention_is_declared_in_definition_comment():
+    definition = json.loads(_WEEKLY.read_text())
     assert "config#2279" in definition["Comment"], (
-        f"{path.name}: the retry convention declaration was dropped from "
-        "the definition's top-level Comment"
+        "the retry convention declaration was dropped from the definition's "
+        "top-level Comment"
     )

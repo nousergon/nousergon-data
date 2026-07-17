@@ -96,24 +96,38 @@ class TestChainOrdering:
         # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
         # input) still ends at NotifyComplete — strict superset preserved.
         #
-        # alpha-engine-config-I2544 (2026-07-14): ReportCard + Director
-        # (previously sitting between the substrate poll and the notify
-        # gate) were LIFTED into the async ne-weekly-advisory-pipeline
-        # child SF, dispatched earlier via StartAdvisoryPipeline right
-        # after DataPhase2. Their own success/degraded wiring (unchanged,
-        # byte-for-byte preserved) is covered by
-        # test_sf_advisory_pipeline_wiring.py::TestReportCardAndDirectorWiring.
-        # The substrate poll's Success edge now feeds CheckShellRunNotify
-        # DIRECTLY (pinned below in
+        # Two non-fatal advisory states (evaluator Report Card v2, then the
+        # Director) sit between the substrate poll and the notify gate. ReportCard's
+        # SUCCESS edge feeds the Director (which weighs the fresh card); ReportCard's
+        # Catch routes to PublishReportCardDegraded (config#2302: a WARNING alert —
+        # advisory grading failed silently for 9 days pre-fix) which then continues to
+        # notify (no card to weigh). The Director's own Next lands on CheckShellRunNotify;
+        # its Catch routes to PublishDirectorDegraded (same config#2302 WARNING-alert
+        # shape) which then continues to notify. Every path still preserves the success
+        # edge. On the Friday preflight both states RUN (dry, via
+        # dry_run.$=$.research_dry — ROADMAP L4504), they are not skipped, so the wiring
+        # is identical on real + preflight runs.
+        # config#2276: the substrate poll now resolves to a terminal status
+        # first; its Success edge is what feeds ReportCard (pinned below in
         # test_wait_for_substrate_routes_via_status_choice).
+        assert states["ReportCard"]["Next"] == "Director"
+        assert all(
+            c["Next"] == "PublishReportCardDegraded" for c in states["ReportCard"]["Catch"]
+        )
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        assert states["Director"]["Next"] == "CheckShellRunNotify"
+        assert all(
+            c["Next"] == "PublishDirectorDegraded" for c in states["Director"]["Catch"]
+        )
+        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
         # config#2278: the real-run success edge now passes through the
         # gate-degraded completion Choice before NotifyComplete.
         assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
         assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
     def test_wait_for_substrate_routes_via_status_choice(self, states):
-        # alpha-engine-config-I2544: the substrate poll's Success edge now
-        # feeds CheckShellRunNotify directly (was ReportCard pre-lift).
+        # config#2276: the substrate poll resolves to a terminal status
+        # before ReportCard, so a failing/hung checker is visible.
         assert (
             states["WaitForWeeklySubstrateHealthCheck"]["Next"]
             == "CheckSubstrateHealthCheckStatus"
@@ -122,7 +136,7 @@ class TestChainOrdering:
         success = next(
             r for r in choice["Choices"] if r.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "CheckShellRunNotify"
+        assert success["Next"] == "ReportCard"
 
 
 class TestCatchSemantics:
@@ -151,14 +165,13 @@ class TestCatchSemantics:
         for c in catches:
             assert c["Next"] == "SubstrateHealthCheckDegraded"
 
-    def test_substrate_degraded_continues_to_notify_gate(self, states):
-        """alpha-engine-config-I2544: ReportCard/Director no longer sit in
-        this SF's tail (see test_sf_advisory_pipeline_wiring.py) — a
-        degraded substrate check now continues straight to the notify
-        gate, same as the healthy path."""
+    def test_substrate_degraded_continues_to_advisory_tail(self, states):
         degraded = states["SubstrateHealthCheckDegraded"]
         assert degraded["Type"] == "Pass"
-        assert degraded["Next"] == "CheckShellRunNotify"
+        assert degraded["Next"] == "ReportCard", (
+            "A degraded substrate check must not skip the ReportCard/Director "
+            "Lambda tail — it is independent of the dashboard box."
+        )
 
 
 class TestCommandShape:
