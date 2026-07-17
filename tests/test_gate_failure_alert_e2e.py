@@ -63,10 +63,17 @@ def stub_flow_doctor_env(monkeypatch):
     """Same stub-secrets shape as test_flow_doctor_wiring.py's fixture —
     non-empty placeholder values so flow-doctor's notifier preflight
     checks pass at construction time without contacting any real
-    service (email/GitHub — this repo's flow-doctor.yaml carries no
-    Telegram notifier; Telegram routing for OTHER repos goes through
-    infrastructure/lambdas/flow_doctor_telegram.py, a separate,
-    already-tested call path)."""
+    service (email/GitHub/Telegram).
+
+    NOTE: this repo's flow-doctor.yaml DOES carry Telegram notifiers
+    (config#645/#1741 — CRITICAL + OPS_HEALTH forum-topic routing,
+    unconditional on every load, not gated on Telegram actually firing
+    in a given test). flow-doctor fails loud on any unresolved ${VAR} at
+    config-load time, so all four Telegram env vars must be seeded here
+    too, mirroring test_flow_doctor_wiring.py's fixture exactly — a
+    same-repo test using synthetic (non-CRITICAL) severities still
+    resolves the whole config file, Telegram block included, at
+    setup_logging() time."""
     monkeypatch.delenv("FLOW_DOCTOR_DISABLED", raising=False)
     monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
     monkeypatch.setenv("FLOW_DOCTOR_SKIP_PREFLIGHT", "1")
@@ -74,6 +81,10 @@ def stub_flow_doctor_env(monkeypatch):
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:stub-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100stub")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "2")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "stub-anthropic-key")
 
 
