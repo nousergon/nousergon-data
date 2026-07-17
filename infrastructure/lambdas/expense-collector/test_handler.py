@@ -357,6 +357,18 @@ class TestHandler:
         assert gh["pace"] == "over"
         assert gh["mtd_cost_usd"] == pytest.approx(1.5)
 
+        # Public/private breakdown (2026-07-17: a wrong public/private repo
+        # classification burned real AWS spend building unnecessary
+        # self-hosted-runner infra for 6 actually-public repos — this
+        # breakdown is the console-side guardrail against repeating that).
+        assert gh["detail"]["gha_private_minutes"] == 1400
+        assert gh["detail"]["gha_public_minutes"] == 400
+        by_repo = gh["detail"]["gha_by_repo"]
+        assert by_repo == [
+            {"repo": "alpha-engine-config", "visibility": "private", "minutes": 1400.0},
+            {"repo": "crucible-dashboard", "visibility": "public", "minutes": 400.0},
+        ]
+
         # GitHub user: fenced error — recorded on the row, run continues
         assert rows["github_user"]["status"] == "error"
         assert "500" in rows["github_user"]["error"]

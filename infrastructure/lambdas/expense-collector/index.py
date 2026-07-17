@@ -483,6 +483,15 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
     # private repos or it overstates ~17x.
     private_repos = _private_repo_names(account, kind, headers)
     minutes_private, minutes_total, billed, by_product = 0.0, 0.0, 0.0, {}
+    # Per-repo minutes + visibility, surfaced on the console so a repo drawing
+    # real Actions minutes but classified "private" (or vice versa) is visible
+    # at a glance instead of inferred — a wrong hardcoded public/private repo
+    # list (not this live-API-derived set) caused a real incident 2026-07-17:
+    # an entire self-hosted-runner migration was built for 6 repos that turned
+    # out to be public (free/unlimited GHA already), based on their appearing
+    # in a billing pull without checking actual visibility. This breakdown is
+    # the console-side guardrail against repeating that mistake.
+    by_repo: dict[str, float] = {}
     for item in doc.get("usageItems", []):
         product = str(item.get("product", "")).lower()
         net = float(item.get("netAmount", 0) or 0)
@@ -491,8 +500,23 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
         if product == "actions" and "minute" in str(item.get("unitType", "")).lower():
             qty = float(item.get("quantity", 0) or 0)
             minutes_total += qty
-            if item.get("repositoryName") in private_repos:
+            repo = item.get("repositoryName") or "(unattributed)"
+            by_repo[repo] = by_repo.get(repo, 0.0) + qty
+            if repo in private_repos:
                 minutes_private += qty
+    minutes_public = round(minutes_total - minutes_private, 1)
+    gha_by_repo = sorted(
+        (
+            {
+                "repo": repo,
+                "visibility": "private" if repo in private_repos else "public",
+                "minutes": round(minutes, 1),
+            }
+            for repo, minutes in by_repo.items()
+        ),
+        key=lambda r: r["minutes"],
+        reverse=True,
+    )
     included = _included_minutes(budgets, key)
     projected_min = _project(minutes_private, mw["elapsed_frac"])
     row.update(
@@ -501,7 +525,10 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
                "used": round(minutes_private, 1), "limit": included,
                "projected": round(projected_min, 0) if projected_min is not None else None},
         detail={"billed_usd_by_product": by_product,
-                "total_actions_minutes_incl_public_free": round(minutes_total, 1)},
+                "total_actions_minutes_incl_public_free": round(minutes_total, 1),
+                "gha_private_minutes": round(minutes_private, 1),
+                "gha_public_minutes": minutes_public,
+                "gha_by_repo": gha_by_repo},
     )
     row = _finish_usd_row(row, mw, _budget_usd(budgets, key))
     # Quota pace (included minutes) is the leading signal; billed-$ pace only
