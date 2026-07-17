@@ -42,15 +42,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUNCTION_NAME="alpha-engine-ci-watch-dispatcher"
 ROLE_NAME="alpha-engine-ci-watch-dispatcher-role"
 POLICY_NAME="alpha-engine-ci-watch-dispatcher-policy"
-# Role EventBridge Scheduler assumes to fire the weekly canary drill
-# (config#2223). Created in --bootstrap only; may ONLY invoke THIS function.
-# (sf-watch-spot-dispatcher reuses its existing defer-scheduler role for the
-# same purpose; ci-watch has no prior scheduler role, hence a dedicated one.)
-CANARY_SCHED_ROLE_NAME="alpha-engine-ci-watch-canary-scheduler-role"
-CANARY_SCHED_POLICY_NAME="invoke-ci-watch-dispatcher"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
-CANARY_SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${CANARY_SCHED_ROLE_NAME}"
+# The Wednesday canary drill now fires THROUGH the Overseer router
+# (alpha-engine-config-I2832) using the shared router-invoke scheduler role,
+# so it exercises the full production dispatch path (router -> registry ->
+# executor). The old dedicated alpha-engine-ci-watch-canary-scheduler-role is
+# RETIRED by this change — its only consumer was the direct-to-executor drill
+# schedule; the live role is orphaned and can be deleted (noted in the PR).
+OVERSEER_ROUTER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:alpha-engine-overseer-dispatcher"
+source "${SCRIPT_DIR}/../_shared/ensure_overseer_scheduler_role.sh"
 # Bootstrap default (first-time deployment only) — sets CI_WATCH_DISPATCH_ENABLED=true
 # as the safe default. The update path (step 3) will read the live value and preserve it.
 LAMBDA_ENV_BOOTSTRAP='Variables={LOG_LEVEL=INFO,CI_WATCH_DISPATCH_ENABLED=true}'
@@ -169,37 +170,22 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # --- 2c. Weekly canary drill schedule (config#2223) ---
-  # Exercises the WHOLE dispatch pipe (Lambda IAM -> scoped RunInstances ->
-  # SSM -> bootstrap start) without a real CI failure. The box short-circuits
-  # before the agent and writes the _canary heartbeat the Fleet Status page
-  # escalates on when missed. 30 min after the sf-watch drill (15:00 UTC) so
-  # the two drills never contend. Idempotent create-or-update, mirrors
-  # sf-watch-liveness-probe/deploy.sh's scheduler style.
-  CANARY_SCHED_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-  if ! aws iam get-role --role-name "${CANARY_SCHED_ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating Scheduler execution role: ${CANARY_SCHED_ROLE_NAME}"
-    run aws iam create-role --role-name "${CANARY_SCHED_ROLE_NAME}" \
-      --assume-role-policy-document "${CANARY_SCHED_TRUST}" \
-      --description "EventBridge Scheduler role: invoke ${FUNCTION_NAME} for the weekly canary drill (config#2223)" \
-      --query 'Role.RoleName' --output text
-  else
-    echo "  Scheduler execution role exists: ${CANARY_SCHED_ROLE_NAME}"
-  fi
-  FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
-  CANARY_INVOKE_POLICY="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":[\"${FN_ARN}\",\"${FN_ARN}:*\"]}]}"
-  echo "  Applying Scheduler invoke policy: ${CANARY_SCHED_POLICY_NAME}"
-  run aws iam put-role-policy --role-name "${CANARY_SCHED_ROLE_NAME}" \
-    --policy-name "${CANARY_SCHED_POLICY_NAME}" \
-    --policy-document "${CANARY_INVOKE_POLICY}"
-  if ! $DRY_RUN; then echo "  Waiting 10s for Scheduler role propagation..."; sleep 10; fi
+  # --- 2c. Weekly canary drill schedule (config#2223; routed via I2832) ---
+  # Exercises the WHOLE production dispatch pipe (router -> registry lookup ->
+  # executor Lambda IAM -> scoped RunInstances -> SSM -> bootstrap start)
+  # without a real CI failure — the SAME path every real ci-main-failure takes
+  # since I2823. The box short-circuits before the agent and writes the
+  # _canary heartbeat the Fleet Status page escalates on when missed. 30 min
+  # after the sf-watch drill (15:00 UTC) so the two drills never contend.
+  OVERSEER_SCHED_ROLE_ARN=$(ensure_overseer_scheduler_role "${REGION}" "${ACCOUNT_ID}" run)
+  if ! $DRY_RUN; then echo "  Waiting 10s for scheduler role propagation..."; sleep 10; fi
 
   CANARY_SCHED_NAME="alpha-engine-ci-watch-canary-drill-weekly"
   CANARY_CRON="cron(30 15 ? * WED *)"
-  # Static Input: the drill's ENTIRE identity (repo/sha/run_id/...) is
-  # synthesized in index.py so no payload can carry a real (repo, sha) into
-  # a drill (see index.py DRILL_REPO isolation invariant).
-  CANARY_TARGET="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${CANARY_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"is_drill\\\":\\\"true\\\"}\"}"
+  # Target is the ROUTER: the drill's ENTIRE identity (repo/sha/run_id/...) is
+  # still synthesized in the executor's index.py (DRILL_REPO isolation
+  # invariant), so the wrapped payload carries only {is_drill:true}.
+  CANARY_TARGET="{\"Arn\":\"${OVERSEER_ROUTER_ARN}\",\"RoleArn\":\"${OVERSEER_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"playbook\\\":\\\"ci-watch\\\",\\\"payload\\\":{\\\"is_drill\\\":\\\"true\\\"}}\"}"
   if aws scheduler get-schedule --name "${CANARY_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
     run aws scheduler update-schedule --name "${CANARY_SCHED_NAME}" \

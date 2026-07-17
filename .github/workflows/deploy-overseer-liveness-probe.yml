@@ -1,35 +1,32 @@
-name: Deploy groom-liveness-probe
+name: Deploy overseer-liveness-probe
 
-# Auto-deploy the alpha-engine-groom-liveness-probe Lambda CODE on merge to
-# main. Same pattern as deploy-scheduled-groom-dispatcher.yml /
-# deploy-freshness-monitor.yml: this script's default/flagless run is already
-# code-only (no aws iam/scheduler writes happen unless --bootstrap is passed),
-# so no new script flag was needed to make this safe.
+# Auto-deploy the alpha-engine-overseer-liveness-probe Lambda CODE on merge to
+# main (alpha-engine-config-I2831). Same pattern as the sibling
+# deploy-*-liveness-probe / deploy-*-dispatcher workflows: this script's
+# default/flagless run is code-only (no aws iam/scheduler writes unless
+# --bootstrap is passed), so no new script flag is needed for safety.
 #
-# A change to SCHED_NAMES/SCHED_CRONS (the two liveness-check cadences, or a
-# future 3rd entry) still requires an operator to run `deploy.sh --bootstrap`
-# by hand, for the same reason as the dispatcher: the github-actions-lambda-
-# deploy OIDC role deliberately lacks iam:CreateRole / iam:PutRolePolicy
-# (fleet-wide policy, infrastructure/iam/README.md). A code change to
-# GROOM_SCHEDULE's _DEFAULT_SCHEDULE (e.g. config#1571's 15:00 entry) IS a
-# code-only change — it auto-deploys via this workflow — but the underlying
-# EventBridge Scheduler cadence for the PROBE ITSELF (when it invokes, not
-# what it checks for) only changes via SCHED_CRONS + --bootstrap.
+# The playbook registry (infrastructure/overseer/playbooks.yaml) is BUNDLED into
+# the zip at deploy — a registry edit therefore deploys through THIS workflow's
+# code path (the path filter includes the registry). A change to SCHED_NAMES/
+# SCHED_CRONS (the probe's own invocation cadence) still needs an operator to run
+# `deploy.sh --bootstrap` by hand: the github-actions-lambda-deploy OIDC role
+# deliberately lacks iam:CreateRole / scheduler writes (fleet-wide policy).
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
-# deploy.json), which already includes this function.
+# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-deploy.json).
 
 on:
   push:
     branches: [main]
     paths:
-      - 'infrastructure/lambdas/groom-liveness-probe/**'
-      - '.github/workflows/deploy-groom-liveness-probe.yml'
+      - 'infrastructure/lambdas/overseer-liveness-probe/**'
+      - 'infrastructure/overseer/playbooks.yaml'
+      - '.github/workflows/deploy-overseer-liveness-probe.yml'
   workflow_dispatch:
 
 concurrency:
-  group: deploy-groom-liveness-probe-main
+  group: deploy-overseer-liveness-probe-main
   cancel-in-progress: false
 
 permissions:
@@ -38,7 +35,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy groom-liveness-probe Lambda (code-only)
+    name: Deploy overseer-liveness-probe Lambda (code-only)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -59,16 +56,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy groom-liveness-probe (code-only — no --bootstrap)
+      - name: Deploy overseer-liveness-probe (code-only — no --bootstrap)
         working-directory: alpha-engine-data
-        run: bash infrastructure/lambdas/groom-liveness-probe/deploy.sh
+        run: bash infrastructure/lambdas/overseer-liveness-probe/deploy.sh
 
       - name: Report deployed version
         working-directory: alpha-engine-data
         run: |
           echo "Deployed commit: ${{ github.sha }}"
           aws lambda get-function \
-            --function-name alpha-engine-groom-liveness-probe \
+            --function-name alpha-engine-overseer-liveness-probe \
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text
 
@@ -77,7 +74,7 @@ jobs:
         uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
-          deploy_workflow: deploy-groom-liveness-probe.yml
+          deploy_workflow: deploy-overseer-liveness-probe.yml
 
   notify-main-failure:
     needs: [deploy]
