@@ -67,7 +67,7 @@ jobs:
         # those are for other subsystems; alerts.publish needs none of them).
         # Same pin as requirements.txt so this step's nousergon_lib.alerts
         # behavior never drifts from the rest of the repo's alerting.
-        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.86.0"
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.4"
 
       - name: Verify SF definitions match live + S3-staged copies (config#2391)
         run: python3 infrastructure/step-functions/check-definition-drift.py

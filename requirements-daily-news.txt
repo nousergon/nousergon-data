@@ -23,4 +23,4 @@ feedparser>=6.0.12
 anyio>=4.14.2
 tenacity>=9.1.4
 pyyaml>=6.0.3
-nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.86.0
+nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.4
