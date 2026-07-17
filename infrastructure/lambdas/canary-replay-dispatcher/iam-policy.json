@@ -113,6 +113,12 @@
           "ec2:ResourceTag/Name": "alpha-engine-canary-replay-spot"
         }
       }
+    },
+    {
+      "Sid": "ClearStaleCompletionMarkerBeforeDispatch",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/tmp/canary/*"
     }
   ]
 }

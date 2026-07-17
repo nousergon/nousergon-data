@@ -34,6 +34,7 @@ def _install_stubs(
     send_async_command_impl=None,
     create_tags_failures=0,
     wait_ssm_online_raises=None,
+    delete_object_raises=None,
 ):
     spot_dispatch_mod = types.ModuleType("nousergon_lib.spot_dispatch")
     spot_dispatch_mod.SpotLaunchError = _SpotLaunchError
@@ -76,11 +77,26 @@ def _install_stubs(
             tags_created.append((Resources, Tags))
             return {}
 
+    deleted_keys: list[tuple] = []
+
+    class _FakeS3:
+        def delete_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
+            if delete_object_raises:
+                raise delete_object_raises
+            deleted_keys.append((Bucket, Key))
+            return {}
+
     boto3_mod = types.ModuleType("boto3")
-    boto3_mod.client = lambda name, **kw: _FakeEc2()
+
+    def _fake_client(name, **kw):
+        if name == "s3":
+            return _FakeS3()
+        return _FakeEc2()
+
+    boto3_mod.client = _fake_client
     sys.modules["boto3"] = boto3_mod
 
-    return terminated, tags_created
+    return terminated, tags_created, deleted_keys
 
 
 def _reload_index():
@@ -190,7 +206,7 @@ class TestLaunchFailures:
         assert result["reason"] == "launch_failed"
 
     def test_tag_write_retries_then_terminates_on_final_failure(self):
-        terminated, tags_created = _install_stubs(create_tags_failures=99)
+        terminated, tags_created, _ = _install_stubs(create_tags_failures=99)
         index = _reload_index()
         result = index.handler({"mode": "scheduled"}, None)
         assert result["launched"] is False
@@ -198,7 +214,7 @@ class TestLaunchFailures:
         assert terminated == ["i-abc123"]
 
     def test_tag_write_succeeds_after_transient_failures(self):
-        terminated, tags_created = _install_stubs(create_tags_failures=2)
+        terminated, tags_created, _ = _install_stubs(create_tags_failures=2)
         index = _reload_index()
         result = index.handler({"mode": "scheduled"}, None)
         assert result["launched"] is True
@@ -206,7 +222,7 @@ class TestLaunchFailures:
         assert len(tags_created) == 1
 
     def test_ssm_online_failure_terminates_box_and_returns_clean_failure(self):
-        terminated, _ = _install_stubs(wait_ssm_online_raises=TimeoutError("ssm never came online"))
+        terminated, _, _ = _install_stubs(wait_ssm_online_raises=TimeoutError("ssm never came online"))
         index = _reload_index()
         result = index.handler({"mode": "scheduled"}, None)
         assert result["launched"] is False
@@ -230,3 +246,71 @@ class TestMarkerKey:
         index = _reload_index()
         result = index.handler({"mode": "scheduled"}, None)
         assert result["marker_key"] == f"tmp/canary/{result['run_token']}.json"
+
+    def test_launched_verdict_carries_a_dispatched_at_timestamp(self):
+        import time
+
+        _install_stubs()
+        index = _reload_index()
+        before = time.time()
+        result = index.handler({"mode": "scheduled"}, None)
+        after = time.time()
+        assert before <= result["dispatched_at"] <= after
+
+
+class TestStaleMarkerGuard:
+    """config-I2753: run_token is deterministic per (repo, PR, sha) / ISO
+    week, so a re-dispatch against an unchanged commit/week can find a
+    STALE marker left over from a prior attempt at the exact same S3 key.
+    The dispatcher must delete that key before launching, so a poller can
+    never observe a leftover verdict from a previous dispatch."""
+
+    def test_launch_clears_the_marker_key_before_launching(self):
+        _, _, deleted_keys = _install_stubs()
+        index = _reload_index()
+        result = index.handler(
+            {
+                "mode": "pr",
+                "repo": "nousergon/crucible-research",
+                "pr_number": "444",
+                "sha": "a9af99d41c4863970aa0d05588b5ce20afe05d10",
+            },
+            None,
+        )
+        assert result["launched"] is True
+        assert deleted_keys == [
+            ("alpha-engine-research", "tmp/canary/pr-nousergon-crucible-research-444-a9af99d41c48.json")
+        ]
+
+    def test_marker_clear_failure_aborts_dispatch_without_launching(self):
+        launched: list[str] = []
+
+        def _tracking_launch(*a, **kw):
+            launched.append("called")
+            return ("i-abc123", "spot")
+
+        _, _, _ = _install_stubs(
+            launch_with_fallback_impl=_tracking_launch,
+            delete_object_raises=RuntimeError("S3 DeleteObject throttled"),
+        )
+        index = _reload_index()
+        result = index.handler({"mode": "scheduled"}, None)
+        assert result["launched"] is False
+        assert result["reason"] == "marker_clear_failed"
+        assert "S3 DeleteObject throttled" in result["error"]
+        # The whole point of clearing FIRST is that a clear failure must
+        # never let a box get launched whose eventual marker a poller
+        # can't trust to be freshly reported — assert we never even tried.
+        assert launched == []
+
+    def test_concurrent_skip_never_attempts_to_clear_the_marker(self):
+        # A live box is already working this exact token — its own,
+        # eventual marker write is the one we want; clearing here would
+        # race the live box's own in-flight completion write.
+        _, _, deleted_keys = _install_stubs(
+            running_instance_ids_impl=lambda *a, **kw: ["i-existing"]
+        )
+        index = _reload_index()
+        result = index.handler({"mode": "scheduled"}, None)
+        assert result["reason"] == "concurrent_skip"
+        assert deleted_keys == []

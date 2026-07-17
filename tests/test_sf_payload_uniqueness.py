@@ -83,6 +83,9 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "PipelineContractCheck": frozenset({"action"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action"}),
+    # config#2249: fast pre-dispatch substrate health gate, immediately
+    # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
+    "SubstrateHealthGate": frozenset({"instance_id.$"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
     "ThinkTankCoverage": frozenset({"mode", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
