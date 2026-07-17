@@ -75,9 +75,13 @@ DISK_WARN_PERCENT = 90
 # without meaningfully eating into the "<2 min fail-fast" target.
 _PROBE_EXECUTION_TIMEOUT_SECONDS = 20
 # SSM delivery timeout — time for the agent to PICK UP the command, not to
-# run it. Short: a healthy agent registers a command in low single-digit
-# seconds; this is the primary signal for "SSM unresponsive."
-_PROBE_DELIVERY_TIMEOUT_SECONDS = 15
+# run it. A healthy agent registers a command in low single-digit seconds;
+# this is the primary signal for "SSM unresponsive." 30 is the API's hard
+# minimum for SendCommand TimeoutSeconds (values below it fail
+# ParamValidationError before the command is even sent — broke the
+# 2026-07-17 Friday-shell preflight at SubstrateHealthGate); the 45s
+# _POLL_BUDGET_SECONDS below still enforces the actual fail-fast bound.
+_PROBE_DELIVERY_TIMEOUT_SECONDS = 30
 
 # Total wall-clock budget (seconds) this Lambda spends polling its own probe
 # command to a terminal status before giving up as ssm_unresponsive. Kept

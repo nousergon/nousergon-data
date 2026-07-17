@@ -231,3 +231,12 @@ def test_two_distinct_named_failure_reasons_are_never_conflated():
     assert disk_out["reason"] == "disk_full"
     assert unresponsive_out["reason"] == "ssm_command_never_registered"
     assert disk_out["reason"] != unresponsive_out["reason"]
+
+
+def test_ssm_delivery_timeout_respects_api_minimum():
+    """SSM SendCommand rejects TimeoutSeconds < 30 with ParamValidationError
+    BEFORE the command is sent. The mocked-ssm tests above can never catch a
+    violation (botocore param validation only runs against the real client),
+    so pin the contract here: 15 broke the 2026-07-17 Friday-shell preflight
+    at SubstrateHealthGate on the gate's first-ever live invocation."""
+    assert index._PROBE_DELIVERY_TIMEOUT_SECONDS >= 30
