@@ -21,14 +21,26 @@ Companion tests:
     data-gap branch's Choice condition + SkipEODReconcileDataGap's
     fail-open Catch (both updated in the same PR to route into this file's
     heal loop instead of straight to the cost-guard tail).
-  * test_sf_eod_substrate_check_wiring.py — StopTradingInstance's routing
-    change (End:true -> Next: CheckDegradedOutcome).
   * test_sf_payload_uniqueness.py — the new top-level ``$.<X>`` fields this
     file introduces, in the closed namespace registry.
   * test_sf_iam_lambda_grants.py — the new
     ``alpha-engine-eod-precondition-probe`` Lambda ARN is IAM-grantable.
   * infrastructure/lambdas/eod-precondition-probe/test_handler.py — the
     probe Lambda's own unit tests (S3 sentinel read + evaluate + deadline math).
+
+alpha-engine-config-I2722 (2026-07-16): the 3 heal-outcome notifiers below
+(``HealConvergedNotify`` / ``HealReplayDispatchFailed`` / ``HealNonConvergent``)
+now route to ``StopTradingInstance`` directly — they used to feed
+``CheckSkipDailySubstrateHealthCheck``, which (with the rest of the
+DailySubstrateHealthCheck chain) was removed and re-homed as a standalone
+dashboard-box systemd timer (genuinely consumer-free within this SF,
+verified; per-row CloudWatch alarms carry the alerting independently of the
+SF). ``TestHandleFailureCostGuardHardening`` below was MOVED here verbatim
+from the now-deleted ``test_sf_eod_substrate_check_wiring.py`` — its
+HandleFailure/ForceStopInstance/TopicArn-hardening coverage was never
+substrate-specific, it just happened to live in that file; ``TestDegradedTerminalState``
+above already independently pins the StopTradingInstance -> CheckDegradedOutcome
+routing that file also covered.
 """
 
 from __future__ import annotations
@@ -174,11 +186,17 @@ class TestDegradedTerminalState:
         assert states["StopTradingInstance"]["Next"] == "CheckDegradedOutcome"
 
     def test_degraded_outcome_routes_on_the_flag(self, states):
+        # config-I2767 (2026-07-16 incident): the flag is only assigned on
+        # the degraded path, so the comparison MUST be IsPresent-guarded —
+        # an unguarded dereference threw States.Runtime on every fully-green
+        # day. Absent flag falls to Default NormalSucceeded.
         cdo = states["CheckDegradedOutcome"]
         assert cdo["Type"] == "Choice"
         c = cdo["Choices"][0]
-        assert c["Variable"] == "$.degraded_summary.degraded"
-        assert c["BooleanEquals"] is True
+        guard, comparison = c["And"]
+        assert guard == {"Variable": "$.degraded_summary.degraded", "IsPresent": True}
+        assert comparison["Variable"] == "$.degraded_summary.degraded"
+        assert comparison["BooleanEquals"] is True
         assert c["Next"] == "DegradedSucceeded"
         assert cdo["Default"] == "NormalSucceeded"
 
@@ -209,8 +227,13 @@ class TestHealLoopEligibility:
         chle = states["CheckHealLoopEligible"]
         assert chle["Type"] == "Choice"
         c = chle["Choices"][0]
-        assert c["Variable"] == "$.pipeline_role"
-        assert c["StringEquals"] == "operator-replay"
+        # config-I2767: IsPresent-guarded — $.pipeline_role is an execution-
+        # input key this SF never floors; absent falls to Default (live
+        # treatment).
+        guard, comparison = c["And"]
+        assert guard == {"Variable": "$.pipeline_role", "IsPresent": True}
+        assert comparison["Variable"] == "$.pipeline_role"
+        assert comparison["StringEquals"] == "operator-replay"
         assert c["Next"] == "HealNonConvergent"
         assert chle["Default"] == "InitHealLoop"
 
@@ -231,7 +254,17 @@ class TestHealLoopBound:
         assert gate["Type"] == "Choice"
         c = gate["Choices"][0]
         assert "Or" in c
-        variables = {cond["Variable"] for cond in c["Or"]}
+        # config-I2767: the deadline operand is IsPresent-guarded (absent →
+        # operand false, loop stays bounded by attempts); the attempts
+        # operand is provably floored by InitHealLoop/HealLoopIncrement.
+        variables = set()
+        for cond in c["Or"]:
+            if "And" in cond:
+                assert cond["And"][0]["IsPresent"] is True
+                assert cond["And"][0]["Variable"] == cond["And"][1]["Variable"]
+                variables.add(cond["And"][1]["Variable"])
+            else:
+                variables.add(cond["Variable"])
         assert variables == {"$.heal_loop.attempts", "$.precondition_probe.Payload.past_deadline"}
         assert c["Next"] == "HealNonConvergent"
         assert gate["Default"] == "HealLaunchPostMarketDataSpot"
@@ -309,8 +342,12 @@ class TestHealLoopDispatchChain:
     def test_converged_choice_dispatches_the_replay(self, states):
         hcc = states["HealCheckConverged"]
         c = hcc["Choices"][0]
-        assert c["Variable"] == "$.precondition_probe.Payload.precondition_met"
-        assert c["BooleanEquals"] is True
+        # config-I2767: IsPresent-guarded — a partial probe payload falls to
+        # Default HealLoopIncrement (bounded loop), never States.Runtime.
+        guard, comparison = c["And"]
+        assert guard == {"Variable": "$.precondition_probe.Payload.precondition_met", "IsPresent": True}
+        assert comparison["Variable"] == "$.precondition_probe.Payload.precondition_met"
+        assert comparison["BooleanEquals"] is True
         assert c["Next"] == "HealDispatchReplay"
         assert hcc["Default"] == "HealLoopIncrement"
 
@@ -349,10 +386,17 @@ class TestHealDispatchReplay:
 class TestHealOutcomeNotifications:
     """The three SNS publishes downstream of the loop — each must be an SNS
     Task (loud, not a swallow) and each must eventually reach the
-    cost-guard tail (CheckSkipDailySubstrateHealthCheck) regardless of its
-    own success/failure, mirroring every other best-effort-notify Catch
-    already established in this file (PublishDataSpotFailureImmediate,
-    PublishSubstrateHealthCheckDegradedAlert)."""
+    cost-guard tail (StopTradingInstance) regardless of its own
+    success/failure, mirroring every other best-effort-notify Catch already
+    established in this file (PublishDataSpotFailureImmediate).
+
+    alpha-engine-config-I2722 (2026-07-16): these used to route through
+    CheckSkipDailySubstrateHealthCheck before reaching the cost-guard tail;
+    that gate + the whole DailySubstrateHealthCheck chain (including
+    PublishSubstrateHealthCheckDegradedAlert, the mirrored best-effort-notify
+    precedent this docstring used to cite) were removed and re-homed as a
+    standalone dashboard-box systemd timer, so these now route to
+    StopTradingInstance directly."""
 
     @pytest.mark.parametrize("state_name,subject_substr", [
         ("HealConvergedNotify", "CONVERGED"),
@@ -372,10 +416,10 @@ class TestHealOutcomeNotifications:
     ])
     def test_reaches_cost_guard_tail_on_success_and_on_sns_failure(self, states, state_name):
         st = states[state_name]
-        assert st["Next"] == "CheckSkipDailySubstrateHealthCheck"
+        assert st["Next"] == "StopTradingInstance"
         catches = [c for c in st["Catch"] if c["ErrorEquals"] == ["States.ALL"]]
         assert len(catches) == 1
-        assert catches[0]["Next"] == "CheckSkipDailySubstrateHealthCheck"
+        assert catches[0]["Next"] == "StopTradingInstance"
 
     def test_nonconvergent_never_reaches_a_halt_state(self, states):
         _HALT = {"HandleFailure", "FailExecution", "ForceStopInstance"}
@@ -405,4 +449,128 @@ class TestIamGrants:
             s.get("Action") == "states:StartExecution"
             and s.get("Resource") == "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
             for s in policy["Statement"]
+        )
+
+
+# ── Moved verbatim from test_sf_eod_substrate_check_wiring.py (deleted
+# alpha-engine-config-I2722, 2026-07-16) — this coverage was never
+# substrate-specific, it just happened to live in that file. ────────────────
+
+
+class TestHandleFailureCostGuardHardening:
+    """Pin the 2026-05-14 cost-guard hardening on ``HandleFailure``.
+
+    Background: 2026-05-14 EOD recovery v2 SF execution failed at
+    ``HandleFailure`` with `Invalid parameter: TopicArn Reason: An
+    ARN must have at least 6 elements, not 5`. Root cause: the
+    recovery input payload had a malformed ``sns_topic_arn`` (colon
+    replaced with a space between ``us-east-1`` and the account ID).
+    Because ``HandleFailure`` had no ``Catch``, the SNS publish
+    failure aborted the whole SF before reaching ``ForceStopInstance``
+    — leaving the trading EC2 running until manual stop. The state's
+    own comment (`"Failure alert via SNS — instance still stops to
+    avoid cost"`) was unenforced.
+
+    Two-part fix:
+    1. Hardcode the SNS topic ARN (no ``$.sns_topic_arn`` indirection)
+       so a malformed input field can never block the cost-guard.
+    2. Catch ``States.ALL`` on ``HandleFailure`` and route to
+       ``ForceStopInstance`` so the cost-guard fires regardless of
+       SNS-side failure (throttling, IAM drift, transient outage,
+       future failure modes).
+    """
+
+    def test_topic_arn_is_literal_not_jsonpath(self, states):
+        """Hardcoded ARN — no ``TopicArn.$`` indirection.
+
+        A future PR that re-introduces the JSONPath form
+        (``TopicArn.$``) would re-open the malformed-input attack
+        surface that broke 2026-05-14 EOD recovery.
+        """
+        params = states["HandleFailure"]["Parameters"]
+        assert "TopicArn" in params, (
+            "HandleFailure.Parameters must include a literal 'TopicArn' field."
+        )
+        assert "TopicArn.$" not in params, (
+            "HandleFailure must NOT use 'TopicArn.$' (JSONPath indirection) — "
+            "the ARN is fixed and per-execution variability creates a "
+            "corruption surface (2026-05-14 incident: malformed sns_topic_arn "
+            "in recovery input → 'ARN must have at least 6 elements' → "
+            "ForceStopInstance never fired → trading EC2 left running)."
+        )
+        # Spot-check the ARN shape — exactly 6 colon-separated parts,
+        # SNS service, alpha-engine-alerts topic.
+        arn = params["TopicArn"]
+        parts = arn.split(":")
+        assert len(parts) == 6, f"SNS ARN must have 6 parts; got {len(parts)}: {arn!r}"
+        assert parts[:3] == ["arn", "aws", "sns"], f"Unexpected ARN prefix: {arn!r}"
+        assert parts[5] == "alpha-engine-alerts", (
+            f"ARN must point to alpha-engine-alerts topic; got {parts[5]!r}"
+        )
+
+    def test_handle_failure_has_catch_to_force_stop_instance(self, states):
+        """HandleFailure must Catch States.ALL → ForceStopInstance.
+
+        Defense-in-depth: even with the hardcoded ARN, any SNS-side
+        failure (throttling, IAM drift, outage) must NOT block the
+        cost-guard. The trading EC2 must always stop.
+        """
+        catches = states["HandleFailure"].get("Catch")
+        assert catches, (
+            "HandleFailure must define a 'Catch' block so SNS-side failures "
+            "(throttling, IAM drift, outage) do NOT block ForceStopInstance. "
+            "Without this, any publish failure leaves the trading EC2 running "
+            "(2026-05-14 incident)."
+        )
+        all_catch = next(
+            (c for c in catches if "States.ALL" in c.get("ErrorEquals", [])),
+            None,
+        )
+        assert all_catch is not None, (
+            "HandleFailure.Catch must include a 'States.ALL' branch — partial "
+            "catches leave failure surfaces uncovered."
+        )
+        assert all_catch["Next"] == "ForceStopInstance", (
+            f"HandleFailure Catch must route to ForceStopInstance, not "
+            f"{all_catch['Next']!r}. The cost-guard is the load-bearing "
+            "step; alert delivery is best-effort."
+        )
+
+    def test_input_schema_no_longer_requires_sns_topic_arn(self, states):
+        """Once the ARN is hardcoded, no state's Parameters or input/output
+        path should reference ``$.sns_topic_arn`` — confirms the SF input
+        schema can drop the field on the next manual recovery payload.
+
+        Walks the JSON tree (rather than grepping the serialized text) so
+        Comment fields that explain *why* the indirection was removed
+        don't trip the test.
+        """
+
+        def _walk_for_jsonpath_use(node, path="$"):
+            hits: list[str] = []
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    sub = f"{path}.{k}"
+                    if k == "Comment":
+                        # Comments document intent — they're allowed to
+                        # mention ``$.sns_topic_arn`` historically.
+                        continue
+                    if isinstance(v, str) and v == "$.sns_topic_arn":
+                        hits.append(sub)
+                    elif k.endswith(".$") and isinstance(v, str) and "sns_topic_arn" in v:
+                        hits.append(sub)
+                    else:
+                        hits.extend(_walk_for_jsonpath_use(v, sub))
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    hits.extend(_walk_for_jsonpath_use(v, f"{path}[{i}]"))
+            return hits
+
+        live_uses = _walk_for_jsonpath_use(states)
+        assert not live_uses, (
+            "No state should bind to '$.sns_topic_arn' after the 2026-05-14 "
+            "hardening — the ARN is hardcoded in HandleFailure and the input "
+            "field is no longer needed. Found live JSONPath references at: "
+            f"{live_uses}. A reintroduction means someone re-added the "
+            "indirection and re-opened the corruption surface."
         )

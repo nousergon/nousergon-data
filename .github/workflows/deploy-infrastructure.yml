@@ -57,6 +57,21 @@ jobs:
             --query "Stacks[0].[StackStatus,Tags[?Key=='git-sha'].Value|[0]]" \
             --output text
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install drift-check alerting dependency
+        # Base package only (no [arcticdb,flow-doctor,rag,contracts] extras —
+        # those are for other subsystems; alerts.publish needs none of them).
+        # Same pin as requirements.txt so this step's nousergon_lib.alerts
+        # behavior never drifts from the rest of the repo's alerting.
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.86.0"
+
+      - name: Verify SF definitions match live + S3-staged copies (config#2391)
+        run: python3 infrastructure/step-functions/check-definition-drift.py
+
       - name: Append to system-wide deploy changelog
         if: always()
         uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
@@ -69,5 +84,5 @@ jobs:
   notify-main-failure:
     needs: [deploy-infrastructure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@a3b11aee34f243da6cfc77d98fdfc9899d1d3f84 # main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@8c40481c0e80790bda54b30af63b4a341bebcccb # main
     secrets: inherit

@@ -50,6 +50,14 @@ def stub_flow_doctor_env(monkeypatch):
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
+    # config#645: flow-doctor.yaml now carries the fleet Telegram notifiers
+    # (CRITICAL + OPS_HEALTH). flow-doctor fails loud on an unresolved ${VAR},
+    # so the wiring tests must seed them (mirrors the runtime, where the box
+    # resolves them from SSM /alpha-engine/TELEGRAM_* + /alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_*).
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:stub-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100stub")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "2")
     # 0.6.0rc2 soak: flow-doctor.yaml now enables Haiku diagnosis with
     # api_key: ${ANTHROPIC_API_KEY}. flow-doctor fails loud on an unresolved
     # ${VAR}, so the wiring tests must seed it (mirrors the runtime, where the
