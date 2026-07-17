@@ -63,6 +63,11 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246: same SpotProbeError "
         "handling as ci-watch-dispatcher)",
     ),
+    "alert-drain-dispatcher": (
+        "v0.122.0",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2824: same "
+        "extra_tags atomic-launch-tagging floor as ci-watch-dispatcher, config#2292)",
+    ),
     "ci-watch-dispatcher": (
         "v0.122.0",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "

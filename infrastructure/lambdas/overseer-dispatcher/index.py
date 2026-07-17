@@ -65,6 +65,17 @@ from pathlib import Path
 
 import boto3
 import yaml
+from botocore.config import Config
+
+# Executor invokes are SYNCHRONOUS and NON-IDEMPOTENT (they launch spot
+# boxes): boto3's default 60s read-timeout + automatic retries caused a
+# double-dispatch on the first live alert-drain drill (first invoke launched
+# the box, the silent retry hit concurrent_skip). Read-timeout must exceed
+# the slowest executor's runtime (300s Lambda timeout on alert-drain), and
+# retries MUST be zero — the caller's verdict handling is the retry policy.
+_EXECUTOR_INVOKE_CONFIG = Config(
+    connect_timeout=10, read_timeout=290, retries={"max_attempts": 0}
+)
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -93,7 +104,7 @@ LEDGER_PREFIX = os.environ.get("OVERSEER_LEDGER_PREFIX", "overseer/dispatch_ledg
 
 _INVOKE_TIMEOUT_NOTE = (
     "executor invoke is synchronous; this Lambda's own timeout must exceed "
-    "the slowest executor's (see deploy.sh --timeout 120)"
+    "the slowest executor's (see deploy.sh --timeout 300)"
 )
 
 
@@ -129,7 +140,9 @@ def _stringify_bools(payload: dict) -> dict:
 
 def _invoke_executor(function_name: str, payload: dict) -> dict:
     """Synchronously invoke the executor and parse its JSON verdict."""
-    resp = boto3.client("lambda", region_name=REGION).invoke(
+    resp = boto3.client(
+        "lambda", region_name=REGION, config=_EXECUTOR_INVOKE_CONFIG
+    ).invoke(
         FunctionName=function_name,
         InvocationType="RequestResponse",
         Payload=json.dumps(payload).encode("utf-8"),

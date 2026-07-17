@@ -1,0 +1,8 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# nousergon_lib.spot_dispatch launch/lock/terminate primitives (config#2106).
+# v0.122.0 = extra_tags on launch_with_fallback (config#2292 atomic
+# discriminator tags) — same pin as ci-watch/sf-watch dispatchers.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.122.0
+# krepis>=0.15.0: matching ec2_spot extra_tags floor + fleet_events emission.
+krepis>=0.15.0
