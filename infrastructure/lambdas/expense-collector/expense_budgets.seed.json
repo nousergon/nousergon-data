@@ -5,11 +5,12 @@
   "providers": {
     "aws": {
       "label": "AWS",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 100.0
     },
     "anthropic_api": {
       "label": "Anthropic API",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 0.0,
+      "note": "budget set to $0 deliberately — Brian is shifting Anthropic-API-billed usage to OpenRouter models (2026-07-17 decision)"
     },
     "claude_max": {
       "label": "Claude Max 20x subscription",
@@ -18,20 +19,20 @@
     },
     "openrouter": {
       "label": "OpenRouter",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 20.0
     },
     "deepseek": {
       "label": "DeepSeek",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 10.0
     },
     "neon": {
       "label": "Neon Postgres",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 15.0
     },
     "github_org": {
       "label": "GitHub (nousergon org)",
-      "monthly_budget_usd": null,
-      "included_minutes": 2000
+      "monthly_budget_usd": 5.0,
+      "included_minutes": 3000
     },
     "github_user": {
       "label": "GitHub (cipher813)",
