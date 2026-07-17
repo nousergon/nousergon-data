@@ -846,6 +846,64 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
     assert bad["status"] == "failed"
 
 
+def test_arctic_append_success_clears_pending_upgrades_ledger():
+    """config#2672: MorningArcticAppend IS the polygon-corrected write — a
+    successful load-bearing append must clear target_date from the durable
+    pending-upgrades ledger (a no-op if it was never marked)."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=False)
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
+
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}), \
+         patch("weekly_collector._clear_pending_upgrade") as p_clear:
+        ok = weekly_collector._run_morning_arctic_append(config, args)
+    assert ok["status"] == "ok"
+    p_clear.assert_called_once_with("2026-04-22", "test-bucket")
+
+
+def test_arctic_append_dry_run_does_not_clear_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
+
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok_dry_run"}), \
+         patch("weekly_collector._clear_pending_upgrade") as p_clear:
+        weekly_collector._run_morning_arctic_append(config, args)
+    p_clear.assert_not_called()
+
+
+def test_arctic_append_failure_does_not_clear_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=False)
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
+
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")), \
+         patch("weekly_collector._clear_pending_upgrade") as p_clear:
+        weekly_collector._run_morning_arctic_append(config, args)
+    p_clear.assert_not_called()
+
+
 def test_arctic_append_reads_constituents_by_run_date_not_pointer():
     """REGRESSION (2026-06-25 weekday-SF halt): _run_morning_arctic_append must
     load constituents via the run_date-DIRECT read, NOT the latest_weekly.json
@@ -973,6 +1031,49 @@ def test_daily_arctic_append_runs_daily_append_with_skip_if_exists_and_is_load_b
          patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
         bad = weekly_collector._run_daily_arctic_append(config, args)
     assert bad["status"] == "failed"
+
+
+def test_daily_arctic_append_success_marks_pending_upgrades_ledger():
+    """config#2672: EOD PostMarketArcticAppend is ALWAYS the yfinance-basis
+    (fallback-quality) write — a successful append must mark run_date pending
+    the next morning's polygon-corrected overwrite."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=False)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}), \
+         patch("weekly_collector._mark_pending_upgrade") as p_mark:
+        ok = weekly_collector._run_daily_arctic_append(config, args)
+    assert ok["status"] == "ok"
+    p_mark.assert_called_once_with("2026-06-16", "fallback_quality", "test-bucket")
+
+
+def test_daily_arctic_append_dry_run_does_not_mark_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=True)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok_dry_run"}), \
+         patch("weekly_collector._mark_pending_upgrade") as p_mark:
+        weekly_collector._run_daily_arctic_append(config, args)
+    p_mark.assert_not_called()
+
+
+def test_daily_arctic_append_failure_does_not_mark_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=False)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")), \
+         patch("weekly_collector._mark_pending_upgrade") as p_mark:
+        weekly_collector._run_daily_arctic_append(config, args)
+    p_mark.assert_not_called()
 
 
 # ── _MACRO_DAILY_TICKERS hard-pin (config-I2703, 2026-07-15 P0) ─────────────

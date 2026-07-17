@@ -502,7 +502,25 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
 
 
 def _github_token() -> str:
-    """PAT for pre-boot enumeration, read from SSM (same param the box uses)."""
+    """App installation token first (config-I2785), groom PAT fallback.
+
+    The 2026-07-16 GitHub partial outage (config-I2784) 503'd every
+    cipher813 user-token REST call for ~an hour while App installation
+    tokens were unaffected — so the ne-groomer App is the primary identity
+    for pre-boot enumeration and the PAT is the fallback, not the reverse.
+    """
+    try:
+        from nousergon_lib.github_app import GitHubAppTokenError, installation_token
+    except ImportError as exc:  # bundle predates the module — PAT path serves
+        logger.warning("github_app module unavailable (%s) — PAT auth", exc)
+    else:
+        try:
+            return installation_token(region=REGION)
+        except GitHubAppTokenError as exc:
+            # Swallow recorded here (warning log); the primary deliverable
+            # survives via the PAT below, and both-paths-dead surfaces at the
+            # call sites' existing demand-gate fail-safe (legacy launch).
+            logger.warning("App-token mint failed (%s) — PAT fallback", exc)
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.get_parameter(Name=GROOM_GH_PAT_SSM, WithDecryption=True)
     return resp["Parameter"]["Value"].strip()

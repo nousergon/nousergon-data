@@ -1,0 +1,5 @@
+# boto3 only — no nousergon_lib dependency (unlike most SF-status-triggered
+# Lambdas in this directory, this one needs neither trading_calendar nor
+# alerts.publish; it publishes directly via boto3 sns.publish, mirroring
+# infrastructure/lambdas/friday-shell-run-report's pattern).
+boto3>=1.34

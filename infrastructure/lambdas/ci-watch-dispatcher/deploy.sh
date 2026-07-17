@@ -58,7 +58,15 @@ LAMBDA_ENV_BOOTSTRAP='Variables={LOG_LEVEL=INFO,CI_WATCH_DISPATCH_ENABLED=true}'
 # Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
 source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
