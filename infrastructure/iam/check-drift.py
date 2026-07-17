@@ -72,8 +72,19 @@ class RolePolicy(NamedTuple):
     origin: str  # human label for output, e.g. "lambdas/freshness-monitor"
 
 
+# Per-role error classes that must surface as FINDINGS, not kill the run:
+# one missing/unreadable role would otherwise mask drift results for every
+# other role in the same invocation.
+_EXPECTED_AWS_ERRORS = ("NoSuchEntity", "AccessDenied", "AccessDeniedException")
+
+
 def _aws_iam(*args: str) -> dict | list | str:
-    """Call aws iam ... and return the parsed JSON output."""
+    """Call aws iam ... and return the parsed JSON output.
+
+    NoSuchEntity/AccessDenied come back as ``{"__aws_error__": <code>}`` so
+    the caller can report a per-role finding and keep checking the remaining
+    roles; any other CLI failure still fails the whole run loudly (exit 2).
+    """
     result = subprocess.run(
         ["aws", "iam", *args, "--output", "json"],
         capture_output=True,
@@ -81,6 +92,9 @@ def _aws_iam(*args: str) -> dict | list | str:
         check=False,
     )
     if result.returncode != 0:
+        for code in _EXPECTED_AWS_ERRORS:
+            if code in result.stderr:
+                return {"__aws_error__": code}
         sys.stderr.write(
             f"AWS CLI failed: aws iam {' '.join(args)}\n"
             f"stderr: {result.stderr}\n"
@@ -170,6 +184,19 @@ def _check_policy(rp: RolePolicy) -> list[str]:
         "--role-name", rp.role_name,
         "--policy-name", rp.policy_name,
     )
+    aws_error = aws_resp.get("__aws_error__") if isinstance(aws_resp, dict) else None
+    if aws_error == "NoSuchEntity":
+        return [
+            f"{rp.role_name} [{rp.origin}]: role/policy does not exist on AWS "
+            f"(codified but never deployed — run deploy.sh --bootstrap, or "
+            f"remove the codified files if the lambda was superseded)"
+        ]
+    if aws_error in ("AccessDenied", "AccessDeniedException"):
+        return [
+            f"{rp.role_name} [{rp.origin}]: CI role cannot read this role — "
+            f"extend github-actions-iam-drift-check's iam-readonly Resource "
+            f"list to include it"
+        ]
     aws_doc = aws_resp.get("PolicyDocument")
 
     if not aws_doc:
