@@ -115,8 +115,9 @@ if $BOOTSTRAP; then
 
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${REGION}" >/dev/null 2>&1; then
     echo "  Creating Lambda function: ${FUNCTION_NAME}"
-    # Timeout 120s: the executor invoke is SYNCHRONOUS and the slowest
-    # executor leg (spot launch + SSM online wait) can take ~90s.
+    # Timeout 300s: the executor invoke is SYNCHRONOUS; the slowest executor
+    # (alert-drain, 300s Lambda timeout) bounds it, with the invoke client's
+    # own 290s read-timeout + zero retries doing the fine-grained bounding.
     run aws lambda create-function \
       --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 \
@@ -124,7 +125,7 @@ if $BOOTSTRAP; then
       --handler index.handler \
       --zip-file "fileb://${ZIP}" \
       --role "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
-      --timeout 120 \
+      --timeout 300 \
       --memory-size 256 \
       --environment "${LAMBDA_ENV_BOOTSTRAP}" \
       --region "${REGION}" \

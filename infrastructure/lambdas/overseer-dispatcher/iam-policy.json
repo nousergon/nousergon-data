@@ -17,7 +17,8 @@
       "Action": "lambda:InvokeFunction",
       "Resource": [
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-sf-watch-spot-dispatcher",
-        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ci-watch-dispatcher"
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ci-watch-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-alert-drain-dispatcher"
       ]
     },
     {

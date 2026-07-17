@@ -64,6 +64,27 @@ playbooks:
     supports_drill: true
     kill_switch_env: CI_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
 
+  alert-drain:
+    description: >-
+      Twice-daily Overseer alert-drain (epic I2821 phase 3, config-I2824):
+      consumes the nousergon-overseer-intake queue + S3 fallback, classifies
+      incidents into the T0-T3 authority tiers per the alert-drain charter,
+      acts within charter authority (v1: PRs, issues, SF reruns only), writes
+      the drain ledger. Fired by EventBridge Scheduler (10:00 + 22:00 UTC)
+      THROUGH this router.
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-alert-drain-dispatcher
+    executor_lambda_dir: alert-drain-dispatcher
+    benign_reasons: [concurrent_skip, disabled]
+    charter: alpha-engine-config/.github/alert-drain-prompt.md
+    concurrency_domain: >-
+      Single lane — EC2 tag lock on Name=alpha-engine-alert-drain-spot (one
+      drain at a time; overlap would double-process queue messages).
+    supports_drill: true
+    kill_switch_env: ALERT_DRAIN_DISPATCH_ENABLED
+
   groom:
     description: >-
       Demand-driven backlog groom (three daily EventBridge cron triggers,
