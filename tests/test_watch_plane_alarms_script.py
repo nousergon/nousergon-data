@@ -52,7 +52,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All four watch-plane Lambdas must be alarmed."""
+    """All five watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -61,6 +61,7 @@ class TestWatchPlaneCoverage:
             "alpha-engine-sf-watch-spot-dispatcher",
             "alpha-engine-ci-watch-dispatcher",
             "alpha-engine-sf-watch-liveness-probe",
+            "alpha-engine-overseer-dispatcher",
         ],
     )
     def test_lambda_is_present(self, script_text, fn_name):
@@ -75,7 +76,7 @@ class TestWatchPlaneCoverage:
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 4
+        assert block.count('"alpha-engine-') == 5
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
@@ -165,3 +166,16 @@ class TestDocstringsNowTruthful:
             "name the alarm-provisioning script — the pre-#2266 wording claimed "
             "a CW alarm that did not exist."
         )
+
+
+class TestOverseerIntakeDlqAlarm:
+    """The intake DLQ depth alarm (alpha-engine-config-I2823) rides this
+    script so its backstop-topic + fail-fast discipline applies to it too."""
+
+    def test_dlq_alarm_present(self, script_text):
+        assert "nousergon-overseer-intake-dlq" in script_text
+        assert "ApproximateNumberOfMessagesVisible" in script_text
+
+    def test_dlq_alarm_routes_to_backstop(self, script_text):
+        dlq_block = script_text[script_text.find("overseer-intake-dlq-depth"):]
+        assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in dlq_block

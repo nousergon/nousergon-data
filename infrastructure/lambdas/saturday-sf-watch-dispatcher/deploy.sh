@@ -38,7 +38,15 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 # Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
 source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
@@ -139,17 +147,21 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FAST_PATH_ENABLED=false,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=false,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,M2_DISPATCH_TARGET=repository_dispatch,FAST_PATH_ENABLED=false,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=false,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge rule: terminal-failure statuses of ANY of the three fleet
-  # trading SFs. One rule, one target — keep the ARN list in lockstep with
+  # EventBridge rule: terminal-failure statuses of ANY registered fleet SF.
+  # One rule, one target — keep the ARN list in lockstep with
   # index.PIPELINES. (The transitional alpha-engine-eod-pipeline alias was
-  # retired 2026-07-11 — config#2272; old SF deleted live.)
+  # retired 2026-07-11 — config#2272; old SF deleted live.) Widened
+  # 2026-07-14 (alpha-engine-config-I2544/I2545) to also cover the two new
+  # child SFs split out of the weekly pipeline — both registered in
+  # index.PIPELINES with has_listener:False (watch-log + Telegram fire;
+  # autonomous-agent dispatch deferred until their own charter exists).
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -159,7 +171,9 @@ if $BOOTSTRAP; then
     "stateMachineArn": [
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-advisory-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-modelzoo-sunday-pipeline"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }
@@ -216,6 +230,9 @@ echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 # was open. Bootstrap (create-function above) still defaults false — safe
 # rollout posture for a NEW deployment only.
 CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" AGENT_DISPATCH_ENABLED false)
+# M2_DISPATCH_TARGET (alpha-engine-config-I2823) — operator-owned routing flag:
+# repository_dispatch (legacy GitHub round-trip) vs overseer (direct router).
+CURRENT_M2_TARGET=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" M2_DISPATCH_TARGET repository_dispatch)
 # FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
 # AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
 CURRENT_FAST_PATH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" FAST_PATH_ENABLED false)
@@ -232,7 +249,7 @@ CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGI
 # Brian-ruled per-cadence budgets (saturday 8 / weekday 2 / eod 2).
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
+  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},M2_DISPATCH_TARGET=${CURRENT_M2_TARGET},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

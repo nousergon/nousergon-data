@@ -38,7 +38,7 @@ def _fake_run(returncode=0, stdout="", stderr=""):
 # ── Discovery against the real repo state ───────────────────────────────────
 
 
-def test_discovers_all_four_orchestrated_state_machines(cd):
+def test_discovers_all_six_orchestrated_state_machines(cd):
     entries = cd._discover_expected_logging_configs()
     names = {e["sf_name"] for e in entries}
     assert names == {
@@ -46,6 +46,13 @@ def test_discovers_all_four_orchestrated_state_machines(cd):
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
         "alpha-engine-groom-dispatch",
+        # alpha-engine-config-I2544/I2545: both are CFN
+        # AWS::StepFunctions::StateMachine resources with a
+        # LoggingConfiguration block, auto-discovered via
+        # _discover_expected_from_cfn's regex walk of the CFN template —
+        # no code change needed in check-drift.py itself.
+        "ne-weekly-advisory-pipeline",
+        "ne-modelzoo-sunday-pipeline",
     }
 
 
@@ -76,13 +83,17 @@ def test_eod_sf_expects_error_level_logging_from_deploy_script(cd):
     assert eod["expected_log_group_name"] == "/aws/stepfunctions/ne-postclose-trading-pipeline"
 
 
-def test_groom_sf_expects_no_logging(cd):
-    """deploy-infrastructure.sh's update_or_create call for groom omits the
-    logging arg on purpose — this guard's codified expectation must match
-    that, not silently assume logging is wanted everywhere."""
+def test_groom_sf_expects_error_logging(cd):
+    """config#2748-adjacent (2026-07-16): groom-dispatch's ERROR-level logging
+    was enabled live to aid active groom-driver incident debugging, then
+    codified in deploy-infrastructure.sh (GROOM_LOG_GROUP_NAME/
+    GROOM_LOGGING_CONFIG, mirroring EOD's pattern) — this guard's codified
+    expectation must match that, not the old no-logging assumption."""
     entries = {e["sf_name"]: e for e in cd._discover_expected_logging_configs()}
     groom = entries["alpha-engine-groom-dispatch"]
-    assert groom["expected_level"] == "OFF"
+    assert groom["expected_level"] == "ERROR"
+    assert groom["expected_include_execution_data"] is False
+    assert groom["expected_log_group_name"] == "/aws/vendedlogs/states/alpha-engine-groom-dispatch"
 
 
 # ── _live_log_group_name ────────────────────────────────────────────────────
@@ -202,15 +213,47 @@ def test_check_sf_missing_state_machine_on_aws(cd):
     assert "not found on AWS" in findings[0]
 
 
-def test_check_sf_groom_no_drift_when_live_is_off(cd):
+def test_check_sf_no_drift_when_expected_off_and_live_is_off(cd):
+    """General OFF-vs-OFF case (no longer groom's real config as of
+    config#2748-adjacent — groom now expects ERROR, see
+    test_groom_sf_expects_error_logging)."""
     entry = {
-        "sf_name": "alpha-engine-groom-dispatch",
+        "sf_name": "some-other-sf-with-no-logging",
         "source_file": _REPO_ROOT / "infrastructure" / "deploy-infrastructure.sh",
         "expected_level": "OFF",
         "expected_include_execution_data": None,
         "expected_log_group_name": None,
     }
     live = {}  # describe-state-machine omits loggingConfiguration entirely when disabled
+    with patch.object(cd.subprocess, "run", return_value=_fake_run(0, json.dumps(live))):
+        findings = cd._check_sf(entry)
+    assert findings == []
+
+
+def test_check_sf_groom_no_drift_when_live_matches_error_config(cd):
+    """config#2748-adjacent: groom-dispatch now expects ERROR-level logging
+    with a real log group — confirm a live config matching that codified
+    expectation produces no drift finding."""
+    entry = {
+        "sf_name": "alpha-engine-groom-dispatch",
+        "source_file": _REPO_ROOT / "infrastructure" / "deploy-infrastructure.sh",
+        "expected_level": "ERROR",
+        "expected_include_execution_data": False,
+        "expected_log_group_name": "/aws/vendedlogs/states/alpha-engine-groom-dispatch",
+    }
+    live = {
+        "loggingConfiguration": {
+            "level": "ERROR",
+            "includeExecutionData": False,
+            "destinations": [
+                {
+                    "cloudWatchLogsLogGroup": {
+                        "logGroupArn": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/vendedlogs/states/alpha-engine-groom-dispatch:*"
+                    }
+                }
+            ],
+        }
+    }
     with patch.object(cd.subprocess, "run", return_value=_fake_run(0, json.dumps(live))):
         findings = cd._check_sf(entry)
     assert findings == []

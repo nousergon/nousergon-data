@@ -12,6 +12,7 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-aggregate-costs*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-scanner*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-thinktank*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-signals-envelope*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-concordance*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-replay-counterfactual*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector*",
@@ -21,7 +22,9 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-regime-retrospective-eval*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller*",
-        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*"
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-substrate-health-gate*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-eod-precondition-probe*"
       ]
     },
     {
@@ -150,6 +153,18 @@
       "Effect": "Allow",
       "Action": "ssm:GetCommandInvocation",
       "Resource": "*"
+    },
+    {
+      "Sid": "StartAdvisoryChildPipeline",
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-advisory-pipeline"
+    },
+    {
+      "Sid": "StartEodSelfHealReplay",
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
     }
   ]
 }

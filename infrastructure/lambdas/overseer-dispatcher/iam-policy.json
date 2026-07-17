@@ -1,0 +1,69 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-overseer-dispatcher:*"
+    },
+    {
+      "Sid": "InvokeRoutedExecutors",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-sf-watch-spot-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ci-watch-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-alert-drain-dispatcher"
+      ]
+    },
+    {
+      "Sid": "EscalationPatAndTelegramSecrets",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+      ]
+    },
+    {
+      "Sid": "DispatchLedgerAndIntakeFallback",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/overseer/dispatch_ledger/*",
+        "arn:aws:s3:::alpha-engine-research/overseer/intake-fallback/*",
+        "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
+      ]
+    },
+    {
+      "Sid": "AlertDedupMarkerRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
+    },
+    {
+      "Sid": "LoudPageSns",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Sid": "SnsTopicArnResolution",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "IntakeBusEvents",
+      "Effect": "Allow",
+      "Action": "events:PutEvents",
+      "Resource": "arn:aws:events:us-east-1:711398986525:event-bus/nousergon-alerts"
+    }
+  ]
+}

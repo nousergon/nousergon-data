@@ -20,6 +20,19 @@ pin file — so a same-day executor merge landing after the morning ``CodeFreshn
 moved the box past its own stale pin and ``EODReconcile`` hard-failed (zero
 ``eod_report.json`` for the day). ``RefreshExecutorDeploy`` must re-freeze the pin
 after ``boot-pull.sh`` succeeds, mirroring ``CodeFreshnessGate``'s own pattern.
+
+alpha-engine-config-I2722 (2026-07-16): ``RefreshExecutorDeploy`` was narrowed
+to a conditional refresh — it now fetches origin and compares local HEAD to
+origin/main FIRST; ``boot-pull.sh`` only runs on the DRIFTED (else) branch.
+The pin re-freeze line now appears TWICE in the command array: once on the
+fast (not-drifted) path (cheap, idempotent, defensive — keeps the lockstep
+invariant even when boot-pull.sh itself is skipped) and once on the drifted
+path, immediately after ``boot-pull.sh``. The ordering assertion below is
+scoped to the drifted-path occurrence specifically (by list index, not a
+naive first-string-match), since the fast-path occurrence legitimately
+appears earlier in the command array (textually before the ``else`` branch)
+without violating the "re-freeze only after boot-pull.sh has refreshed the
+checkout" invariant — it simply isn't in the same branch as boot-pull.sh at all.
 """
 
 from __future__ import annotations
@@ -84,27 +97,52 @@ def test_morning_planner_exports_pinned_sha() -> None:
 
 def test_eod_refresh_executor_deploy_repins_sha_after_bootpull() -> None:
     """config#2042: RefreshExecutorDeploy re-pulls origin/main via boot-pull.sh
-    at the top of the EOD pipeline (config#1549) by design, so it must re-freeze
-    the pin file to match — otherwise EODReconcile's check_deploy_drift compares
-    the freshly-pulled box against the stale morning CodeFreshnessGate pin and
-    hard-fails on any executor PR merged between the morning gate and EOD."""
+    on the drifted branch of its conditional refresh (alpha-engine-config-I2722)
+    by design, so it must re-freeze the pin file to match — otherwise
+    EODReconcile's check_deploy_drift compares the freshly-pulled box against
+    the stale morning CodeFreshnessGate pin and hard-fails on any executor PR
+    merged between the morning gate and EOD."""
     cmds = _commands("RefreshExecutorDeploy", sf_path=_EOD_SF_PATH)
-    bootpull = next((c for c in cmds if "boot-pull.sh" in c), None)
-    assert bootpull is not None, "RefreshExecutorDeploy must run boot-pull.sh."
-    freeze = next(
-        (c for c in cmds if _PIN_FILE in c and "rev-parse HEAD" in c), None
-    )
-    assert freeze is not None, (
+    bootpull_idx = next((i for i, c in enumerate(cmds) if "boot-pull.sh" in c), None)
+    assert bootpull_idx is not None, "RefreshExecutorDeploy must run boot-pull.sh (on the drifted branch)."
+    freeze_idxs = [
+        i for i, c in enumerate(cmds) if _PIN_FILE in c and "rev-parse HEAD" in c
+    ]
+    assert freeze_idxs, (
         "RefreshExecutorDeploy must re-freeze `git -C .../alpha-engine rev-parse "
         f"HEAD` into {_PIN_FILE} after boot-pull.sh, mirroring CodeFreshnessGate's "
         "own pin pattern — otherwise a same-day executor merge desyncs the box "
         "from the stale morning pin and EODReconcile hard-fails."
     )
-    assert "/home/ec2-user/alpha-engine" in freeze, (
-        "the re-frozen SHA must be the crucible-executor (alpha-engine) checkout HEAD."
+    for i in freeze_idxs:
+        assert "/home/ec2-user/alpha-engine" in cmds[i], (
+            "the re-frozen SHA must be the crucible-executor (alpha-engine) checkout HEAD."
+        )
+    # Ordering: at least one re-freeze occurrence must come AFTER boot-pull.sh
+    # actually refreshes the checkout — this is the drifted-path occurrence
+    # (alpha-engine-config-I2722's conditional refresh also has a SEPARATE
+    # fast-path re-freeze that legitimately appears earlier in the command
+    # array, on a branch that never runs boot-pull.sh at all — see
+    # test_eod_refresh_executor_deploy_repins_sha_on_fast_path_too below).
+    assert any(i > bootpull_idx for i in freeze_idxs), (
+        "at least one pin re-freeze must occur AFTER boot-pull.sh has "
+        "refreshed the checkout (the drifted-path occurrence)."
     )
-    # Ordering: re-freeze must come AFTER boot-pull.sh actually refreshes the checkout.
-    joined = "\n".join(cmds)
-    assert joined.index("boot-pull.sh") < joined.index(_PIN_FILE), (
-        "re-freeze the SHA only after boot-pull.sh has refreshed the checkout."
+
+
+def test_eod_refresh_executor_deploy_repins_sha_on_fast_path_too() -> None:
+    """alpha-engine-config-I2722 (2026-07-16): RefreshExecutorDeploy was
+    narrowed to a conditional refresh — the expensive boot-pull.sh only runs
+    when the checkout has actually drifted from origin/main. The pin
+    re-freeze must still happen UNCONDITIONALLY (cheap, idempotent) so the
+    pin-matches-HEAD lockstep invariant this whole file pins holds even when
+    boot-pull.sh itself is skipped on the fast (not-drifted) path."""
+    cmds = _commands("RefreshExecutorDeploy", sf_path=_EOD_SF_PATH)
+    freeze_idxs = [
+        i for i, c in enumerate(cmds) if _PIN_FILE in c and "rev-parse HEAD" in c
+    ]
+    assert len(freeze_idxs) >= 2, (
+        "expected the pin re-freeze to appear on BOTH the fast (not-drifted) "
+        f"and full-refresh (drifted) paths; found {len(freeze_idxs)} "
+        f"occurrence(s) in {cmds!r}."
     )

@@ -299,7 +299,7 @@
         {
           "Variable": "$.snapshot_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipEODReconcile"
+          "Next": "ProbeEODReconcilePrecondition"
         },
         {
           "Variable": "$.snapshot_poll.Status",
@@ -429,7 +429,7 @@
         {
           "Variable": "$.eod_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipDailySubstrateHealthCheck"
+          "Next": "StopTradingInstance"
         },
         {
           "Variable": "$.eod_poll.Status",
@@ -468,152 +468,6 @@
       "Seconds": 10,
       "Next": "WaitForEOD"
     },
-    "DailySubstrateHealthCheck": {
-      "Type": "Task",
-      "Comment": "Phase 2 → 3 transparency-substrate health check, daily cadence. Mirrors the Sat SF WeeklySubstrateHealthCheck but runs only the daily-cadence rows of transparency_inventory.yaml (lineage, risk_events, residual_pct). Closes the gap where daily-emitting rows would otherwise only get checked once per week. Per-row CloudWatch metrics emit to AlphaEngine/Substrate; the same alarms PR #176 created cover both cadences (SubstrateRowOK metric is cadence-agnostic). Non-blocking (a failure degrades visibly — see SubstrateHealthCheckDegraded — it does not halt the cost-guard tail) — same pattern as WeeklySubstrateHealthCheck. Runs on dashboard EC2 (the SF dispatcher) where alpha-engine-dashboard + lib pin are installed. config#2326 — NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync — infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. config#2326 timeout convention (mirrors config#2276's weekly-SF fix): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout — time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call). Budget: executionTimeout kept at 180 (daily-cadence subset of rows; observed comparable to or faster than the Sat SF's --cadence weekly sweep now that pip is removed) — the previous 180/180/240 set conflated the delivery timeout with an execution ceiling (the same inversion config#2276 flagged on the weekly SF).",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-dashboard",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/substrate-health-check-daily.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check-daily/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python -m nousergon_lib.transparency --cadence daily --alert 2>&1 | tee /var/log/substrate-health-check-daily.log"
-          ],
-          "executionTimeout": [
-            "180"
-          ]
-        },
-        "TimeoutSeconds": 60
-      },
-      "TimeoutSeconds": 210,
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "config#2326: substrate-check failure is non-blocking but VISIBLE — set health_check_degraded and publish a best-effort alert (SubstrateHealthCheckDegraded), then continue to StopTradingInstance. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure (e.g. dashboard EC2 unreachable). Cost-guard requirement UNCHANGED: trading EC2 must always stop, regardless of substrate-check outcome — the degraded path still terminates at StopTradingInstance, never HandleFailure.",
-          "Next": "SubstrateHealthCheckDegraded",
-          "ResultPath": "$.substrate_check_error"
-        }
-      ],
-      "ResultPath": "$.substrate_check_result",
-      "Next": "WaitForDailySubstrateHealthCheck"
-    },
-    "WaitForDailySubstrateHealthCheck": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.substrate_check_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 5,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "config#2326: non-blocking but VISIBLE — a substrate-poll infra failure sets health_check_degraded (via SubstrateHealthCheckDegraded) then continues to StopTradingInstance. Row-level alarms still page on failure regardless of polling outcome.",
-          "Next": "SubstrateHealthCheckDegraded",
-          "ResultPath": "$.substrate_check_error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
-      },
-      "ResultPath": "$.substrate_check_poll",
-      "Next": "CheckDailySubstrateHealthCheckStatus"
-    },
-    "CheckDailySubstrateHealthCheckStatus": {
-      "Type": "Choice",
-      "Comment": "config#2326: poll the daily substrate check to a TERMINAL status (mirrors the weekly SF's CheckSubstrateHealthCheckStatus / config#2276 CheckMorningEnrichStatus idiom, minus the re-issue gate — observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved straight to StopTradingInstance, so a hung/failing health checker was invisible (green cost-guard shutdown regardless). Terminal non-Success (Failed / TimedOut / Cancelled — incl. executionTimeout expiry) → SubstrateHealthCheckDegraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds backstops SSM control-plane pathology. $.substrate_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForDailySubstrateHealthCheck pins Status via its ResultSelector.",
-      "Choices": [
-        {
-          "Variable": "$.substrate_check_poll.Status",
-          "StringEquals": "Success",
-          "Next": "StopTradingInstance"
-        },
-        {
-          "Or": [
-            {
-              "Variable": "$.substrate_check_poll.Status",
-              "StringEquals": "InProgress"
-            },
-            {
-              "Variable": "$.substrate_check_poll.Status",
-              "StringEquals": "Pending"
-            },
-            {
-              "Variable": "$.substrate_check_poll.Status",
-              "StringEquals": "Delayed"
-            }
-          ],
-          "Next": "DailySubstrateHealthCheckPollWait"
-        }
-      ],
-      "Default": "SubstrateHealthCheckDegraded"
-    },
-    "DailySubstrateHealthCheckPollWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForDailySubstrateHealthCheck"
-    },
-    "SubstrateHealthCheckDegraded": {
-      "Type": "Pass",
-      "Comment": "config#2326 (mirrors the weekly SF's SubstrateHealthCheckDegraded / config#2276): the daily substrate health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckDailySubstrateHealthCheckStatus.Default). An SF-controlled boolean recorded on the execution record. Unlike the weekly SF, the EOD SF has NO success-path SNS notifier to thread this flag into (audited in test_sf_notifier_totality_wiring.py — PipelineComplete-equivalent tail here is just the cost-guard instance stop), so visibility here is a DEDICATED best-effort SNS publish (PublishSubstrateHealthCheckDegradedAlert) mirroring the existing fail-open PublishDataSpotFailureImmediate idiom in this same file, rather than silence. Continues to StopTradingInstance — the cost-guard shutdown must never be delayed or skipped by a health-check degradation.",
-      "Result": true,
-      "ResultPath": "$.health_check_degraded",
-      "Next": "PublishSubstrateHealthCheckDegradedAlert"
-    },
-    "PublishSubstrateHealthCheckDegradedAlert": {
-      "Type": "Task",
-      "Comment": "config#2326: best-effort SNS alert that the EOD daily substrate health check degraded (crashed, timed out, or finished non-Success) — surfaces the miss WITHOUT blocking the cost-guard instance stop. Message is a HARDCODED CONSTANT (config#1819 convention: never States.Format a Subject; here Message is also kept constant rather than conditionally dereferencing $.substrate_check_error / $.substrate_check_poll, which are set by DIFFERENT predecessors — a Catch path sets only the former, a terminal-status path only the latter, and States.Format on a field absent from a given path's payload raises States.Runtime, which would itself dodge the cost-guard). The execution record still carries whichever of the two fields fired; operators cross-reference the SF console. Its own Catch also routes to StopTradingInstance so even an SNS-side failure cannot delay/block the cost-guard.",
-      "Resource": "arn:aws:states:::sns:publish",
-      "Parameters": {
-        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Substrate Health Check — DEGRADED (fail-open, shutdown continues)",
-        "Message": "The EOD daily substrate health check (nousergon_lib.transparency --cadence daily) degraded — it crashed, timed out, or its SSM command finished non-Success — but the pipeline continued to instance-stop (fail-open, config#2326). Per-row CloudWatch alarms independently page on row-level failures; this alert covers the SSM/infra-level failure class those alarms don't see. Detail is on the execution record ($.substrate_check_error and/or $.substrate_check_poll) — view at https://console.nousergon.ai/pipeline-status"
-      },
-      "ResultPath": "$.substrate_health_check_degraded_notify",
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "config#1819-style: a best-effort alert publish failure must never delay/block the cost-guard instance stop.",
-          "ResultPath": "$.substrate_health_check_degraded_notify_error",
-          "Next": "StopTradingInstance"
-        }
-      ],
-      "Next": "StopTradingInstance"
-    },
     "CheckSkipRefreshExecutorDeploy": {
       "Type": "Choice",
       "Comment": "Per-task rerun gate (L4607) for the top-of-pipeline executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} routes past RefreshExecutorDeploy to the first work gate (CheckSkipPostMarketData); missing flag = run as normal. This is the FIRST gate the SSM-ready path enters — hoisting the refresh here (out of the per-step EODReconcile refresh added in nousergon-data#574) means the ENTIRE EOD run (PostMarketData → PostMarketArcticAppend → CaptureSnapshot → EODReconcile) executes latest origin/main by construction, closing the silent-stale-code exposure on the non-drift-guarded work steps. Per feedback_preflight_fast_fail_before_expensive_work.",
@@ -644,7 +498,7 @@
     },
     "RefreshExecutorDeploy": {
       "Type": "Task",
-      "Comment": "Hoisted deploy-drift chokepoint (config#1549). Refreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status → HandleFailure → ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against — this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here — mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly — keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed.",
+      "Comment": "Hoisted deploy-drift chokepoint (config#1549), NARROWED to a conditional refresh (alpha-engine-config-I2722, 2026-07-16): fetches origin and compares local HEAD to origin/main FIRST; the expensive boot-pull.sh (multi-repo pull + pip install + systemd-unit sync + trades.db restore, up to the full 600s budget) only runs when the checkout has actually drifted. A hard-fail-on-any-invocation reading would false-fail every day an intraday executor merge lands (the exact scenario this chokepoint exists to catch), since boot-pull.sh's own boot-pull.service only fires on instance boot. Original rationale retained below for the drifted path, which is UNCHANGED byte-for-byte.\n\nRefreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07–08:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status → HandleFailure → ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against — this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here — mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly — keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed. The fast (not-drifted) path also re-freezes the pin unconditionally (cheap, idempotent) rather than assuming it's already correct, so the lockstep invariant holds regardless of which branch ran.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -653,8 +507,17 @@
           "commands": [
             "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
-            "sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1",
-            "sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'"
+            "sudo -u ec2-user -H git fetch origin --quiet",
+            "LOCAL_SHA=$(sudo -u ec2-user git rev-parse HEAD)",
+            "REMOTE_SHA=$(sudo -u ec2-user git rev-parse origin/main)",
+            "if [ \"$LOCAL_SHA\" = \"$REMOTE_SHA\" ]; then",
+            "  echo \"checkout current ($LOCAL_SHA) -- skipping refresh\"",
+            "  sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'",
+            "else",
+            "  echo \"checkout drifted (local=$LOCAL_SHA remote=$REMOTE_SHA) -- running full refresh\"",
+            "  sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1",
+            "  sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'",
+            "fi"
           ],
           "executionTimeout": [
             "600"
@@ -804,16 +667,27 @@
           "Next": "CheckSkipCaptureSnapshot"
         }
       ],
-      "Default": "LaunchPostMarketDataSpot"
+      "Default": "InitDataSpotRetryCounter"
+    },
+    "InitDataSpotRetryCounter": {
+      "Type": "Pass",
+      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload — e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling. force_on_demand starts false; IncrementDataSpotRetry flips it true so the one retry never gambles on spot a second time.",
+      "Result": {
+        "attempts": 0,
+        "force_on_demand": false
+      },
+      "ResultPath": "$.data_spot_retry",
+      "Next": "LaunchPostMarketDataSpot"
     },
     "LaunchPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (2026-07-14 incident) — the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
-          "workload": "post-market-data"
+          "workload": "post-market-data",
+          "force_on_demand.$": "$.data_spot_retry.force_on_demand"
         }
       },
       "TimeoutSeconds": 420,
@@ -846,16 +720,33 @@
       "Comment": "launched:true -> poll; launched:false kill-switch -> continue to snapshot/reconcile.",
       "Choices": [
         {
-          "Variable": "$.postmarket_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — a dispatcher payload without data_spot.launched previously threw States.Runtime here, ending the execution FAILED before StopTradingInstance (cost guard bypassed).",
           "Next": "PollPostMarketDataSpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.postmarket_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: a payload WITHOUT data_spot.launched means the dispatcher could not verifiably launch (partial/malformed result) — route into the existing data-spot failure notifier instead of silently treating it as an intentional not-launched skip (Default).",
+          "Next": "ExtractDataSpotError"
         }
       ],
       "Default": "CheckSkipCaptureSnapshot"
     },
     "PollPostMarketDataSpot": {
       "Type": "Task",
-      "Comment": "Poll the post-market data-spot SSM command; bounded by the on-box watchdog + reaper.",
+      "Comment": "Poll the post-market data-spot SSM command; bounded by the on-box watchdog + reaper. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) — a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.postmarket_launch.Payload.data_spot.command_id",
@@ -876,9 +767,9 @@
             "Ssm.SdkClientException",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "MaxAttempts": 6,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -901,12 +792,12 @@
     },
     "CheckPostMarketDataSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open: an EOD data failure must not block reconcile + instance-stop, config#1767 #4). Inverse of the OLD on-trading CheckPostMarketStatus which HandleFailure'd.",
+      "Comment": "Success -> the Arctic append spot workload retry-counter init; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotRetryBudget (one relaunch retry before the existing fail-open path). Inverse of the OLD on-trading CheckPostMarketStatus which HandleFailure'd.",
       "Choices": [
         {
           "Variable": "$.postmarket_poll.Status",
           "StringEquals": "Success",
-          "Next": "LaunchPostMarketArcticAppendSpot"
+          "Next": "InitDataSpotArcticRetryCounter"
         },
         {
           "Variable": "$.postmarket_poll.Status",
@@ -924,21 +815,54 @@
           "Next": "PostMarketDataSpotWait"
         }
       ],
+      "Default": "CheckDataSpotRetryBudget"
+    },
+    "CheckDataSpotRetryBudget": {
+      "Type": "Choice",
+      "Comment": "A terminal non-Success status on the post-market-data spot poll (Failed/Cancelled/TimedOut/the SSM Undeliverable class an already-reclaimed spot instance produces) is presumed transient AWS spot interruption until proven otherwise — retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption is no longer 'transient blip' territory and falls through to the existing fail-open path rather than looping indefinitely. $.data_spot_retry is always initialized by InitDataSpotRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementDataSpotRetry"
+        }
+      ],
       "Default": "ExtractDataSpotError"
+    },
+    "IncrementDataSpotRetry": {
+      "Type": "Pass",
+      "Comment": "force_on_demand flips to true for the retry — a box already lost to spot interruption once must not gamble on spot again.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.data_spot_retry.attempts, 1)",
+        "force_on_demand": true
+      },
+      "ResultPath": "$.data_spot_retry",
+      "Next": "LaunchPostMarketDataSpot"
     },
     "PostMarketDataSpotWait": {
       "Type": "Wait",
       "Seconds": 15,
       "Next": "PollPostMarketDataSpot"
     },
+    "InitDataSpotArcticRetryCounter": {
+      "Type": "Pass",
+      "Comment": "Retry budget for the Arctic-append sub-phase — the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter, including force_on_demand.",
+      "Result": {
+        "attempts": 0,
+        "force_on_demand": false
+      },
+      "ResultPath": "$.data_spot_arctic_retry",
+      "Next": "LaunchPostMarketArcticAppendSpot"
+    },
     "LaunchPostMarketArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the EOD ArcticDB append on the spot box. Arctic/S3 write runs ON THE SPOT via its executor profile, not the trading box.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the EOD ArcticDB append on the spot box. Arctic/S3 write runs ON THE SPOT via its executor profile, not the trading box. force_on_demand.$ mirrors LaunchPostMarketDataSpot's post-interruption-retry behavior.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
-          "workload": "post-market-arctic-append"
+          "workload": "post-market-arctic-append",
+          "force_on_demand.$": "$.data_spot_arctic_retry.force_on_demand"
         }
       },
       "TimeoutSeconds": 420,
@@ -971,16 +895,33 @@
       "Comment": "launched:true -> poll; launched:false kill-switch -> continue.",
       "Choices": [
         {
-          "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — same States.Runtime-before-cost-guard class as CheckPostMarketDataSpotLaunched.",
           "Next": "PollPostMarketArcticAppendSpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767: malformed dispatcher payload — route into the existing data-spot failure notifier, never a silent skip.",
+          "Next": "ExtractDataSpotError"
         }
       ],
       "Default": "CheckSkipCaptureSnapshot"
     },
     "PollPostMarketArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "Poll the EOD Arctic-append data-spot SSM command.",
+      "Comment": "Poll the EOD Arctic-append data-spot SSM command. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) — a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.postmarket_arctic_launch.Payload.data_spot.command_id",
@@ -1001,9 +942,9 @@
             "Ssm.SdkClientException",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "MaxAttempts": 6,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -1026,7 +967,7 @@
     },
     "CheckPostMarketArcticAppendSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> ExtractDataSpotError -> CONTINUE (fail-open).",
+      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotArcticRetryBudget (one relaunch retry before the existing fail-open path).",
       "Choices": [
         {
           "Variable": "$.postmarket_arctic_poll.Status",
@@ -1049,7 +990,29 @@
           "Next": "PostMarketArcticAppendSpotWait"
         }
       ],
+      "Default": "CheckDataSpotArcticRetryBudget"
+    },
+    "CheckDataSpotArcticRetryBudget": {
+      "Type": "Choice",
+      "Comment": "Same one-retry-then-give-up policy as CheckDataSpotRetryBudget, applied to the Arctic-append sub-phase. $.data_spot_arctic_retry is always initialized by InitDataSpotArcticRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot_arctic_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementDataSpotArcticRetry"
+        }
+      ],
       "Default": "ExtractDataSpotError"
+    },
+    "IncrementDataSpotArcticRetry": {
+      "Type": "Pass",
+      "Comment": "force_on_demand flips to true for the retry — mirrors IncrementDataSpotRetry.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.data_spot_arctic_retry.attempts, 1)",
+        "force_on_demand": true
+      },
+      "ResultPath": "$.data_spot_arctic_retry",
+      "Next": "LaunchPostMarketArcticAppendSpot"
     },
     "PostMarketArcticAppendSpotWait": {
       "Type": "Wait",
@@ -1110,42 +1073,49 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipEODReconcile"
+          "Next": "ProbeEODReconcilePrecondition"
         }
       ],
       "Default": "CaptureSnapshot"
     },
-    "CheckSkipEODReconcile": {
-      "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
-      "Choices": [
+    "ProbeEODReconcilePrecondition": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #1: verify-by-artifact EOD-reconcile precondition probe. Replaces the old $.data_spot_error launch-phase flag test with a fresh S3 read (via alpha-engine-eod-precondition-probe) of the macro-freshness sentinel builders/daily_append.py writes only AFTER readback-verifying run_date's SPY close is queryable in ArcticDB — the actual precondition eod_reconcile.py's _spy_close hard-depends on, not merely 'did the launch/poll path see an error'. Called fresh at every reconcile-gate entry (including each HealReProbe iteration in the heal loop below) — never cached, never trusted from an earlier point in the execution.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-eod-precondition-probe",
+        "Payload": {
+          "run_date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
         {
-          "And": [
-            {
-              "Variable": "$.pipeline_role",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.pipeline_role",
-              "StringEquals": "operator-replay"
-            },
-            {
-              "Variable": "$.skip_eod_reconcile",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_eod_reconcile",
-              "BooleanEquals": true
-            }
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
           ],
-          "Next": "CheckSkipDailySubstrateHealthCheck"
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
-      "Default": "EODReconcile"
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SWALLOW (feedback_no_silent_fails): (a) failure mode swallowed = the precondition-probe Lambda itself errored (IAM drift, S3 outage, malformed sentinel JSON) — NOT a data-gap signal; (c) recording surface = $.precondition_probe is left ABSENT on this path, so CheckSkipEODReconcile's BooleanEquals-false test does not match and control falls through to its Default (EODReconcile) rather than silently skipping a possibly-fine reconcile. This is deliberately fail-SAFE-toward-reconcile, not fail-open: eod_reconcile.py's own _spy_close hard-fail (no fallback, by design) remains the authoritative backstop if the data is genuinely absent — a probe-infra failure can at worst cause one more HandleFailure page, never a silent false-green.",
+          "ResultPath": null,
+          "Next": "CheckSkipEODReconcile"
+        }
+      ],
+      "ResultPath": "$.precondition_probe",
+      "Next": "CheckSkipEODReconcile"
     },
-    "CheckSkipDailySubstrateHealthCheck": {
+    "CheckSkipEODReconcile": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607). Input {\"skip_daily_substrate_health_check\": true} routes past DailySubstrateHealthCheck directly to StopTradingInstance (the always-run cost-guard cleanup); missing flag = run as normal. The substrate check is already non-blocking. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} routes past EODReconcile to the next gate (CheckSkipDailySubstrateHealthCheck); missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work. REPLACED 2026-07-15 (config-I2702 deliverable #1): the old $.data_spot_error IsPresent test decided skip/run from a LAUNCH-PHASE flag, which the 2026-07-15 incident proved can be stale (a transient poll-side SDK hiccup stamped the flag while the collector was still running and later finished rc=0, but the flag test skipped reconcile anyway). Now gates on $.precondition_probe.Payload.precondition_met — a FRESH S3 read of the readback-verified macro-freshness sentinel, taken immediately before this Choice by the new ProbeEODReconcilePrecondition state. IsPresent+BooleanEquals(false) (not merely absent) — a probe that never ran (its own Catch swallow) falls through to Default (EODReconcile), deliberately fail-safe-toward-reconcile; see ProbeEODReconcilePrecondition's Catch comment.",
       "Choices": [
         {
           "And": [
@@ -1158,22 +1128,556 @@
               "StringEquals": "operator-replay"
             },
             {
-              "Variable": "$.skip_daily_substrate_health_check",
+              "Variable": "$.skip_eod_reconcile",
               "IsPresent": true
             },
             {
-              "Variable": "$.skip_daily_substrate_health_check",
+              "Variable": "$.skip_eod_reconcile",
               "BooleanEquals": true
             }
           ],
           "Next": "StopTradingInstance"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "BooleanEquals": false
+            }
+          ],
+          "Next": "SkipEODReconcileDataGap"
         }
       ],
-      "Default": "DailySubstrateHealthCheck"
+      "Default": "EODReconcile"
+    },
+    "SkipEODReconcileDataGap": {
+      "Type": "Task",
+      "Comment": "Loud, distinctly-labeled alert for a known/self-healing condition — NOT a silent swallow (feedback_no_silent_fails): the precondition probe confirmed run_date's SPY close is not yet verified-present in ArcticDB, so EODReconcile is skipped rather than left to guarantee-crash into the generic HandleFailure/FailExecution path. UPDATED config-I2702 deliverable #3: recovery is no longer a documented MANUAL operator-replay step — control proceeds into the closed self-heal loop (SetDegradedFlag -> CheckHealLoopEligible -> InitHealLoop -> ...) which dispatches the missing data-spot workload(s), re-probes, and auto-starts a reconcile-only replay execution (I2700's proven skip_post_market_data + skip_capture_snapshot shape) the moment the precondition lands — paging only if it fails to converge within 2 attempts or by the probe-computed 09:00 UTC deadline (HealNonConvergent).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile SKIPPED (data gap, self-healing)",
+        "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) — no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
+      },
+      "ResultPath": "$.eod_skip_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Defense-in-depth, mirrors HandleFailure's own Catch: an SNS-side failure must not block entry into the self-heal loop.",
+          "ResultPath": null,
+          "Next": "SetDegradedFlag"
+        }
+      ],
+      "Next": "SetDegradedFlag"
+    },
+    "SetDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "config-I2702 deliverable #4: an execution that skips ANY load-bearing state (here: EODReconcile) must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary flag, checked once by CheckDegradedOutcome AFTER the cost-guard tail (StopTradingInstance) always completes, to route to the distinct DegradedSucceeded terminal instead of NormalSucceeded. The DISTINCT NOTIFICATION half of deliverable #4 already fired above (SkipEODReconcileDataGap) and will fire again from HealConvergedNotify or HealNonConvergent below — this flag only controls the terminal state's shape/output, mirroring how SubstrateHealthCheckDegraded already threads $.health_check_degraded through this same file for an analogous (lower-severity) condition.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_reconcile_skipped_data_gap",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckHealLoopEligible"
+    },
+    "CheckHealLoopEligible": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #3: recursion guard. An operator-replay execution (pipeline_role=operator-replay — including a heal-dispatched replay itself, HealDispatchReplay below) that STILL finds the precondition unmet must not spawn a further self-heal loop (replays run with skip_post_market_data=true, so they have no data-spot phase to retry — looping here would just burn the 2-attempt budget doing nothing). Page immediately instead. A live/daemon/backstop-triggered execution (the normal case) enters the loop.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — this SF has no InitializeInput floor (StartAt is CheckMutexRole), so $.pipeline_role is an execution-input key that is not provably present. Absent falls to Default InitHealLoop, i.e. the live-execution treatment, which is the correct reading for any non-replay trigger.",
+          "Next": "HealNonConvergent"
+        }
+      ],
+      "Default": "InitHealLoop"
+    },
+    "InitHealLoop": {
+      "Type": "Pass",
+      "Comment": "config-I2702 deliverable #3: attempts counter for the closed self-heal loop. Mirrors the InitDataSpotRetryCounter/InitSSMPollCounter idiom already used elsewhere in this file. Bound at 2 attempts (issue's suggested default) — combined with the 09:00-UTC-next-day deadline the precondition probe computes, whichever gate trips first ends the loop (HealLoopGate).",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.heal_loop",
+      "Next": "HealLoopGate"
+    },
+    "HealLoopGate": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #3(d): stop the loop and page loudly (never silently) once EITHER bound trips — 2 attempts exhausted, or the probe-computed 09:00 UTC deadline has passed (checked against the MOST RECENT probe result; $.precondition_probe is always present here because SkipEODReconcileDataGap is only reachable after a successful ProbeEODReconcilePrecondition call).",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.heal_loop.attempts",
+              "NumericGreaterThanEquals": 2
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.precondition_probe.Payload.past_deadline",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.precondition_probe.Payload.past_deadline",
+                  "BooleanEquals": true
+                }
+              ],
+              "Comment": "config-I2767: IsPresent-guarded — a probe payload without past_deadline previously threw States.Runtime inside this Or. Absent, the operand is simply false and the loop stays bounded by the attempts operand alone (2 attempts, then HealNonConvergent pages)."
+            }
+          ],
+          "Next": "HealNonConvergent"
+        }
+      ],
+      "Default": "HealLaunchPostMarketDataSpot"
+    },
+    "HealLaunchPostMarketDataSpot": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(a): dispatch the missing post-market-data workload. force_on_demand=true unconditionally — we are already in a degraded-recovery context (the upstream CheckDataSpotRetryBudget single-retry-on-spot already ran and this loop is a step beyond that), so gambling on spot capacity again is not worth the risk of a second interruption burning a heal-loop attempt.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-data-spot-dispatcher",
+        "Payload": {
+          "workload": "post-market-data",
+          "force_on_demand": true
+        }
+      },
+      "TimeoutSeconds": 420,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A launch failure this heal attempt is not fatal to the loop — HealLoopIncrement retries (bounded by HealLoopGate).",
+          "ResultPath": "$.heal_error",
+          "Next": "HealLoopIncrement"
+        }
+      ],
+      "ResultPath": "$.heal_postmarket_launch",
+      "Next": "HealCheckPostMarketDataSpotLaunched"
+    },
+    "HealCheckPostMarketDataSpotLaunched": {
+      "Type": "Choice",
+      "Comment": "launched:true -> poll; launched:false (kill-switch) -> this heal attempt accomplished nothing, try again next iteration.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — absent launched (malformed dispatcher payload) falls to Default HealLoopIncrement: the bounded heal loop (2 attempts) retries or pages via HealNonConvergent, never States.Runtime.",
+          "Next": "HealPollPostMarketDataSpot"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealPollPostMarketDataSpot": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #5: poll the SSM command's OWN authoritative state to a terminal status — no arbitrary attempt cap on the InProgress/Pending/Delayed branch (bounded only by the data-spot box's own MAX_RUNTIME_SECONDS=7200 watchdog). The transient-SDK-error Retry budget below mirrors the widened PollPostMarketDataSpot budget.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.heal_postmarket_launch.Payload.data_spot.command_id",
+        "InstanceId.$": "$.heal_postmarket_launch.Payload.data_spot.instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 6,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.heal_error",
+          "Next": "HealLoopIncrement"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.heal_postmarket_poll",
+      "Next": "HealCheckPostMarketDataSpotStatus"
+    },
+    "HealCheckPostMarketDataSpotStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> dispatch the Arctic-append workload; InProgress/Pending/Delayed -> wait+re-poll (unbounded, deliverable #5); ANY terminal non-Success -> this heal attempt failed, try again next iteration.",
+      "Choices": [
+        {
+          "Variable": "$.heal_postmarket_poll.Status",
+          "StringEquals": "Success",
+          "Next": "HealLaunchArcticAppendSpot"
+        },
+        {
+          "Variable": "$.heal_postmarket_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "HealPostMarketDataSpotWait"
+        },
+        {
+          "Variable": "$.heal_postmarket_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "HealPostMarketDataSpotWait"
+        },
+        {
+          "Variable": "$.heal_postmarket_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "HealPostMarketDataSpotWait"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealPostMarketDataSpotWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "HealPollPostMarketDataSpot"
+    },
+    "HealLaunchArcticAppendSpot": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(a): dispatch the missing post-market-arctic-append workload (the actual SPY-close WRITE the probe checks for).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-data-spot-dispatcher",
+        "Payload": {
+          "workload": "post-market-arctic-append",
+          "force_on_demand": true
+        }
+      },
+      "TimeoutSeconds": 420,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.heal_error",
+          "Next": "HealLoopIncrement"
+        }
+      ],
+      "ResultPath": "$.heal_arctic_launch",
+      "Next": "HealCheckArcticAppendSpotLaunched"
+    },
+    "HealCheckArcticAppendSpotLaunched": {
+      "Type": "Choice",
+      "Comment": "launched:true -> poll; launched:false (kill-switch) -> try again next iteration.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — absent launched falls to Default HealLoopIncrement (bounded heal loop), never States.Runtime.",
+          "Next": "HealPollArcticAppendSpot"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealPollArcticAppendSpot": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #5: poll the SSM command's own authoritative state to a terminal status — unbounded on InProgress, bounded only by the box's own watchdog.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.heal_arctic_launch.Payload.data_spot.command_id",
+        "InstanceId.$": "$.heal_arctic_launch.Payload.data_spot.instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 6,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.heal_error",
+          "Next": "HealLoopIncrement"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.heal_arctic_poll",
+      "Next": "HealCheckArcticAppendSpotStatus"
+    },
+    "HealCheckArcticAppendSpotStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> re-probe the precondition; InProgress/Pending/Delayed -> wait+re-poll (unbounded, deliverable #5); ANY terminal non-Success -> try again next iteration.",
+      "Choices": [
+        {
+          "Variable": "$.heal_arctic_poll.Status",
+          "StringEquals": "Success",
+          "Next": "HealReProbe"
+        },
+        {
+          "Variable": "$.heal_arctic_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "HealArcticAppendSpotWait"
+        },
+        {
+          "Variable": "$.heal_arctic_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "HealArcticAppendSpotWait"
+        },
+        {
+          "Variable": "$.heal_arctic_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "HealArcticAppendSpotWait"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealArcticAppendSpotWait": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "HealPollArcticAppendSpot"
+    },
+    "HealReProbe": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(b): re-probe after the dispatched workloads complete. Overwrites $.precondition_probe with the FRESH result (never trusts the earlier probe) — HealCheckConverged and, on the next iteration, HealLoopGate's deadline check both read this latest value.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-eod-precondition-probe",
+        "Payload": {
+          "run_date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A re-probe infra failure is not a convergence signal either way — try again next iteration rather than guessing.",
+          "ResultPath": "$.heal_error",
+          "Next": "HealLoopIncrement"
+        }
+      ],
+      "ResultPath": "$.precondition_probe",
+      "Next": "HealCheckConverged"
+    },
+    "HealCheckConverged": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #3(c): the precondition landed -> dispatch the reconcile-only replay. Not yet -> try again next iteration.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded — a probe payload without precondition_met falls to Default HealLoopIncrement: not converged, loop stays bounded (2 attempts, then HealNonConvergent pages), never States.Runtime.",
+          "Next": "HealDispatchReplay"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealLoopIncrement": {
+      "Type": "Pass",
+      "Comment": "Advances the heal-loop attempt counter and returns to HealLoopGate for the bound check. Mirrors IncrementDataSpotRetry/IncrementSSMPoll.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.heal_loop.attempts, 1)"
+      },
+      "ResultPath": "$.heal_loop",
+      "Next": "HealLoopGate"
+    },
+    "HealDispatchReplay": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution, reusing I2700's PROVEN input shape EXACTLY (pipeline_role=operator-replay + skip_post_market_data=true + skip_capture_snapshot=true — the shape that ran successfully as 'operator-replay-eodreconcile-2026-07-15' and its 2026-07-13 precedent). Deliberately a SEPARATE execution rather than looping this one back through CaptureSnapshot: CaptureSnapshot already ran ONCE earlier in THIS execution (it sits upstream of the precondition probe in the pipeline order), so re-entering the data-spot phase in-place would re-trigger a second live-IB snapshot capture — exactly what I2700's skip_capture_snapshot flag exists to avoid. skip_refresh_executor_deploy=true because RefreshExecutorDeploy already ran at the top of THIS execution and re-froze .frozen_executor_sha — the box is already known-fresh. Fire-and-forget (non-.sync): this execution's own terminal state does not wait for the replay's outcome — the replay's own SUCCEEDED/FAILED status is independently observable (execution name eod-heal-replay-{run_date}-*) and IS the 'convergence notification' this issue's closes-when criteria describes.",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Parameters": {
+        "StateMachineArn.$": "$$.StateMachine.Id",
+        "Name.$": "States.Format('eod-heal-replay-{}-{}', $.run_date, $$.Execution.Name)",
+        "Input": {
+          "trading_instance_id.$": "$.trading_instance_id",
+          "ec2_instance_id.$": "$.ec2_instance_id",
+          "run_date.$": "$.run_date",
+          "triggered_by": "eod-self-heal",
+          "pipeline_role": "operator-replay",
+          "skip_post_market_data": true,
+          "skip_capture_snapshot": true,
+          "skip_refresh_executor_deploy": true
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "The data healed but the StartExecution API call itself failed (IAM drift, throttling) — this is NOT a silent success; page immediately rather than pretending convergence.",
+          "ResultPath": "$.heal_replay_dispatch_error",
+          "Next": "HealReplayDispatchFailed"
+        }
+      ],
+      "ResultPath": "$.heal_replay_dispatch",
+      "Next": "HealConvergedNotify"
+    },
+    "HealReplayDispatchFailed": {
+      "Type": "Task",
+      "Comment": "Loud page: the precondition converged but the auto-replay StartExecution call itself failed — requires a MANUAL operator-replay using I2700's shape (skip_post_market_data + skip_capture_snapshot).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Self-Heal — CONVERGED BUT REPLAY DISPATCH FAILED (operator action required)",
+        "Message.$": "States.Format('EOD self-heal for {} converged (SPY close now verified present) but the auto-replay StartExecution call itself failed: {}. Run a manual operator-replay: pipeline_role=operator-replay, skip_post_market_data=true, skip_capture_snapshot=true (I2700 shape).', $.run_date, States.JsonToString($.heal_replay_dispatch_error))"
+      },
+      "ResultPath": "$.heal_replay_dispatch_failed_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Next": "StopTradingInstance"
+    },
+    "HealConvergedNotify": {
+      "Type": "Task",
+      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) — the self-heal succeeded without any operator action; the replay execution named here does the actual EODReconcile.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Self-Heal — CONVERGED (replay dispatched, no operator action needed)",
+        "Message.$": "States.Format('EOD self-heal for {} converged after {} attempt(s): the missing data-spot workload(s) were re-dispatched, SPY close is now verified present in ArcticDB, and a reconcile-only replay execution has been started automatically ({}). No operator action required.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
+      },
+      "ResultPath": "$.heal_converged_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Next": "StopTradingInstance"
+    },
+    "HealNonConvergent": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(d): THE loud page. Fires only when the heal loop exhausted its 2-attempt budget, passed the probe-computed 09:00 UTC deadline, or this is a replay execution that still can't converge (CheckHealLoopEligible). Genuinely requires operator attention — the automatic path has been exhausted.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Self-Heal — DID NOT CONVERGE (operator action required)",
+        "Message.$": "States.Format('EOD self-heal for {} did NOT converge: the automatic heal loop (dispatch missing data-spot workload(s) -> re-probe) exhausted its attempt budget and/or passed its deadline without SPY close landing in ArcticDB. pipeline_role={}, latest probe: {}. Manual intervention needed — investigate the data-spot dispatch failures, then run an operator-replay (I2700 shape: skip_post_market_data=true, skip_capture_snapshot=true) once the underlying data issue is fixed.', $.run_date, $.pipeline_role, States.JsonToString($.precondition_probe))"
+      },
+      "ResultPath": "$.heal_nonconvergent_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Next": "StopTradingInstance"
     },
     "StopTradingInstance": {
       "Type": "Task",
-      "Comment": "Stop trading EC2 instance after EOD completes",
+      "Comment": "Stop trading EC2 instance after EOD completes EXTENDED config-I2702 deliverable #4: no longer a bare execution terminal (End:true) — routes to CheckDegradedOutcome so a run that skipped EODReconcile ends in the distinct DegradedSucceeded terminal instead of the same plain ExecutionSucceeded a fully-green day gets.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1198,7 +1702,36 @@
         }
       ],
       "ResultPath": "$.stop_result",
-      "End": true
+      "Next": "CheckDegradedOutcome"
+    },
+    "CheckDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set (by SetDegradedFlag) iff the precondition probe ever found the SPY close not-yet-verified-present this execution — regardless of whether the self-heal loop subsequently converged (HealConvergedNotify) or paged (HealNonConvergent): EODReconcile was skipped IN THIS EXECUTION either way, so 'plain ExecutionSucceeded' would still be a lie about THIS execution's own work, even when the system as a whole self-healed via a replay.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on the degraded path (SetDegradedFlag) — on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
+          "Next": "DegradedSucceeded"
+        }
+      ],
+      "Default": "NormalSucceeded"
+    },
+    "NormalSucceeded": {
+      "Type": "Succeed",
+      "Comment": "The ordinary, fully-green terminal — EODReconcile ran (or was validly skipped via an operator-replay skip_eod_reconcile flag), nothing degraded."
+    },
+    "DegradedSucceeded": {
+      "Type": "Succeed",
+      "Comment": "config-I2702 deliverable #4: distinct terminal for a run that skipped EODReconcile. Still reports AWS execution status SUCCEEDED (a Step Functions Succeed state cannot do otherwise) — the 'never report plain green' guarantee is carried by (a) this being a DIFFERENT named state than NormalSucceeded, visible in the SF console/execution history and in $.degraded_summary on the execution output, and (b) the distinctly-labeled SNS/Telegram notifications that already fired earlier in this execution (SkipEODReconcileDataGap, and HealConvergedNotify or HealNonConvergent) — mirroring this file's OWN established pattern for exactly this kind of signal (PublishDataSpotFailureImmediate, SubstrateHealthCheckDegraded + PublishSubstrateHealthCheckDegradedAlert) rather than relying on sf-telegram-notifier's generic execution-status rendering, which does not special-case Succeed-state names."
     },
     "HandleFailure": {
       "Type": "Task",
@@ -1206,7 +1739,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Pipeline \u2014 FAILED",
+        "Subject": "Alpha Engine EOD Pipeline — FAILED",
         "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",

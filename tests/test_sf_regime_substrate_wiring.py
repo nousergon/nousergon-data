@@ -6,20 +6,24 @@ state that invokes it lives here. This test verifies the wiring
 contract between the two so silent drift (e.g. a refactor renames the
 Lambda or removes the state) breaks CI rather than the next Saturday SF.
 
-Five invariants:
+Five invariants (alpha-engine-config-I2515 Phase B reorder: RegimeSubstrate
+now runs BEFORE the RAG chain, moved ahead of RAG/ThinkTank, so
+SignalsEnvelope reads a same-day regime label; the multi-agent Research
+state + CheckSkipResearch were removed):
 
 1. ``RegimeSubstrate`` state exists and is a Task that invokes
    ``alpha-engine-predictor-regime-substrate:live``.
 2. ``CheckSkipRegimeSubstrate`` state exists and routes to either
-   ``RegimeSubstrate`` (default) or ``CheckSkipResearch`` (when
+   ``RegimeSubstrate`` (default) or ``SignalsEnvelope`` (when
    ``skip_regime_substrate: true``).
-3. The post-RAG control flow lands on ``CheckSkipRegimeSubstrate``,
-   not on ``CheckSkipResearch`` directly. Two routes: the
-   ``CheckSkipRAGIngestion`` skip path AND the
+3. The post-RAG control flow lands on ``ThinkTankCoverage`` (moved to run
+   after RAG so its theses read the fresh corpus), not on
+   ``CheckSkipRegimeSubstrate`` (which now runs BEFORE RAG). Two routes:
+   the ``CheckSkipRAGIngestion`` skip path AND the
    ``CheckRAGIngestionStatus`` success path.
-4. ``RegimeSubstrate``'s Catch routes to ``CheckSkipResearch``, not
+4. ``RegimeSubstrate``'s Catch routes to ``SignalsEnvelope``, not
    ``HandleFailure`` — pins the Stage A observe-only contract that a
-   regime failure must not halt Research.
+   regime failure must not halt the load-bearing envelope producer.
 5. ``RegimeSubstrate`` payload is ``{"action": "produce"}`` —
    handler-side ``dry_run`` mode would not write the substrate
    artifact, so the SF must always invoke ``produce``.
@@ -96,10 +100,11 @@ def test_regime_substrate_payload_is_produce_action() -> None:
 
 
 def test_check_skip_regime_substrate_routes_correctly() -> None:
-    """Skip path lands on CheckSkipRegimeRetrospectiveEval (not directly
-    on CheckSkipResearch) so the T1 eval still gets its own independent
-    skip-gate evaluation. Honors the "each regime step has its own
-    skip flag" invariant introduced with T1 wiring."""
+    """alpha-engine-config-I2515 Phase B: RegimeSubstrate now runs BEFORE
+    the RAG chain (moved ahead of RAG/ThinkTank) so SignalsEnvelope reads a
+    same-day regime label. Skip path lands on SignalsEnvelope directly
+    (RegimeSubstrate's compute is skipped, but the envelope still runs
+    reading whatever regime artifact already exists)."""
     sf = _sf()
     states = _flat_states(sf)
     assert "CheckSkipRegimeSubstrate" in states
@@ -109,55 +114,57 @@ def test_check_skip_regime_substrate_routes_correctly() -> None:
     skip_choice = state["Choices"][0]
     skip_vars = skip_choice["And"]
     assert any(c.get("Variable") == "$.skip_regime_substrate" for c in skip_vars)
-    assert skip_choice["Next"] == "CheckSkipRegimeRetrospectiveEval"
+    assert skip_choice["Next"] == "SignalsEnvelope"
 
 
-def test_post_rag_control_flow_lands_on_regime_skip_gate() -> None:
-    """Both post-RAG routes must point at CheckSkipRegimeSubstrate, not
-    CheckSkipResearch directly. Catches a refactor that bypasses the
-    regime state."""
+def test_post_rag_control_flow_lands_on_thinktank_coverage() -> None:
+    """alpha-engine-config-I2515 Phase B: ThinkTankCoverage moved to run
+    AFTER the RAG chain (was between Scanner and RAG) so its theses read
+    the fresh corpus. Both post-RAG routes must point at ThinkTankCoverage
+    now, not CheckSkipRegimeSubstrate (which runs BEFORE RAG in the new
+    order). Catches a refactor that re-introduces the stale-corpus bug."""
     sf = _sf()
     states = _flat_states(sf)
     # CheckSkipRAGIngestion's skip-branch
     skip_choice = states["CheckSkipRAGIngestion"]["Choices"][0]
-    assert skip_choice["Next"] == "CheckSkipRegimeSubstrate", (
-        "CheckSkipRAGIngestion skip path must land on CheckSkipRegimeSubstrate"
+    assert skip_choice["Next"] == "ThinkTankCoverage", (
+        "CheckSkipRAGIngestion skip path must land on ThinkTankCoverage"
     )
     # CheckRAGIngestionStatus's success branch
     success_choice = next(
         c for c in states["CheckRAGIngestionStatus"]["Choices"]
         if c.get("StringEquals") == "Success"
     )
-    assert success_choice["Next"] == "CheckSkipRegimeSubstrate", (
-        "CheckRAGIngestionStatus success path must land on CheckSkipRegimeSubstrate"
+    assert success_choice["Next"] == "ThinkTankCoverage", (
+        "CheckRAGIngestionStatus success path must land on ThinkTankCoverage"
     )
 
 
 def test_regime_substrate_failure_is_non_blocking() -> None:
     """Stage A observe-only contract: RegimeSubstrate failure must NOT
-    halt the pipeline. The Catch[States.ALL] routes to
-    CheckSkipRegimeRetrospectiveEval (not HandleFailure) so the T1 eval
-    + Research still get a chance to run."""
+    halt the pipeline. alpha-engine-config-I2515 Phase B: the
+    Catch[States.ALL] now routes to SignalsEnvelope (RegimeSubstrate's new
+    direct successor, moved ahead of RAG/ThinkTank) so the load-bearing
+    envelope producer still gets a chance to run."""
     sf = _sf()
     states = _flat_states(sf)
     catches = states["RegimeSubstrate"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "CheckSkipRegimeRetrospectiveEval", (
+    assert states_all["Next"] == "SignalsEnvelope", (
         "RegimeSubstrate Catch[States.ALL] must route to "
-        "CheckSkipRegimeRetrospectiveEval (non-blocking), not HandleFailure "
+        "SignalsEnvelope (non-blocking), not HandleFailure "
         "(blocking). Stage A is observe-only; a regime substrate failure "
-        "during the 4-week observation period must not halt downstream."
+        "must not halt downstream."
     )
 
 
-def test_regime_substrate_next_is_eval_skip_gate() -> None:
-    """Success path lands on CheckSkipRegimeRetrospectiveEval so the
-    T1 eval gets a chance to run (it independently honors its own
-    skip flag). Substrate + eval are sibling observe-only steps,
-    neither gates the other."""
+def test_regime_substrate_next_is_signals_envelope() -> None:
+    """alpha-engine-config-I2515 Phase B: Success path lands on
+    SignalsEnvelope (moved ahead of RAG/ThinkTank so the envelope's
+    market_regime field reads a same-day regime label)."""
     sf = _sf()
     states = _flat_states(sf)
-    assert states["RegimeSubstrate"]["Next"] == "CheckSkipRegimeRetrospectiveEval"
+    assert states["RegimeSubstrate"]["Next"] == "SignalsEnvelope"
 
 
 def test_regime_substrate_timeout_is_reasonable() -> None:
@@ -215,16 +222,19 @@ def test_regime_retrospective_eval_payload_is_produce_action() -> None:
 
 
 def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
-    """{\"skip_regime_retrospective_eval\": true} bypasses to the
-    research-chain entry CheckSkipResearch. config#885 relocated the
+    """{\"skip_regime_retrospective_eval\": true} bypasses to
+    CheckSkipDataPhase2. config#885 relocated the
     Scanner→RAG→RegimeSubstrate→RegimeRetrospectiveEval chain INTO
     ResearchPredictorParallel Branch A (so PredictorTraining forks
     parallel to it after DataPhase1). RegimeRetrospectiveEval +
     CheckSkipRegimeRetrospectiveEval now live INSIDE Branch A, so the
-    skip path lands on the next Branch-A state CheckSkipResearch (its
-    sibling), NOT the Parallel state itself (which would be an invalid
-    branch-internal → parent transition). Independent of
-    skip_regime_substrate so each regime step has its own skip flag."""
+    skip path lands on the sibling Branch-A state CheckSkipDataPhase2,
+    NOT the Parallel state itself (which would be an invalid
+    branch-internal → parent transition). alpha-engine-config-I2515 Phase
+    B removed the multi-agent Research state (and CheckSkipResearch) that
+    used to sit here — CheckSkipDataPhase2 is now the direct successor.
+    Independent of skip_regime_substrate so each regime step has its own
+    skip flag."""
     sf = _sf()
     branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
         "States"
@@ -240,9 +250,9 @@ def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
         for c in skip_vars
     )
     # config#885: the chain is INSIDE Branch A now → skip continues to the
-    # sibling Branch-A state CheckSkipResearch, never the parent Parallel.
-    assert skip_choice["Next"] == "CheckSkipResearch"
-    assert "CheckSkipResearch" in branch_a
+    # sibling Branch-A state CheckSkipDataPhase2, never the parent Parallel.
+    assert skip_choice["Next"] == "CheckSkipDataPhase2"
+    assert "CheckSkipDataPhase2" in branch_a
     # The chain is no longer at top level — it forks parallel to Branch B.
     par = sf["States"]["ResearchPredictorParallel"]
     assert par["Type"] == "Parallel"
@@ -254,40 +264,43 @@ def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
 def test_regime_retrospective_eval_failure_is_non_blocking() -> None:
     """Observe-only contract: a T1 eval failure must NOT halt the
     pipeline. config#885 relocated the chain INTO Branch A, so the
-    Catch[States.ALL] now routes to the next Branch-A state
-    CheckSkipResearch (non-blocking, in-branch) — NOT
-    ResearchPredictorParallel (the parent, an invalid branch→parent
-    transition) and NOT HandleFailure (blocking, and an invalid
-    branch→top-level transition that would re-introduce SF Parallel
-    cross-branch cancellation). T1 is observability, not gating."""
+    Catch[States.ALL] now routes to the sibling Branch-A state
+    CheckSkipDataPhase2 (non-blocking, in-branch, alpha-engine-config-I2515
+    Phase B's new direct successor) — NOT ResearchPredictorParallel (the
+    parent, an invalid branch→parent transition) and NOT HandleFailure
+    (blocking, and an invalid branch→top-level transition that would
+    re-introduce SF Parallel cross-branch cancellation). T1 is
+    observability, not gating."""
     sf = _sf()
     branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
         "States"
     ]
     catches = branch_a["RegimeRetrospectiveEval"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "CheckSkipResearch", (
+    assert states_all["Next"] == "CheckSkipDataPhase2", (
         "RegimeRetrospectiveEval Catch[States.ALL] must route to the "
-        "in-branch research-chain entry CheckSkipResearch (non-blocking), "
+        "in-branch state CheckSkipDataPhase2 (non-blocking), "
         "not HandleFailure (blocking) nor the parent Parallel. T1 is "
-        "observability; a failure must not halt Research."
+        "observability; a failure must not halt Branch A."
     )
     assert states_all["Next"] in branch_a
 
 
-def test_regime_retrospective_eval_next_is_research_chain_entry() -> None:
+def test_regime_retrospective_eval_next_is_data_phase2_skip_gate() -> None:
     """config#885: the chain lives INSIDE Branch A, so
     RegimeRetrospectiveEval's success continuation is its sibling
-    Branch-A state CheckSkipResearch (the research-chain entry), not the
-    parent Parallel."""
+    Branch-A state CheckSkipDataPhase2, not the parent Parallel.
+    alpha-engine-config-I2515 Phase B removed the multi-agent Research
+    state (and CheckSkipResearch) that used to sit between this chain and
+    DataPhase2."""
     sf = _sf()
     branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
         "States"
     ]
     assert (
-        branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
+        branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
     )
-    assert "CheckSkipResearch" in branch_a
+    assert "CheckSkipDataPhase2" in branch_a
 
 
 def test_regime_retrospective_eval_timeout_accommodates_smoother_fit() -> None:

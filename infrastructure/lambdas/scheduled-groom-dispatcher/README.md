@@ -115,20 +115,17 @@ but injection protection is cheap).
   `Errors` metric during bootstrap-ops to page on it.)
 - **Kill-switch**: set the Lambda env `GROOM_DISPATCH_ENABLED=false` to disable
   without deleting the Scheduler rules.
-- **Pre-boot pace gate (2026-07-04)**: before launching the spot box, compares
-  reset-aligned weekly Claude usage (WET) against how much of the current
-  weekly window has elapsed (`krepis.usage_pacing.pace_check` — same gate
-  `alpha-engine-config/scripts/groom_budget.py` runs on-box); a launch running
-  ahead of pace is skipped entirely (`launched: false, reason: "pace_gate_skip"`,
-  routed through the existing `CheckLaunched`→`GroomSkipped` Step Function
-  branch, no SF changes needed) **and sends its own Telegram ping** — the only
-  place a pre-boot skip is ever visible, since a run that never boots has no
-  on-box `groom_run.sh` to notify the way the on-box budget-gate skip does.
-  Fail-safe on any S3/read error — never blocks a scheduled groom (and never
-  pings on a fail-safe pass-through either). `GROOM_PACE_GATE_ENABLED=false`
-  disables just this gate (independent of `GROOM_DISPATCH_ENABLED`);
-  `GROOM_WEEKLY_WET_CEILING` / `CCUSAGE_BUCKET` override the calibrated
-  defaults.
+- **Usage pacing DISMANTLED (2026-07-14, Brian ruling)**: the pre-boot pace
+  gate (2026-07-04 → SSoT ceiling config-I2461) is removed — no recorded usage
+  level defers or blocks a scheduled launch anymore. Its false trips and
+  SILENT skips (2026-07-14: the 01:00 and 07:00 UTC triggers both
+  pace-skipped with no decision record) cost more groom coverage than the
+  weekly-quota protection was worth. The surviving guardrail is on-box: a
+  mid-run provider usage/quota top-out winds down cleanly with a distinct
+  Telegram ping (config#1803). Trigger evaluations now ALWAYS leave a
+  decision record — including enumeration failures (`skip_reason:
+  demand_all_failed`, config-I2540) — so a missing record file unambiguously
+  means the scheduler never invoked this Lambda.
 - **Narrow IAM**: the box reads its own run secrets from SSM via its own
   instance profile — this Lambda needs none of those. Its own IAM grants are
   EC2 launch/terminate, `iam:PassRole` for the executor role, SSM

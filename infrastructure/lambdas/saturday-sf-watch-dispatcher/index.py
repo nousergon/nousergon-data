@@ -141,6 +141,18 @@ _DEFAULT_MAX_DISPATCHES = 2
 # repository_dispatch target — the private alpha-engine-config repo hosts the
 # agent GHA workflow (on: repository_dispatch, types: [*-sf-failure]).
 DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
+
+# M2 dispatch target (alpha-engine-config-I2823). "repository_dispatch" (the
+# legacy default) round-trips through GitHub -> sf-watch.yml -> lambda invoke,
+# making SF recovery depend on GitHub availability (cf. the 2026-07-16 GitHub
+# 503 incident). "overseer" invokes alpha-engine-overseer-dispatcher directly
+# (Lambda-to-Lambda, async) — the router consults the playbook registry,
+# invokes the spot dispatcher, and owns P1-filing/paging on bad verdicts.
+# OPERATOR-OWNED runtime flag like AGENT_DISPATCH_ENABLED (deploy.sh preserves
+# it across redeploys). Flip gated on the reshaped weekly SF's first live run
+# (gate:weekly-sf) — see alpha-engine-config-I2823.
+M2_DISPATCH_TARGET = os.environ.get("M2_DISPATCH_TARGET", "repository_dispatch")
+OVERSEER_FUNCTION = os.environ.get("OVERSEER_FUNCTION", "alpha-engine-overseer-dispatcher")
 # Dedicated fine-grained PAT (SecureString) scoped to the SF-path repos, shared
 # across pipelines. Read at dispatch time only — never logged.
 GITHUB_PAT_SSM_PARAM = os.environ.get(
@@ -185,11 +197,22 @@ PIPELINES: dict[str, dict[str, object]] = {
         # decision there belongs to the agent's Lane-D discipline, never a
         # deterministic rule).
         "fast_path": {
+            # alpha-engine-config-I2717 (2026-07-16): "WaitForChronicGap" /
+            # "ChronicGapSelfHeal" removed — that state (+ its liveness-poll
+            # loop) was deleted from step_function_daily.json entirely, moved
+            # to the standalone --daily-heal job which is NOT part of this
+            # pipeline at all.
+            # alpha-engine-config-I2745 (2026-07-16): "WaitForMorningEnrich" /
+            # "WaitForMorningArcticAppend" / "MorningEnrich" / "MorningArcticAppend"
+            # were stale — those on-trading state names were retired by the
+            # config#1767 Phase-2 spot decoupling and replaced with the Spot-based
+            # polling/launch states below. Updated to the current step_function_daily.json
+            # state names (verified to exist and be correct SSM poll/spot-launch shape).
             "poll_states": frozenset(
-                {"WaitForMorningEnrich", "WaitForMorningArcticAppend", "WaitForChronicGap"}
+                {"PollMorningEnrichSpot", "PollMorningArcticAppendSpot"}
             ),
             "data_task_states": frozenset(
-                {"MorningEnrich", "MorningArcticAppend", "ChronicGapSelfHeal"}
+                {"LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"}
             ),
             "veto_states": frozenset({"RunMorningPlanner", "RunDaemon"}),
         },
@@ -200,6 +223,33 @@ PIPELINES: dict[str, dict[str, object]] = {
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
         "has_listener": True,
+    },
+    # alpha-engine-config-I2544: async advisory child of ne-weekly-freshness-
+    # pipeline (eval-judge chain / ReportCard / Director), split out so a
+    # hang there no longer risks the Saturday critical path. has_listener:
+    # False (onboarding default, mirrors how a brand-new pipeline registers
+    # here BEFORE its alpha-engine-config repository_dispatch agent charter
+    # exists) — the watch-log artifact + Telegram receipt still fire
+    # unconditionally; only the AUTONOMOUS-AGENT dispatch is deferred until a
+    # charter for "weekly-advisory-sf-failure" is added and this flips to
+    # True. Non-trading-critical (advisory/observability tail only).
+    "ne-weekly-advisory-pipeline": {
+        "cadence_slug": "weekly-advisory",
+        "label": "Weekly Advisory (eval-judge/ReportCard/Director)",
+        "watch_prefix": "consolidated/weekly-advisory_sf_watch",
+        "dispatch_event_type": "weekly-advisory-sf-failure",
+        "has_listener": False,
+    },
+    # alpha-engine-config-I2545: ModelZoo rotation moved off Saturday to its
+    # own Sunday 09:00 UTC trigger. Same onboarding posture as the advisory
+    # pipeline above (has_listener: False until a dedicated agent charter
+    # exists) — watch-log + Telegram receipt fire unconditionally.
+    "ne-modelzoo-sunday-pipeline": {
+        "cadence_slug": "modelzoo-sunday",
+        "label": "ModelZoo Sunday Rotation",
+        "watch_prefix": "consolidated/modelzoo-sunday_sf_watch",
+        "dispatch_event_type": "modelzoo-sunday-sf-failure",
+        "has_listener": False,
     },
     # The transitional `alpha-engine-eod-pipeline` alias (config#1408) was
     # retired 2026-07-11 (config#2272) after the dormant old state machine was
@@ -974,22 +1024,47 @@ def _maybe_dispatch_agent(
         # pipeline (see _notify).
         return {"dispatched": False, "reason": "no_listener"}
     event_type = cfg["dispatch_event_type"]
+    client_payload = {
+        "pipeline_name": pipeline_name,
+        "cadence_slug": cfg["cadence_slug"],
+        "state_machine_arn": sm_arn,
+        "execution_arn": record.get("execution_arn", ""),
+        "failed_state": record.get("failed_state"),
+        "cause": record.get("cause"),
+        "run_date": run_date,
+        "status": record.get("status"),
+        "watch_log_key": key,
+        "is_preflight": record.get("is_preflight", False),
+    }
+    if M2_DISPATCH_TARGET == "overseer":
+        # Direct Lambda-to-Lambda dispatch (alpha-engine-config-I2823) — no
+        # GitHub in the loop. Async (Event): the router owns verdict handling,
+        # P1 filing, and loud paging; this Lambda's watch-log record (already
+        # written) is the local audit surface either way.
+        try:
+            resp = boto3.client("lambda", region_name=REGION).invoke(
+                FunctionName=OVERSEER_FUNCTION,
+                InvocationType="Event",
+                Payload=json.dumps(
+                    {"playbook": "sf-watch", "payload": client_payload}
+                ).encode("utf-8"),
+            )
+            status_code = int(resp.get("StatusCode", 0))
+            logger.info(
+                "agent dispatch sent via overseer router %s (http=%s)",
+                OVERSEER_FUNCTION, status_code,
+            )
+            return {"dispatched": True, "target": "overseer",
+                    "status_code": status_code, "event_type": event_type}
+        except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised (same carve-out as the repository_dispatch leg below)
+            logger.warning("overseer dispatch invoke failed (non-fatal): %s", exc)
+            return {"dispatched": False, "target": "overseer",
+                    "error": f"{type(exc).__name__}: {exc}"}
     try:
         pat = _get_github_pat()
         payload = {
             "event_type": event_type,
-            "client_payload": {
-                "pipeline_name": pipeline_name,
-                "cadence_slug": cfg["cadence_slug"],
-                "state_machine_arn": sm_arn,
-                "execution_arn": record.get("execution_arn", ""),
-                "failed_state": record.get("failed_state"),
-                "cause": record.get("cause"),
-                "run_date": run_date,
-                "status": record.get("status"),
-                "watch_log_key": key,
-                "is_preflight": record.get("is_preflight", False),
-            },
+            "client_payload": client_payload,
         }
         req = urllib.request.Request(
             f"https://api.github.com/repos/{DISPATCH_REPO}/dispatches",

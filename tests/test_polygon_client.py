@@ -11,9 +11,11 @@ free-tier "before end of day" rejections for stocks for a week.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from polygon_client import PolygonClient, PolygonForbiddenError
 
@@ -339,6 +341,36 @@ def test_get_ticker_events_empty_results_object():
     client = _make_client()
     with patch.object(client, "_get", return_value={"status": "OK"}):
         assert client.get_ticker_events("FB") == []
+
+
+def _http_404(body: dict) -> requests.HTTPError:
+    resp = requests.Response()
+    resp.status_code = 404
+    resp._content = json.dumps(body).encode()
+    return requests.HTTPError("404 Client Error", response=resp)
+
+
+def test_get_ticker_events_404_not_found_returns_empty():
+    """config#2812: polygon returns 404 {"status": "NOT_FOUND"} for a ticker
+    whose entity has no events record at all — verified live for BLD/JHG after
+    their 2026-07-01 delisting (vs. 200 for still-active AAPL/META). This must
+    be treated the same as "no renames found" (like the 403 case above), not as
+    a detection failure — otherwise prune_delisted_tickers can never clear the
+    rename-safety check for a genuinely fully-retired ticker."""
+    client = _make_client()
+    err = _http_404({"status": "NOT_FOUND", "message": "No events found for given ID"})
+    with patch.object(client, "_get", side_effect=err):
+        assert client.get_ticker_events("BLD") == []
+
+
+def test_get_ticker_events_404_unexpected_body_propagates():
+    """A 404 that does NOT carry status=NOT_FOUND is an unrecognized shape —
+    preserve the history-safety default (propagate, don't silently swallow)."""
+    client = _make_client()
+    err = _http_404({"status": "SOMETHING_ELSE"})
+    with patch.object(client, "_get", side_effect=err):
+        with pytest.raises(requests.HTTPError):
+            client.get_ticker_events("BLD")
 
 
 # ── fractional split-ratio fields (2026-07-02 incident class) ────────────────

@@ -127,9 +127,26 @@
             "Comment": "GROOM_DISPATCH_ENABLED=false is an intentional kill-switch skip; config#1979's concurrent-same-tier skip is also a clean no-launch — both route to a clean Succeed rather than polling a box that was never launched.",
             "Choices": [
               {
-                "Variable": "$.groomLaunch.Payload.groom.launched",
-                "BooleanEquals": true,
+                "And": [
+                  {
+                    "Variable": "$.groomLaunch.Payload.groom.launched",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.groomLaunch.Payload.groom.launched",
+                    "BooleanEquals": true
+                  }
+                ],
+                "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
                 "Next": "PollGroomCommand"
+              },
+              {
+                "Not": {
+                  "Variable": "$.groomLaunch.Payload.groom.launched",
+                  "IsPresent": true
+                },
+                "Comment": "config-I2767: a launch payload WITHOUT groom.launched means the launch is unverifiable (partial/malformed dispatcher result) — escalate via GroomRetriesExhausted's notifier rather than silently taking the Default GroomSkipped, which is reserved for an INTENTIONAL kill-switch/concurrency no-op.",
+                "Next": "GroomRetriesExhausted"
               }
             ],
             "Default": "GroomSkipped"

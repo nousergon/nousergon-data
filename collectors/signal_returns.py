@@ -49,7 +49,8 @@ def collect(
 
     Steps:
       1. Seed score_performance from S3 signals (entry prices from universe_returns)
-      2. Backfill score_performance returns from universe_returns JOIN
+      2. Primary outcome write: long-format score_performance_outcomes (fail-loud);
+         wide-column bookkeeping echo writes only price_{h}d (outcome columns retired)
       3. Seed predictor_outcomes from S3 predictions
       4. Backfill predictor_outcomes returns from universe_returns JOIN
 
@@ -79,16 +80,23 @@ def collect(
         s3, bucket, db_path, signals_prefix, dry_run,
     )
 
-    # Step 2: Backfill score_performance returns via universe_returns JOIN
-    results["backfill_score_returns"] = _backfill_score_returns(db_path, dry_run)
-
-    # Step 2c: Phase-2 dual-write of the long-format score_performance_outcomes
-    # table (EPIC config#1483). Emits one row per (signal, score_date, horizon)
-    # for the canonical HorizonPolicy horizons, sourced from universe_returns
-    # decimals + validated against the nousergon_lib outcome_record contract.
-    # ADDITIVE + SECONDARY during the >=1-week dual-write soak — the wide
-    # score_performance columns (Step 2) stay primary until the Phase-4 cutover.
+    # Step 2 — PRIMARY outcome write (EPIC config#1483 Phase 4, config#1550):
+    # the long-format score_performance_outcomes table is now the canonical
+    # outcome store — one row per (signal, score_date, HorizonPolicy horizon),
+    # sourced from universe_returns decimals + validated against the
+    # nousergon_lib outcome_record contract. Every consumer reads THIS
+    # (analysis.outcome_store & peers; burn-down allowlists {} fleet-wide), so a
+    # write failure must FAIL the whole collector step — the Phase-2 dual-write
+    # soak that let it degrade to status:partial is retired.
     results["backfill_outcome_records"] = _backfill_outcome_records(db_path, dry_run)
+
+    # Step 2c — wide-column bookkeeping ECHO. The horizon-suffixed OUTCOME
+    # columns (return_/spy_*_return/beat_spy_/log_alpha_21d) are RETIRED: no
+    # longer written now that the long store is primary and consumers are cut
+    # over (config#1550, EPIC config#1483 Phase 4). Only the non-outcome
+    # price_{h}d bookkeeping survives (not part of the outcome contract; kept
+    # until a follow-on decides otherwise).
+    results["backfill_score_returns"] = _backfill_score_returns(db_path, dry_run)
 
     # Step 2b: Drift gate — emit canonical-context coverage as a CW gauge
     # so an alarm fires if the producer ever regresses (e.g. signals.json
@@ -422,9 +430,19 @@ def _backfill_score_context(
 
 
 def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
-    """Backfill 5d/10d/21d/30d returns in score_performance by JOINing
-    universe_returns, plus the canonical 21d log-domain market-relative
-    alpha (log_alpha_21d) — the same target the predictor trains on.
+    """Backfill the wide ``price_{h}d`` exit-price bookkeeping columns in
+    score_performance by JOINing universe_returns.
+
+    EPIC config#1483 Phase 4 (config#1550): the horizon-suffixed OUTCOME columns
+    (``return_{h}d`` / ``spy_{h}d_return`` / ``beat_spy_{h}d`` / ``log_alpha_21d``)
+    are RETIRED — the canonical outcome store is the long-format
+    ``score_performance_outcomes`` table (Step 2, ``_backfill_outcome_records``),
+    which every consumer now reads. This function keeps only the non-outcome
+    ``price_{h}d`` write (an exit-price convenience, not part of the outcome
+    contract), and the beat_spy-repair + log_alpha-backfill blocks retire WITH
+    the wide writes (the long-store insert already derives beat_spy and carries
+    log_alpha). Physical columns are NOT dropped (SQLite; dead columns are
+    harmless — legacy rows keep their historical values).
     """
     try:
         conn = sqlite3.connect(db_path)
@@ -432,11 +450,10 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
 
         updated = 0
         for horizon in ("5d", "10d", "21d", "30d"):
-            bdays = {"5d": 5, "10d": 10, "21d": 21, "30d": 30}[horizon]
-
-            # Find score_performance rows missing this horizon's return
+            # Pending = rows whose price_{h}d exit bookkeeping isn't computed yet.
+            # (Re-keyed off price_{h}d rather than the now-retired return_{h}d.)
             pending = pd.read_sql_query(
-                f"SELECT symbol, score_date, price_on_date FROM score_performance WHERE return_{horizon} IS NULL",
+                f"SELECT symbol, score_date, price_on_date FROM score_performance WHERE price_{horizon} IS NULL",
                 conn,
             )
             if pending.empty:
@@ -449,9 +466,10 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
                 if entry_price is None:
                     continue
 
-                # Look up forward return from universe_returns
+                # Look up forward return from universe_returns purely to derive
+                # the exit price — the return itself is NOT persisted anymore.
                 ur = conn.execute(
-                    f"SELECT return_{horizon}, spy_return_{horizon}, beat_spy_{horizon} FROM universe_returns WHERE ticker = ? AND eval_date = ?",
+                    f"SELECT return_{horizon} FROM universe_returns WHERE ticker = ? AND eval_date = ?",
                     (ticker, score_date),
                 ).fetchone()
 
@@ -459,83 +477,21 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
                     continue
 
                 stock_return = ur[0]  # already as decimal (e.g., 0.05)
-                spy_return = ur[1]
-                beat_spy = ur[2]
                 exit_price = round(entry_price * (1 + stock_return), 2)
 
                 if not dry_run:
                     conn.execute(
-                        f"UPDATE score_performance SET price_{horizon}=?, return_{horizon}=?, spy_{horizon}_return=?, beat_spy_{horizon}=? WHERE symbol=? AND score_date=? AND return_{horizon} IS NULL",
-                        (
-                            exit_price,
-                            round(stock_return * 100, 2),  # stored as percentage
-                            round(spy_return * 100, 2) if spy_return is not None else None,
-                            beat_spy,
-                            ticker, score_date,
-                        ),
+                        f"UPDATE score_performance SET price_{horizon}=? WHERE symbol=? AND score_date=? AND price_{horizon} IS NULL",
+                        (exit_price, ticker, score_date),
                     )
                 updated += 1
-
-        # Backfill canonical 21d log-domain market-relative alpha
-        # (log_alpha_21d) — the same target the predictor trains on
-        # (actual_log_alpha). Separate block from the arithmetic loop
-        # because it sources the LOG columns, not the arithmetic ones:
-        #   log_alpha = log_return_21d - log_spy_return_21d
-        # Mirrors _backfill_predictor_returns (lines ~629-631) so the
-        # judge outcome-IC correlates against an identically-defined
-        # alpha. No clipping / sector-neutralization — raw log diff, per
-        # the canonical-alpha framework (cutover 2026-05-09).
-        ur_cols = {
-            r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()
-        }
-        if {"log_return_21d", "log_spy_return_21d"} <= ur_cols:
-            pending_alpha = pd.read_sql_query(
-                "SELECT symbol, score_date FROM score_performance WHERE log_alpha_21d IS NULL",
-                conn,
-            )
-            for _, row in pending_alpha.iterrows():
-                ticker = row["symbol"]
-                score_date = row["score_date"]
-                ur = conn.execute(
-                    "SELECT log_return_21d, log_spy_return_21d "
-                    "FROM universe_returns WHERE ticker = ? AND eval_date = ?",
-                    (ticker, score_date),
-                ).fetchone()
-                if ur is None or ur[0] is None:
-                    continue
-                log_alpha = ur[0] - (ur[1] if ur[1] is not None else 0.0)
-                if not dry_run:
-                    conn.execute(
-                        "UPDATE score_performance SET log_alpha_21d=? "
-                        "WHERE symbol=? AND score_date=? AND log_alpha_21d IS NULL",
-                        (round(log_alpha, 6), ticker, score_date),
-                    )
-                updated += 1
-        else:
-            # Carve-out per ~/Development/CLAUDE.md no-silent-fails: (a) failure
-            # mode = legacy universe_returns lacking 21d log columns (pre-#197);
-            # (b) primary deliverable (5/10/21/30d arithmetic returns above)
-            # survives; (c) recording surface = this WARN. Post-#197 DBs always
-            # have these, so a sustained WARN means a migration regressed.
-            logger.warning(
-                "score_performance: universe_returns lacks log_return_21d/"
-                "log_spy_return_21d — skipping canonical log_alpha_21d backfill"
-            )
-
-        # Repair: fix beat_spy columns where return exists but beat_spy is NULL
-        for horizon in ("5d", "10d", "21d", "30d"):
-            repaired = conn.execute(
-                f"UPDATE score_performance SET beat_spy_{horizon} = CASE WHEN return_{horizon} > spy_{horizon}_return THEN 1 ELSE 0 END WHERE return_{horizon} IS NOT NULL AND spy_{horizon}_return IS NOT NULL AND beat_spy_{horizon} IS NULL",
-            ).rowcount
-            if repaired:
-                logger.info("Repaired %d beat_spy_%s values", repaired, horizon)
 
         if not dry_run:
             conn.commit()
         conn.close()
 
         if updated:
-            logger.info("Backfilled %d score_performance returns via universe_returns JOIN", updated)
+            logger.info("Backfilled %d score_performance price_{h}d columns via universe_returns JOIN", updated)
         return {"status": "ok", "rows_written": updated}
 
     except Exception as e:
@@ -732,16 +688,13 @@ def _backfill_outcome_records(
         return {"status": "ok", "rows_written": written}
 
     except Exception as e:
-        # no-silent-fails carve-out (~/Development/CLAUDE.md): (a) failure mode =
-        # the NEW long-format dual-write (schema / contract / JOIN bug); (b) the
-        # primary deliverable — the wide score_performance columns (Step 2,
-        # already committed) — survives, and the live eval system reads THOSE,
-        # not this table, during the soak; (c) recording surface = this ERROR
-        # log + status:error in the returned dict, which bubbles to collect()'s
-        # has_errors → overall status:partial. At the Phase-4 cutover this store
-        # becomes primary and this handler flips to fail-loud (re-raise).
+        # FAIL-LOUD (EPIC config#1483 Phase 4, config#1550). The Phase-2 soak
+        # carve-out that swallowed this into status:partial is retired: the
+        # long-format store is now the PRIMARY outcome write that every consumer
+        # reads, so a schema / contract / JOIN failure here starves the live eval
+        # system and MUST fail the collector step rather than degrade silently.
         logger.error("backfill_outcome_records failed: %s", e)
-        return {"status": "error", "error": str(e), "rows_written": 0}
+        raise
 
 
 # ── Step 3: Seed predictor_outcomes ───────────────────────────────────────────
