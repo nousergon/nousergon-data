@@ -92,6 +92,17 @@ CHECK_RESULTS_KEY = "_freshness_monitor/check_results.json"
 HISTORY_KEY = "_freshness_monitor/history.json"
 CYCLE_VERDICT_KEY = "_freshness_monitor/cycle_verdict.json"
 
+# config#1297 — the general sweep moved from a 15-min cron to daily (Brian's
+# 2026-06-27 directive: the 15-min sweep was unnecessary noise once the
+# saturday_sf/run_calendar staleness models were fixed). These two artifacts
+# stay on a 30-min weekday-market-hours mini-rule (separate EB cron, event={
+# "mode": "intraday"}) so genuinely intraday monitoring isn't blinded by the
+# daily cadence: `open_orders_latest` (market-hours order-book freshness) and
+# `freshness_monitor_heartbeat` (the monitor's OWN dead-man's-switch artifact
+# — its whole purpose is fast detection of a monitor outage, which a daily
+# cadence would defeat).
+INTRADAY_ARTIFACT_IDS = frozenset({"open_orders_latest", "freshness_monitor_heartbeat"})
+
 # config#1240 — auto-remediation dispatch. The confirmed-miss path reads the
 # per-artifact `recovery:` spec from the registry and DISPATCHES the named
 # backfill primitive (SF start_execution / Lambda invoke) instead of (or, per
@@ -1028,41 +1039,76 @@ def _handle_historical(
     }
 
 
-# ── Main handler ────────────────────────────────────────────────────────────
+# ── Intraday-mode probe (config#1297) ───────────────────────────────────────
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """EventBridge cron handler — every 15min walk the registry,
-    emit heartbeat + check_results, alert on misses past SLA.
+def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
+    """30-min weekday-market-hours mini-rule, scoped to
+    :data:`INTRADAY_ARTIFACT_IDS` only.
 
-    ``event["mode"] == "historical"`` dispatches to the daily
-    historical-probe path instead (separate EB cron at ~04:00 UTC).
+    Alerts/dispatches exactly like the daily full sweep (same
+    :func:`_run_probe_pass`) but writes NO check_results/heartbeat/
+    cycle_verdict — those full-registry dashboard surfaces are owned solely
+    by the daily sweep (which itself checks these same two artifacts, just
+    once a day), so a partial pass can never overwrite them with a
+    2-artifact-only view.
     """
-    started_at = time.time()
-    now = datetime.now(timezone.utc)
-    s3 = boto3.client("s3")
-
-    if event and event.get("mode") == "historical":
-        return _handle_historical(
-            s3, now, started_at, event.get("lookback"),
-        )
-
     logger.info(
-        "freshness-monitor invoked at %s (alerts_enabled=%s)",
+        "freshness-monitor invoked in INTRADAY mode at %s (alerts_enabled=%s)",
         now.isoformat(), ALERTS_ENABLED,
     )
 
-    # Load registry. If THIS fails, we want the Lambda to error out
-    # so the CW alarm fires — a broken registry must not be silent.
     specs, recovery_by_id = load_registry_with_recovery(
-        s3, REGISTRY_BUCKET, REGISTRY_KEY
+        s3_client, REGISTRY_BUCKET, REGISTRY_KEY
     )
-    logger.info(
-        "loaded %d specs from registry (%d with recovery specs)",
-        len(specs), len(recovery_by_id),
+    intraday_specs = [s for s in specs if s.artifact_id in INTRADAY_ARTIFACT_IDS]
+    missing_ids = INTRADAY_ARTIFACT_IDS - {s.artifact_id for s in intraday_specs}
+    if missing_ids:
+        logger.warning(
+            "intraday mode: registry is missing expected artifact_id(s) %s",
+            sorted(missing_ids),
+        )
+
+    pairs, alerted, dispatched, per_spec_exceptions = _run_probe_pass(
+        s3_client, intraday_specs, recovery_by_id, now,
     )
 
-    # Walk and probe.
+    duration_seconds = round(time.time() - started_at, 2)
+    logger.info(
+        "freshness-monitor INTRADAY complete: %s checked, %s alerted, %s dispatched, "
+        "%s per-spec exceptions, duration=%.2fs",
+        len(pairs), alerted, dispatched, per_spec_exceptions, duration_seconds,
+    )
+
+    return {
+        "mode": "intraday",
+        "n_entries_checked": len(pairs),
+        "alerts_enabled": ALERTS_ENABLED,
+        "alerted": alerted,
+        "dispatched": dispatched,
+        "per_spec_exceptions": per_spec_exceptions,
+        "duration_seconds": duration_seconds,
+    }
+
+
+# ── Probe pass (shared by the daily full sweep + the intraday mini-rule) ────
+
+
+def _run_probe_pass(
+    s3_client: Any,
+    specs: list[ArtifactSpec],
+    recovery_by_id: dict[str, dict],
+    now: datetime,
+) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int]:
+    """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
+    alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions)``.
+
+    Shared verbatim by the daily full-registry sweep and the intraday
+    mini-rule (config#1297) — the only difference between the two callers
+    is which `specs` they pass in and what they do with the returned
+    `pairs` (the full sweep serializes them to the shared dashboard
+    surfaces; the intraday mini-rule only alerts, per `handler`'s docstring).
+    """
     pairs: list[tuple[ArtifactSpec, CheckResult]] = []
     alerted = 0
     dispatched = 0
@@ -1071,7 +1117,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
     for spec in specs:
-        result, exc = _check_one(s3, spec, now)
+        result, exc = _check_one(s3_client, spec, now)
         if exc is not None:
             per_spec_exceptions += 1
             logger.warning(
@@ -1088,7 +1134,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         did_dispatch = False
         try:
             did_dispatch = _maybe_dispatch_recovery(
-                s3, aws_clients, spec, recovery, result, now,
+                s3_client, aws_clients, spec, recovery, result, now,
             )
         except Exception as disp_exc:  # noqa: BLE001 — dispatch must not sink the pass
             logger.warning(
@@ -1105,6 +1151,58 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         )
         if not suppress_page and _maybe_alert(spec, result, now):
             alerted += 1
+
+    return pairs, alerted, dispatched, per_spec_exceptions
+
+
+# ── Main handler ────────────────────────────────────────────────────────────
+
+
+def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+    """EventBridge cron handler — daily walk of the full registry, emit
+    heartbeat + check_results, alert on misses past SLA.
+
+    ``event["mode"] == "historical"`` dispatches to the daily
+    historical-probe path instead (separate EB cron at ~04:00 UTC).
+
+    ``event["mode"] == "intraday"`` (config#1297) dispatches to a lighter
+    pass scoped to :data:`INTRADAY_ARTIFACT_IDS` only, on a separate 30-min
+    weekday-market-hours EB cron. It alerts/dispatches exactly like the full
+    sweep but does NOT write check_results/heartbeat/cycle_verdict — those
+    are the full-registry dashboard surfaces and only the daily sweep (which
+    covers every artifact, including these two) owns them, so a partial
+    intraday pass can never clobber them with a 2-artifact-only view.
+    """
+    started_at = time.time()
+    now = datetime.now(timezone.utc)
+    s3 = boto3.client("s3")
+
+    if event and event.get("mode") == "historical":
+        return _handle_historical(
+            s3, now, started_at, event.get("lookback"),
+        )
+
+    if event and event.get("mode") == "intraday":
+        return _handle_intraday(s3, now, started_at)
+
+    logger.info(
+        "freshness-monitor invoked at %s (alerts_enabled=%s)",
+        now.isoformat(), ALERTS_ENABLED,
+    )
+
+    # Load registry. If THIS fails, we want the Lambda to error out
+    # so the CW alarm fires — a broken registry must not be silent.
+    specs, recovery_by_id = load_registry_with_recovery(
+        s3, REGISTRY_BUCKET, REGISTRY_KEY
+    )
+    logger.info(
+        "loaded %d specs from registry (%d with recovery specs)",
+        len(specs), len(recovery_by_id),
+    )
+
+    pairs, alerted, dispatched, per_spec_exceptions = _run_probe_pass(
+        s3, specs, recovery_by_id, now,
+    )
 
     # Emit dashboard surface + self-heartbeat.
     check_results = _serialize_check_results(pairs, now)

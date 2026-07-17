@@ -91,7 +91,7 @@ def test_full_input_contract() -> None:
 def test_full_input_matches_live_cron_target() -> None:
     """The ``full`` builder must reproduce the CFN SaturdayTrigger Input."""
     cfn = _CFN.read_text()
-    block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayTrigger:", 1)[0]
+    block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayPipelineSchedule:", 1)[0]
     # Narrow to the Input: !Sub | heredoc (the surrounding region carries a
     # comment mentioning "shell_run mode" that is not part of the target input).
     after_input = block.split("Input:", 1)[1]

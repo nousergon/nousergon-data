@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Nousergon Overseer playbook registry v1",
+  "description": "Contract for infrastructure/overseer/playbooks.yaml (alpha-engine-config-I2823). Additive-only evolution: new fields must be optional; renames/removals require a schema_version bump.",
+  "type": "object",
+  "required": ["schema_version", "playbooks"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "playbooks": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z0-9-]{1,40}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "description", "tier", "routed", "enabled",
+          "executor_function", "executor_lambda_dir",
+          "concurrency_domain", "supports_drill", "kill_switch_env"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string", "minLength": 10 },
+          "tier": { "enum": ["T0", "T1", "T2", "T3"] },
+          "routed": { "type": "boolean" },
+          "enabled": { "type": "boolean" },
+          "executor_function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
+          "executor_lambda_dir": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+          "benign_reasons": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-z_]+$" },
+            "minItems": 1
+          },
+          "charter": { "type": "string" },
+          "concurrency_domain": { "type": "string" },
+          "supports_drill": { "type": "boolean" },
+          "kill_switch_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" }
+        },
+        "if": { "properties": { "routed": { "const": true } } },
+        "then": { "required": ["benign_reasons"] }
+      }
+    }
+  }
+}

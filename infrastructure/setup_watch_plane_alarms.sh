@@ -62,6 +62,7 @@ declare -A WATCH_PLANE_FUNCTIONS=(
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
   ["ci-watch-dispatcher"]="alpha-engine-ci-watch-dispatcher"
   ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
+  ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
 )
 
 echo "Configuring watch-plane Lambda alarms"
@@ -122,3 +123,30 @@ echo "Validation:"
 echo "  aws cloudwatch describe-alarms --region $REGION \\"
 echo "    --alarm-name-prefix alpha-engine-watch-plane- \\"
 echo "    --query 'MetricAlarms[].[AlarmName,StateValue]' --output table"
+
+# --- 3. Overseer intake DLQ depth (alpha-engine-config-I2823) ----------------
+# A message landing on the intake DLQ means EventBridge delivered an alert
+# event 5x and the queue rejected it every time — structured alert events are
+# being LOST. Same backstop-topic routing rationale as the Lambda alarms.
+
+echo ""
+echo "==> Creating overseer intake DLQ depth alarm..."
+run aws cloudwatch put-metric-alarm \
+  --region "$REGION" \
+  --alarm-name "alpha-engine-watch-plane-overseer-intake-dlq-depth" \
+  --alarm-description "Watch-plane backstop: any message on nousergon-overseer-intake-dlq means structured alert events (Overseer phase 1, alpha-engine-config-I2822) are being dropped after redrive exhaustion. Routes to the INDEPENDENT ${BACKSTOP_TOPIC_NAME} topic. Provisioned by infrastructure/setup_watch_plane_alarms.sh." \
+  --namespace "AWS/SQS" \
+  --metric-name "ApproximateNumberOfMessagesVisible" \
+  --dimensions "Name=QueueName,Value=nousergon-overseer-intake-dlq" \
+  --statistic "Maximum" \
+  --period 300 \
+  --evaluation-periods 1 \
+  --datapoints-to-alarm 1 \
+  --threshold 1 \
+  --comparison-operator "GreaterThanOrEqualToThreshold" \
+  --treat-missing-data "notBreaching" \
+  --alarm-actions "$BACKSTOP_TOPIC_ARN" \
+  --ok-actions "$BACKSTOP_TOPIC_ARN"
+
+echo ""
+echo "Done."
