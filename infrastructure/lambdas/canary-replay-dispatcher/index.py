@@ -45,9 +45,21 @@ idempotency: a retried Thursday dispatch in the same ISO week, or a
 re-pushed commit on the same PR/sha, overwrites the same key rather than
 littering orphan markers.
 
+STALE-MARKER GUARD (config-I2753, 2026-07-17): the same "overwrites the
+same key" property above has a sharp edge — "overwrites" is only true once
+the NEW box finishes and writes its own marker, which is minutes after
+this Lambda returns. In between, a poller's first check can still find the
+OLD marker from a prior attempt against the same token. `_launch_canary_
+replay_spot()` therefore synchronously deletes any pre-existing marker at
+`marker_key` (`_clear_stale_marker()`) before launching, so a poller can
+never observe a leftover verdict from a previous dispatch; the launched
+verdict also carries `dispatched_at` for a caller that wants an extra,
+independent freshness check on top.
+
 SYNCHRONOUS CONTRACT (mirrors ci-watch-dispatcher): every anticipated
 failure mode — concurrency skip, spot+on-demand launch exhaustion, a
-malformed event, a post-launch SSM failure — returns a clean, well-formed
+malformed event, a stale-marker clear failure, a post-launch SSM
+failure — returns a clean, well-formed
 `{"launched": false, "reason": ...}` rather than raising, so the per-PR
 GHA job's synchronous `aws lambda invoke` gets an unambiguous JSON verdict
 to branch on. Only a genuinely unexpected internal bug propagates as an
@@ -120,6 +132,7 @@ VOLUME_SIZE_GB = int(os.environ.get("CANARY_REPLAY_VOLUME_SIZE_GB", "40"))
 
 CANARY_REPLAY_TAG_NAME = "alpha-engine-canary-replay-spot"
 CANARY_REPLAY_RUN_TOKEN_TAG_KEY = "canary-replay-run-token"
+MARKER_BUCKET = os.environ.get("CANARY_REPLAY_MARKER_BUCKET", "alpha-engine-research")
 
 TAG_WRITE_ATTEMPTS = int(os.environ.get("CANARY_REPLAY_TAG_WRITE_ATTEMPTS", "3"))
 TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("CANARY_REPLAY_TAG_WRITE_RETRY_DELAY_SEC", "2"))
@@ -287,6 +300,43 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="canary-replay")
 
 
+def _clear_stale_marker(run_token: str) -> None:
+    """Delete any pre-existing completion marker at this run_token's S3 key
+    BEFORE launching a new box (config-I2753 fix).
+
+    run_token is deterministic per (repo, PR, sha) / per ISO-week (module
+    docstring's "DETERMINISTIC run_token" section) — a re-dispatch against
+    an unchanged commit/week (e.g. a retriggered PR whose head sha hasn't
+    moved, or a manual retry within the same ISO week) reuses the EXACT
+    SAME marker_key a prior attempt used. Without clearing it first, the
+    per-PR GHA poller's very first `head-object` check can find a STALE
+    marker left over from a PRIOR (possibly hours/days-old, possibly
+    since-fixed-cause) failed attempt and report THAT as this dispatch's
+    verdict — while the box just launched hasn't even finished booting.
+    Root-caused live 2026-07-17 on crucible-research#444: the GHA "Poll for
+    completion marker" step found and reported a marker with
+    finished_at ~23h in the past (from the 2026-07-16 Neon-quota-outage
+    era) within 2 seconds of dispatch, while the freshly-launched box went
+    on to genuinely PASS ~5.5 minutes later — too late, the job had already
+    failed the check.
+
+    S3 delete-then-read is strongly read-after-write consistent (no
+    eventual-consistency window since Dec 2020), so once this call
+    returns, any marker a poller subsequently finds at this key is
+    guaranteed to have been written by THIS dispatch, not a leftover. A
+    missing key is not an error (idempotent no-op — DeleteObject on an
+    absent key is a normal 204, boto3 does not raise). Any OTHER S3
+    failure propagates (fail-loud): a silently-kept stale marker produces
+    a WRONG verdict, which is worse than a failed dispatch that produces no
+    verdict at all — the caller converts this to a clean launched:false
+    rather than proceeding into launching a box whose result nobody can
+    trust to be freshly reported.
+    """
+    boto3.client("s3", region_name=REGION).delete_object(
+        Bucket=MARKER_BUCKET, Key=f"tmp/canary/{run_token}.json"
+    )
+
+
 def _create_discriminator_tag(instance_id: str, run_token: str) -> str | None:
     """Write the load-bearing run_token discriminator tag with a bounded
     retry. Returns None on success, or the final error string after
@@ -342,6 +392,19 @@ def _launch_canary_replay_spot(mode: str, research_ref: str, data_ref: str,
                 "existing_instance_ids": existing, "run_token": run_token}
 
     try:
+        _clear_stale_marker(run_token)
+    except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false
+        logger.error(
+            "canary-replay marker-clear FAILED for token=%s — aborting dispatch "
+            "rather than risk a poller reading a stale marker: %s: %s",
+            run_token, type(exc).__name__, exc,
+        )
+        return {"launched": False, "reason": "marker_clear_failed",
+                "error": f"{type(exc).__name__}: {exc}", "run_token": run_token,
+                "dedupe_degraded": dedupe_degraded}
+
+    dispatched_at = time.time()
+    try:
         instance_id, market = _launch_instance()
     except SpotLaunchError as exc:
         logger.error("canary-replay spot launch failed: %s: %s", type(exc).__name__, exc)
@@ -391,6 +454,12 @@ def _launch_canary_replay_spot(mode: str, research_ref: str, data_ref: str,
         "data_ref": data_ref,
         "run_token": run_token,
         "marker_key": f"tmp/canary/{run_token}.json",
+        # config-I2753 defense-in-depth: the primary fix is
+        # _clear_stale_marker() above, but a caller that independently
+        # wants to double-check freshness (belt-and-suspenders against any
+        # future variant of the same staleness class) can reject any
+        # marker whose finished_at predates this dispatch.
+        "dispatched_at": dispatched_at,
         "dedupe_degraded": dedupe_degraded,
     }
     if dedupe_degraded:
