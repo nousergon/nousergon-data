@@ -5,4 +5,4 @@ boto3>=1.34.0
 # already unique per ISO week — no hand-rolled fingerprint/clear state needed).
 # Root-pin lockstep (tests/test_lib_pin_lockstep.py) — no exemption needed,
 # this Lambda uses no spot_dispatch feature requiring a newer tag.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.116.0
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
