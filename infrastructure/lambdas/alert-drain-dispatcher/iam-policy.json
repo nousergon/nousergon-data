@@ -9,7 +9,7 @@
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-canary-replay-dispatcher:*"
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-alert-drain-dispatcher:*"
     },
     {
       "Sid": "RunInstancesInstanceScopedByTagAndType",
@@ -18,7 +18,7 @@
       "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestTag/Name": "alpha-engine-canary-replay-spot",
+          "aws:RequestTag/Name": "alpha-engine-alert-drain-spot",
           "ec2:InstanceType": [
             "t3.medium",
             "t3a.medium",
@@ -62,13 +62,13 @@
       }
     },
     {
-      "Sid": "CreateDiscriminatorTagOnOwnBoxesOnly",
+      "Sid": "CreateDiscriminatorTagsOnOwnBoxesOnly",
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
       "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
       "Condition": {
         "StringEquals": {
-          "ec2:ResourceTag/Name": "alpha-engine-canary-replay-spot"
+          "ec2:ResourceTag/Name": "alpha-engine-alert-drain-spot"
         }
       }
     },
@@ -82,10 +82,10 @@
       "Resource": "*"
     },
     {
-      "Sid": "PassCanaryReplayExecutorRoleToEc2",
+      "Sid": "PassAlertDrainExecutorRoleToEc2",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-canary-replay-executor-role",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-alert-drain-executor-role",
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": "ec2.amazonaws.com"
@@ -93,7 +93,7 @@
       }
     },
     {
-      "Sid": "SsmRunCanaryReplayBootstrap",
+      "Sid": "SsmRunAlertDrainBootstrap",
       "Effect": "Allow",
       "Action": [
         "ssm:SendCommand",
@@ -102,7 +102,7 @@
       "Resource": "*"
     },
     {
-      "Sid": "TerminateCanaryReplaySpotOnError",
+      "Sid": "TerminateAlertDrainSpotOnError",
       "Effect": "Allow",
       "Action": [
         "ec2:TerminateInstances"
@@ -110,15 +110,9 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "ec2:ResourceTag/Name": "alpha-engine-canary-replay-spot"
+          "ec2:ResourceTag/Name": "alpha-engine-alert-drain-spot"
         }
       }
-    },
-    {
-      "Sid": "ClearStaleCompletionMarkerBeforeDispatch",
-      "Effect": "Allow",
-      "Action": "s3:DeleteObject",
-      "Resource": "arn:aws:s3:::alpha-engine-research/tmp/canary/*"
     }
   ]
 }

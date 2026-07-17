@@ -1394,3 +1394,78 @@ def test_budget_escalation_telegram_failure_is_non_fatal(monkeypatch):
     assert result["budget_escalated"] is False
     assert result["agent_dispatch"]["reason"] == "attempt_budget_exhausted"
     s3.put_object.assert_called_once()  # primary deliverable survived
+
+
+# ── M2 overseer dispatch mode (alpha-engine-config-I2823) ────────────────────
+
+
+def _make_clients_with_lambda(**kwargs):
+    """Like _make_clients but also returns a lambda client mock."""
+    factory, sf, s3 = _make_clients(**kwargs)
+    lam = MagicMock()
+    lam.invoke.return_value = {"StatusCode": 202}
+
+    def factory_with_lambda(name, region_name=None):
+        if name == "lambda":
+            return lam
+        return factory(name, region_name=region_name)
+
+    return factory_with_lambda, sf, s3, lam
+
+
+def test_m2_overseer_mode_invokes_router_not_github(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
+    factory, sf, s3, lam = _make_clients_with_lambda()
+    with patch("index.boto3.client", side_effect=factory), patch(
+        "index.urllib.request.urlopen",
+        side_effect=AssertionError("GitHub must NOT be called in overseer mode"),
+    ):
+        result = index.handler(_event("FAILED"), None)
+
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["agent_dispatch"]["target"] == "overseer"
+    lam.invoke.assert_called_once()
+    call = lam.invoke.call_args.kwargs
+    assert call["FunctionName"] == index.OVERSEER_FUNCTION
+    assert call["InvocationType"] == "Event"
+    sent = json.loads(call["Payload"])
+    assert sent["playbook"] == "sf-watch"
+    payload = sent["payload"]
+    assert payload["pipeline_name"] == "ne-weekly-freshness-pipeline"
+    assert payload["cadence_slug"] == "saturday"
+    assert payload["watch_log_key"] == "consolidated/saturday_sf_watch/2023-11-14.json"
+    assert payload["run_date"] == "2023-11-14"
+
+
+def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
+    factory, sf, s3, lam = _make_clients_with_lambda()
+    lam.invoke.side_effect = RuntimeError("router down")
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)
+
+    # Watch-log (primary) landed; dispatch failure recorded, not raised.
+    s3.put_object.assert_called_once()
+    assert result["agent_dispatch"]["dispatched"] is False
+    assert "router down" in result["agent_dispatch"]["error"]
+
+
+def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    assert index.M2_DISPATCH_TARGET == "repository_dispatch"
+    factory, sf, s3, lam = _make_clients_with_lambda()
+    monkeypatch.setattr(index, "_get_github_pat", MagicMock(return_value="pat"))
+    resp_cm = MagicMock()
+    resp_cm.__enter__ = MagicMock(return_value=MagicMock(status=204))
+    resp_cm.__exit__ = MagicMock(return_value=False)
+    with patch("index.boto3.client", side_effect=factory), patch(
+        "index.urllib.request.urlopen", return_value=resp_cm
+    ) as urlopen:
+        result = index.handler(_event("FAILED"), None)
+
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["agent_dispatch"].get("target") != "overseer"
+    urlopen.assert_called_once()
+    lam.invoke.assert_not_called()
