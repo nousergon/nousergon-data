@@ -1,0 +1,55 @@
+name: IAM Drift Check (Lambda exec roles)
+
+# Catches drift between infrastructure/lambdas/<name>/iam-policy.json and the
+# live Lambda exec role's inline policy (alpha-engine-config#2825). deploy.sh
+# only applies iam-policy.json on --bootstrap (operator-only, never run by the
+# auto-deploy-on-merge CI workflow — see infrastructure/iam/README.md
+# "Single-writer rule"), so a merged policy edit previously had NO live
+# effect and NO signal until someone happened to run a manual full sweep.
+#
+# This is READ-ONLY (same OIDC role infrastructure/iam/check-drift.py already
+# uses) — it does not apply anything. Reconcile findings with
+# infrastructure/lambdas/reapply_iam_policy.sh <lambda-name> after ruling the
+# direction (codified vs live) per-role, same as the 2026-07-17 reconciliation
+# in alpha-engine-config#2825.
+#
+# Triggers:
+#   - Every PR touching a lambda's iam-policy.json or deploy.sh (catches a
+#     codified change that forgot to bootstrap, or vice versa, before merge)
+#   - Daily at 09:45 UTC (catches out-of-band manual IAM edits)
+#   - Manual via workflow_dispatch
+#
+# AWS auth: OIDC -> github-actions-iam-drift-check role (defined in
+# alpha-engine; trust policy already permits nousergon-data). Not every
+# lambda role is in that role's read grant yet — check_iam_drift.py reports
+# those as SKIPPED rather than failing the job.
+
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/lambdas/*/iam-policy.json'
+      - 'infrastructure/lambdas/*/deploy.sh'
+      - 'infrastructure/lambdas/check_iam_drift.py'
+      - '.github/workflows/iam-drift-check-lambdas.yml'
+  schedule:
+    - cron: '45 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
+
+      - name: Run Lambda exec-role IAM drift check (codified vs live AWS)
+        run: python3 infrastructure/lambdas/check_iam_drift.py
