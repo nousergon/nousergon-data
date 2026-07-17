@@ -22,6 +22,7 @@ import io
 import json
 import os
 import sys
+import types
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -31,6 +32,108 @@ import pytest
 # Make the Lambda handler importable.
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# ── Hermetic guard (config#2208) ────────────────────────────────────────────
+# 2026-07-11 incident: this suite's per-test `monkeypatch.setattr(index,
+# "notify_via_flow_doctor", ...)` convention had one gap —
+# test_handler_per_spec_exception_does_not_sink_pass enables
+# FRESHNESS_MONITOR_ENABLED=true but never re-stubbed the notifier after its
+# `importlib.reload(index)`, so the REAL flow_doctor_telegram.notify_via_
+# flow_doctor ran whenever this file was exercised with live AWS/Telegram
+# credentials ambient (laptop, EC2 box) — paging the live ops-health
+# Telegram channel with fixture data (probe_bad_template / probe_missing).
+#
+# Fix, mirroring scheduled-groom-dispatcher's `_install_stubs` fleet
+# pattern: replace `flow_doctor_telegram` in sys.modules with a safe no-op
+# BEFORE any test's `import index` (or `importlib.reload(index)`) runs. Since
+# index.py re-executes `from flow_doctor_telegram import
+# notify_via_flow_doctor` on every reload, every reload re-binds to this
+# no-op — a test can no longer reach the real notifier just by forgetting a
+# monkeypatch. Individual tests still layer their own tracked Mock on top via
+# `monkeypatch.setattr(index, "notify_via_flow_doctor", ...)` to assert on
+# call args (dedup_key, severity, ...); that is a deliberate override for
+# assertions, not a gap this stub needs to anticipate.
+#
+# `_real_flow_doctor_telegram` keeps a handle on the REAL module (captured
+# before it's replaced below) so the deterministic owner_repo backstop added
+# alongside this fix can be tested directly, in isolation from this file's
+# stub.
+import flow_doctor_telegram as _real_flow_doctor_telegram  # noqa: E402
+
+_fdt_stub = types.ModuleType("flow_doctor_telegram")
+_fdt_stub.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+sys.modules["flow_doctor_telegram"] = _fdt_stub
+
+
+# ── Hermetic guard regression coverage (config#2208) ────────────────────────
+
+
+def test_notify_via_flow_doctor_is_hermetically_stubbed_by_default():
+    """Regression guard for the 2026-07-11 incident: even a fresh
+    ``importlib.reload(index)`` — with no per-test monkeypatch applied at
+    all — must bind ``index.notify_via_flow_doctor`` to this file's no-op
+    stub, never to the real ``flow_doctor_telegram.notify_via_flow_doctor``
+    (which reaches live Telegram). This is what makes every test in this
+    file safe by construction, not by every author remembering to stub."""
+    import importlib
+    import index
+
+    importlib.reload(index)
+    assert index.notify_via_flow_doctor is _fdt_stub.notify_via_flow_doctor
+    assert index.notify_via_flow_doctor is not _real_flow_doctor_telegram.notify_via_flow_doctor
+
+
+def test_real_notify_via_flow_doctor_refuses_test_namespace_owner_repo(monkeypatch):
+    """Deterministic belt (config#2208 optional backstop): the REAL
+    ``notify_via_flow_doctor`` — exercised directly here via the reference
+    saved before this file's module stub replaced ``sys.modules
+    ["flow_doctor_telegram"]`` — refuses to dispatch when ``context
+    ["owner_repo"]`` is a test-fixture namespace, before it ever reaches
+    flow-doctor init or the ``send_message`` fallback. Covers both fixture
+    owner_repo values seen in the 2026-07-11 incident."""
+    get_fd_mock = mock.Mock(side_effect=AssertionError("must not init flow-doctor"))
+    send_message_mock = mock.Mock(side_effect=AssertionError("must not fall back to send_message"))
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", get_fd_mock)
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", send_message_mock)
+
+    for owner_repo in ("ae-test", "alpha-engine-test"):
+        result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+            "artifact_id=probe_bad_template owner_repo=%s state=probe_failed" % owner_repo,
+            silent=False,
+            severity="critical",
+            dedup_key="freshness_probe_bad_template_2026-W28",
+            flow_name="freshness-monitor",
+            topics=(),
+            db_basename="flow_doctor_freshness_monitor",
+            context={"artifact_id": "probe_bad_template", "owner_repo": owner_repo},
+        )
+        assert result is False
+
+    get_fd_mock.assert_not_called()
+    send_message_mock.assert_not_called()
+
+
+def test_real_notify_via_flow_doctor_does_not_refuse_real_owner_repo(monkeypatch):
+    """The backstop is scoped to the known test namespaces — a real
+    owner_repo must still reach flow-doctor init, not be silently
+    swallowed."""
+    get_fd_mock = mock.Mock(return_value=None)
+    send_message_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", get_fd_mock)
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", send_message_mock)
+
+    result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+        "artifact_id=pit_parity owner_repo=alpha-engine-data state=missing",
+        silent=False,
+        severity="critical",
+        dedup_key="freshness_pit_parity_2026-W28",
+        flow_name="freshness-monitor",
+        topics=(),
+        db_basename="flow_doctor_freshness_monitor",
+        context={"artifact_id": "pit_parity", "owner_repo": "alpha-engine-data"},
+    )
+    assert result is True
+    get_fd_mock.assert_called_once()
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -756,6 +859,152 @@ def test_handler_dispatches_to_historical_on_mode_flag(monkeypatch, fixed_now):
     assert result["mode"] == "historical"
     index._handle_historical.assert_called_once()
     index.load_registry.assert_not_called()  # current-state path NOT taken
+
+
+# ── Intraday-mode probe (config#1297) ───────────────────────────────────────
+
+
+def test_handler_dispatches_to_intraday_on_mode_flag(monkeypatch, fixed_now):
+    """event={'mode': 'intraday'} routes to _handle_intraday without
+    touching the current-state (daily full-sweep) path."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(
+        index, "_handle_intraday",
+        mock.Mock(return_value={"mode": "intraday", "n_entries_checked": 0,
+                                 "alerts_enabled": False, "alerted": 0,
+                                 "dispatched": 0, "per_spec_exceptions": 0,
+                                 "duration_seconds": 0.0}),
+    )
+    monkeypatch.setattr(index, "load_registry_with_recovery", mock.Mock())  # would fail otherwise
+    monkeypatch.setattr(
+        index, "datetime", mock.Mock(
+            now=mock.Mock(return_value=fixed_now),
+        ),
+    )
+    result = index.handler({"mode": "intraday"}, None)
+    assert result["mode"] == "intraday"
+    index._handle_intraday.assert_called_once()
+    index.load_registry_with_recovery.assert_not_called()  # daily full-sweep path NOT taken
+
+
+@pytest.fixture
+def intraday_registry_body() -> bytes:
+    """A registry with the two intraday artifacts plus one unrelated
+    daily artifact — the intraday pass must check only the former two."""
+    return b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  severity: warning
+artifacts:
+  - artifact_id: open_orders_latest
+    s3_key_template: "trades/open_orders/latest.json"
+    cadence: continuous
+    interval_minutes: 30
+    sla_minutes_after_cron: 15
+    severity: warning
+    owner_repo: alpha-engine
+    created_at: "2025-01-01"
+    run_calendar: market_hours
+    active_hours_utc: [14, 21]
+  - artifact_id: freshness_monitor_heartbeat
+    s3_key_template: "_freshness_monitor/heartbeat.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 15
+    severity: critical
+    owner_repo: alpha-engine-data
+    created_at: "2025-01-01"
+    run_calendar: all_days
+  - artifact_id: probe_missing
+    s3_key_template: "path/{date}/missing.json"
+    cadence: saturday_sf
+    sla_minutes_after_cron: 60
+    severity: critical
+    owner_repo: alpha-engine-test
+    created_at: "2025-01-01"
+"""
+
+
+def test_handle_intraday_scopes_to_intraday_artifact_ids_only(
+    monkeypatch, intraday_registry_body, fake_s3, fixed_now
+):
+    """The intraday pass must check exactly INTRADAY_ARTIFACT_IDS, never the
+    rest of the registry (probe_missing here) — that's the daily sweep's job."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = intraday_registry_body
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({"mode": "intraday"}, None)
+
+    assert result["mode"] == "intraday"
+    assert result["n_entries_checked"] == 2  # open_orders_latest + heartbeat only
+
+
+def test_handle_intraday_does_not_write_shared_dashboard_surfaces(
+    monkeypatch, intraday_registry_body, fake_s3, fixed_now
+):
+    """The intraday pass alerts but must NOT write check_results/heartbeat/
+    cycle_verdict — those full-registry surfaces are owned solely by the
+    daily sweep; a partial write would clobber them with a 2-artifact view."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = intraday_registry_body
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    index.handler({"mode": "intraday"}, None)
+
+    put_keys = [k for (_, k, _) in fake_s3._put_calls]
+    assert index.CHECK_RESULTS_KEY not in put_keys
+    assert index.HEARTBEAT_KEY not in put_keys
+    assert index.CYCLE_VERDICT_KEY not in put_keys
+
+
+def test_handle_intraday_warns_on_missing_expected_artifact_id(
+    monkeypatch, fake_s3, fixed_now
+):
+    """A registry missing one of the two hardcoded intraday ids logs a
+    warning rather than silently checking zero/one artifact."""
+    fake_s3._registry_body = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+artifacts:
+  - artifact_id: open_orders_latest
+    s3_key_template: "trades/open_orders/latest.json"
+    cadence: continuous
+    interval_minutes: 30
+    sla_minutes_after_cron: 15
+    severity: warning
+    owner_repo: alpha-engine
+    created_at: "2025-01-01"
+    run_calendar: market_hours
+    active_hours_utc: [14, 21]
+"""
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+
+    result = index.handler({"mode": "intraday"}, None)
+
+    assert result["n_entries_checked"] == 1  # only open_orders_latest present
 
 
 # ── Trading-day-axis historical-probe tests ─────────────────────────────────

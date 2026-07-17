@@ -11,8 +11,13 @@ WorkingDirectory=/home/ec2-user/alpha-engine-data
 ExecStart=/home/ec2-user/alpha-engine-data/scripts/run_daily_news_standalone.sh
 StandardOutput=journal
 StandardError=journal
-# ~20-30 min pull (Polygon 5 req/min over the ~96-ticker holdings∪signals
-# universe); 40 min cap gives headroom.
+# ~20-30 min pull (Polygon 5 req/min over the ~106-ticker holdings∪signals
+# universe, up from ~96 as of 2026-06-15 — universe grows over time, keep
+# this comment approximate not exact). 40 min cap gives headroom. GDELT's
+# OWN contribution is separately hard-capped at 20 min inside the adapter
+# (GdeltNewsAdapter's max_fetch_seconds, config#2813) regardless of how
+# badly it's throttling that day, so this outer timeout is now a backstop,
+# not the primary defense against a slow/throttled run.
 TimeoutStartSec=2400
 # Shared-box memory guard. Measured peak RSS ~0.17 GB; cap generously.
 MemoryAccounting=yes

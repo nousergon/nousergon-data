@@ -41,7 +41,7 @@ def states() -> dict:
 class TestCronSchedule:
     def test_saturday_trigger_fires_thu_through_sat(self):
         cfn = _CFN.read_text()
-        block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayTrigger:", 1)[0]
+        block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayPipelineSchedule:", 1)[0]
         assert "cron(0 9 ? * THU-SAT *)" in block, (
             "weekly cron must fire THU-SAT so the run-day gate can "
             "self-select holiday-shortened weeks (config#1824)"
@@ -88,11 +88,25 @@ class TestGateRouting:
 class TestGateOutcomes:
     def test_non_run_day_is_green_succeed_skip(self, states):
         choice = states["WeeklyRunDayGateChoice"]
-        (rule,) = choice["Choices"]
-        assert rule["Variable"] == "$.weekly_run_day_gate.Payload.is_weekly_run_day"
-        assert rule["BooleanEquals"] is False
-        assert rule["Next"] == "WeeklyRunDaySkip"
+        skip_rule, malformed_rule = choice["Choices"]
+        # config#2275: IsPresent-guarded dereference (And short-circuit).
+        guard, comparison = skip_rule["And"]
+        assert guard == {
+            "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+            "IsPresent": True,
+        }
+        assert comparison["Variable"] == "$.weekly_run_day_gate.Payload.is_weekly_run_day"
+        assert comparison["BooleanEquals"] is False
+        assert skip_rule["Next"] == "WeeklyRunDaySkip"
         assert states["WeeklyRunDaySkip"]["Type"] == "Succeed"
+        # config#2275: a gate payload WITHOUT the field routes through the
+        # malformed-payload floor Pass into the fail-open+alert notifier.
+        assert malformed_rule["Not"] == {
+            "Variable": "$.weekly_run_day_gate.Payload.is_weekly_run_day",
+            "IsPresent": True,
+        }
+        assert malformed_rule["Next"] == "WeeklyRunDayGateMalformed"
+        assert states["WeeklyRunDayGateMalformed"]["Next"] == "WeeklyRunDayGateFailed"
 
     def test_run_day_proceeds_to_normal_head(self, states):
         assert states["WeeklyRunDayGateChoice"]["Default"] == "CheckRunMode"

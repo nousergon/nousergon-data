@@ -15,15 +15,26 @@ This restructures the sequential
   ... -> Research -> DataPhase2 -> eval-judge chain -> ... ->
       Counterfactual -> PredictorTraining -> DriftDetection -> ...
 into an SF Parallel:
-  Branch A = CheckSkipResearch -> Research -> DataPhase2 -> eval-judge
-             chain -> EvalRollingMean -> RationaleClustering ->
-             ReplayConcordance -> Counterfactual
+  Branch A (as of the 2026-05-16 origin) = CheckSkipResearch -> Research ->
+             DataPhase2 -> eval-judge chain -> EvalRollingMean ->
+             RationaleClustering -> ReplayConcordance -> Counterfactual
   Branch B = CheckSkipPredictorTraining -> PredictorTraining quartet
   join    -> AggregateBranchOutcomes -> CheckBranchOutcomes ->
              CheckSkipBacktester (config#902: the standalone DriftDetection
              state was collapsed — drift is now bundled onto the
              PredictorTraining spot inside Branch B — so the join routes
              straight to the backtester skip-gate)
+
+UPDATE (alpha-engine-config-I2515 Phase B): the multi-agent Research graph
+runner (CheckSkipResearch/Research/CheckResearchStatus) was REMOVED from
+Branch A. Current Branch A head: Scanner -> CheckSkipRegimeSubstrate ->
+RegimeSubstrate -> SignalsEnvelope (new load-bearing signals.json
+producer) -> ChallengerShadow (new, non-blocking) -> CheckSkipRAGIngestion
+-> RAG chain -> ThinkTankCoverage (moved here, post-RAG) ->
+CheckSkipRegimeRetrospectiveEval -> RegimeRetrospectiveEval ->
+CheckSkipDataPhase2 -> DataPhase2 -> eval-judge chain -> ... ->
+Counterfactual. The Parallel/Branch-B/join structure and the
+sibling-branch decoupling invariant this file pins are unchanged.
 
 CORRECTNESS-CRITICAL: SF Parallel's default semantics cancel sibling
 branches when one branch errors. With strict-Research hard-failing and
@@ -60,20 +71,32 @@ _BRANCH_A_STATES = {
     # RegimeRetrospectiveEval chain was relocated FROM top level INTO
     # Branch A's head (Scanner is Branch A's StartAt) so PredictorTraining
     # (Branch B) forks parallel to it directly after DataPhase1.
-    "Scanner", "CheckSkipRAGIngestion", "RAGIngestion",
+    #
+    # alpha-engine-config-I2515 Phase B: the multi-agent Research graph
+    # runner (CheckSkipResearch/Research/CheckResearchStatus) was REMOVED.
+    # RegimeSubstrate now runs BEFORE the RAG chain (moved ahead of RAG/
+    # ThinkTank), followed by the new SignalsEnvelope (thin envelope
+    # producer replacing Research as the signals.json producer) and
+    # ChallengerShadow (keeps the no_agent champion-baseline shadow alive).
+    # ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh
+    # corpus. ExtractResearchError was renamed ExtractSignalsEnvelopeError.
+    #
+    # alpha-engine-config-I2544: the eval-judge chain (CheckSkipEvalJudge
+    # through AggregateCosts) PLUS ReportCard/Director were LIFTED out of
+    # Branch A into the async ne-weekly-advisory-pipeline child SF
+    # (step_function_advisory.json — see test_sf_advisory_pipeline_wiring.py
+    # for their coverage there). DataPhase2 now routes straight into
+    # StartAdvisoryPipeline (fire-and-forget dispatch), which converges on
+    # BranchAComplete like every other Branch A terminal edge.
+    "Scanner", "CheckSkipRegimeSubstrate", "RegimeSubstrate",
+    "SignalsEnvelope", "ChallengerShadow",
+    "ThinkTankCoverage", "CheckSkipRAGIngestion", "RAGIngestion",
     "WaitForRAGIngestion", "CheckRAGIngestionStatus", "RAGIngestionWait",
     "RAGIngestionRetryGate", "RAGIngestionReissue", "ExtractRAGIngestionError",
-    "CheckSkipRegimeSubstrate", "RegimeSubstrate",
     "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
-    "CheckSkipResearch", "Research", "CheckResearchStatus",
-    "CheckSkipDataPhase2", "DataPhase2", "CheckSkipEvalJudge",
-    "ComputeEvalCadence", "CheckMonthlyCadence",
-    "EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly",
-    "EvalJudgePollChoice", "EvalJudgePollWait", "EvalJudgePoll",
-    "EvalJudgePollDecision", "EvalJudgeProcess", "EvalRollingMean",
-    "CheckSkipRationaleClustering", "RationaleClustering",
-    "CheckSkipReplayConcordance", "ReplayConcordance",
-    "CheckSkipCounterfactual", "Counterfactual", "ExtractResearchError",
+    "CheckSkipDataPhase2", "DataPhase2",
+    "StartAdvisoryPipeline", "PublishAdvisoryDispatchFailureAlert",
+    "ExtractSignalsEnvelopeError",
     "PublishResearchFailureImmediate",
     "BranchAComplete", "BranchAFailed",
 }
@@ -81,13 +104,18 @@ _BRANCH_B_STATES = {
     "CheckSkipPredictorTraining", "PredictorTraining",
     "WaitForPredictorTraining", "CheckPredictorStatus", "PredictorWait",
     "ExtractPredictorError", "PublishPredictorFailureImmediate",
-    # config#1083 parallel model-zoo fan-out: ResolveZooSpecs -> Map -> Select.
-    "ResolveZooSpecs", "WaitResolveZoo", "CheckResolveZooStatus",
-    "ResolveZooWait", "ExtractModelZooResolveError", "ParseZooSpecs",
-    "ModelZooTrainMap", "ModelZooSelect",
-    "WaitForModelZoo", "CheckModelZooStatus", "ModelZooWait",
-    "ExtractModelZooSelectError", "PublishModelZooFailureImmediate",
+    # config#2253 validated skip path: skip_predictor_training=true routes
+    # through a manifest-freshness HeadObject before the branch may read
+    # as succeeded (backtest-eval preset bypasses validation by design).
+    "ValidatePredictorSkipWeightsFresh", "CheckPredictorSkipWeightsFresh",
+    "PredictorSkipWeightsStale", "PredictorTrainingSkipped",
     "BranchBComplete", "BranchBFailed",
+    # alpha-engine-config-I2545: the config#1083 model-zoo fan-out
+    # (ResolveZooSpecs -> Map -> Select) was LIFTED out of Branch B into
+    # its own Sunday-triggered ne-modelzoo-sunday-pipeline child SF
+    # (step_function_modelzoo.json — see test_sf_modelzoo_pipeline_wiring.py
+    # for their coverage there). CheckPredictorStatus's Success edge now
+    # routes straight to BranchBComplete.
 }
 
 
@@ -159,13 +187,16 @@ class TestParallelStatePresence:
         assert len(parallel["Branches"]) == 2
 
     def test_branch_a_starts_at_scanner(self, parallel):
-        # config#885: Branch A now leads with the relocated Scanner chain
-        # (Scanner → RAG → RegimeSubstrate → RegimeRetrospectiveEval →
-        # CheckSkipResearch → ...). CheckSkipResearch is no longer the
-        # StartAt — it is the chain's continuation inside Branch A.
+        # config#885: Branch A now leads with the relocated Scanner chain.
+        # alpha-engine-config-I2515 Phase B: the chain is now Scanner →
+        # RegimeSubstrate → SignalsEnvelope → ChallengerShadow → RAG →
+        # ThinkTankCoverage → RegimeRetrospectiveEval → DataPhase2 → ...
+        # (the multi-agent Research state and CheckSkipResearch were
+        # removed; SignalsEnvelope is the chain's continuation inside
+        # Branch A).
         assert parallel["Branches"][0]["StartAt"] == "Scanner"
         branch_a = parallel["Branches"][0]["States"]
-        assert "CheckSkipResearch" in branch_a
+        assert "SignalsEnvelope" in branch_a
 
     def test_branch_b_starts_at_check_skip_predictor_training(self, parallel):
         assert (
@@ -192,33 +223,39 @@ class TestParallelStatePresence:
 
 
 class TestResearchAndPredictorAreSiblingBranches:
-    """The core decoupling: Research and PredictorTraining must be in
-    SIBLING Parallel branches, never serialized."""
+    """The core decoupling: the research module's Branch A work and
+    PredictorTraining must be in SIBLING Parallel branches, never
+    serialized. alpha-engine-config-I2515 Phase B removed the multi-agent
+    Research state entirely; SignalsEnvelope is its load-bearing successor
+    and stands in as the proof-point here."""
 
-    def test_research_in_branch_a(self, branch_a):
-        assert "Research" in branch_a
+    def test_signals_envelope_in_branch_a(self, branch_a):
+        assert "SignalsEnvelope" in branch_a
 
     def test_predictor_training_in_branch_b(self, branch_b):
         assert "PredictorTraining" in branch_b
 
-    def test_research_not_in_branch_b(self, branch_b):
-        assert "Research" not in branch_b
+    def test_signals_envelope_not_in_branch_b(self, branch_b):
+        assert "SignalsEnvelope" not in branch_b
 
     def test_predictor_training_not_in_branch_a(self, branch_a):
         assert "PredictorTraining" not in branch_a
 
     def test_no_research_to_predictor_serial_edge_anywhere(self, sf):
-        """Defensive: no state's Next/Default/Catch may point Research →
-        PredictorTraining or chain them sequentially. The old serial edge
-        was CheckSkipCounterfactual/Counterfactual → CheckSkipPredictor
-        Training; that must now be a branch-local terminal."""
+        """Defensive: no state's Next/Default/Catch may point Branch A work →
+        PredictorTraining or chain them sequentially — Branch A must never
+        route into Branch B's StartAt. alpha-engine-config-I2544: the old
+        serial-edge suspects (CheckSkipCounterfactual/Counterfactual) moved
+        to the async advisory child SF along with the rest of the eval-judge
+        chain, so this now checks EVERY remaining Branch A state generically
+        rather than naming specific lifted states."""
         a = sf["States"]["ResearchPredictorParallel"]["Branches"][0][
             "States"
         ]
-        for n in ("Counterfactual", "CheckSkipCounterfactual"):
-            assert "CheckSkipPredictorTraining" not in _own_targets(a[n]), (
-                f"{n} still routes to CheckSkipPredictorTraining — Research "
-                f"and PredictorTraining are re-serialized."
+        for n, st in a.items():
+            assert "CheckSkipPredictorTraining" not in _own_targets(st), (
+                f"{n} routes to CheckSkipPredictorTraining — Branch A and "
+                f"PredictorTraining (Branch B) are re-serialized."
             )
 
 
@@ -233,34 +270,53 @@ class TestBranchAContents:
     def test_branch_a_state_present(self, branch_a, name):
         assert name in branch_a
 
-    def test_data_phase2_after_research_in_branch_a(self, branch_a):
-        # Research success → CheckSkipDataPhase2 → DataPhase2
-        ok = [
-            c["Next"]
-            for c in branch_a["CheckResearchStatus"]["Choices"]
-            if c.get("StringEquals") == "OK"
-        ]
-        assert ok == ["CheckSkipDataPhase2"]
+    def test_data_phase2_after_regime_retrospective_eval_in_branch_a(self, branch_a):
+        # alpha-engine-config-I2515 Phase B: the removed multi-agent
+        # Research state (and CheckResearchStatus) used to sit between the
+        # regime chain and DataPhase2. RegimeRetrospectiveEval's success
+        # path now goes straight to CheckSkipDataPhase2 → DataPhase2.
+        assert branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
 
-    def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
-        assert branch_a["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
-        assert branch_a["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
-
-    def test_skip_research_still_routes_into_branch(self, branch_a):
-        """skip_research must still bypass to DataPhase2's skip-gate
-        (preserved skip-gate semantics) — and stay INSIDE Branch A."""
-        c = branch_a["CheckSkipResearch"]["Choices"][0]
-        assert c["Next"] == "CheckSkipDataPhase2"
-        assert c["Next"] in branch_a
-
-    def test_eval_judge_quartet_preserved(self, branch_a):
-        assert branch_a["EvalJudgePollChoice"]["Type"] == "Choice"
-        assert branch_a["EvalJudgePollWait"]["Type"] == "Wait"
-        assert branch_a["EvalJudgePollWait"]["Next"] == "EvalJudgePoll"
-        assert (
-            branch_a["EvalJudgePoll"]["Next"] == "EvalJudgePollDecision"
+    def test_advisory_dispatch_after_dataphase2_in_branch_a(self, branch_a):
+        """alpha-engine-config-I2544: DataPhase2's successor is now
+        StartAdvisoryPipeline (fire-and-forget dispatch of the eval-judge
+        chain + ReportCard/Director into the async child SF), not the
+        eval-judge chain's own CheckSkipEvalJudge skip-gate — that gate now
+        lives in step_function_advisory.json (see
+        test_sf_advisory_pipeline_wiring.py)."""
+        assert branch_a["DataPhase2"]["Next"] == "StartAdvisoryPipeline"
+        assert branch_a["CheckSkipDataPhase2"]["Choices"][0]["Next"] == (
+            "StartAdvisoryPipeline"
         )
+        assert branch_a["StartAdvisoryPipeline"]["Next"] == "BranchAComplete"
+
+    def test_start_advisory_pipeline_dispatch_shape(self, branch_a):
+        """alpha-engine-config-I2544: fire-and-forget (states:startExecution,
+        NOT .sync) dispatch, named advisory-{run_date} for idempotency —
+        a same-run_date retry hits ExecutionAlreadyExists, treated as
+        pass-through success (not a genuine failure)."""
+        d = branch_a["StartAdvisoryPipeline"]
+        assert d["Type"] == "Task"
+        assert d["Resource"] == "arn:aws:states:::states:startExecution"
+        assert d["Parameters"]["StateMachineArn"] == (
+            "arn:aws:states:us-east-1:711398986525:stateMachine:"
+            "ne-weekly-advisory-pipeline"
+        )
+        assert d["Parameters"]["Name.$"] == "States.Format('advisory-{}', $.run_date)"
+        already_exists = next(
+            c for c in d["Catch"]
+            if c["ErrorEquals"] == ["StepFunctions.ExecutionAlreadyExistsException"]
+        )
+        assert already_exists["Next"] == "BranchAComplete"
+        catch_all = next(
+            c for c in d["Catch"] if c["ErrorEquals"] == ["States.ALL"]
+        )
+        assert catch_all["Next"] == "PublishAdvisoryDispatchFailureAlert"
+        alert = branch_a["PublishAdvisoryDispatchFailureAlert"]
+        assert alert["Resource"] == "arn:aws:states:::sns:publish"
+        assert alert["Next"] == "BranchAComplete"
+        assert all(c["Next"] == "BranchAComplete" for c in alert["Catch"])
 
 
 class TestBranchBContents:
@@ -274,13 +330,156 @@ class TestBranchBContents:
         assert name in branch_b
 
     def test_skip_predictor_training_gate_preserved(self, branch_b):
-        c = branch_b["CheckSkipPredictorTraining"]["Choices"][0]
-        variables = {cond["Variable"] for cond in c["And"]}
-        assert variables == {"$.skip_predictor_training"}
-        # skip → branch-local completion (NOT the old CheckSkipDrift edge)
-        assert c["Next"] == "BranchBComplete"
-        assert branch_b["CheckSkipPredictorTraining"]["Default"] == (
-            "PredictorTraining"
+        """config#2253: the skip gate is now a TWO-rule Choice. Rule order
+        is load-bearing (ASL evaluates in order, first match wins):
+        rule 0 = backtest-eval preset (skip AND mode) → straight to the
+        skip terminal, NO freshness validation (the config#830 replay
+        preset's contract is 'existing artifacts, whatever their vintage');
+        rule 1 = plain skip → the manifest-freshness validation task.
+        Absent flag still defaults to PredictorTraining (scheduled runs
+        unaffected)."""
+        gate = branch_b["CheckSkipPredictorTraining"]
+        assert len(gate["Choices"]) == 2
+        preset_rule, plain_rule = gate["Choices"]
+        # Rule 0: skip + mode=backtest-eval — must come FIRST or the plain
+        # skip rule would shadow it and mid-week replays would hard-fail
+        # on a stale manifest.
+        preset_vars = {cond["Variable"] for cond in preset_rule["And"]}
+        assert preset_vars == {"$.skip_predictor_training", "$.mode"}
+        assert any(
+            cond.get("StringEquals") == "backtest-eval"
+            for cond in preset_rule["And"]
+        )
+        assert preset_rule["Next"] == "PredictorTrainingSkipped"
+        # Rule 1: plain skip → validated-skip path (present-and-true; a
+        # missing flag must never match).
+        plain_vars = {cond["Variable"] for cond in plain_rule["And"]}
+        assert plain_vars == {"$.skip_predictor_training"}
+        assert any(
+            cond.get("IsPresent") is True for cond in plain_rule["And"]
+        )
+        assert any(
+            cond.get("BooleanEquals") is True for cond in plain_rule["And"]
+        )
+        assert plain_rule["Next"] == "ValidatePredictorSkipWeightsFresh"
+        assert gate["Default"] == "PredictorTraining"
+
+    def test_validated_skip_path_wiring(self, branch_b):
+        """config#2253: the plain-skip path must VALIDATE the operator's
+        weights-are-already-live claim against the live weights manifest
+        before the branch may read as succeeded.
+
+        Surface choice is load-bearing: manifest.json is written
+        UNCONDITIONALLY by every non-dry training run (promotion-gate
+        independent), while weights/meta/archive/{date}/ is TRADING-DAY
+        keyed (config#1015 — Friday) and would NEVER match the Saturday
+        calendar $.run_date this validation compares against."""
+        v = branch_b["ValidatePredictorSkipWeightsFresh"]
+        assert v["Type"] == "Task"
+        assert v["Resource"] == "arn:aws:states:::aws-sdk:s3:headObject"
+        assert v["Parameters"]["Bucket"] == "alpha-engine-research"
+        assert v["Parameters"]["Key"] == (
+            "predictor/weights/meta/manifest.json"
+        )
+        # ResultSelector lifts the DATE part of LastModified so the Choice
+        # can do a lexicographic (== chronological for YYYY-MM-DD) compare.
+        sel = v["ResultSelector"]["manifest_last_modified_date.$"]
+        assert "States.StringSplit($.LastModified, 'T')" in sel
+        assert v["ResultPath"] == "$.predictor_skip_validation"
+        # Fail loud: any S3/serialization error is a branch failure, not a
+        # silent fall-through to either skipping OR re-training.
+        assert [c["Next"] for c in v["Catch"]] == ["BranchBFailed"]
+        assert all(c["ResultPath"] == "$.error" for c in v["Catch"])
+        assert v["Next"] == "CheckPredictorSkipWeightsFresh"
+
+    def test_validated_skip_freshness_choice(self, branch_b):
+        """manifest date >= run_date → skip terminal; stale → synthesized
+        $.error → BranchBFailed (never a silent skip onto stale weights,
+        never an implicit re-run of the 1h training spot the operator
+        asked to skip)."""
+        c = branch_b["CheckPredictorSkipWeightsFresh"]
+        assert c["Type"] == "Choice"
+        (fresh,) = c["Choices"]
+        conds = {
+            k: v for cond in fresh["And"] for k, v in cond.items()
+            if k != "Variable"
+        }
+        assert all(
+            cond["Variable"]
+            == "$.predictor_skip_validation.manifest_last_modified_date"
+            for cond in fresh["And"]
+        )
+        # Shape guard: no fleet SF consumed the aws-sdk:s3 LastModified
+        # serialization before — a non-ISO value (HTTP-date/epoch) must
+        # fail LOUD, not silently wrong-pass a lexicographic compare.
+        assert conds["StringMatches"] == "20*-*-*"
+        assert conds["StringGreaterThanEqualsPath"] == "$.run_date"
+        assert fresh["Next"] == "PredictorTrainingSkipped"
+        assert c["Default"] == "PredictorSkipWeightsStale"
+        # The stale Pass synthesizes $.error (a Choice.Default transition
+        # does not populate an error path — the config#2160 States.Runtime
+        # trap) and routes to BranchBFailed.
+        stale = branch_b["PredictorSkipWeightsStale"]
+        assert stale["Type"] == "Pass"
+        assert stale["ResultPath"] == "$.error"
+        assert stale["Parameters"]["Error"] == "PredictorSkipWeightsStale"
+        assert "$.run_date" in stale["Parameters"]["Cause.$"]
+        assert stale["Next"] == "BranchBFailed"
+
+    def test_skip_terminal_reads_as_succeeded_branch(self, branch_b):
+        """THE aggregator seam (config#2253): AggregateBranchOutcomes reads
+        ONLY $.parallel_result[1].branch_b.branch_b_status, so the skip
+        terminal must record the IDENTICAL success contract as
+        BranchBComplete — same ResultPath, same branch_b_status=OK — plus
+        an explicit skipped marker (and nothing fabricated beyond that).
+        End:true preserves the per-branch error-isolation invariant."""
+        skipped = branch_b["PredictorTrainingSkipped"]
+        assert skipped["Type"] == "Pass"
+        assert skipped["End"] is True
+        assert skipped["ResultPath"] == "$.branch_b"
+        assert skipped["Result"]["branch_b_status"] == "OK"
+        assert skipped["Result"]["skipped"] is True
+        # Exactly the success contract + the marker — nothing else.
+        assert set(skipped["Result"]) == {"branch_b_status", "skipped"}
+        # Contract equivalence with the real success terminal.
+        complete = branch_b["BranchBComplete"]
+        assert (
+            skipped["Result"]["branch_b_status"]
+            == complete["Result"]["branch_b_status"]
+        )
+        assert skipped["ResultPath"] == complete["ResultPath"]
+
+    def test_validation_head_object_key_is_iam_granted(self, branch_b):
+        """Cross-guard: the manifest key the SF HeadObjects must be granted
+        to the SF role in infrastructure/iam/alpha-engine-step-functions-
+        role.json (Sid HeadPredictorWeightsManifest) — the aws-sdk:s3 task
+        runs AS the state machine role, and a missing grant only surfaces
+        live as an AccessDenied on the recovery path (the worst time)."""
+        iam_path = (
+            _REPO_ROOT / "infrastructure" / "iam"
+            / "alpha-engine-step-functions-role.json"
+        )
+        policy = json.loads(iam_path.read_text())
+        key = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"]["Key"]
+        bucket = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"][
+            "Bucket"
+        ]
+        expected_arn = f"arn:aws:s3:::{bucket}/{key}"
+        grants = [
+            s for s in policy["Statement"]
+            if s.get("Effect") == "Allow"
+            and "s3:GetObject" in (
+                s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+            )
+            and expected_arn in (
+                s["Resource"]
+                if isinstance(s["Resource"], list) else [s["Resource"]]
+            )
+        ]
+        assert grants, (
+            f"SF role policy lacks s3:GetObject on {expected_arn} — the "
+            f"ValidatePredictorSkipWeightsFresh HeadObject would "
+            f"AccessDenied live."
         )
 
     def test_predictor_status_poll_quartet_preserved(self, branch_b):
@@ -300,139 +499,19 @@ class TestBranchBContents:
             "WaitForPredictorTraining"
         )
 
-    def test_predictor_success_routes_to_resolve_zoo_specs(self, branch_b):
-        # config#1083: champion-retrain success now flows into the parallel
-        # model-zoo fan-out, starting with ResolveZooSpecs (skip path still →
-        # BranchBComplete).
+    def test_predictor_success_routes_to_branch_b_complete(self, branch_b):
+        """alpha-engine-config-I2545: the config#1083 model-zoo fan-out
+        (ResolveZooSpecs -> Map -> Select) was lifted out of Branch B into
+        its own Sunday-triggered child SF (step_function_modelzoo.json —
+        see test_sf_modelzoo_pipeline_wiring.py). Champion-retrain success
+        now routes DIRECTLY to BranchBComplete, same as the skip path."""
         success = [
             c["Next"]
             for c in branch_b["CheckPredictorStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["ResolveZooSpecs"]
-
-    def test_zoo_fanout_pipeline_wiring(self, branch_b):
-        """config#1083: ResolveZooSpecs → (poll) → ParseZooSpecs → ModelZooTrainMap
-        (Map, per-spec spot) → ModelZooSelect → (poll) → BranchBComplete. Every
-        failure path is best-effort (routes via the alert, never BranchBFailed)."""
-        # ResolveZooSpecs dispatches list-rotation-specs on the box.
-        resolve = branch_b["ResolveZooSpecs"]
-        assert resolve["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
-        rcmd = resolve["Parameters"]["Parameters"]["commands.$"]
-        assert "list-rotation-specs" in rcmd
-        assert all(c["Next"] != "BranchBFailed" for c in resolve["Catch"])
-        assert resolve["Next"] == "WaitResolveZoo"
-        # Resolve poll → CheckResolveZooStatus: Success → ParseZooSpecs.
-        check_resolve = branch_b["CheckResolveZooStatus"]
-        rnexts = {c["StringEquals"]: c["Next"] for c in check_resolve["Choices"]}
-        assert rnexts["Success"] == "ParseZooSpecs"
-        # Default routes through ExtractModelZooResolveError (mirrors
-        # ExtractPredictorError/ExtractResearchError/ExtractRAGIngestionError)
-        # — a Choice.Default transition does not populate $.model_zoo_error the
-        # way a Task Catch's ResultPath does, and PublishModelZooFailureImmediate's
-        # Message calls States.JsonToString($.model_zoo_error); a direct
-        # Choice->Task jump on this edge died with States.Runtime, masking the
-        # real zoo-resolve failure (observed live 2026-07-10, config#2160 arc).
-        assert check_resolve["Default"] == "ExtractModelZooResolveError"
-        extract_resolve = branch_b["ExtractModelZooResolveError"]
-        assert extract_resolve["Type"] == "Pass"
-        assert extract_resolve["ResultPath"] == "$.model_zoo_error"
-        assert extract_resolve["Parameters"]["poll.$"] == "$.resolve_zoo_poll"
-        assert extract_resolve["Next"] == "PublishModelZooFailureImmediate"
-        # ParseZooSpecs lifts the JSON array into $.parsed_zoo.zoo_specs.
-        parse = branch_b["ParseZooSpecs"]
-        assert parse["Type"] == "Pass"
-        assert "StringToJson" in parse["Parameters"]["zoo_specs.$"]
-        assert "Catch" not in parse  # a Pass cannot carry a Catch (AWS schema)
-        assert parse["Next"] == "ModelZooTrainMap"
-
-    def test_model_zoo_train_map_per_spec_isolation(self, branch_b):
-        """THE robustness property: the Map fans out one spot PER spec, and each
-        iteration self-terminates as success (recording status as data), so one
-        challenger crashing never aborts its siblings."""
-        m = branch_b["ModelZooTrainMap"]
-        assert m["Type"] == "Map"
-        assert m["ItemsPath"] == "$.parsed_zoo.zoo_specs"
-        assert isinstance(m["MaxConcurrency"], int) and m["MaxConcurrency"] >= 1
-        # Backstop tolerance so a Map-engine error never aborts survivors.
-        assert m["ToleratedFailurePercentage"] == 100
-        # Each item carries the spec id + shared SSM context.
-        assert m["ItemSelector"]["spec_id.$"] == "$$.Map.Item.Value"
-        assert m["ItemSelector"]["ec2_instance_id.$"] == "$.ec2_instance_id"
-        proc = m["ItemProcessor"]["States"]
-        # The dispatch invokes the per-spec spot mode with the item's spec id.
-        dcmd = proc["TrainSpecDispatch"]["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-spec" in dcmd
-        assert "$.spec_id" in dcmd
-        assert "$.preflight_args" in dcmd
-        # PER-ITERATION ISOLATION: both terminals are End:true Pass states
-        # recording status as DATA — the iteration NEVER throws.
-        for term in ("TrainSpecOK", "TrainSpecFailed"):
-            assert proc[term]["Type"] == "Pass"
-            assert proc[term]["End"] is True
-        # A failed/cancelled/timed-out spec routes to TrainSpecFailed (data),
-        # NOT a throw — siblings proceed.
-        cts = proc["CheckTrainSpecStatus"]
-        assert cts["Default"] == "TrainSpecFailed"
-        # The dispatch + poll Catches record failure as data (TrainSpecFailed),
-        # never throwing out of the iteration.
-        assert all(c["Next"] == "TrainSpecFailed" for c in proc["TrainSpecDispatch"]["Catch"])
-        assert all(c["Next"] == "TrainSpecFailed" for c in proc["WaitTrainSpec"]["Catch"])
-        # The Map state's own Catch is a best-effort backstop, never BranchBFailed.
-        assert all(c["Next"] != "BranchBFailed" for c in m["Catch"])
-        assert m["Next"] == "ModelZooSelect"
-
-    def test_model_zoo_select_is_best_effort(self, branch_b):
-        """config#1083: ModelZooSelect runs the selection on ONE spot after the
-        Map joins; every failure path converges to BranchBComplete via the alert,
-        never BranchBFailed (the champion already trained+promoted)."""
-        sel = branch_b["ModelZooSelect"]
-        assert sel["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
-        scmd = sel["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-select" in scmd
-        assert "$.preflight_args" in scmd
-        assert any(
-            c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
-            for c in sel["Catch"]
-        )
-        assert all(c["Next"] != "BranchBFailed" for c in sel["Catch"])
-        assert sel["Next"] == "WaitForModelZoo"
-        # Select poll Catch is best-effort; routes via the alert, never BranchBFailed.
-        wait = branch_b["WaitForModelZoo"]
-        assert all(c["Next"] != "BranchBFailed" for c in wait["Catch"])
-        check = branch_b["CheckModelZooStatus"]
-        # Default routes through ExtractModelZooSelectError — same rationale
-        # as ExtractModelZooResolveError above: CheckModelZooStatus.Default
-        # does not populate $.model_zoo_error, and a direct jump to
-        # PublishModelZooFailureImmediate died with States.Runtime (observed
-        # live 2026-07-10, config#2160 arc).
-        assert check["Default"] == "ExtractModelZooSelectError"
-        extract_select = branch_b["ExtractModelZooSelectError"]
-        assert extract_select["Type"] == "Pass"
-        assert extract_select["ResultPath"] == "$.model_zoo_error"
-        assert extract_select["Parameters"]["poll.$"] == "$.model_zoo_poll"
-        assert extract_select["Next"] == "PublishModelZooFailureImmediate"
-        nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
-        assert nexts["InProgress"] == "ModelZooWait"
-        assert nexts["Pending"] == "ModelZooWait"
-        assert nexts["Success"] == "BranchBComplete"
-        assert branch_b["ModelZooWait"]["Next"] == "WaitForModelZoo"
-        # The alert state is itself best-effort.
-        alert = branch_b["PublishModelZooFailureImmediate"]
-        assert alert["Resource"] == "arn:aws:states:::sns:publish"
-        assert alert["Next"] == "BranchBComplete"
-        assert all(c["Next"] == "BranchBComplete" for c in alert["Catch"])
-        assert "PREDICTOR_DEFER_TRAINING_EMAIL" in alert["Parameters"]["Message.$"]
-
-    def test_model_zoo_map_iterator_no_dangling(self, branch_b):
-        """The Map's iterator namespace is self-consistent (all Next/Default/Catch
-        targets resolve within the iterator's own States)."""
-        proc = branch_b["ModelZooTrainMap"]["ItemProcessor"]
-        names = set(proc["States"])
-        assert proc["StartAt"] in names
-        for n, st in proc["States"].items():
-            for t in _own_targets(st):
-                assert t in names, f"Map iterator dangling: {n} -> {t}"
+        assert success == ["BranchBComplete"]
+        assert "ResolveZooSpecs" not in branch_b
 
     def test_branch_b_ssm_can_resolve_instance_id(self, branch_b):
         """Branch B's SSM calls reference $.ec2_instance_id — which is
@@ -512,19 +591,22 @@ class TestPerBranchErrorIsolation:
                         f"Branch{bi} {n} -> {t} dangles within the branch"
                     )
 
-    def test_research_hardfail_routes_to_branch_a_failed(self, branch_a):
-        """strict-Research hard-fail (Task Catch) + the soft-fail status
-        path (ExtractResearchError → PublishResearchFailureImmediate) must
-        record FAILED, not halt the SF. The PublishResearchFailureImmediate
-        intermediate is the fast-SNS-alert state added 2026-05-24; both
-        success and failure paths through it terminate at BranchAFailed."""
+    def test_signals_envelope_hardfail_routes_to_branch_a_failed(self, branch_a):
+        """alpha-engine-config-I2515 Phase B: SignalsEnvelope replaces the
+        removed multi-agent Research state as Branch A's load-bearing
+        producer. Its hard-fail (Task Catch) routes through
+        ExtractSignalsEnvelopeError (renamed from ExtractResearchError) →
+        PublishResearchFailureImmediate (the fast-SNS-alert state added
+        2026-05-24, shared with RAGIngestion failures) → BranchAFailed —
+        NO non-blocking Catch-to-continue, unlike ThinkTankCoverage/
+        ChallengerShadow."""
         catch_targets = [
-            c["Next"] for c in branch_a["Research"]["Catch"]
+            c["Next"] for c in branch_a["SignalsEnvelope"]["Catch"]
         ]
-        assert catch_targets == ["BranchAFailed"]
+        assert catch_targets == ["ExtractSignalsEnvelopeError"]
         # ExtractError → PublishImmediate → BranchAFailed
         assert (
-            branch_a["ExtractResearchError"]["Next"]
+            branch_a["ExtractSignalsEnvelopeError"]["Next"]
             == "PublishResearchFailureImmediate"
         )
         publish = branch_a["PublishResearchFailureImmediate"]
@@ -534,11 +616,16 @@ class TestPerBranchErrorIsolation:
         # SNS-publish-fails escape hatch also lands at BranchAFailed
         for c in publish.get("Catch", []):
             assert c["Next"] == "BranchAFailed"
-        # CheckResearchStatus non-OK/SKIPPED → ExtractResearchError
-        assert (
-            branch_a["CheckResearchStatus"]["Default"]
-            == "ExtractResearchError"
-        )
+
+    def test_challenger_shadow_is_non_blocking(self, branch_a):
+        """alpha-engine-config-I2515 Phase B: unlike SignalsEnvelope,
+        ChallengerShadow is observe-only (producer leaderboard shadow feed)
+        and must never hard-fail Branch A."""
+        catch_targets = [
+            c["Next"] for c in branch_a["ChallengerShadow"]["Catch"]
+        ]
+        assert catch_targets == ["CheckSkipRAGIngestion"]
+        assert "BranchAFailed" not in catch_targets
 
     def test_dataphase2_failure_routes_to_branch_a_failed(self, branch_a):
         assert [c["Next"] for c in branch_a["DataPhase2"]["Catch"]] == [
@@ -573,24 +660,12 @@ class TestPerBranchErrorIsolation:
             == "ExtractPredictorError"
         )
 
-    def test_eval_chain_fail_soft_catches_preserved(self, branch_a):
-        """The eval/agent-justification observability Catches must stay
-        fail-soft (route forward within the branch), NOT to BranchAFailed
-        — they were never SF-halting and must not become so."""
-        for n in (
-            "EvalJudgeSubmitWeekly",
-            "EvalJudgeProcess",
-            "EvalRollingMean",
-            "RationaleClustering",
-            "ReplayConcordance",
-            "Counterfactual",
-        ):
-            for c in branch_a[n].get("Catch", []):
-                assert c["Next"] != "BranchAFailed", (
-                    f"{n} observability Catch became a hard branch fail — "
-                    f"it must stay fail-soft (forward within Branch A)."
-                )
-                assert c["Next"] != "HandleFailure"
+    # NOTE: the eval-judge / agent-justification fail-soft-Catch coverage
+    # (EvalJudgeSubmitWeekly, EvalJudgeProcess, EvalRollingMean,
+    # RationaleClustering, ReplayConcordance, Counterfactual) moved to
+    # test_sf_advisory_pipeline_wiring.py's
+    # test_eval_chain_fail_soft_catches_preserved_in_advisory_pipeline
+    # (alpha-engine-config-I2544 — these states no longer live in Branch A).
 
 
 class TestPostJoinAggregationAndFailure:
@@ -689,18 +764,22 @@ class TestInboundRewireAndDownstreamUnchanged:
     def test_relocated_chain_threads_through_branch_a(self, branch_a):
         """The relocated Scanner chain's terminal RegimeRetrospectiveEval
         (and its skip-gate + non-blocking Catch) continue to
-        CheckSkipResearch IN-BRANCH — never the parent Parallel (invalid
-        branch→parent) nor top-level HandleFailure (cross-branch cancel)."""
-        assert branch_a["Scanner"]["Next"] == "CheckSkipRAGIngestion"
+        CheckSkipDataPhase2 IN-BRANCH — never the parent Parallel (invalid
+        branch→parent) nor top-level HandleFailure (cross-branch cancel).
+        alpha-engine-config-I2515 Phase B: Scanner's successor is now
+        CheckSkipRegimeSubstrate (RegimeSubstrate moved ahead of RAG/
+        ThinkTank), and the removed multi-agent Research state's
+        CheckSkipResearch successor is replaced by CheckSkipDataPhase2."""
+        assert branch_a["Scanner"]["Next"] == "CheckSkipRegimeSubstrate"
         assert (
-            branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipResearch"
+            branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
         )
         assert [
             c["Next"]
             for c in branch_a["RegimeRetrospectiveEval"]["Catch"]
-        ] == ["CheckSkipResearch"]
+        ] == ["CheckSkipDataPhase2"]
         c = branch_a["CheckSkipRegimeRetrospectiveEval"]
-        assert c["Choices"][0]["Next"] == "CheckSkipResearch"
+        assert c["Choices"][0]["Next"] == "CheckSkipDataPhase2"
         assert c["Default"] == "RegimeRetrospectiveEval"
 
     def test_relocated_chain_gone_from_top_level(self, states):
@@ -718,8 +797,8 @@ class TestInboundRewireAndDownstreamUnchanged:
         """The relocated RAGIngestion error edges that USED to hit the
         top-level HandleFailure must now route to the branch-fail path
         (PublishResearchFailureImmediate → BranchAFailed), mirroring
-        ExtractResearchError — a branch state pointing at the non-branch
-        HandleFailure is an invalid ASL transition AND would re-introduce
+        ExtractSignalsEnvelopeError — a branch state pointing at the
+        non-branch HandleFailure is an invalid ASL transition AND would re-introduce
         cross-branch cancellation."""
         assert [c["Next"] for c in branch_a["RAGIngestion"]["Catch"]] == [
             "PublishResearchFailureImmediate"
@@ -822,10 +901,28 @@ class TestNoDanglingTargetsAnywhere:
                         f"Branch{bi} dangling: {n} -> {t}"
                     )
 
-    def test_exactly_one_end_terminal_class_per_branch(self, parallel):
+    def test_branch_terminal_sets_pinned(self, parallel):
+        """Pin the CLOSED set of End:true terminals per branch, and require
+        every terminal to record its branch status as data (the Parallel
+        error-isolation contract). Branch B gained a third terminal in
+        config#2253: PredictorTrainingSkipped (validated-skip success)."""
+        expected = [
+            ("$.branch_a", {"BranchAComplete", "BranchAFailed"}),
+            (
+                "$.branch_b",
+                {
+                    "BranchBComplete",
+                    "BranchBFailed",
+                    "PredictorTrainingSkipped",
+                },
+            ),
+        ]
         for bi, b in enumerate(parallel["Branches"]):
             ends = {
                 k for k, v in b["States"].items() if v.get("End") is True
             }
-            # Each branch has exactly its 2 Complete/Failed terminals.
-            assert len(ends) == 2, (bi, ends)
+            result_path, names = expected[bi]
+            assert ends == names, (bi, ends)
+            for k in ends:
+                assert b["States"][k]["Type"] == "Pass", (bi, k)
+                assert b["States"][k]["ResultPath"] == result_path, (bi, k)

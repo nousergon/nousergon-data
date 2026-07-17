@@ -15,3 +15,12 @@ systemctl daemon-reload
 systemctl enable --now metron-intraday.timer
 systemctl list-timers metron-intraday.timer --no-pager
 echo "metron-intraday.timer installed and started"
+
+# Installed-vs-repo drift probe (config#2352) — same install call also
+# provisions the daily self-check so a future on-box unit edit (bypassing
+# this script) pages within a day. Idempotent, same pattern as above.
+cp "${UNIT_DIR}/systemd-unit-drift-check.service" /etc/systemd/system/systemd-unit-drift-check.service
+cp "${UNIT_DIR}/systemd-unit-drift-check.timer" /etc/systemd/system/systemd-unit-drift-check.timer
+systemctl daemon-reload
+systemctl enable --now systemd-unit-drift-check.timer
+echo "systemd-unit-drift-check.timer installed and started"

@@ -49,19 +49,38 @@ class TestStatePresence:
 
 
 class TestChainOrdering:
-    """Wiring goes: SaturdayHealthCheck → WaitForSat → Substrate → WaitForSubstrate → Notify."""
+    """Wiring goes: SaturdayHealthCheck → WaitForSat → CheckSatStatus →
+    Substrate → WaitForSubstrate → CheckSubStatus → Notify (config#2276
+    turned each check-once poll into a poll-to-terminal-status loop)."""
 
-    def test_wait_for_saturday_health_check_routes_to_substrate(self, states):
+    def test_wait_for_saturday_health_check_routes_to_status_choice(self, states):
         wait_state = states["WaitForSaturdayHealthCheck"]
-        assert wait_state["Next"] == "WeeklySubstrateHealthCheck", (
-            "WaitForSaturdayHealthCheck must hand off to the substrate check, "
-            "not skip directly to NotifyComplete."
+        assert wait_state["Next"] == "CheckSaturdayHealthCheckStatus", (
+            "WaitForSaturdayHealthCheck must hand off to the terminal-status "
+            "Choice (config#2276 poll loop), not fire-and-forget onward."
         )
 
-    def test_wait_for_saturday_catch_routes_to_substrate(self, states):
+    def test_saturday_status_success_routes_to_substrate(self, states):
+        choice = states["CheckSaturdayHealthCheckStatus"]
+        success = next(
+            r for r in choice["Choices"] if r.get("StringEquals") == "Success"
+        )
+        assert success["Next"] == "WeeklySubstrateHealthCheck", (
+            "A successful freshness check must hand off to the substrate "
+            "check, not skip directly to NotifyComplete."
+        )
+
+    def test_wait_for_saturday_catch_routes_to_degraded_then_substrate(self, states):
         catches = states["WaitForSaturdayHealthCheck"]["Catch"]
-        assert any(c["Next"] == "WeeklySubstrateHealthCheck" for c in catches), (
-            "If freshness polling fails, substrate check must still run — "
+        assert any(c["Next"] == "SaturdayHealthCheckDegraded" for c in catches), (
+            "If freshness polling fails, the degraded flag must be set — "
+            "pre-config#2276 this continued silently."
+        )
+        assert (
+            states["SaturdayHealthCheckDegraded"]["Next"]
+            == "WeeklySubstrateHealthCheck"
+        ), (
+            "A degraded freshness check must still run the substrate check — "
             "they're independent observability paths."
         )
 
@@ -77,45 +96,69 @@ class TestChainOrdering:
         # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
         # input) still ends at NotifyComplete — strict superset preserved.
         #
-        # Two non-fatal advisory states (evaluator Report Card v2, then the
-        # Director) sit between the substrate poll and the notify gate. ReportCard's
-        # SUCCESS edge feeds the Director (which weighs the fresh card); ReportCard's
-        # Catch skips the Director straight to notify (no card to weigh). The
-        # Director's own Next AND Catch both land on CheckShellRunNotify, so every
-        # path still preserves the success edge. On the Friday preflight both states
-        # RUN (dry, via dry_run.$=$.research_dry — ROADMAP L4504), they are not
-        # skipped, so the wiring is identical on real + preflight runs.
+        # alpha-engine-config-I2544 (2026-07-14): ReportCard + Director
+        # (previously sitting between the substrate poll and the notify
+        # gate) were LIFTED into the async ne-weekly-advisory-pipeline
+        # child SF, dispatched earlier via StartAdvisoryPipeline right
+        # after DataPhase2. Their own success/degraded wiring (unchanged,
+        # byte-for-byte preserved) is covered by
+        # test_sf_advisory_pipeline_wiring.py::TestReportCardAndDirectorWiring.
+        # The substrate poll's Success edge now feeds CheckShellRunNotify
+        # DIRECTLY (pinned below in
+        # test_wait_for_substrate_routes_via_status_choice).
+        # config#2278: the real-run success edge now passes through the
+        # gate-degraded completion Choice before NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
+
+    def test_wait_for_substrate_routes_via_status_choice(self, states):
+        # alpha-engine-config-I2544: the substrate poll's Success edge now
+        # feeds CheckShellRunNotify directly (was ReportCard pre-lift).
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckSubstrateHealthCheckStatus"
         )
-        assert states["ReportCard"]["Next"] == "Director"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in states["ReportCard"]["Catch"])
-        assert states["Director"]["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in states["Director"]["Catch"])
-        assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
+        choice = states["CheckSubstrateHealthCheckStatus"]
+        success = next(
+            r for r in choice["Choices"] if r.get("StringEquals") == "Success"
+        )
+        assert success["Next"] == "CheckShellRunNotify"
 
 
 class TestCatchSemantics:
-    """Substrate failures must NOT halt the pipeline.
+    """Substrate failures must NOT halt the pipeline — but must be VISIBLE.
 
     Per-row CloudWatch alarms own paging; the SF Catch only fires on
-    infra-level failures (SSM unreachable, EC2 down). Either way, the
-    failure path must terminate at NotifyComplete, not HandleFailure.
+    infra-level failures (SSM unreachable, EC2 down). config#2276: the
+    failure path sets $.health_check_degraded (SubstrateHealthCheckDegraded
+    Pass) and CONTINUES to the advisory tail — never HandleFailure, and
+    never the plain-SUCCESS NotifyComplete either (that was the silent-skip
+    masking this issue closed). Full degraded-flag threading is pinned in
+    tests/test_sf_health_check_honesty_wiring.py.
     """
 
-    def test_substrate_check_catch_is_non_blocking(self, states):
+    def test_substrate_check_catch_is_non_blocking_but_visible(self, states):
         catches = states["WeeklySubstrateHealthCheck"]["Catch"]
         assert len(catches) >= 1
         for c in catches:
-            assert c["Next"] == "NotifyComplete", (
-                f"Substrate Catch must continue to NotifyComplete, not "
-                f"{c['Next']!r} — the substrate check is observability, not gating."
+            assert c["Next"] == "SubstrateHealthCheckDegraded", (
+                f"Substrate Catch must set the degraded flag, not go to "
+                f"{c['Next']!r} — observability, not gating; visible, not silent."
             )
 
-    def test_substrate_wait_catch_is_non_blocking(self, states):
+    def test_substrate_wait_catch_is_non_blocking_but_visible(self, states):
         catches = states["WaitForWeeklySubstrateHealthCheck"]["Catch"]
         for c in catches:
-            assert c["Next"] == "NotifyComplete"
+            assert c["Next"] == "SubstrateHealthCheckDegraded"
+
+    def test_substrate_degraded_continues_to_notify_gate(self, states):
+        """alpha-engine-config-I2544: ReportCard/Director no longer sit in
+        this SF's tail (see test_sf_advisory_pipeline_wiring.py) — a
+        degraded substrate check now continues straight to the notify
+        gate, same as the healthy path."""
+        degraded = states["SubstrateHealthCheckDegraded"]
+        assert degraded["Type"] == "Pass"
+        assert degraded["Next"] == "CheckShellRunNotify"
 
 
 class TestCommandShape:
@@ -155,6 +198,14 @@ class TestCommandShape:
         # Stale repo on the dispatcher would run an outdated lib pin.
         joined = " ".join(commands)
         assert "git" in joined and "pull" in joined
+
+    def test_no_runtime_pip_install(self, commands):
+        # config#2276: deps are synced at deploy time (crucible-dashboard
+        # infrastructure/deploy-on-merge.sh pip-installs on requirements.txt
+        # diff; nousergon-lib is tag-pinned there) — a live PyPI dependency
+        # mid-pipeline is forbidden.
+        joined = " ".join(commands)
+        assert "pip install" not in joined
 
 
 class TestResultPathIsolation:

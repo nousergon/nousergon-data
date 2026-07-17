@@ -7,9 +7,17 @@ may underperform (Cohen, Malloy & Nguyen 2020).
 Outputs filing_changes.json to S3 for downstream consumption by the research
 scoring pipeline.
 
+Egress contract (config-I2780): centroid aggregation is pushed down to
+Postgres — this module must NEVER select raw ``rag.chunks.embedding`` rows
+in bulk. A full-corpus embedding read is ~150-250MB of Neon data-transfer
+per run and, amplified by per-PR canary replays, exhausted the project's
+monthly quota on 2026-07-16 (hard connect lockout for every RAG consumer).
+Canary/CI invocations must additionally pass ``--sample-tickers N``.
+
 Usage:
     python -m rag.pipelines.filing_change_detection --output-s3
     python -m rag.pipelines.filing_change_detection --output-local /tmp/filing_changes.json
+    python -m rag.pipelines.filing_change_detection --sample-tickers 5 --output-local /tmp/probe.json
 """
 
 from __future__ import annotations
@@ -26,50 +34,159 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _load_filing_embeddings() -> dict[str, list[dict]]:
-    """Load all 10-K and 10-Q filing embeddings grouped by ticker.
+def _embedding_to_f32(embedding) -> np.ndarray:
+    """Coerce a pgvector ``vector`` column value to a float32 ndarray.
 
-    Returns {ticker: [{filed_date, doc_type, embeddings: [np.array], sections: {label: [np.array]}}]}
+    ``nousergon_lib.rag.db.get_connection`` registers pgvector's psycopg2
+    codec, whose contract is that ``vector`` columns come back as numpy
+    arrays. Depending on the pgvector/psycopg2 build that resolves on the
+    weekly data spot, that same codec can instead hand back a
+    ``pgvector.Vector`` object — which has NO numpy interop (no
+    ``__array__``/``__len__``/``__iter__``), so ``np.array(v, dtype=...)``
+    falls through to ``float(v)`` and raises
+    ``TypeError: float() argument must be ... not 'Vector'`` (the
+    2026-07-11 weekly-freshness break at Step 8/9, filing change detection).
+
+    Normalize via pgvector's documented ``Vector.to_numpy()`` before the
+    array cast so the "laziness" signal computes identically regardless of
+    which representation the codec returns. This stays FAIL-LOUD: a raw
+    string here means the codec silently failed to register, and
+    ``np.asarray('[...]', dtype=np.float32)`` still raises rather than
+    silently mis-parsing it.
+    """
+    if hasattr(embedding, "to_numpy"):  # pgvector.Vector — not numpy-coercible
+        embedding = embedding.to_numpy()
+    return np.asarray(embedding, dtype=np.float32)
+
+
+# Server-side centroid aggregation (config-I2780 / config-I2753 / config-I2781).
+#
+# The original query here SELECTed the raw ``c.embedding`` column for EVERY
+# 10-K/10-Q chunk in the corpus on every invocation (~25k chunks × ~5KB of
+# pgvector text wire format ≈ 150-250MB of Neon egress per run), then reduced
+# it all client-side to one centroid per filing (+ one per section) for only
+# the latest two filings per (ticker, doc_type). That single query shape —
+# amplified by the per-PR canary replay re-running it on every push
+# (config#2246) — is what exhausted the Neon project's 5GB/month data-transfer
+# quota on 2026-07-16 and hard-locked every RAG consumer out of the DB.
+#
+# The reduction is associative, so it is pushed down to Postgres: pgvector's
+# ``AVG(vector)`` computes the element-wise mean (identical semantics to the
+# ``np.mean(np.stack(...))`` it replaces), GROUPING SETS emits both the
+# per-filing overall centroid and the per-(filing, section) centroids in one
+# pass, and DENSE_RANK restricts the scan to the filings actually compared.
+# Wire payload drops from the full corpus to ~one vector per (filing ×
+# section) actually analyzed — ≈95%+ egress reduction — with the client-side
+# similarity/flag logic unchanged.
+#
+# ``GROUPING(c.section_label)`` disambiguates the overall row (=1) from a
+# per-section row whose label is genuinely NULL (=0); unlabeled chunks
+# contribute to the overall centroid but not to any section, exactly as the
+# old client-side grouping behaved.
+_CENTROID_SQL = """
+    WITH filings AS (
+        SELECT id, ticker, doc_type, filed_date,
+               DENSE_RANK() OVER (
+                   PARTITION BY ticker, doc_type ORDER BY filed_date DESC
+               ) AS date_rank
+        FROM rag.documents
+        WHERE doc_type IN ('10-K', '10-Q'){ticker_filter}
+    )
+    SELECT f.ticker,
+           f.doc_type,
+           f.filed_date,
+           c.section_label,
+           GROUPING(c.section_label) AS is_overall,
+           AVG(c.embedding)          AS centroid,
+           COUNT(*)                  AS n_chunks
+    FROM filings f
+    JOIN rag.chunks c ON c.document_id = f.id
+    WHERE f.date_rank <= %s AND c.embedding IS NOT NULL
+    GROUP BY GROUPING SETS (
+        (f.ticker, f.doc_type, f.filed_date),
+        (f.ticker, f.doc_type, f.filed_date, c.section_label)
+    )
+    ORDER BY f.ticker, f.doc_type, f.filed_date
+"""
+
+# Canary/CI sampling (config-I2780 fix b): restrict the scan to the first N
+# tickers (deterministic order) so a probe run proves the code path end-to-end
+# for kilobytes of egress instead of replaying full production load.
+_TICKER_SAMPLE_FILTER = """
+          AND ticker IN (
+              SELECT DISTINCT ticker FROM rag.documents
+              WHERE doc_type IN ('10-K', '10-Q')
+              ORDER BY ticker
+              LIMIT %s
+          )"""
+
+
+def _load_filing_centroids(
+    min_filings: int = 2, sample_tickers: int | None = None
+) -> dict[str, list[dict]]:
+    """Load per-filing embedding centroids for the latest filings per ticker.
+
+    Aggregation happens server-side (see ``_CENTROID_SQL``); only centroids
+    cross the wire. Fetches the latest ``max(2, min_filings)`` distinct
+    filing dates per (ticker, doc_type): two is all the consecutive-pair
+    comparison reads, but ``min_filings > 2`` callers still need to OBSERVE
+    that many filings exist to preserve the original threshold semantics.
+
+    DENSE_RANK (not ROW_NUMBER) ranks by distinct ``filed_date``, so a filing
+    ingested from two sources on the same date collapses into one centroid
+    group — matching the old client-side grouping by (ticker, doc_type, date).
+
+    Args:
+        min_filings: Same threshold ``compute_filing_changes`` applies.
+        sample_tickers: When set (canary/CI probes), restrict to the first N
+            tickers so the probe never replays full production load
+            (config-I2780).
+
+    Returns:
+        {ticker: [{ticker, doc_type, filed_date, centroid: np.ndarray,
+                   sections: {label: np.ndarray}, n_chunks: int}, ...]}
+        with each ticker's filings sorted by filed_date ascending.
     """
     from nousergon_lib.rag.db import get_connection
 
-    sql = """
-        SELECT d.ticker, d.doc_type, d.filed_date, c.section_label, c.embedding
-        FROM rag.documents d
-        JOIN rag.chunks c ON c.document_id = d.id
-        WHERE d.doc_type IN ('10-K', '10-Q')
-        ORDER BY d.ticker, d.filed_date, c.chunk_index
-    """
+    params: list = []
+    if sample_tickers is not None:
+        if sample_tickers < 1:
+            raise ValueError(f"sample_tickers must be >= 1; got {sample_tickers}")
+        ticker_filter = _TICKER_SAMPLE_FILTER
+        params.append(sample_tickers)
+    else:
+        ticker_filter = ""
+    sql = _CENTROID_SQL.format(ticker_filter=ticker_filter)
+    params.append(max(2, min_filings))
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(sql, params)
             rows = cur.fetchall()
 
-    # Group by (ticker, doc_type, filed_date)
     grouped: dict[tuple, dict] = {}
-    for ticker, doc_type, filed_date, section_label, embedding in rows:
+    for ticker, doc_type, filed_date, section_label, is_overall, centroid, n_chunks in rows:
         key = (ticker, doc_type, str(filed_date))
         if key not in grouped:
             grouped[key] = {
                 "ticker": ticker,
                 "doc_type": doc_type,
                 "filed_date": str(filed_date),
-                "embeddings": [],
-                "sections": defaultdict(list),
+                "centroid": None,
+                "sections": {},
+                "n_chunks": 0,
             }
-        if embedding is not None:
-            vec = np.array(embedding, dtype=np.float32)
-            grouped[key]["embeddings"].append(vec)
-            if section_label:
-                grouped[key]["sections"][section_label].append(vec)
+        if is_overall:
+            grouped[key]["centroid"] = _embedding_to_f32(centroid)
+            grouped[key]["n_chunks"] = int(n_chunks)
+        elif section_label:
+            grouped[key]["sections"][section_label] = _embedding_to_f32(centroid)
 
-    # Reorganize by ticker
     by_ticker: dict[str, list[dict]] = defaultdict(list)
     for entry in grouped.values():
         by_ticker[entry["ticker"]].append(entry)
 
-    # Sort each ticker's filings by date
     for ticker in by_ticker:
         by_ticker[ticker].sort(key=lambda x: x["filed_date"])
 
@@ -85,14 +202,9 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
-def _centroid(vectors: list[np.ndarray]) -> np.ndarray | None:
-    """Compute the mean (centroid) of a list of vectors."""
-    if not vectors:
-        return None
-    return np.mean(np.stack(vectors), axis=0)
-
-
-def compute_filing_changes(min_filings: int = 2) -> list[dict]:
+def compute_filing_changes(
+    min_filings: int = 2, sample_tickers: int | None = None
+) -> list[dict]:
     """Compute filing change scores for all tickers with consecutive filings.
 
     For each ticker with 2+ same-type filings, computes:
@@ -100,9 +212,16 @@ def compute_filing_changes(min_filings: int = 2) -> list[dict]:
     - section_similarities: per-section centroid cosine similarity
     - change_score: 1 - overall_similarity (0 = identical, 1 = completely different)
 
+    Args:
+        min_filings: Minimum same-type filings a ticker needs to be analyzed.
+        sample_tickers: When set, analyze only the first N tickers — the
+            canary/CI probe knob (config-I2780); production runs leave it None.
+
     Returns list of per-ticker change records.
     """
-    by_ticker = _load_filing_embeddings()
+    by_ticker = _load_filing_centroids(
+        min_filings=min_filings, sample_tickers=sample_tickers
+    )
     results = []
 
     for ticker, filings in by_ticker.items():
@@ -119,20 +238,20 @@ def compute_filing_changes(min_filings: int = 2) -> list[dict]:
             prev = type_filings[-2]
             curr = type_filings[-1]
 
-            prev_centroid = _centroid(prev["embeddings"])
-            curr_centroid = _centroid(curr["embeddings"])
+            prev_centroid = prev["centroid"]
+            curr_centroid = curr["centroid"]
 
             if prev_centroid is None or curr_centroid is None:
                 continue
 
             overall_sim = _cosine_similarity(prev_centroid, curr_centroid)
 
-            # Section-level similarities
+            # Section-level similarities (only sections present in BOTH filings)
             section_sims = {}
             all_sections = set(prev["sections"].keys()) | set(curr["sections"].keys())
             for section in all_sections:
-                prev_sec = _centroid(prev["sections"].get(section, []))
-                curr_sec = _centroid(curr["sections"].get(section, []))
+                prev_sec = prev["sections"].get(section)
+                curr_sec = curr["sections"].get(section)
                 if prev_sec is not None and curr_sec is not None:
                     section_sims[section] = round(_cosine_similarity(prev_sec, curr_sec), 4)
 
@@ -146,8 +265,8 @@ def compute_filing_changes(min_filings: int = 2) -> list[dict]:
                 "overall_similarity": round(overall_sim, 4),
                 "change_score": change_score,
                 "section_similarities": section_sims,
-                "n_prev_chunks": len(prev["embeddings"]),
-                "n_curr_chunks": len(curr["embeddings"]),
+                "n_prev_chunks": prev["n_chunks"],
+                "n_curr_chunks": curr["n_chunks"],
             }
 
             # Flag "lazy" filings: very high similarity = minimal changes
@@ -188,9 +307,33 @@ def main():
     parser.add_argument("--output-s3", action="store_true", help="Write results to S3")
     parser.add_argument("--output-local", type=str, help="Write results to local file")
     parser.add_argument("--bucket", type=str, default="alpha-engine-research")
+    parser.add_argument(
+        "--sample-tickers",
+        type=int,
+        default=None,
+        help=(
+            "Restrict the analysis to the first N tickers (deterministic "
+            "order). Canary/CI probe knob (config-I2780): proves the "
+            "DB-to-S3 code path end-to-end for kilobytes of Neon egress "
+            "instead of replaying full production load. Production runs "
+            "omit it."
+        ),
+    )
+    parser.add_argument(
+        "--key-prefix",
+        type=str,
+        default="",
+        help=(
+            "Prefix the dated S3 key with this (e.g. 'canary/{run_id}/') and "
+            "never touch the real 'latest.json' pointer. Used by the "
+            "Saturday-replay canary (alpha-engine-config#2246) to exercise "
+            "this pipeline against the live pgvector corpus without "
+            "clobbering the production pointer."
+        ),
+    )
     args = parser.parse_args()
 
-    results = compute_filing_changes()
+    results = compute_filing_changes(sample_tickers=args.sample_tickers)
 
     output = {
         "date": date.today().isoformat(),
@@ -208,19 +351,23 @@ def main():
     if args.output_s3:
         import boto3
         s3 = boto3.client("s3")
-        key = f"rag/filing_changes/{date.today().isoformat()}.json"
+        key = f"rag/filing_changes/{args.key_prefix}{date.today().isoformat()}.json"
         s3.put_object(
             Bucket=args.bucket, Key=key,
             Body=json.dumps(output, indent=2).encode(),
             ContentType="application/json",
         )
-        # Also write latest pointer
-        s3.put_object(
-            Bucket=args.bucket, Key="rag/filing_changes/latest.json",
-            Body=json.dumps(output, indent=2).encode(),
-            ContentType="application/json",
-        )
-        logger.info("Written to s3://%s/%s (+ latest)", args.bucket, key)
+        if args.key_prefix:
+            # Canary/staging run — never touch the real pointer consumers read.
+            logger.info("Written to s3://%s/%s (key-prefix set, latest.json untouched)", args.bucket, key)
+        else:
+            # Also write latest pointer
+            s3.put_object(
+                Bucket=args.bucket, Key="rag/filing_changes/latest.json",
+                Body=json.dumps(output, indent=2).encode(),
+                ContentType="application/json",
+            )
+            logger.info("Written to s3://%s/%s (+ latest)", args.bucket, key)
 
     # Print summary
     print(f"\n{'='*60}")
@@ -244,6 +391,16 @@ def main():
                 rf_sim = r["section_similarities"].get("Risk Factors", "N/A")
                 print(f"  {r['ticker']} {r['doc_type']}: RF_sim={rf_sim} "
                       f"({r['prev_date']}→{r['curr_date']})")
+
+    # Grep-able single-line summary for orchestrating shell scripts (the
+    # Saturday-replay canary's spot bootstrap in particular — see
+    # alpha-engine-config#2246).
+    print("RESULT_JSON=" + json.dumps({
+        "status": "PASS",  # canary aggregator contract: literal PASS (config-I2748)
+        "n_analyzed": output["n_analyzed"],
+        "n_lazy": output["n_lazy"],
+        "n_risk_factor_changes": output["n_risk_factor_changes"],
+    }))
 
 
 if __name__ == "__main__":

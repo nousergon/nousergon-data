@@ -1,0 +1,579 @@
+{
+  "events": [
+    {
+      "type": "ExecutionStarted",
+      "executionStartedEventDetails": {
+        "input": "{\"ec2_instance_id\": [\"i-09b539c844515d549\"], \"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"pipeline_role\": \"weekly\"}"
+      },
+      "id": 1,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "InitializeInput",
+        "input": "{}"
+      },
+      "id": 2,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateExited",
+      "stateExitedEventDetails": {
+        "name": "InitializeInput",
+        "output": "{\"ec2_instance_id\": [\"i-09b539c844515d549\"], \"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"pipeline_role\": \"weekly\", \"run_date\": \"2026-07-11\", \"preflight_args\": \"\", \"research_dry\": false, \"data_phase2_dry\": false, \"regime_action\": \"produce\", \"pipeline_label\": \"\", \"skip_weekly_run_day_gate\": false}"
+      },
+      "id": 3,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckWeeklyRunDayGate",
+        "input": "{}"
+      },
+      "id": 4,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WeeklyRunDayGate",
+        "input": "{}"
+      },
+      "id": 5,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "WeeklyRunDayGate",
+        "output": "{}"
+      },
+      "id": 6,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WeeklyRunDayGateChoice",
+        "input": "{}"
+      },
+      "id": 7,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckRunMode",
+        "input": "{}"
+      },
+      "id": 8,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipLibPinDriftCheck",
+        "input": "{}"
+      },
+      "id": 9,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "LibPinDriftCheck",
+        "input": "{}"
+      },
+      "id": 10,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "LibPinDriftCheck",
+        "output": "{}"
+      },
+      "id": 11,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "LibPinDriftGate",
+        "input": "{}"
+      },
+      "id": 12,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PipelineContractCheck",
+        "input": "{}"
+      },
+      "id": 13,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "PipelineContractCheck",
+        "output": "{}"
+      },
+      "id": 14,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PipelineContractGate",
+        "input": "{}"
+      },
+      "id": 15,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckMutexRole",
+        "input": "{}"
+      },
+      "id": 16,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ComputeMutexTtl",
+        "input": "{}"
+      },
+      "id": 17,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateExited",
+      "stateExitedEventDetails": {
+        "name": "ComputeMutexTtl",
+        "output": "{}"
+      },
+      "id": 18,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "AcquireMutex",
+        "input": "{}"
+      },
+      "id": 19,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "AcquireMutex",
+        "output": "{}"
+      },
+      "id": 20,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckShellRun",
+        "input": "{}"
+      },
+      "id": 21,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipMorningEnrich",
+        "input": "{}"
+      },
+      "id": 22,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "MorningEnrich",
+        "input": "{}"
+      },
+      "id": 23,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "MorningEnrich",
+        "output": "{}"
+      },
+      "id": 24,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForMorningEnrich",
+        "input": "{}"
+      },
+      "id": 25,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "WaitForMorningEnrich",
+        "output": "{}"
+      },
+      "id": 26,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckMorningEnrichStatus",
+        "input": "{}"
+      },
+      "id": 27,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipDataPhase1",
+        "input": "{}"
+      },
+      "id": 28,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "DataPhase1",
+        "input": "{}"
+      },
+      "id": 29,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "DataPhase1",
+        "output": "{}"
+      },
+      "id": 30,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForDataPhase1",
+        "input": "{}"
+      },
+      "id": 31,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "WaitForDataPhase1",
+        "output": "{}"
+      },
+      "id": 32,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckDataPhase1Status",
+        "input": "{}"
+      },
+      "id": 33,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ParallelStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ResearchPredictorParallel",
+        "input": "{}"
+      },
+      "id": 34,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "Scanner",
+        "input": "{}"
+      },
+      "id": 35,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "Scanner",
+        "output": "{}"
+      },
+      "id": 36,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipRAGIngestion",
+        "input": "{}"
+      },
+      "id": 37,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "RAGIngestion",
+        "input": "{}"
+      },
+      "id": 38,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "RAGIngestion",
+        "output": "{}"
+      },
+      "id": 39,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForRAGIngestion",
+        "input": "{}"
+      },
+      "id": 40,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "WaitForRAGIngestion",
+        "output": "{}"
+      },
+      "id": 41,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckRAGIngestionStatus",
+        "input": "{}"
+      },
+      "id": 42,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "RAGIngestionRetryGate",
+        "input": "{}"
+      },
+      "id": 43,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ExtractRAGIngestionError",
+        "input": "{}"
+      },
+      "id": 44,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PublishResearchFailureImmediate",
+        "input": "{}"
+      },
+      "id": 45,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "PublishResearchFailureImmediate",
+        "output": "{}"
+      },
+      "id": 46,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "BranchAFailed",
+        "input": "{}"
+      },
+      "id": 47,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipPredictorTraining",
+        "input": "{}"
+      },
+      "id": 48,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PredictorTraining",
+        "input": "{}"
+      },
+      "id": 49,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "PredictorTraining",
+        "output": "{}"
+      },
+      "id": 50,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForPredictorTraining",
+        "input": "{}"
+      },
+      "id": 51,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "WaitForPredictorTraining",
+        "output": "{}"
+      },
+      "id": 52,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckPredictorStatus",
+        "input": "{}"
+      },
+      "id": 53,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "BranchBComplete",
+        "input": "{}"
+      },
+      "id": 54,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "AggregateBranchOutcomes",
+        "input": "{}"
+      },
+      "id": 55,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckBranchOutcomes",
+        "input": "{}"
+      },
+      "id": 56,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ExtractParallelBranchError",
+        "input": "{}"
+      },
+      "id": 57,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "NormalizeFailureContext",
+        "input": "{}"
+      },
+      "id": 58,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "NormalizeFailureContextRepin",
+        "input": "{}"
+      },
+      "id": 59,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "NormalizeFailureContextRealLabel",
+        "input": "{}"
+      },
+      "id": 60,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "HandleFailure",
+        "input": "{}"
+      },
+      "id": 61,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "HandleFailure",
+        "output": "{}"
+      },
+      "id": 62,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "FailStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "FailExecution",
+        "input": "{}"
+      },
+      "id": 63,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ExecutionFailed",
+      "executionFailedEventDetails": {
+        "error": "PipelineFailure",
+        "cause": "..."
+      },
+      "id": 64,
+      "timestamp": "2026-07-11T09:00:00Z"
+    }
+  ]
+}

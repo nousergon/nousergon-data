@@ -23,36 +23,29 @@ fleet chokepoints — no lib change):
 The box reads its OWN run secrets (PAT, etc.) from SSM via its instance profile
 (alpha-engine-executor-profile → alpha-engine-executor-role, which already has
 ssm:GetParameter on /alpha-engine/*) — this Lambda needs none of those. It DOES
-(2026-07-04) read the two Telegram secrets itself, scoped narrowly (see the
-pre-boot pace gate note below), for the one notification only IT can send (a
-pre-boot skip never boots a box, so there's no on-box groom_run.sh to ping).
+(2026-07-04) read the two Telegram secrets itself, scoped narrowly, for the
+notifications only IT can send (a pre-boot skip/failure never boots a box, so
+there is no on-box groom_run.sh to ping).
 
 Fail-loud (a scheduled groom IS the deliverable): a launch/SSM failure RAISES so
 EventBridge retries + the Lambda error metric + a CloudWatch alarm surface the
 miss, rather than silently dropping a pass.
 
-**Pre-boot pace gate (Brian-ratified 2026-07-04).** Before launching the spot
-box at all, this handler compares the reset-aligned weekly WET (interactive +
-groom, same S3 source `alpha-engine-config/scripts/groom_budget.py` reads) to
-how much of the current weekly reset window has already elapsed. If usage is
-running ahead of a straight-line pace through the window (the same
-``krepis.usage_pacing.pace_check`` gate `groom_budget.py` runs on-box), the
-launch is skipped entirely — no spot cost at all, not even the ~2-5 min boot.
-This REPLACES the box-side static 85%/95% floor/taper (config#1348) as the
-short-circuit's first line; `groom_budget.py`'s on-box gate (same pace check,
-different vantage point — sees this run's own live consumption too) remains
-as the second line for the GHA path and as a belt for this one. Fail-safe:
-ANY error reading S3/computing the gate → launch proceeds, never blocked by a
-pace-gate infra hiccup (mirrors `groom_budget.py`'s own fail-safe posture).
-A pace-gate skip returns ``launched: False`` — the dispatch Step Function's
-existing `CheckLaunched` → `GroomSkipped` branch (already used for the
-`GROOM_DISPATCH_ENABLED=false` kill-switch) handles it with no SF changes. A
-skip also sends its own Telegram ping — best-effort via `krepis.telegram
-.send_message` (never raises), scoped IAM to read just the two Telegram SSM
-params (see iam-policy.json). Distinct from the on-box budget gate's own
-Telegram ping (`groom_budget.py` skip, or `groom_driver.py`'s mid-run
-recheck via `groom_run.sh`'s "WOUND DOWN" message) — a pre-boot skip never
-reaches the box, so this Lambda is the ONLY place that can notify for it.
+**Usage pacing DISMANTLED (Brian ruling 2026-07-14).** The pre-boot pace gate
+(Brian-ratified 2026-07-04; compared reset-aligned weekly WET against a
+straight-line pace through the weekly reset window and skipped the launch when
+ahead) is REMOVED, along with its on-box counterparts (`groom_budget.py`
+pre-run gate + `groom_driver.py` mid-run recheck, removed in
+alpha-engine-config the same day) and the `usage-pace-alert` Lambda. The
+gate's false trips and SILENT skips (2026-07-14: both the 01:00 and 07:00 UTC
+triggers pace-skipped with no decision record and a silent Telegram ping)
+cost more groom coverage than the weekly-quota protection was worth. The
+provider-quota guardrail that remains lives on-box: a mid-run usage/quota
+top-out is classified (config#1803) and winds down cleanly with a distinct
+Telegram ping. Every trigger evaluation now writes a decision record — the
+demand-all path always did (`_write_trigger_record`); an enumeration FAILURE
+now writes one too (config-I2540), so a missing record unambiguously means
+the scheduler never invoked this Lambda.
 
 Managed OUTSIDE CloudFormation (same as before): operator-deployed via
 `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until the new code +
@@ -71,7 +64,6 @@ from zoneinfo import ZoneInfo
 
 import boto3
 from flow_doctor_telegram import notify_via_flow_doctor
-from krepis.usage_pacing import pace_check, reset_window
 import urllib.error
 import urllib.request
 
@@ -101,23 +93,6 @@ BACKLOG_REPOS = (
     "nousergon/vires-ops", "nousergon/telos-ops",
 )
 _RESEARCH_BUCKET = "alpha-engine-research"
-
-# ── Pre-boot pace gate (mirrors alpha-engine-config/scripts/groom_budget.py) ───
-# Kill-switch independent of GROOM_DISPATCH_ENABLED — lets ops disable JUST the
-# pace gate (e.g. during a known burst) without touching the dispatch trigger.
-PACE_GATE_ENABLED = os.environ.get("GROOM_PACE_GATE_ENABLED", "true").lower() == "true"
-# Calibrated 2026-07-08 — MUST track alpha-engine-config/scripts/groom_budget.py's
-# WEEKLY_WET_CEILING; re-calibrate both together against /usage every few days.
-WEEKLY_WET_CEILING = int(os.environ.get("GROOM_WEEKLY_WET_CEILING", "850000000"))
-_PT = ZoneInfo("America/Los_Angeles")
-# MUST match groom_budget.py's WEEKLY_RESET_ANCHOR/WEEKLY_PERIOD exactly — both
-# derive the SAME reset-aligned window from one observed reset instant.
-WEEKLY_RESET_ANCHOR = datetime(2026, 7, 12, 21, 0)   # PT, naive — Sunday 9pm PT
-WEEKLY_PERIOD = timedelta(days=7)
-CCUSAGE_BUCKET = os.environ.get("CCUSAGE_BUCKET", "alpha-engine-research")
-CCUSAGE_PREFIX = "claude_code_usage/"
-# Self-expiring operator override — MUST track groom_budget.py::OVERRIDE_UNTIL_PARAM.
-OVERRIDE_UNTIL_PARAM = "/alpha-engine/groom/dynamic_budget_override_until"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
 # t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
@@ -170,97 +145,10 @@ _DEFAULT_MODEL = "claude-sonnet-5"
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
-def _parse_ccusage_key(key: str) -> "str | None":
-    """Date string from either layout: {source}/{date}.json or {source}/{date}/{run}.json.
-
-    Boto3 mirror of alpha-engine-config/scripts/groom_budget.py::_parse_key —
-    duplicated (not imported) because that script is a different repo and this
-    Lambda needs a boto3, not subprocess-`aws`-CLI, S3 client."""
-    p = key[len(CCUSAGE_PREFIX):].split("/")
-    if len(p) == 2 and p[1].endswith(".json"):
-        return p[1][:-5]
-    if len(p) == 3 and p[2].endswith(".json"):
-        return p[1]
-    return None
 
 
-def _read_weekly_wet(window_start: datetime) -> float:
-    """Sum WET (all sources) at/after the PT datetime ``window_start``, hour-precise.
-
-    Boto3 mirror of groom_budget.py::read_weekly_wet (same S3 layout, same
-    hour-boundary trim on the window's start day)."""
-    s3 = boto3.client("s3", region_name=REGION)
-    total = 0.0
-    start_date = window_start.date().isoformat()
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=CCUSAGE_BUCKET, Prefix=CCUSAGE_PREFIX):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            d = _parse_ccusage_key(key)
-            if not d or d < start_date:
-                continue
-            body = s3.get_object(Bucket=CCUSAGE_BUCKET, Key=key)["Body"].read()
-            doc = json.loads(body or b"{}")
-            for hr, models in (doc.get("by_hour") or {}).items():
-                if d == start_date and int(hr) < window_start.hour:
-                    continue
-                total += sum(r.get("wet", 0) for r in models.values())
-    return total
 
 
-def _parse_override_until(raw: str) -> "datetime | None":
-    """PT-naive datetime from the SSM value; None if blank/unparseable."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(_PT).replace(tzinfo=None)
-    return dt
-
-
-def _read_override_until() -> "datetime | None":
-    """Active override expiry from SSM; None when absent/unreadable."""
-    try:
-        ssm = boto3.client("ssm", region_name=REGION)
-        raw = ssm.get_parameter(Name=OVERRIDE_UNTIL_PARAM)["Parameter"]["Value"]
-    except Exception:  # noqa: BLE001 — absent override => normal policy
-        return None
-    return _parse_override_until(raw)
-
-
-def _pace_gate_status() -> dict:
-    """Compute the pre-boot pace-gate decision. Fail-safe: ANY error (S3 read,
-    parse, credentials) returns ``exceeded: False`` with the error recorded —
-    a pace-gate infra hiccup must never block a scheduled groom, mirroring
-    groom_budget.py's own fail-safe posture."""
-    try:
-        now_pt = datetime.now(_PT).replace(tzinfo=None)
-        override_until = _read_override_until()
-        if override_until is not None and now_pt < override_until:
-            return {
-                "exceeded": False,
-                "override_until": override_until.isoformat(),
-                "reason": "operator override active — pace gate suspended",
-            }
-        window_start, _next_reset = reset_window(now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
-        wet = _read_weekly_wet(window_start)
-        used_frac = wet / WEEKLY_WET_CEILING if WEEKLY_WET_CEILING else 0.0
-        status = pace_check(used_frac, now_pt, WEEKLY_RESET_ANCHOR, WEEKLY_PERIOD)
-        return {
-            "exceeded": status.exceeded,
-            "used_frac": round(status.used_frac, 4),
-            "elapsed_frac": round(status.elapsed_frac, 4),
-            "overrun": round(status.overrun, 4),
-            "wet": round(wet, 1),
-        }
-    except Exception as e:  # noqa: BLE001 — fail-safe: never block a scheduled groom
-        logger.warning("pace gate check failed (non-fatal, launching anyway): %s: %s",
-                       type(e).__name__, e)
-        return {"exceeded": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _resolve_run_mode(event: dict) -> str:
@@ -324,7 +212,7 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
 def _resolve_pr_budget(event: dict) -> int | None:
     """Optional per-schedule PR budget override (config#1769).
 
-    Only the Opus high-only schedule sets this today; missing/invalid → None
+    Only the dedicated high-only schedule sets this today; missing/invalid → None
     (groom_spot_bootstrap.sh's GROOM_PR_BUDGET default of 50 applies).
     """
     raw = event.get("pr_budget")
@@ -468,12 +356,25 @@ def _running_tier_instance_ids(tier_tag: str) -> list[str]:
     for a lane is still running when the next trigger re-evaluates the same
     lane. Fail-safe: any API error returns ``[]`` (never blocks a launch on a
     broken check — this guard is an optimization, not a correctness gate,
-    mirroring every other pre-launch gate in this file)."""
-    return spot_dispatch.running_instance_ids(
-        "alpha-engine-groom-spot",
-        {GROOM_TIER_TAG_KEY: tier_tag},
-        region=REGION,
-    )
+    mirroring every other pre-launch gate in this file). config#2267 (lib
+    v0.106.0): ``spot_dispatch.running_instance_ids`` now RAISES
+    ``SpotProbeError`` instead of fail-open-returning ``[]`` itself (closing a
+    different gap for callers that want to KNOW a probe failed); this caller
+    still wants fail-SAFE for launch-blocking purposes, so it catches here and
+    logs loudly instead of silently swallowing."""
+    try:
+        return spot_dispatch.running_instance_ids(
+            "alpha-engine-groom-spot",
+            {GROOM_TIER_TAG_KEY: tier_tag},
+            region=REGION,
+        )
+    except spot_dispatch.SpotProbeError as exc:
+        logger.warning(
+            "concurrency probe failed for tier_tag=%s — failing safe, NOT "
+            "blocking this launch (guard is an optimization, not a "
+            "correctness gate): %s", tier_tag, exc,
+        )
+        return []
 
 
 def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
@@ -599,34 +500,27 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     }
 
 
-def _notify_pace_skip(pace: dict, schedule_label: str, run_mode: str) -> None:
-    """Best-effort loud ping for a pre-boot pace skip — never raises."""
-    text = (
-        "🟡 Backlog groom SKIPPED — soft budget threshold passed before boot "
-        f"(schedule={schedule_label}, run_mode={run_mode}). Weekly usage "
-        f"{pace['used_frac']:.0%} > {pace['elapsed_frac']:.0%} elapsed "
-        f"(overrun {pace['overrun']:+.0%}). Spot box was never launched — no "
-        "cost incurred. Resumes automatically on the next scheduled run "
-        "(or after the weekly reset)."
-    )
-    try:
-        notify_via_flow_doctor(
-            text,
-            silent=True,
-            severity="info",
-            dedup_key=f"{_FLOW_NAME}:pace_skip:{schedule_label}",
-            flow_name=_FLOW_NAME,
-            topics=_GROOM_LIFECYCLE_TOPICS,
-            db_basename=_DB_BASENAME,
-            context={"schedule": schedule_label, "run_mode": run_mode, **pace},
-            silent_topic=FleetTelegramTopic.GROOM,
-        )
-    except Exception as exc:  # noqa: BLE001 — secondary observability
-        logger.warning("pace-gate skip Telegram failed (non-fatal): %s", exc)
-
 
 def _github_token() -> str:
-    """PAT for pre-boot enumeration, read from SSM (same param the box uses)."""
+    """App installation token first (config-I2785), groom PAT fallback.
+
+    The 2026-07-16 GitHub partial outage (config-I2784) 503'd every
+    cipher813 user-token REST call for ~an hour while App installation
+    tokens were unaffected — so the ne-groomer App is the primary identity
+    for pre-boot enumeration and the PAT is the fallback, not the reverse.
+    """
+    try:
+        from nousergon_lib.github_app import GitHubAppTokenError, installation_token
+    except ImportError as exc:  # bundle predates the module — PAT path serves
+        logger.warning("github_app module unavailable (%s) — PAT auth", exc)
+    else:
+        try:
+            return installation_token(region=REGION)
+        except GitHubAppTokenError as exc:
+            # Swallow recorded here (warning log); the primary deliverable
+            # survives via the PAT below, and both-paths-dead surfaces at the
+            # call sites' existing demand-gate fail-safe (legacy launch).
+            logger.warning("App-token mint failed (%s) — PAT fallback", exc)
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.get_parameter(Name=GROOM_GH_PAT_SSM, WithDecryption=True)
     return resp["Parameter"]["Value"].strip()
@@ -911,6 +805,28 @@ def _write_queue_manifests(schedule_label: str, launches: list,
     return keys
 
 
+def _write_skip_record(schedule_label: str, skip_reason: str, **extra) -> None:
+    """Decision record for a trigger evaluation that never reached a launch
+    decision (config-I2540) — same key shape the console lists, additive
+    ``skip_reason`` field, empty ``decisions`` (schema_version 2 already means
+    "no boxes launched" for an empty list). Best-effort non-fatal, mirroring
+    ``_write_trigger_record``: a record-write failure must never block or
+    crash the skip path itself."""
+    now = datetime.now(ZoneInfo("UTC"))
+    key = f"groom/decisions/{now:%Y-%m-%d}/trigger-{now:%H%M}.json"
+    body = json.dumps({
+        "schema_version": 2, "trigger": "demand-all", "schedule": schedule_label,
+        "skip_reason": skip_reason, "decisions": [],
+        "decided_at": now.isoformat(), **extra,
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — deliberate swallow: the skip/notify path is the primary deliverable here; failure recorded in this Lambda's CW logs
+        logger.warning("skip record write failed (non-fatal): %s", exc)
+
+
 def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> None:
     """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json."""
     now = datetime.now(ZoneInfo("UTC"))
@@ -928,30 +844,64 @@ def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> 
         logger.warning("trigger record write failed (non-fatal): %s", exc)
 
 
+def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: dict) -> None:
+    """config#2667: the ``launch_decided`` fast-path (the end-of-SF
+    ``run_mode=sweep`` box, and any other pre-decided ``launch_decided``
+    invocation) previously wrote NO ``groom/decisions/{date}/*.json`` record at
+    all — unlike the ``demand-all`` full-mode path, which always has via
+    ``_write_trigger_record``/``_write_skip_record``. That left the dispatch
+    decision log — the ground-truth input ``groom-liveness-probe`` now reads
+    (config#2667) to detect a silently-missing run artifact — structurally
+    blind to sweep dispatches: a sweep box that died silently after this
+    Lambda logged "dispatched" left no trace for the probe to even know a
+    trigger had fired.
+
+    Own key prefix (``sweep-{HHMM}``, not ``trigger-{HHMM}``) — sweep and a
+    same-minute demand-all evaluation must never collide on one S3 key. Same
+    schema shape as ``_write_trigger_record``/``_write_skip_record`` (schema_
+    version 2, a ``decisions`` list of ``{launch, ...}`` dicts) so the probe's
+    reader treats both trigger kinds identically. Best-effort non-fatal,
+    mirroring the demand-all writers: a record-write failure must never block
+    or crash the (fire-and-forget) sweep dispatch itself."""
+    now = datetime.now(ZoneInfo("UTC"))
+    key = f"groom/decisions/{now:%Y-%m-%d}/sweep-{now:%H%M%S}.json"
+    launch_ok = bool(launched.get("launched"))
+    body = json.dumps({
+        "schema_version": 2, "trigger": "launch_decided", "run_mode": run_mode,
+        "schedule": schedule_label,
+        "decisions": [{
+            "launch": launch_ok,
+            "issue_filter": launched.get("issue_filter", ""),
+            "model": launched.get("model", ""),
+            "reason": launched.get("reason", "launch_decided"),
+            "tier_tag": launched.get("tier_tag", ""),
+        }],
+        "decided_at": now.isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — mirrors _write_trigger_record: observability only, never blocks the launch it's recording
+        logger.warning("sweep decision record write failed (non-fatal): %s", exc)
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-opus-4-8", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
+    "claude-sonnet-5", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
     `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
     (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
-    `pr_budget` is set only on the Opus high-only schedule (config#1769).
+    `pr_budget` is set only on the dedicated high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
     own relaunch loop on its final bounded retry — no live schedule sets it.
     `queue_manifest_key` (config#2152/#2175) marks an explicit operator queue
     (drain runs): it bypasses the demand-count gates — which count GitHub
-    enumeration, meaningless for a manifest — but launches SPOT-FIRST and
-    still honors the pre-boot pace gate (weekly WET protection covers drains).
-
-    Pre-boot pace gate (2026-07-04): if weekly Claude usage is running ahead
-    of a linear pace through the current reset window, the launch is skipped
-    entirely — before any spot cost is incurred — rather than deferring the
-    decision to the on-box `groom_budget.py` gate. See module docstring. A
-    skip here sends its own Telegram ping (best-effort — `krepis.telegram
-    .send_message` never raises) since this is the ONLY place a pre-boot skip
-    is ever visible; a run that never boots has no on-box `groom_run.sh` to
-    fire its own notification the way the on-box budget-gate skip does.
+    enumeration, meaningless for a manifest — but launches SPOT-FIRST.
+    (The pre-boot pace gate that used to run here was dismantled 2026-07-14
+    with the rest of usage pacing — see module docstring.)
 
     config#2129 two-phase SF flow (`decide_only` / `launch_decided`): the
     dispatch Step Function no longer invokes this Lambda once per trigger and
@@ -995,9 +945,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # gate, paying for an on-demand box as a side effect of `force_on_demand`
     # conflating "skip demand gate" with "force on-demand market";
     # force_on_demand keeps BOTH meanings for its one remaining caller (the
-    # dispatch SF's final bounded relaunch retry). The pre-boot PACE gate
-    # deliberately still applies to manifest runs — weekly WET protection
-    # covers drains too.
+    # dispatch SF's final bounded relaunch retry).
     queue_manifest_key = str(event.get("queue_manifest_key") or "")
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
@@ -1005,12 +953,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     if event.get("launch_decided"):
         # config#2129: a decide_only call (or the SF's bounded-relaunch loop
         # re-invoking for the SAME already-decided box) already made this
-        # decision — launch EXACTLY what's given, no pace gate (a per-TRIGGER
-        # call, not per-box), no re-decision. Returns the SAME singular
-        # {"groom": {...}} shape the SF's existing per-box states expect.
+        # decision — launch EXACTLY what's given, no re-decision. Returns the
+        # SAME singular {"groom": {...}} shape the SF's existing per-box
+        # states expect.
         # config#2201: the SF's end-of-SF DispatchEndOfSfSweep state also
         # lands here (run_mode=sweep + launch_decided) — the sweep box is
-        # unconditional by design, so bypassing the pace/demand gates is
+        # unconditional by design, so bypassing the demand gates is
         # exactly right; the config#1979 concurrent guard (on the distinct
         # 'sweep' lane tag) is the only pre-launch check that applies.
         result = _launch_groom_spot(
@@ -1018,21 +966,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
         )
+        # config#2667: record this decision too — previously only the
+        # demand-all path did (_write_trigger_record/_write_skip_record),
+        # leaving sweep-mode (and any other launch_decided) dispatches with
+        # no entry in the dispatch-decision log at all.
+        _write_sweep_decision_record(schedule_label, run_mode, result)
         return {"groom": result}
-
-    if PACE_GATE_ENABLED:
-        pace = _pace_gate_status()
-        if pace.get("exceeded"):
-            logger.warning(
-                "pace gate SKIP — used_frac=%.4f > elapsed_frac=%.4f (overrun=%+.4f, "
-                "wet=%.0f) — groom spot NOT launched, resumes next schedule/reset",
-                pace["used_frac"], pace["elapsed_frac"], pace["overrun"], pace["wet"],
-            )
-            _notify_pace_skip(pace, schedule_label, run_mode)
-            skip = {"launched": False, "reason": "pace_gate_skip", **pace}
-            if event.get("decide_only"):
-                return {"decide": {"launches": [], **skip}}
-            return {"groom": skip}
 
     if (run_mode == "full" and not force_on_demand and not queue_manifest_key
             and str(event.get("trigger", "")) == "demand-all"):
@@ -1048,6 +987,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
             logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
             _notify_demand_trigger_failed(exc, schedule_label)
+            # config-I2540: an enumeration failure must still leave a decision
+            # record — a missing groom/decisions/{date}/trigger-*.json file
+            # must unambiguously mean "the scheduler never invoked this
+            # Lambda", never "it ran and failed quietly". No counts are
+            # available on this path (enumeration is what failed).
+            _write_skip_record(schedule_label, "demand_all_failed", error=str(exc))
             err = {"launched": False, "reason": "demand_all_failed", "error": str(exc)}
             if event.get("decide_only"):
                 return {"decide": {"launches": [], **err}}
@@ -1063,10 +1008,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     continue
                 logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
                             d.reason, d.issue_filter, d.model)
-                # config#2201: SlotDecision still carries partition_index/
-                # partition_count (lib fields kept for pin-lockstep compat —
-                # deferred lib cleanup), but they are no longer consumed:
-                # the end-of-SF sweep box replaced per-box partitioned sweeps.
+                # config#2201: SlotDecision no longer carries partition_index/
+                # partition_count at all — those fields were fully removed
+                # from nousergon-lib's SlotDecision (confirmed on the lib's
+                # current default branch, pin >= v0.109.0). The end-of-SF
+                # sweep box replaced per-box partitioned sweeps.
                 entry = {"model": d.model, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
@@ -1106,7 +1052,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 return {"groom": skip}
             # Launch with the DECIDED bundle + cheapest adequate model — the
             # schedule's model is only the slot default; high never runs
-            # below Opus, and a bundle without high never pays for it.
+            # below its own tier's model, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
             model = decision.model
             logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",

@@ -70,7 +70,8 @@ class TestTradingDayGateChoice:
         false_branch = [
             c["Next"]
             for c in states["TradingDayGateChoice"]["Choices"]
-            if c.get("BooleanEquals") is False
+            # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
+            if any(op.get("BooleanEquals") is False for op in c.get("And", [c]))
         ]
         assert false_branch == ["NotifyHolidaySkip"]
 
@@ -83,8 +84,12 @@ class TestTradingDayGateChoice:
         assert states["TradingDayGateChoice"]["Default"] == "StartExecutorEC2"
 
     def test_choice_reads_is_trading_day_off_gate_payload(self, states):
-        var = states["TradingDayGateChoice"]["Choices"][0]["Variable"]
-        assert var == "$.trading_day_gate.Payload.is_trading_day"
+        # config-I2767: the comparison is IsPresent-guarded inside an And;
+        # both operands read the same gate-payload path.
+        rule = states["TradingDayGateChoice"]["Choices"][0]
+        variables = {op["Variable"] for op in rule["And"]}
+        assert variables == {"$.trading_day_gate.Payload.is_trading_day"}
+        assert any(op.get("IsPresent") is True for op in rule["And"])
 
 
 class TestTradingDayGateFailed:

@@ -13,39 +13,61 @@ Design:
   acquire the mutex via ``DynamoDB.PutItem`` with
   ``ConditionExpression: attribute_not_exists(mutex_key)``.
 - Operator-initiated runs (any other ``pipeline_role`` value, including
-  absent) bypass entirely — they are deliberately concurrent with
-  cadence runs.
-- ``mutex_key`` = ``{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}``
-  (UTC minute bucket parsed from ``$$.Execution.StartTime``). Two
-  duplicate cron-fired executions in the same minute produce identical
-  keys; the second loses with ``ConditionalCheckFailedException`` →
-  ``MutexConflict`` Fail.
-- No TTL / no release: the date+minute in the key is itself the
-  staleness window — a successfully-acquired key is naturally single-use
-  because no future execution can land in the same past minute-bucket.
+  absent and the recovery role ``watch-rerun``) bypass entirely — they
+  are deliberately concurrent with cadence runs.
+- WEEKLY SF (config#2280): ``mutex_key`` =
+  ``{state-machine-name}#{pipeline_role}#{run_date}`` — the RUN-SLOT.
+  The old UTC minute bucket only caught duplicates landing in the SAME
+  minute; an EventBridge internal retry >60s later, an operator re-paste
+  a minute later, or a re-introduced duplicate rule at minute distance
+  got a different key and ran concurrently. Keying on ``$.run_date``
+  (stamped by ``InitializeInput``) makes ANY second cadence execution of
+  the same run-slot lose with ``ConditionalCheckFailedException`` →
+  ``MutexConflict`` Fail, regardless of stagger.
+- WEEKLY TTL (config#2280): a run-date key has no natural expiry, so the
+  weekly item carries ``ttl_epoch`` (~24h) with table TTL enabled as the
+  crashed-holder BACKSTOP. The epoch is computed by ``ComputeMutexTtl``,
+  a single JSONata Pass state (JSONPath intrinsics cannot convert
+  ISO-8601 → epoch) inserted on the cadence path only — so the attribute
+  is ALWAYS present when AcquireMutex runs. The PRIMARY stale-item
+  mechanism is ``scripts/weekly_sf_rerun.py``: it deletes the failed
+  holder's item only after verifying the holder execution is TERMINAL
+  (never steals from a RUNNING one), then starts a ``watch-rerun-*``
+  recovery execution whose non-cadence role bypasses the mutex.
+- WEEKDAY/EOD SFs: unchanged minute-bucket key
+  (``{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}`` parsed
+  from ``$$.Execution.StartTime``), no ``ttl_epoch`` — the minute bucket
+  encodes its own staleness, items without the attribute never expire,
+  so enabling table TTL is additive and does not change their contract.
+- Redrives resume the SAME execution and never re-enter AcquireMutex —
+  the run-slot key change does not affect redrive behavior (no new
+  acquire happens on redrive).
 - Fail-open on non-Conditional-Check errors (DDB outage / IAM drift):
   the mutex is best-effort architectural insurance; per
   ``[[feedback_no_silent_fails]]`` "secondary observability" carve-out
   the primary deliverable survives a mutex-side failure.
 
 This test pins:
-- The 3 new states exist in each SF (``CheckMutexRole``, ``AcquireMutex``,
-  ``MutexConflict``) with correct Type + Resource.
+- The 3 mutex states exist in each SF (``CheckMutexRole``, ``AcquireMutex``,
+  ``MutexConflict``) with correct Type + Resource; the weekly SF
+  additionally carries ``ComputeMutexTtl`` (JSONata Pass) between
+  ``CheckMutexRole`` and ``AcquireMutex``.
 - Wiring: ``InitializeInput.Next`` (or ``StartAt`` for EOD) → ``CheckMutexRole``;
   ``CheckMutexRole.Default`` → former-first-state;
   ``AcquireMutex.Next`` → former-first-state.
 - ``CheckMutexRole`` gates on ``$.pipeline_role`` in the cadence allowlist.
 - ``AcquireMutex`` catches ``DynamoDB.ConditionalCheckFailedException`` →
   ``MutexConflict``; catches ``States.ALL`` → fail-open to former-first-state.
-- ``mutex_key`` Format string references ``$$.StateMachine.Name``,
-  ``$.pipeline_role``, and ``$$.Execution.StartTime`` so the minute-bucket
-  parsing is anchored to SF runtime context (not a hardcoded value).
+- Weekly ``mutex_key`` Format references ``$$.StateMachine.Name``,
+  ``$.pipeline_role``, and ``$.run_date`` (run-slot); weekday/eod keep the
+  ``$$.Execution.StartTime`` minute-bucket parsing.
 - CFN: ``ExecutionMutexTable`` exists with PK ``mutex_key`` (S),
-  PAY_PER_REQUEST, no TTL attribute (intentional — minute-bucket key
-  encodes its own staleness).
+  PAY_PER_REQUEST, and ``TimeToLiveSpecification`` on ``ttl_epoch``
+  (config#2280 — supersedes the config#730 sweeper for weekly items).
 - IAM: ``alpha-engine-step-functions-role`` has ``dynamodb:PutItem`` on
-  the mutex table resource (release/cleanup excluded because the design
-  intentionally has no release path).
+  the mutex table resource (release/cleanup excluded: the SF itself never
+  deletes; the rerun helper's verified steal runs under operator /
+  sf-watch-executor credentials, not this role).
 """
 
 from __future__ import annotations
@@ -146,6 +168,60 @@ class TestMutexStatesPresent:
             f"swaps to a Lambda-based mutex, this assertion needs to evolve "
             f"alongside the IAM grant in alpha-engine-step-functions-role.json."
         )
+
+    def test_saturday_compute_mutex_ttl_is_jsonata_pass(self, saturday_sf):
+        """config#2280: the weekly SF computes the ttl epoch in a dedicated
+        JSONata Pass state on the cadence path. JSONPath intrinsics cannot
+        convert ISO-8601 → epoch (States.MathAdd needs a number the context
+        object never provides); JSONata's $toMillis is the only in-ASL
+        epoch source, and confining it to ONE Pass state keeps AcquireMutex
+        in JSONPath so its Catch/ResultPath semantics are untouched."""
+        states = saturday_sf["States"]
+        assert "ComputeMutexTtl" in states, (
+            "saturday SF missing ComputeMutexTtl — without it the "
+            "AcquireMutex Item references $.mutex_ttl_epoch that nothing "
+            "sets, throwing States.Runtime into the fail-open Catch and "
+            "silently disabling the mutex"
+        )
+        st = states["ComputeMutexTtl"]
+        assert st["Type"] == "Pass"
+        assert st["QueryLanguage"] == "JSONata", (
+            "ComputeMutexTtl must opt into JSONata — JSONPath has no "
+            "ISO-8601 → epoch conversion"
+        )
+        assert st["Next"] == "AcquireMutex"
+        output = st["Output"]
+        assert "$toMillis($states.context.Execution.StartTime)" in output, (
+            "ttl must be anchored to Execution.StartTime via $toMillis"
+        )
+        assert "mutex_ttl_epoch" in output
+        assert "86400" in output, (
+            "ttl window drifted from the documented ~24h backstop — if "
+            "deliberate, update this test + the AcquireMutex/CFN comments"
+        )
+        assert "$string(" in output, (
+            "mutex_ttl_epoch must be stamped as a STRING — DynamoDB's N "
+            "attribute value is string-encoded on the wire, and "
+            "AcquireMutex references it via a JSONPath 'N.$' that "
+            "requires a string"
+        )
+        # The cadence path must route THROUGH the ttl computation.
+        acquire_rule = states["CheckMutexRole"]["Choices"][0]
+        assert acquire_rule["Next"] == "ComputeMutexTtl", (
+            "saturday CheckMutexRole cadence path must enter "
+            "ComputeMutexTtl before AcquireMutex, so $.mutex_ttl_epoch is "
+            "ALWAYS present when the putItem parameters are evaluated"
+        )
+
+    @pytest.mark.parametrize("sf_name", ["weekday", "eod"])
+    def test_non_weekly_sfs_have_no_compute_mutex_ttl(self, sf_name, all_sfs):
+        """Weekday/EOD keep the minute-bucket design (self-encoding
+        staleness, no ttl attribute). If a future PR ports the run-slot
+        key + TTL there, update this test alongside the key-format and
+        Item assertions below."""
+        states = all_sfs[sf_name]["States"]
+        assert "ComputeMutexTtl" not in states
+        assert states["CheckMutexRole"]["Choices"][0]["Next"] == "AcquireMutex"
 
     @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))
     def test_mutex_conflict_is_fail(self, sf_name, all_sfs):
@@ -297,8 +373,47 @@ class TestAcquireMutexSemantics:
             f"the PutItem unconditionally clobbers, defeating the whole guard"
         )
 
-    @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))
-    def test_mutex_key_format_includes_runtime_anchors(self, sf_name, all_sfs):
+    def test_saturday_mutex_key_is_run_slot(self, saturday_sf):
+        """config#2280: the weekly key bins on (state-machine, pipeline-role,
+        run_date) — the RUN-SLOT — so a second cadence execution of the same
+        run_date conflicts at ANY stagger (5 minutes or 5 hours apart), not
+        just in the same start-minute. A recovery rerun after a terminal
+        failure acquires nothing at all: the helper emits the non-cadence
+        role 'watch-rerun', which bypasses CheckMutexRole entirely."""
+        params = saturday_sf["States"]["AcquireMutex"]["Parameters"]
+        key_format = params["Item"]["mutex_key"]["S.$"]
+        for anchor in (
+            "$$.StateMachine.Name",
+            "$.pipeline_role",
+            "$.run_date",
+        ):
+            assert anchor in key_format, (
+                f"saturday AcquireMutex mutex_key Format missing anchor "
+                f"{anchor!r} — without it the run-slot binning collapses and "
+                f"either over-protects (false MutexConflict) or "
+                f"under-protects (misses staggered dup-triggers)"
+            )
+        assert "$$.Execution.StartTime" not in key_format, (
+            "saturday mutex_key must NOT reference Execution.StartTime — "
+            "any start-time component re-opens the staggered-duplicate hole "
+            "config#2280 closed (two triggers minutes apart would get "
+            "different keys and run concurrently)"
+        )
+
+    def test_saturday_item_carries_ttl_epoch(self, saturday_sf):
+        """The run-date key has no natural expiry (unlike the minute
+        bucket), so the weekly item must carry the ttl_epoch backstop
+        stamped by ComputeMutexTtl."""
+        item = saturday_sf["States"]["AcquireMutex"]["Parameters"]["Item"]
+        assert item.get("ttl_epoch") == {"N.$": "$.mutex_ttl_epoch"}, (
+            "saturday AcquireMutex Item must write ttl_epoch from "
+            "$.mutex_ttl_epoch (ComputeMutexTtl) — without it a crashed "
+            "holder's run-slot item never expires and next Saturday's "
+            "operator hygiene burden returns (config#2280)"
+        )
+
+    @pytest.mark.parametrize("sf_name", ["weekday", "eod"])
+    def test_non_weekly_mutex_key_keeps_minute_bucket(self, sf_name, all_sfs):
         params = all_sfs[sf_name]["States"]["AcquireMutex"]["Parameters"]
         key_format = params["Item"]["mutex_key"]["S.$"]
         # The key MUST reference all 3 anchors so duplicate-target detection
@@ -327,6 +442,16 @@ class TestAcquireMutexSemantics:
             f"degrades to hour-bucketing, which would falsely conflict every "
             f"intra-hour operator rerun of a cadence role."
         )
+
+    @pytest.mark.parametrize("sf_name", ["weekday", "eod"])
+    def test_non_weekly_items_do_not_write_ttl_epoch(self, sf_name, all_sfs):
+        """Minute-bucket items self-encode staleness and intentionally
+        never expire (matching the original L274 design). Writing
+        ttl_epoch there without a ComputeMutexTtl feeder would throw
+        States.Runtime into the fail-open Catch — silently disabling the
+        mutex. Port the full run-slot+TTL design or none of it."""
+        item = all_sfs[sf_name]["States"]["AcquireMutex"]["Parameters"]["Item"]
+        assert "ttl_epoch" not in item
 
     @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))
     def test_acquire_catches_conditional_check_to_mutex_conflict(
@@ -423,20 +548,30 @@ class TestCfnExecutionMutexTable:
             "this whole design relies on key off the partition-key existence"
         )
 
-    def test_mutex_table_intentionally_has_no_ttl(self, cfn_text):
-        """The design INTENTIONALLY omits TTL — the minute-bucket in the
-        key encodes its own staleness window. If a future PR adds TTL,
-        it MUST also update this test + the design docstring at the top
-        + ROADMAP L274 — silent TTL addition would change the semantic
-        contract (locks no longer permanent past their natural staleness)."""
+    def test_mutex_table_ttl_enabled_on_ttl_epoch(self, cfn_text):
+        """config#2280: the weekly run-slot key has no natural expiry, so
+        the table enables TTL on ttl_epoch as the crashed-holder backstop
+        (primary stale-item mechanism = the rerun helper's verified
+        steal). Enabling TTL on a live table is a safe, additive in-place
+        UpdateTimeToLive — no table replacement, and weekday/eod items
+        without the attribute are ignored by TTL (their contract is
+        unchanged). This supersedes the config#730 sweeper for weekly
+        items. The AttributeName MUST stay in lockstep with the weekly
+        AcquireMutex Item key ('ttl_epoch') — drift means items silently
+        never expire."""
         anchor = cfn_text.index("ExecutionMutexTable:")
         block = cfn_text[anchor : anchor + 1200]
-        assert "TimeToLiveSpecification" not in block, (
-            "ExecutionMutexTable must NOT declare TimeToLiveSpecification — "
-            "the design intentionally relies on minute-bucket key encoding "
-            "for natural single-use semantics. If you want TTL, also update "
-            "this test + AcquireMutex Item.ttl_epoch + the L274 design"
+        assert "TimeToLiveSpecification" in block, (
+            "ExecutionMutexTable must declare TimeToLiveSpecification — "
+            "without it the weekly run-slot items (which, unlike the old "
+            "minute-bucket keys, CAN go stale) never self-expire "
+            "(config#2280)"
         )
+        assert "AttributeName: ttl_epoch" in block, (
+            "TTL AttributeName must be ttl_epoch — must match the weekly "
+            "AcquireMutex Item attribute or items silently never expire"
+        )
+        assert "Enabled: true" in block
 
 
 # ---------------------------------------------------------------------------
@@ -472,17 +607,19 @@ class TestIamGrant:
         )
 
     def test_role_does_not_grant_delete_item(self, role_policy):
-        """L274 design has no release path. dynamodb:DeleteItem would be
-        dead permission — least-privilege violation. If a future PR adds
-        release/cleanup, also update this test + the design docstring."""
+        """The SF itself has no release path — dynamodb:DeleteItem on THIS
+        role would be dead permission (least-privilege violation). The
+        config#2280 verified steal (delete-after-terminal-holder) lives in
+        scripts/weekly_sf_rerun.py and runs under operator / sf-watch
+        executor credentials, never under the state machine's role."""
         for stmt in role_policy["Statement"]:
             a = stmt.get("Action", [])
             actions = [a] if isinstance(a, str) else a
             assert "dynamodb:DeleteItem" not in actions, (
                 "alpha-engine-step-functions-role should NOT grant "
-                "dynamodb:DeleteItem — L274 design intentionally has no "
-                "release path (minute-bucket key encodes natural staleness). "
-                "If you're adding release, update the test + the design"
+                "dynamodb:DeleteItem — the SF never deletes mutex items; "
+                "stale-item release belongs to the rerun helper (operator/"
+                "sf-watch credentials) + table TTL, not the SF role"
             )
 
     def test_role_ddb_grant_scoped_to_mutex_table(self, role_policy):

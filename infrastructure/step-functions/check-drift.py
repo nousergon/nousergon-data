@@ -20,20 +20,24 @@ not a hypothetical one):
   * `infrastructure/cloudformation/alpha-engine-orchestration.yaml` —
     declares `LoggingConfiguration` for the two CFN-owned state machines
     (`SaturdayPipeline` / `ne-weekly-freshness-pipeline` and
-    `WeekdayPipeline` / `ne-preopen-trading-pipeline`). The CFN comment on
-    those resources spells out why this is safe from the deploy-vs-drift
-    trap: the deploy script's `update-state-machine` call passes only
-    `--definition`, so it never wipes this CFN-set config.
+    `WeekdayPipeline` / `ne-preopen-trading-pipeline`). Since config#2273
+    the deploy scripts ALSO pass `--logging-configuration` explicitly on
+    every `update-state-machine` call, mirroring these CFN-declared shapes
+    — so an update self-heals a recreate-dropped config rather than
+    relying on partial-update preservation; this script remains the
+    backstop for out-of-band drift.
   * `infrastructure/deploy-infrastructure.sh` — the EOD SF
     (`ne-postclose-trading-pipeline`) is NOT in CloudFormation (script-
     managed); its `EOD_LOGGING_CONFIG` literal there is the source of truth,
     passed explicitly on every `update-state-machine` / `create-state-machine`
-    call. The backlog-groom SF (`alpha-engine-groom-pipeline`) is also
-    script-managed but its `update_or_create` call deliberately omits a
-    logging arg ("preserving its current no-logging behavior exactly", per
-    that script's comment) — so this guard's codified expectation for groom
-    is "no logging enabled", and it flags drift if that ever changes without
-    a matching source update.
+    call. The backlog-groom SF (`alpha-engine-groom-dispatch`) is also
+    script-managed and, as of config#2748-adjacent (2026-07-16), likewise
+    passes an explicit `GROOM_LOGGING_CONFIG` (ERROR level, a dedicated log
+    group) on every update — enabled live to aid active groom-driver incident
+    debugging, then codified here so deploys stop drifting from it. If groom's
+    `update_or_create` call ever omits the logging arg again without a
+    matching source update, this guard flags it as drift rather than
+    silently trusting either state.
 
 This script parses both files (regex-based textual extraction — CFN's
 `!Ref`/`!GetAtt`/`!Sub` intrinsics aren't valid YAML for a stock loader, and
@@ -243,33 +247,66 @@ def _discover_expected_from_deploy_script() -> list[dict]:
             ),
         })
 
-    # --- Groom: deliberately no logging (update_or_create omits the arg) ---
+    # --- Groom: explicit LoggingConfiguration (config#2748-adjacent, 2026-07-16) ---
+    # ERROR-level logging was enabled live to aid active groom-driver incident
+    # debugging, then codified here mirroring EOD's pattern (log group created
+    # idempotently by deploy-infrastructure.sh, level/includeExecutionData
+    # parsed from the literal JSON, log group name from its own literal).
     groom_arn_match = re.search(
         r'GROOM_ARN="arn:aws:states:\$REGION:\$\{ACCOUNT_ID\}:stateMachine:([\w-]+)"',
         text,
     )
-    groom_call_match = re.search(
-        r'update_or_create\s+"\$GROOM_ARN"\s+"\$GROOM_STAMPED"\s+"[\w-]+"\s+"[^"]+"\s*(".*")?\s*$',
-        text,
-        re.MULTILINE,
-    )
-    if groom_arn_match:
+    groom_log_group_match = re.search(r'GROOM_LOG_GROUP_NAME="([^"]+)"', text)
+    groom_config_match = re.search(r"GROOM_LOGGING_CONFIG='(\{.*?\})'", text)
+
+    if groom_arn_match and groom_log_group_match and groom_config_match:
         groom_name = groom_arn_match.group(1)
-        has_logging_arg = bool(groom_call_match and groom_call_match.group(1))
-        if has_logging_arg:
+        groom_log_group_name = groom_log_group_match.group(1)
+        level_match = re.search(r'"level":"([^"]+)"', groom_config_match.group(1))
+        include_match = re.search(
+            r'"includeExecutionData":(true|false)', groom_config_match.group(1)
+        )
+        if level_match and include_match:
             results.append({
                 "sf_name": groom_name,
                 "source_file": DEPLOY_INFRA_SH,
-                "error": (
-                    f"groom SF's update_or_create call in "
-                    f"{DEPLOY_INFRA_SH.name} now passes a logging arg — "
-                    f"this script's groom-has-no-logging assumption is "
-                    f"stale, update it rather than trusting this result"
-                ),
+                "expected_level": level_match.group(1),
+                "expected_include_execution_data": include_match.group(1) == "true",
+                "expected_log_group_name": groom_log_group_name,
             })
         else:
             results.append({
                 "sf_name": groom_name,
+                "source_file": DEPLOY_INFRA_SH,
+                "error": (
+                    f"GROOM_LOGGING_CONFIG in {DEPLOY_INFRA_SH.name} didn't "
+                    f"parse as expected (level/includeExecutionData)"
+                ),
+            })
+    elif groom_arn_match:
+        # Logging-arg literals not found — either genuinely reverted to
+        # no-logging, or the deploy plumbing changed shape. Distinguish via
+        # the actual update_or_create call rather than guessing.
+        groom_call_match = re.search(
+            r'update_or_create\s+"\$GROOM_ARN"\s+"\$GROOM_STAMPED"\s+"[\w-]+"\s+"[^"]+"\s*(".*")?\s*$',
+            text,
+            re.MULTILINE,
+        )
+        has_logging_arg = bool(groom_call_match and groom_call_match.group(1))
+        if has_logging_arg:
+            results.append({
+                "sf_name": groom_arn_match.group(1),
+                "source_file": DEPLOY_INFRA_SH,
+                "error": (
+                    f"groom SF's update_or_create call in "
+                    f"{DEPLOY_INFRA_SH.name} passes a logging arg but "
+                    f"GROOM_LOG_GROUP_NAME/GROOM_LOGGING_CONFIG literals "
+                    f"weren't found — update this parser to match"
+                ),
+            })
+        else:
+            results.append({
+                "sf_name": groom_arn_match.group(1),
                 "source_file": DEPLOY_INFRA_SH,
                 "expected_level": "OFF",
                 "expected_include_execution_data": None,

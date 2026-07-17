@@ -35,7 +35,18 @@ RULE_NAME="alpha-engine-saturday-sf-watch-failed"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
-DRY_RUN=false
+# Shared operator-flag-preserve helper (config#1818/#2236/#2264 bug class).
+source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"
+
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do
@@ -55,7 +66,13 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler + run unit tests ----------------------------------
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
+
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PKG=$(mktemp -d)
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast
@@ -64,16 +81,24 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# The gate now runs on bare CI runners (deploy-saturday-sf-watch-dispatcher.yml,
+# config#2295), not just operator laptops where pytest/boto3 were ambient — so
+# it must self-provision its own test deps or it dies "No module named pytest"
+# (2026-07-12 incident; same class the fleet already hit 2026-07-02/-04 and
+# fixed the same way in ci-watch-dispatcher, spot-orphan-reaper, groom-liveness-
+# probe, et al). test_handler.py does a REAL `import index` (no sys.modules
+# stubs), which pulls boto3, the local flow_doctor_telegram (found via the
+# test's sys.path parent insert), and nousergon_lib.flow_doctor_fleet. pytest +
+# boto3 + the pinned nousergon-lib + krepis are installed by the shared gate into its own scratch
+# dir — NOT the caller's global site-packages, not bundled into the
+# Lambda zip.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" boto3 "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
-
-LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PKG=$(mktemp -d)
-trap "rm -rf '$PKG'" EXIT
 
 echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
@@ -122,16 +147,21 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FAST_PATH_ENABLED=false,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,FAST_PATH_ENABLED=false,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=false,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge rule: terminal-failure statuses of ANY of the three fleet
-  # trading SFs (+ the transitional EOD alias). One rule, one target — keep
-  # the ARN list in lockstep with index.PIPELINES.
+  # EventBridge rule: terminal-failure statuses of ANY registered fleet SF.
+  # One rule, one target — keep the ARN list in lockstep with
+  # index.PIPELINES. (The transitional alpha-engine-eod-pipeline alias was
+  # retired 2026-07-11 — config#2272; old SF deleted live.) Widened
+  # 2026-07-14 (alpha-engine-config-I2544/I2545) to also cover the two new
+  # child SFs split out of the weekly pipeline — both registered in
+  # index.PIPELINES with has_listener:False (watch-log + Telegram fire;
+  # autonomous-agent dispatch deferred until their own charter exists).
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -142,7 +172,8 @@ if $BOOTSTRAP; then
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-eod-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-advisory-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-modelzoo-sunday-pipeline"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }
@@ -198,23 +229,24 @@ echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 # 2026-07-06 preopen SF failures (dispatched=False on both) while the market
 # was open. Bootstrap (create-function above) still defaults false — safe
 # rollout posture for a NEW deployment only.
-CURRENT_DISPATCH=$(aws lambda get-function-configuration \
-  --function-name "${FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --query 'Environment.Variables.AGENT_DISPATCH_ENABLED' --output text 2>/dev/null)
-case "${CURRENT_DISPATCH}" in true|false) ;; *) CURRENT_DISPATCH=false ;; esac
+CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" AGENT_DISPATCH_ENABLED false)
 # FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
 # AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
-CURRENT_FAST_PATH=$(aws lambda get-function-configuration \
-  --function-name "${FUNCTION_NAME}" \
-  --region "${REGION}" \
-  --query 'Environment.Variables.FAST_PATH_ENABLED' --output text 2>/dev/null)
-case "${CURRENT_FAST_PATH}" in true|false) ;; *) CURRENT_FAST_PATH=false ;; esac
-echo "  preserving AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH} (operator-owned)"
-echo "  preserving FAST_PATH_ENABLED=${CURRENT_FAST_PATH} (operator-owned)"
+CURRENT_FAST_PATH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" FAST_PATH_ENABLED false)
+# EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION (config#2003) is operator-owned
+# exactly like the two flags above — preserved via the shared helper
+# (config#1818/#2264 class: the update call REPLACES the whole Variables
+# map, so any operator-set flag missing here silently resets on redeploy).
+CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION false)
+# SF_WATCH_MAX_DISPATCHES_* (config#2269) are CONFIG DEFAULTS, not operator
+# kill-switches — deliberately NOT run through preserve_env_flag: the
+# canonical way to change a per-cadence dispatch ceiling is a PR editing
+# index.py's defaults + these pins together (a live env tweak SHOULD be reset
+# to the reviewed value on the next redeploy). Values mirror the charter's
+# Brian-ruled per-cadence budgets (saturday 8 / weekday 2 / eod 2).
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
+  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

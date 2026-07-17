@@ -293,7 +293,11 @@ def reconstruct_basis(
         structural idempotency (we always restate from the freshly-pulled raw).
       * ``total_return_close`` via ``corporate_actions.total_return_series`` over
         the dividend events — the SEPARATE total-return axis; it does NOT mutate
-        ``Close``.
+        ``Close``. ``split_actions`` is also passed to ``total_return_series`` so
+        a dividend declared before a later split has its nominal ``cash_amount``
+        scaled onto ``Close``'s post-split basis (config#1462) — without this a
+        pre-split dividend's declared amount overstates the back-adjust and the
+        error compounds across every subsequent pre-split dividend.
 
     Pure: no network / S3 / ArcticDB — the migration's network fetch + I/O live
     in the orchestration, so this is unit-testable with hand-built fakes.
@@ -311,7 +315,15 @@ def reconstruct_basis(
     )
 
     # 2. SEPARATE total-return axis (does NOT mutate split_adj["Close"]).
-    tr_close = ca.total_return_series(split_adj, dividend_actions)
+    # split_actions is passed through so a dividend declared BEFORE a later
+    # split has its feed-nominal cash_amount scaled onto the SAME post-split
+    # share basis split_adj["Close"] is already on (config#1462) — otherwise
+    # a pre-split dividend's cash amount overstates the back-adjust by the
+    # intervening cumulative split factor, whether or not that split was
+    # itself confirmed-applied to Close (see total_return_series docstring).
+    tr_close = ca.total_return_series(
+        split_adj, dividend_actions, split_actions=split_actions,
+    )
 
     out = split_adj.copy()
     out[TOTAL_RETURN_COL] = tr_close.reindex(out.index)

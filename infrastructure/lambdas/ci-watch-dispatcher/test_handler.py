@@ -9,7 +9,11 @@ raising; the (repo, sha)-scoped concurrency lock (narrower than groom's
 per-tier lock — two different shas on the same repo must NOT block each
 other); a post-launch SSM-send failure terminates the box and returns
 launched:false; a malformed event returns launched:false rather than raising;
-the kill-switch short-circuit.
+the kill-switch short-circuit; and the config#2267 launch-path hardening — a
+failed concurrency probe launches WITH dedupe_degraded:true recorded
+(site 1), and the load-bearing discriminator tags ride the RunInstances
+launch call ATOMICALLY via extra_tags (site 2 root fix, config#2292) — the
+PR758 post-launch create_tags bounded-retry/terminate path is gone entirely.
 """
 
 from __future__ import annotations
@@ -53,7 +57,6 @@ class _FakeWaiter:
 class _FakeEc2:
     def __init__(self, running_instances=None):
         self.terminated = []
-        self.tags_created = []
         # {(repo, sha) -> [instance_ids]} already "live" for the concurrency
         # guard's describe_instances check to find.
         self._running_instances = dict(running_instances or {})
@@ -64,10 +67,6 @@ class _FakeEc2:
     def terminate_instances(self, InstanceIds):  # noqa: N803 — boto3 kwarg name
         self.terminated.extend(InstanceIds)
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
-
-    def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
-        self.tags_created.append((Resources, Tags))
-        return {}
 
     def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
         by_name = {f["Name"]: f["Values"] for f in Filters}
@@ -120,6 +119,16 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None):
     else:
         import nousergon_lib.spot_dispatch  # noqa: F401 — first import picks up the current stub
 
+    # SpotProbeError back-fill (config#2267 site 1): index.py imports it and
+    # its requirements pin nousergon-lib v0.106.0 (the first version carrying
+    # it), but a local/shared environment may still have an OLDER installed
+    # lib. Inject a name-compatible stand-in so the suite runs under both —
+    # under >= 0.106.0 the real class is present and this is a no-op. (Reload
+    # above re-executes the module, so re-check every _load call.)
+    _sd = sys.modules["nousergon_lib.spot_dispatch"]
+    if not hasattr(_sd, "SpotProbeError"):
+        _sd.SpotProbeError = type("SpotProbeError", (Exception,), {})
+
     import index
 
     importlib.reload(index)
@@ -148,6 +157,7 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
         calls["spot"] = kw.get("spot")
         calls["profile"] = kw.get("iam_instance_profile")
         calls["tag_name"] = kw.get("tag_name")
+        calls["extra_tags"] = kw.get("extra_tags")
         return "i-abc"
 
     idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
@@ -161,11 +171,14 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     assert calls["spot"] is True
     assert calls["profile"] == "alpha-engine-ci-watch-executor-profile"
     assert calls["tag_name"] == "alpha-engine-ci-watch-spot"
-    # The instance is tagged with its repo+sha for the concurrency guard.
-    assert idx._test_ec2.tags_created == [
-        (["i-abc"], [{"Key": "ci-watch-repo", "Value": "nousergon/alpha-engine-config"},
-                     {"Key": "ci-watch-sha", "Value": "abc1234def5678900000000000000000000abcd"}])
-    ]
+    # config#2292 root fix: the repo+sha discriminator tags ride the SAME
+    # RunInstances call as the launch itself (extra_tags), not a separate
+    # post-launch create_tags call.
+    assert calls["extra_tags"] == {
+        "ci-watch-repo": "nousergon/alpha-engine-config",
+        "ci-watch-sha": "abc1234def5678900000000000000000000abcd",
+    }
+    assert idx._test_ec2.terminated == []
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
     # ci_watch_spot_bootstrap.sh (alpha-engine-config) takes its CI fields as
@@ -276,7 +289,13 @@ def test_different_repo_same_sha_is_not_blocked(monkeypatch):
     assert out["launched"] is True
 
 
-def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
+def test_concurrency_check_failure_still_launches(monkeypatch):
+    # config#2267 site 1 POLICY: a broken probe must never block a launch —
+    # coverage beats dedupe. (Under nousergon-lib >= 0.106.0 the raw
+    # describe_instances error surfaces as SpotProbeError and the launch is
+    # flagged dedupe_degraded; under the old fail-open lib it degrades to []
+    # silently. Either way the box launches — the explicit degraded-flag
+    # contract is pinned separately below.)
     idx = _load(
         monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
         env={"CI_WATCH_DISPATCH_ENABLED": "true"},
@@ -287,9 +306,52 @@ def test_concurrency_check_fails_safe_and_still_launches(monkeypatch):
 
     idx._test_ec2.describe_instances = _boom
     out = idx.handler(_event(), None)
-    # A broken check must never block a launch — optimization, not a
-    # correctness gate (mirrors groom's fail-safe posture on its own guard).
     assert out["launched"] is True
+
+
+def test_probe_failure_launches_with_dedupe_degraded_recorded(monkeypatch):
+    """config#2267 site 1: SpotProbeError from the concurrency probe →
+    proceed to launch, with dedupe_degraded:true + the probe error recorded
+    in the returned verdict (lib-version-agnostic via a direct monkeypatch
+    of the probe primitive)."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-degraded",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+
+    def _probe_down(*args, **kwargs):
+        raise idx.SpotProbeError("concurrency probe failed for tag_name='alpha-engine-ci-watch-spot': ThrottlingException: rate exceeded")
+
+    monkeypatch.setattr(idx.spot_dispatch, "running_instance_ids", _probe_down)
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["dedupe_degraded"] is True
+    # The verdict names the probe error — the GHA caller archives it.
+    assert "ThrottlingException" in out["dedupe_probe_error"]
+    # A healthy probe keeps the flag False.
+    idx2 = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out2 = idx2.handler(_event(), None)
+    assert out2["launched"] is True
+    assert out2["dedupe_degraded"] is False
+    assert "dedupe_probe_error" not in out2
+
+
+def test_discriminator_tags_ride_the_launch_call_not_a_separate_create_tags(monkeypatch):
+    """config#2292 root fix for config#2267 site 2: the (repo, sha)
+    discriminator tags are passed to spot_dispatch.launch_with_fallback as
+    extra_tags — merged into krepis.ec2_spot.launch's RunInstances
+    TagSpecifications — so there is no separate post-launch create_tags call
+    left to retry or fail. A launch that succeeds is a fully-tagged launch,
+    unconditionally; no ec2.create_tags call happens at all."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-atomic",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["instance_id"] == "i-atomic"
+    assert idx._test_ec2.terminated == []
+    assert not hasattr(idx._test_ec2, "create_tags_attempts")
 
 
 def test_post_launch_ssm_failure_terminates_instance_returns_clean_false(monkeypatch):
@@ -345,3 +407,115 @@ def test_disabled_flag_short_circuits(monkeypatch):
     assert out["launched"] is False
     assert out["reason"] == "disabled"
     assert idx._test_ssm.sent == []
+
+
+# ── config#2223: weekly synthetic canary drill ───────────────────────────────
+
+
+def test_drill_synthesizes_isolated_identity_and_launches(monkeypatch):
+    """The happy path the weekly canary exists to verify: `{"is_drill":
+    "true"}` (the EventBridge Scheduler rule's entire static Input)
+    round-trips the REAL launch pipe with a code-synthesized drill identity —
+    DRILL_REPO + per-day sha — plus the sf-watch-drill discriminator tag."""
+    from datetime import datetime, timezone
+
+    calls = {}
+
+    def _launch(types_, subnets, **kw):
+        calls["extra_tags"] = kw.get("extra_tags")
+        return "i-stub"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"is_drill": "true"}, None)
+    expected_sha = idx._drill_sha(datetime.now(timezone.utc))
+    assert out["launched"] is True
+    assert out["is_drill"] is True
+    assert out["repo"] == idx.DRILL_REPO == "nousergon/ci-watch-drill"
+    assert out["sha"] == expected_sha
+    assert calls["extra_tags"] == {
+        "ci-watch-repo": idx.DRILL_REPO,
+        "ci-watch-sha": expected_sha,
+        "sf-watch-drill": "true",
+    }
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--is-drill "true"' in cmd
+    assert f'--ci-repo "{idx.DRILL_REPO}"' in cmd
+    assert f'--ci-sha "{expected_sha}"' in cmd
+
+
+def test_drill_identity_can_never_collide_with_a_real_dispatch(monkeypatch):
+    """Pins the structural isolation invariant (index.DRILL_REPO comment):
+    the drill sha is allowlist-valid but per-day-deterministic, DRILL_REPO is
+    not a real fleet repository, and the slash-flattened completion-marker
+    stem contains 'drill-' — so a drill can never dedupe-block a real
+    dispatch and its marker key never collides with a real one."""
+    from datetime import datetime, timezone
+
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    sha = idx._drill_sha(datetime.now(timezone.utc))
+    assert idx._SHA_RE.match(sha)
+    # ci_watch_run.sh's completion key stem is "{repo//\//-}-{sha}" — for a
+    # drill that is "nousergon-ci-watch-drill-<sha>", which contains "drill-".
+    marker_stem = f"{idx.DRILL_REPO.replace('/', '-')}-{sha}"
+    assert "drill-" in marker_stem
+    # Deterministic within a day — a duplicate drill dedupes against itself.
+    assert sha == idx._drill_sha(datetime.now(timezone.utc))
+
+
+def test_drill_ignores_payload_supplied_identity(monkeypatch):
+    """ISOLATION INVARIANT: even a payload that smuggles a real (repo, sha)
+    into a drill gets the code-synthesized drill identity — no payload can
+    point a drill at a real dispatch's lock/marker keys."""
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler({
+        "is_drill": "true",
+        "repo": "nousergon/alpha-engine-config",
+        "sha": "abc1234def5678900000000000000000000abcd",
+        "run_id": "123456789",
+        "run_url": "https://github.com/nousergon/alpha-engine-config/actions/runs/123456789",
+        "workflow": "Fleet CI",
+        "branch": "main",
+    }, None)
+    assert out["launched"] is True
+    assert out["repo"] == idx.DRILL_REPO
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--ci-repo "nousergon/alpha-engine-config"' not in cmd
+
+
+def test_drill_same_day_duplicate_dedupes_against_itself_only(monkeypatch):
+    from datetime import datetime, timezone
+
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    sha = idx._drill_sha(datetime.now(timezone.utc))
+    idx2 = _load(
+        monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={(idx.DRILL_REPO, sha): ["i-drill-live"]},
+    )
+    out = idx2.handler({"is_drill": "true"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "concurrent_skip"
+    assert idx2._test_ssm.sent == []
+
+
+def test_malformed_is_drill_returns_clean_false(monkeypatch):
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"is_drill": "yes-please"}, None)
+    assert out["launched"] is False
+    assert out["reason"] == "invalid_event"
+    assert idx._test_ssm.sent == []
+
+
+def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch):
+    calls = {}
+
+    def _launch(types_, subnets, **kw):
+        calls["extra_tags"] = kw.get("extra_tags")
+        return "i-stub"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["is_drill"] is False
+    assert "sf-watch-drill" not in calls["extra_tags"]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert '--is-drill "false"' in cmd

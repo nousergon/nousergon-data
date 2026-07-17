@@ -35,6 +35,18 @@ Parameters:
     Type: String
     Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-alerts
 
+  # alpha-engine-config-I2717/I2722 (2026-07-16): the data-spot-dispatcher and
+  # predictor-health-check Lambdas are managed OUTSIDE this stack (operator-
+  # deployed, no --bootstrap IAM here) — same pattern as the other Lambda ARN
+  # Parameters above, this stack only wires EventBridge glue to them by ARN.
+  DataSpotDispatcherLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-spot-dispatcher
+
+  PredictorHealthCheckLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-health-check:live
+
   StepFunctionsRoleArn:
     Type: String
     Default: arn:aws:iam::711398986525:role/alpha-engine-step-functions-role
@@ -81,7 +93,8 @@ Resources:
   # `universe_writer_lock` covers for manual `daily_append` invocations —
   # that lock guards the data writer; this table guards the SF entry point.
   # Together they cover both halves of "exactly one cron-fired execution of
-  # each SF per minute bucket."
+  # each SF per slot" (run-date slot for the weekly SF, minute bucket for
+  # the weekday/EOD SFs — see Schema note below).
   #
   # Trigger of record: the 2026-05-26 duplicate-EventBridge-target incident
   # (PR #322), where two parallel SF executions raced 321 unique-symbol
@@ -92,13 +105,25 @@ Resources:
   # throttle, cross-region replay coincidence, any future shape the CI
   # chokepoint misses).
   #
-  # Schema: mutex_key (S) PK only — no TTL attribute and no auto-release.
-  # The mutex_key encodes `{state-machine-name}#{pipeline_role}#{minute-bucket}`,
-  # so a successfully-acquired key is naturally single-use: no future
-  # execution can land in the same minute-bucket of a past UTC date. Item
-  # accumulation is ~12 items/week × cadence runs ≈ <1000/yr; PAY_PER_REQUEST
-  # storage cost is negligible (sub-cent annual). Periodic sweeper deferred —
-  # operationally meaningful staleness is a non-issue.
+  # Schema: mutex_key (S) PK, plus (config#2280) an OPTIONAL ttl_epoch (N)
+  # attribute with table TTL enabled.
+  # - WEEKLY SF (step_function.json): mutex_key encodes
+  #   `{state-machine-name}#{pipeline_role}#{run_date}` — the RUN-SLOT — so
+  #   staggered duplicate triggers of the same run-slot conflict at ANY
+  #   minute distance (the old minute bucket only caught same-minute dups).
+  #   A run-date key has no natural expiry, so the weekly AcquireMutex
+  #   stamps ttl_epoch (~24h) as the crashed-holder BACKSTOP; the PRIMARY
+  #   stale-item mechanism is scripts/weekly_sf_rerun.py's verified steal
+  #   (delete only after the holder execution is confirmed terminal).
+  # - WEEKDAY/EOD SFs still key on the minute bucket and write NO ttl_epoch;
+  #   items without the attribute never expire (DynamoDB TTL ignores them),
+  #   so this TimeToLiveSpecification is a purely ADDITIVE, backward-
+  #   compatible change — enabling TTL on a live table is a safe in-place
+  #   UpdateTimeToLive, no table replacement.
+  # Item accumulation is ~12 items/week × cadence runs ≈ <1000/yr;
+  # PAY_PER_REQUEST storage cost is negligible (sub-cent annual). TTL
+  # supersedes the config#730 stale-item sweeper for weekly items; the
+  # weekday/eod minute-bucket items remain permanent-but-benign as before.
   ExecutionMutexTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -110,6 +135,9 @@ Resources:
       KeySchema:
         - AttributeName: mutex_key
           KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl_epoch
+        Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: false
 
@@ -136,16 +164,24 @@ Resources:
       DefinitionS3Location:
         Bucket: alpha-engine-research
         Key: infrastructure/step_function.json
-      # Alternative: inline definition via DefinitionString
-      # Using S3 location so the JSON files in the repo are the source of truth.
-      # Deploy script uploads JSON to S3 then updates the state machine.
-      # LoggingConfiguration is OWNED HERE (declarative SoT). The deploy
-      # script's update-state-machine call passes only --definition, which is a
-      # partial update (omitted loggingConfiguration is left unchanged), so this
-      # CFN-set logging is NOT wiped on each deploy. Logging the SF execution
-      # FailedEvents (level=ERROR) is what carries the L274 MutexConflict Cause
-      # into the log group for the metric filter below. The ne-* rename
-      # (config#1381) re-created these SFs without logging — this restores it.
+      # SINGLE-WRITER CONTRACT (config#2273): the repo file
+      # infrastructure/step_function.json is the sole source of truth for
+      # this definition. DefinitionS3Location is only READ at stack-create /
+      # resource-replacement time; both deploy paths
+      # (deploy-infrastructure.sh on merge, deploy_step_function.sh for
+      # manual/bootstrap) upload the stamped repo bytes to this exact S3
+      # key BEFORE update-state-machine, so a CFN restamp can only ever
+      # re-deploy the same bytes — CFN is not an independent writer in
+      # practice. Drift backstop across all three copies (repo / S3 / live):
+      # infrastructure/step-functions/check-definition-drift.py.
+      # LoggingConfiguration is DECLARED here (declarative SoT for the
+      # shape) and ASSERTED explicitly (--logging-configuration) by the
+      # deploy scripts on every update since config#2273 — never left to
+      # partial-update preservation (the recreate-drops-logging class is
+      # config#1464). Logging the SF execution FailedEvents (level=ERROR)
+      # is what carries the L274 MutexConflict Cause into the log group
+      # for the metric filter below. The ne-* rename (config#1381)
+      # re-created these SFs without logging — this restores it.
       LoggingConfiguration:
         Level: ERROR
         IncludeExecutionData: true
@@ -171,6 +207,57 @@ Resources:
         Destinations:
           - CloudWatchLogsLogGroup:
               LogGroupArn: !GetAtt PreopenTradingLogGroup.Arn
+
+  # --------------------------------------------------------------------------
+  # Step Functions — Weekly Advisory Pipeline (alpha-engine-config-I2544)
+  # --------------------------------------------------------------------------
+  # Async child of SaturdayPipeline — the eval-judge chain / EvalRollingMean /
+  # RationaleClustering / ReplayConcordance / Counterfactual / AggregateCosts /
+  # ReportCard / Director, decoupled from the Saturday critical path.
+  # SaturdayPipeline's StartAdvisoryPipeline state fires this fire-and-forget
+  # (states:startExecution, NOT .sync) once DataPhase2 completes. NOT an
+  # EventBridge target — it has no cron trigger of its own. Same
+  # single-writer contract (config#2273) as SaturdayPipeline/WeekdayPipeline —
+  # see infrastructure/step_function_advisory.json's top-level Comment.
+  AdvisoryPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-weekly-advisory-pipeline
+      RoleArn: !Ref StepFunctionsRoleArn
+      DefinitionS3Location:
+        Bucket: alpha-engine-research
+        Key: infrastructure/step_function_advisory.json
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt WeeklyAdvisoryLogGroup.Arn
+
+  # --------------------------------------------------------------------------
+  # Step Functions — ModelZoo Sunday Pipeline (alpha-engine-config-I2545)
+  # --------------------------------------------------------------------------
+  # The model-zoo rotation (ResolveZooSpecs → ModelZooTrainMap →
+  # ModelZooSelect), moved off Saturday to its own Sunday 09:00 UTC trigger
+  # (Brian-ruled 2026-07-14 — see ModelZooSundayTrigger below). Ends with a
+  # re-invoke of the crucible-evaluator grading Lambda as the persistent-dash
+  # re-grade. Triggered directly by EventBridge — unlike AdvisoryPipeline
+  # above, this one IS an EventBridge target (it has no upstream SF to fire
+  # it fire-and-forget from).
+  ModelZooSundayPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-modelzoo-sunday-pipeline
+      RoleArn: !Ref StepFunctionsRoleArn
+      DefinitionS3Location:
+        Bucket: alpha-engine-research
+        Key: infrastructure/step_function_modelzoo.json
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ModelZooSundayLogGroup.Arn
 
   # --------------------------------------------------------------------------
   # EventBridge Rules — Pipeline Triggers
@@ -233,42 +320,105 @@ Resources:
   # (InitializeInput→CheckShellRun/ApplyShellRunDefaults) is UNCHANGED — the
   # Lambda still supplies {"shell_run": true, "pipeline_role": "shell-run"}.
 
-  WeekdayTrigger:
-    Type: AWS::Events::Rule
+  # RENAMED 2026-07-16 (config#2413 live-verification finding): CloudFormation
+  # refuses to change a resource's Type under the same logical ID in an
+  # update ("Update of resource type is not permitted") — confirmed via a
+  # real --no-execute-changeset dry run. WeekdayTrigger existed as
+  # AWS::Events::Rule; renaming the logical ID to WeekdayPipelineSchedule
+  # makes CFN treat this as a replacement (delete the old Rule, create the
+  # new Schedule) instead of an illegal in-place type transform. The
+  # `Name: alpha-engine-weekday` PHYSICAL resource name is unchanged, so
+  # nothing outside this template (EventBridge target ARNs, IAM references)
+  # needs updating — only this logical ID.
+  WeekdayPipelineSchedule:
+    Type: AWS::Scheduler::Schedule
     Properties:
       Name: alpha-engine-weekday
-      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC). At the old
-      # 06:00 start the daemon was ready ~31–32 min later (06:31–06:32 PT)
-      # even on SUCCESSFUL runs — i.e. the order book/daemon was ~1–2 min
-      # LATE for the 06:30 PT open every single day. Combined with the
-      # alpha-engine-data#264 MorningEnrich speedup (~−12 min, no longer
-      # flirting with the 30-min SSM timeout), a 05:45 start gives ~22 min
-      # expected / ~32 min P99 to daemon-ready → ready ≤ 06:17 PT at the
-      # 99th percentile, comfortably before the 06:30 open with margin.
-      # NOTE (pre-existing, unchanged here): the UTC expression assumes
-      # PDT (UTC−7); during PST the effective PT start shifts an hour.
-      # That DST caveat predates this change and is intentionally left
-      # as-is — out of scope for the start-time fix.
-      Description: Weekday 12:45 UTC (5:45 AM PT, PDT) — daily data + predictor + executor; daemon ready before 06:30 PT open
-      ScheduleExpression: 'cron(45 12 ? * MON-FRI *)'
+      # 2026-05-19: moved 06:00 → 05:45 PT (13:00 → 12:45 UTC) — bought a
+      # 13-min P99 buffer (daemon-ready ≤06:17 PT vs 06:30 open). That buffer
+      # has since been consumed by added stages (CodeFreshnessGate, predictor
+      # health/drift checks, chronic-gap self-heal): live SF history for
+      # 2026-07-09/07-10/07-13 (all SUCCEEDED on the first scheduled attempt)
+      # shows RunDaemon completing 06:31:45–06:34:15 PT — 2–4 min AFTER the
+      # 06:30 PT open every time, not a one-off. State-level breakdown shows
+      # PollMorningArcticAppendSpot alone consuming ~36–38 min (~75% of the
+      # ~46–49 min total run) — a known/expected duration already documented
+      # in alpha-engine-data's data-spot-dispatcher MAX_RUNTIME_SECONDS
+      # comment, not a defect to fix here. 2026-07-13: moved 05:45 → 05:15 PT
+      # (30-min buffer above the observed ceiling vs the 13-min buffer the
+      # 05:45 change relied on) to absorb the same kind of stage-creep
+      # without needing another manual bump every ~2 months. See
+      # nousergon/alpha-engine-config#2412 (tracked follow-up: early-warning
+      # canary so buffer erosion pages automatically instead of being
+      # noticed anecdotally).
+      # RESOLVED 2026-07-14 (config#2413): migrated this trigger from
+      # AWS::Events::Rule to AWS::Scheduler::Schedule so
+      # ScheduleExpressionTimezone can carry real IANA-timezone/DST-aware PT
+      # scheduling, matching StopTradingSchedule below. Previously, the bare
+      # UTC cron on AWS::Events::Rule (no ScheduleExpressionTimezone support)
+      # silently assumed PDT (UTC−7); during PST the effective PT start would
+      # have shifted an hour earlier (i.e. MORE buffer, not less — benign,
+      # but not the documented 5:15 AM PT contract). EventBridge Scheduler
+      # now resolves the cron against America/Los_Angeles directly, so the
+      # 12:15 UTC-equivalent cron expression below auto-adjusts across the
+      # DST boundary and always fires at 5:15 AM PT.
+      Description: Weekday 5:15 AM PT (DST-aware) — daily data + predictor + executor; daemon ready before 06:30 PT open
+      ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: 'America/Los_Angeles'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        # SINGLE TARGET PER SCHEDULE. See the SaturdayTrigger Targets
+        # comment for the 2026-05-26 duplicate-target incident that
+        # codified the analogous EventBridge-Rule invariant. SoT for
+        # this schedule is THIS FILE; the deploy scripts no longer
+        # touch EventBridge/Scheduler.
+        #
+        # EventBridge Scheduler's Step-Functions integration
+        # (arn:aws:scheduler:::aws-sdk:sfn:startExecution) wraps the
+        # SFN StartExecution call: StateMachineArn is the target state
+        # machine, and Input is a JSON STRING (not a nested object)
+        # holding the payload passed through to the execution's own
+        # input — the same payload the old AWS::Events::Rule target's
+        # top-level Input carried verbatim.
+        Arn: 'arn:aws:scheduler:::aws-sdk:sfn:startExecution'
+        RoleArn: !Ref EventBridgeSfnRoleArn
+        # pipeline_role="daily" (Option-D 2026-05-25): identifies this as
+        # the canonical weekday trading-cadence run. Page 25 filters to
+        # role="daily" by default for the Weekday section.
+        Input: !Sub |
+          {
+            "StateMachineArn": "${WeekdayPipeline}",
+            "Input": "{\"ec2_instance_id\": [\"${MicroInstanceId}\"], \"trading_instance_id\": [\"${TradingInstanceId}\"], \"sns_topic_arn\": \"${AlertsTopic}\", \"pipeline_role\": \"daily\"}"
+          }
+
+  # alpha-engine-config-I2545: ModelZoo Sunday trigger. Brian-ruled
+  # 2026-07-14 — 09:00 UTC gives a full day of retry headroom before Monday
+  # 12:45 UTC preopen (ne-preopen-trading-pipeline). Independent of
+  # SaturdayTrigger (no dependency edge in EventBridge; ordering is purely
+  # "the day after Saturday" by construction of the two separate cron
+  # expressions — no explicit day-of-week arithmetic needed since Sunday
+  # always immediately follows Saturday).
+  ModelZooSundayTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-modelzoo-sunday
+      Description: Sunday 09:00 UTC — model-zoo rotation + persistent-dash re-grade (moved off Saturday, alpha-engine-config-I2545)
+      ScheduleExpression: 'cron(0 9 ? * SUN *)'
       State: ENABLED
       Targets:
-        # SINGLE TARGET PER RULE. See the SaturdayTrigger Targets
-        # comment for the 2026-05-26 duplicate-target incident that
-        # codified this invariant. SoT for this rule is THIS FILE;
-        # the deploy scripts no longer touch EventBridge.
-        - Id: weekday-pipeline
-          Arn: !Ref WeekdayPipeline
+        # SINGLE TARGET PER RULE — see SaturdayTrigger's Targets comment for
+        # the 2026-05-26 duplicate-target incident that codified this
+        # invariant fleet-wide.
+        - Id: modelzoo-sunday-pipeline
+          Arn: !Ref ModelZooSundayPipeline
           RoleArn: !Ref EventBridgeSfnRoleArn
-          # pipeline_role="daily" (Option-D 2026-05-25): identifies this as
-          # the canonical weekday trading-cadence run. Page 25 filters to
-          # role="daily" by default for the Weekday section.
           Input: !Sub |
             {
               "ec2_instance_id": ["${MicroInstanceId}"],
-              "trading_instance_id": ["${TradingInstanceId}"],
               "sns_topic_arn": "${AlertsTopic}",
-              "pipeline_role": "daily"
+              "pipeline_role": "modelzoo-sunday"
             }
 
   # --------------------------------------------------------------------------
@@ -292,6 +442,97 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ResearchAlerts.Arn
+
+  # alpha-engine-config-I2717 (Brian ruling 2026-07-16, option 1: standalone
+  # daily heal): the universe-gap self-heal (formerly the head of the
+  # preopen SF's MorningArcticAppend state) + the chronic-polygon-gap heal
+  # (formerly the preopen SF's ChronicGapSelfHeal state, both REMOVED from
+  # step_function_daily.json — see alpha-engine-config-I2722) now run as one
+  # standalone EventBridge-triggered spot job, invoking the SAME
+  # alpha-engine-data-spot-dispatcher Lambda the preopen/postclose SFs use,
+  # via its "daily-heal" workload (weekly_collector.py --daily-heal).
+  # 09:00 UTC — hours before the 12:45 UTC preopen, so a healed day still
+  # lands same-day ahead of predictor inference.
+  DailyHealTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-daily-heal
+      Description: Weekday 09:00 UTC — standalone universe-gap + chronic-polygon-gap data heal (alpha-engine-config-I2717), off the preopen critical path
+      ScheduleExpression: 'cron(0 9 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        # SINGLE TARGET PER RULE — see SaturdayTrigger's Targets comment for
+        # the 2026-05-26 duplicate-target incident that codified this
+        # invariant fleet-wide.
+        - Id: daily-heal-dispatch
+          Arn: !Ref DataSpotDispatcherLambdaArn
+          Input: '{"workload": "daily-heal"}'
+
+  DailyHealTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataSpotDispatcherLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyHealTrigger.Arn
+
+  # alpha-engine-config-I2722 (Brian ruling 2026-07-16): PredictorHealthCheck
+  # + PredictorDriftCheck re-home off the preopen SF onto their own direct
+  # EventBridge triggers — approach (a)/(b) per state, NO new bundled health
+  # SF (ARCHITECTURE §36: "adding redundant scheduled paths 'for safety' is
+  # the wrong fix"). Both are non-blocking observability producers, never
+  # trading gates, so a plain scheduled invoke (no SF Catch/fail-soft
+  # plumbing needed) is the correct-weight mechanism. 13:40 UTC = after the
+  # preopen SF's observed ~13:15 P99 completion, so both checks observe the
+  # SAME predictions/{trading_day}.json artifact they scored against when
+  # they ran inside the SF.
+  PredictorHealthCheckTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-predictor-health-check
+      Description: Weekday 13:40 UTC — daily predictor model health (IC, hit rate, calibration, retrain triggers), re-homed off the preopen SF (alpha-engine-config-I2722)
+      ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Id: predictor-health-check
+          Arn: !Ref PredictorHealthCheckLambdaArn
+          Input: '{"action": "check"}'
+
+  PredictorHealthCheckTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PredictorHealthCheckLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PredictorHealthCheckTrigger.Arn
+
+  # config#1853 daily prediction-health producer, re-homed per I2722. The
+  # SF-era Payload threaded $.trading_day_gate.Payload.check_date for the
+  # `date` field — no such state exists on a bare EventBridge invoke, so this
+  # omits `date` entirely: nousergon/crucible-predictor's check_drift now
+  # defaults a missing date to nousergon_lib.dates.last_closed_trading_day()
+  # (fixed alongside this PR — see crucible-predictor-PR<N>, previously
+  # date.today() which is NOT trading-day-aware per this repo's Date
+  # Conventions rule).
+  PredictorDriftCheckTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-predictor-drift-check
+      Description: Weekday 13:40 UTC — daily prediction-drift producer (config#1853), re-homed off the preopen SF (alpha-engine-config-I2722)
+      ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Id: predictor-drift-check
+          Arn: !Ref PredictorLambdaArn
+          Input: '{"action": "check_drift"}'
+
+  PredictorDriftCheckTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PredictorLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PredictorDriftCheckTrigger.Arn
 
   # --------------------------------------------------------------------------
   # EventBridge Scheduler — Stop Trading Instance (10 PM PT backstop)
@@ -334,6 +575,30 @@ Resources:
       MetricName: HealthChecksFailed
       Statistic: Maximum
       Period: 21600  # 6 hours
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # alpha-engine-config-I2717 (Brian ruling 2026-07-16): "loud alert whenever
+  # the healer actually does heal-work" — a heal firing (universe-gap day OR
+  # chronic-polygon-gap ticker) is a real data-quality event worth seeing
+  # regardless of where the heal runs. Emitted every --daily-heal run
+  # (weekly_collector._run_daily_heal), including 0, so TreatMissingData=
+  # notBreaching covers the steady "nothing to heal" state (no data point ==
+  # no alarm evaluation window == OK) while a real missed run still shows up
+  # via the dispatcher's own Lambda-error alarms, not this one.
+  DailyHealDaysHealedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-daily-heal-days-healed
+      AlarmDescription: Standalone daily data-heal (alpha-engine-config-I2717) actually healed something — data-quality event, not a failure
+      Namespace: AlphaEngine/Data
+      MetricName: daily_heal_days_healed
+      Statistic: Maximum
+      Period: 86400  # 1 day — one data point per daily-heal run
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
@@ -614,6 +879,22 @@ Resources:
       LogGroupName: /aws/stepfunctions/ne-preopen-trading-pipeline
       RetentionInDays: 30
 
+  # alpha-engine-config-I2544/I2545: log groups for the two new child SFs,
+  # same CFN-owned pattern (+ 30-day retention) as the two above — both new
+  # SFs are CFN AWS::StepFunctions::StateMachine resources (unlike the
+  # script-managed EOD pipeline), so their log groups are CFN resources too.
+  WeeklyAdvisoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-weekly-advisory-pipeline
+      RetentionInDays: 30
+
+  ModelZooSundayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/ne-modelzoo-sunday-pipeline
+      RetentionInDays: 30
+
   # The SF MutualExclusionGuard (L274) fails a duplicate-trigger execution with a
   # terminal `MutexConflict` Fail — visible today only in SF execution history +
   # the SNS HandleFailure email. These metric-filters + alarms add a CloudWatch
@@ -819,6 +1100,14 @@ Outputs:
   WeekdayPipelineArn:
     Value: !Ref WeekdayPipeline
     Description: Weekday pipeline state machine ARN
+
+  AdvisoryPipelineArn:
+    Value: !Ref AdvisoryPipeline
+    Description: Weekly advisory child pipeline state machine ARN (alpha-engine-config-I2544)
+
+  ModelZooSundayPipelineArn:
+    Value: !Ref ModelZooSundayPipeline
+    Description: ModelZoo Sunday child pipeline state machine ARN (alpha-engine-config-I2545)
 
   ExecutionMutexTableName:
     Value: !Ref ExecutionMutexTable

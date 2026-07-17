@@ -177,9 +177,18 @@ def _completion_marker_exists(s3, kind: WatchKind, watch_tags: dict[str, str]) -
     failure direction than silently swallowing a genuine incomplete run
     (recording surface: the logger.warning below)."""
     if not all(watch_tags.get(key) for key in kind.discriminator_tag_keys):
-        # Box was reaped before its discriminator tags ever landed (e.g. the
-        # dispatcher's post-launch tag-write failed) — cannot look up a
-        # marker either way.
+        # Box was reaped before its discriminator tags ever landed — cannot
+        # look up a marker either way. INVARIANT (config#2267 site 2, root
+        # fix landed config#2292): the sf-watch/ci-watch dispatchers now pass
+        # discriminator tags as ``extra_tags`` into the SAME RunInstances
+        # TagSpecifications call that launches the box (krepis.ec2_spot.launch
+        # >= 0.12.0, via nousergon-lib's spot_dispatch.launch_with_fallback)
+        # — tagging is atomic with launch, not a separate post-launch
+        # create_tags call, so there is no launch→tag race window left at
+        # all. A box that reaches the reaper with any discriminator tag
+        # missing is therefore a genuine anomaly (e.g. an operator-run
+        # instance manually stripped of tags), not the old race — worth the
+        # alert this False triggers.
         return False
     key = _completion_key(kind, watch_tags)
     try:

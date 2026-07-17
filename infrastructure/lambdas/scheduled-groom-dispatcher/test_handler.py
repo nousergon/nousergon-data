@@ -34,6 +34,10 @@ class _SpotCapacityExhausted(_SpotLaunchError):
     pass
 
 
+class _GitHubAppTokenError(RuntimeError):
+    """Mirrors nousergon_lib.github_app.GitHubAppTokenError (config-I2785)."""
+
+
 def _install_stubs(launch_impl, boto_clients):
     # Real nousergon_lib.flow_doctor_fleet (FleetTelegramTopic enum) is installed
     # into TEST_DEPS by deploy.sh — do NOT hand-roll it here (config#1772).
@@ -50,6 +54,19 @@ def _install_stubs(launch_impl, boto_clients):
     boto3_mod = types.ModuleType("boto3")
     boto3_mod.client = lambda name, **kw: boto_clients[name]
     sys.modules["boto3"] = boto3_mod
+
+    # config-I2785: deterministic App-token path. Default = mint failure, so
+    # every pre-existing test keeps its exact prior _github_token behavior
+    # (SSM PAT via _FakeSSM); the App-first ordering tests override
+    # installation_token on this stub.
+    ga_mod = types.ModuleType("nousergon_lib.github_app")
+    ga_mod.GitHubAppTokenError = _GitHubAppTokenError  # type: ignore[attr-defined]
+
+    def _default_mint(**kw):
+        raise _GitHubAppTokenError("stubbed: no App creds in hermetic tests")
+
+    ga_mod.installation_token = _default_mint  # type: ignore[attr-defined]
+    sys.modules["nousergon_lib.github_app"] = ga_mod
 
 
 class _FakeWaiter:
@@ -95,7 +112,7 @@ class _FakeSsm:
         self.sent.append(kw)
         return {"Command": {"CommandId": "cmd-123"}}
 
-    def get_parameter(self, Name):  # noqa: N803 — boto3 API
+    def get_parameter(self, Name, WithDecryption=False):  # noqa: N803 — boto3 API
         if Name not in self.parameters:
             raise RuntimeError(f"Parameter {Name} not found")
         return {"Parameter": {"Value": self.parameters[Name]}}
@@ -119,10 +136,10 @@ class _FakeS3Paginator:
 
 
 class _FakeS3:
-    """Fake S3 client for the pace gate's boto3-native WET reader.
+    """Fake S3 client for the dispatcher's boto3-native S3 reads/writes.
 
-    ``objects`` maps a full S3 key to its raw JSON bytes content — mirrors the
-    real ``claude_code_usage/{source}/{date}[/{run}].json`` layout.
+    ``objects`` maps a full S3 key to its raw JSON bytes content (usage docs,
+    queue manifests, decision records).
     """
 
     def __init__(self, objects: dict | None = None):
@@ -252,19 +269,20 @@ def test_sweep_run_mode_is_forwarded(monkeypatch):
 
 
 def test_high_only_schedule_forwards_model_and_issue_filter(monkeypatch):
-    # The Opus (6pm PT) schedule's event carries model + issue_filter —
-    # these must reach the box as exported env vars ahead of the bootstrap exec.
+    # The high-only (01:00 UTC / 6pm PT) schedule's event carries model +
+    # issue_filter — these must reach the box as exported env vars ahead of
+    # the bootstrap exec.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
-        {"run_mode": "full", "model": "claude-opus-4-8", "issue_filter": "high-only",
+        {"run_mode": "full", "model": "claude-sonnet-5", "issue_filter": "high-only",
          "schedule": "0 1 * * *"},
         None,
     )
     g = out["groom"]
-    assert g["model"] == "claude-opus-4-8"
+    assert g["model"] == "claude-sonnet-5"
     assert g["issue_filter"] == "high-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_MODEL=claude-opus-4-8" in cmd
+    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
     assert "export GROOM_ISSUE_FILTER=high-only" in cmd
     assert cmd.index("export GROOM_MODEL") < cmd.index("groom_spot_bootstrap.sh")
 
@@ -274,7 +292,7 @@ def test_high_only_schedule_forwards_pr_budget(monkeypatch):
     out = idx.handler(
         {
             "run_mode": "full",
-            "model": "claude-opus-4-8",
+            "model": "claude-sonnet-5",
             "issue_filter": "high-only",
             "schedule": "0 1 * * *",
             "pr_budget": 100,
@@ -291,7 +309,7 @@ def test_deploy_schedule_high_only_carries_pr_budget():
         Path(__file__).resolve().parent / "deploy.sh"
     ).read_text()
     assert '"pr_budget":100' in deploy_sh or '"pr_budget": 100' in deploy_sh
-    # Haiku/Sonnet schedules must NOT inherit the Opus override.
+    # Haiku/Sonnet-mid schedules must NOT inherit the high-only override.
     low_line = next(
         line for line in deploy_sh.splitlines()
         if "low-only" in line and "SCHED_INPUTS" not in line
@@ -299,7 +317,12 @@ def test_deploy_schedule_high_only_carries_pr_budget():
     assert "pr_budget" not in low_line
 
 
-# ── Pre-boot pace gate (2026-07-04) ─────────────────────────────────────────
+# ── Usage pacing dismantled (Brian ruling 2026-07-14) ───────────────────────
+# The pre-boot pace gate, its SSoT ceiling wiring (config-I2461), the SSM
+# operator override, and the Anthropic-only WET reader were all REMOVED with
+# the rest of usage pacing. These tests pin the dismantle: no amount of
+# recorded usage may block or defer a scheduled launch anymore, and the env
+# kill-switch is inert (the gate it disabled no longer exists).
 def _wet_doc(wet: float) -> bytes:
     import json
     return json.dumps({"by_hour": {"10": {"opus": {"wet": wet}}}}).encode()
@@ -316,96 +339,65 @@ def _spy_notify(monkeypatch, idx):
     return calls
 
 
-def test_pace_gate_skips_launch_when_usage_ahead_of_pace(monkeypatch):
-    # 1 day into the window (elapsed_frac ~= 1/7 ~= 0.143): 50% of the weekly
-    # ceiling already consumed is way ahead of pace -> skip BEFORE any launch.
+def test_heavy_recorded_usage_never_blocks_launch(monkeypatch):
+    # Pre-dismantle this fixture (50% of the old ceiling consumed 1 day into
+    # the window) skipped the launch with reason=pace_gate_skip. Now: launch.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_notify(monkeypatch, idx)
-
-    def _launch(types_, subnets, **kw):
-        raise AssertionError("spot launch must NOT be attempted when the pace gate skips")
-
-    # index.py now delegates through nousergon_lib.spot_dispatch (config#2106)
-    # rather than calling nousergon_lib.ec2_spot directly — patch the entry
-    # point it actually calls.
-    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    g = out["groom"]
-    assert g["launched"] is False
-    assert g["reason"] == "pace_gate_skip"
-    assert g["exceeded"] is True
-    assert idx._test_ssm.sent == []  # no bootstrap command ever sent
-    # The pre-boot skip must notify — it's the ONLY place this outcome is ever
-    # visible (a run that never boots has no on-box groom_run.sh to ping).
-    assert len(notified) == 1
-    assert notified[0][1]["silent"] is True
-    assert notified[0][1]["severity"] == "info"
-    assert notified[0][1]["silent_topic"] is not None
-    assert "SKIPPED" in notified[0][0]
-    assert "soft budget threshold passed before boot" in notified[0][0]
-    assert "never launched" in notified[0][0]
-
-
-def test_pace_gate_allows_launch_when_on_pace(monkeypatch):
-    # 50% elapsed, only 10% of the ceiling used -> well under pace -> launches.
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-15.json":
-                            _wet_doc(0.1 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=3, hours=12)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
     notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
-    assert notified == []  # no ping when nothing was skipped
+    assert notified == []  # nothing skipped -> nothing to ping
 
 
-def test_pace_gate_suspended_when_operator_override_active(monkeypatch):
-    # Way over pace, but SSM override is active -> still launch.
-    idx = _load(
-        monkeypatch,
-        env={"GROOM_DISPATCH_ENABLED": "true"},
-        s3_objects={"claude_code_usage/groom/2026-07-13.json":
-                    _wet_doc(0.9 * 1_140_000_000)},
-        ssm_parameters={"/alpha-engine/groom/dynamic_budget_override_until": "2099-01-01T00:00"},
-    )
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    assert out["groom"]["launched"] is True
-
-
-def test_pace_gate_disabled_still_launches_even_if_ahead_of_pace(monkeypatch):
+def test_legacy_pace_gate_env_flag_is_inert(monkeypatch):
+    # A stale GROOM_PACE_GATE_ENABLED=true in the live Lambda env (deploys
+    # don't prune unknown env vars) must have zero effect.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
-                                   "GROOM_PACE_GATE_ENABLED": "false"},
+                                   "GROOM_PACE_GATE_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.99 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    notified = _spy_notify(monkeypatch, idx)
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     assert out["groom"]["launched"] is True
-    assert notified == []  # kill-switch disables the ping too — the gate never ran
 
 
-def test_pace_gate_fails_safe_and_still_launches_on_s3_error(monkeypatch):
+def test_demand_all_failure_writes_skip_decision_record(monkeypatch):
+    # config-I2540: an enumeration failure must leave a decision record with
+    # skip_reason=demand_all_failed (empty decisions list), so a MISSING
+    # record file unambiguously means "the scheduler never invoked the
+    # Lambda" — the 2026-07-14 incident class where the console could not
+    # distinguish an outage from a quiet early exit.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    notified = _spy_notify(monkeypatch, idx)
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("github down")))
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["reason"] == "demand_all_failed"
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/")}
+    assert len(records) == 1, f"exactly one skip record expected, got {list(records)}"
+    doc = json.loads(list(records.values())[0])
+    assert doc["skip_reason"] == "demand_all_failed"
+    assert doc["decisions"] == []
+    assert "github down" in doc["error"]
+    assert doc["schema_version"] == 2
 
+
+def test_demand_all_failure_skip_record_write_error_never_masks_the_skip(monkeypatch):
+    # The record write is best-effort: an S3 failure there must not turn the
+    # (already-notified) skip into a crash — no-silent-swallows carve-out,
+    # recorded via the CW warning log.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("github down")))
     def _boom(**kw):
-        raise RuntimeError("S3 unreachable")
-    monkeypatch.setattr(idx._test_s3, "get_paginator", _boom)
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
-    assert out["groom"]["launched"] is True
-    assert notified == []  # fail-safe path never trips (exceeded=False), no ping
+        raise RuntimeError("S3 down too")
+    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["reason"] == "demand_all_failed"
 
 
 def test_gated_reverify_schedule_forwards_filter(monkeypatch):
@@ -636,7 +628,7 @@ def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
     idx._test_ec2.describe_instances = _boom
     out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
     # A broken check must never block a launch — it's an optimization, not a
-    # correctness gate (mirrors the pace gate / demand gate fail-safe posture).
+    # correctness gate (mirrors the demand gate fail-safe posture).
     assert out["groom"]["launched"] is True
 
 
@@ -666,10 +658,10 @@ def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
 
 
 def test_demand_gate_bundles_and_downgrades_model(monkeypatch):
-    # Opus slot, no high issues, starving low+mid -> ONE Sonnet run.
+    # high slot, no high issues, starving low+mid -> ONE Sonnet run.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
-    out = idx.handler({"run_mode": "full", "model": "claude-opus-4-8",
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
                        "issue_filter": "high-only", "schedule": "0 1 * * *"}, None)
     g = out["groom"]
     assert g["launched"] and g["issue_filter"] == "mid+low"
@@ -758,7 +750,7 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
     g = out["groom"]
     assert g["trigger"] == "demand-all"
     launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
-    assert launched == {("high-only", "claude-opus-4-8"),
+    assert launched == {("high-only", "claude-sonnet-5"),
                         ("mid-only", "claude-sonnet-5"),
                         ("low-only", "claude-haiku-4-5")}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
@@ -905,21 +897,6 @@ def test_decide_only_demand_all_failure_shape(monkeypatch):
     assert out["decide"]["reason"] == "demand_all_failed"
 
 
-def test_decide_only_respects_pace_gate_skip(monkeypatch):
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
-                s3_objects={"claude_code_usage/groom/2026-07-13.json":
-                            _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
-    out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *",
-                       "decide_only": True}, None)
-    d = out["decide"]
-    assert d["launches"] == []
-    assert d["reason"] == "pace_gate_skip"
-    assert idx._test_ssm.sent == []
-
-
 def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     # A launch_decided event must NEVER touch demand-gate/fresh-stat enumeration
@@ -940,19 +917,15 @@ def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
     assert "export GROOM_ISSUE_FILTER=low-only" in cmd
 
 
-def test_launch_decided_bypasses_pace_gate(monkeypatch):
-    # A relaunch of an already-decided box must not be re-blocked by the
-    # pre-boot pace gate — that gate is a per-TRIGGER decision, made once by
-    # decide_only; re-checking it per-box would let a mid-run pace shift
-    # cancel a box the trigger already committed to.
+def test_launch_decided_launches_regardless_of_recorded_usage(monkeypatch):
+    # A relaunch of an already-decided box launches unconditionally — no
+    # usage-derived gate applies (the pace gate that once could re-block this
+    # path pre-config#2129 was dismantled 2026-07-14).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.9 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
     out = idx.handler({
-        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-opus-4-8",
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-sonnet-5",
         "issue_filter": "high-only", "launch_decided": True,
     }, None)
     assert out["groom"]["launched"] is True
@@ -972,7 +945,7 @@ _SWEEP_SF_EVENT = {
 
 def test_sweep_launch_decided_launches_haiku_sweep_box(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    # Unconditional by design: no demand/pace enumeration on the sweep path.
+    # Unconditional by design: no demand enumeration on the sweep path.
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
                         lambda token: (_ for _ in ()).throw(
                             AssertionError("sweep launch_decided must not enumerate")))
@@ -1052,6 +1025,81 @@ def test_sweep_launch_failure_raises_for_sf_catch(monkeypatch):
     idx = _load(monkeypatch, launch_impl=_boom, env={"GROOM_DISPATCH_ENABLED": "true"})
     with pytest.raises(_SpotLaunchError, match="RunInstances denied"):
         idx.handler(dict(_SWEEP_SF_EVENT), None)
+
+
+# ── config#2667: launch_decided (sweep) dispatches now write a decision ─────
+# record too — previously ONLY the demand-all path did, leaving the
+# dispatch-decision log (groom/decisions/{date}/*.json, the ground truth
+# groom-liveness-probe reads to detect a silently-missing run artifact)
+# structurally blind to sweep-mode dispatches.
+
+
+def test_sweep_launch_writes_decision_record(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler(dict(_SWEEP_SF_EVENT), None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1, f"exactly one sweep decision record expected, got {list(idx._test_s3._objects)}"
+    doc = json.loads(list(records.values())[0])
+    assert doc["schema_version"] == 2
+    assert doc["run_mode"] == "sweep"
+    assert doc["trigger"] == "launch_decided"
+    assert doc["decisions"] == [{
+        "launch": True, "issue_filter": "mid-only", "model": "claude-haiku-4-5",
+        "reason": "launch_decided", "tier_tag": "sweep",
+    }]
+    assert "decided_at" in doc
+
+
+def test_sweep_skip_launch_writes_decision_record_with_launch_false(monkeypatch):
+    # The concurrent-lane skip path (a prior cycle's sweep box still live) is
+    # itself a launch_decided invocation that must ALSO leave a record — with
+    # launch=false, so the liveness probe correctly does NOT expect an
+    # artifact for it (see groom-liveness-probe's _decision_launched).
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"sweep": ["i-live-sweep"]},
+    )
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert out["groom"]["launched"] is False
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1
+    doc = json.loads(list(records.values())[0])
+    assert doc["decisions"][0]["launch"] is False
+    assert doc["decisions"][0]["reason"] == "concurrent_tier_skip"
+
+
+def test_sweep_decision_record_write_failure_never_blocks_dispatch(monkeypatch):
+    # Best-effort, mirrors _write_trigger_record/_write_skip_record: a record
+    # -write failure must never turn an already-successful sweep launch into
+    # a crash.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+
+    def _boom(**kw):
+        raise RuntimeError("S3 down")
+
+    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert out["groom"]["launched"] is True
+
+
+def test_full_mode_launch_decided_also_writes_sweep_style_decision_record(monkeypatch):
+    # The launch_decided fast-path is shared by sweep AND any other
+    # pre-decided relaunch (e.g. the SF's bounded-relaunch loop for a
+    # full-mode box) — the record write applies uniformly to the whole
+    # launch_decided branch, not just run_mode=sweep.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-sonnet-5",
+        "issue_filter": "high-only", "launch_decided": True,
+    }, None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1
+    doc = json.loads(list(records.values())[0])
+    assert doc["run_mode"] == "full"
+    assert doc["decisions"][0]["launch"] is True
 
 
 def test_launch_decided_never_exports_partition_envs(monkeypatch):
@@ -1248,21 +1296,18 @@ def test_manifest_key_skips_demand_all_block(monkeypatch):
     assert len(idx._test_ssm.sent) == 1  # ONE box, not a demand-all fan-out
 
 
-def test_manifest_key_still_honors_pace_gate(monkeypatch):
-    """Deliberate (config#2175): the weekly WET pace gate applies to drains
-    too — a manifest bypasses the demand-COUNT gates only, never the budget."""
+def test_manifest_key_launches_regardless_of_recorded_usage(monkeypatch):
+    """Post-dismantle (2026-07-14): a manifest drain launches even with heavy
+    recorded usage — the weekly WET pace gate that used to apply to drains
+    (config#2175) is gone with the rest of usage pacing."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.5 * 1_140_000_000)})
-    fixed_now = idx.WEEKLY_RESET_ANCHOR + idx.timedelta(days=1)
-    monkeypatch.setattr(idx, "datetime", type("D", (), {
-        "now": staticmethod(lambda tz=None: fixed_now)}))
     out = idx.handler({"run_mode": "full", "schedule": "manual",
                        "model": "claude-haiku-4-5", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
-    assert out["groom"]["launched"] is False
-    assert out["groom"]["reason"] == "pace_gate_skip"
-    assert idx._test_ssm.sent == []
+    assert out["groom"]["launched"] is True
+    assert len(idx._test_ssm.sent) == 1
 
 
 def test_scheduled_demand_all_without_manifest_key_still_enumerates(monkeypatch):
@@ -1272,3 +1317,26 @@ def test_scheduled_demand_all_without_manifest_key_still_enumerates(monkeypatch)
     _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
     out = idx.handler(_demand_event(), None)
     assert len(out["groom"]["launches"]) == 3
+
+
+# ── _github_token auth ordering (config-I2785) ──────────────────────────────
+# App installation token first, PAT fallback — the 2026-07-16 GitHub outage
+# (config-I2784) 503'd user-token REST while App tokens were unaffected; the
+# ordering under test is that incident's structural fix.
+
+
+def test_github_token_prefers_app_installation_token(monkeypatch):
+    idx = _load(monkeypatch)
+    ga = sys.modules["nousergon_lib.github_app"]
+    monkeypatch.setattr(ga, "installation_token", lambda **kw: "ghs_app")
+    # No PAT parameter seeded — proves the SSM PAT path is never consulted
+    # while the App path serves.
+    assert idx._github_token() == "ghs_app"
+
+
+def test_github_token_falls_back_to_pat_on_mint_failure(monkeypatch):
+    # The stub's default installation_token raises GitHubAppTokenError.
+    idx = _load(monkeypatch, ssm_parameters={
+        "/alpha-engine/saturday_sf_watch/github_pat": "pat_value",
+    })
+    assert idx._github_token() == "pat_value"

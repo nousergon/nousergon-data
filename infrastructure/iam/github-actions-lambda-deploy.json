@@ -105,7 +105,10 @@
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["changelog/", "changelog/*"]
+          "s3:prefix": [
+            "changelog/",
+            "changelog/*"
+          ]
         }
       }
     },
@@ -123,8 +126,15 @@
       ],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-*-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-*-pipeline"
       ]
+    },
+    {
+      "Sid": "InfraDeployValidateSFDefinition",
+      "Effect": "Allow",
+      "Action": "states:ValidateStateMachineDefinition",
+      "Resource": "*"
     },
     {
       "Sid": "InfraDeployResourceCRUD",
@@ -321,7 +331,9 @@
       ],
       "Resource": [
         "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline",
-        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*"
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/vendedlogs/states/alpha-engine-groom-dispatch",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/vendedlogs/states/alpha-engine-groom-dispatch:*"
       ]
     },
     {

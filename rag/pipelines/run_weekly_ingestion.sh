@@ -2,18 +2,21 @@
 # rag/pipelines/run_weekly_ingestion.sh — Weekly RAG ingestion pipeline.
 #
 # Runs all ingestion pipelines in sequence:
-#   0. Preflight — env vars + S3 reachability (hard-fails on miss)
-#   1. SEC filings (10-K/10-Q) — from signals universe, 2y lookback
-#   2. 8-K material events — from signals universe, 1y lookback
-#   3. Earnings transcripts (Finnhub) — from signals universe, latest 8
-#   4. Thesis history — from research.db (incremental)
-#   5. News pipeline (Wave 1 Gate A) — fetch via aggregator → NLP →
-#      news_aggregates parquet + RAG corpus ingest
-#   6. Form 4 insider transactions (Wave 1 Gate A) — EDGAR → parquet
-#   7. Analyst pipeline (Wave 1 Gate A) — yfinance + Finnhub snapshot
-#      → self-derived 7d/30d revisions
-#   8. Filing change detection — analyze consecutive filings
-#   9. Manifest emit — corpus snapshot for presentation layer
+#   0.  Preflight — env vars + S3 reachability (hard-fails on miss)
+#   1.  SEC filings (10-K/10-Q) — from signals universe, 2y lookback
+#   2.  8-K material events — from signals universe, 1y lookback
+#   3.  Earnings transcripts (Finnhub) — from signals universe, latest 8
+#   4.  Thesis history — from research.db (incremental)
+#   5.  News pipeline (Wave 1 Gate A) — fetch via aggregator → NLP →
+#       news_aggregates parquet + RAG corpus ingest
+#   6.  Form 4 insider transactions (Wave 1 Gate A) — EDGAR → parquet
+#   7.  13F institutional ownership (config#2428) — reads the
+#       inst_ownership derived table (produced separately by
+#       data.derived.inst_ownership) → RAG corpus ingest, doc_type="13F"
+#   8.  Analyst pipeline (Wave 1 Gate A) — yfinance + Finnhub snapshot
+#       → self-derived 7d/30d revisions
+#   9.  Filing change detection — analyze consecutive filings
+#   10. Manifest emit — corpus snapshot for presentation layer
 #
 # Intended to run on the Saturday Step Function via SSM on the always-on
 # EC2 instance. `set -euo pipefail` plus no `|| echo "non-fatal"`
@@ -88,13 +91,13 @@ echo "========================================"
 
 # ── Step 0: Preflight — fail fast on env / connectivity drift ────────────────
 echo ""
-echo "==> Step 0/9: Preflight checks..."
+echo "==> Step 0/10: Preflight checks..."
 $PYTHON_BIN -m rag.preflight
 
 # Friday shell-run dry path: stop HERE, immediately after the existing
 # rag.preflight passed and strictly BEFORE Step 1 (the first ingest
 # pipeline). Every fetch (SEC/Finnhub/yfinance), every Voyage embedding
-# call, and every Postgres/pgvector + parquet write lives in Steps 1-9
+# call, and every Postgres/pgvector + parquet write lives in Steps 1-10
 # below — all statically unreachable once we exit here. rag.preflight
 # itself only does check_env_vars + check_s3_bucket (S3 HEAD): read-only,
 # zero external API fetch, zero mutation.
@@ -107,23 +110,23 @@ fi
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
-echo "==> Step 1/9: SEC filings (10-K/10-Q)..."
+echo "==> Step 1/10: SEC filings (10-K/10-Q)..."
 $PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
 # ── Step 2: 8-K material events ─────────────────────────────────────────────
 echo ""
-echo "==> Step 2/9: 8-K material events..."
+echo "==> Step 2/10: 8-K material events..."
 $PYTHON_BIN -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365 $DRY_RUN
 
 # ── Step 3: Earnings transcripts (Finnhub) ──────────────────────────────────
 # FINNHUB_API_KEY is verified by preflight; no runtime skip branch.
 echo ""
-echo "==> Step 3/9: Earnings transcripts (Finnhub)..."
+echo "==> Step 3/10: Earnings transcripts (Finnhub)..."
 $PYTHON_BIN -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ticker 8 $DRY_RUN
 
 # ── Step 4: Thesis history (v2 quant/qual from signals.json) ─────────────────
 echo ""
-echo "==> Step 4/9: Thesis history..."
+echo "==> Step 4/10: Thesis history..."
 SINCE=$(date -u -d '14 days ago' '+%Y-%m-%d' 2>/dev/null || date -u -v-14d '+%Y-%m-%d')
 $PYTHON_BIN -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
 
@@ -147,36 +150,48 @@ fi
 # (Loughran-McDonald sentiment + Anthropic-Haiku event extraction) → write
 # structured aggregates parquet → ingest article narrative to RAG corpus.
 echo ""
-echo "==> Step 5/9: News pipeline..."
+echo "==> Step 5/10: News pipeline..."
 $PYTHON_BIN -m rag.pipelines.run_news_pipeline --from-signals --hours 168 $DRY_RUN
 
 # ── Step 6: Form 4 insider transactions (Wave 1 Gate A) ──────────────────────
 # EDGAR Form 4 → structured per-(filed_date) parquet at
 # s3://alpha-engine-research/data/insider_transactions/{date}.parquet
 echo ""
-echo "==> Step 6/9: Form 4 insider transactions..."
+echo "==> Step 6/10: Form 4 insider transactions..."
 $PYTHON_BIN -m rag.pipelines.ingest_form4 --from-signals --lookback-days 90 $DRY_RUN
 
-# ── Step 7: Analyst pipeline (Wave 1 Gate A) ─────────────────────────────────
+# ── Step 7: 13F institutional ownership (config#2428) ───────────────────────
+# Reads the inst_ownership derived table (data.derived.inst_ownership —
+# built separately from SEC quarterly bulk Form 13F data, NOT re-fetched
+# here) and ingests one RAG document per (ticker, quarter) QoQ summary,
+# doc_type="13F". If the derived table hasn't been produced for the
+# current quarter yet, this is a no-op (logged, non-fatal exit 0) rather
+# than a pipeline failure — the SEC bulk data itself is ~45-day delayed
+# by regulation, so an empty quarter is expected, not an error.
+echo ""
+echo "==> Step 7/10: 13F institutional ownership..."
+$PYTHON_BIN -m rag.pipelines.ingest_13f --from-signals $DRY_RUN
+
+# ── Step 8: Analyst pipeline (Wave 1 Gate A) ─────────────────────────────────
 # Snapshot per-(ticker, date) consensus + price targets via yfinance + Finnhub,
 # then compute 7d/30d revisions deltas from the accumulated time series.
 # Revisions become meaningful after ~4 weekly snapshots (Gate B in ROADMAP).
 echo ""
-echo "==> Step 7/9: Analyst snapshot + revisions..."
+echo "==> Step 8/10: Analyst snapshot + revisions..."
 $PYTHON_BIN -m rag.pipelines.run_analyst_pipeline --from-signals $DRY_RUN
 
-# ── Step 8: Filing change detection ──────────────────────────────────────────
+# ── Step 9: Filing change detection ──────────────────────────────────────────
 echo ""
-echo "==> Step 8/9: Filing change detection..."
+echo "==> Step 9/10: Filing change detection..."
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
 else
     echo "  SKIPPED in dry-run mode"
 fi
 
-# ── Step 9: Manifest emit (presentation-layer source of truth) ───────────────
+# ── Step 10: Manifest emit (presentation-layer source of truth) ─────────────
 echo ""
-echo "==> Step 9/9: Emit corpus manifest..."
+echo "==> Step 10/10: Emit corpus manifest..."
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3
 else
@@ -218,6 +233,7 @@ results = {
         'thesis_history': {'status': 'ok'},
         'news_pipeline': {'status': 'ok'},
         'form4_insider': {'status': 'ok'},
+        'inst_ownership_13f': {'status': 'ok'},
         'analyst_pipeline': {'status': 'ok'},
         'filing_changes': {'status': 'ok'},
     },
