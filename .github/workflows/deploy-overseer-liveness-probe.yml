@@ -64,10 +64,16 @@ jobs:
         working-directory: alpha-engine-data
         run: |
           echo "Deployed commit: ${{ github.sha }}"
+          # Tolerate a not-yet-bootstrapped function: deploy.sh gracefully skips
+          # the code update until an operator runs --bootstrap (the OIDC role
+          # can't create the Lambda), so this report must NOT hard-fail the job
+          # when the function does not exist yet — matching the deploy step's
+          # own guard (alpha-engine-config-I2831 first-merge red-main fix).
           aws lambda get-function \
             --function-name alpha-engine-overseer-liveness-probe \
             --query "Configuration.[LastModified,CodeSha256]" \
-            --output text
+            --output text \
+            || echo "(function not bootstrapped yet — code deploy was skipped)"
 
       - name: Append to system-wide deploy changelog
         if: always()
