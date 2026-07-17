@@ -96,7 +96,10 @@
       "Action": "ssm:GetParameter",
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_pat",
-        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_app_id",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_app_installation_id",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_app_private_key"
       ]
     },
     {

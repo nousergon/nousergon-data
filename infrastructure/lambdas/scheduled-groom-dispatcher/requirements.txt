@@ -16,4 +16,9 @@ boto3>=1.34.0
 # -> claude-sonnet-5 — this Lambda picks it up automatically via
 # ge.decide_slot()/decide_trigger()'s SlotDecision.model; no code change here,
 # behavior change only (see test_handler.py updates in this same commit).
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.109.0
+# v0.124.0 (config-I2785, nousergon-lib#220) adds nousergon_lib.github_app +
+# the [github_app] extra (PyJWT[crypto]) — _github_token() now mints the
+# ne-groomer App installation token first (the identity untouched by the
+# 2026-07-16 user-token REST outage, config-I2784) and keeps the PAT only
+# as fallback.
+nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.0
