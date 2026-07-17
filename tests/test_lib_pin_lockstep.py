@@ -73,11 +73,6 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
         "bumped for extra_tags atomic-launch-tagging, config#2292)",
     ),
-    "config-runner-dispatcher": (
-        "v0.110.0",
-        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2572: same SpotProbeError "
-        "handling as ci-watch-dispatcher, pinned to the latest tag at time of writing)",
-    ),
     "data-spot-dispatcher": (
         "v0.83.0",
         "ec2_spot launch chokepoint (config#1767)",
