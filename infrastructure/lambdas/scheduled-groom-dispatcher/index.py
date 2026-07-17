@@ -95,11 +95,15 @@ BACKLOG_REPOS = (
 _RESEARCH_BUCKET = "alpha-engine-research"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
-# t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
-# on capacity error. Cheap-first type order biases pool selection toward price.
+# t4g .medium/.large (arm64/Graviton) across all 6 default-VPC subnets; the lib
+# CLI rotates on capacity error. Cheap-first type order biases toward price.
+# Graviton is ~20% cheaper than the prior t3.medium at equal perf and the Compute
+# Savings Plan (instance-family-agnostic) already covers it — cost-I2864. CRITICAL:
+# every type here MUST be arm64 to match the arm64 AMI below — an arm64 AMI will
+# not boot on an x86 instance type (and vice-versa).
 INSTANCE_TYPES = [
     t.strip()
-    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t3.medium,t3a.medium,t2.medium").split(",")
+    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t4g.medium,t4g.large").split(",")
     if t.strip()
 ]
 SUBNETS = [
@@ -111,7 +115,7 @@ SUBNETS = [
     ).split(",")
     if s.strip()
 ]
-AMI_ID = os.environ.get("GROOM_AMI_ID", "ami-0c421724a94bba6d6")  # Amazon Linux 2023 x86_64
+AMI_ID = os.environ.get("GROOM_AMI_ID", "ami-02e447f4c654c7179")  # Amazon Linux 2023 arm64/Graviton (cost-I2864)
 KEY_NAME = os.environ.get("GROOM_KEY_NAME", "alpha-engine-key")
 SECURITY_GROUP = os.environ.get("GROOM_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
 IAM_PROFILE = os.environ.get("GROOM_IAM_PROFILE", "alpha-engine-executor-profile")
