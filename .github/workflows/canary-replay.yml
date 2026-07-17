@@ -27,6 +27,17 @@ on:
   pull_request:
     types: [opened, reopened, labeled]
 
+# One in-flight canary per PR: iterative pushes to an actively-developed
+# branch superseded each other 29 times on 2026-07-16 alone, and every
+# launched replay ran the data probe's full-corpus pgvector read against
+# production Neon — the amplification that exhausted the project's monthly
+# data-transfer quota (config-I2780). The newest head is the only one whose
+# verdict matters; cancel the stale poll and let the dispatcher's server-side
+# dedupe decline the stale launch.
+concurrency:
+  group: canary-replay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   id-token: write
   contents: read
