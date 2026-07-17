@@ -206,6 +206,25 @@ class TestNeonPeriodPacing:
         assert row["quota"]["projected"] == pytest.approx(5.0)
         assert row["pace"] is None or row["pace"] == "under"  # 5.0 !> 5 GB
 
+    def test_operator_note_and_fixed_cost_surface(self, monkeypatch):
+        """A budgets note + fixed_monthly_usd (e.g. temporary paid plan) must
+        reach the row — the fixed-cost branch used to blank the note."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {"name": "nousergon",
+                "data_transfer_bytes": 8_000_000,
+                "consumption_period_start": "2026-07-01T00:00:00Z",
+                "consumption_period_end": "2026-08-01T00:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        budgets = {"providers": {"neon": {
+            "fixed_monthly_usd": 19.0, "note": "Launch plan — TEMPORARY"}}}
+        row = index.collect_neon(index._month_window(NOW), budgets,
+                                 {index.SSM_NEON: "k"})
+        assert row["mtd_cost_usd"] == 19.0
+        assert row["projected_month_end_usd"] == 19.0
+        assert row["note"] == "Launch plan — TEMPORARY"
+
 
 class TestFixedRows:
     def test_config_only_subscription_row(self):

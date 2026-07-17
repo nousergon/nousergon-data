@@ -428,8 +428,12 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
                 "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
                 "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
                 "consumption_period": f"{period_start} → {period_end}"},
-        note="free plan — the binding constraint is the transfer quota, not $"
-             if not _fixed_usd(budgets, "neon") else None,
+        # Prefer an operator note from the budgets SSoT (e.g. a temporary
+        # paid-plan explanation) so what the operator recorded reaches the page;
+        # fall back to the free-plan default only when no cost is configured.
+        note=_cfg_note(budgets, "neon")
+             or ("free plan — the binding constraint is the transfer quota, not $"
+                 if not _fixed_usd(budgets, "neon") else None),
     )
     row["budget_usd"] = _budget_usd(budgets, "neon")
     return row
@@ -522,6 +526,13 @@ def _private_repo_names(account: str, kind: str, headers: dict) -> set[str]:
         if len(batch) < 100:
             break
     return names
+
+
+def _cfg_note(budgets: dict, key: str) -> str | None:
+    """Operator-authored note for a provider from the budgets SSoT (surfaced on
+    the row so a manual explanation — e.g. a temporary plan change — reaches the
+    console)."""
+    return ((budgets.get("providers") or {}).get(key) or {}).get("note")
 
 
 def _included_minutes(budgets: dict, key: str) -> float | None:
