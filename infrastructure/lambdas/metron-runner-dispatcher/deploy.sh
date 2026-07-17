@@ -56,6 +56,7 @@
 # Usage:
 #   bash .../metron-runner-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
 #   bash .../metron-runner-dispatcher/deploy.sh --bootstrap # operator-only: create/update the IAM role + Lambda + Function URL + reconcile schedule
+#   bash .../metron-runner-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../metron-runner-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../metron-runner-dispatcher/deploy.sh --smoke     # invoke the WORKER phase once with a synthetic job id (fires a REAL spot box)
 #   bash .../metron-runner-dispatcher/deploy.sh --reconcile-test # invoke the RECONCILE phase once directly (read-only unless it finds a genuinely stale job)
@@ -63,6 +64,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="metron-runner-dispatcher"
 ROLE_NAME="metron-runner-dispatcher-role"
 POLICY_NAME="metron-runner-dispatcher-policy"
@@ -84,12 +86,14 @@ case "${DRY_RUN:-false}" in
   *) DRY_RUN=false ;;
 esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 RECONCILE_TEST=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     --reconcile-test) RECONCILE_TEST=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
@@ -141,6 +145,14 @@ ZIP="${PKG}/function.zip"
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
+
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
