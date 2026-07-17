@@ -56,27 +56,6 @@
       }
     },
     {
-      "Sid": "ReadClaudeCodeUsageForPaceGate",
-      "Effect": "Allow",
-      "Action": [
-        "s3:ListBucket"
-      ],
-      "Resource": "arn:aws:s3:::alpha-engine-research",
-      "Condition": {
-        "StringLike": {
-          "s3:prefix": "claude_code_usage/*"
-        }
-      }
-    },
-    {
-      "Sid": "ReadClaudeCodeUsageObjectsForPaceGate",
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject"
-      ],
-      "Resource": "arn:aws:s3:::alpha-engine-research/claude_code_usage/*"
-    },
-    {
       "Sid": "ListGroomRunArtifactsForFreshSkip",
       "Effect": "Allow",
       "Action": [
@@ -112,20 +91,15 @@
       ]
     },
     {
-      "Sid": "ReadGroomBudgetOverrideParam",
-      "Effect": "Allow",
-      "Action": [
-        "ssm:GetParameter"
-      ],
-      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/dynamic_budget_override_until"
-    },
-    {
       "Sid": "ReadGroomPatForDemandGate",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_pat",
-        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_app_id",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_app_installation_id",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_app_private_key"
       ]
     },
     {
@@ -139,6 +113,21 @@
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/queues/*"
+    },
+    {
+      "Sid": "FlowDoctorDedupStore",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
+      ]
     }
   ]
 }

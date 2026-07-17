@@ -816,13 +816,15 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
     def _fake_loader(s3, bucket, run_date=None):
         return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
 
-    # happy path. The prior-gap self-heal is a separate collaborator with its
-    # own test file (test_universe_gap_self_heal.py); no-op it here so this
-    # test isolates the same-day append behavior it asserts on.
-    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    # happy path. alpha-engine-config-I2717 (2026-07-16): the prior-gap
+    # self-heal that used to run at the head of this function was REMOVED
+    # entirely (moved to the standalone --daily-heal entrypoint — see
+    # test_universe_gap_self_heal.py for the heal function's own tests, and
+    # the test_run_daily_heal_* tests below for its new caller). This test no
+    # longer needs to no-op _self_heal_missing_universe_days — it is simply
+    # not called by _run_morning_arctic_append anymore.
     calls = []
     with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
-         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
          patch("builders._constituents_loader.load_constituents_for_run_date",
                side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append",
@@ -830,15 +832,76 @@ def test_arctic_append_runs_daily_append_and_is_load_bearing():
         ok = weekly_collector._run_morning_arctic_append(config, args)
     assert ok["status"] == "ok" and ok["mode"] == "morning_arctic_append"
     assert calls and calls[0]["date_str"] == "2026-04-22"
+    assert "prior_gap_heal" not in ok["collectors"], (
+        "the prior-gap self-heal collector entry must be gone — that heal "
+        "moved to the standalone --daily-heal entrypoint (I2717)"
+    )
 
     # load-bearing: append raises → failed
     with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
-         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
          patch("builders._constituents_loader.load_constituents_for_run_date",
                side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")):
         bad = weekly_collector._run_morning_arctic_append(config, args)
     assert bad["status"] == "failed"
+
+
+def test_arctic_append_success_clears_pending_upgrades_ledger():
+    """config#2672: MorningArcticAppend IS the polygon-corrected write — a
+    successful load-bearing append must clear target_date from the durable
+    pending-upgrades ledger (a no-op if it was never marked)."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=False)
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
+
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}), \
+         patch("weekly_collector._clear_pending_upgrade") as p_clear:
+        ok = weekly_collector._run_morning_arctic_append(config, args)
+    assert ok["status"] == "ok"
+    p_clear.assert_called_once_with("2026-04-22", "test-bucket")
+
+
+def test_arctic_append_dry_run_does_not_clear_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
+
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok_dry_run"}), \
+         patch("weekly_collector._clear_pending_upgrade") as p_clear:
+        weekly_collector._run_morning_arctic_append(config, args)
+    p_clear.assert_not_called()
+
+
+def test_arctic_append_failure_does_not_clear_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=False)
+
+    def _fake_loader(s3, bucket, run_date=None):
+        return ({"AAPL", "MSFT"}, run_date or "2026-04-22")
+
+    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
+         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
+         patch("builders._constituents_loader.load_constituents_for_run_date",
+               side_effect=_fake_loader), \
+         patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")), \
+         patch("weekly_collector._clear_pending_upgrade") as p_clear:
+        weekly_collector._run_morning_arctic_append(config, args)
+    p_clear.assert_not_called()
 
 
 def test_arctic_append_reads_constituents_by_run_date_not_pointer():
@@ -871,11 +934,11 @@ def test_arctic_append_reads_constituents_by_run_date_not_pointer():
         return ({"AAPL", "MSFT", "NVDA"}, run_date)
 
     captured = []
-    # No-op the prior-gap self-heal (own test file) so the loader/append calls
-    # asserted below are exactly today's append, not the heal's per-day reads.
-    _noop_heal = {"missing_days": [], "healed_days": [], "deferred_days": [], "errors": []}
+    # alpha-engine-config-I2717 (2026-07-16): the prior-gap self-heal used to
+    # need no-oping here too — it no longer runs inside this function at all
+    # (moved to the standalone --daily-heal entrypoint), so the loader/append
+    # calls asserted below are already exactly today's append.
     with patch("weekly_collector.boto3.client", return_value=MagicMock()), \
-         patch("weekly_collector._self_heal_missing_universe_days", return_value=_noop_heal), \
          patch("builders._constituents_loader.load_constituents_for_run_date",
                side_effect=_fake_loader), \
          patch("builders.daily_append.daily_append",
@@ -970,6 +1033,97 @@ def test_daily_arctic_append_runs_daily_append_with_skip_if_exists_and_is_load_b
     assert bad["status"] == "failed"
 
 
+def test_daily_arctic_append_success_marks_pending_upgrades_ledger():
+    """config#2672: EOD PostMarketArcticAppend is ALWAYS the yfinance-basis
+    (fallback-quality) write — a successful append must mark run_date pending
+    the next morning's polygon-corrected overwrite."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=False)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}), \
+         patch("weekly_collector._mark_pending_upgrade") as p_mark:
+        ok = weekly_collector._run_daily_arctic_append(config, args)
+    assert ok["status"] == "ok"
+    p_mark.assert_called_once_with("2026-06-16", "fallback_quality", "test-bucket")
+
+
+def test_daily_arctic_append_dry_run_does_not_mark_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=True)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok_dry_run"}), \
+         patch("weekly_collector._mark_pending_upgrade") as p_mark:
+        weekly_collector._run_daily_arctic_append(config, args)
+    p_mark.assert_not_called()
+
+
+def test_daily_arctic_append_failure_does_not_mark_pending_upgrades_ledger():
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-06-16", dry_run=False)
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL", "MSFT"]}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.daily_append.daily_append", side_effect=RuntimeError("boom")), \
+         patch("weekly_collector._mark_pending_upgrade") as p_mark:
+        weekly_collector._run_daily_arctic_append(config, args)
+    p_mark.assert_not_called()
+
+
+# ── _MACRO_DAILY_TICKERS hard-pin (config-I2703, 2026-07-15 P0) ─────────────
+#
+# SPY (the alpha-math + eod_reconcile benchmark) was found excluded from
+# daily_append's internal expected_tickers scoping — a SEPARATE bug fixed
+# in builders/daily_append.py (see tests/test_spy_universe_member.py
+# section D). While investigating, a second, independent drift risk turned
+# up here: _run_morning_enrich carried its OWN inline copy of the
+# macro/benchmark ticker list (local var, no leading underscore) instead of
+# sharing the module-level _MACRO_DAILY_TICKERS constant that
+# _load_daily_universe_tickers (the EOD PostMarketArcticAppend twin of this
+# weekday state) uses. Two independently-editable literals of "the daily
+# macro tickers" is a duplicate-pin-drift risk: SPY could be removed from
+# one copy (e.g. a churn-scoping refactor) and silently survive in the
+# other, masking exactly the kind of gap this incident was about. These
+# tests pin (a) SPY is a permanent member of the single canonical constant,
+# and (b) both call sites derive from it — no second inline copy.
+
+
+def test_macro_daily_tickers_constant_pins_spy():
+    """The canonical macro/benchmark ticker list must always include SPY —
+    this is the hard pin the freshness/missing-from-closes scoping in
+    daily_append.py relies on to never treat SPY as a churn-eligible
+    S&P straggler."""
+    assert "SPY" in weekly_collector._MACRO_DAILY_TICKERS
+
+
+def test_morning_enrich_and_daily_arctic_append_share_one_macro_ticker_list():
+    """Guard against config-I2703 regressing: _run_morning_enrich must NOT
+    reintroduce a separate inline copy of the macro-tickers list — both the
+    weekday (MorningEnrich) and EOD (_load_daily_universe_tickers) paths
+    must derive expected_tickers from the SAME module-level constant."""
+    import inspect
+
+    morning_enrich_src = inspect.getsource(weekly_collector._run_morning_enrich)
+    assert "_MACRO_DAILY_TICKERS" in morning_enrich_src, (
+        "_run_morning_enrich no longer references the shared "
+        "_MACRO_DAILY_TICKERS constant — check it hasn't reintroduced a "
+        "separate inline copy of the macro/benchmark ticker list "
+        "(the config-I2703 duplicate-pin-drift regression)."
+    )
+    assert "MACRO_DAILY_TICKERS = [" not in morning_enrich_src, (
+        "_run_morning_enrich has its own inline macro-tickers list literal "
+        "again — this must be a single shared constant "
+        "(weekly_collector._MACRO_DAILY_TICKERS), not two independently-"
+        "editable copies."
+    )
+
+
 # ── chronic-gap heal hard timeout (L4605) ───────────────────────────────────
 
 
@@ -1007,3 +1161,184 @@ def test_hard_timeout_clean_exit_does_not_fire():
     with weekly_collector._hard_timeout(5, "x"):
         ran.append(True)
     assert ran == [True]
+
+
+# ── standalone daily heal (alpha-engine-config-I2717, 2026-07-16) ──────────
+
+
+def test_daily_heal_routes_via_run_weekly():
+    """run_weekly must dispatch --daily-heal to _run_daily_heal."""
+    args = SimpleNamespace(
+        morning_enrich=False, morning_arctic_append=False,
+        daily_arctic_append=False, chronic_gap_heal=False, daily_heal=True,
+        daily=False,
+    )
+    with patch("weekly_collector._run_daily_heal",
+               return_value={"status": "ok", "mode": "daily_heal"}) as heal:
+        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+    heal.assert_called_once()
+    assert out["mode"] == "daily_heal"
+
+
+def test_run_daily_heal_happy_path_no_work_emits_zero_metric():
+    """Both sub-heals are no-ops (nothing to heal): days_healed == 0, the
+    CloudWatch metric still emits (continuous baseline, per the existing
+    chronic-gap-alarm convention), and the S3 heal-summary artifact is
+    written to the documented path."""
+    config = {"bucket": "test-bucket"}  # no chronic_polygon_gaps configured
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    _noop_universe_heal = {
+        "missing_days": [], "fallback_quality_days": [], "healed_days": [],
+        "deferred_days": [], "errors": [],
+    }
+    put_metric_calls = []
+    put_object_calls = []
+
+    class _FakeCloudwatch:
+        def put_metric_data(self, **kwargs):
+            put_metric_calls.append(kwargs)
+
+    class _FakeS3:
+        def put_object(self, **kwargs):
+            put_object_calls.append(kwargs)
+
+    def _fake_client(name):
+        return {"cloudwatch": _FakeCloudwatch(), "s3": _FakeS3()}[name]
+
+    with patch("weekly_collector.boto3.client", side_effect=_fake_client), \
+         patch("weekly_collector._self_heal_missing_universe_days",
+               return_value=_noop_universe_heal):
+        out = weekly_collector._run_daily_heal(config, args)
+
+    assert out["status"] == "ok"
+    assert out["mode"] == "daily_heal"
+    assert out["days_healed"] == 0
+    assert out["collectors"]["universe_gap_heal"]["status"] == "ok"
+    assert out["collectors"]["chronic_gap_heal"]["status"] == "ok"
+
+    assert len(put_metric_calls) == 1
+    metric = put_metric_calls[0]
+    assert metric["Namespace"] == "AlphaEngine/Data"
+    assert metric["MetricData"][0]["MetricName"] == "daily_heal_days_healed"
+    assert metric["MetricData"][0]["Value"] == 0.0
+
+    assert len(put_object_calls) == 1
+    put = put_object_calls[0]
+    assert put["Bucket"] == "test-bucket"
+    assert put["Key"] == "data/heal/daily/2026-04-22.json"
+
+
+def test_run_daily_heal_counts_universe_and_chronic_healed_work():
+    """days_healed sums universe-gap days healed + chronic-gap tickers
+    healed — either kind firing is a real data-quality event."""
+    config = {"bucket": "test-bucket", "chronic_polygon_gaps": {"tickers": {"BRK-B": "x"}}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    _universe_heal = {
+        "missing_days": ["2026-04-20"], "fallback_quality_days": [],
+        "healed_days": [{"date": "2026-04-20", "kind": "missing", "tickers": 500}],
+        "deferred_days": [], "errors": [],
+    }
+    put_metric_calls = []
+
+    class _FakeCloudwatch:
+        def put_metric_data(self, **kwargs):
+            put_metric_calls.append(kwargs)
+
+    class _FakeS3:
+        def put_object(self, **kwargs):
+            pass
+
+    def _fake_client(name):
+        return {"cloudwatch": _FakeCloudwatch(), "s3": _FakeS3()}[name]
+
+    with patch("weekly_collector.boto3.client", side_effect=_fake_client), \
+         patch("weekly_collector._self_heal_missing_universe_days",
+               return_value=_universe_heal), \
+         patch("weekly_collector._load_chronic_polygon_gaps", lambda c: ["BRK-B"]), \
+         patch("weekly_collector._detect_chronic_gap_polygon_recovery",
+               lambda **k: {"status": "ok"}), \
+         patch("weekly_collector._detect_chronic_gap_constituents_drift",
+               lambda **k: {"still_constituents": ["BRK-B"]}), \
+         patch("weekly_collector._self_heal_chronic_polygon_gaps",
+               return_value={"healed": ["BRK-B"], "skipped_already_fresh": [], "errors": []}):
+        out = weekly_collector._run_daily_heal(config, args)
+
+    assert out["days_healed"] == 2  # 1 universe day + 1 chronic ticker
+    assert put_metric_calls[0]["MetricData"][0]["Value"] == 2.0
+
+
+def test_run_daily_heal_universe_gap_timeout_is_best_effort_skip():
+    """A hung universe-gap heal hits the standalone hard timeout and is
+    recorded as a best-effort skip — must never fail the overall mode."""
+    import time as _time
+
+    config = {"bucket": "test-bucket"}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    def _hang(**k):
+        _time.sleep(5)  # interrupted by SIGALRM at 1s
+        return {"healed_days": []}
+
+    with patch("weekly_collector._UNIVERSE_GAP_HEAL_STANDALONE_HARD_TIMEOUT_S", 1), \
+         patch("weekly_collector._self_heal_missing_universe_days", side_effect=_hang), \
+         patch("weekly_collector.boto3.client", return_value=MagicMock()):
+        out = weekly_collector._run_daily_heal(config, args)
+
+    assert out["status"] == "ok", "the mode must stay ok — heals are best-effort internally"
+    assert out["collectors"]["universe_gap_heal"]["status"] == "skipped"
+    assert "hard timeout" in out["collectors"]["universe_gap_heal"]["error"]
+    assert out["days_healed"] == 0
+
+
+def test_run_daily_heal_standalone_timeout_is_config_overridable():
+    """universe_gap_heal.standalone_hard_timeout_s in config overrides the
+    module default — asserted by capturing the seconds argument passed to
+    _hard_timeout rather than actually sleeping past it."""
+    config = {
+        "bucket": "test-bucket",
+        "universe_gap_heal": {"standalone_hard_timeout_s": 42},
+    }
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    captured_seconds = []
+    real_hard_timeout = weekly_collector._hard_timeout
+
+    def _spy_hard_timeout(seconds, label):
+        captured_seconds.append(seconds)
+        return real_hard_timeout(seconds, label)
+
+    with patch("weekly_collector._hard_timeout", side_effect=_spy_hard_timeout), \
+         patch("weekly_collector._self_heal_missing_universe_days",
+               return_value={"healed_days": []}), \
+         patch("weekly_collector.boto3.client", return_value=MagicMock()):
+        weekly_collector._run_daily_heal(config, args)
+
+    assert 42 in captured_seconds
+
+
+def test_run_daily_heal_propagates_on_s3_artifact_write_failure():
+    """Fail-loud posture: an inability to write the heal-summary artifact
+    (the clearest 'cannot reach S3 at all' signal) must propagate out of
+    _run_daily_heal, not be swallowed — this is what lets main() exit
+    nonzero when the heal infrastructure itself is unreachable."""
+    config = {"bucket": "test-bucket"}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True)
+
+    class _FailingS3:
+        def put_object(self, **kwargs):
+            raise RuntimeError("S3 totally unreachable")
+
+    class _FakeCloudwatch:
+        def put_metric_data(self, **kwargs):
+            pass
+
+    def _fake_client(name):
+        return {"cloudwatch": _FakeCloudwatch(), "s3": _FailingS3()}[name]
+
+    with patch("weekly_collector.boto3.client", side_effect=_fake_client), \
+         patch("weekly_collector._self_heal_missing_universe_days",
+               return_value={"healed_days": []}), \
+         pytest.raises(RuntimeError, match="S3 totally unreachable"):
+        weekly_collector._run_daily_heal(config, args)

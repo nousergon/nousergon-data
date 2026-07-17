@@ -37,9 +37,14 @@ The wedged-SHARED-HOST risk config#1811 exists to catch does not apply the
 same way to a single-purpose ephemeral box with its own bootstrap watchdog
 (InstanceInitiatedShutdownBehavior=terminate), so they are excluded here by
 name — this test still fails loud on any OTHER bare poll (a real copy-drift
-on a persistent/shared target). ChronicGapSelfHeal stays on the trading box
-(small, fail-soft, 300s timeout) and keeps its liveness-poller loop,
-retargeted to the trading box instead of the now-retired shared data spot.
+on a persistent/shared target).
+
+alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal (and its
+liveness-poller loop — InitChronicGapPoll/WaitForChronicGap/
+CheckChronicGapStatus/ChronicGapWait/StampChronicGapUnresponsive) was REMOVED
+from this SF entirely; the heal now runs as a standalone EventBridge-
+triggered daily job, off the trading box. Only two liveness loops remain on
+the trading box: code-freshness-gate and morning-planner.
 """
 
 from __future__ import annotations
@@ -62,16 +67,15 @@ _POLLER_ARN_FRAGMENT = "alpha-engine-ssm-liveness-poller"
 _BARE_POLL_EXEMPT = {"PollMorningEnrichSpot", "PollMorningArcticAppendSpot"}
 
 # loop name -> (init, poll, check, wait, poll slot, stamp)
+# alpha-engine-config-I2717 (2026-07-16): the "chronic-gap-heal" loop entry
+# (InitChronicGapPoll/WaitForChronicGap/CheckChronicGapStatus/ChronicGapWait/
+# StampChronicGapUnresponsive) was REMOVED — that heal now runs standalone,
+# off this SF and off the trading box entirely.
 _LOOPS = {
     "code-freshness-gate": (
         "InitCodeFreshnessPoll", "WaitForCodeFreshness",
         "CheckCodeFreshnessStatus", "CodeFreshnessWait",
         "$.code_freshness_poll", "StampCodeFreshnessUnresponsive",
-    ),
-    "chronic-gap-heal": (
-        "InitChronicGapPoll", "WaitForChronicGap",
-        "CheckChronicGapStatus", "ChronicGapWait",
-        "$.chronic_gap_poll", "StampChronicGapUnresponsive",
     ),
     "morning-planner": (
         "InitMorningPlannerPoll", "WaitForMorningPlanner",
@@ -144,9 +148,9 @@ def test_loop_wiring(states, step):
     # comment used to describe was retired — MorningEnrich/MorningArcticAppend
     # moved to two independent, self-terminating ephemeral spots with their
     # OWN (non-liveness-poller) poll loops, so no loop in THIS registry targets
-    # a spot anymore. All three remaining loops (code-freshness-gate,
-    # chronic-gap-heal, morning-planner) run on the persistent trading box and
-    # force-STOP (never terminate) it.
+    # a spot anymore. Both remaining loops (code-freshness-gate,
+    # morning-planner — chronic-gap-heal removed per alpha-engine-config-I2717)
+    # run on the persistent trading box and force-STOP (never terminate) it.
     st_stamp = states[stamp]
     assert st_stamp["ResultPath"] == "$.error"
     assert st_stamp["Parameters"]["Cause.$"] == f"{slot}.detail"
@@ -187,7 +191,12 @@ def test_code_freshness_gate_front_loads_the_drift_check(states):
     assert "CODE-STALE-AFTER-HEAL" in cmds and "exit 1" in cmds, (
         "persistent drift after the one self-heal must exit non-zero (fail loud)"
     )
-    assert "ast.parse" in cmds, "executor syntax gate must run (broken main may not proceed)"
+    assert "import executor.main" in cmds and "executor.daemon" in cmds and "executor.eod_reconcile" in cmds, (
+        "executor import smoke test must run (broken main or any transitive "
+        "import may not proceed; config#2353 upgraded this from an ast.parse-only "
+        "syntax check to a real import so ImportErrors in non-entrypoint modules "
+        "are caught too)"
+    )
 
     fresh = [
         c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]

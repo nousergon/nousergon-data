@@ -79,7 +79,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -161,14 +160,14 @@ SF_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
 # test_drill_run_date_can_never_collide_with_a_real_run_date.
 DRILL_RUN_DATE_PREFIX = "drill-"
 
-# Discriminator tag write (config#2267 site 2): the tags are LOAD-BEARING —
-# without them the next failure's dedupe guard is blind (duplicate box) and
-# spot-orphan-reaper cannot derive the completion-marker key (guaranteed
-# false "incomplete reap" page for a healthy run). Bounded retry, then
-# terminate-the-box-and-fail-the-dispatch on final failure. Retry delay is
-# env-overridable so tests run at 0.
-TAG_WRITE_ATTEMPTS = int(os.environ.get("SF_WATCH_TAG_WRITE_ATTEMPTS", "3"))
-TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("SF_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "2"))
+# Discriminator tags (config#2267 site 2, config#2292 root fix): the tags
+# are LOAD-BEARING — without them the next failure's dedupe guard is blind
+# (duplicate box) and spot-orphan-reaper cannot derive the completion-marker
+# key. They now ride the RunInstances TagSpecifications call ATOMICALLY (see
+# _launch_instance's extra_tags) instead of a separate post-launch
+# create_tags call — the box is never observably untagged, so the PR758
+# bounded-retry-then-terminate path this replaced is gone entirely (one
+# mechanism, not two).
 
 # The box reads its own run secrets (PAT) via its instance profile in the
 # common case, but the PRELUDE below (run before the profile-backed bootstrap
@@ -211,6 +210,11 @@ _WATCH_PREFIXES = {
     "ne-weekly-freshness-pipeline": "consolidated/saturday_sf_watch",
     "ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch",
     "ne-postclose-trading-pipeline": "consolidated/eod_sf_watch",
+    # alpha-engine-config-I2544/I2545 (2026-07-14): the two child SFs split
+    # out of the weekly pipeline, added together with their
+    # saturday-sf-watch-dispatcher PIPELINES entries per the lockstep test.
+    "ne-weekly-advisory-pipeline": "consolidated/weekly-advisory_sf_watch",
+    "ne-modelzoo-sunday-pipeline": "consolidated/modelzoo-sunday_sf_watch",
     # The transitional alpha-engine-eod-pipeline alias was removed together
     # with saturday-sf-watch-dispatcher's PIPELINES entry on 2026-07-11
     # (config#2272) — the lockstep test enforces "together".
@@ -335,14 +339,30 @@ exec bash infrastructure/sf_watch_spot_bootstrap.sh \
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(
+    cadence_slug: str, pipeline_name: str, run_date: str,
+    is_drill: bool = False, force_on_demand: bool = False,
+) -> tuple[str, str]:
     """Launch the SF-watch box; spot first, on-demand fallback on capacity
     exhaustion — or straight to on-demand when ``force_on_demand`` (the
     config#2270 reclaim relaunch; ``launch_with_fallback`` grew the kwarg in
     nousergon-lib v0.106.0, this Lambda's pinned version). Raises
     SpotLaunchError (or the SpotCapacityExhausted subclass) if every attempt
     is exhausted/fails — caught once by the caller and converted to a clean
-    launched:false."""
+    launched:false.
+
+    The load-bearing (cadence, pipeline, run_date) discriminator tags
+    (config#2267 site 2) ride the SAME RunInstances call as the launch
+    itself via ``extra_tags`` (config#2292 root fix, nousergon-lib >= 0.108.0
+    / krepis >= 0.12.0) — the box is never observably untagged, so there is
+    no post-launch create_tags step to retry or fail."""
+    extra_tags = {
+        SF_WATCH_CADENCE_TAG_KEY: cadence_slug,
+        SF_WATCH_PIPELINE_TAG_KEY: pipeline_name,
+        SF_WATCH_RUN_DATE_TAG_KEY: run_date,
+    }
+    if is_drill:
+        extra_tags[SF_WATCH_DRILL_TAG_KEY] = "true"
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -351,6 +371,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name=SF_WATCH_TAG_NAME,
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -408,40 +429,6 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="sf-watch")
 
 
-def _create_discriminator_tags(
-    instance_id: str, cadence_slug: str, pipeline_name: str, run_date: str,
-    is_drill: bool = False,
-) -> str | None:
-    """Write the load-bearing discriminator tags (config#2267 site 2) with a
-    bounded retry. Returns None on success, or the final ``"ExcName: msg"``
-    string after TAG_WRITE_ATTEMPTS failures — the caller terminates the box
-    and fails the dispatch (the tags are what make the box visible to the
-    dedupe guard and the spot-orphan-reaper; an untagged box must not run).
-    A canary drill box (config#2223) additionally carries
-    ``sf-watch-drill=true`` so fleet consumers can tell it apart."""
-    tags = [
-        {"Key": SF_WATCH_CADENCE_TAG_KEY, "Value": cadence_slug},
-        {"Key": SF_WATCH_PIPELINE_TAG_KEY, "Value": pipeline_name},
-        {"Key": SF_WATCH_RUN_DATE_TAG_KEY, "Value": run_date},
-    ]
-    if is_drill:
-        tags.append({"Key": SF_WATCH_DRILL_TAG_KEY, "Value": "true"})
-    last_error = ""
-    for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
-        try:
-            boto3.client("ec2", region_name=REGION).create_tags(
-                Resources=[instance_id], Tags=tags
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001 — bounded retry; final failure is FATAL to the dispatch (caller terminates + fails)
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "sf-watch discriminator tag write attempt %d/%d failed for %s: %s",
-                attempt, TAG_WRITE_ATTEMPTS, instance_id, last_error,
-            )
-            if attempt < TAG_WRITE_ATTEMPTS:
-                time.sleep(TAG_WRITE_RETRY_DELAY_SEC)
-    return last_error
 
 
 def _defer_schedule_name(
@@ -712,7 +699,10 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
     # config#2270: the reclaim checker's bounded relaunch skips spot entirely.
     force_on_demand = fields.get("force_on_demand") == "true"
     try:
-        instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+        instance_id, market = _launch_instance(
+            cadence_slug, pipeline_name, run_date,
+            is_drill=is_drill, force_on_demand=force_on_demand,
+        )
     except SpotLaunchError as exc:
         logger.error("sf-watch spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
@@ -722,27 +712,11 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
                " dedupe_degraded=true" if dedupe_degraded else "")
     # config#1979-style tags so the NEXT trigger's guard check (above) — and
     # the fleet spot-orphan-reaper's completion-marker lookup — can find the
-    # box. LOAD-BEARING, not cosmetic (config#2267 site 2): bounded retry,
-    # then TERMINATE the box and fail the dispatch on final failure — a box
-    # invisible to the dedupe guard and the reaper must not run. (The root
-    # fix — discriminator tags atomic with launch via RunInstances
-    # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
-    # RunInstances chokepoint, growing an extra-tags parameter; until then
-    # this retry+terminate closes the hole loudly.)
-    tag_error = _create_discriminator_tags(
-        instance_id, cadence_slug, pipeline_name, run_date, is_drill=is_drill
-    )
-    if tag_error is not None:
-        _terminate_instance(instance_id)
-        logger.error(
-            "sf-watch discriminator tag write FAILED after %d attempts for %s "
-            "(%s/%s@%s) — box terminated, dispatch failed: %s",
-            TAG_WRITE_ATTEMPTS, instance_id, cadence_slug, pipeline_name,
-            run_date, tag_error,
-        )
-        return {"launched": False, "reason": "tag_write_failed",
-                "instance_id": instance_id, "error": tag_error,
-                "dedupe_degraded": dedupe_degraded}
+    # box. LOAD-BEARING, not cosmetic (config#2267 site 2) — and, as of
+    # config#2292, ATOMIC with launch: _launch_instance already passed them
+    # as extra_tags into the RunInstances TagSpecifications, so the box is
+    # never observably untagged. No post-launch create_tags step remains to
+    # retry or fail here.
 
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —

@@ -33,9 +33,9 @@ RESEARCH_BUCKET_ARN = "arn:aws:s3:::alpha-engine-research"
 # Adding a new S3 read to index.py without extending the policy AND this map
 # is exactly the config#2142 gap — keep them in lockstep.
 READ_SURFACES = {
-    # pace gate (_pace_gate_status)
-    "claude_code_usage": "claude_code_usage/groom/2026-07-10.json",
-    # engagement scan (_load_recent_engagements, config#1893/#2038)
+    # engagement scan (_load_recent_engagements, config#1893/#2038).
+    # claude_code_usage was removed 2026-07-14 with the pre-boot pace gate
+    # (usage pacing dismantled) — the dispatcher no longer reads usage docs.
     "groom_run_artifacts": "groom/2026-07-10/abc123.json",
 }
 
