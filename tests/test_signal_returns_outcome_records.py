@@ -23,7 +23,11 @@ from collectors.signal_returns import (
     _ensure_score_performance_outcomes_schema,
 )
 from nousergon_lib.contracts import conformance_errors
-from nousergon_lib.quant.horizons import DEFAULT_POLICY
+from nousergon_lib.quant.horizons import (
+    DEFAULT_POLICY,
+    HorizonPolicy,
+    PrimaryHorizonMissing,
+)
 
 _RESOLVED_AT = "2026-07-01T00:00:00+00:00"
 
@@ -203,3 +207,88 @@ class TestDualWrite:
         res = _backfill_outcome_records(tmp_db, dry_run=False, resolved_at=_RESOLVED_AT)
         assert res["status"] == "ok"
         assert _fetch(tmp_db) == {}
+
+
+def _add_10d_universe_columns(db: str, *, resolved: bool = True):
+    """Add the 10d universe_returns columns as a DATA change (no producer schema
+    edit). ``resolved=False`` leaves them absent, simulating an unproduced horizon."""
+    with sqlite3.connect(db) as conn:
+        for c, t in (("return_10d", "REAL"), ("spy_return_10d", "REAL"), ("beat_spy_10d", "INTEGER")):
+            conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {c} {t}")
+        if resolved:
+            conn.execute("UPDATE universe_returns SET return_10d=0.02, spy_return_10d=0.01, beat_spy_10d=1")
+        conn.commit()
+
+
+def _store_columns(db: str) -> set[str]:
+    with sqlite3.connect(db) as conn:
+        return {r[1] for r in conn.execute("PRAGMA table_info(score_performance_outcomes)")}
+
+
+class TestAddAHorizonAcceptance:
+    """EPIC config#1483's testable finish line (config#1550): adding an eval
+    horizon is a DATA change — one extra long-store ROW per signal, with ZERO
+    schema change and no fleet-wide `_Nd` column rename (the config#1456 bug
+    class). The horizon is a HorizonPolicy PARAMETER, not a column name."""
+
+    def test_extra_diagnostic_horizon_is_a_data_change(self, tmp_db):
+        # Canonical (default policy 5+21) store columns, for the zero-change assert.
+        canonical_db = tmp_db + ".canonical"
+        _seed(canonical_db)
+        _backfill_outcome_records(canonical_db, dry_run=False, resolved_at=_RESOLVED_AT)
+        canonical_cols = _store_columns(canonical_db)
+
+        # Same producer, a policy with an EXTRA diagnostic horizon (10), and the
+        # 10d data present in universe_returns.
+        _seed(tmp_db)
+        _add_10d_universe_columns(tmp_db, resolved=True)
+        policy = HorizonPolicy(primary_horizon=21, diagnostic_horizons=(5, 10))
+
+        res = _backfill_outcome_records(
+            tmp_db, dry_run=False, resolved_at=_RESOLVED_AT, policy=policy
+        )
+        assert res["status"] == "ok"
+
+        rows = _fetch(tmp_db)
+        assert set(rows) == {5, 10, 21}          # the new 10d row appeared
+        assert rows[10]["is_primary"] == 0
+        assert rows[10]["log_alpha"] is None      # non-primary → null canonical alpha
+        assert rows[10]["stock_return"] == pytest.approx(0.02)  # decimals, not percent
+        # ZERO schema change: the store's physical columns are identical to the
+        # canonical-policy store's — adding a horizon added a ROW, not a COLUMN.
+        assert _store_columns(tmp_db) == canonical_cols
+
+    def test_consumer_policy_filtered_read_returns_new_horizon(self, tmp_db):
+        _seed(tmp_db)
+        _add_10d_universe_columns(tmp_db, resolved=True)
+        policy = HorizonPolicy(primary_horizon=21, diagnostic_horizons=(5, 10))
+        _backfill_outcome_records(tmp_db, dry_run=False, resolved_at=_RESOLVED_AT, policy=policy)
+
+        # A consumer filters WHERE horizon_days = :h with :h resolved from policy.
+        with sqlite3.connect(tmp_db) as conn:
+            got = conn.execute(
+                "SELECT stock_return FROM score_performance_outcomes WHERE horizon_days = ?",
+                (10,),
+            ).fetchall()
+        assert len(got) == 1 and got[0][0] == pytest.approx(0.02)
+
+    def test_unproduced_horizon_yields_empty_gracefully(self, tmp_db):
+        # Policy declares horizon 10 but universe_returns lacks its columns → the
+        # producer skips it (graceful-empty), still writes the produced horizons.
+        _seed(tmp_db)
+        policy = HorizonPolicy(primary_horizon=21, diagnostic_horizons=(5, 10))
+        res = _backfill_outcome_records(
+            tmp_db, dry_run=False, resolved_at=_RESOLVED_AT, policy=policy
+        )
+        assert res["status"] == "ok"
+        rows = _fetch(tmp_db)
+        assert set(rows) == {5, 21}   # 10 gracefully absent, no crash
+        assert 10 not in rows
+
+    def test_missing_primary_raises(self):
+        # The canonical-label starvation gate: a resolved horizon set lacking the
+        # PRIMARY horizon is a producer-starvation bug and must fail loud, never
+        # degrade to a diagnostic-only read (nousergon_lib.quant.horizons contract).
+        policy = HorizonPolicy(primary_horizon=21, diagnostic_horizons=(5, 10))
+        with pytest.raises(PrimaryHorizonMissing):
+            policy.require_primary_present([5, 10])
