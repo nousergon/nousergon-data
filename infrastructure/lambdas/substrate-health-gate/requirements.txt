@@ -1,0 +1,2 @@
+# boto3 is provided by the Lambda python3.12 runtime; no external deps.
+# (File kept so deploy.sh's uniform pip-install packaging step works.)
