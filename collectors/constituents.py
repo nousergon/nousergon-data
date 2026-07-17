@@ -1,5 +1,7 @@
 """
-constituents.py — Fetch S&P 500 + S&P 400 constituent tickers from Wikipedia.
+constituents.py — Fetch S&P 500 + S&P 400 constituent membership from the
+SSGA SPDR ETFs' daily holdings files (SPY / MDY), with GICS sector + GICS
+sub-industry classification from Wikipedia.
 
 Writes constituents.json to S3 with:
   - tickers: deduplicated list of ~900 symbols
@@ -8,7 +10,32 @@ Writes constituents.json to S3 with:
   - sub_industry_map: {ticker: GICS_sub_industry_name}
   - sp500_count, sp400_count, total_count, fetched_at
 
-Falls back to a local CSV cache if Wikipedia is unreachable.
+Falls back to a local CSV cache if either source is unreachable.
+
+MEMBERSHIP SOURCE (config#2812, replaces Wikipedia-as-membership-source):
+SPY and MDY are full-replication S&P 500 / S&P 400 index funds — the fund
+manager (State Street/SSGA) is contractually required to hold the ACTUAL
+current index constituents, and both publish their full holdings as a daily
+xlsx, no auth. This is standard free/practical index-membership tracking
+(the alternative — a licensed S&P Dow Jones Indices data feed — is the true
+gold standard but a paid commercial subscription, overkill here). Verified
+live 2026-07-17: JHG and BLD (delisted 2026-07-01 via take-private mergers)
+had already dropped from BOTH SPY's and MDY's holdings, while Wikipedia's
+community-edited constituents pages still listed both 17+ days later —
+Wikipedia-membership-lag was the root cause of alpha-engine-config-I2703/
+I2812 (the daily preopen pipeline's ArcticDB freshness gate hard-failing
+every day on two tickers a Wikipedia-driven auto-prune could never catch,
+since it requires the ticker to be ABSENT from the Wikipedia page first).
+
+SECTOR SOURCE (unchanged): SPY/MDY's own "Sector" holdings column is NOT
+usable GICS classification (verified live: >98% of SPY rows carry a literal
+"-" placeholder, not a sector name) — Wikipedia's constituents tables remain
+the sector/sub-industry source, keyed by ticker and looked up against the
+SSGA-sourced membership list. A membership ticker absent from Wikipedia's
+sector map still hard-fails in ``collect()`` (unchanged behavior) — this is
+now a *useful* freshness signal in the opposite direction (Wikipedia lagging
+on a brand-new ADDITION, which is much rarer and lower-impact than the
+removal-lag this fix addresses, and surfaces loudly rather than silently).
 
 ``sub_industry_map`` (config#934 narrow slice, 2026-07-09): the Wikipedia
 constituents tables already scraped here carry a "GICS Sub-Industry" column
@@ -25,8 +52,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import boto3
@@ -52,12 +80,40 @@ GICS_TO_ETF: dict[str, str] = {
 
 _CACHE_PATH = Path(__file__).parent.parent / "data" / "constituents_cache.csv"
 
-_URLS = {
+# Membership ground truth: SSGA SPDR full-replication index funds' daily
+# holdings (config#2812). Both hosted by the same provider with an identical
+# schema (Name/Ticker/Identifier/SEDOL/Weight/Sector/Shares Held), no auth.
+_SSGA_HOLDINGS_URLS = {
+    "S&P 500": "https://www.ssga.com/us/en/individual/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx",
+    "S&P 400": "https://www.ssga.com/us/en/individual/library-content/products/fund-data/etfs/us/holdings-daily-us-en-mdy.xlsx",
+}
+
+# Sector/sub-industry classification source (unchanged from pre-config#2812).
+_WIKIPEDIA_URLS = {
     "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
     "S&P 400": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
 }
 
 _HEADERS = {"User-Agent": "alpha-engine-data/1.0 (weekly-collector)"}
+
+# A real US equity ticker in the SSGA holdings file: 1-6 uppercase letters,
+# optional single-letter share class suffix (e.g. BRK.A). Excludes the file's
+# non-equity rows: cash positions ("-"/"999USDZ92", "CASH_USD"), tiny
+# settlement/contra placeholder rows (CUSIP-shaped "ticker" values), and the
+# trailing legal-disclaimer text block (NaN ticker).
+_SSGA_TICKER_RE = re.compile(r"^[A-Z]{1,6}(\.[A-Z])?$")
+
+# Sector-classification is now sourced independently of membership
+# (config#2812), so a small number of SSGA-confirmed-current members can
+# legitimately have no Wikipedia sector row yet — Wikipedia lags brand-new
+# index ADDITIONS the same way it lagged JHG/BLD's REMOVAL, just verified
+# live to be a much smaller/quieter gap (2 tickers, TOST + IESC, both
+# recent legitimate additions, on the first live run of this fix). Warn
+# loudly and proceed for a small gap; a gap this large signals a genuine
+# parse/layout failure and still hard-fails, mirroring daily_append's
+# missing-from-closes convention (small-N tolerated + alerted, not silently
+# dropped, per feedback_no_silent_fails).
+_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD = 10
 
 
 def collect(
@@ -67,7 +123,8 @@ def collect(
     dry_run: bool = False,
 ) -> dict:
     """
-    Fetch S&P 500+400 constituents from Wikipedia and write to S3.
+    Fetch S&P 500+400 membership from SSGA (SPY/MDY holdings) + GICS sector
+    classification from Wikipedia, and write to S3.
 
     Returns dict with status, counts, and any errors.
     """
@@ -82,11 +139,19 @@ def collect(
         return {"status": "error", "error": "No tickers fetched"}
 
     unmapped = [t for t in tickers if t not in sector_map]
-    if unmapped:
+    if len(unmapped) > _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD:
         raise RuntimeError(
             f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} tickers "
-            f"missing GICS sector. Sample: {unmapped[:10]}. EOD reconcile sector "
-            f"attribution depends on full coverage; aborting before write."
+            f"missing GICS sector (exceeds the {_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD}-ticker "
+            f"tolerance for Wikipedia addition-lag). Sample: {unmapped[:10]}. EOD reconcile "
+            f"sector attribution depends on full coverage; aborting before write."
+        )
+    if unmapped:
+        logger.warning(
+            "Sector mapping: %d of %d tickers missing GICS sector (within the "
+            "%d-ticker Wikipedia addition-lag tolerance) — likely recent index "
+            "additions Wikipedia hasn't classified yet: %s",
+            len(unmapped), len(tickers), _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD, unmapped,
         )
     # Sub-industry is additive/best-effort — NOT a hard gate like sector
     # above. Nothing downstream consumes it yet (config#934 narrow slice),
@@ -210,108 +275,168 @@ def _select_constituents_table(tables: list[pd.DataFrame], index_name: str) -> p
     return max(candidates, key=len)
 
 
+def _fetch_ssga_membership() -> tuple[list[str], int, int]:
+    """Fetch current S&P 500 + S&P 400 membership from SPY/MDY's daily
+    holdings files (config#2812 — see module docstring for why this replaced
+    Wikipedia as the membership source).
+
+    Returns (tickers, sp500_count, sp400_count). Raises on any fetch/parse
+    failure — caller falls back to the local cache.
+    """
+    tickers: list[str] = []
+    sp500_count = 0
+    sp400_count = 0
+    for index_name, url in _SSGA_HOLDINGS_URLS.items():
+        resp = requests.get(url, headers=_HEADERS, timeout=30)
+        resp.raise_for_status()
+        # SSGA's holdings sheet has a 4-row banner (fund name/date/disclaimer)
+        # above the real header row.
+        df = pd.read_excel(BytesIO(resp.content), skiprows=4, engine="openpyxl")
+        if "Ticker" not in df.columns:
+            raise RuntimeError(
+                f"SSGA holdings file for {index_name} missing 'Ticker' column "
+                f"(columns: {list(df.columns)}). Layout drift — extractor needs update."
+            )
+        raw_tickers = df["Ticker"].astype(str).str.strip()
+        batch = [t for t in raw_tickers if _SSGA_TICKER_RE.match(t)]
+        # BRK.A/BRK.B style share-class dot → hyphen, matching the yfinance
+        # convention the rest of the pipeline expects (was also done for the
+        # Wikipedia source).
+        batch = [t.replace(".", "-") for t in batch]
+        if not batch:
+            raise RuntimeError(
+                f"SSGA holdings file for {index_name} yielded zero valid tickers "
+                f"after filtering ({len(raw_tickers)} raw rows) — parse likely broken."
+            )
+        tickers.extend(batch)
+        logger.info("Fetched %d tickers from %s (SSGA %s holdings)",
+                    len(batch), index_name, "SPY" if index_name == "S&P 500" else "MDY")
+        if index_name == "S&P 500":
+            sp500_count = len(batch)
+        else:
+            sp400_count = len(batch)
+    return list(dict.fromkeys(tickers)), sp500_count, sp400_count  # dedupe, preserve order
+
+
+def _fetch_wikipedia_sectors() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Fetch GICS sector + sub-industry classification from Wikipedia's
+    constituents tables, keyed by ticker (config#2812 — Wikipedia is now
+    classification-only; see module docstring). Returns maps for every
+    ticker Wikipedia currently lists, regardless of SSGA membership; the
+    caller filters to the SSGA-sourced membership list.
+
+    Returns (sector_map, sector_etf_map, sub_industry_map). Raises on any
+    fetch/parse failure or missing sector column — caller falls back to the
+    local cache.
+    """
+    sector_map: dict[str, str] = {}
+    sector_etf_map: dict[str, str] = {}
+    sub_industry_map: dict[str, str] = {}
+
+    for index_name, url in _WIKIPEDIA_URLS.items():
+        resp = requests.get(url, headers=_HEADERS, timeout=15)
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+        df = _select_constituents_table(tables, index_name)
+
+        col = next(
+            (c for c in df.columns if "symbol" in str(c).lower() or "ticker" in str(c).lower()),
+            df.columns[0],
+        )
+        batch = (
+            df[col]
+            .astype(str)
+            .str.strip()
+            .str.replace(".", "-", regex=False)  # BRK.B → BRK-B for yfinance
+            .tolist()
+        )
+        batch = [t for t in batch if t and t != "nan" and len(t) <= 6]
+        logger.info("Fetched %d tickers from %s (Wikipedia sector classification)",
+                    len(batch), index_name)
+
+        sector_col = next(
+            (c for c in df.columns if "gics" in str(c).lower() and "sector" in str(c).lower()
+             and "sub" not in str(c).lower()),
+            None,
+        )
+        if sector_col is None:
+            raise RuntimeError(
+                f"GICS sector column missing from {index_name} Wikipedia table "
+                f"(columns: {list(df.columns)}). Column-name drift — extractor needs update."
+            )
+        for ticker, sector in zip(batch, df[sector_col].astype(str).tolist()):
+            sector_name = sector.strip()
+            sector_map[ticker] = sector_name
+            etf = GICS_TO_ETF.get(sector_name)
+            if etf:
+                sector_etf_map[ticker] = etf
+        logger.info(
+            "[%s] Sector map: %d added (running total: %d sectors, %d ETFs)",
+            index_name, len(batch), len(sector_map), len(sector_etf_map),
+        )
+
+        # GICS Sub-Industry column (config#934 narrow slice) — same
+        # table, one level finer than sector (e.g. "Semiconductors" /
+        # "Application Software" vs. the parent "Information
+        # Technology" sector). Best-effort: unlike sector above, a
+        # missing sub-industry column does NOT raise — nothing
+        # downstream depends on this yet, so a Wikipedia layout
+        # change here should degrade gracefully rather than block
+        # the weekly constituents write.
+        sub_industry_col = next(
+            (c for c in df.columns if "gics" in str(c).lower() and "sub" in str(c).lower()
+             and "industry" in str(c).lower()),
+            None,
+        )
+        if sub_industry_col is not None:
+            for ticker, sub_industry in zip(
+                batch, df[sub_industry_col].astype(str).tolist()
+            ):
+                sub_industry_name = sub_industry.strip()
+                if sub_industry_name and sub_industry_name.lower() != "nan":
+                    sub_industry_map[ticker] = sub_industry_name
+            logger.info(
+                "[%s] Sub-industry map: running total %d",
+                index_name, len(sub_industry_map),
+            )
+        else:
+            logger.warning(
+                "[%s] GICS Sub-Industry column missing (columns: %s) — "
+                "sub_industry_map will be incomplete for this index.",
+                index_name, list(df.columns),
+            )
+
+    return sector_map, sector_etf_map, sub_industry_map
+
+
 def _fetch_constituents() -> tuple[
     list[str], dict[str, str], dict[str, str], dict[str, str], int, int
 ]:
     """
-    Fetch constituent tickers and sector mappings from Wikipedia.
+    Fetch constituent membership from SSGA (SPY/MDY holdings) and GICS
+    sector/sub-industry classification from Wikipedia (config#2812).
 
     Returns:
         (tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count)
-        - sector_map: {ticker: GICS_sector_name}
-        - sector_etf_map: {ticker: sector_ETF_symbol}
+        - tickers: SSGA-sourced S&P 500 + S&P 400 membership (ground truth)
+        - sector_map: {ticker: GICS_sector_name}, filtered to ``tickers``
+        - sector_etf_map: {ticker: sector_ETF_symbol}, filtered to ``tickers``
         - sub_industry_map: {ticker: GICS_sub_industry_name} (best-effort,
           additive — a ticker missing here does not block collect()).
     """
-    tickers: list[str] = []
-    sector_map: dict[str, str] = {}
-    sector_etf_map: dict[str, str] = {}
-    sub_industry_map: dict[str, str] = {}
-    sp500_count = 0
-    sp400_count = 0
-
     try:
-        for index_name, url in _URLS.items():
-            resp = requests.get(url, headers=_HEADERS, timeout=15)
-            resp.raise_for_status()
-            tables = pd.read_html(StringIO(resp.text))
-            df = _select_constituents_table(tables, index_name)
+        tickers, sp500_count, sp400_count = _fetch_ssga_membership()
+        wiki_sector_map, wiki_sector_etf_map, wiki_sub_industry_map = _fetch_wikipedia_sectors()
 
-            col = next(
-                (c for c in df.columns if "symbol" in str(c).lower() or "ticker" in str(c).lower()),
-                df.columns[0],
-            )
-            batch = (
-                df[col]
-                .astype(str)
-                .str.strip()
-                .str.replace(".", "-", regex=False)  # BRK.B → BRK-B for yfinance
-                .tolist()
-            )
-            batch = [t for t in batch if t and t != "nan" and len(t) <= 6]
-            tickers.extend(batch)
-            logger.info("Fetched %d tickers from %s", len(batch), index_name)
+        # Filter the Wikipedia-derived maps down to SSGA's membership list —
+        # a ticker Wikipedia still lists but SSGA has already dropped (the
+        # exact I2703/I2812 failure mode) must not leak into the output.
+        member_set = set(tickers)
+        sector_map = {t: s for t, s in wiki_sector_map.items() if t in member_set}
+        sector_etf_map = {t: e for t, e in wiki_sector_etf_map.items() if t in member_set}
+        sub_industry_map = {t: s for t, s in wiki_sub_industry_map.items() if t in member_set}
 
-            if index_name == "S&P 500":
-                sp500_count = len(batch)
-            else:
-                sp400_count = len(batch)
-
-            sector_col = next(
-                (c for c in df.columns if "gics" in str(c).lower() and "sector" in str(c).lower()
-                 and "sub" not in str(c).lower()),
-                None,
-            )
-            if sector_col is None:
-                raise RuntimeError(
-                    f"GICS sector column missing from {index_name} Wikipedia table "
-                    f"(columns: {list(df.columns)}). Column-name drift — extractor needs update."
-                )
-            for ticker, sector in zip(batch, df[sector_col].astype(str).tolist()):
-                sector_name = sector.strip()
-                sector_map[ticker] = sector_name
-                etf = GICS_TO_ETF.get(sector_name)
-                if etf:
-                    sector_etf_map[ticker] = etf
-            logger.info(
-                "[%s] Sector map: %d added (running total: %d sectors, %d ETFs)",
-                index_name, len(batch), len(sector_map), len(sector_etf_map),
-            )
-
-            # GICS Sub-Industry column (config#934 narrow slice) — same
-            # table, one level finer than sector (e.g. "Semiconductors" /
-            # "Application Software" vs. the parent "Information
-            # Technology" sector). Best-effort: unlike sector above, a
-            # missing sub-industry column does NOT raise — nothing
-            # downstream depends on this yet, so a Wikipedia layout
-            # change here should degrade gracefully rather than block
-            # the weekly constituents write.
-            sub_industry_col = next(
-                (c for c in df.columns if "gics" in str(c).lower() and "sub" in str(c).lower()
-                 and "industry" in str(c).lower()),
-                None,
-            )
-            if sub_industry_col is not None:
-                for ticker, sub_industry in zip(
-                    batch, df[sub_industry_col].astype(str).tolist()
-                ):
-                    sub_industry_name = sub_industry.strip()
-                    if sub_industry_name and sub_industry_name.lower() != "nan":
-                        sub_industry_map[ticker] = sub_industry_name
-                logger.info(
-                    "[%s] Sub-industry map: running total %d",
-                    index_name, len(sub_industry_map),
-                )
-            else:
-                logger.warning(
-                    "[%s] GICS Sub-Industry column missing (columns: %s) — "
-                    "sub_industry_map will be incomplete for this index.",
-                    index_name, list(df.columns),
-                )
-
-        tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
-
-        # Update local cache with full sector mapping so a future Wikipedia
+        # Update local cache with full sector mapping so a future source
         # outage doesn't dead-end on the empty-sector-map raise in collect().
         # Prior cache stored only ticker symbols; the 2026-05-11 partial
         # outage exposed that gap (S&P 500 fetch succeeded, S&P 400 failed,
@@ -327,7 +452,7 @@ def _fetch_constituents() -> tuple[
         return tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count
 
     except Exception as e:
-        logger.warning("Wikipedia fetch failed (%s); trying local cache...", e)
+        logger.warning("Constituents fetch failed (%s); trying local cache...", e)
         return _load_from_cache()
 
 

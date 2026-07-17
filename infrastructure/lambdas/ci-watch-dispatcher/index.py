@@ -66,11 +66,9 @@ import hashlib
 import logging
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timezone
 
-import boto3
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import (  # SpotProbeError: nousergon-lib >= 0.106.0
     SpotCapacityExhausted,
@@ -154,15 +152,14 @@ def _drill_sha(now: datetime) -> str:
         f"ci-watch-drill-{now:%Y-%m-%d}".encode("utf-8")
     ).hexdigest()[:40]
 
-# Discriminator tag write (config#2267 site 2, same defect class as
-# sf-watch-spot-dispatcher's): the (repo, sha) tags are LOAD-BEARING —
-# without them the next failure's dedupe guard is blind (duplicate box) and
-# spot-orphan-reaper cannot derive the completion-marker key (guaranteed
-# false "incomplete reap" page for a healthy run). Bounded retry, then
-# terminate-the-box-and-fail-the-dispatch on final failure. Retry delay is
-# env-overridable so tests run at 0.
-TAG_WRITE_ATTEMPTS = int(os.environ.get("CI_WATCH_TAG_WRITE_ATTEMPTS", "3"))
-TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("CI_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "2"))
+# Discriminator tags (config#2267 site 2, config#2292 root fix): the (repo,
+# sha) tags are LOAD-BEARING — without them the next failure's dedupe guard
+# is blind (duplicate box) and spot-orphan-reaper cannot derive the
+# completion-marker key. They now ride the RunInstances TagSpecifications
+# call ATOMICALLY (see _launch_instance's extra_tags) instead of a separate
+# post-launch create_tags call — the box is never observably untagged, so
+# the PR758 bounded-retry-then-terminate path this replaced is gone entirely
+# (one mechanism, not two).
 
 # The box reads its own run secrets (PAT) via its instance profile in the
 # common case, but the PRELUDE below (run before the profile-backed bootstrap
@@ -282,11 +279,20 @@ exec bash infrastructure/ci_watch_spot_bootstrap.sh \
 """
 
 
-def _launch_instance() -> tuple[str, str]:
+def _launch_instance(repo: str, sha: str, is_drill: bool = False) -> tuple[str, str]:
     """Launch the CI-watch box; spot first, on-demand fallback on capacity
     exhaustion. Raises SpotLaunchError (or the SpotCapacityExhausted subclass)
     if BOTH the spot attempt and the on-demand fallback are exhausted/fail —
-    caught once by the caller and converted to a clean launched:false."""
+    caught once by the caller and converted to a clean launched:false.
+
+    The load-bearing (repo, sha) discriminator tags (config#2267 site 2) ride
+    the SAME RunInstances call as the launch itself via ``extra_tags``
+    (config#2292 root fix, nousergon-lib >= 0.108.0 / krepis >= 0.12.0) — the
+    box is never observably untagged, so there is no post-launch create_tags
+    step to retry or fail."""
+    extra_tags = {CI_WATCH_REPO_TAG_KEY: repo, CI_WATCH_SHA_TAG_KEY: sha}
+    if is_drill:
+        extra_tags[CI_WATCH_DRILL_TAG_KEY] = "true"
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -295,6 +301,7 @@ def _launch_instance() -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name=CI_WATCH_TAG_NAME,
+        extra_tags=extra_tags,
         region=REGION,
     )
 
@@ -345,39 +352,6 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="ci-watch")
 
 
-def _create_discriminator_tags(instance_id: str, repo: str, sha: str,
-                               is_drill: bool = False) -> str | None:
-    """Write the load-bearing (repo, sha) discriminator tags (config#2267
-    site 2) with a bounded retry. Returns None on success, or the final
-    ``"ExcName: msg"`` string after TAG_WRITE_ATTEMPTS failures — the caller
-    terminates the box and fails the dispatch (the tags are what make the
-    box visible to the dedupe guard and the spot-orphan-reaper; an untagged
-    box must not run). A canary drill box (config#2223) additionally carries
-    ``sf-watch-drill=true`` so fleet consumers can tell it apart."""
-    tags = [
-        {"Key": CI_WATCH_REPO_TAG_KEY, "Value": repo},
-        {"Key": CI_WATCH_SHA_TAG_KEY, "Value": sha},
-    ]
-    if is_drill:
-        tags.append({"Key": CI_WATCH_DRILL_TAG_KEY, "Value": "true"})
-    last_error = ""
-    for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
-        try:
-            boto3.client("ec2", region_name=REGION).create_tags(
-                Resources=[instance_id], Tags=tags
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001 — bounded retry; final failure is FATAL to the dispatch (caller terminates + fails)
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "ci-watch discriminator tag write attempt %d/%d failed for %s: %s",
-                attempt, TAG_WRITE_ATTEMPTS, instance_id, last_error,
-            )
-            if attempt < TAG_WRITE_ATTEMPTS:
-                time.sleep(TAG_WRITE_RETRY_DELAY_SEC)
-    return last_error
-
-
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
                           is_drill: str = "false") -> dict:
@@ -418,7 +392,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
 
     run_token = uuid.uuid4().hex
     try:
-        instance_id, market = _launch_instance()
+        instance_id, market = _launch_instance(repo, sha, is_drill=is_drill == "true")
     except SpotLaunchError as exc:
         logger.error("ci-watch spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
@@ -427,25 +401,11 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                 " dedupe_degraded=true" if dedupe_degraded else "")
     # config#1979-style tags so the NEXT trigger's guard check (above) — and
     # the fleet spot-orphan-reaper's completion-marker lookup — can find the
-    # box. LOAD-BEARING, not cosmetic (config#2267 site 2): bounded retry,
-    # then TERMINATE the box and fail the dispatch on final failure — a box
-    # invisible to the dedupe guard and the reaper must not run. (The root
-    # fix — discriminator tags atomic with launch via RunInstances
-    # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
-    # RunInstances chokepoint, growing an extra-tags parameter; until then
-    # this retry+terminate closes the hole loudly.)
-    tag_error = _create_discriminator_tags(instance_id, repo, sha,
-                                           is_drill=is_drill == "true")
-    if tag_error is not None:
-        _terminate_instance(instance_id)
-        logger.error(
-            "ci-watch discriminator tag write FAILED after %d attempts for %s "
-            "(%s@%s) — box terminated, dispatch failed: %s",
-            TAG_WRITE_ATTEMPTS, instance_id, repo, sha, tag_error,
-        )
-        return {"launched": False, "reason": "tag_write_failed",
-                "instance_id": instance_id, "error": tag_error,
-                "dedupe_degraded": dedupe_degraded}
+    # box. LOAD-BEARING, not cosmetic (config#2267 site 2) — and, as of
+    # config#2292, ATOMIC with launch: _launch_instance already passed them
+    # as extra_tags into the RunInstances TagSpecifications, so the box is
+    # never observably untagged. No post-launch create_tags step remains to
+    # retry or fail here.
 
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —

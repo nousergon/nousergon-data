@@ -41,7 +41,7 @@ def states() -> dict:
 class TestCronSchedule:
     def test_saturday_trigger_fires_thu_through_sat(self):
         cfn = _CFN.read_text()
-        block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayTrigger:", 1)[0]
+        block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayPipelineSchedule:", 1)[0]
         assert "cron(0 9 ? * THU-SAT *)" in block, (
             "weekly cron must fire THU-SAT so the run-day gate can "
             "self-select holiday-shortened weeks (config#1824)"
