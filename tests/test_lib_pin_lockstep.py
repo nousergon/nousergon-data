@@ -110,9 +110,12 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.109.0",
+        "v0.124.0",
         "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
-        "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409)",
+        "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409); "
+        "v0.124.0 for nousergon_lib.github_app — _github_token() mints the "
+        "ne-groomer App installation token first, PAT fallback (config-I2785, "
+        "nousergon-lib#220, incident config-I2784)",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",

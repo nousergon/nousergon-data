@@ -313,6 +313,21 @@ DAILY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations
 ADVISORY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-weekly-advisory-pipeline:*"}}]}'
 MODELZOO_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-modelzoo-sunday-pipeline:*"}}]}'
 
+# config#2748-adjacent: groom-dispatch ERROR-level logging was enabled live
+# 2026-07-16 (ad hoc, outside this script) to aid debugging active groom-driver
+# incidents; codifying it here so deploys stop drifting from live and future
+# incident debugging has execution data by default. Log group name matches
+# what AWS auto-created under the vendedlogs convention when logging was first
+# enabled via update-state-machine without an explicit destination — reusing
+# it (not inventing a second /aws/stepfunctions/... group) avoids an orphaned
+# duplicate.
+GROOM_LOG_GROUP_NAME="/aws/vendedlogs/states/alpha-engine-groom-dispatch"
+GROOM_LOG_GROUP_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${GROOM_LOG_GROUP_NAME}:*"
+echo "  Ensuring groom-dispatch log group exists (idempotent)..."
+aws logs create-log-group --log-group-name "$GROOM_LOG_GROUP_NAME" --region "$REGION" 2>/dev/null || true
+aws logs put-retention-policy --log-group-name "$GROOM_LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
+GROOM_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":false,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$GROOM_LOG_GROUP_ARN"'"}}]}'
+
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline" "$SAT_LOGGING_CONFIG"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline" "$DAILY_LOGGING_CONFIG"
 update_or_defer_to_cfn "$ADVISORY_ARN" "$ADVISORY_STAMPED" "Weekly advisory child pipeline" "$ADVISORY_LOGGING_CONFIG"
@@ -323,7 +338,7 @@ update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post
 # deploy.sh --bootstrap). Every deploy between config#2129 (2026-07-01) and this fix was
 # updating the orphaned groom-pipeline name instead of the live groom-dispatch, which is
 # why PRs #761 and #763's SF definition fixes had zero live effect on actual groom runs.
-update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Backlog groom dispatch"
+update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Backlog groom dispatch" "$GROOM_LOGGING_CONFIG"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""

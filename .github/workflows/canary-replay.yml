@@ -12,10 +12,31 @@ name: Canary Replay
 # Fork PRs have no OIDC trust to this account — configure-aws-credentials
 # fails cleanly and the job exits 0 rather than failing a check a fork
 # contributor cannot fix.
+#
+# config-I2780 interim stopgap (2026-07-16): `synchronize` dropped from the
+# trigger. Each probe run does a full unfiltered read of the production
+# Neon RAG corpus (filing_change_detection.py's _load_filing_embeddings has
+# no incremental/watermark path) — with `synchronize` included, every push
+# to an already-labeled PR re-ran the full read, and 29 such reads hit in a
+# single day exhausted the Neon project's egress quota. This is a debounce
+# only, not the real fix: the canary should read from a replica/staging
+# snapshot or a bounded sample, tracked as the closing condition on I2780.
+# `opened`/`reopened`/`labeled` still gate one read per PR lifecycle event.
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, labeled]
+    types: [opened, reopened, labeled]
+
+# One in-flight canary per PR: iterative pushes to an actively-developed
+# branch superseded each other 29 times on 2026-07-16 alone, and every
+# launched replay ran the data probe's full-corpus pgvector read against
+# production Neon — the amplification that exhausted the project's monthly
+# data-transfer quota (config-I2780). The newest head is the only one whose
+# verdict matters; cancel the stale poll and let the dispatcher's server-side
+# dedupe decline the stale launch.
+concurrency:
+  group: canary-replay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
