@@ -201,7 +201,7 @@ class TestRegistryBundle:
         index, _ = index_mod
         reg = index._registry()
         routed = {k for k, v in reg["playbooks"].items() if v.get("routed")}
-        assert routed == {"sf-watch", "ci-watch"}
+        assert routed == {"sf-watch", "ci-watch", "alert-drain"}
         for name in routed:
             assert reg["playbooks"][name]["benign_reasons"]
 
@@ -212,3 +212,18 @@ class TestRegistryBundle:
         out = index.handler({"playbook": "sf-watch", "payload": {}}, None)
         assert out["reason"] == "registry_error"
         index._file_p1.assert_called_once()
+
+
+class TestInvokeClientConfig:
+    """The executor invoke is non-idempotent: the boto client MUST use zero
+    retries and a read-timeout exceeding the slowest executor (the first live
+    drill double-dispatched via boto3's silent default retry)."""
+
+    def test_zero_retries_and_long_read_timeout(self, index_mod):
+        index, fake_boto3 = index_mod
+        _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})
+        index.handler({"playbook": "sf-watch", "payload": {}}, None)
+        cfg = fake_boto3.client.call_args.kwargs.get("config")
+        assert cfg is index._EXECUTOR_INVOKE_CONFIG
+        assert cfg.retries == {"max_attempts": 0}
+        assert cfg.read_timeout == 290
