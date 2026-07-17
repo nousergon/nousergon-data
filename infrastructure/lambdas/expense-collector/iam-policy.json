@@ -20,7 +20,7 @@
         "arn:aws:ssm:us-east-1:711398986525:parameter/symposion/DEEPSEEK_API_KEY",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/NEON_API_KEY",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/NEON_DATA_TRANSFER_QUOTA_GB",
-        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/groom/github_pat",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/GITHUB_TOKEN",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/expenses/*"
       ]
     },

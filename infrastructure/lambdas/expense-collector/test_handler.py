@@ -183,16 +183,26 @@ class TestDiffRow:
         assert row["mtd_cost_usd"] == 0.0  # top-up mid-month, never negative
 
 
-class TestNeonWalker:
-    def test_sums_nested_metrics(self):
-        doc = {"periods": [{"consumption": [
-            {"data_transfer_bytes": 1_000_000_000, "compute_time_seconds": 3600},
-            {"data_transfer_bytes": 2_000_000_000, "written_data_bytes": 5},
-        ]}]}
-        sums: dict[str, float] = {}
-        index._sum_metrics(doc, sums)
-        assert sums["data_transfer_bytes"] == 3_000_000_000
-        assert sums["compute_time_seconds"] == 3600
+class TestNeonPeriodPacing:
+    def test_period_aware_projection(self, monkeypatch):
+        """Neon's consumption period can start mid-calendar-month (plan
+        change) — pacing must use ITS bounds, not the calendar month's."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {
+                "name": "nousergon", "data_transfer_bytes": 2_500_000_000,
+                "compute_time_seconds": 7200,
+                # Half the period elapsed at NOW (7/17 12:00): 2.5 GB → 5 GB
+                "consumption_period_start": "2026-07-14T12:00:00Z",
+                "consumption_period_end": "2026-07-20T12:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        mw = index._month_window(NOW)
+        row = index.collect_neon(mw, {}, {index.SSM_NEON: "k",
+                                          index.SSM_NEON_QUOTA_GB: "5"})
+        assert row["quota"]["used"] == pytest.approx(2.5)
+        assert row["quota"]["projected"] == pytest.approx(5.0)
+        assert row["pace"] is None or row["pace"] == "under"  # 5.0 !> 5 GB
 
 
 class TestFixedRows:
@@ -242,7 +252,8 @@ def env(monkeypatch):
         index.SSM_DEEPSEEK: "sk-ds-xxx",
         index.SSM_NEON: "neon-xxx",
         index.SSM_NEON_QUOTA_GB: "5",
-        index.SSM_GITHUB_PAT: "ghp-xxx",
+        index.SSM_GITHUB_TOKEN: "ghp-xxx",
+        index.SSM_GITHUB_USER_PAT: "ghp-user-xxx",
         # no ANTHROPIC_ADMIN_KEY → client-telemetry fallback path
     })
     monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
@@ -252,19 +263,25 @@ def env(monkeypatch):
             "data": {"total_credits": 50.0, "total_usage": 42.5}},
         "api.deepseek.com/user/balance": {
             "balance_infos": [{"currency": "USD", "total_balance": "15.00"}]},
-        "console.neon.tech": {"periods": [{"consumption": [
-            {"data_transfer_bytes": 3_000_000_000, "compute_time_seconds": 7200}]}]},
+        "/api/v2/projects/p1": {"project": {
+            "name": "nousergon", "data_transfer_bytes": 3_000_000_000,
+            "compute_time_seconds": 7200,
+            "consumption_period_start": "2026-07-01T00:00:00Z",
+            "consumption_period_end": "2026-08-01T00:00:00Z"}},
+        "/api/v2/projects": {"projects": [{"id": "p1"}]},
         "organizations/nousergon/settings/billing/usage": {"usageItems": [
             {"product": "Actions", "unitType": "Minutes", "quantity": 1400,
-             "netAmount": 0.0},
+             "netAmount": 0.0, "repositoryName": "alpha-engine-config"},
+            {"product": "Actions", "unitType": "Minutes", "quantity": 400,
+             "netAmount": 0.0, "repositoryName": "crucible-dashboard"},  # public → free
             {"product": "Packages", "unitType": "GigabyteHours", "quantity": 10,
-             "netAmount": 1.5},
+             "netAmount": 1.5, "repositoryName": "alpha-engine-config"},
         ]},
+        "orgs/nousergon/repos?type=private": [
+            {"name": "alpha-engine-config", "private": True}],
+        # user PAT present but the endpoint is down → fenced hard error row
         "users/cipher813/settings/billing/usage": RuntimeError(
-            "HTTP 403 from github: PAT lacks Plan scope"),
-        # legacy included-minutes probes: gone on the enhanced billing platform
-        "orgs/nousergon/settings/billing/actions": RuntimeError("HTTP 410"),
-        "users/cipher813/settings/billing/actions": RuntimeError("HTTP 410"),
+            "HTTP 500 from github: upstream error"),
     }))
     return s3, store
 
@@ -308,15 +325,17 @@ class TestHandler:
         assert neon["quota"]["limit"] == 5.0
         assert neon["pace"] == "over"
 
-        # GitHub org: minutes quota pacing (1400 @ 53% → ~2630 > 2000)
+        # GitHub org: quota counts PRIVATE-repo minutes only (1400, not the
+        # 1800 incl. public-free), paced 1400 @ 53% → ~2630 > 2000
         gh = rows["github_org"]
         assert gh["quota"]["used"] == 1400
+        assert gh["detail"]["total_actions_minutes_incl_public_free"] == 1800
         assert gh["pace"] == "over"
         assert gh["mtd_cost_usd"] == pytest.approx(1.5)
 
         # GitHub user: fenced error — recorded on the row, run continues
         assert rows["github_user"]["status"] == "error"
-        assert "403" in rows["github_user"]["error"]
+        assert "500" in rows["github_user"]["error"]
 
         # Fixed row from budgets config
         assert rows["claude_max"]["status"] == "fixed"
@@ -353,13 +372,28 @@ class TestHandler:
         assert "measured since 2026-07-17" in row["note"]
         assert row["projected_month_end_usd"] is None
 
+    def test_user_billing_404_without_user_pat_is_not_configured(self, env, monkeypatch):
+        """No fleet token can read cipher813's personal billing (verified live
+        2026-07-17): a 404 WITHOUT the dedicated user PAT param is a known
+        credential gap, not an outage — must not pollute the error banner."""
+        s3, store = env
+        mw = index._month_window(NOW)
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "users/cipher813/settings/billing/usage": RuntimeError(
+                "HTTP 404 from github: Not Found"),
+        }))
+        secrets = {index.SSM_GITHUB_TOKEN: "ghp-xxx"}  # no SSM_GITHUB_USER_PAT
+        row = index.collect_github(mw, {}, secrets, account="cipher813", kind="user")
+        assert row["status"] == "not_configured"
+        assert "Plan:read" in row["error"]
+
     def test_all_providers_failing_raises(self, env, monkeypatch):
         s3, store = env
         monkeypatch.setattr(index, "_http_json",
                             http_router({}))  # every HTTP call unrouted → raises
         fail_ce = FakeCE()
         fail_ce.get_cost_and_usage = lambda **kw: (_ for _ in ()).throw(RuntimeError("ce down"))
-        ssm = FakeSSM({index.SSM_GITHUB_PAT: "ghp-xxx", index.SSM_NEON: "n"})
+        ssm = FakeSSM({index.SSM_GITHUB_TOKEN: "ghp-xxx", index.SSM_NEON: "n"})
         # No budgets fixed rows either → zero ok rows ⇒ systemic failure raises.
         del store["config/expense_budgets.json"]
         monkeypatch.setattr(

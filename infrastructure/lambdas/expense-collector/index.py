@@ -86,10 +86,15 @@ SSM_OPENROUTER = "/alpha-engine/OPENROUTER_API_KEY"
 SSM_DEEPSEEK = "/symposion/DEEPSEEK_API_KEY"
 SSM_NEON = "/alpha-engine/NEON_API_KEY"
 SSM_NEON_QUOTA_GB = "/alpha-engine/NEON_DATA_TRANSFER_QUOTA_GB"
-SSM_GITHUB_PAT = "/alpha-engine/groom/github_pat"
+# Verified 2026-07-17: of the fleet's six GitHub tokens, ONLY this one can read
+# the enhanced org billing-usage endpoint (the groom/config-runner/etc PATs all
+# 403). No existing token can see the cipher813 PERSONAL account's billing —
+# that needs a user-scoped fine-grained PAT with "Plan: read", wired below.
+SSM_GITHUB_TOKEN = "/alpha-engine/GITHUB_TOKEN"
+SSM_GITHUB_USER_PAT = "/alpha-engine/expenses/GITHUB_USER_BILLING_PAT"
 SSM_ANTHROPIC_ADMIN = "/alpha-engine/expenses/ANTHROPIC_ADMIN_KEY"
 SSM_PARAMS = [SSM_OPENROUTER, SSM_DEEPSEEK, SSM_NEON, SSM_NEON_QUOTA_GB,
-              SSM_GITHUB_PAT, SSM_ANTHROPIC_ADMIN]
+              SSM_GITHUB_TOKEN, SSM_GITHUB_USER_PAT, SSM_ANTHROPIC_ADMIN]
 
 GITHUB_ORG = "nousergon"
 GITHUB_USER = "cipher813"
@@ -362,21 +367,49 @@ def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
 
 
 def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
-    row = _row("neon", "Neon Postgres", source="consumption_api")
+    """Free-tier-compatible consumption read: the ``consumption_history``
+    endpoints are Scale-plan-only (verified 403/404 live, 2026-07-17), but the
+    per-project detail object carries current-consumption-period counters
+    (``data_transfer_bytes``, ``compute_time_seconds``, …) plus the period
+    bounds on every plan — sum across projects and pace against the period."""
+    row = _row("neon", "Neon Postgres", source="projects_api")
     if SSM_NEON not in secrets:
         row.update(status="not_configured", error=f"SSM {SSM_NEON} missing")
         return row
-    frm = mw["start"].strftime("%Y-%m-%dT00:00:00Z")
-    to = _now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-    doc = _http_json(
-        "https://console.neon.tech/api/v2/consumption_history/account"
-        f"?from={frm}&to={to}&granularity=daily",
-        {"Authorization": f"Bearer {secrets[SSM_NEON]}", "Accept": "application/json"})
+    headers = {"Authorization": f"Bearer {secrets[SSM_NEON]}", "Accept": "application/json"}
+    listing = _http_json("https://console.neon.tech/api/v2/projects", headers)
     sums: dict[str, float] = {}
-    _sum_metrics(doc, sums)
+    period_start = period_end = None
+    project_names = []
+    for proj in listing.get("projects", []):
+        detail = _http_json(
+            f"https://console.neon.tech/api/v2/projects/{proj['id']}", headers)
+        p = detail.get("project", {})
+        project_names.append(p.get("name", proj["id"]))
+        for k in ("data_transfer_bytes", "compute_time_seconds",
+                  "active_time_seconds", "written_data_bytes"):
+            if isinstance(p.get(k), (int, float)):
+                sums[k] = sums.get(k, 0.0) + float(p[k])
+        period_start = period_start or p.get("consumption_period_start")
+        period_end = period_end or p.get("consumption_period_end")
     transfer_gb = sums.get("data_transfer_bytes", 0.0) / 1e9
     quota_gb = float(secrets.get(SSM_NEON_QUOTA_GB, 0) or 0) or None
-    projected_gb = _project(transfer_gb, mw["elapsed_frac"])
+    # Pace against Neon's OWN consumption period when reported (it can start
+    # mid-calendar-month, e.g. after a plan change), else the calendar month.
+    observed_frac = mw["elapsed_frac"]
+    if period_start and period_end:
+        try:
+            ps = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
+            pe = datetime.fromisoformat(period_end.replace("Z", "+00:00"))
+            total = (pe - ps).total_seconds()
+            if total > 0:
+                observed_frac = max((_now_utc() - ps).total_seconds() / total, 0.0)
+        except ValueError:
+            logger.warning("unparseable Neon consumption period: %s → %s",
+                           period_start, period_end)
+    projected_gb = None
+    if observed_frac >= MIN_PROJECTION_FRAC:
+        projected_gb = transfer_gb / observed_frac
     row.update(
         mtd_cost_usd=float(_fixed_usd(budgets, "neon") or 0.0),
         projected_month_end_usd=float(_fixed_usd(budgets, "neon") or 0.0),
@@ -384,8 +417,10 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
                "limit": quota_gb,
                "projected": round(projected_gb, 3) if projected_gb is not None else None},
         pace=_pace(projected_gb, quota_gb),
-        detail={"compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
-                "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3)},
+        detail={"projects": project_names,
+                "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
+                "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
+                "consumption_period": f"{period_start} → {period_end}"},
         note="free plan — the binding constraint is the transfer quota, not $"
              if not _fixed_usd(budgets, "neon") else None,
     )
@@ -393,67 +428,69 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
     return row
 
 
-def _sum_metrics(obj, sums: dict[str, float]) -> None:
-    """Walk arbitrarily-nested Neon consumption JSON, accumulating the numeric
-    metric leaves we care about (shape-tolerant: Neon has moved fields between
-    ``periods``/``consumption`` nestings across API revisions)."""
-    metric_keys = {"data_transfer_bytes", "compute_time_seconds",
-                   "active_time_seconds", "written_data_bytes"}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in metric_keys and isinstance(v, (int, float)):
-                sums[k] = sums.get(k, 0.0) + float(v)
-            else:
-                _sum_metrics(v, sums)
-    elif isinstance(obj, list):
-        for item in obj:
-            _sum_metrics(item, sums)
-
-
 def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
                    kind: str) -> dict:
     """One row per billing account (org + personal are separate meters with
-    separate included-minutes quotas — they are deliberately NOT merged)."""
+    separate included-minutes quotas — they are deliberately NOT merged).
+    Enhanced billing platform only: the legacy ``settings/billing/actions``
+    endpoints are 410-Gone/404 for both accounts (verified 2026-07-17), so the
+    included-minutes quota comes from the budgets SSoT."""
     key = f"github_{kind}"
     row = _row(key, f"GitHub ({account} {kind})", source="billing_usage_api")
-    if SSM_GITHUB_PAT not in secrets:
-        row.update(status="not_configured", error=f"SSM {SSM_GITHUB_PAT} missing")
+    # Personal-account billing needs its own user-scoped PAT ("Plan: read");
+    # the org token cannot see it (404) — fall back so the row self-heals the
+    # moment the operator adds the param, no code change needed.
+    token = (secrets.get(SSM_GITHUB_USER_PAT) or secrets.get(SSM_GITHUB_TOKEN)
+             if kind == "user" else secrets.get(SSM_GITHUB_TOKEN))
+    if not token:
+        row.update(status="not_configured", error=f"SSM {SSM_GITHUB_TOKEN} missing")
         return row
-    headers = {"Authorization": f"Bearer {secrets[SSM_GITHUB_PAT]}",
+    headers = {"Authorization": f"Bearer {token}",
                "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
     base = ("https://api.github.com/organizations/" if kind == "org"
             else "https://api.github.com/users/")
     now = _now_utc()
-    doc = _http_json(f"{base}{account}/settings/billing/usage"
-                     f"?year={now.year}&month={now.month}", headers)
-    minutes, billed, by_product = 0.0, 0.0, {}
+    try:
+        doc = _http_json(f"{base}{account}/settings/billing/usage"
+                         f"?year={now.year}&month={now.month}", headers)
+    except RuntimeError as exc:
+        if kind == "user" and SSM_GITHUB_USER_PAT not in secrets \
+                and ("HTTP 404" in str(exc) or "HTTP 403" in str(exc)):
+            # Known credential gap, not an outage: no fleet token can read the
+            # personal account's billing. Surface as not_configured (kept out
+            # of the incomplete-totals error banner) with the fix inline.
+            row.update(status="not_configured",
+                       error=f"needs a cipher813 fine-grained PAT with Plan:read "
+                             f"stored at SSM {SSM_GITHUB_USER_PAT}")
+            return row
+        raise
+    # The included-minutes quota (2000/mo, free org) is drawn ONLY by
+    # private-repo minutes; public-repo usage appears in usageItems too but is
+    # 100%-discounted free (verified live 2026-07-17: 34.9k total minutes, of
+    # which most were public-repo/free) — so quota pacing must filter to
+    # private repos or it overstates ~17x.
+    private_repos = _private_repo_names(account, kind, headers)
+    minutes_private, minutes_total, billed, by_product = 0.0, 0.0, 0.0, {}
     for item in doc.get("usageItems", []):
         product = str(item.get("product", "")).lower()
         net = float(item.get("netAmount", 0) or 0)
         billed += net
         by_product[product] = round(by_product.get(product, 0.0) + net, 2)
         if product == "actions" and "minute" in str(item.get("unitType", "")).lower():
-            minutes += float(item.get("quantity", 0) or 0)
+            qty = float(item.get("quantity", 0) or 0)
+            minutes_total += qty
+            if item.get("repositoryName") in private_repos:
+                minutes_private += qty
     included = _included_minutes(budgets, key)
-    # Legacy per-product endpoint still serves included_minutes for accounts
-    # not yet migrated to the enhanced billing platform — best-effort probe.
-    try:
-        legacy_base = ("https://api.github.com/orgs/" if kind == "org"
-                       else "https://api.github.com/users/")
-        legacy = _http_json(f"{legacy_base}{account}/settings/billing/actions", headers)
-        if isinstance(legacy.get("included_minutes"), (int, float)):
-            included = float(legacy["included_minutes"])
-    except Exception as exc:  # noqa: BLE001 — endpoint 404/410s post-migration;
-        # budgets-config figure (recorded above) remains the quota source.
-        logger.info("legacy GH billing endpoint unavailable for %s: %s", account, exc)
-    projected_min = _project(minutes, mw["elapsed_frac"])
+    projected_min = _project(minutes_private, mw["elapsed_frac"])
     row.update(
         mtd_cost_usd=round(billed, 2),
-        quota={"unit": "Actions minutes", "used": round(minutes, 1), "limit": included,
+        quota={"unit": "private-repo Actions minutes",
+               "used": round(minutes_private, 1), "limit": included,
                "projected": round(projected_min, 0) if projected_min is not None else None},
-        pace=_pace(projected_min, included),
-        detail={"billed_usd_by_product": by_product},
+        detail={"billed_usd_by_product": by_product,
+                "total_actions_minutes_incl_public_free": round(minutes_total, 1)},
     )
     row = _finish_usd_row(row, mw, _budget_usd(budgets, key))
     # Quota pace (included minutes) is the leading signal; billed-$ pace only
@@ -461,6 +498,23 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
     if row["pace"] is None:
         row["pace"] = _pace(projected_min, included)
     return row
+
+
+def _private_repo_names(account: str, kind: str, headers: dict) -> set[str]:
+    """Names of the account's PRIVATE repos (the only ones that draw the
+    included-minutes quota). Org listing filters server-side via type=private;
+    the user path needs the user's own PAT (visibility=private on /user/repos
+    only works self-scoped)."""
+    url = (f"https://api.github.com/orgs/{account}/repos?type=private&per_page=100"
+           if kind == "org"
+           else "https://api.github.com/user/repos?visibility=private&affiliation=owner&per_page=100")
+    names: set[str] = set()
+    for page in range(1, 6):  # 500-repo ceiling, far above fleet size
+        batch = _http_json(f"{url}&page={page}", headers)
+        names.update(r["name"] for r in batch if isinstance(r, dict) and "name" in r)
+        if len(batch) < 100:
+            break
+    return names
 
 
 def _included_minutes(budgets: dict, key: str) -> float | None:
