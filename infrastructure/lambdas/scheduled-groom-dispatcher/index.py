@@ -854,8 +854,10 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
     invocation) previously wrote NO ``groom/decisions/{date}/*.json`` record at
     all — unlike the ``demand-all`` full-mode path, which always has via
     ``_write_trigger_record``/``_write_skip_record``. That left the dispatch
-    decision log — the ground-truth input ``groom-liveness-probe`` now reads
-    (config#2667) to detect a silently-missing run artifact — structurally
+    decision log — the ground-truth input the ``overseer-liveness-probe``
+    ``run_window`` check now reads (config#2667; the reader moved off the
+    retired groom-liveness-probe in I2831) to detect a silently-missing run
+    artifact — structurally
     blind to sweep dispatches: a sweep box that died silently after this
     Lambda logged "dispatched" left no trace for the probe to even know a
     trigger had fired.

@@ -87,3 +87,48 @@ def test_router_bundles_this_registry():
     pin the copy line so a rename breaks CI, not the deploy."""
     deploy = (LAMBDAS_DIR / "overseer-dispatcher" / "deploy.sh").read_text()
     assert "overseer/playbooks.yaml" in deploy
+
+
+# ── Liveness block contract (alpha-engine-config-I2831) ──────────────────────
+# The registry also drives the registry-driven overseer-liveness-probe: each
+# playbook's optional `liveness.checks` + the top-level `watch_plane_liveness`.
+
+
+def test_liveness_probe_bundles_this_registry():
+    """The overseer-liveness-probe's deploy.sh must copy THIS registry into its
+    zip (the probe's check table) — same bundling contract as the router."""
+    deploy = (LAMBDAS_DIR / "overseer-liveness-probe" / "deploy.sh").read_text()
+    assert "overseer/playbooks.yaml" in deploy
+
+
+def _sibling_dispatcher_pipeline_names() -> set[str]:
+    """SF names in saturday-sf-watch-dispatcher's PIPELINES dict — the SSoT the
+    sf-watch liveness pipeline list must mirror. (Was pinned inside the sf-watch
+    probe's own test before I2831 moved the list into this registry.)"""
+    text = (LAMBDAS_DIR / "saturday-sf-watch-dispatcher" / "index.py").read_text()
+    start = text.index("PIPELINES: dict")
+    end = text.index("\n}\n", start)
+    block = text[start:end]
+    # Only keys at the dict's own 4-space indent are pipeline names.
+    return set(re.findall(r'^ {4}"([\w.-]+)":\s*\{', block, re.M))
+
+
+def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher():
+    """REGRESSION GUARD (moved from sf-watch-liveness-probe's own test): the
+    sf-watch playbook's liveness pipeline list (the eventbridge_rule
+    ``expect_state_machines`` + ``state_machines_exist`` list — ONE YAML anchor)
+    must exactly match saturday-sf-watch-dispatcher's PIPELINES registry. Drift
+    would silently check a stale pipeline set — the exact class the probe exists
+    to catch."""
+    checks = REGISTRY["playbooks"]["sf-watch"]["liveness"]["checks"]
+    ebr = next(c for c in checks if c["type"] == "eventbridge_rule")
+    sme = next(c for c in checks if c["type"] == "state_machines_exist")
+    # The anchor: the two lists are literally the same object after YAML load.
+    assert ebr["expect_state_machines"] == sme["state_machines"]
+    registry_pipes = set(ebr["expect_state_machines"])
+    sibling = _sibling_dispatcher_pipeline_names()
+    assert registry_pipes == sibling, (
+        "sf-watch liveness pipeline list drifted from saturday-sf-watch-dispatcher's "
+        f"PIPELINES — only-registry: {sorted(registry_pipes - sibling)}, "
+        f"only-dispatcher: {sorted(sibling - registry_pipes)}"
+    )

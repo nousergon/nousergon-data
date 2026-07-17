@@ -1030,8 +1030,8 @@ def test_sweep_launch_failure_raises_for_sf_catch(monkeypatch):
 # ── config#2667: launch_decided (sweep) dispatches now write a decision ─────
 # record too — previously ONLY the demand-all path did, leaving the
 # dispatch-decision log (groom/decisions/{date}/*.json, the ground truth
-# groom-liveness-probe reads to detect a silently-missing run artifact)
-# structurally blind to sweep-mode dispatches.
+# the overseer-liveness-probe run_window check reads to detect a
+# silently-missing run artifact) structurally blind to sweep-mode dispatches.
 
 
 def test_sweep_launch_writes_decision_record(monkeypatch):
@@ -1055,7 +1055,8 @@ def test_sweep_skip_launch_writes_decision_record_with_launch_false(monkeypatch)
     # The concurrent-lane skip path (a prior cycle's sweep box still live) is
     # itself a launch_decided invocation that must ALSO leave a record — with
     # launch=false, so the liveness probe correctly does NOT expect an
-    # artifact for it (see groom-liveness-probe's _decision_launched).
+    # artifact for it (see overseer-liveness-probe's run_window
+    # _rw_decision_launched).
     idx = _load(
         monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
         running_tier_instances={"sweep": ["i-live-sweep"]},
