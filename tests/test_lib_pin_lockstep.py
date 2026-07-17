@@ -96,6 +96,21 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "(same SpotProbeError handling requirement, same source code, 2026-07-17 vires GHA "
         "quota migration)",
     ),
+    "morning-signal-runner-dispatcher": (
+        "v0.110.0",
+        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
+        "(same SpotProbeError handling requirement, same source code, 2026-07-17 GHA quota migration)",
+    ),
+    "mnemon-runner-dispatcher": (
+        "v0.110.0",
+        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
+        "(same SpotProbeError handling requirement, same source code, 2026-07-17 GHA quota migration)",
+    ),
+    "krepis-runner-dispatcher": (
+        "v0.110.0",
+        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
+        "(same SpotProbeError handling requirement, same source code, 2026-07-17 GHA quota migration)",
+    ),
     "data-spot-dispatcher": (
         "v0.83.0",
         "ec2_spot launch chokepoint (config#1767)",
