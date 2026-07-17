@@ -79,12 +79,15 @@ def fake_repo(cd, tmp_path, monkeypatch):
 
 
 def test_map_covers_all_four_orchestrated_state_machines(cd):
+    # alpha-engine-config-I2890 (2026-07-17): the I2544/I2545 advisory +
+    # Sunday-modelzoo child SFs were retired (splits reversed — the weekly SF
+    # runs the full inline pattern again), so the map is back to four.
     names = {e["sf_name"] for e in cd.SF_DEFINITIONS}
     assert names == {
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
-        "alpha-engine-groom-pipeline",
+        "alpha-engine-groom-dispatch",
     }
 
 
@@ -110,6 +113,27 @@ def test_s3_constants_match_deploy_script(cd):
     deploy = (_REPO_ROOT / "infrastructure" / "deploy-infrastructure.sh").read_text()
     assert f'BUCKET="{cd.S3_BUCKET}"' in deploy
     assert cd.S3_PREFIX == "infrastructure/"
+
+
+def test_groom_entry_uses_live_dispatch_name_not_stale_pipeline_name(cd):
+    """alpha-engine-config#2391: deploy-infrastructure.sh targets
+    `alpha-engine-groom-dispatch` — the OLD `alpha-engine-groom-pipeline`
+    name is a dead state machine. This map previously still carried the
+    stale name, which meant this drift guard would have quietly checked
+    nothing real even if it had been wired up (describe-state-machine on
+    a dead ARN reads as missing-in-aws, not as "extend coverage")."""
+    entries = {e["sf_name"]: e for e in cd.SF_DEFINITIONS}
+    assert "alpha-engine-groom-pipeline" not in entries
+    assert entries["alpha-engine-groom-dispatch"]["definition_file"] == "step_function_groom.json"
+
+
+def test_groom_arn_in_deploy_script_matches_map(cd):
+    """The map's groom sf_name must be the same literal deploy-infrastructure.sh
+    actually creates/updates (GROOM_ARN), not a name that merely looks plausible."""
+    deploy = (_REPO_ROOT / "infrastructure" / "deploy-infrastructure.sh").read_text()
+    entries = {e["sf_name"]: e for e in cd.SF_DEFINITIONS}
+    groom_name = entries["alpha-engine-groom-dispatch"]["sf_name"]
+    assert f'GROOM_ARN="arn:aws:states:$REGION:${{ACCOUNT_ID}}:stateMachine:{groom_name}"' in deploy
 
 
 # ── normalization ───────────────────────────────────────────────────────────
@@ -225,6 +249,84 @@ def test_check_sf_missing_repo_file(cd, fake_repo):
     assert "not found" in findings[0]
 
 
+# ── groom-dispatch specifically (alpha-engine-config#2391) ──────────────────
+#
+# Exercises the real SF_DEFINITIONS entry for alpha-engine-groom-dispatch
+# (not a fake_repo stand-in) against the actual on-disk
+# infrastructure/step_function_groom.json, mirroring how the weekly/daily/eod
+# entries are covered above — same _dispatcher mocked-CLI shape, just pointed
+# at the groom entry and the real repo file instead of a tmp_path fixture.
+
+
+def _groom_entry(cd):
+    return next(e for e in cd.SF_DEFINITIONS if e["sf_name"] == "alpha-engine-groom-dispatch")
+
+
+def test_check_sf_groom_dispatch_clean_when_all_three_copies_match(cd):
+    entry = _groom_entry(cd)
+    repo_def = json.loads((_REPO_ROOT / "infrastructure" / entry["definition_file"]).read_text())
+    with patch.object(
+        cd.subprocess,
+        "run",
+        side_effect=_dispatcher(live_def=_stamped(repo_def), s3_def=_stamped(repo_def)),
+    ):
+        findings = cd._check_sf(entry)
+    assert findings == []
+
+
+def test_check_sf_groom_dispatch_detects_live_drift(cd):
+    """The exact incident class config#2391 documents: an ASL change lands in
+    the repo but never reaches the live groom-dispatch state machine (e.g.
+    because a deploy path targeted the wrong/dead SF name) — this must be
+    reported as LIVE drift and fail the check."""
+    entry = _groom_entry(cd)
+    repo_def = json.loads((_REPO_ROOT / "infrastructure" / entry["definition_file"]).read_text())
+    stale_live = json.loads(json.dumps(repo_def))
+    stale_live["Comment"] = "a stale groom comment from 11 days ago"
+    with patch.object(
+        cd.subprocess,
+        "run",
+        side_effect=_dispatcher(live_def=_stamped(stale_live), s3_def=_stamped(repo_def)),
+    ):
+        findings = cd._check_sf(entry)
+    assert len(findings) == 1
+    assert "alpha-engine-groom-dispatch" in findings[0]
+    assert "LIVE" in findings[0]
+
+
+def test_check_sf_groom_dispatch_detects_stale_s3_staged_copy(cd):
+    entry = _groom_entry(cd)
+    repo_def = json.loads((_REPO_ROOT / "infrastructure" / entry["definition_file"]).read_text())
+    stale_s3 = json.loads(json.dumps(repo_def))
+    stale_s3["Comment"] = "a stale S3-staged groom comment"
+    with patch.object(
+        cd.subprocess,
+        "run",
+        side_effect=_dispatcher(live_def=_stamped(repo_def), s3_def=_stamped(stale_s3)),
+    ):
+        findings = cd._check_sf(entry)
+    assert len(findings) == 1
+    assert "alpha-engine-groom-dispatch" in findings[0]
+    assert "S3 staged copy" in findings[0]
+
+
+def test_check_sf_groom_dispatch_missing_on_aws(cd):
+    """If deploy-infrastructure.sh regresses back to the dead
+    alpha-engine-groom-pipeline name (or any other wrong target), describe-
+    state-machine on the codified alpha-engine-groom-dispatch ARN comes back
+    missing — this must fail loud, not silently pass."""
+    entry = _groom_entry(cd)
+    repo_def = json.loads((_REPO_ROOT / "infrastructure" / entry["definition_file"]).read_text())
+    with patch.object(
+        cd.subprocess,
+        "run",
+        side_effect=_dispatcher(s3_def=_stamped(repo_def), sf_missing=True),
+    ):
+        findings = cd._check_sf(entry)
+    assert len(findings) == 1
+    assert "not found" in findings[0]
+
+
 def test_aws_cli_hard_exits_on_unexpected_failure(cd):
     """A broken CLI/creds state must never read as 'no drift'."""
     with patch.object(cd.subprocess, "run", return_value=_fake_run(255, "", "AccessDenied")):
@@ -244,6 +346,7 @@ def test_main_returns_zero_when_clean(cd, monkeypatch):
 
 def test_main_returns_one_on_drift(cd, monkeypatch):
     monkeypatch.setattr(cd, "_check_sf", lambda entry: [f"{entry['sf_name']}: drifted"])
+    monkeypatch.setattr(cd, "_alert_on_drift", lambda findings, **kw: None)
     monkeypatch.setattr("sys.argv", ["check-definition-drift.py"])
     assert cd.main() == 1
 
@@ -261,3 +364,104 @@ def test_main_name_filter_scopes_to_one_sf(cd, monkeypatch):
     )
     assert cd.main() == 0
     assert checked == ["ne-weekly-freshness-pipeline"]
+
+
+# ── SNS alerting on drift (alpha-engine-config#2391 acceptance criterion 3) ──
+#
+# Mirrors validators/constituents_drift_check.py's lazy-import +
+# try/except-around-publish pattern; nousergon_lib isn't installed in this
+# test environment, so these tests fake the module via sys.modules rather
+# than requiring the real dependency (same spirit as mocking the aws CLI
+# above — no real network/SNS access in CI).
+
+
+class _FakePublishResult:
+    def __init__(self, sns_ok=True, telegram_ok=True):
+        self.sns = type("Chan", (), {"ok": sns_ok})()
+        self.telegram = type("Chan", (), {"ok": telegram_ok})()
+        self.any_ok = sns_ok or telegram_ok
+
+
+@pytest.fixture()
+def fake_nousergon_lib_alerts(monkeypatch):
+    """Install a fake nousergon_lib.alerts module and return the recorded
+    publish() calls list."""
+    import sys
+    import types
+
+    calls: list[dict] = []
+
+    def fake_publish(message, **kwargs):
+        calls.append({"message": message, **kwargs})
+        return _FakePublishResult()
+
+    fake_alerts_module = types.ModuleType("nousergon_lib.alerts")
+    fake_alerts_module.publish = fake_publish
+    fake_lib_module = types.ModuleType("nousergon_lib")
+    fake_lib_module.alerts = fake_alerts_module
+
+    monkeypatch.setitem(sys.modules, "nousergon_lib", fake_lib_module)
+    monkeypatch.setitem(sys.modules, "nousergon_lib.alerts", fake_alerts_module)
+    return calls
+
+
+def test_alert_on_drift_publishes_via_nousergon_lib(cd, fake_nousergon_lib_alerts):
+    cd._alert_on_drift(["alpha-engine-groom-dispatch: definition drift (LIVE vs x)"])
+    assert len(fake_nousergon_lib_alerts) == 1
+    call = fake_nousergon_lib_alerts[0]
+    assert "alpha-engine-groom-dispatch" in call["message"]
+    assert call["severity"] == "error"
+    assert "check-definition-drift.py" in call["source"]
+
+
+def test_alert_on_drift_missing_nousergon_lib_does_not_raise(cd, monkeypatch):
+    """No nousergon_lib installed (this test env's actual default state) must
+    degrade to a logged warning, never an exception — the drift check's exit
+    code is the authoritative signal even when alerting is unavailable."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocking_import(name, *args, **kwargs):
+        if name == "nousergon_lib" or name.startswith("nousergon_lib."):
+            raise ImportError("no module named nousergon_lib")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
+    cd._alert_on_drift(["fake-sf: drifted"])  # must not raise
+
+
+def test_main_fires_alert_on_drift(cd, monkeypatch, fake_nousergon_lib_alerts):
+    fake_entry = {
+        "sf_name": "alpha-engine-groom-dispatch",
+        "definition_file": "step_function_groom.json",
+    }
+    monkeypatch.setattr(cd, "SF_DEFINITIONS", (fake_entry,))
+    monkeypatch.setattr(cd, "_check_sf", lambda entry: [f"{entry['sf_name']}: drifted"])
+    monkeypatch.setattr("sys.argv", ["check-definition-drift.py"])
+    assert cd.main() == 1
+    assert len(fake_nousergon_lib_alerts) == 1
+
+
+def test_main_no_drift_does_not_fire_alert(cd, monkeypatch, fake_nousergon_lib_alerts):
+    fake_entry = {
+        "sf_name": "alpha-engine-groom-dispatch",
+        "definition_file": "step_function_groom.json",
+    }
+    monkeypatch.setattr(cd, "SF_DEFINITIONS", (fake_entry,))
+    monkeypatch.setattr(cd, "_check_sf", lambda entry: [])
+    monkeypatch.setattr("sys.argv", ["check-definition-drift.py"])
+    assert cd.main() == 0
+    assert fake_nousergon_lib_alerts == []
+
+
+def test_main_no_alert_flag_suppresses_alert_even_on_drift(cd, monkeypatch, fake_nousergon_lib_alerts):
+    fake_entry = {
+        "sf_name": "alpha-engine-groom-dispatch",
+        "definition_file": "step_function_groom.json",
+    }
+    monkeypatch.setattr(cd, "SF_DEFINITIONS", (fake_entry,))
+    monkeypatch.setattr(cd, "_check_sf", lambda entry: [f"{entry['sf_name']}: drifted"])
+    monkeypatch.setattr("sys.argv", ["check-definition-drift.py", "--no-alert"])
+    assert cd.main() == 1
+    assert fake_nousergon_lib_alerts == []

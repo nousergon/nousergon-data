@@ -63,14 +63,14 @@ _DEPLOY_SCRIPTS = (
 # now flows directly into WeekdayPipelineSchedule.
 _TRIGGER_SUCCESSORS = {
     "SaturdayTrigger": "WeekdayPipelineSchedule",
-    # alpha-engine-config-I2545: ModelZooSundayTrigger was inserted between
-    # WeekdayPipelineSchedule and ResearchAlerts in the CFN template — update this
-    # chain in the SAME PR as any future insertion between two entries here
-    # (an unregistered gap silently merges the two neighboring blocks and
-    # masks a genuine multi-target regression, exactly the failure mode
-    # this successor-chain exists to prevent).
-    "WeekdayPipelineSchedule": "ModelZooSundayTrigger",
-    "ModelZooSundayTrigger": "ResearchAlerts",
+    # alpha-engine-config-I2890 (2026-07-17): ModelZooSundayTrigger was RETIRED
+    # (I2544/I2545 splits reversed — ModelZoo is back inline in the Saturday
+    # SF), so WeekdayPipelineSchedule flows directly into ResearchAlerts again.
+    # Update this chain in the SAME PR as any future insertion between two
+    # entries here (an unregistered gap silently merges the two neighboring
+    # blocks and masks a genuine multi-target regression, exactly the failure
+    # mode this successor-chain exists to prevent).
+    "WeekdayPipelineSchedule": "ResearchAlerts",
 }
 
 

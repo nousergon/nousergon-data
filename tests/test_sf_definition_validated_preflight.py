@@ -41,8 +41,10 @@ _STAMPED_VARS = (
     "$DAILY_STAMPED",
     "$EOD_STAMPED",
     "$GROOM_STAMPED",
-    "$ADVISORY_STAMPED",
-    "$MODELZOO_STAMPED",
+    # alpha-engine-config-I2890 (2026-07-17): $ADVISORY_STAMPED and
+    # $MODELZOO_STAMPED were retired with the I2544/I2545 child SFs — the
+    # splits were reversed and the weekly SF carries the full inline pattern
+    # in step_function.json again.
 )
 
 

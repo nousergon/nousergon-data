@@ -3864,7 +3864,8 @@
         "FunctionName": "alpha-engine-evaluator:live",
         "Payload": {
           "date.$": "$.run_date",
-          "dry_run.$": "$.research_dry"
+          "dry_run.$": "$.research_dry",
+          "snapshot": true
         }
       },
       "TimeoutSeconds": 300,

@@ -931,8 +931,9 @@ class TestHappyPathTraversal:
                         for cc in conds
                         if "StringEquals" in cc
                     }
-                    if eqs & {"Success", "OK", "SKIPPED"}:
-                        # success-continuation edge
+                    if eqs & {"Success", "OK", "SKIPPED", "HEALTHY"}:
+                        # success-continuation edge (HEALTHY: config#2249
+                        # SubstrateHealthGate verdict on a green trace)
                         success_edge = success_edge or c["Next"]
                     if eqs & {"FAILED", "ERROR"}:
                         # a FAILED-guard Choice (CheckBranchOutcomes shape):
@@ -1028,7 +1029,11 @@ class TestHappyPathTraversal:
         # composed directly after LibPinDriftGate's pass-through (no drift ->
         # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
         # violation) — two extra states in the visited order.
-        assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
+        # config#2249: CheckSkipMorningEnrich.Default now routes through the
+        # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
+        # MorningEnrich (fast fail on a dead dispatch box) — two extra states
+        # in the visited order on the no-skip path.
+        assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
             "CheckRunMode",
@@ -1040,6 +1045,8 @@ class TestHappyPathTraversal:
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
+            "SubstrateHealthGate",
+            "CheckSubstrateHealthGate",
             "MorningEnrich",
         ]
 
