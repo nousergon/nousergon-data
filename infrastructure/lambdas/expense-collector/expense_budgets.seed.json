@@ -31,7 +31,7 @@
     "github_org": {
       "label": "GitHub (nousergon org)",
       "monthly_budget_usd": null,
-      "included_minutes": 2000
+      "included_minutes": 3000
     },
     "github_user": {
       "label": "GitHub (cipher813)",
