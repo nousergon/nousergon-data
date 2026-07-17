@@ -95,7 +95,13 @@ jobs:
             exit 1
           fi
           MARKER_KEY=$(jq -r '.marker_key' "$RESP")
-          DISPATCHED_AT=$(jq -r '.dispatched_at' "$RESP")
+          # `// 0` degrades safely if the dispatcher Lambda hasn't been
+          # redeployed with dispatched_at yet (config-I2753 rollout: this
+          # workflow and the Lambda deploy don't have to land in lockstep)
+          # — 0 makes the freshness check below always pass, matching the
+          # pre-fix behavior, rather than a bare `null` breaking the awk
+          # numeric comparison and timing out every run.
+          DISPATCHED_AT=$(jq -r '.dispatched_at // 0' "$RESP")
           echo "marker_key=${MARKER_KEY}" >> "$GITHUB_OUTPUT"
           echo "dispatched_at=${DISPATCHED_AT}" >> "$GITHUB_OUTPUT"
 
