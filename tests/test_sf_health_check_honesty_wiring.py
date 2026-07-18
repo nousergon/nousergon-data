@@ -216,7 +216,10 @@ def test_degraded_notifiers_mirror_config_1819_shape(states, notifier):
     assert 0 < len(subject) <= 100
     assert "\n" not in subject
     assert "health checks" in subject
-    assert st["End"] is True
+    # config#2857: the real-completion path no longer Ends here directly —
+    # it converges into the SF-envelope completion marker before ending.
+    assert "End" not in st
+    assert st["Next"] == "WriteCompletionMarker"
     (catch,) = st["Catch"]
     assert catch["ErrorEquals"] == ["States.ALL"]
     assert catch["Next"] == "NotifyCompleteDegraded"  # config#1819 idiom

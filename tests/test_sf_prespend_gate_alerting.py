@@ -142,7 +142,10 @@ def test_gate_degraded_threads_into_completion_email(states):
     assert "SUCCESS" in notify["Parameters"]["Subject"]
     assert len(notify["Parameters"]["Subject"]) <= 100
     assert "Subject.$" not in notify["Parameters"]
-    assert notify["End"] is True
+    # config#2857: converges into the SF-envelope completion marker before
+    # ending, rather than Ending here directly.
+    assert "End" not in notify
+    assert notify["Next"] == "WriteCompletionMarker"
     (catch,) = notify["Catch"]
     assert catch["Next"] == "NotifyCompleteDegraded"  # config#1819 idiom
 

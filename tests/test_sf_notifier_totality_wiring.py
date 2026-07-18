@@ -362,19 +362,28 @@ class TestSuccessPathNotifiersAreNonFatal:
     otherwise-succeeded pipeline (2026-06-12 NotifyComplete incident)."""
 
     @pytest.mark.parametrize(
-        "name,degraded_next",
+        "name,degraded_next,terminal_next",
         [
-            ("NotifyComplete", "NotifyCompleteDegraded"),
-            ("NotifyShellRunComplete", "NotifyShellRunCompleteDegraded"),
+            # config#2857: the real-completion pair now converges into the
+            # SF-envelope completion marker instead of Ending directly. The
+            # Friday-PM preflight (shell_run) pair is deliberately EXCLUDED
+            # from the marker (a dry pass must not satisfy the SLA) and
+            # still Ends here exactly as before.
+            ("NotifyComplete", "NotifyCompleteDegraded", "WriteCompletionMarker"),
+            ("NotifyShellRunComplete", "NotifyShellRunCompleteDegraded", None),
         ],
     )
     def test_notifier_catches_and_still_ends_success(
-        self, weekly_states, name, degraded_next
+        self, weekly_states, name, degraded_next, terminal_next
     ):
         st = weekly_states[name]
         assert st["Type"] == "Task"
         assert st["Resource"] == "arn:aws:states:::sns:publish"
-        assert st.get("End") is True
+        if terminal_next:
+            assert "End" not in st
+            assert st["Next"] == terminal_next
+        else:
+            assert st.get("End") is True
         catches = st.get("Catch", [])
         assert catches, f"{name} must Catch a publish failure (config#1819)"
         assert any(
@@ -383,10 +392,17 @@ class TestSuccessPathNotifiersAreNonFatal:
         )
         degraded = weekly_states[degraded_next]
         assert degraded["Type"] == "Pass"
-        assert degraded["End"] is True, (
-            f"{degraded_next} must still End the execution as SUCCEEDED — "
-            f"a caught notify failure must not propagate into a Fail"
-        )
+        if terminal_next:
+            assert "End" not in degraded
+            assert degraded["Next"] == terminal_next, (
+                f"{degraded_next} must still reach the SUCCEEDED completion "
+                f"marker — a caught notify failure must not propagate into a Fail"
+            )
+        else:
+            assert degraded["End"] is True, (
+                f"{degraded_next} must still End the execution as SUCCEEDED — "
+                f"a caught notify failure must not propagate into a Fail"
+            )
 
     def test_notify_complete_subject_still_bounded(self, weekly_states):
         """NotifyComplete/NotifyShellRunComplete's Subjects are hardcoded
