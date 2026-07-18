@@ -87,7 +87,9 @@ def _check_role(role_file: Path) -> list[str]:
     if _canonical_json(source_doc) != _canonical_json(aws_doc):
         findings.append(
             f"{role_name}/{policy_name}: source document differs from "
-            f"AWS document (content drift)"
+            f"AWS document (content drift)\n"
+            f"    source: {_canonical_json(source_doc)}\n"
+            f"    aws:    {_canonical_json(aws_doc)}"
         )
 
     return findings
@@ -114,7 +116,9 @@ def _check_trust_role(trust_file: Path) -> list[str]:
     if _canonical_json(source_doc) != _canonical_json(aws_doc):
         findings = [
             f"{role_name}: trust snapshot differs from AWS "
-            f"AssumeRolePolicyDocument (trust-drift — run apply.sh to push)"
+            f"AssumeRolePolicyDocument (trust-drift — run apply.sh to push)\n"
+            f"    source: {_canonical_json(source_doc)}\n"
+            f"    aws:    {_canonical_json(aws_doc)}"
         ]
     else:
         findings = []
