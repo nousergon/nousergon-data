@@ -12,9 +12,9 @@ name: Live FRED Smoke
 # Secret gate: requires repo secret FRED_API_KEY. Forks without the
 # secret get a clean skip rather than a failing CI status.
 
-on:
-
 permissions: {}
+
+on:
   pull_request:
     branches: [main]
     paths:

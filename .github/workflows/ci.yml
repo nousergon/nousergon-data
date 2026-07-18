@@ -1,8 +1,8 @@
 name: CI
 
-on:
-
 permissions: {}
+
+on:
   push:
     branches: [main]
   pull_request:
