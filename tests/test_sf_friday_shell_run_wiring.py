@@ -189,9 +189,13 @@ _SPOT_STATES = {
 # _SPOT_STATES) routed dry via --preflight-only, not a Lambda dry flag.
 # alpha-engine-config-I2515 Phase B removed the multi-agent Research state
 # entirely — its "Research" entry here is retired along with it.
-# SignalsEnvelope/ChallengerShadow (its replacements) do NOT thread
-# $.research_dry (their Payloads carry no dry-run signal, mirroring
-# ThinkTankCoverage's own no-dry-flag convention), so neither is added here.
+# ChallengerShadow still threads no dry-run signal (mirroring ThinkTankCoverage's
+# no-dry-flag convention). SignalsEnvelope, however, threads a preflight signal
+# (config-I2916) — NOT via this _DRY_LAMBDA_STATES map, because it is NOT a
+# full dry short-circuit: preflight.$=$.research_dry keeps the read/build/write
+# path LIVE and only downgrades the I2880 board-staleness guard to a WARN on the
+# Friday dry-Scanner preflight. That distinct wiring is pinned by
+# test_signals_envelope_preflight_signal below, not by the dry-flag map.
 # state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
     "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
@@ -720,6 +724,37 @@ class TestByteIdenticalAbsentPath:
             f"{name}.Payload[{payload_key}] must be {ref} (so the dry flag "
             f"follows the control var); got {payload.get(payload_key)!r}"
         )
+
+    def test_signals_envelope_preflight_signal(self, sf):
+        """config-I2916: SignalsEnvelope threads preflight.$=$.research_dry so the
+        Friday-PM dry-Scanner preflight downgrades the signals-envelope Lambda's
+        I2880 universe-board fallback-staleness guard from a hard raise to a WARN
+        (the dated board is intentionally absent on the dry preflight, so the
+        ~5-trading-day-stale prior-Saturday fallback is EXPECTED there).
+
+        This is DISTINCT from a full dry short-circuit: the key is `preflight`,
+        NOT `dry_run_llm` (which is_dry() would use to return before any S3
+        access). SignalsEnvelope's read/build/write path stays LIVE on the
+        preflight (bootstrap/transport smoke is the preflight's whole point);
+        only the one expected-stale-fallback condition is relaxed. On the real
+        Saturday run research_dry=false → preflight=false → the guard is fully
+        in force.
+        """
+        payload = self._state(sf, "SignalsEnvelope")["Parameters"]["Payload"]
+        assert payload.get("preflight.$") == "$.research_dry", (
+            "SignalsEnvelope.Payload must thread preflight.$=$.research_dry so the "
+            "Friday preflight relaxes the I2880 board-staleness guard to a WARN; "
+            f"got {payload.get('preflight.$')!r}"
+        )
+        # It must NOT reuse dry_run_llm — that would short-circuit the read path
+        # entirely (is_dry), defeating the transport smoke this state exists for.
+        assert "dry_run_llm.$" not in payload, (
+            "SignalsEnvelope must NOT thread dry_run_llm (full S3 short-circuit); "
+            "the config-I2916 fix keeps the read path live via a distinct "
+            "`preflight` signal."
+        )
+        # run_date must still flow so the (live) read keys off the same date.
+        assert payload.get("run_date.$") == "$.run_date"
 
 
 class TestConsolidatedNotify:
