@@ -1083,7 +1083,7 @@
             },
             "RAGIngestion": {
               "Type": "Task",
-              "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design — accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy.",
+              "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design — accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy. config#2938 (2026-07-18): executionTimeout raised 3600s→14400s (4h). Step 5/9 of spot_data_weekly.sh --rag-only is the multi-source news sweep whose Polygon leg (5 req/min, account-wide) now covers the FULL ~944-ticker universe (~3.15h) — the prior 3600s cap SIGKILLed it twice (ExecutionTimedOut/137) after the universe grew ~9x. 4h is the config#2938 ruling-2 hard cap; it must move in LOCKSTEP with the inner run_ssm \"rag-only\" timeout + the rag-only MAX_RUNTIME_SECONDS watchdog in spot_data_weekly.sh and the WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS constant in collectors/news_sources/fetch_budget.py (guarded by tests/test_rag_ingestion_news_budget_wiring.py). Well under the 43200s global ceiling; runs in Branch A parallel to PredictorTraining.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
@@ -1091,7 +1091,7 @@
                 "Parameters": {
                   "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$.preflight_args))",
                   "executionTimeout": [
-                    "3600"
+                    "14400"
                   ]
                 },
                 "TimeoutSeconds": 3600
