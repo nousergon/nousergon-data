@@ -72,7 +72,9 @@ _CHAIN = [
     ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
-    ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "PipelineComplete"),
+    # config#2857: the skip edge now routes through the SF-envelope
+    # completion marker (still a genuine pipeline SUCCESS) before PipelineComplete.
+    ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "WriteCompletionMarker"),
 ]
 
 
@@ -222,7 +224,10 @@ class TestEntryEdgesRouteThroughGates:
         # RunDailyNews removed (alpha-engine-config#1089): the standalone 04:00
         # daily-news chain now produces the artifact, so the weekday SF ends at
         # the daemon restart instead of routing into a news chain.
-        assert states["RunDaemon"]["Next"] == "PipelineComplete"
+        # config#2857: now routes through the SF-envelope completion marker
+        # before PipelineComplete.
+        assert states["RunDaemon"]["Next"] == "WriteCompletionMarker"
+        assert states["WriteCompletionMarker"]["Next"] == "PipelineComplete"
 
 
 class TestPaths:
@@ -273,7 +278,9 @@ class TestPaths:
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags=all_flags)
         for task in (c[1] for c in _CHAIN):
             assert task not in order, f"{task} ran despite its skip flag"
-        assert order == ["PipelineComplete"]
+        # config#2857: the skip edge still passes through the SF-envelope
+        # completion marker on its way to PipelineComplete.
+        assert order == ["WriteCompletionMarker", "PipelineComplete"]
 
     def test_skip_data_phase_resumes_at_predictor_inference(self, states):
         """config#1767: skip_morning_enrich skips the ENTIRE spot data phase
