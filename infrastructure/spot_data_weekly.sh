@@ -248,7 +248,8 @@ done
 # (5 req/min, account-wide) now covers the FULL ~944-ticker universe (~3.15h)
 # per config#2938 ruling 1. The DataPhase1-sized defaults (5400s watchdog,
 # 3600s inner workload) SIGKILLed it twice on 2026-07-18. rag-only therefore
-# gets the config#2938 4h hard cap on BOTH the spot-side watchdog and the inner
+# gets the config#2938 hard cap (6h since 2026-07-18 — measured filings phase
+# >=1h precedes the ~3.15h Polygon sweep) on BOTH the spot-side watchdog and the inner
 # workload SSM call. These MUST stay in lockstep with the RAGIngestion
 # executionTimeout in step_function.json (14400s) and the
 # WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS constant in
@@ -256,12 +257,12 @@ done
 # tests/test_rag_ingestion_news_budget_wiring.py. Other modes (DataPhase1,
 # workloads) keep the 5400s default; an explicit --max-runtime-seconds still
 # wins so an operator can override.
-RAG_ONLY_EXECUTION_TIMEOUT_SECONDS=14400          # = SF RAGIngestion executionTimeout
+RAG_ONLY_EXECUTION_TIMEOUT_SECONDS=21600          # = SF RAGIngestion executionTimeout
 RAG_ONLY_WORKLOAD_TIMEOUT_SECONDS="$RAG_ONLY_EXECUTION_TIMEOUT_SECONDS"
 if [ "$RUN_MODE" = "rag-only" ] && [ "$MAX_RUNTIME_EXPLICIT" != "1" ]; then
     # +300s so the box's own shutdown watchdog is a BACKSTOP that fires after
     # the outer SF executionTimeout/cleanup, never before the sweep completes.
-    MAX_RUNTIME_SECONDS=14700
+    MAX_RUNTIME_SECONDS=21900
 fi
 
 # launch-only contract: the id artifact is how the weekday SF finds the

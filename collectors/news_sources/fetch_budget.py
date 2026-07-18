@@ -42,7 +42,7 @@ POLYGON_SECONDS_PER_TICKER = 12.5
 # ── Weekly (Saturday RAGIngestion) — config#2938 ruling 1: FULL coverage ────
 # The weekly corpus feeds predictor training + research, so it is sized to
 # COMPLETE the full-universe Polygon sweep, NOT to bail early. Hard-capped at
-# ~4h (ruling 2) so the fetch plus the rest of the RAGIngestion step
+# ~6h (ruling 2) so the fetch plus the rest of the RAGIngestion step
 # (GDELT/Yahoo/NLP/RAG-ingest, a few min) fit inside the SSM executionTimeout.
 #
 # LOCKSTEP: this cap is mirrored by three timeouts in nousergon-data —
@@ -50,20 +50,25 @@ POLYGON_SECONDS_PER_TICKER = 12.5
 # the inner ``run_ssm "rag-only"`` timeout, and the rag-only spot-watchdog
 # ``MAX_RUNTIME_SECONDS`` — and is CI-guarded there. Changing it here means
 # changing all three (their guard test names this constant).
-WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS = 14_400  # 4h
+WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS = 21_600  # 6h
 
-# Reserve inside the 4h step for everything that is NOT the Polygon crawl:
-# spot bootstrap/deps + the GDELT/Yahoo sources + NLP + the RAG-ingest step.
-_WEEKLY_STEP_NON_POLYGON_RESERVE_SECONDS = 2_400
+# Reserve inside the step for everything that is NOT the Polygon crawl:
+# spot bootstrap/deps + the SEC-filings ingestion phase + the GDELT/Yahoo
+# sources + NLP + the RAG-ingest step. MEASURED, not guessed: on 2026-07-18
+# the filings phase ALONE ran >=3600s on both live attempts (attempt-0 and
+# watch-rerun-2026-07-18-2 were still mid-filings when killed at the 1h
+# inner cap) — the original 2_400s reserve under-counted it, leaving
+# nominal filings + full Polygon sweep (~11_328s) over the old 4h envelope.
+_WEEKLY_STEP_NON_POLYGON_RESERVE_SECONDS = 6_000
 
 # A small universe still gets a sane budget (never below this floor).
 _WEEKLY_NEWS_FLOOR_SECONDS = 1_800
 
-# The Polygon sweep may consume at most (4h − reserve) so the rest of the
+# The Polygon sweep may consume at most (6h − reserve) so the rest of the
 # step always gets to run within the SSM executionTimeout.
 _WEEKLY_POLYGON_CAP_SECONDS = (
     WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS - _WEEKLY_STEP_NON_POLYGON_RESERVE_SECONDS
-)  # 12_000
+)  # 15_600
 
 
 def weekly_news_max_fetch_seconds(universe_size: int) -> int:
@@ -72,7 +77,7 @@ def weekly_news_max_fetch_seconds(universe_size: int) -> int:
     Sized from the LIVE universe to COMPLETE the full sweep (config#2938
     ruling 1), floored so a small universe still gets a sane budget, and
     capped so the fetch plus the rest of the RAGIngestion step fit inside the
-    4h SSM ``executionTimeout``. The adapter's own deadline guard is then a
+    6h SSM ``executionTimeout``. The adapter's own deadline guard is then a
     SIGKILL backstop (partial coverage + WARN), never the intended operating
     mode — at the ~944-ticker universe the ~3.15h crawl completes well inside
     the derived ~11.8k s budget.

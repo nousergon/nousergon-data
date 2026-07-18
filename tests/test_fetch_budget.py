@@ -67,11 +67,13 @@ class TestWeeklyBudget:
             1_000_000
         )
 
-    def test_weekly_cap_matches_4h_policy(self):
-        # The SSM executionTimeout the nousergon-data guard pins against is the
-        # config#2938 4h ruling. If this changes, the three nousergon-data
+    def test_weekly_cap_matches_6h_policy(self):
+        # The SSM executionTimeout the nousergon-data guard pins against:
+        # config#2938 ruling-2 hard cap, widened 4h->6h on 2026-07-18 after
+        # live measurement showed the filings phase alone needs >=1h before
+        # the Polygon sweep starts. If this changes, the three nousergon-data
         # timeouts (executionTimeout / run_ssm / MAX_RUNTIME) move in lockstep.
-        assert WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS == 14_400
+        assert WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS == 21_600
 
 
 class TestDailyBudget:
