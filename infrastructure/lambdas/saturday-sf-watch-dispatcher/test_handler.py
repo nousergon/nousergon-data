@@ -844,24 +844,21 @@ def test_fast_path_preflight_excluded(fast_path_on):
     assert result["fast_path"]["reason"] == "preflight"
 
 
-# ── config#2003: suppress agent dispatch for operator-recovery reruns and ───
-# ── post-escalation same-day repeats ─────────────────────────────────────────
+# ── Shepherd ruling (Brian, 2026-07-18) + fast-path self-loop guard ─────────
 #
-# Observed 2026-07-08 (EOD incident, config#1446/#1464): the watch correctly
-# escalated the original eod-2026-07-08-* failure as human-gated (IAM), then
-# dispatched TWO MORE agent runs for the operator's own recovery reruns
-# `watch-rerun-2026-07-08-1`/`-2` — duplicating a recovery already in
-# progress. Both carve-outs below still write the watch-log + Telegram
-# receipt (observability stays); only the agent repository_dispatch is
-# suppressed.
+# watch-rerun-* failures DISPATCH: the overseer shepherds the whole incident
+# arc, reruns included (the 2026-07-18 arc showed the old config#2003
+# suppression benched the autonomous loop after the first recovery rerun —
+# bugs #3-#5 all fell to the operator by structure). The 2026-07-08 pile-on
+# config#2003 fixed is now bounded by the config#2269 per-day dispatch
+# ceiling + the charter's same-error rule. Only fast-path-rerun-* (this
+# Lambda's own deterministic rerun) still suppresses — self-loop guard.
 
 
-def test_watch_rerun_named_execution_suppresses_dispatch_but_still_records(monkeypatch):
-    """(a) An execution named after the watch's OWN recommended recovery-rerun
-    convention (`watch-rerun-<date>-<n>`) must NOT summon a second agent, but
-    the watch-log event AND the Telegram receipt still fire (unlike the
-    silent config#1827 operator-abort path — the operator needs confirmation
-    the watch recognized their recovery attempt, not silence)."""
+def test_watch_rerun_named_execution_dispatches_fresh_agent(monkeypatch):
+    """Shepherd ruling (2026-07-18): a FAILED `watch-rerun-<date>-<n>`
+    execution summons a fresh agent like any other failure — the overseer
+    owns the whole incident arc. Watch-log + dispatch both fire."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     fired = {"called": False}
@@ -877,34 +874,50 @@ def test_watch_rerun_named_execution_suppresses_dispatch_but_still_records(monke
             _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-1"), None
         )
 
-    # No repository_dispatch HTTP call — the agent spin-up is suppressed.
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    assert fired["called"] is True
+
+    s3.put_object.assert_called_once()
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["execution_name"] == "watch-rerun-2026-07-08-1"
+    assert ev["dispatch_suppressed"] is None
+
+
+def test_fast_path_rerun_still_suppresses_self_loop(monkeypatch):
+    """The Lambda's OWN deterministic rerun (`fast-path-rerun-*`) must not
+    re-dispatch on failure — self-loop guard survives the shepherd ruling."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="fast-path-rerun-2026-07-08-1"), None
+        )
+
     assert result["agent_dispatch"] == {
         "dispatched": False, "reason": "operator_recovery_rerun",
     }
     assert result["action"] == "observe"
     assert fired["called"] is False
-
-    # Watch-log STILL written (fail-loud) and carries the auditable reason.
-    s3.put_object.assert_called_once()
     written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    ev = written["events"][-1]
-    assert ev["execution_name"] == "watch-rerun-2026-07-08-1"
-    assert ev["dispatch_suppressed"] == "operator_recovery_rerun"
-    assert ev["action"] == "observe"
-
-    # Telegram receipt STILL fires — observability stays, only dispatch is
-    # suppressed (distinct from the SILENT operator-abort path).
-    assert result["telegram_sent"] is True
-    index.notify_via_flow_doctor.assert_called_once()
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "DISPATCH SUPPRESSED" in text
-    assert "watch-rerun-2026-07-08-1" in text
+    assert written["events"][-1]["dispatch_suppressed"] == "operator_recovery_rerun"
 
 
-def test_second_watch_rerun_same_day_also_suppressed(monkeypatch):
-    """The exact 2026-07-08 incident shape: TWO operator recovery reruns the
-    same day both suppress — the second rerun attempt must not dispatch
-    either, regardless of how many prior events already exist."""
+def test_second_watch_rerun_same_day_gated_only_by_escalation_flag_or_ceiling(monkeypatch):
+    """Post-shepherd: a second same-day watch-rerun failure is no longer
+    suppressed AS a rerun. With a prior `escalated` event and the
+    DISPATCH_AFTER_ESCALATION opt-out at its default (false), the
+    already_escalated_today gate still holds; with the flag true, it
+    dispatches (bounded by the config#2269 ceiling)."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
@@ -912,27 +925,29 @@ def test_second_watch_rerun_same_day_also_suppressed(monkeypatch):
         "schema_version": 1,
         "events": [
             {"action": "escalated", "execution_name": "eod-2026-07-08-1"},
-            {
-                "action": "observe",
-                "execution_name": "watch-rerun-2026-07-08-1",
-                "dispatch_suppressed": "operator_recovery_rerun",
-            },
         ],
     }
+
+    # Default (DISPATCH_AFTER_ESCALATION=false): escalation gate holds.
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", False)
     factory, _, s3 = _make_clients(existing=existing)
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(
             _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-2"), None
         )
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "already_escalated_today",
+    }
 
-    assert result["agent_dispatch"]["dispatched"] is False
-    assert result["agent_dispatch"]["reason"] in {
-        "operator_recovery_rerun", "already_escalated_today",
-    }
-    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    assert written["events"][-1]["dispatch_suppressed"] in {
-        "operator_recovery_rerun", "already_escalated_today",
-    }
+    # Shepherd posture (flag true): the rerun failure dispatches.
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", True)
+    factory, _, s3 = _make_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-2"), None
+        )
+    assert result["agent_dispatch"]["dispatched"] is True
+
 
 
 def test_fast_path_named_rerun_execution_also_suppresses_dispatch(monkeypatch):
