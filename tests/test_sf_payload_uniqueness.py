@@ -88,7 +88,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
     # Research state as the signals.json producer.
-    "SignalsEnvelope": frozenset({"run_date.$", "target"}),
+    # config-I2916: preflight.$=$.research_dry threads the Friday-PM shell-run
+    # signal so the signals-envelope Lambda downgrades its I2880 universe-board
+    # fallback-staleness guard to a WARN (the dry Scanner leaves the dated board
+    # absent every Friday). DISTINCT from dry_run_llm — the read/build/write
+    # path still runs; only the expected-stale-fallback bound is relaxed.
+    "SignalsEnvelope": frozenset({"run_date.$", "target", "preflight.$"}),
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
