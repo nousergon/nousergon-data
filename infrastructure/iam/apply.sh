@@ -14,16 +14,24 @@
 # to CloudFormation/Terraform.
 #
 # Usage:
-#   ./infrastructure/iam/apply.sh                  # apply every policy
+#   ./infrastructure/iam/apply.sh                  # apply every policy + trust snapshot
 #   ./infrastructure/iam/apply.sh github-actions-lambda-deploy   # one role
 #   ./infrastructure/iam/apply.sh --dry-run        # print planned commands
 #
 # Prerequisites:
-#   - AWS CLI configured with iam:PutRolePolicy on the target roles
-#   - The target IAM roles already exist (this script only updates inline
-#     policies; it does NOT create the roles themselves, because the trust
-#     policies differ and are outside the scope of a simple flat-file
-#     approach)
+#   - AWS CLI configured with iam:PutRolePolicy + iam:UpdateAssumeRolePolicy
+#     on the target roles
+#   - The target IAM roles already exist (this script does not create roles —
+#     initial creation stays in the owning deploy script, since it also has
+#     to handle the "role doesn't exist yet" bootstrap case)
+#
+# *.trust.json files are version-tracked snapshots of a role's ASSUME-ROLE
+# (trust) policy, applied via `update-assume-role-policy` — distinct from the
+# *.json inline permission documents applied via `put-role-policy` above.
+# config#2826: these snapshots are the single source of truth a role's trust
+# document is derived from; deploy scripts that need to (re-)assert a trust
+# policy (e.g. deploy-infrastructure.sh's step 3b) read the same file rather
+# than keeping their own inline copy, so the two can never drift apart.
 
 set -euo pipefail
 
@@ -70,29 +78,62 @@ apply_one() {
   echo "  OK"
 }
 
+apply_trust_one() {
+  local file="$1"
+  local role
+  role="$(basename "$file" .trust.json)"
+
+  if ! python3 -c "import json; json.load(open('$file'))" 2>/dev/null; then
+    echo "ERROR: $file is not valid JSON — skipping" >&2
+    return 1
+  fi
+
+  echo "Applying trust snapshot $file -> role=$role (update-assume-role-policy)"
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "  [dry-run] aws iam update-assume-role-policy --role-name $role --policy-document file://$file --region $REGION"
+    return 0
+  fi
+
+  aws iam update-assume-role-policy \
+    --role-name "$role" \
+    --policy-document "file://$file" \
+    --region "$REGION"
+  echo "  OK"
+}
+
 cd "$SCRIPT_DIR"
 
 if [ -n "$TARGET_ROLE" ]; then
-  file="${TARGET_ROLE}.json"
-  if [ ! -f "$file" ]; then
-    echo "ERROR: $file not found in $SCRIPT_DIR" >&2
+  found=0
+  perm_file="${TARGET_ROLE}.json"
+  trust_file="${TARGET_ROLE}.trust.json"
+  if [ -f "$perm_file" ]; then
+    apply_one "$perm_file"
+    found=1
+  fi
+  if [ -f "$trust_file" ]; then
+    apply_trust_one "$trust_file"
+    found=1
+  fi
+  if [ "$found" = 0 ]; then
+    echo "ERROR: neither $perm_file nor $trust_file found in $SCRIPT_DIR" >&2
     exit 1
   fi
-  apply_one "$file"
 else
   shopt -s nullglob
+  trust_files=( *.trust.json )
+  for file in "${trust_files[@]}"; do
+    apply_trust_one "$file"
+  done
+
   files=( *.json )
   if [ ${#files[@]} -eq 0 ]; then
     echo "No .json policy files found in $SCRIPT_DIR"
     exit 0
   fi
   for file in "${files[@]}"; do
-    # *.trust.json are version-tracked snapshots of assume-role (trust)
-    # policies, NOT inline permission documents — they are applied with
-    # `aws iam update-assume-role-policy`, never put-role-policy. Skip them
-    # in the bulk pass (see README "Trust policies + role creation").
     case "$file" in
-      *.trust.json) echo "Skipping trust snapshot $file (apply with update-assume-role-policy)"; continue ;;
+      *.trust.json) continue ;;  # already applied above via apply_trust_one
     esac
     apply_one "$file"
   done

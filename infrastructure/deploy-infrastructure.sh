@@ -331,21 +331,20 @@ update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Ba
 # is attempted here — that keeps the GHA deploy role's IAM grant minimal
 # (iam:UpdateAssumeRolePolicy on this one role — see
 # infrastructure/iam/github-actions-lambda-deploy.json).
+#
+# config#2826: the trust document itself lives in ONE place —
+# infrastructure/iam/alpha-engine-eventbridge-sfn-role.trust.json — the same
+# version-tracked snapshot deploy_step_function.sh's own bootstrap reads and
+# apply.sh/check-drift.py operate on. This step reads that file instead of
+# carrying its own inline copy, closing the exact class of drift that caused
+# this gap in the first place (two hand-maintained literals of the same
+# trust document, one of them missing a principal).
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
-EB_TRUST='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"Service": ["events.amazonaws.com", "scheduler.amazonaws.com"]},
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}'
+EB_TRUST_FILE="$SCRIPT_DIR/iam/${EB_ROLE_NAME}.trust.json"
 echo "  Ensuring $EB_ROLE_NAME trusts events.amazonaws.com + scheduler.amazonaws.com (idempotent)..."
 aws iam update-assume-role-policy \
     --role-name "$EB_ROLE_NAME" \
-    --policy-document "$EB_TRUST" \
+    --policy-document "file://$EB_TRUST_FILE" \
     --region "$REGION"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
