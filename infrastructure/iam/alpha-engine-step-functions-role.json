@@ -165,6 +165,12 @@
       "Effect": "Allow",
       "Action": "states:StartExecution",
       "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+    },
+    {
+      "Sid": "WriteSfCompletionMarker",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_sf_completion/*"
     }
   ]
 }
