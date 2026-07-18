@@ -3739,17 +3739,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-dashboard",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python -m nousergon_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log",
-            "echo '--- constituents drift check ---' | tee -a /var/log/substrate-health-check.log",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','source .venv/bin/activate','trap \\'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT','python -m nousergon_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log','echo \\'--- constituents drift check ---\\' | tee -a /var/log/substrate-health-check.log','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log','echo \\'--- phase marker sweep ---\\' | tee -a /var/log/substrate-health-check.log',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.phase_marker_sweep --run-date \"$RUN_DATE\" --alert 2>&1 | tee -a /var/log/substrate-health-check.log')",
           "executionTimeout": [
             "240"
           ]

@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.sf_command_utils import extract_commands
+
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
@@ -180,11 +182,18 @@ class TestCommandShape:
     Drops here would silently neuter the check (e.g. dropping --alert
     suppresses SNS without changing exit code; dropping --cadence flips
     to argparse error).
+
+    config#2322: the commands array was converted from a static ``commands``
+    list to a ``commands.$`` ASL intrinsic (``States.Array(...)``) so the
+    phase-marker-sweep command can thread ``export RUN_DATE.$=$.run_date``
+    (same shape as the Backtester/Parity/Evaluator spot stages —
+    tests/test_sf_run_date_threading.py) — extract_commands() reads through
+    either shape.
     """
 
     @pytest.fixture
     def commands(self, states) -> list[str]:
-        return states["WeeklySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands"]
+        return extract_commands(states["WeeklySubstrateHealthCheck"])
 
     def test_invokes_transparency_module(self, commands):
         assert any(
@@ -219,6 +228,64 @@ class TestCommandShape:
         # mid-pipeline is forbidden.
         joined = " ".join(commands)
         assert "pip install" not in joined
+
+
+class TestPhaseMarkerSweep:
+    """config#2322: post-run phase-marker sweep must run after the
+    constituents-drift check, on the same run_date the backtest chain
+    wrote its `.phases/` markers under, and must not be able to abort the
+    SF (the existing States.ALL Catch on this state already makes any
+    non-zero exit non-blocking — see TestCatchSemantics)."""
+
+    @pytest.fixture
+    def commands(self, states) -> list[str]:
+        return extract_commands(states["WeeklySubstrateHealthCheck"])
+
+    def test_invokes_phase_marker_sweep_module(self, commands):
+        assert any(
+            "python -m validators.phase_marker_sweep" in cmd for cmd in commands
+        )
+
+    def test_phase_marker_sweep_passes_alert_flag(self, commands):
+        sweep_cmd = next(
+            c for c in commands if "validators.phase_marker_sweep" in c
+        )
+        assert "--alert" in sweep_cmd
+
+    def test_phase_marker_sweep_runs_after_constituents_drift(self, commands):
+        drift_idx = next(
+            i for i, c in enumerate(commands)
+            if "validators.constituents_drift_check" in c
+        )
+        sweep_idx = next(
+            i for i, c in enumerate(commands)
+            if "validators.phase_marker_sweep" in c
+        )
+        assert drift_idx < sweep_idx
+
+    def test_run_date_exported_before_phase_marker_sweep(self, commands):
+        rd_idx = next(
+            i for i, c in enumerate(commands)
+            if c.startswith("export RUN_DATE=")
+        )
+        sweep_idx = next(
+            i for i, c in enumerate(commands)
+            if "validators.phase_marker_sweep" in c
+        )
+        assert rd_idx < sweep_idx
+
+    def test_phase_marker_sweep_reads_exported_run_date(self, commands):
+        sweep_cmd = next(
+            c for c in commands if "validators.phase_marker_sweep" in c
+        )
+        assert '--run-date "$RUN_DATE"' in sweep_cmd
+
+    def test_run_date_threaded_from_sf_run_date(self, states):
+        # value is threaded from the SF-stamped $.run_date (States.Format),
+        # same contract as tests/test_sf_run_date_threading.py's spot stages.
+        raw_expr = states["WeeklySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands.$"]
+        assert "States.Format('export RUN_DATE=" in raw_expr
+        assert "$.run_date" in raw_expr
 
 
 class TestResultPathIsolation:
