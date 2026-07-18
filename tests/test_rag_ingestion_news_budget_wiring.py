@@ -99,3 +99,17 @@ def test_other_modes_keep_dataphase1_watchdog_default():
     # workloads) stays 5400s so those modes are not silently over-budgeted.
     text = _SCRIPT.read_text()
     assert 'MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"' in text
+
+
+def test_max_runtime_explicit_default_initialized_before_use():
+    # The script runs under `set -u`; the --max-runtime-seconds flag path is
+    # the only assignment of MAX_RUNTIME_EXPLICIT=1. Without a default init
+    # BEFORE the rag-only override check, every SF-driven rag-only dispatch
+    # dies with "MAX_RUNTIME_EXPLICIT: unbound variable" (2026-07-18
+    # watch-rerun-2026-07-18-1 failure — the exact incident this pins).
+    text = _SCRIPT.read_text()
+    default = 'MAX_RUNTIME_EXPLICIT="${MAX_RUNTIME_EXPLICIT:-0}"'
+    assert default in text, "MAX_RUNTIME_EXPLICIT must be default-initialized"
+    assert text.index(default) < text.index('"$MAX_RUNTIME_EXPLICIT" != "1"'), (
+        "default init must precede the rag-only override check"
+    )
