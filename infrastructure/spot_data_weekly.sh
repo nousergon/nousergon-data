@@ -114,6 +114,12 @@ AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # plus pip install + preflight. If the workload legitimately needs longer,
 # bump this — don't silently rely on the orphan reaper.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# Set to 1 only by the --max-runtime-seconds flag: the rag-only 4h-cap
+# override below must not clobber an explicit operator value. MUST be
+# default-initialized here — this script runs under `set -u`, and the flag
+# path is the only assignment (2026-07-18: the missing default killed every
+# SF-driven rag-only dispatch with "MAX_RUNTIME_EXPLICIT: unbound variable").
+MAX_RUNTIME_EXPLICIT="${MAX_RUNTIME_EXPLICIT:-0}"
 # ── Spot-interruption resilience (2026-05-30 incident) ──────────────────────
 # The Saturday SF DataPhase1 failed when this run's nested spot
 # (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-
