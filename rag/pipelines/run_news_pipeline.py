@@ -106,8 +106,21 @@ def main() -> int:
     from collectors.news_sources.polygon import PolygonNewsAdapter
     from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
 
+    # config#2938 ruling 1 — the WEEKLY corpus gets FULL coverage: size the
+    # Polygon budget from the LIVE universe so the ~5-req/min sweep COMPLETES
+    # (the adapter guard is only a SIGKILL backstop). GDELT keeps its own tight
+    # default (its throttle-degrades-this-adapter posture, config#2813). The
+    # budget is kept below the RAGIngestion SSM executionTimeout so the rest of
+    # the step (NLP + RAG ingest) always runs — see fetch_budget for the
+    # derivation and its lockstep with nousergon-data's step_function.json.
+    from collectors.news_sources.fetch_budget import weekly_news_max_fetch_seconds
+    poly_budget = weekly_news_max_fetch_seconds(len(tickers))
+    logger.info(
+        "[run_news_pipeline] weekly Polygon news budget = %ds for %d tickers",
+        poly_budget, len(tickers),
+    )
     aggregator = NewsAggregator(sources=[
-        PolygonNewsAdapter(),
+        PolygonNewsAdapter(max_fetch_seconds=poly_budget),
         GdeltNewsAdapter(ticker_name_map=_load_ticker_name_map()),
         YahooRssNewsAdapter(),
     ])
