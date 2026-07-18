@@ -871,6 +871,19 @@ def _watch_is_acting(record: dict, dispatch: dict) -> bool:
     return dispatch.get("dispatched") is True
 
 
+def _safe_cause_for_telegram(cause, max_len: int = 300):
+    """Truncate cause string before backtick-wrapping to prevent entity parse errors.
+
+    Telegram Markdown parse_mode fails with 400 if an entity delimiter (backtick)
+    is split by truncation. Truncating the content before wrapping ensures delimiters
+    always close safely."""
+    if not cause:
+        return None
+    if len(cause) <= max_len:
+        return cause
+    return cause[:max_len - 1] + "…"
+
+
 def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     """Distinct, SILENT Telegram receipt — ONLY when ``_watch_is_acting``.
 
@@ -903,7 +916,8 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     if record.get("failed_state"):
         lines.append(f"Failed state: `{record['failed_state']}`")
     if record.get("cause"):
-        lines.append(f"Cause: `{record['cause']}`")
+        safe_cause = _safe_cause_for_telegram(record['cause'])
+        lines.append(f"Cause: `{safe_cause}`")
     lines.append(f"Watch log: `s3://{WATCH_BUCKET}/{key}`")
     if fast_path:
         lines.append(f"Rerun: `{record.get('rerun_execution_arn', '')}`")
@@ -972,7 +986,7 @@ def _escalate_budget_exhausted(record: dict, key: str, pipeline_name: str, run_d
         f"{record.get('prior_dispatch_count', '?')} today already hit the "
         f"{record.get('dispatch_ceiling', '?')}-attempt ceiling for run_date {run_date}.",
         f"Failed state: `{record.get('failed_state')}`" if record.get("failed_state") else "",
-        f"Cause: `{record['cause']}`" if record.get("cause") else "",
+        f"Cause: `{_safe_cause_for_telegram(record.get('cause'))}`" if record.get("cause") else "",
         f"Watch log: `s3://{WATCH_BUCKET}/{key}`",
         "_The watch has GIVEN UP on today for this pipeline — no further agent "
         "dispatches or reruns will fire. Human needed (config#2269)._",

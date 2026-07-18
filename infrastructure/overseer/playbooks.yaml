@@ -135,10 +135,16 @@ playbooks:
 
   groom:
     description: >-
-      Demand-driven backlog groom (three daily EventBridge cron triggers,
-      symmetric demand evaluation, pace gate). Inventory-only here: its
-      trigger topology is scheduler-driven with zero routing decisions, so it
-      keeps its direct EventBridge->Lambda path.
+      Backlog groom, both legs of the SAME executor Lambda/SF (config#2201,
+      config-I2928 Phase 3): (1) the three daily fixed-cron EventBridge
+      triggers running the tier/decision-record groom proper, and (2) the
+      demand-driven end-of-SF Haiku PR-sweep leg (`groom_run.sh --mode
+      sweep`, fired by scripts/groom_driver.py after a fleet Step Function
+      completes rather than on a schedule). Inventory-only here: both legs'
+      trigger topology is scheduler/event-driven with zero routing decisions,
+      so both keep their direct EventBridge->Lambda path rather than a
+      separate registry line — see the liveness comment below for why sweep
+      needs no dedicated check either.
     tier: T2
     routed: false
     enabled: true
@@ -168,6 +174,35 @@ playbooks:
             - {hour: 1, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "01:00 daily (Sonnet high-only)"}
             - {hour: 7, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "07:00 daily (Sonnet mid-only)"}
             - {hour: 19, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "19:00 daily (Haiku low-only)"}
+
+  gate-sweeps:
+    description: >-
+      Daily backlog gate-maintenance sweep train (config-I2928 Phase 3):
+      gate_due_sweep.py (Re-exam date arrival flagging), gate_dependency_sweep.py
+      (gate:dependency re-admission), gate_sf_run_sweep.py (gate:*-sf
+      re-admission on SF success), gate_data_sweep.py (gate:data auto-lift +
+      gate:device Re-exam maintenance), gate_milestone_sweep.py (gate:milestone
+      auto-clear), check_definition_drift_sweep.py (SF definition drift
+      backstop), complexity_gate_boundary_lint.py (complexity:ultra <->
+      gate:decision boundary lint), gate_ask_block_sweep.py (Decision Queue
+      Ask-block completeness), groom_gate_park.py --resurface (groom:parked
+      issue resurface). Inventory-only here: NO Lambda is involved at all — this
+      is a pure GitHub Actions scheduled workflow in a DIFFERENT repo
+      (alpha-engine-config), so it has no overseer-dispatcher routing surface
+      and no executor_function/kill_switch_env to speak of.
+    tier: T3
+    routed: false
+    enabled: true
+    trigger_type: github_actions_cron
+    workflow_file: .github/workflows/gate-due-sweep.yml
+    repo: alpha-engine-config
+    schedule_cron: "30 13 * * *"
+    charter: alpha-engine-config/scripts/gate_due_sweep.py
+    concurrency_domain: >-
+      Single GHA concurrency group `gate-due-sweep` (cancel-in-progress:
+      false) — the workflow's own steps run sequentially in one job, most
+      with continue-on-error so one sweep's failure doesn't mask the rest.
+    supports_drill: false
 
 # ── Cross-cutting watch-plane liveness (alpha-engine-config-I2831) ────────────
 # Checks that belong to NO single playbook: the overseer-dispatcher router

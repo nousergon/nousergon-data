@@ -13,6 +13,13 @@ Pins:
      decline the registry doesn't know stays escalating (correct default), but
      a TYPO'd benign reason would silently page on a by-design decline.
   4. Kill-switch lockstep: ``kill_switch_env`` appears in the executor source.
+
+Pins 2 and 4 above only apply to Lambda-backed entries (``trigger_type``
+absent, or explicitly ``lambda_dispatch``). Entries with
+``trigger_type: github_actions_cron`` (alpha-engine-config-I2928 Phase 3) have
+NO Lambda at all — they are pure GitHub Actions scheduled workflows, usually
+in a different repo — so they carry ``workflow_file``/``repo`` instead, which
+this test module checks separately below.
 """
 
 from __future__ import annotations
@@ -31,13 +38,28 @@ LAMBDAS_DIR = REPO_ROOT / "infrastructure" / "lambdas"
 REGISTRY = yaml.safe_load((OVERSEER_DIR / "playbooks.yaml").read_text())
 SCHEMA = json.loads((OVERSEER_DIR / "playbooks.schema.json").read_text())
 
+# alpha-engine-config-I2928 Phase 3: split the playbook set into lambda-backed
+# entries (trigger_type absent, or explicitly lambda_dispatch — the implicit
+# default, so pre-existing entries with no trigger_type at all land here) vs.
+# github_actions_cron entries (no Lambda exists for these at all).
+LAMBDA_BACKED_PLAYBOOKS = sorted(
+    name
+    for name, spec in REGISTRY["playbooks"].items()
+    if spec.get("trigger_type", "lambda_dispatch") != "github_actions_cron"
+)
+GHA_CRON_PLAYBOOKS = sorted(
+    name
+    for name, spec in REGISTRY["playbooks"].items()
+    if spec.get("trigger_type") == "github_actions_cron"
+)
+
 
 def test_registry_validates_against_schema():
     jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate(REGISTRY, SCHEMA)
 
 
-@pytest.mark.parametrize("name", sorted(REGISTRY["playbooks"]))
+@pytest.mark.parametrize("name", LAMBDA_BACKED_PLAYBOOKS)
 def test_executor_lambda_dir_exists(name):
     spec = REGISTRY["playbooks"][name]
     lambda_dir = LAMBDAS_DIR / spec["executor_lambda_dir"]
@@ -47,7 +69,7 @@ def test_executor_lambda_dir_exists(name):
     )
 
 
-@pytest.mark.parametrize("name", sorted(REGISTRY["playbooks"]))
+@pytest.mark.parametrize("name", LAMBDA_BACKED_PLAYBOOKS)
 def test_executor_function_matches_dir_convention(name):
     spec = REGISTRY["playbooks"][name]
     assert spec["executor_function"] == f"alpha-engine-{spec['executor_lambda_dir']}", (
@@ -72,7 +94,7 @@ def test_benign_reasons_exist_in_executor_source(name):
     )
 
 
-@pytest.mark.parametrize("name", sorted(REGISTRY["playbooks"]))
+@pytest.mark.parametrize("name", LAMBDA_BACKED_PLAYBOOKS)
 def test_kill_switch_env_exists_in_executor_source(name):
     spec = REGISTRY["playbooks"][name]
     src = (LAMBDAS_DIR / spec["executor_lambda_dir"] / "index.py").read_text()
@@ -80,6 +102,55 @@ def test_kill_switch_env_exists_in_executor_source(name):
         f"playbook {name!r}: kill_switch_env {spec['kill_switch_env']!r} not found "
         f"in {spec['executor_lambda_dir']}/index.py"
     )
+
+
+# ── GitHub Actions cron entries (alpha-engine-config-I2928 Phase 3) ──────────
+# These have no Lambda at all, so they carry workflow_file/repo instead of the
+# executor_*/kill_switch_env fields checked above. Cross-repo file-existence
+# checks are impractical from this test (the workflow lives in
+# alpha-engine-config, this test runs in nousergon-data), so we assert shape
+# instead: a sane workflow_file path pattern + a repo field for cross-repo
+# entries.
+
+WORKFLOW_FILE_PATTERN = re.compile(r"^\.github/workflows/[a-z0-9_-]+\.ya?ml$")
+
+
+@pytest.mark.parametrize("name", GHA_CRON_PLAYBOOKS)
+def test_gha_cron_entry_has_sane_workflow_file(name):
+    spec = REGISTRY["playbooks"][name]
+    workflow_file = spec.get("workflow_file")
+    assert workflow_file, (
+        f"playbook {name!r}: trigger_type github_actions_cron requires a "
+        f"workflow_file (no Lambda exists for this entry to fall back on)"
+    )
+    assert WORKFLOW_FILE_PATTERN.match(workflow_file), (
+        f"playbook {name!r}: workflow_file {workflow_file!r} does not look like "
+        f"a .github/workflows/*.yml path"
+    )
+
+
+@pytest.mark.parametrize("name", GHA_CRON_PLAYBOOKS)
+def test_gha_cron_entry_has_repo(name):
+    spec = REGISTRY["playbooks"][name]
+    assert spec.get("repo"), (
+        f"playbook {name!r}: trigger_type github_actions_cron requires a repo "
+        f"field — this registry lives in nousergon-data but the workflow may "
+        f"live elsewhere, and the field disambiguates that for readers"
+    )
+
+
+@pytest.mark.parametrize("name", GHA_CRON_PLAYBOOKS)
+def test_gha_cron_entry_has_no_lambda_fields(name):
+    """A github_actions_cron entry has no Lambda — Lambda-specific fields
+    should not be present (schema already forbids requiring them, but this
+    pins the intent: don't half-fill a Lambda reference for an entry with
+    none)."""
+    spec = REGISTRY["playbooks"][name]
+    for field in ("executor_function", "executor_lambda_dir", "kill_switch_env"):
+        assert field not in spec, (
+            f"playbook {name!r}: trigger_type github_actions_cron entries should "
+            f"not carry {field!r} — there is no Lambda backing this entry"
+        )
 
 
 def test_router_bundles_this_registry():

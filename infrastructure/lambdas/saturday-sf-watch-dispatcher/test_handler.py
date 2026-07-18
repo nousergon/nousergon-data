@@ -158,6 +158,23 @@ def test_watch_log_path_is_code_fenced(monkeypatch):
     assert "Cause: `States.TaskFailed: RAGIngestion failed`" in text
 
 
+def test_long_cause_truncates_safely_for_telegram(monkeypatch):
+    """config#2939: long cause strings must be truncated before backtick-wrapping
+    to prevent Telegram parse_mode failure when a delimiter is split by truncation."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    long_cause = "x" * 500 + " extra text that should not appear"
+    factory, _, _ = _make_clients(describe={"cause": long_cause})
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED"), None)
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "Cause: `" in text
+    assert text.count("`") % 2 == 0, "All backticks must be paired (even count)"
+    assert "…`" in text, "Truncated cause must end with ellipsis inside backticks"
+    assert "extra text that should not appear" not in text
+
+
 def test_run_date_prefers_input_run_date():
     factory, _, s3 = _make_clients(describe={
         "input": json.dumps({"run_date": "2026-06-20", "shell_run": False}),
