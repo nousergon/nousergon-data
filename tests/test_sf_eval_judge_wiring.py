@@ -656,7 +656,9 @@ class TestReplayConcordance:
     def test_payload_carries_required_fields(self, states):
         payload = states["ReplayConcordance"]["Parameters"]["Payload"]
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
-        assert payload["target_models"] == ["claude-haiku-4-5"]
+        # alpha-engine-config-I2997 (2026-07-19): ReplayConcordance migrated
+        # off direct Anthropic to OpenRouter (deepseek/deepseek-v4-flash).
+        assert payload["target_models"] == ["deepseek/deepseek-v4-flash"]
         assert payload["window_days"] == 56
         assert payload["max_artifacts"] == 150
 
