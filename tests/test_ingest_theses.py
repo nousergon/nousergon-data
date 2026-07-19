@@ -69,11 +69,11 @@ def _entry(ticker, thesis, **extra):
     return e
 
 
-def _run(holder, universe):
+def _run(holder, universe, dry_run=True):
     holder["s3"] = _InMemoryS3({"2026-07-18": {"universe": universe}})
     from rag.pipelines.ingest_theses import ingest_signals_theses
 
-    return ingest_signals_theses(dry_run=True)
+    return ingest_signals_theses(dry_run=dry_run)
 
 
 def test_null_thesis_summary_skipped_not_crash(_stub_env):
@@ -98,3 +98,30 @@ def test_null_and_valid_theses_mixed(_stub_env):
     ]
     res = _run(_stub_env, universe)
     assert res["signals_theses"] == 1  # AAPL only
+
+
+def test_null_sibling_fields_ingest_without_crash_or_none_pollution(_stub_env):
+    """config#2964: a >=50-char thesis paired with explicit-null sub_scores /
+    score / signal / conviction / sector must still ingest cleanly -- no
+    ``None.get()`` crash, and the embedded text must not contain the literal
+    string 'None' for any null field."""
+    entry = _entry(
+        "QUAL",
+        "A" * 60,
+        sub_scores=None,
+        score=None,
+        signal=None,
+        conviction=None,
+        sector=None,
+    )
+    from rag.pipelines.ingest_theses import ingest_signals_theses
+
+    _stub_env["s3"] = _InMemoryS3({"2026-07-18": {"universe": [entry]}})
+    res = ingest_signals_theses(dry_run=False)  # must not raise
+
+    assert res["signals_theses"] == 1
+    ingest_document_mock = sys.modules["nousergon_lib.rag.retrieval"].ingest_document
+    _, kwargs = ingest_document_mock.call_args
+    assert kwargs["sector"] is None
+    embedded_content = kwargs["chunks"][0]["content"]
+    assert "None" not in embedded_content

@@ -92,6 +92,13 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "date helpers coherence with sf-telegram-notifier",
     ),
+    "expense-collector": (
+        "v0.83.0",
+        "flow-doctor forum-topic routing (config#1742); OPS_HEALTH-only "
+        "single-topic consumer, same exemption group as "
+        "saturday-integrity-sentinel/sf-watch-liveness-probe/pipeline-watchdog "
+        "(alpha-engine-config#2843)",
+    ),
     "freshness-monitor": (
         "v0.85.0",
         "flow-doctor event_driven + liveness_via (config#1747/1718/1726)",

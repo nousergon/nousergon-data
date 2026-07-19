@@ -53,6 +53,19 @@ message, rendered red by the console page and logged with traceback here)
 rather than propagated. The handler still RAISES if the budgets SSoT and every
 adapter fail together, or if the artifact write fails — a rollup that can't
 record anything is a dead check and must trip the Lambda error metric.
+
+Over-budget Telegram alert (alpha-engine-config#2843): after the rollup write,
+any provider row whose ``pace`` flips to ``"over"`` gets a RISING-EDGE Telegram
+ping via flow-doctor's OPS_HEALTH topic — once per provider per calendar
+month, re-arming if the row drops back under budget/quota and later re-crosses.
+State lives at ``expenses/alert_state/{YYYY-MM}.json`` (provider key → last-
+observed breached flag), mirroring the (now-retired) usage-pace-alert Lambda's
+rising-edge mechanism (git history @ nousergon-data#831~1:
+infrastructure/lambdas/usage-pace-alert/index.py). This is a NOTIFICATION
+ONLY — usage-pacing ENFORCEMENT (predictive gates) was dismantled fleet-wide
+2026-07-14 (Brian ruling) and must never be re-added here. It is also fully
+distinct from the separate Claude-Max WET pace alert that Lambda used to send
+(different Lambda, different data source) — no duplication.
 """
 
 from __future__ import annotations
@@ -67,6 +80,9 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
+from flow_doctor_telegram import notify_via_flow_doctor
+from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
+
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -79,6 +95,14 @@ LATEST_KEY = "expenses/latest.json"
 BASELINE_PREFIX = "expenses/baselines/"
 SNAPSHOT_PREFIX = "expenses/snapshots/"
 COST_RAW_PREFIX = "decision_artifacts/_cost_raw/"
+ALERT_STATE_PREFIX = "expenses/alert_state/"
+
+# Over-budget Telegram alert (config#2843) — notification only, OPS_HEALTH
+# topic (this is an advisory pace signal, not a critical incident; unlike the
+# retired usage-pace-alert's OVER tier it does not also fan out to CRITICAL).
+_FLOW_NAME = "expense-collector"
+_DB_BASENAME = "flow_doctor_expense_collector"
+_ALERT_TOPICS = (FleetTelegramTopic.OPS_HEALTH,)
 
 # SSM parameter names (batch-read; absent ones degrade that row to
 # status="not_configured", never the whole run).
@@ -210,6 +234,104 @@ def _put_json(s3, key: str, doc: dict, if_none_match: bool = False) -> bool:
         if if_none_match and code in {"PreconditionFailed", "412"}:
             return False
         raise
+
+
+# ---------------------------------------------------------------------------
+# Over-budget Telegram alert (config#2843) — rising-edge state per provider,
+# per calendar month. Mirrors the retired usage-pace-alert Lambda's
+# _load_state/_save_state/notify_via_flow_doctor mechanism (git history @
+# nousergon-data#831~1) rather than reimplementing it.
+# ---------------------------------------------------------------------------
+
+def _alert_state_key(period: str) -> str:
+    return f"{ALERT_STATE_PREFIX}{period}.json"
+
+
+def _load_alert_state(s3, period: str) -> dict:
+    """Prior per-provider breached flags for THIS calendar-month period;
+    ``{}`` (nothing armed) if absent, unreadable, or malformed — so a fresh
+    month naturally starts with every provider re-armed. Best-effort: a read
+    failure is treated as "no prior state" (worst case: one duplicate alert),
+    never raises (this is dedup bookkeeping, not the primary breach signal —
+    the pace itself already comes from the rollup written above)."""
+    key = _alert_state_key(period)
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        data = json.loads(obj["Body"].read())
+    except Exception as exc:  # noqa: BLE001 — absence expected; bad blob recoverable
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code not in {"NoSuchKey", "404", "403"}:
+            logger.warning("could not read expense alert state %s: %s", key, exc)
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
+        return {}
+    return data
+
+
+def _save_alert_state(s3, period: str, breached: dict[str, bool]) -> None:
+    """Persist this run's observed per-provider breached flags. Best-effort: a
+    write failure only risks a duplicate alert next run (logged), never a
+    missed breach (the breach itself already surfaced via Telegram)."""
+    key = _alert_state_key(period)
+    try:
+        s3.put_object(
+            Bucket=BUCKET, Key=key, ContentType="application/json",
+            Body=json.dumps({"period": period, "providers": breached}, indent=2).encode(),
+        )
+    except Exception as exc:  # noqa: BLE001 — dedup state; failure only risks a dup ping
+        logger.warning("could not persist expense alert state %s: %s", key, exc)
+
+
+def _alert_over_budget(row: dict, period: str) -> bool:
+    """Telegram ping for a provider row that just RISING-EDGE flipped to
+    ``pace == "over"``. Delivery-surface failure is logged, never raised —
+    the breach itself is already recorded in the rollup artifact."""
+    text = (
+        "\U0001f6a8 *Expense pacing — over budget/quota*\n"
+        f"*{row['label']}* ({period}) projected to end the month over its "
+        "budget/quota.\n"
+        f"MTD ${row['mtd_cost_usd']:,.2f}"
+        + (f" → projected ${row['projected_month_end_usd']:,.2f}"
+           if row.get("projected_month_end_usd") is not None else "")
+        + (f" (budget ${row['budget_usd']:,.2f})" if row.get("budget_usd") is not None else "")
+        + "\n_See the Expenses page in the console for detail._"
+    )
+    dedup_key = f"{_FLOW_NAME}:{row['key']}:{period}"
+    try:
+        return notify_via_flow_doctor(
+            text, silent=False, severity="warning", dedup_key=dedup_key,
+            flow_name=_FLOW_NAME, topics=_ALERT_TOPICS, db_basename=_DB_BASENAME,
+            context={"provider": row["key"], "period": period, "pace": row["pace"]},
+        )
+    except Exception as exc:  # noqa: BLE001 — delivery surface only
+        logger.warning("over-budget alert Telegram send failed (non-fatal): %s", exc)
+        return False
+
+
+def run_over_budget_alerts(s3, period: str, rows: list[dict]) -> dict:
+    """Rising-edge Telegram alert pass over this run's rows. Fires once per
+    provider per calendar month on the FIRST flip to ``pace == "over"``; stays
+    quiet on sustained breach; re-arms (allows a new ping) the moment a row
+    drops back to any non-"over" pace, so a later re-breach in the same month
+    alerts again. Never raises — this is a notification-only enhancement
+    layered after the rollup write already succeeded; a bug here must not cost
+    the rollup itself (config#2843 scope: notification only, no enforcement)."""
+    try:
+        prev = _load_alert_state(s3, period).get("providers", {})
+        new_state: dict[str, bool] = {}
+        alerted: list[str] = []
+        for row in rows:
+            key = row["key"]
+            breached = row.get("pace") == "over"
+            new_state[key] = breached
+            if breached and not prev.get(key, False):
+                if _alert_over_budget(row, period):
+                    alerted.append(key)
+        _save_alert_state(s3, period, new_state)
+        return {"alerted": alerted}
+    except Exception as exc:  # noqa: BLE001 — notification-only; never masks the rollup
+        logger.warning("over-budget alert pass failed (non-fatal, rollup unaffected): %s", exc)
+        return {"alerted": [], "error": str(exc)[:300]}
 
 
 def _load_ssm(names: list[str]) -> dict[str, str]:
@@ -373,12 +495,35 @@ def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
     return _finish_usd_row(row, mw, _budget_usd(budgets, key), observed_frac=observed)
 
 
+NEON_TRANSFER_FREE_GB = 500.0
+NEON_TRANSFER_OVERAGE_USD_PER_GB = 0.10
+# Neon Launch plan pricing (neon.com/pricing, verified live 2026-07-17): no
+# flat monthly fee ("pay for what you use, no monthly minimum"). Compute
+# $0.106/CU-hour and storage $0.35/GB-month are BOTH left unknown below — the
+# per-project detail object (the only endpoint this free/Launch-plan API key
+# can reach; ``consumption_history`` is Scale-plan-only, 403/404 confirmed
+# live) exposes ``compute_time_seconds`` (wall-clock active-compute seconds,
+# NOT CU-scaled — no CU-size/vCPU field is returned anywhere in this response
+# to convert it into CU-hours) and ``written_data_bytes`` (a cumulative WRITE
+# counter, not a point-in-time storage size — no ``logical_size_bytes`` or
+# equivalent current-size field is present either). Fabricating a $ figure
+# from either would be a guess dressed up as a bill; both render `None` with
+# the gap named in ``detail.cost_components_unavailable`` instead.
+NEON_COMPUTE_USD_PER_CU_HOUR = 0.106  # documented for when a CU-size field
+NEON_STORAGE_USD_PER_GB_MONTH = 0.35  # ever becomes available; unused today.
+
+
 def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
     """Free-tier-compatible consumption read: the ``consumption_history``
     endpoints are Scale-plan-only (verified 403/404 live, 2026-07-17), but the
     per-project detail object carries current-consumption-period counters
     (``data_transfer_bytes``, ``compute_time_seconds``, …) plus the period
-    bounds on every plan — sum across projects and pace against the period."""
+    bounds on every plan — sum across projects and pace against the period.
+    Only the data-transfer line is actually computable in $ from those
+    counters (see ``NEON_COMPUTE_USD_PER_CU_HOUR`` docstring above for why
+    compute + storage are NOT): a real partial bill, not a fabricated flat
+    fee, unless the operator sets an explicit ``fixed_monthly_usd`` override
+    (e.g. a manually-confirmed paid-plan invoice) in the budgets SSoT."""
     row = _row("neon", "Neon Postgres", source="projects_api")
     if SSM_NEON not in secrets:
         row.update(status="not_configured", error=f"SSM {SSM_NEON} missing")
@@ -417,23 +562,66 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
     projected_gb = None
     if observed_frac >= MIN_PROJECTION_FRAC:
         projected_gb = transfer_gb / observed_frac
+
+    # Data transfer overage is the ONE line item this endpoint can actually
+    # price: 500 GB/mo free egress, then $0.10/GB (neon.com/pricing, verified
+    # live 2026-07-17). Compute and storage are genuinely uncomputable from
+    # the fields this API key can reach — see the module-level constants'
+    # docstring — and MUST surface as unknown, not silently dropped or
+    # counted as $0.
+    transfer_mtd_usd = max(0.0, transfer_gb - NEON_TRANSFER_FREE_GB) * NEON_TRANSFER_OVERAGE_USD_PER_GB
+    transfer_projected_usd = None
+    if observed_frac >= MIN_PROJECTION_FRAC:
+        transfer_projected_usd = (max(0.0, (transfer_gb / observed_frac) - NEON_TRANSFER_FREE_GB)
+                                   * NEON_TRANSFER_OVERAGE_USD_PER_GB)
+    cost_components_unavailable = [
+        {"component": "compute", "unit": "CU-hour", "reason":
+         "compute_time_seconds is wall-clock active-compute time, not "
+         "CU-scaled — the project detail API returns no CU-size/vCPU field "
+         "to convert it into billable CU-hours"},
+        {"component": "storage", "unit": "GB-month", "reason":
+         "written_data_bytes is a cumulative write counter, not a "
+         "point-in-time storage size — the project detail API returns no "
+         "logical_size_bytes (or equivalent current-size) field"},
+    ]
+
+    fixed_override = _fixed_usd(budgets, "neon")
+    if fixed_override is not None:
+        # Explicit operator override (e.g. a manually-confirmed paid-plan
+        # invoice) — takes precedence over the computed estimate below, same
+        # as every other provider's fixed_monthly_usd escape hatch.
+        mtd_cost_usd = float(fixed_override)
+        projected_month_end_usd = float(fixed_override)
+    else:
+        mtd_cost_usd = round(transfer_mtd_usd, 4)
+        projected_month_end_usd = (round(transfer_projected_usd, 4)
+                                    if transfer_projected_usd is not None else None)
+
     row.update(
-        mtd_cost_usd=float(_fixed_usd(budgets, "neon") or 0.0),
-        projected_month_end_usd=float(_fixed_usd(budgets, "neon") or 0.0),
+        mtd_cost_usd=mtd_cost_usd,
+        projected_month_end_usd=projected_month_end_usd,
         quota={"unit": "GB data transfer", "used": round(transfer_gb, 3),
                "limit": quota_gb,
                "projected": round(projected_gb, 3) if projected_gb is not None else None},
         pace=_pace(projected_gb, quota_gb),
         detail={"projects": project_names,
                 "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
+                "compute_cost_usd": None,
                 "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
-                "consumption_period": f"{period_start} → {period_end}"},
+                "storage_cost_usd": None,
+                "data_transfer_cost_usd": round(transfer_mtd_usd, 4),
+                "consumption_period": f"{period_start} → {period_end}",
+                "cost_components_unavailable": (None if fixed_override is not None
+                                                 else cost_components_unavailable)},
         # Prefer an operator note from the budgets SSoT (e.g. a temporary
         # paid-plan explanation) so what the operator recorded reaches the page;
-        # fall back to the free-plan default only when no cost is configured.
+        # fall back to a note that names the estimate's gaps when no override
+        # is configured, so the console never implies this is a full bill.
         note=_cfg_note(budgets, "neon")
-             or ("free plan — the binding constraint is the transfer quota, not $"
-                 if not _fixed_usd(budgets, "neon") else None),
+             or (None if fixed_override is not None else
+                 "estimated from data transfer overage only — compute and "
+                 "storage costs are unknown (see detail.cost_components_unavailable); "
+                 "actual bill will be higher if either is nonzero"),
     )
     row["budget_usd"] = _budget_usd(budgets, "neon")
     return row
@@ -748,6 +936,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     _put_json(s3, f"{MONTHLY_PREFIX}{mw['period']}.json", doc)
     _put_json(s3, LATEST_KEY, doc)
 
+    # Over-budget Telegram alert (config#2843) — after the rollup write, since
+    # it reads the rows' already-computed `pace` field; never allowed to raise
+    # (notification-only enhancement layered on top of an already-successful
+    # rollup).
+    alert_result = run_over_budget_alerts(s3, mw["period"], rows)
+
     if err_rows and not ok_rows:
         # Every live adapter failed — systemic (network/creds/deploy) breakage,
         # not a provider blip: raise so the Lambda error metric pages.
@@ -755,4 +949,4 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                            f"{[(r['key'], r['error']) for r in err_rows]}")
     return {"period": mw["period"], "providers": len(rows),
             "errors": [(r["key"], r["error"]) for r in err_rows],
-            "totals": totals}
+            "totals": totals, "alerts": alert_result}
