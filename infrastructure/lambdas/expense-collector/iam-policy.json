@@ -25,6 +25,16 @@
       ]
     },
     {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH"
+      ]
+    },
+    {
       "Sid": "CostExplorerRead",
       "Effect": "Allow",
       "Action": ["ce:GetCostAndUsage", "ce:GetCostForecast"],
@@ -55,6 +65,21 @@
           "s3:prefix": ["expenses/*", "decision_artifacts/_cost_raw/*"]
         }
       }
+    },
+    {
+      "Sid": "FlowDoctorDedupStore",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
+      ]
     }
   ]
 }
