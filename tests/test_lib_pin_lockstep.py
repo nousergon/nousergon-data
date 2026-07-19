@@ -73,29 +73,6 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
         "bumped for extra_tags atomic-launch-tagging, config#2292)",
     ),
-    "config-runner-dispatcher": (
-        "v0.110.0",
-        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2572: same SpotProbeError "
-        "handling as ci-watch-dispatcher, pinned to the latest tag at time of writing)",
-    ),
-    "metron-runner-dispatcher": (
-        "v0.110.0",
-        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
-        "(same SpotProbeError handling requirement, same source code, 2026-07-17 metron/telos GHA "
-        "quota migration)",
-    ),
-    "telos-runner-dispatcher": (
-        "v0.110.0",
-        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
-        "(same SpotProbeError handling requirement, same source code, 2026-07-17 metron/telos GHA "
-        "quota migration)",
-    ),
-    "vires-runner-dispatcher": (
-        "v0.110.0",
-        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
-        "(same SpotProbeError handling requirement, same source code, 2026-07-17 vires GHA "
-        "quota migration)",
-    ),
     "data-spot-dispatcher": (
         "v0.83.0",
         "ec2_spot launch chokepoint (config#1767)",
@@ -116,9 +93,12 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "trading_calendar coherence with eod-success-friday-shell-trigger",
     ),
-    "groom-liveness-probe": (
+    "overseer-liveness-probe": (
         "v0.83.0",
-        "flow-doctor forum-topic routing (config#1742)",
+        "flow-doctor forum-topic routing (config#1742) — unified registry-driven "
+        "watch-plane liveness probe; mirrors the sf-watch/groom probes it replaces "
+        "(alpha-engine-config-I2831; groom probe deleted, sf-watch slimmed to its "
+        "reclaim/sweep action paths)",
     ),
     "pipeline-watchdog": (
         "v0.83.0",

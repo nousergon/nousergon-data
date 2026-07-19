@@ -39,10 +39,11 @@ SECOND agent from being summoned for an incident already being handled — both
 still write the watch-log event AND send the Telegram receipt (`mode:
 DISPATCH SUPPRESSED`), recording the decision via `dispatch_suppressed`
 (never a silent skip):
-1. **Operator-recovery reruns** — an execution named after the watch's own
-   recommended recovery-rerun convention (`watch-rerun-*`) or this Lambda's
-   own fast-path rerun (`fast-path-rerun-*`) is a recovery attempt already in
-   progress, not a fresh incident (`RECOVERY_RERUN_NAME_PREFIXES`).
+1. **Fast-path reruns only** — an execution this Lambda started itself
+   (`fast-path-rerun-*`) never re-dispatches (self-loop guard,
+   `RECOVERY_RERUN_NAME_PREFIXES`). `watch-rerun-*` failures DISPATCH since
+   2026-07-18 (Brian's shepherd ruling): the overseer shepherds the whole
+   incident arc, reruns included; the per-day dispatch ceiling bounds pile-on.
 2. **Same-day post-escalation repeats** — once this pipeline's watch-log for
    today already carries an `action: escalated` event (a human is already
    engaged), subsequent failures suppress by default. Opt back into the old
@@ -264,19 +265,22 @@ _CAUSE_MAX_CHARS = 600
 # `ABORTED`, because a programmatic/self-abort can still be a real defect that
 # must dispatch. `OperatorAbort` is the marker the fleet's manual-stop path sets.
 OPERATOR_ABORT_ERRORS = frozenset({"OperatorAbort"})
-# config#2003 — operator-recovery-rerun carve-out. `watch-rerun-*` is the
-# dispatcher's OWN recommended-command naming convention (the Telegram receipt
-# / runbook tell the operator to StartExecution with this prefix when manually
-# recovering an already-diagnosed, already-escalated incident — see the
-# 2026-07-08 EOD incident, config#1446/#1464, where the watch escalated the
-# original failure then dispatched TWO more agents for the operator's own
-# `watch-rerun-2026-07-08-1`/`-2` recovery attempts). `fast-path-rerun-*` is
-# this Lambda's own deterministic-rerun prefix (config#1900) — an execution it
-# started itself never needs a second agent dispatch either. Prefix-matched
-# against the SF execution NAME (`detail.name`), never the ARN. Keep this list
-# SMALL and EXPLICIT, mirroring OPERATOR_ABORT_ERRORS above — a new recovery
-# convention must be added here deliberately, not inferred.
-RECOVERY_RERUN_NAME_PREFIXES = ("watch-rerun-", "fast-path-rerun-")
+# Recovery-rerun carve-out — NARROWED to fast-path only (Brian's shepherd
+# ruling, 2026-07-18): "the overseer should be the shepherd for all these
+# processes going forward; it should run autonomously to monitor the process."
+# A FAILED `watch-rerun-*` execution therefore DISPATCHES a fresh agent like
+# any other failure — the 2026-07-18 incident showed the old config#2003
+# suppression benched the autonomous loop for an entire multi-bug arc the
+# moment the first recovery rerun started (bugs #3-#5 all landed on the
+# operator by structure, not choice). The 2026-07-08 pile-on that motivated
+# config#2003 (agents dispatched on top of an operator's active recovery) is
+# now bounded by the config#2269 per-day dispatch ceiling + the charter's
+# same-error escalation rule instead of a blanket suppression.
+# `fast-path-rerun-*` (config#1900, this Lambda's own deterministic rerun)
+# stays suppressed: dispatching on our own rerun's failure is a self-loop;
+# its failure path is charter work tracked under the shepherd umbrella issue.
+# Prefix-matched against the SF execution NAME (`detail.name`), never the ARN.
+RECOVERY_RERUN_NAME_PREFIXES = ("fast-path-rerun-",)
 # Bound the history scan: fetch the newest N events (reverseOrder), reconstruct
 # chronological order locally to find the entered-but-not-exited state. The
 # failed state's enclosing StateEntered is always in the tail of the history.
@@ -329,16 +333,14 @@ def _is_operator_abort(status: str, describe_resp: dict | None) -> bool:
 
 
 def _is_operator_recovery_rerun(execution_name: str) -> bool:
-    """True iff ``execution_name`` matches one of the dispatcher's own
-    documented recovery-rerun naming conventions (config#2003).
+    """True iff ``execution_name`` is this Lambda's own fast-path rerun.
 
-    A failure of an execution named e.g. ``watch-rerun-2026-07-08-1`` is not a
-    fresh incident — it's the operator (or the fast path) already acting on an
-    incident this watch already diagnosed/escalated. Dispatching a second
-    agent for it duplicates a recovery already in progress and risks a
-    collision. Deliberately a prefix allowlist, not a heuristic — an unmatched
-    name (including one that merely CONTAINS "rerun") still dispatches
-    normally, so a genuine new incident is never silently swallowed."""
+    Only ``fast-path-rerun-*`` suppresses (self-loop guard) — ``watch-rerun-*``
+    failures dispatch a fresh agent per Brian's 2026-07-18 shepherd ruling
+    (the overseer owns the whole incident arc; the config#2269 ceiling and the
+    charter's same-error rule bound pile-on). Deliberately a prefix allowlist,
+    not a heuristic — an unmatched name (including one that merely CONTAINS
+    "rerun") still dispatches normally."""
     return execution_name.startswith(RECOVERY_RERUN_NAME_PREFIXES)
 
 
@@ -727,6 +729,15 @@ def _build_event_record(
     # config#1827: a deliberate operator abort is recorded loudly but never
     # auto-dispatches a recovery agent (would waste a cycle and, once weekday/EOD
     # leave propose-only, risk an automated countermand of a human decision).
+    # 2026-07-17: preflight (Friday shell-run) failures now DISPATCH — the
+    # 2026-07-10 blanket suppression predated the charter's preflight mode;
+    # today the payload carries is_preflight, the charter's PREFLIGHT MODE
+    # section scopes the agent to shell-run reruns (weekly_sf_rerun.py
+    # preserves the original input's shell_run flag), and the whole point of
+    # the Friday rehearsal is to have failures fixed BEFORE Saturday 09:00 —
+    # observe-only left the fixing to a human on Friday night. Preflight
+    # remains gated from the deterministic FAST PATH (_fast_path_recovery):
+    # only the charter-carrying agent understands shell-run scope.
     # config#2003: two more carve-outs, checked in order (first match wins —
     # the reason string is a single value, most-specific/deliberate first):
     #   operator_abort            — an explicit human STOP marker.
@@ -751,8 +762,6 @@ def _build_event_record(
     budget_exhausted = prior_dispatches >= dispatch_ceiling
     if operator_abort:
         dispatch_suppressed = "operator_abort"
-    elif is_preflight:
-        dispatch_suppressed = "preflight"
     elif operator_recovery_rerun:
         dispatch_suppressed = "operator_recovery_rerun"
     elif already_escalated and not DISPATCH_AFTER_ESCALATION:
@@ -862,6 +871,19 @@ def _watch_is_acting(record: dict, dispatch: dict) -> bool:
     return dispatch.get("dispatched") is True
 
 
+def _safe_cause_for_telegram(cause, max_len: int = 300):
+    """Truncate cause string before backtick-wrapping to prevent entity parse errors.
+
+    Telegram Markdown parse_mode fails with 400 if an entity delimiter (backtick)
+    is split by truncation. Truncating the content before wrapping ensures delimiters
+    always close safely."""
+    if not cause:
+        return None
+    if len(cause) <= max_len:
+        return cause
+    return cause[:max_len - 1] + "…"
+
+
 def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     """Distinct, SILENT Telegram receipt — ONLY when ``_watch_is_acting``.
 
@@ -894,7 +916,8 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     if record.get("failed_state"):
         lines.append(f"Failed state: `{record['failed_state']}`")
     if record.get("cause"):
-        lines.append(f"Cause: `{record['cause']}`")
+        safe_cause = _safe_cause_for_telegram(record['cause'])
+        lines.append(f"Cause: `{safe_cause}`")
     lines.append(f"Watch log: `s3://{WATCH_BUCKET}/{key}`")
     if fast_path:
         lines.append(f"Rerun: `{record.get('rerun_execution_arn', '')}`")
@@ -963,7 +986,7 @@ def _escalate_budget_exhausted(record: dict, key: str, pipeline_name: str, run_d
         f"{record.get('prior_dispatch_count', '?')} today already hit the "
         f"{record.get('dispatch_ceiling', '?')}-attempt ceiling for run_date {run_date}.",
         f"Failed state: `{record.get('failed_state')}`" if record.get("failed_state") else "",
-        f"Cause: `{record['cause']}`" if record.get("cause") else "",
+        f"Cause: `{_safe_cause_for_telegram(record.get('cause'))}`" if record.get("cause") else "",
         f"Watch log: `s3://{WATCH_BUCKET}/{key}`",
         "_The watch has GIVEN UP on today for this pipeline — no further agent "
         "dispatches or reruns will fire. Human needed (config#2269)._",

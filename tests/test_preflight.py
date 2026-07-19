@@ -10,6 +10,7 @@ mock requests + boto3 + arcticdb to exercise each failure mode.
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -22,6 +23,13 @@ BUCKET = "test-bucket"
 
 def _make(mode: str = "phase1") -> DataPreflight:
     return DataPreflight(bucket=BUCKET, mode=mode)
+
+
+def _host_is(url: str, host: str) -> bool:
+    """Exact-host match (not substring) so 'evil-polygon.io.attacker.com'
+    can't be mistaken for a probe to the real host."""
+    netloc = urlparse(url).netloc
+    return netloc == host or netloc.endswith(f".{host}")
 
 
 # ── Mode validation ──────────────────────────────────────────────────────────
@@ -420,8 +428,8 @@ class TestMorningEnrichMode:
             mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
             pf.run()
         urls = [c.args[0] for c in mock_http.call_args_list]
-        assert any("polygon.io" in u for u in urls), urls
-        assert any("stlouisfed.org" in u for u in urls), urls
+        assert any(_host_is(u, "polygon.io") for u in urls), urls
+        assert any(_host_is(u, "stlouisfed.org") for u in urls), urls
 
     def test_morning_enrich_no_arcticdb_freshness_check(self):
         """morning_enrich must NOT call check_arcticdb_fresh (it is part

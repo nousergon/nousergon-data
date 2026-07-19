@@ -259,11 +259,18 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
                detail={"top_services_usd": {k: round(v, 2) for k, v in top.items()}},
                note="Cost Explorer data lags ~24h")
     try:
+        # CE's MONTHLY-granularity forecast over a partial-month window returns
+        # the FULL month-end total (already includes actuals-to-date) — the
+        # exact figure AWS's own console "forecasted month-end" tile shows. Use
+        # it DIRECTLY; adding MTD double-counts spend-to-date (that bug made a
+        # $103.25 month-end read as $152.14). The DAILY-granularity forecast
+        # would instead return the remainder-only, but MONTHLY is what matches
+        # the console, so we anchor to the provider-authoritative number.
         fc = ce.get_cost_forecast(
             TimePeriod={"Start": end, "End": next_month.strftime("%Y-%m-%d")},
             Metric="UNBLENDED_COST", Granularity="MONTHLY")
-        row["projected_month_end_usd"] = round(mtd + float(fc["Total"]["Amount"]), 2)
-        row["detail"]["projection_source"] = "ce_forecast"
+        row["projected_month_end_usd"] = round(float(fc["Total"]["Amount"]), 2)
+        row["detail"]["projection_source"] = "ce_forecast_monthly"
     except Exception as exc:  # noqa: BLE001 — forecast is an enhancement; the
         # straight-line fallback below is the recorded degradation surface.
         logger.info("CE forecast unavailable (straight-line fallback): %s", exc)
@@ -421,8 +428,12 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
                 "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
                 "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
                 "consumption_period": f"{period_start} → {period_end}"},
-        note="free plan — the binding constraint is the transfer quota, not $"
-             if not _fixed_usd(budgets, "neon") else None,
+        # Prefer an operator note from the budgets SSoT (e.g. a temporary
+        # paid-plan explanation) so what the operator recorded reaches the page;
+        # fall back to the free-plan default only when no cost is configured.
+        note=_cfg_note(budgets, "neon")
+             or ("free plan — the binding constraint is the transfer quota, not $"
+                 if not _fixed_usd(budgets, "neon") else None),
     )
     row["budget_usd"] = _budget_usd(budgets, "neon")
     return row
@@ -472,6 +483,15 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
     # private repos or it overstates ~17x.
     private_repos = _private_repo_names(account, kind, headers)
     minutes_private, minutes_total, billed, by_product = 0.0, 0.0, 0.0, {}
+    # Per-repo minutes + visibility, surfaced on the console so a repo drawing
+    # real Actions minutes but classified "private" (or vice versa) is visible
+    # at a glance instead of inferred — a wrong hardcoded public/private repo
+    # list (not this live-API-derived set) caused a real incident 2026-07-17:
+    # an entire self-hosted-runner migration was built for 6 repos that turned
+    # out to be public (free/unlimited GHA already), based on their appearing
+    # in a billing pull without checking actual visibility. This breakdown is
+    # the console-side guardrail against repeating that mistake.
+    by_repo: dict[str, float] = {}
     for item in doc.get("usageItems", []):
         product = str(item.get("product", "")).lower()
         net = float(item.get("netAmount", 0) or 0)
@@ -480,8 +500,23 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
         if product == "actions" and "minute" in str(item.get("unitType", "")).lower():
             qty = float(item.get("quantity", 0) or 0)
             minutes_total += qty
-            if item.get("repositoryName") in private_repos:
+            repo = item.get("repositoryName") or "(unattributed)"
+            by_repo[repo] = by_repo.get(repo, 0.0) + qty
+            if repo in private_repos:
                 minutes_private += qty
+    minutes_public = round(minutes_total - minutes_private, 1)
+    gha_by_repo = sorted(
+        (
+            {
+                "repo": repo,
+                "visibility": "private" if repo in private_repos else "public",
+                "minutes": round(minutes, 1),
+            }
+            for repo, minutes in by_repo.items()
+        ),
+        key=lambda r: r["minutes"],
+        reverse=True,
+    )
     included = _included_minutes(budgets, key)
     projected_min = _project(minutes_private, mw["elapsed_frac"])
     row.update(
@@ -490,7 +525,10 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
                "used": round(minutes_private, 1), "limit": included,
                "projected": round(projected_min, 0) if projected_min is not None else None},
         detail={"billed_usd_by_product": by_product,
-                "total_actions_minutes_incl_public_free": round(minutes_total, 1)},
+                "total_actions_minutes_incl_public_free": round(minutes_total, 1),
+                "gha_private_minutes": round(minutes_private, 1),
+                "gha_public_minutes": minutes_public,
+                "gha_by_repo": gha_by_repo},
     )
     row = _finish_usd_row(row, mw, _budget_usd(budgets, key))
     # Quota pace (included minutes) is the leading signal; billed-$ pace only
@@ -515,6 +553,13 @@ def _private_repo_names(account: str, kind: str, headers: dict) -> set[str]:
         if len(batch) < 100:
             break
     return names
+
+
+def _cfg_note(budgets: dict, key: str) -> str | None:
+    """Operator-authored note for a provider from the budgets SSoT (surfaced on
+    the row so a manual explanation — e.g. a temporary plan change — reaches the
+    console)."""
+    return ((budgets.get("providers") or {}).get(key) or {}).get("note")
 
 
 def _included_minutes(budgets: dict, key: str) -> float | None:

@@ -23,10 +23,10 @@
 # prefixes (the reclaim_relaunch record), and lambda:InvokeFunction scoped to
 # alpha-engine-sf-watch-spot-dispatcher.
 #
-# Cadence (UTC): twice daily, offset 15 min from the groom-liveness-probe's own
-# cadence (06:30/14:30) purely to avoid simultaneous invocation, not for any
-# functional reason — this is a config-drift check, not tied to any pipeline's
-# own schedule:
+# Cadence (UTC): the SWEEP runs twice daily (the reclaim checker is event-driven,
+# not scheduled). Offset from the overseer-liveness-probe's cadence (06:50/14:50)
+# purely to avoid simultaneous invocation — the sweep isn't tied to any
+# pipeline's own schedule:
 #   06:45 daily   cron(45 6 * * ? *)
 #   14:45 daily   cron(45 14 * * ? *)
 #

@@ -114,6 +114,12 @@ AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # plus pip install + preflight. If the workload legitimately needs longer,
 # bump this — don't silently rely on the orphan reaper.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# Set to 1 only by the --max-runtime-seconds flag: the rag-only 4h-cap
+# override below must not clobber an explicit operator value. MUST be
+# default-initialized here — this script runs under `set -u`, and the flag
+# path is the only assignment (2026-07-18: the missing default killed every
+# SF-driven rag-only dispatch with "MAX_RUNTIME_EXPLICIT: unbound variable").
+MAX_RUNTIME_EXPLICIT="${MAX_RUNTIME_EXPLICIT:-0}"
 # ── Spot-interruption resilience (2026-05-30 incident) ──────────────────────
 # The Saturday SF DataPhase1 failed when this run's nested spot
 # (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-
@@ -229,13 +235,35 @@ while [[ $# -gt 0 ]]; do
         --phase1-only) RUN_MODE="phase1-only"; shift ;;
         --launch-only) RUN_MODE="launch-only"; shift ;;
         --id-artifact-key) ID_ARTIFACT_KEY="$2"; shift 2 ;;
-        --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; shift 2 ;;
+        --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; MAX_RUNTIME_EXPLICIT=1; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;  # legacy: collapses INSTANCE_TYPES to single value
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# ── config#2938: rag-only full-universe news-sweep budget ────────────────────
+# RAGIngestion's Step 5/9 is the multi-source news sweep whose Polygon leg
+# (5 req/min, account-wide) now covers the FULL ~944-ticker universe (~3.15h)
+# per config#2938 ruling 1. The DataPhase1-sized defaults (5400s watchdog,
+# 3600s inner workload) SIGKILLed it twice on 2026-07-18. rag-only therefore
+# gets the config#2938 hard cap (6h since 2026-07-18 — measured filings phase
+# >=1h precedes the ~3.15h Polygon sweep) on BOTH the spot-side watchdog and the inner
+# workload SSM call. These MUST stay in lockstep with the RAGIngestion
+# executionTimeout in step_function.json (14400s) and the
+# WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS constant in
+# collectors/news_sources/fetch_budget.py — guarded by
+# tests/test_rag_ingestion_news_budget_wiring.py. Other modes (DataPhase1,
+# workloads) keep the 5400s default; an explicit --max-runtime-seconds still
+# wins so an operator can override.
+RAG_ONLY_EXECUTION_TIMEOUT_SECONDS=21600          # = SF RAGIngestion executionTimeout
+RAG_ONLY_WORKLOAD_TIMEOUT_SECONDS="$RAG_ONLY_EXECUTION_TIMEOUT_SECONDS"
+if [ "$RUN_MODE" = "rag-only" ] && [ "$MAX_RUNTIME_EXPLICIT" != "1" ]; then
+    # +300s so the box's own shutdown watchdog is a BACKSTOP that fires after
+    # the outer SF executionTimeout/cleanup, never before the sweep completes.
+    MAX_RUNTIME_SECONDS=21900
+fi
 
 # launch-only contract: the id artifact is how the weekday SF finds the
 # spot — launching without it would orphan the instance until the
@@ -775,7 +803,7 @@ RAG_ONLY_PREFLIGHT
     echo "═══════════════════════════════════════════════════════════════"
     echo "  RAG-ONLY RUN (skipping DataPhase1)"
     echo "═══════════════════════════════════════════════════════════════"
-    run_ssm "rag-only" 3600 <<RAG_ONLY
+    run_ssm "rag-only" "$RAG_ONLY_WORKLOAD_TIMEOUT_SECONDS" <<RAG_ONLY
 set -eo pipefail
 ${ENV_SOURCE}
 cd /home/ec2-user/alpha-engine-data
