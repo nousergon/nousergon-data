@@ -158,6 +158,23 @@ def test_watch_log_path_is_code_fenced(monkeypatch):
     assert "Cause: `States.TaskFailed: RAGIngestion failed`" in text
 
 
+def test_long_cause_truncates_safely_for_telegram(monkeypatch):
+    """config#2939: long cause strings must be truncated before backtick-wrapping
+    to prevent Telegram parse_mode failure when a delimiter is split by truncation."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    long_cause = "x" * 500 + " extra text that should not appear"
+    factory, _, _ = _make_clients(describe={"cause": long_cause})
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED"), None)
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "Cause: `" in text
+    assert text.count("`") % 2 == 0, "All backticks must be paired (even count)"
+    assert "…`" in text, "Truncated cause must end with ellipsis inside backticks"
+    assert "extra text that should not appear" not in text
+
+
 def test_run_date_prefers_input_run_date():
     factory, _, s3 = _make_clients(describe={
         "input": json.dumps({"run_date": "2026-06-20", "shell_run": False}),
@@ -547,27 +564,29 @@ def test_programmatic_abort_still_dispatches(monkeypatch):
     assert written["events"][-1]["dispatch_suppressed"] is None
 
 
-# ── preflight dispatch carve-out (found 2026-07-10, before ever firing live) ──
+# ── preflight dispatch (2026-07-17: suppression carve-out REMOVED) ────────────
 # The Friday-PM dry pass of ne-weekly-freshness-pipeline (shell_run=true in the
-# execution input) is a deliberate rehearsal, not a production failure. Prior
-# to this fix, is_preflight only suppressed the deterministic fast-path rerun
-# (_maybe_fast_path) — the agent-dispatch path had no equivalent gate, so a
-# FAILED Friday shell-run would fire a genuine saturday-sf-failure
-# repository_dispatch, indistinguishable from a real Saturday production
-# failure, and summon the full diagnose-fix-merge-rerun agent.
+# execution input) is a deliberate rehearsal whose whole point is surfacing
+# live-only bugs BEFORE Saturday 09:00. The 2026-07-10 blanket agent-dispatch
+# suppression predated the charter's preflight plumbing; today the dispatch
+# payload carries is_preflight, the charter's PREFLIGHT MODE section scopes the
+# agent to shell-run reruns (weekly_sf_rerun.py preserves the original input's
+# shell_run flag), so preflight failures now DISPATCH the agent. The
+# deterministic FAST PATH remains preflight-gated (config#1900): only the
+# charter-carrying agent understands shell-run scope.
 
 
-def test_preflight_suppresses_agent_dispatch(monkeypatch):
-    """A Friday shell-run (preflight) failure must NOT auto-dispatch a recovery
-    agent even when the flag + listener are on — mirrors the operator-abort
-    carve-out (config#1827) exactly, but for a rehearsal run rather than a
-    human stop. Watch-log still written (fail-loud preserved); no Telegram."""
+def test_preflight_dispatches_agent_with_preflight_context(monkeypatch):
+    """A Friday shell-run (preflight) failure DOES auto-dispatch the recovery
+    agent (2026-07-17 design change) — and the fired repository_dispatch
+    payload carries is_preflight=true so the charter's PREFLIGHT MODE binds
+    the agent to shell-run scope. Watch-log still written (fail-loud)."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
-    fired = {"called": False}
+    fired = {"payload": None}
 
     def fake_urlopen(req, timeout=None):
-        fired["called"] = True
+        fired["payload"] = json.loads(req.data.decode())
         return _FakeResp()
 
     monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
@@ -580,26 +599,25 @@ def test_preflight_suppresses_agent_dispatch(monkeypatch):
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
 
-    # Dispatch suppressed — no repository_dispatch HTTP call fired.
-    assert result["agent_dispatch"] == {"dispatched": False, "reason": "preflight"}
-    assert result["action"] == "observe"
-    assert fired["called"] is False
-    # Watch-log STILL written (fail-loud) and carries the auditable reason.
+    # Dispatch FIRED — and the payload is explicitly preflight-scoped.
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert fired["payload"] is not None
+    assert fired["payload"]["client_payload"]["is_preflight"] is True
+    # Watch-log written with the dispatch recorded, no suppression reason.
     s3.put_object.assert_called_once()
     written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
     ev = written["events"][-1]
     assert ev["is_preflight"] is True
-    assert ev["dispatch_suppressed"] == "preflight"
-    assert ev["action"] == "observe"
-    assert result["telegram_sent"] is False
-    index.notify_via_flow_doctor.assert_not_called()
+    assert ev["dispatch_suppressed"] is None
+    assert ev["action"] == "dispatch"
 
 
-def test_preflight_also_still_gated_from_fast_path(monkeypatch):
-    """Over-suppression is impossible to get backwards here: a preflight FAILED
-    must not fall through to the fast path either (fast path has its own
-    is_preflight check, config#1900) — confirms both recovery layers agree a
-    preflight failure gets NO automated action, only the watch-log record.
+def test_preflight_still_gated_from_fast_path(monkeypatch):
+    """The deterministic fast path keeps its own is_preflight gate
+    (config#1900) even though agent dispatch is now allowed on preflight —
+    a plain input-replay rerun would bypass the charter's PREFLIGHT MODE
+    judgment; only the agent path understands shell-run scope. The failure
+    therefore falls through the fast path TO the agent dispatch.
     Uses the weekday pipeline since it's the only one with a `fast_path` scope
     configured — the is_preflight gate itself is cadence-agnostic."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
@@ -615,7 +633,7 @@ def test_preflight_also_still_gated_from_fast_path(monkeypatch):
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
     assert result["fast_path"] == {"fast_path": False, "reason": "preflight"}
-    assert result["agent_dispatch"] == {"dispatched": False, "reason": "preflight"}
+    assert result["agent_dispatch"]["dispatched"] is True
 
 
 # ── config#1900: deterministic zero-token fast path ──────────────────────────
@@ -843,24 +861,21 @@ def test_fast_path_preflight_excluded(fast_path_on):
     assert result["fast_path"]["reason"] == "preflight"
 
 
-# ── config#2003: suppress agent dispatch for operator-recovery reruns and ───
-# ── post-escalation same-day repeats ─────────────────────────────────────────
+# ── Shepherd ruling (Brian, 2026-07-18) + fast-path self-loop guard ─────────
 #
-# Observed 2026-07-08 (EOD incident, config#1446/#1464): the watch correctly
-# escalated the original eod-2026-07-08-* failure as human-gated (IAM), then
-# dispatched TWO MORE agent runs for the operator's own recovery reruns
-# `watch-rerun-2026-07-08-1`/`-2` — duplicating a recovery already in
-# progress. Both carve-outs below still write the watch-log + Telegram
-# receipt (observability stays); only the agent repository_dispatch is
-# suppressed.
+# watch-rerun-* failures DISPATCH: the overseer shepherds the whole incident
+# arc, reruns included (the 2026-07-18 arc showed the old config#2003
+# suppression benched the autonomous loop after the first recovery rerun —
+# bugs #3-#5 all fell to the operator by structure). The 2026-07-08 pile-on
+# config#2003 fixed is now bounded by the config#2269 per-day dispatch
+# ceiling + the charter's same-error rule. Only fast-path-rerun-* (this
+# Lambda's own deterministic rerun) still suppresses — self-loop guard.
 
 
-def test_watch_rerun_named_execution_suppresses_dispatch_but_still_records(monkeypatch):
-    """(a) An execution named after the watch's OWN recommended recovery-rerun
-    convention (`watch-rerun-<date>-<n>`) must NOT summon a second agent, but
-    the watch-log event AND the Telegram receipt still fire (unlike the
-    silent config#1827 operator-abort path — the operator needs confirmation
-    the watch recognized their recovery attempt, not silence)."""
+def test_watch_rerun_named_execution_dispatches_fresh_agent(monkeypatch):
+    """Shepherd ruling (2026-07-18): a FAILED `watch-rerun-<date>-<n>`
+    execution summons a fresh agent like any other failure — the overseer
+    owns the whole incident arc. Watch-log + dispatch both fire."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     fired = {"called": False}
@@ -876,34 +891,50 @@ def test_watch_rerun_named_execution_suppresses_dispatch_but_still_records(monke
             _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-1"), None
         )
 
-    # No repository_dispatch HTTP call — the agent spin-up is suppressed.
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    assert fired["called"] is True
+
+    s3.put_object.assert_called_once()
+    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    ev = written["events"][-1]
+    assert ev["execution_name"] == "watch-rerun-2026-07-08-1"
+    assert ev["dispatch_suppressed"] is None
+
+
+def test_fast_path_rerun_still_suppresses_self_loop(monkeypatch):
+    """The Lambda's OWN deterministic rerun (`fast-path-rerun-*`) must not
+    re-dispatch on failure — self-loop guard survives the shepherd ruling."""
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
+    factory, _, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="fast-path-rerun-2026-07-08-1"), None
+        )
+
     assert result["agent_dispatch"] == {
         "dispatched": False, "reason": "operator_recovery_rerun",
     }
     assert result["action"] == "observe"
     assert fired["called"] is False
-
-    # Watch-log STILL written (fail-loud) and carries the auditable reason.
-    s3.put_object.assert_called_once()
     written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    ev = written["events"][-1]
-    assert ev["execution_name"] == "watch-rerun-2026-07-08-1"
-    assert ev["dispatch_suppressed"] == "operator_recovery_rerun"
-    assert ev["action"] == "observe"
-
-    # Telegram receipt STILL fires — observability stays, only dispatch is
-    # suppressed (distinct from the SILENT operator-abort path).
-    assert result["telegram_sent"] is True
-    index.notify_via_flow_doctor.assert_called_once()
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "DISPATCH SUPPRESSED" in text
-    assert "watch-rerun-2026-07-08-1" in text
+    assert written["events"][-1]["dispatch_suppressed"] == "operator_recovery_rerun"
 
 
-def test_second_watch_rerun_same_day_also_suppressed(monkeypatch):
-    """The exact 2026-07-08 incident shape: TWO operator recovery reruns the
-    same day both suppress — the second rerun attempt must not dispatch
-    either, regardless of how many prior events already exist."""
+def test_second_watch_rerun_same_day_gated_only_by_escalation_flag_or_ceiling(monkeypatch):
+    """Post-shepherd: a second same-day watch-rerun failure is no longer
+    suppressed AS a rerun. With a prior `escalated` event and the
+    DISPATCH_AFTER_ESCALATION opt-out at its default (false), the
+    already_escalated_today gate still holds; with the flag true, it
+    dispatches (bounded by the config#2269 ceiling)."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
@@ -911,27 +942,29 @@ def test_second_watch_rerun_same_day_also_suppressed(monkeypatch):
         "schema_version": 1,
         "events": [
             {"action": "escalated", "execution_name": "eod-2026-07-08-1"},
-            {
-                "action": "observe",
-                "execution_name": "watch-rerun-2026-07-08-1",
-                "dispatch_suppressed": "operator_recovery_rerun",
-            },
         ],
     }
+
+    # Default (DISPATCH_AFTER_ESCALATION=false): escalation gate holds.
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", False)
     factory, _, s3 = _make_clients(existing=existing)
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(
             _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-2"), None
         )
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "already_escalated_today",
+    }
 
-    assert result["agent_dispatch"]["dispatched"] is False
-    assert result["agent_dispatch"]["reason"] in {
-        "operator_recovery_rerun", "already_escalated_today",
-    }
-    written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    assert written["events"][-1]["dispatch_suppressed"] in {
-        "operator_recovery_rerun", "already_escalated_today",
-    }
+    # Shepherd posture (flag true): the rerun failure dispatches.
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", True)
+    factory, _, s3 = _make_clients(existing=existing)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(
+            _event("FAILED", sm_arn=EOD_ARN, name="watch-rerun-2026-07-08-2"), None
+        )
+    assert result["agent_dispatch"]["dispatched"] is True
+
 
 
 def test_fast_path_named_rerun_execution_also_suppresses_dispatch(monkeypatch):

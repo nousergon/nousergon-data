@@ -42,7 +42,20 @@ arcticdb>=6.18.7
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.116.0
+#
+# alpha-engine-config#2456 NOTE: builders/daily_append.py's new L2
+# series-contract wiring imports nousergon_lib.series_contract, which ships
+# on nousergon-lib#195 (not yet merged/tagged as of this PR). This repo's
+# nousergon-lib pin MUST stay a tagged ``vX.Y.Z`` release in lockstep across
+# requirements.txt / Dockerfile / requirements-daily-news.txt / Lambda
+# requirements (tests/test_lib_pin_lockstep.py) — a branch ref is not a
+# valid pin here, so this file intentionally still points at v0.86.0. Bump
+# to (and add the ``series-contract`` extra from) the first tagged release
+# that includes nousergon-lib#195 as an immediate same-repo follow-up PR
+# once that release ships; until then this repo's test suite exercises the
+# wiring against an editable install of the nousergon-lib branch (see this
+# PR's description) rather than a real pip-installable pin.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

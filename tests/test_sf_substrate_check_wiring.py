@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.sf_command_utils import extract_commands
+
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
@@ -96,24 +98,38 @@ class TestChainOrdering:
         # unchanged NotifyComplete, so the REAL Saturday run (no shell_run
         # input) still ends at NotifyComplete — strict superset preserved.
         #
-        # alpha-engine-config-I2544 (2026-07-14): ReportCard + Director
-        # (previously sitting between the substrate poll and the notify
-        # gate) were LIFTED into the async ne-weekly-advisory-pipeline
-        # child SF, dispatched earlier via StartAdvisoryPipeline right
-        # after DataPhase2. Their own success/degraded wiring (unchanged,
-        # byte-for-byte preserved) is covered by
-        # test_sf_advisory_pipeline_wiring.py::TestReportCardAndDirectorWiring.
-        # The substrate poll's Success edge now feeds CheckShellRunNotify
-        # DIRECTLY (pinned below in
+        # Two non-fatal advisory states (evaluator Report Card v2, then the
+        # Director) sit between the substrate poll and the notify gate. ReportCard's
+        # SUCCESS edge feeds the Director (which weighs the fresh card); ReportCard's
+        # Catch routes to PublishReportCardDegraded (config#2302: a WARNING alert —
+        # advisory grading failed silently for 9 days pre-fix) which then continues to
+        # notify (no card to weigh). The Director's own Next lands on CheckShellRunNotify;
+        # its Catch routes to PublishDirectorDegraded (same config#2302 WARNING-alert
+        # shape) which then continues to notify. Every path still preserves the success
+        # edge. On the Friday preflight both states RUN (dry, via
+        # dry_run.$=$.research_dry — ROADMAP L4504), they are not skipped, so the wiring
+        # is identical on real + preflight runs.
+        # config#2276: the substrate poll now resolves to a terminal status
+        # first; its Success edge is what feeds ReportCard (pinned below in
         # test_wait_for_substrate_routes_via_status_choice).
+        assert states["ReportCard"]["Next"] == "Director"
+        assert all(
+            c["Next"] == "PublishReportCardDegraded" for c in states["ReportCard"]["Catch"]
+        )
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        assert states["Director"]["Next"] == "CheckShellRunNotify"
+        assert all(
+            c["Next"] == "PublishDirectorDegraded" for c in states["Director"]["Catch"]
+        )
+        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
         # config#2278: the real-run success edge now passes through the
         # gate-degraded completion Choice before NotifyComplete.
         assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
         assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
     def test_wait_for_substrate_routes_via_status_choice(self, states):
-        # alpha-engine-config-I2544: the substrate poll's Success edge now
-        # feeds CheckShellRunNotify directly (was ReportCard pre-lift).
+        # config#2276: the substrate poll resolves to a terminal status
+        # before ReportCard, so a failing/hung checker is visible.
         assert (
             states["WaitForWeeklySubstrateHealthCheck"]["Next"]
             == "CheckSubstrateHealthCheckStatus"
@@ -122,7 +138,7 @@ class TestChainOrdering:
         success = next(
             r for r in choice["Choices"] if r.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "CheckShellRunNotify"
+        assert success["Next"] == "ReportCard"
 
 
 class TestCatchSemantics:
@@ -151,14 +167,13 @@ class TestCatchSemantics:
         for c in catches:
             assert c["Next"] == "SubstrateHealthCheckDegraded"
 
-    def test_substrate_degraded_continues_to_notify_gate(self, states):
-        """alpha-engine-config-I2544: ReportCard/Director no longer sit in
-        this SF's tail (see test_sf_advisory_pipeline_wiring.py) — a
-        degraded substrate check now continues straight to the notify
-        gate, same as the healthy path."""
+    def test_substrate_degraded_continues_to_advisory_tail(self, states):
         degraded = states["SubstrateHealthCheckDegraded"]
         assert degraded["Type"] == "Pass"
-        assert degraded["Next"] == "CheckShellRunNotify"
+        assert degraded["Next"] == "ReportCard", (
+            "A degraded substrate check must not skip the ReportCard/Director "
+            "Lambda tail — it is independent of the dashboard box."
+        )
 
 
 class TestCommandShape:
@@ -167,11 +182,18 @@ class TestCommandShape:
     Drops here would silently neuter the check (e.g. dropping --alert
     suppresses SNS without changing exit code; dropping --cadence flips
     to argparse error).
+
+    config#2322: the commands array was converted from a static ``commands``
+    list to a ``commands.$`` ASL intrinsic (``States.Array(...)``) so the
+    phase-marker-sweep command can thread ``export RUN_DATE.$=$.run_date``
+    (same shape as the Backtester/Parity/Evaluator spot stages —
+    tests/test_sf_run_date_threading.py) — extract_commands() reads through
+    either shape.
     """
 
     @pytest.fixture
     def commands(self, states) -> list[str]:
-        return states["WeeklySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands"]
+        return extract_commands(states["WeeklySubstrateHealthCheck"])
 
     def test_invokes_transparency_module(self, commands):
         assert any(
@@ -206,6 +228,64 @@ class TestCommandShape:
         # mid-pipeline is forbidden.
         joined = " ".join(commands)
         assert "pip install" not in joined
+
+
+class TestPhaseMarkerSweep:
+    """config#2322: post-run phase-marker sweep must run after the
+    constituents-drift check, on the same run_date the backtest chain
+    wrote its `.phases/` markers under, and must not be able to abort the
+    SF (the existing States.ALL Catch on this state already makes any
+    non-zero exit non-blocking — see TestCatchSemantics)."""
+
+    @pytest.fixture
+    def commands(self, states) -> list[str]:
+        return extract_commands(states["WeeklySubstrateHealthCheck"])
+
+    def test_invokes_phase_marker_sweep_module(self, commands):
+        assert any(
+            "python -m validators.phase_marker_sweep" in cmd for cmd in commands
+        )
+
+    def test_phase_marker_sweep_passes_alert_flag(self, commands):
+        sweep_cmd = next(
+            c for c in commands if "validators.phase_marker_sweep" in c
+        )
+        assert "--alert" in sweep_cmd
+
+    def test_phase_marker_sweep_runs_after_constituents_drift(self, commands):
+        drift_idx = next(
+            i for i, c in enumerate(commands)
+            if "validators.constituents_drift_check" in c
+        )
+        sweep_idx = next(
+            i for i, c in enumerate(commands)
+            if "validators.phase_marker_sweep" in c
+        )
+        assert drift_idx < sweep_idx
+
+    def test_run_date_exported_before_phase_marker_sweep(self, commands):
+        rd_idx = next(
+            i for i, c in enumerate(commands)
+            if c.startswith("export RUN_DATE=")
+        )
+        sweep_idx = next(
+            i for i, c in enumerate(commands)
+            if "validators.phase_marker_sweep" in c
+        )
+        assert rd_idx < sweep_idx
+
+    def test_phase_marker_sweep_reads_exported_run_date(self, commands):
+        sweep_cmd = next(
+            c for c in commands if "validators.phase_marker_sweep" in c
+        )
+        assert '--run-date "$RUN_DATE"' in sweep_cmd
+
+    def test_run_date_threaded_from_sf_run_date(self, states):
+        # value is threaded from the SF-stamped $.run_date (States.Format),
+        # same contract as tests/test_sf_run_date_threading.py's spot stages.
+        raw_expr = states["WeeklySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands.$"]
+        assert "States.Format('export RUN_DATE=" in raw_expr
+        assert "$.run_date" in raw_expr
 
 
 class TestResultPathIsolation:

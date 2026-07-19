@@ -277,7 +277,13 @@ def ingest_signals_theses(
 
         for entry in universe:
             ticker = entry.get("ticker", "")
-            thesis = entry.get("thesis_summary", "")
+            # `dict.get(key, default)` returns the default ONLY when the key is
+            # ABSENT; an explicit JSON `null` yields None. Quant-envelope signals
+            # (stance_source="quant_envelope_producer") carry thesis_summary=null
+            # by design — no LLM narrative to embed — so `or ""` normalises
+            # null/absent to empty and the <50-char guard skips them cleanly
+            # instead of raising `len(None)` (config#2938 follow-on, 2026-07-18).
+            thesis = entry.get("thesis_summary") or ""
             if not ticker or len(thesis) < 50:
                 continue
 

@@ -1,3 +1,0 @@
-# config#1742 T2 — flow-doctor forum-topic routing for groom liveness probe.
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
-krepis>=0.10.2

@@ -47,6 +47,38 @@ playbooks:
       via one-shot EventBridge Scheduler self-reinvoke (config#2226).
     supports_drill: true
     kill_switch_env: SF_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
+    # Wiring-integrity checks the overseer-liveness-probe runs (I2831). These
+    # migrated verbatim from sf-watch-liveness-probe's per-probe constants — the
+    # registry is now the ONE place this surface is enumerated. The pipeline
+    # list is a YAML anchor so it is declared ONCE and stays lockstep with
+    # saturday-sf-watch-dispatcher's PIPELINES (pinned by
+    # tests/test_overseer_playbook_registry.py). The reclaim-checker (config#2270)
+    # + disabled-window sweep (config#2257) ACTION paths are NOT here — they stay
+    # in the slimmed sf-watch-liveness-probe (their EC2-event trigger topology +
+    # 45 pinned tests; full migration tracked as a follow-up).
+    liveness:
+      checks:
+        - type: eventbridge_rule
+          rule_name: alpha-engine-saturday-sf-watch-failed
+          expect_enabled: true
+          expect_target_function: alpha-engine-saturday-sf-watch-dispatcher
+          expect_state_machines: &sf_watch_pipelines
+            - ne-weekly-freshness-pipeline
+            - ne-preopen-trading-pipeline
+            - ne-postclose-trading-pipeline
+            - ne-weekly-advisory-pipeline
+            - ne-modelzoo-sunday-pipeline
+        - type: state_machines_exist
+          state_machines: *sf_watch_pipelines
+        - type: lambda_active
+          function: alpha-engine-saturday-sf-watch-dispatcher
+        - type: lambda_active
+          function: alpha-engine-sf-watch-spot-dispatcher
+          report_kill_switch: SF_WATCH_DISPATCH_ENABLED
+          launch_config:
+            ami_env: SF_WATCH_AMI_ID
+            security_group_env: SF_WATCH_SECURITY_GROUP
+            subnets_env: SF_WATCH_SUBNETS
 
   ci-watch:
     description: >-
@@ -63,6 +95,14 @@ playbooks:
     concurrency_domain: EC2 tag lock on (repo, sha) — per-commit, not per-repo.
     supports_drill: true
     kill_switch_env: CI_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
+    # The ci-watch executor's own liveness (was checked as part of
+    # sf-watch-liveness-probe's spot-dispatch leg; now attributed to its own
+    # playbook). Kill-switch value REPORTED, never alerted.
+    liveness:
+      checks:
+        - type: lambda_active
+          function: alpha-engine-ci-watch-dispatcher
+          report_kill_switch: CI_WATCH_DISPATCH_ENABLED
 
   alert-drain:
     description: >-
@@ -84,13 +124,27 @@ playbooks:
       drain at a time; overlap would double-process queue messages).
     supports_drill: true
     kill_switch_env: ALERT_DRAIN_DISPATCH_ENABLED
+    # The alert-drain executor's own liveness. Its intake queue + the two
+    # intake EventBridge rules are cross-cutting infra, checked under the
+    # top-level watch_plane_liveness block below.
+    liveness:
+      checks:
+        - type: lambda_active
+          function: alpha-engine-alert-drain-dispatcher
+          report_kill_switch: ALERT_DRAIN_DISPATCH_ENABLED
 
   groom:
     description: >-
-      Demand-driven backlog groom (three daily EventBridge cron triggers,
-      symmetric demand evaluation, pace gate). Inventory-only here: its
-      trigger topology is scheduler-driven with zero routing decisions, so it
-      keeps its direct EventBridge->Lambda path.
+      Backlog groom, both legs of the SAME executor Lambda/SF (config#2201,
+      config-I2928 Phase 3): (1) the three daily fixed-cron EventBridge
+      triggers running the tier/decision-record groom proper, and (2) the
+      demand-driven end-of-SF Haiku PR-sweep leg (`groom_run.sh --mode
+      sweep`, fired by scripts/groom_driver.py after a fleet Step Function
+      completes rather than on a schedule). Inventory-only here: both legs'
+      trigger topology is scheduler/event-driven with zero routing decisions,
+      so both keep their direct EventBridge->Lambda path rather than a
+      separate registry line — see the liveness comment below for why sweep
+      needs no dedicated check either.
     tier: T2
     routed: false
     enabled: true
@@ -100,3 +154,73 @@ playbooks:
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
     supports_drill: false
     kill_switch_env: GROOM_DISPATCH_ENABLED
+    # Run-window accounting migrated from groom-liveness-probe (config#2414/#2667):
+    # for each MATURE expected trigger (fixed-cron schedule below UNION the
+    # dispatcher's own groom/decisions/ log, covering sweep-mode which has no
+    # cron), assert an S3 run artifact's run_start landed in [T, T+ceiling+margin].
+    # A trigger with no covering artifact = a silent groom death → problem line.
+    # `schedule` MIRRORS scheduled-groom-dispatcher/deploy.sh SCHED_CRONS — the
+    # registry is now the SSoT (was GROOM_SCHEDULE env / _DEFAULT_SCHEDULE const).
+    liveness:
+      checks:
+        - type: run_window
+          label: groom
+          artifact_prefix: groom/
+          decision_record_prefix: groom/decisions/
+          ceiling_min: 360   # groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS (360 min)
+          margin_min: 45     # box boot + report latency slack
+          lookback_hours: 30
+          schedule:
+            - {hour: 1, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "01:00 daily (Sonnet high-only)"}
+            - {hour: 7, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "07:00 daily (Sonnet mid-only)"}
+            - {hour: 19, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "19:00 daily (Haiku low-only)"}
+
+  gate-sweeps:
+    description: >-
+      Daily backlog gate-maintenance sweep train (config-I2928 Phase 3):
+      gate_due_sweep.py (Re-exam date arrival flagging), gate_dependency_sweep.py
+      (gate:dependency re-admission), gate_sf_run_sweep.py (gate:*-sf
+      re-admission on SF success), gate_data_sweep.py (gate:data auto-lift +
+      gate:device Re-exam maintenance), gate_milestone_sweep.py (gate:milestone
+      auto-clear), check_definition_drift_sweep.py (SF definition drift
+      backstop), complexity_gate_boundary_lint.py (complexity:ultra <->
+      gate:decision boundary lint), gate_ask_block_sweep.py (Decision Queue
+      Ask-block completeness), groom_gate_park.py --resurface (groom:parked
+      issue resurface). Inventory-only here: NO Lambda is involved at all — this
+      is a pure GitHub Actions scheduled workflow in a DIFFERENT repo
+      (alpha-engine-config), so it has no overseer-dispatcher routing surface
+      and no executor_function/kill_switch_env to speak of.
+    tier: T3
+    routed: false
+    enabled: true
+    trigger_type: github_actions_cron
+    workflow_file: .github/workflows/gate-due-sweep.yml
+    repo: alpha-engine-config
+    schedule_cron: "30 13 * * *"
+    charter: alpha-engine-config/scripts/gate_due_sweep.py
+    concurrency_domain: >-
+      Single GHA concurrency group `gate-due-sweep` (cancel-in-progress:
+      false) — the workflow's own steps run sequentially in one job, most
+      with continue-on-error so one sweep's failure doesn't mask the rest.
+    supports_drill: false
+
+# ── Cross-cutting watch-plane liveness (alpha-engine-config-I2831) ────────────
+# Checks that belong to NO single playbook: the overseer-dispatcher router
+# itself + the phase-1 intake plane (setup_overseer_intake.sh, config-I2822).
+# Today only CW alarms cover these — the probe now asserts their wiring too.
+watch_plane_liveness:
+  checks:
+    - type: lambda_active
+      function: alpha-engine-overseer-dispatcher
+    - type: sqs_queue_exists
+      queue_name: nousergon-overseer-intake
+      expect_dlq: nousergon-overseer-intake-dlq
+    - type: eventbridge_rule
+      rule_name: overseer-intake-alert-events
+      event_bus_name: nousergon-alerts
+      expect_enabled: true
+      expect_target_queue: nousergon-overseer-intake
+    - type: eventbridge_rule
+      rule_name: overseer-intake-cw-alarm-state
+      expect_enabled: true
+      expect_target_queue: nousergon-overseer-intake

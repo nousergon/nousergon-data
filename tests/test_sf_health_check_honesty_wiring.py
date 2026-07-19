@@ -39,6 +39,8 @@ import pathlib
 
 import pytest
 
+from tests.sf_command_utils import extract_commands
+
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
 
@@ -54,15 +56,10 @@ CHECKS = [
      "CheckSaturdayHealthCheckStatus", "SaturdayHealthCheckPollWait",
      "SaturdayHealthCheckDegraded", "$.health_check_poll",
      "WeeklySubstrateHealthCheck", 300),
-    # alpha-engine-config-I2544 (2026-07-14): "proceeds-to" was ReportCard
-    # pre-lift — ReportCard/Director now live in the async
-    # ne-weekly-advisory-pipeline child SF, dispatched earlier via
-    # StartAdvisoryPipeline. This tail has nothing left to proceed into
-    # except the notify gate.
     ("WeeklySubstrateHealthCheck", "WaitForWeeklySubstrateHealthCheck",
      "CheckSubstrateHealthCheckStatus", "SubstrateHealthCheckPollWait",
      "SubstrateHealthCheckDegraded", "$.substrate_check_poll",
-     "CheckShellRunNotify", 240),
+     "ReportCard", 240),
 ]
 _IDS = [c[0] for c in CHECKS]
 
@@ -256,7 +253,10 @@ def test_no_runtime_pip_install_anywhere_in_definition(states):
 
 
 def test_constituents_drift_step_is_fail_visible(states):
-    cmds = states["WeeklySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands"]
+    # config#2322: commands moved from a static list to a commands.$
+    # States.Array intrinsic (to thread export RUN_DATE for the new
+    # phase-marker-sweep line) — extract_commands() reads through either.
+    cmds = extract_commands(states["WeeklySubstrateHealthCheck"])
     (drift_line,) = [c for c in cmds if "constituents_drift_check" in c]
     assert "|| true" not in drift_line, (
         "config#2276: the drift check exits 1 on alert-worthy drift (the "

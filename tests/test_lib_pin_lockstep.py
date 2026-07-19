@@ -76,33 +76,6 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "bumped for extra_tags atomic-launch-tagging, config#2292; bumped for config#2698 "
         "SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
-    "config-runner-dispatcher": (
-        "v0.124.5",
-        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2572: same SpotProbeError "
-        "handling as ci-watch-dispatcher; bumped for config#2698 SpotQuotaExceededError "
-        "on-demand fallback, first available at v0.124.1)",
-    ),
-    "metron-runner-dispatcher": (
-        "v0.124.5",
-        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
-        "(same SpotProbeError handling requirement, same source code, 2026-07-17 metron/telos GHA "
-        "quota migration; bumped for config#2698 SpotQuotaExceededError on-demand fallback, "
-        "first available at v0.124.1)",
-    ),
-    "telos-runner-dispatcher": (
-        "v0.124.5",
-        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
-        "(same SpotProbeError handling requirement, same source code, 2026-07-17 metron/telos GHA "
-        "quota migration; bumped for config#2698 SpotQuotaExceededError on-demand fallback, "
-        "first available at v0.124.1)",
-    ),
-    "vires-runner-dispatcher": (
-        "v0.124.5",
-        "nousergon_lib.spot_dispatch chokepoint — mirrors config-runner-dispatcher's pin exactly "
-        "(same SpotProbeError handling requirement, same source code, 2026-07-17 vires GHA "
-        "quota migration; bumped for config#2698 SpotQuotaExceededError on-demand fallback, "
-        "first available at v0.124.1)",
-    ),
     "data-spot-dispatcher": (
         "v0.124.5",
         "ec2_spot launch chokepoint (config#1767); bumped for config#2698 "
@@ -127,9 +100,12 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "trading_calendar coherence with eod-success-friday-shell-trigger",
     ),
-    "groom-liveness-probe": (
+    "overseer-liveness-probe": (
         "v0.83.0",
-        "flow-doctor forum-topic routing (config#1742)",
+        "flow-doctor forum-topic routing (config#1742) — unified registry-driven "
+        "watch-plane liveness probe; mirrors the sf-watch/groom probes it replaces "
+        "(alpha-engine-config-I2831; groom probe deleted, sf-watch slimmed to its "
+        "reclaim/sweep action paths)",
     ),
     "pipeline-watchdog": (
         "v0.83.0",

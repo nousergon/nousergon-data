@@ -57,6 +57,17 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
     },
     {
+      "Sid": "WatchLogArtifactList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["consolidated/*_sf_watch/*"]
+        }
+      }
+    },
+    {
       "Sid": "FastPathRerun",
       "Effect": "Allow",
       "Action": [
