@@ -312,6 +312,12 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
     },
     {
+      "Sid": "RagManifestPublicMirrorRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/rag/manifest/*"
+    },
+    {
       "Sid": "InfraDeployMetricFilters",
       "Effect": "Allow",
       "Action": [
