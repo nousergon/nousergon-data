@@ -172,6 +172,14 @@ def ingest_articles(
         "n_failures": 0,
     }
 
+    # Pass 1: resolve dedup + dry-run/empty-text skips and build the list
+    # of documents that actually need an embedding. config#2956
+    # deliverable 3 — accumulate ALL pending chunk bodies across every
+    # article/ticker in this run and call ``embed_texts_fn`` ONCE (it
+    # already batches internally in blocks of up to 128, see
+    # ``nousergon_lib.rag.embeddings.embed_texts``) instead of once PER
+    # article, which was the previous N-embedding-calls-per-run shape.
+    pending: list[dict[str, Any]] = []
     for article in articles:
         body = _chunk_text(article)
         if not body or len(body) < 20:
@@ -204,48 +212,73 @@ def ingest_articles(
                 )
                 stats["n_documents_ingested"] += 1
                 continue
-            try:
-                # One chunk per news article — short bodies. If the
-                # excerpt grows in a future adapter (e.g. Benzinga full
-                # body), split here at ~400-token windows mirroring
-                # ingest_8k_filings._chunk_text.
-                section_label = (
-                    article.canonical_title[:100] if article.canonical_title
-                    else "news"
-                )
-                chunks = [{
-                    "content": body,
-                    "section_label": section_label,
-                }]
-                embeddings = embed_texts_fn([chunks[0]["content"]])
-                chunks[0]["embedding"] = embeddings[0]
+            # One chunk per news article — short bodies. If the excerpt
+            # grows in a future adapter (e.g. Benzinga full body), split
+            # here at ~400-token windows mirroring
+            # ingest_8k_filings._chunk_text.
+            section_label = (
+                article.canonical_title[:100] if article.canonical_title
+                else "news"
+            )
+            pending.append({
+                "article": article,
+                "ticker": ticker,
+                "rag_source": rag_source,
+                "external_id": external_id,
+                "chunk": {"content": body, "section_label": section_label},
+            })
 
-                doc_id = ingest_document_fn(
-                    ticker=ticker,
-                    sector=ticker_to_sector.get(ticker),
-                    doc_type="news",
-                    source=rag_source,
-                    filed_date=filed_date,
-                    title=article.canonical_title or None,
-                    url=article.canonical_url or None,
-                    chunks=chunks,
-                    external_id=external_id,
+    if pending:
+        try:
+            embeddings = embed_texts_fn([item["chunk"]["content"] for item in pending])
+        except Exception as e:
+            # A batch-level embedding failure (e.g. Voyage API outage)
+            # fails every pending document this run — isolated per-run,
+            # not per-document, since there is now one shared API call.
+            # Still fail soft: log and count, don't crash the caller.
+            stats["n_failures"] += len(pending)
+            logger.warning(
+                "[news_ingest] batch embedding failed for %d pending "
+                "document(s): %s", len(pending), e,
+            )
+            pending = []
+        else:
+            for item, embedding in zip(pending, embeddings):
+                item["chunk"]["embedding"] = embedding
+
+    # Pass 2: ingest each document, isolating per-document failures so
+    # one bad write doesn't drop the rest of the batch.
+    for item in pending:
+        article = item["article"]
+        ticker = item["ticker"]
+        rag_source = item["rag_source"]
+        try:
+            doc_id = ingest_document_fn(
+                ticker=ticker,
+                sector=ticker_to_sector.get(ticker),
+                doc_type="news",
+                source=rag_source,
+                filed_date=filed_date,
+                title=article.canonical_title or None,
+                url=article.canonical_url or None,
+                chunks=[item["chunk"]],
+                external_id=item["external_id"],
+            )
+            if doc_id:
+                stats["n_documents_ingested"] += 1
+                logger.info(
+                    "Ingested news for %s on %s (%s): %s",
+                    ticker, filed_date, rag_source,
+                    article.canonical_title[:80],
                 )
-                if doc_id:
-                    stats["n_documents_ingested"] += 1
-                    logger.info(
-                        "Ingested news for %s on %s (%s): %s",
-                        ticker, filed_date, rag_source,
-                        article.canonical_title[:80],
-                    )
-                else:
-                    stats["n_failures"] += 1
-            except Exception as e:
+            else:
                 stats["n_failures"] += 1
-                logger.warning(
-                    "[news_ingest] failed for %s %s: %s",
-                    ticker, article.canonical_url, e,
-                )
+        except Exception as e:
+            stats["n_failures"] += 1
+            logger.warning(
+                "[news_ingest] failed for %s %s: %s",
+                ticker, article.canonical_url, e,
+            )
 
     logger.info(
         "[news_ingest] complete: %s", stats,
