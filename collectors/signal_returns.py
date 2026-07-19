@@ -121,6 +121,18 @@ def collect(
         db_path, dry_run, forward_days=forward_days,
     )
 
+    # Step 4b: Horizon-grading freshness gate (config#2972) — emit the
+    # trading-day lag between "newest date whose forward_days window has
+    # closed" and "newest date actually graded" for both universe_returns and
+    # predictor_outcomes. A healthy pipeline keeps this at 0; sustained lag
+    # growth (not a one-off 1-2td lag right after a window closes) is the
+    # alarmable signal that the JOIN/backfill has genuinely stalled, as
+    # distinct from the expected wait for a forward-looking window to close.
+    if not dry_run:
+        results["horizon_grading_lag"] = _emit_horizon_grading_lag_metric(
+            db_path, forward_days=forward_days,
+        )
+
     # Upload updated research.db back to S3
     total_written = sum(r.get("rows_written", 0) for r in results.values())
     if not dry_run and total_written > 0:
@@ -1228,6 +1240,178 @@ def _emit_context_coverage_metric(db_path: str) -> dict:
             "investigate _seed_score_performance / signals.json shape.",
             summary["coverage_pct"], summary["rows_fully_populated"],
             summary["rows_post_cutoff"], _DRIFT_EFFECTIVE_DATE,
+        )
+
+    return summary
+
+
+# ── Horizon-grading freshness gate (config#2972) ─────────────────────────────
+#
+# 2026-06/07: a prior investigation pass queried research.db directly and
+# found predictor_outcomes.horizon_days/correct/actual_log_alpha NULL for
+# every prediction_date >= 2026-06-17 (and the same cutoff on
+# universe_returns.log_return_21d), and mistook this for a silently-broken
+# write path. Root-cause re-investigation (config#2972) found NO break: a
+# 21-trading-day-forward metric is *expected* to lag "today" by up to 21
+# trading days before it can be populated at all — add_trading_days(2026-06-17,
+# 21) == 2026-07-20, which had simply not arrived yet as of the date those
+# rows were queried. The apparent "cutoff" was the natural lag boundary, not
+# a stall.
+#
+# The real gap this exposed: NOTHING was distinguishing "expected lag" from
+# "the grading pipeline actually stopped advancing" — a prior groom pass spent
+# real investigation cycles on a false alarm because there was no cheap,
+# producer-side signal for "is the horizon-grading lag inside its expected
+# band, or has it stopped shrinking?". This closes that gap the same way
+# _emit_context_coverage_metric closes the canonical-context gap: a
+# producer-side CloudWatch gauge, best-effort or emit non-fatal, alarmable via
+# infrastructure/setup_horizon_grading_alarms.sh.
+#
+# Metric definition: for each of universe_returns.log_return_{h}d and
+# predictor_outcomes.horizon_days, compute
+#   lag_trading_days = count_trading_days(MAX(date with the column populated),
+#                                          last date whose h-trading-day
+#                                          forward window has already closed)
+# A healthy pipeline keeps this at 0 (every date whose window has closed is
+# graded by the next run). A stalled pipeline (the JOIN/backfill genuinely
+# breaking, e.g. a real regression in universe_returns's 21d computation)
+# makes this grow without bound instead of resetting to 0 each run — that
+# growth, not the raw NULL count, is the alarmable signal.
+def _newest_window_closed(
+    max_candidate: str | None, today: date, h: int,
+) -> str | None:
+    """Newest date <= `max_candidate` whose h-trading-day forward window has
+    already closed as of `today`. None if no row is closed yet (e.g. the
+    table is empty, or every row is still within its forward window).
+
+    `max_candidate` (the newest row present in the table at all) may itself
+    still be inside its own forward window — walk backward a bounded number
+    of trading days (h + margin) to find the newest one that has closed.
+    Bounded at h + 10 steps: a well-formed table has a closed row within
+    that many trading days of the newest row, since _get_existing_dates
+    keeps re-enqueuing any closed-but-ungraded date every run.
+    """
+    if not max_candidate:
+        return None
+    from nousergon_lib.trading_calendar import add_trading_days, previous_trading_day
+
+    d = date.fromisoformat(max_candidate)
+    for _ in range(h + 10):
+        if add_trading_days(d, h) < today:
+            return d.isoformat()
+        d = previous_trading_day(d)
+    return None
+
+
+def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
+    """CloudWatch gauge: trading-day lag between "latest closed h-day window"
+    and "latest date actually graded" for universe_returns + predictor_outcomes.
+
+    Always emits (including 0) so the alarm baseline is continuous. Best
+    effort: read/emit errors log a warning but never raise — this is
+    observability, not a load-bearing path (mirrors
+    _emit_context_coverage_metric).
+    """
+    from nousergon_lib.trading_calendar import count_trading_days
+
+    h = forward_days
+    today = date.today()
+
+    summary: dict = {"status": "ok", "forward_days": h}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            max_eval_date = conn.execute(
+                "SELECT MAX(eval_date) FROM universe_returns"
+            ).fetchone()[0]
+            max_graded_returns = conn.execute(
+                f"SELECT MAX(eval_date) FROM universe_returns "
+                f"WHERE log_return_{h}d IS NOT NULL"
+            ).fetchone()[0]
+            max_prediction_date = conn.execute(
+                "SELECT MAX(prediction_date) FROM predictor_outcomes"
+            ).fetchone()[0]
+            max_graded_outcome = conn.execute(
+                "SELECT MAX(prediction_date) FROM predictor_outcomes "
+                "WHERE horizon_days IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "horizon_grading_lag_metric: DB read failed — drift alarm "
+            "cadence may degrade until next cycle. %s", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+        return summary
+
+    newest_closed_returns = _newest_window_closed(max_eval_date, today, h)
+    newest_closed_outcomes = _newest_window_closed(max_prediction_date, today, h)
+
+    # Lag = trading days between the newest already-graded date and the
+    # newest date whose window has closed (0 if nothing has closed yet, or
+    # the newest closed date is already graded — count_trading_days is a
+    # half-open (start, end] count so it's 0 when start == end and never
+    # negative for a healthy monotonic backfill).
+    lag_returns = (
+        count_trading_days(date.fromisoformat(max_graded_returns), date.fromisoformat(newest_closed_returns))
+        if newest_closed_returns and max_graded_returns
+        else 0
+    )
+    lag_outcomes = (
+        count_trading_days(date.fromisoformat(max_graded_outcome), date.fromisoformat(newest_closed_outcomes))
+        if newest_closed_outcomes and max_graded_outcome
+        else 0
+    )
+
+    summary.update(
+        max_eval_date=max_eval_date,
+        max_graded_returns_eval_date=max_graded_returns,
+        newest_window_closed_eval_date=newest_closed_returns,
+        universe_returns_lag_trading_days=lag_returns,
+        max_prediction_date=max_prediction_date,
+        max_graded_outcome_prediction_date=max_graded_outcome,
+        newest_window_closed_prediction_date=newest_closed_outcomes,
+        predictor_outcomes_lag_trading_days=lag_outcomes,
+    )
+
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[
+                {
+                    "MetricName": "universe_returns_horizon_grading_lag_trading_days",
+                    "Value": float(lag_returns),
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                },
+                {
+                    "MetricName": "predictor_outcomes_grading_lag_trading_days",
+                    "Value": float(lag_outcomes),
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                },
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "horizon_grading_lag metric emit failed: %s — drift alarm "
+            "cadence may degrade until next cycle.", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+
+    if summary["status"] == "ok" and (lag_returns > 0 or lag_outcomes > 0):
+        logger.warning(
+            "Horizon grading lag: universe_returns=%dtd predictor_outcomes=%dtd "
+            "(forward_days=%d). A healthy pipeline re-grades to lag=0 every run — "
+            "sustained lag > 0 across consecutive runs indicates the grading "
+            "JOIN/backfill has actually stalled (not just normal forward-window "
+            "wait), unlike a single-run lag of 1-2td which is expected right "
+            "after a new window closes.",
+            lag_returns, lag_outcomes, h,
         )
 
     return summary
