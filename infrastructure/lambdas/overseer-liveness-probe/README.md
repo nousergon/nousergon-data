@@ -30,6 +30,7 @@ Check types (contract in `playbooks.schema.json`, a discriminated union on `type
 | `lambda_active` | function `Active` + `LastUpdateStatus` `Successful`; optional kill-switch **reported** (never alerted) + optional launch-config (AMI/SG/subnet) existence |
 | `run_window` | per mature expected trigger (fixed-cron **union** the dispatcher decision log), an S3 run artifact's `run_start` landed in `[T, T+ceiling+margin]` |
 | `sqs_queue_exists` | intake queue (+ optional DLQ) exists |
+| `sf_watch_invocation_success` | `run_window`'s event-driven sibling (config#2901): per watched pipeline, every mature terminal (`FAILED`/`TIMED_OUT`/`ABORTED`) SF execution has a matching watch-log entry — catches a dispatcher that is wired+`Active` but crashes before writing its log |
 
 **Kill-switch REPORTED, never alerted:** a deliberate operator disable
 (`SF_WATCH_DISPATCH_ENABLED` etc.) is state, not an incident — it is logged and
@@ -62,18 +63,24 @@ Scheduler rules. First-time / cadence change:
 
 ```
 bash deploy.sh --dry-run     # show actions
-bash deploy.sh --bootstrap   # first-time: role + Lambda + 2 Scheduler rules
+bash deploy.sh --bootstrap   # first-time / cadence or IAM change: role + Lambda + 4 Scheduler rules
 bash deploy.sh               # update code only (same command CI runs)
 bash deploy.sh --smoke       # invoke once (read-only; pings only on a REAL problem)
 ```
 
-Merging the PR has **zero** live effect until an operator runs `--bootstrap`.
+Merging the PR has **zero** live effect until an operator runs `--bootstrap`
+(bootstrap is idempotent — safe to re-run to pick up an IAM or cadence change
+on an already-deployed function, including the config#2901 4x/day bump and its
+`states:ListExecutions`/`DescribeExecution` + sf-watch-log-prefix S3 grants).
 The CloudWatch alarm on this function's `Errors` metric (which the fail-loud
 contract assumes) is provisioned by `infrastructure/setup_watch_plane_alarms.sh`.
 
-Cadence (UTC): `cron(50 6 * * ? *)` and `cron(50 14 * * ? *)` — offset from the
-slimmed sf-watch probe's sweep cadence purely to avoid simultaneous invocation;
-the `run_window` maturity gate makes exact probe time non-critical.
+Cadence (UTC): `cron(50 2/8/14/20 * * ? *)` — 4x/day (config#2901 bump from
+2x: every check here is a cheap read-only API call, worth halving worst-case
+detection latency to ~6h), offset from the slimmed sf-watch probe's sweep
+cadence purely to avoid simultaneous invocation; the `run_window`/
+`sf_watch_invocation_success` maturity gates make exact probe time
+non-critical.
 
 ## Post-merge operator cleanup (one-time)
 

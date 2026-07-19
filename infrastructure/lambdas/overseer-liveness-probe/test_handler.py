@@ -478,6 +478,161 @@ def test_run_window_single_silent_death_not_masked_by_later_success():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# sf_watch_invocation_success (config#2901)
+# ══════════════════════════════════════════════════════════════════════════
+
+_SFWS_SPEC = {
+    "type": "sf_watch_invocation_success",
+    "label": "sf-watch-invocation",
+    "pipelines": {"ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch"},
+    "ceiling_min": 10,
+    "margin_min": 5,
+    "lookback_hours": 30,
+}
+_SFWS_ARN = f"arn:aws:states:{index.REGION}:{index.ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
+
+
+def _sfws_execution(name="exec-1", status="FAILED", stop_offset_min=60):
+    return {
+        "executionArn": f"{_SFWS_ARN}:{name}",
+        "name": name,
+        "status": status,
+        "startDate": NOW - timedelta(minutes=stop_offset_min + 1),
+        "stopDate": NOW - timedelta(minutes=stop_offset_min),
+    }
+
+
+def _sfws_sfn(executions, describe_input=None):
+    sfn = MagicMock()
+    sfn.list_executions.return_value = {"executions": executions}
+    sfn.describe_execution.return_value = (
+        {"input": json.dumps({"run_date": describe_input})} if describe_input else {"input": "{}"}
+    )
+    return sfn
+
+
+def _sfws_s3(watch_log_events=None, missing=False):
+    s3 = MagicMock()
+    if missing:
+        s3.get_object.side_effect = FakeClientError("NoSuchKey")
+    else:
+        doc = {"events": watch_log_events or []}
+        s3.get_object.return_value = {"Body": _Body(json.dumps(doc).encode())}
+    return s3
+
+
+def test_sf_watch_invocation_success_logged_execution_clean():
+    ex = _sfws_execution()
+    sfn = _sfws_sfn([ex])
+    s3 = _sfws_s3(watch_log_events=[{"execution_arn": ex["executionArn"]}])
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert problems == []
+
+
+def test_sf_watch_invocation_success_missing_log_object_is_finding():
+    """The crash-on-invocation class (2026-07-17 incident): a terminal
+    execution happened but the dispatcher never even created the date's
+    watch-log object."""
+    ex = _sfws_execution()
+    sfn = _sfws_sfn([ex])
+    s3 = _sfws_s3(missing=True)
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert len(problems) == 1
+    assert "NO matching watch-log entry" in problems[0]
+    assert "ne-preopen-trading-pipeline" in problems[0]
+
+
+def test_sf_watch_invocation_success_log_exists_but_execution_not_recorded():
+    """Watch-log for the date exists (some other execution logged fine) but
+    THIS execution's arn is absent — also a miss."""
+    ex = _sfws_execution(name="exec-2")
+    sfn = _sfws_sfn([ex])
+    s3 = _sfws_s3(watch_log_events=[{"execution_arn": f"{_SFWS_ARN}:some-other-exec"}])
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert len(problems) == 1
+
+
+def test_sf_watch_invocation_success_ignores_non_terminal_status():
+    ex = _sfws_execution(status="RUNNING")
+    sfn = _sfws_sfn([ex])
+    s3 = _sfws_s3(missing=True)
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert problems == []
+
+
+def test_sf_watch_invocation_success_ignores_immature_execution():
+    """An execution that stopped inside ceiling+margin is not yet mature —
+    the dispatcher may simply not have finished writing yet."""
+    ex = _sfws_execution(stop_offset_min=2)
+    sfn = _sfws_sfn([ex])
+    s3 = _sfws_s3(missing=True)
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert problems == []
+
+
+def test_sf_watch_invocation_success_ignores_execution_before_lookback():
+    ex = _sfws_execution(stop_offset_min=60 * 40)  # 40h ago, lookback is 30h
+    sfn = _sfws_sfn([ex])
+    s3 = _sfws_s3(missing=True)
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert problems == []
+
+
+def test_sf_watch_invocation_success_uses_run_date_from_execution_input():
+    """run_date comes from describe_execution's input.run_date (mirrors the
+    dispatcher's own _run_date), not the execution's calendar start date."""
+    ex = _sfws_execution()
+    sfn = _sfws_sfn([ex], describe_input="2026-07-01")
+    s3 = _sfws_s3(watch_log_events=[{"execution_arn": ex["executionArn"]}])
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert problems == []
+    s3.get_object.assert_called_once_with(
+        Bucket=index.WATCH_BUCKET, Key="consolidated/weekday_sf_watch/2026-07-01.json"
+    )
+
+
+def test_sf_watch_invocation_success_fail_loud_on_unexpected_s3_error():
+    ex = _sfws_execution()
+    sfn = _sfws_sfn([ex])
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("AccessDenied")
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        with pytest.raises(FakeClientError):
+            index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+
+
+def test_sf_watch_invocation_success_fail_loud_on_unexpected_sfn_error():
+    sfn = MagicMock()
+    sfn.list_executions.side_effect = FakeClientError("AccessDenied")
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=MagicMock()):
+        with pytest.raises(FakeClientError):
+            index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+
+
+def test_sf_watch_invocation_success_paginates_list_executions():
+    ex_old = _sfws_execution(name="old", stop_offset_min=60 * 40)  # past horizon
+    ex_new = _sfws_execution(name="new", stop_offset_min=60)
+    sfn = MagicMock()
+    sfn.list_executions.side_effect = [
+        {"executions": [ex_new], "nextToken": "tok"},
+        {"executions": [ex_old]},
+    ]
+    sfn.describe_execution.return_value = {"input": "{}"}
+    s3 = _sfws_s3(missing=True)
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFWS_SPEC, NOW)
+    assert len(problems) == 1 and "'new'" in problems[0]
+    assert sfn.list_executions.call_count == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # aggregation, dedup, handler, registry
 # ══════════════════════════════════════════════════════════════════════════
 

@@ -15,16 +15,23 @@
 #
 # IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds) + read-only
 # events:DescribeRule/ListTargetsByRule + states:DescribeStateMachine +
-# lambda:GetFunctionConfiguration + ec2:Describe{Images,SecurityGroups,Subnets}
-# + sqs:GetQueueUrl + s3 Get/List on the run-window prefixes + s3 Get/Put on the
+# states:ListExecutions/DescribeExecution (sf_watch_invocation_success,
+# config#2901) + lambda:GetFunctionConfiguration +
+# ec2:Describe{Images,SecurityGroups,Subnets} + sqs:GetQueueUrl + s3 Get/List
+# on the run-window + sf-watch-invocation-log prefixes + s3 Get/Put on the
 # dedup state key + dynamodb on the flow-doctor store. NO InvokeFunction / EC2
 # mutate — this probe never acts.
 #
-# Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
-# cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
-# config-drift + run-window check, not tied to any pipeline's own schedule:
-#   06:50 daily   cron(50 6 * * ? *)
+# Cadence (UTC): 4x daily (config#2901 bump from 2x — every check here is a
+# cheap read-only API call, and halving worst-case detection latency to ~6h
+# is worth it for a live-incident watch plane), offset :50 past the hour to
+# avoid colliding with the slimmed sf-watch probe's own sweep cadence
+# (06:45/14:45) — this is a config-drift + run-window/invocation-success
+# check, not tied to any pipeline's own schedule:
+#   02:50 daily   cron(50 2 * * ? *)
+#   08:50 daily   cron(50 8 * * ? *)
 #   14:50 daily   cron(50 14 * * ? *)
+#   20:50 daily   cron(50 20 * * ? *)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers/probes
 # (narrow OIDC blast radius, operator-deployed only). Merging the PR has ZERO
@@ -51,12 +58,16 @@ FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 SCHED_NAMES=(
-  "alpha-engine-overseer-liveness-0650-daily"
+  "alpha-engine-overseer-liveness-0250-daily"
+  "alpha-engine-overseer-liveness-0850-daily"
   "alpha-engine-overseer-liveness-1450-daily"
+  "alpha-engine-overseer-liveness-2050-daily"
 )
 SCHED_CRONS=(
-  "cron(50 6 * * ? *)"
+  "cron(50 2 * * ? *)"
+  "cron(50 8 * * ? *)"
   "cron(50 14 * * ? *)"
+  "cron(50 20 * * ? *)"
 )
 SCHED_PREFIX="alpha-engine-overseer-liveness-"
 

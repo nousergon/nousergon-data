@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Nousergon Overseer playbook registry v1",
-  "description": "Contract for infrastructure/overseer/playbooks.yaml (alpha-engine-config-I2823). Additive-only evolution: new fields must be optional; renames/removals require a schema_version bump. The optional `liveness` (per-playbook) and `watch_plane_liveness` (top-level) blocks (alpha-engine-config-I2831) drive the registry-driven overseer-liveness-probe — added additively, schema_version unchanged. The optional `trigger_type` discriminant (alpha-engine-config-I2928 Phase 3) models a second trigger topology for `routed: false` inventory-only entries that have NO Lambda at all (pure GitHub Actions cron, e.g. the gate-due-sweep.yml daily job) — it defaults to `lambda_dispatch` when absent, so every entry written before this field existed remains valid unchanged; `github_actions_cron` entries require `workflow_file`/`repo` instead of the executor_*/kill_switch_env fields.",
+  "description": "Contract for infrastructure/overseer/playbooks.yaml (alpha-engine-config-I2823). Additive-only evolution: new fields must be optional; renames/removals require a schema_version bump. The optional `liveness` (per-playbook) and `watch_plane_liveness` (top-level) blocks (alpha-engine-config-I2831) drive the registry-driven overseer-liveness-probe — added additively, schema_version unchanged. The optional `trigger_type` discriminant (alpha-engine-config-I2928 Phase 3) models a second trigger topology for `routed: false` inventory-only entries that have NO Lambda at all (pure GitHub Actions cron, e.g. the gate-due-sweep.yml daily job) — it defaults to `lambda_dispatch` when absent, so every entry written before this field existed remains valid unchanged; `github_actions_cron` entries require `workflow_file`/`repo` instead of the executor_*/kill_switch_env fields. The `sf_watch_invocation_success` check type (alpha-engine-config#2901) is `run_window`'s event-driven sibling: instead of a fixed cron `schedule`, its expected triggers are each watched pipeline's own terminal (FAILED/TIMED_OUT/ABORTED) Step Function executions — catching a dispatcher that is deployed/Active/correctly-wired but crashes on every real invocation before writing its watch-log, a class `lambda_active`+`eventbridge_rule` cannot see.",
   "type": "object",
   "required": ["schema_version", "playbooks"],
   "additionalProperties": false,
@@ -193,6 +193,32 @@
                 }
               }
             }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "type", "label", "pipelines",
+            "ceiling_min", "margin_min", "lookback_hours"
+          ],
+          "properties": {
+            "type": { "const": "sf_watch_invocation_success" },
+            "label": { "type": "string", "minLength": 1 },
+            "pipelines": {
+              "description": "state_machine_name -> its watch-log S3 prefix (mirrors saturday-sf-watch-dispatcher's PIPELINES[*].watch_prefix — lockstep-pinned by tests/test_overseer_playbook_registry.py).",
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": { "pattern": "^[a-z0-9-]+$" },
+              "additionalProperties": { "type": "string", "pattern": "^consolidated/[a-z0-9_-]+$" }
+            },
+            "terminal_statuses": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "enum": ["FAILED", "TIMED_OUT", "ABORTED"] }
+            },
+            "ceiling_min": { "type": "integer", "minimum": 1 },
+            "margin_min": { "type": "integer", "minimum": 0 },
+            "lookback_hours": { "type": "integer", "minimum": 1 }
           }
         }
       ]

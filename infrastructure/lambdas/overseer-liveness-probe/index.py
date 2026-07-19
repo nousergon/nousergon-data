@@ -27,6 +27,11 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
                                 dispatcher decision log), an S3 run artifact's
                                 run_start landed in [T, T+ceiling+margin].
   * ``sqs_queue_exists``      — queue (and optional DLQ) exists.
+  * ``sf_watch_invocation_success`` — run_window's event-driven sibling
+                                (config#2901): per pipeline, every mature
+                                terminal SF execution has a matching
+                                watch-log entry — catches a dispatcher that
+                                crashes on invocation, not just an unwired one.
 
 Conventions preserved from both source probes:
   * silent-unless-broken: a clean pass logs + returns, no Telegram noise.
@@ -540,6 +545,127 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
     return problems, {}
 
 
+# ── Check: sf_watch_invocation_success (config#2901) ──────────────────────────
+# run_window's event-driven sibling: sf-watch has no fixed cron — a watched
+# pipeline's own terminal (FAILED/TIMED_OUT/ABORTED) SF execution IS the
+# expected trigger, and the dispatcher's watch-log write (synchronous, same
+# invocation) is the success signal. Catches a dispatcher that is deployed,
+# Active, and correctly wired (eventbridge_rule + lambda_active both clean)
+# but crashes before `_write_watch_log` on every real invocation — the
+# 2026-07-17 ListBucket/403 incident class.
+
+_SFWS_DEFAULT_TERMINAL_STATUSES = ("FAILED", "TIMED_OUT", "ABORTED")
+
+
+def _sfws_run_date(describe_resp: dict | None, execution: dict) -> str:
+    """Mirrors saturday-sf-watch-dispatcher._run_date: prefer the execution
+    input's ``run_date``, else the execution's own start date — so the
+    expected watch-log key matches what the dispatcher itself would compute."""
+    if describe_resp:
+        try:
+            payload = json.loads(describe_resp.get("input") or "{}")
+            rd = payload.get("run_date")
+            if isinstance(rd, str) and rd:
+                return rd
+        except (ValueError, TypeError):
+            pass
+    start = execution.get("startDate")
+    if isinstance(start, datetime):
+        return start.astimezone(timezone.utc).date().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _sfws_terminal_executions(
+    sfn, state_machine_arn: str, statuses: tuple[str, ...], horizon: datetime, mature_before: datetime,
+) -> list[dict]:
+    """Terminal executions for one state machine with ``stopDate`` in
+    ``[horizon, mature_before]``. ``list_executions`` (no statusFilter, since
+    the API only accepts one) returns newest-first — page only until we pass
+    the horizon, not the whole history."""
+    out: list[dict] = []
+    token = None
+    while True:
+        kwargs = {"stateMachineArn": state_machine_arn, "maxResults": 100}
+        if token:
+            kwargs["nextToken"] = token
+        resp = sfn.list_executions(**kwargs)
+        past_horizon = False
+        for ex in resp.get("executions", []):
+            stop_date = ex.get("stopDate")
+            if stop_date is None:
+                continue  # still running or malformed — not a terminal execution
+            if stop_date < horizon:
+                past_horizon = True
+                continue
+            if ex.get("status") in statuses and stop_date <= mature_before:
+                out.append(ex)
+        token = resp.get("nextToken")
+        if not token or past_horizon:
+            break
+    return out
+
+
+def _sfws_watch_log_execution_arns(s3, watch_prefix: str, run_date: str) -> set[str] | None:
+    """execution_arns already recorded in this date's watch-log, or None if
+    the log object doesn't exist at all (the strongest form of the finding:
+    a mature terminal execution with not even an empty log written for its
+    date). Any read error OTHER than absence RAISES (fail-loud, mirrors every
+    other PRIMARY read in this probe)."""
+    key = f"{watch_prefix}/{run_date}.json"
+    try:
+        obj = s3.get_object(Bucket=WATCH_BUCKET, Key=key)
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) in {"NoSuchKey", "404"}:
+            return None
+        raise
+    try:
+        doc = json.loads(obj["Body"].read())
+    except (ValueError, TypeError):
+        return None
+    events = doc.get("events") if isinstance(doc, dict) else None
+    if not isinstance(events, list):
+        return None
+    return {e.get("execution_arn") for e in events if isinstance(e, dict)}
+
+
+def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """Per watched pipeline, every mature terminal execution must have a
+    matching watch-log entry — a miss means the dispatcher was invoked
+    (EventBridge always fires on the matching SF event) but never recorded
+    it, i.e. it crashed on invocation rather than merely being unwired."""
+    label = spec["label"]
+    statuses = tuple(spec.get("terminal_statuses") or _SFWS_DEFAULT_TERMINAL_STATUSES)
+    mature_min = spec["ceiling_min"] + spec["margin_min"]
+    horizon = now - timedelta(hours=spec["lookback_hours"])
+    mature_before = now - timedelta(minutes=mature_min)
+    sfn = _sfn_client()
+    s3 = _s3_client()
+    problems: list[str] = []
+    log_cache: dict[tuple[str, str], set[str] | None] = {}
+    for pipeline_name, watch_prefix in sorted(spec["pipelines"].items()):
+        arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{pipeline_name}"
+        for ex in _sfws_terminal_executions(sfn, arn, statuses, horizon, mature_before):
+            describe_resp = None
+            try:
+                describe_resp = sfn.describe_execution(executionArn=ex["executionArn"])
+            except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+                if _error_code(exc) != "ExecutionDoesNotExist":
+                    raise
+            run_date = _sfws_run_date(describe_resp, ex)
+            cache_key = (watch_prefix, run_date)
+            if cache_key not in log_cache:
+                log_cache[cache_key] = _sfws_watch_log_execution_arns(s3, watch_prefix, run_date)
+            logged_arns = log_cache[cache_key]
+            if logged_arns is None or ex["executionArn"] not in logged_arns:
+                problems.append(
+                    f"{label}: pipeline '{pipeline_name}' execution '{ex.get('name', ex['executionArn'])}' "
+                    f"({ex.get('status')} @ {ex.get('stopDate')}) has NO matching watch-log entry under "
+                    f"'{watch_prefix}/{run_date}.json' — the dispatcher was invoked but appears to have "
+                    "crashed before writing its watch-log (invocation-success failure, not a wiring gap)"
+                )
+    return problems, {}
+
+
 # ── Check dispatch table + aggregation ───────────────────────────────────────
 
 CHECKERS = {
@@ -548,6 +674,7 @@ CHECKERS = {
     "lambda_active": _check_lambda_active,
     "sqs_queue_exists": _check_sqs_queue_exists,
     "run_window": _check_run_window,
+    "sf_watch_invocation_success": _check_sf_watch_invocation_success,
 }
 
 

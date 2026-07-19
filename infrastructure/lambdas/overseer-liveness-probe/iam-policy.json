@@ -35,13 +35,25 @@
     {
       "Sid": "ReadRegisteredStateMachines",
       "Effect": "Allow",
-      "Action": ["states:DescribeStateMachine"],
+      "Action": ["states:DescribeStateMachine", "states:ListExecutions"],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-advisory-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-modelzoo-sunday-pipeline"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchInvocationExecutions",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-advisory-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-modelzoo-sunday-pipeline:*"
       ]
     },
     {
@@ -94,6 +106,35 @@
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": { "s3:prefix": "groom/*" }
+      }
+    },
+    {
+      "Sid": "SfWatchInvocationLogsRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/consolidated/saturday_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/weekday_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/eod_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/weekly-advisory_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/modelzoo-sunday_sf_watch/*"
+      ]
+    },
+    {
+      "Sid": "SfWatchInvocationLogsList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "consolidated/saturday_sf_watch/*",
+            "consolidated/weekday_sf_watch/*",
+            "consolidated/eod_sf_watch/*",
+            "consolidated/weekly-advisory_sf_watch/*",
+            "consolidated/modelzoo-sunday_sf_watch/*"
+          ]
+        }
       }
     },
     {

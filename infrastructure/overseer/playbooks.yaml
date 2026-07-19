@@ -79,6 +79,28 @@ playbooks:
             ami_env: SF_WATCH_AMI_ID
             security_group_env: SF_WATCH_SECURITY_GROUP
             subnets_env: SF_WATCH_SUBNETS
+        # Invocation-success check (config#2901, the 2026-07-17 saturday-sf-
+        # watch-dispatcher ListBucket/403 crash-on-invocation incident): the
+        # checks above only assert WIRING (rule enabled+targeted, Lambda
+        # Active) — a dispatcher that is correctly wired but throws before
+        # `_write_watch_log` is invisible to them. Each pipeline's own
+        # terminal SF executions ARE the expected triggers here; `pipelines`
+        # MIRRORS saturday-sf-watch-dispatcher's PIPELINES[*].watch_prefix
+        # (lockstep-pinned by tests/test_overseer_playbook_registry.py).
+        - type: sf_watch_invocation_success
+          label: sf-watch-invocation
+          pipelines:
+            ne-weekly-freshness-pipeline: consolidated/saturday_sf_watch
+            ne-preopen-trading-pipeline: consolidated/weekday_sf_watch
+            ne-postclose-trading-pipeline: consolidated/eod_sf_watch
+            ne-weekly-advisory-pipeline: consolidated/weekly-advisory_sf_watch
+            ne-modelzoo-sunday-pipeline: consolidated/modelzoo-sunday_sf_watch
+          # A terminal execution's watch-log write happens synchronously in
+          # the same invocation (seconds, not minutes) — 10min ceiling + 5min
+          # margin is generous slack for cold-start/throttle, not a real SLA.
+          ceiling_min: 10
+          margin_min: 5
+          lookback_hours: 30
 
   ci-watch:
     description: >-

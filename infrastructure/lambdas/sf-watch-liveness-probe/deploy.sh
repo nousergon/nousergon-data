@@ -24,9 +24,9 @@
 # alpha-engine-sf-watch-spot-dispatcher.
 #
 # Cadence (UTC): the SWEEP runs twice daily (the reclaim checker is event-driven,
-# not scheduled). Offset from the overseer-liveness-probe's cadence (06:50/14:50)
-# purely to avoid simultaneous invocation — the sweep isn't tied to any
-# pipeline's own schedule:
+# not scheduled). Offset :45-past-the-hour from the overseer-liveness-probe's
+# cadence (:50-past-the-hour, 4x/day as of config#2901) purely to avoid
+# simultaneous invocation — the sweep isn't tied to any pipeline's own schedule:
 #   06:45 daily   cron(45 6 * * ? *)
 #   14:45 daily   cron(45 14 * * ? *)
 #

@@ -184,6 +184,38 @@ def _sibling_dispatcher_pipeline_names() -> set[str]:
     return set(re.findall(r'^ {4}"([\w.-]+)":\s*\{', block, re.M))
 
 
+def _sibling_dispatcher_watch_prefixes() -> dict[str, str]:
+    """pipeline_name -> watch_prefix, parsed per-entry from
+    saturday-sf-watch-dispatcher's PIPELINES dict (the SSoT the
+    sf_watch_invocation_success check's ``pipelines`` map must mirror)."""
+    text = (LAMBDAS_DIR / "saturday-sf-watch-dispatcher" / "index.py").read_text()
+    start = text.index("PIPELINES: dict")
+    end = text.index("\n}\n", start)
+    block = text[start:end]
+    out: dict[str, str] = {}
+    for name, entry in re.findall(r'^ {4}"([\w.-]+)":\s*\{(.*?)\n {4}\},?\n', block, re.M | re.S):
+        m = re.search(r'"watch_prefix":\s*"([\w/-]+)"', entry)
+        if m:
+            out[name] = m.group(1)
+    return out
+
+
+def test_sf_watch_invocation_success_pipelines_lockstep_with_dispatcher():
+    """REGRESSION GUARD (config#2901): the sf_watch_invocation_success check's
+    ``pipelines`` map (state_machine -> watch_prefix) must exactly mirror
+    saturday-sf-watch-dispatcher's PIPELINES — a drifted or stale watch_prefix
+    would make the check read the WRONG date's watch-log and silently never
+    find a match, false-alarming (or worse, false-clean) forever."""
+    checks = REGISTRY["playbooks"]["sf-watch"]["liveness"]["checks"]
+    sfws = next(c for c in checks if c["type"] == "sf_watch_invocation_success")
+    sibling = _sibling_dispatcher_watch_prefixes()
+    assert sfws["pipelines"] == sibling, (
+        "sf_watch_invocation_success pipelines map drifted from "
+        f"saturday-sf-watch-dispatcher's PIPELINES watch_prefix values: "
+        f"registry={sfws['pipelines']} dispatcher={sibling}"
+    )
+
+
 def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher():
     """REGRESSION GUARD (moved from sf-watch-liveness-probe's own test): the
     sf-watch playbook's liveness pipeline list (the eventbridge_rule
