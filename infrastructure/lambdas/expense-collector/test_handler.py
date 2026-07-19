@@ -260,6 +260,57 @@ class TestNeonPeriodPacing:
         assert row["projected_month_end_usd"] == 19.0
         assert row["note"] == "Launch plan — TEMPORARY"
 
+    def test_computed_transfer_overage_cost(self, monkeypatch):
+        """No fixed_monthly_usd override configured (config#2913): mtd_cost_usd
+        must be a REAL computed estimate from data-transfer overage — 500 GB/mo
+        free egress, then $0.10/GB (neon.com/pricing, verified 2026-07-17) — not
+        the fabricated flat $19/mo the row used to hard-set regardless of usage.
+        600 GB used, full-month period, NOW at exactly 50% elapsed ⇒ 100 GB
+        overage MTD ($10.00), straight-line-projected usage 1200 GB month-end
+        ⇒ 700 GB overage ($70.00)."""
+        monkeypatch.setattr(index, "_now_utc",
+                            lambda: datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {
+                "name": "nousergon", "data_transfer_bytes": 600_000_000_000,
+                "compute_time_seconds": 7200, "written_data_bytes": 5_000_000_000,
+                "consumption_period_start": "2026-07-01T00:00:00Z",
+                "consumption_period_end": "2026-08-01T00:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        mw = index._month_window(datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        row = index.collect_neon(mw, {}, {index.SSM_NEON: "k"})
+        assert row["mtd_cost_usd"] == pytest.approx(10.0)
+        assert row["projected_month_end_usd"] == pytest.approx(70.0)
+        assert row["detail"]["data_transfer_cost_usd"] == pytest.approx(10.0)
+
+    def test_compute_and_storage_surface_as_unknown_not_zero(self, monkeypatch):
+        """Compute (no CU-size field to convert compute_time_seconds into
+        CU-hours) and storage (written_data_bytes is cumulative writes, not a
+        point-in-time size — no logical_size_bytes field) are genuinely
+        uncomputable from this endpoint: they must render None/unknown and be
+        named in detail.cost_components_unavailable, never fabricated as 0 or
+        silently dropped from the row (config#2913 fail-loud discipline)."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {
+                "name": "nousergon", "data_transfer_bytes": 8_000_000,
+                "compute_time_seconds": 7200, "written_data_bytes": 5_000_000_000,
+                "consumption_period_start": "2026-07-01T00:00:00Z",
+                "consumption_period_end": "2026-08-01T00:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        row = index.collect_neon(index._month_window(NOW), {}, {index.SSM_NEON: "k"})
+        assert row["detail"]["compute_cost_usd"] is None
+        assert row["detail"]["storage_cost_usd"] is None
+        unavailable = {c["component"] for c in row["detail"]["cost_components_unavailable"]}
+        assert unavailable == {"compute", "storage"}
+        assert "unknown" in row["note"] or "cost_components_unavailable" in row["note"]
+        # Negligible transfer (8 MB, well under the 500 GB free tier) ⇒ the
+        # ONE computable line item is legitimately $0 — distinct from "unknown".
+        assert row["mtd_cost_usd"] == 0.0
+        assert row["detail"]["data_transfer_cost_usd"] == 0.0
+
 
 class TestFixedRows:
     def test_config_only_subscription_row(self):
