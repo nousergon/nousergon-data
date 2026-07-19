@@ -33,7 +33,11 @@ Architecture:
               events + entities)
 
 Idempotency: pre-checked via the lib's ``document_exists`` — re-runs
-on the same (ticker, date, source) skip the embedding call entirely.
+of the SAME article (matched via ``external_id``, the aggregator's
+composite fingerprint) skip the embedding call entirely. Distinct
+articles for one (ticker, source, day) are no longer collapsed onto a
+single row (config#2957) — ``external_id`` is what makes per-article
+dedup possible instead of per-(ticker, source, day).
 
 Chunking: news articles are short (title + body excerpt = typically
 <500 tokens). We emit ONE chunk per article per ticker. For longer
@@ -134,10 +138,11 @@ def ingest_articles(
     Args:
         articles: aggregated news articles (from NewsAggregator).
         filed_date: the canonical filed_date stamped on every document
-            this run. Per the RAG schema this is the dedup key
-            alongside (ticker, doc_type, source). For news, all
-            articles in one ingest batch share a filed_date — typically
-            the calendar date the batch was fetched.
+            this run. For news, all articles in one ingest batch share a
+            filed_date — typically the calendar date the batch was
+            fetched. Per-article dedup within that shared filed_date is
+            keyed on each article's ``external_id`` (config#2957), not
+            filed_date alone.
         ticker_to_sector: optional ticker → GICS sector map. Sector is
             an optional column on the RAG documents table; omit to
             skip sector tagging.
@@ -175,9 +180,19 @@ def ingest_articles(
 
         rag_source = _rag_source(_canonical_source(article))
 
+        # Stable per-article identity for dedup (config#2957): the
+        # aggregator's own composite fingerprint (normalized title +
+        # URL host+path, alpha-engine-data collectors/news_aggregator.py
+        # ``_article_fingerprint``) already groups source variants of the
+        # same real-world story, so re-ingesting the SAME article (even
+        # from a later run / different day's fetch) yields the SAME
+        # external_id. Without this, rag.documents' dedup key collapses
+        # every article for one (ticker, source, day) onto a single row.
+        external_id = article.canonical_fingerprint or None
+
         for ticker in article.tickers:
             stats["n_documents_attempted"] += 1
-            if document_exists_fn(ticker, "news", filed_date, rag_source):
+            if document_exists_fn(ticker, "news", filed_date, rag_source, external_id):
                 stats["n_documents_skipped_exists"] += 1
                 continue
             if dry_run:
@@ -214,6 +229,7 @@ def ingest_articles(
                     title=article.canonical_title or None,
                     url=article.canonical_url or None,
                     chunks=chunks,
+                    external_id=external_id,
                 )
                 if doc_id:
                     stats["n_documents_ingested"] += 1

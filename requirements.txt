@@ -55,6 +55,16 @@ arcticdb>=6.18.7
 # once that release ships; until then this repo's test suite exercises the
 # wiring against an editable install of the nousergon-lib branch (see this
 # PR's description) rather than a real pip-installable pin.
+# alpha-engine-config#2957 NOTE: rag/pipelines/ingest_news.py now passes an
+# external_id kwarg to nousergon_lib.rag's document_exists/ingest_document
+# (per-article news dedup — nousergon-lib#225, not yet merged/tagged as of
+# this PR). Per the lockstep rule above, the pin below intentionally stays
+# at v0.124.6 (external_id not yet supported there) rather than a branch
+# ref; this repo's test suite exercises the new kwarg via injected fakes
+# (document_exists_fn/ingest_document_fn), so it doesn't need the real lib
+# release to validate. Bump to the first tagged release that includes
+# nousergon-lib#225 as an immediate same-repo follow-up PR once that
+# release ships — this PR stays draft + gate:dependency until then.
 nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
