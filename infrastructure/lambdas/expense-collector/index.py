@@ -373,12 +373,35 @@ def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
     return _finish_usd_row(row, mw, _budget_usd(budgets, key), observed_frac=observed)
 
 
+NEON_TRANSFER_FREE_GB = 500.0
+NEON_TRANSFER_OVERAGE_USD_PER_GB = 0.10
+# Neon Launch plan pricing (neon.com/pricing, verified live 2026-07-17): no
+# flat monthly fee ("pay for what you use, no monthly minimum"). Compute
+# $0.106/CU-hour and storage $0.35/GB-month are BOTH left unknown below — the
+# per-project detail object (the only endpoint this free/Launch-plan API key
+# can reach; ``consumption_history`` is Scale-plan-only, 403/404 confirmed
+# live) exposes ``compute_time_seconds`` (wall-clock active-compute seconds,
+# NOT CU-scaled — no CU-size/vCPU field is returned anywhere in this response
+# to convert it into CU-hours) and ``written_data_bytes`` (a cumulative WRITE
+# counter, not a point-in-time storage size — no ``logical_size_bytes`` or
+# equivalent current-size field is present either). Fabricating a $ figure
+# from either would be a guess dressed up as a bill; both render `None` with
+# the gap named in ``detail.cost_components_unavailable`` instead.
+NEON_COMPUTE_USD_PER_CU_HOUR = 0.106  # documented for when a CU-size field
+NEON_STORAGE_USD_PER_GB_MONTH = 0.35  # ever becomes available; unused today.
+
+
 def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
     """Free-tier-compatible consumption read: the ``consumption_history``
     endpoints are Scale-plan-only (verified 403/404 live, 2026-07-17), but the
     per-project detail object carries current-consumption-period counters
     (``data_transfer_bytes``, ``compute_time_seconds``, …) plus the period
-    bounds on every plan — sum across projects and pace against the period."""
+    bounds on every plan — sum across projects and pace against the period.
+    Only the data-transfer line is actually computable in $ from those
+    counters (see ``NEON_COMPUTE_USD_PER_CU_HOUR`` docstring above for why
+    compute + storage are NOT): a real partial bill, not a fabricated flat
+    fee, unless the operator sets an explicit ``fixed_monthly_usd`` override
+    (e.g. a manually-confirmed paid-plan invoice) in the budgets SSoT."""
     row = _row("neon", "Neon Postgres", source="projects_api")
     if SSM_NEON not in secrets:
         row.update(status="not_configured", error=f"SSM {SSM_NEON} missing")
@@ -417,23 +440,66 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
     projected_gb = None
     if observed_frac >= MIN_PROJECTION_FRAC:
         projected_gb = transfer_gb / observed_frac
+
+    # Data transfer overage is the ONE line item this endpoint can actually
+    # price: 500 GB/mo free egress, then $0.10/GB (neon.com/pricing, verified
+    # live 2026-07-17). Compute and storage are genuinely uncomputable from
+    # the fields this API key can reach — see the module-level constants'
+    # docstring — and MUST surface as unknown, not silently dropped or
+    # counted as $0.
+    transfer_mtd_usd = max(0.0, transfer_gb - NEON_TRANSFER_FREE_GB) * NEON_TRANSFER_OVERAGE_USD_PER_GB
+    transfer_projected_usd = None
+    if observed_frac >= MIN_PROJECTION_FRAC:
+        transfer_projected_usd = (max(0.0, (transfer_gb / observed_frac) - NEON_TRANSFER_FREE_GB)
+                                   * NEON_TRANSFER_OVERAGE_USD_PER_GB)
+    cost_components_unavailable = [
+        {"component": "compute", "unit": "CU-hour", "reason":
+         "compute_time_seconds is wall-clock active-compute time, not "
+         "CU-scaled — the project detail API returns no CU-size/vCPU field "
+         "to convert it into billable CU-hours"},
+        {"component": "storage", "unit": "GB-month", "reason":
+         "written_data_bytes is a cumulative write counter, not a "
+         "point-in-time storage size — the project detail API returns no "
+         "logical_size_bytes (or equivalent current-size) field"},
+    ]
+
+    fixed_override = _fixed_usd(budgets, "neon")
+    if fixed_override is not None:
+        # Explicit operator override (e.g. a manually-confirmed paid-plan
+        # invoice) — takes precedence over the computed estimate below, same
+        # as every other provider's fixed_monthly_usd escape hatch.
+        mtd_cost_usd = float(fixed_override)
+        projected_month_end_usd = float(fixed_override)
+    else:
+        mtd_cost_usd = round(transfer_mtd_usd, 4)
+        projected_month_end_usd = (round(transfer_projected_usd, 4)
+                                    if transfer_projected_usd is not None else None)
+
     row.update(
-        mtd_cost_usd=float(_fixed_usd(budgets, "neon") or 0.0),
-        projected_month_end_usd=float(_fixed_usd(budgets, "neon") or 0.0),
+        mtd_cost_usd=mtd_cost_usd,
+        projected_month_end_usd=projected_month_end_usd,
         quota={"unit": "GB data transfer", "used": round(transfer_gb, 3),
                "limit": quota_gb,
                "projected": round(projected_gb, 3) if projected_gb is not None else None},
         pace=_pace(projected_gb, quota_gb),
         detail={"projects": project_names,
                 "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
+                "compute_cost_usd": None,
                 "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
-                "consumption_period": f"{period_start} → {period_end}"},
+                "storage_cost_usd": None,
+                "data_transfer_cost_usd": round(transfer_mtd_usd, 4),
+                "consumption_period": f"{period_start} → {period_end}",
+                "cost_components_unavailable": (None if fixed_override is not None
+                                                 else cost_components_unavailable)},
         # Prefer an operator note from the budgets SSoT (e.g. a temporary
         # paid-plan explanation) so what the operator recorded reaches the page;
-        # fall back to the free-plan default only when no cost is configured.
+        # fall back to a note that names the estimate's gaps when no override
+        # is configured, so the console never implies this is a full bill.
         note=_cfg_note(budgets, "neon")
-             or ("free plan — the binding constraint is the transfer quota, not $"
-                 if not _fixed_usd(budgets, "neon") else None),
+             or (None if fixed_override is not None else
+                 "estimated from data transfer overage only — compute and "
+                 "storage costs are unknown (see detail.cost_components_unavailable); "
+                 "actual bill will be higher if either is nonzero"),
     )
     row["budget_usd"] = _budget_usd(budgets, "neon")
     return row
