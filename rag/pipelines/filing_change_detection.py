@@ -18,6 +18,11 @@ Usage:
     python -m rag.pipelines.filing_change_detection --output-s3
     python -m rag.pipelines.filing_change_detection --output-local /tmp/filing_changes.json
     python -m rag.pipelines.filing_change_detection --sample-tickers 5 --output-local /tmp/probe.json
+
+    # config#2943: scoped to the RAG corpus population (holdings ∪ active
+    # candidates ∪ top-60 board) — the default production posture from
+    # run_weekly_ingestion.sh / run_daily_corpus_delta.sh
+    python -m rag.pipelines.filing_change_detection --tickers AAPL,MSFT,NVDA --output-s3
 """
 
 from __future__ import annotations
@@ -95,9 +100,16 @@ _TICKER_SAMPLE_FILTER = """
               LIMIT %s
           )"""
 
+# config#2943 ruling item 4: filing_change_detection runs on the RAG corpus
+# SCOPE (holdings ∪ active candidates ∪ top-60 board) by default, not the
+# whole rag.documents table — an explicit ticker allowlist, same egress-
+# minimizing shape as the sample filter above (pushed into the WHERE, not a
+# client-side post-filter over a full-corpus read).
+_TICKER_SCOPE_FILTER = "\n          AND ticker = ANY(%s)"
+
 
 def _load_filing_centroids(
-    min_filings: int = 2, sample_tickers: int | None = None
+    min_filings: int = 2, sample_tickers: int | None = None, tickers: list[str] | None = None,
 ) -> dict[str, list[dict]]:
     """Load per-filing embedding centroids for the latest filings per ticker.
 
@@ -116,6 +128,12 @@ def _load_filing_centroids(
         sample_tickers: When set (canary/CI probes), restrict to the first N
             tickers so the probe never replays full production load
             (config-I2780).
+        tickers: When set (config#2943 default production posture),
+            restrict to this explicit ticker list — the RAG corpus scope
+            (holdings ∪ active candidates ∪ top-60 board). Mutually
+            exclusive with ``sample_tickers``; ``sample_tickers`` (a CI/canary
+            knob) wins if both are somehow passed, matching the caller-side
+            argparse mutual-exclusion in ``main()``.
 
     Returns:
         {ticker: [{ticker, doc_type, filed_date, centroid: np.ndarray,
@@ -140,6 +158,9 @@ def _load_filing_centroids(
             raise ValueError(f"sample_tickers must be >= 1; got {sample_tickers}")
         ticker_filter = _TICKER_SAMPLE_FILTER
         params.append(sample_tickers)
+    elif tickers:
+        ticker_filter = _TICKER_SCOPE_FILTER
+        params.append(list(tickers))
     else:
         ticker_filter = ""
     sql = _CENTROID_SQL.format(ticker_filter=ticker_filter)
@@ -188,7 +209,7 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def compute_filing_changes(
-    min_filings: int = 2, sample_tickers: int | None = None
+    min_filings: int = 2, sample_tickers: int | None = None, tickers: list[str] | None = None,
 ) -> list[dict]:
     """Compute filing change scores for all tickers with consecutive filings.
 
@@ -201,11 +222,13 @@ def compute_filing_changes(
         min_filings: Minimum same-type filings a ticker needs to be analyzed.
         sample_tickers: When set, analyze only the first N tickers — the
             canary/CI probe knob (config-I2780); production runs leave it None.
+        tickers: When set (config#2943 default production posture), restrict
+            to this explicit ticker list (the RAG corpus scope).
 
     Returns list of per-ticker change records.
     """
     by_ticker = _load_filing_centroids(
-        min_filings=min_filings, sample_tickers=sample_tickers
+        min_filings=min_filings, sample_tickers=sample_tickers, tickers=tickers,
     )
     results = []
 
@@ -316,9 +339,24 @@ def main():
             "clobbering the production pointer."
         ),
     )
+    parser.add_argument(
+        "--tickers", type=str, default=None,
+        help=(
+            "config#2943: comma-separated ticker allowlist — the RAG corpus "
+            "scope (holdings ∪ active candidates ∪ top-60 board). Default "
+            "production posture is to pass the resolved scope explicitly "
+            "(see run_daily_corpus_delta.sh / run_weekly_ingestion.sh); "
+            "omitting BOTH this and --sample-tickers analyzes the whole "
+            "rag.documents table (legacy full-corpus behavior)."
+        ),
+    )
     args = parser.parse_args()
 
-    results = compute_filing_changes(sample_tickers=args.sample_tickers)
+    tickers = (
+        [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        if args.tickers else None
+    )
+    results = compute_filing_changes(sample_tickers=args.sample_tickers, tickers=tickers)
 
     output = {
         "date": date.today().isoformat(),

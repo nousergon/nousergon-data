@@ -11,14 +11,19 @@ Usage:
     # Ingest recent filings for a list of tickers
     .venv/bin/python -m rag.pipelines.ingest_sec_filings --tickers AAPL,MSFT,GOOG
 
-    # Backfill last 2 years for all tickers in latest signals
-    .venv/bin/python -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2
+    # Backfill last 2 years for the corpus scope (holdings ∪ active
+    # candidates ∪ top-60 signals board — config#2943)
+    .venv/bin/python -m rag.pipelines.ingest_sec_filings --scope holdings+candidates+board60 --lookback-years 2
+
+config#2943: the old ``--from-signals`` (whole ~900-ticker signals.json
+universe) is retired — replaced by ``--scope holdings+candidates+board60``,
+resolved via the shared ``rag.pipelines._corpus_scope`` module. See that
+module's docstring for the binding ruling this implements.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import re
@@ -57,6 +62,11 @@ _CHUNK_OVERLAP = 50
 # run (or day) actually hits EDGAR.
 
 from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
+from rag.pipelines._corpus_scope import (  # noqa: E402
+    DEFAULT_BUCKET,
+    add_scope_arg,
+    resolve_tickers_from_args,
+)
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -289,30 +299,26 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest SEC filings into RAG store")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from latest signals.json on S3")
+    add_scope_arg(parser)
+    parser.add_argument("--bucket", type=str, default=DEFAULT_BUCKET)
     parser.add_argument("--lookback-years", type=int, default=2, help="Years of filings to backfill")
+    parser.add_argument(
+        "--lookback-days", type=int, default=None,
+        help="Days of filings to backfill (overrides --lookback-years when set — "
+             "config#2943 daily delta uses this for a short incremental window; "
+             "re-checking an already-covered window is a dedup-idempotent no-op "
+             "via document_exists, not a re-download).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print what would be ingested without writing")
     args = parser.parse_args()
 
-    if args.tickers:
-        tickers = [t.strip().upper() for t in args.tickers.split(",")]
-    elif args.from_signals:
-        import boto3
-        s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(Bucket="alpha-engine-research", Prefix="signals/", Delimiter="/")
-        prefixes = sorted([p["Prefix"] for p in resp.get("CommonPrefixes", [])])
-        if not prefixes:
-            logger.error("No signals found on S3")
-            return
-        obj = s3.get_object(Bucket="alpha-engine-research", Key=f"{prefixes[-1]}signals.json")
-        data = json.loads(obj["Body"].read())
-        tickers = [s["ticker"] for s in data.get("universe", []) if s.get("ticker")]
-        logger.info("Loaded %d tickers from signals", len(tickers))
-    else:
-        parser.error("Provide --tickers or --from-signals")
+    tickers = resolve_tickers_from_args(args)
+    if not tickers:
+        parser.error("Provide --tickers or --scope holdings+candidates+board60")
         return
+    logger.info("Resolved %d tickers for SEC filings ingestion", len(tickers))
 
-    lookback_days = args.lookback_years * 365
+    lookback_days = args.lookback_days if args.lookback_days is not None else args.lookback_years * 365
     total = 0
     for ticker in tickers:
         n = ingest_ticker(ticker, lookback_days=lookback_days, dry_run=args.dry_run)

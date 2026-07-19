@@ -397,6 +397,40 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt DailyHealTrigger.Arn
 
+  # alpha-engine-config#2943 (EPIC config#2967): weekday RAG-corpus delta
+  # (filings + news, scoped to holdings ∪ active candidates ∪ top-60 signals
+  # board) — the structural fix that moves bulk RAG ingestion off the
+  # Saturday critical path. Invokes the SAME alpha-engine-data-spot-
+  # dispatcher Lambda the DailyHealTrigger above uses, via its new
+  # "daily-corpus-rag-delta" workload. 23:30 UTC weekdays — well after the
+  # ~20:00 UTC postclose SF settles, well before the next day's ~11:00-12:00
+  # UTC (04:00 PT) daily-news + preopen window, so this has ZERO overlap
+  # with either trading critical path (constraint from the config#2943
+  # binding ruling). Entirely off both the preopen and postclose SFs, same
+  # posture as DailyHealTrigger.
+  DailyCorpusDeltaTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-daily-corpus-delta
+      Description: Weekday 23:30 UTC — standalone RAG-corpus delta (filings + news, config#2943 scope), off both trading critical paths
+      ScheduleExpression: 'cron(30 23 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        # SINGLE TARGET PER RULE — see SaturdayTrigger's Targets comment for
+        # the 2026-05-26 duplicate-target incident that codified this
+        # invariant fleet-wide.
+        - Id: daily-corpus-delta-dispatch
+          Arn: !Ref DataSpotDispatcherLambdaArn
+          Input: '{"workload": "daily-corpus-rag-delta"}'
+
+  DailyCorpusDeltaTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataSpotDispatcherLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyCorpusDeltaTrigger.Arn
+
   # alpha-engine-config-I2722 (Brian ruling 2026-07-16): PredictorHealthCheck
   # + PredictorDriftCheck re-home off the preopen SF onto their own direct
   # EventBridge triggers — approach (a)/(b) per state, NO new bundled health

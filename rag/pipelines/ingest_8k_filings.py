@@ -10,17 +10,21 @@ Usage:
     # Ingest recent 8-Ks for specific tickers
     python -m rag.pipelines.ingest_8k_filings --tickers AAPL,MSFT
 
-    # Backfill from latest signals universe
-    python -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365
+    # Backfill from the corpus scope (holdings ∪ active candidates ∪
+    # top-60 signals board — config#2943)
+    python -m rag.pipelines.ingest_8k_filings --scope holdings+candidates+board60 --lookback-days 365
 
     # Daily mode: only last 7 days (for cron/Lambda)
-    python -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 7
+    python -m rag.pipelines.ingest_8k_filings --scope holdings+candidates+board60 --lookback-days 7
+
+config#2943: the old ``--from-signals`` (whole ~900-ticker signals.json
+universe) is retired — replaced by ``--scope holdings+candidates+board60``,
+resolved via the shared ``rag.pipelines._corpus_scope`` module.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import re
@@ -67,6 +71,11 @@ _CHUNK_OVERLAP = 50
 # already fetched it this run/day.
 
 from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
+from rag.pipelines._corpus_scope import (  # noqa: E402
+    DEFAULT_BUCKET,
+    add_scope_arg,
+    resolve_tickers_from_args,
+)
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -255,28 +264,17 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest 8-K filings into RAG store")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from latest signals.json")
+    add_scope_arg(parser)
+    parser.add_argument("--bucket", type=str, default=DEFAULT_BUCKET)
     parser.add_argument("--lookback-days", type=int, default=365, help="Days of filings to backfill")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if args.tickers:
-        tickers = [t.strip().upper() for t in args.tickers.split(",")]
-    elif args.from_signals:
-        import boto3
-        s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(Bucket="alpha-engine-research", Prefix="signals/", Delimiter="/")
-        prefixes = sorted([p["Prefix"] for p in resp.get("CommonPrefixes", [])])
-        if not prefixes:
-            logger.error("No signals found on S3")
-            return
-        obj = s3.get_object(Bucket="alpha-engine-research", Key=f"{prefixes[-1]}signals.json")
-        data = json.loads(obj["Body"].read())
-        tickers = [s["ticker"] for s in data.get("universe", []) if s.get("ticker")]
-        logger.info("Loaded %d tickers from signals", len(tickers))
-    else:
-        parser.error("Provide --tickers or --from-signals")
+    tickers = resolve_tickers_from_args(args)
+    if not tickers:
+        parser.error("Provide --tickers or --scope holdings+candidates+board60")
         return
+    logger.info("Resolved %d tickers for 8-K ingestion", len(tickers))
 
     total = 0
     for ticker in tickers:

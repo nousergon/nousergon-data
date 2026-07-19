@@ -149,6 +149,18 @@ _WORKLOADS: dict[str, str] = {
     # step_function_daily.json entirely. Runs off the preopen critical path with
     # a much bigger heal timeout budget (see weekly_collector._run_daily_heal).
     "daily-heal": "python weekly_collector.py --daily-heal",
+    # alpha-engine-config#2943: standalone daily RAG-corpus delta (filings +
+    # news, scoped to holdings ∪ active candidates ∪ top-60 signals board),
+    # EventBridge-triggered ~23:30 UTC weekdays (alpha-engine-daily-corpus-
+    # delta rule) — well after the ~20:00 UTC postclose SF settles, well
+    # before the next day's preopen/daily-news window. Runs entirely off
+    # BOTH the preopen and postclose trading critical paths, on its own spot,
+    # via this same dispatcher. Needs the 4 RAG secrets (Voyage/Finnhub/EDGAR/
+    # Postgres) fetched from SSM before the collector runs — see
+    # ``_bootstrap_command``'s RAG-secrets branch below, gated on
+    # workload == "daily-corpus-rag-delta" so the other four (non-RAG)
+    # workloads' bootstrap is unchanged.
+    "daily-corpus-rag-delta": "bash rag/pipelines/run_daily_corpus_delta.sh",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
@@ -177,12 +189,31 @@ def _bootstrap_command(workload: str, collector_cmd: str, run_token: str) -> str
     python3.12 + git, shallow clones, a requirements.txt venv with the numpy<2
     pin the fleet's pyarrow is compiled against, then the collector. The box
     self-terminates on completion (InstanceInitiatedShutdownBehavior=terminate).
+
+    config#2943: the ``daily-corpus-rag-delta`` workload additionally needs the
+    4 RAG secrets (VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY,
+    RAG_DATABASE_URL) exported before the collector runs — same SSM
+    parameter names + fetch shape ``spot_data_weekly.sh``'s rag-only path
+    uses, so ``rag.preflight`` sees them identically regardless of which
+    launcher ran it.
     """
     log = f"/var/log/data-spot-{workload}.log"
     s3_log = (
         f"s3://alpha-engine-research/_ssm_logs/data-spot/{workload}/"
         f"$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%S)-{run_token}.log"
     )
+    rag_secrets_block = ""
+    if workload == "daily-corpus-rag-delta":
+        rag_secrets_block = f"""
+for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
+  val=$(aws ssm get-parameter --name /alpha-engine/$name --with-decryption \\
+    --query 'Parameter.Value' --output text --region {REGION} 2>/dev/null) \\
+    || fail "RAG secret $name fetch failed"
+  [ -n "$val" ] || fail "RAG secret $name empty"
+  export "$name=$val"
+  unset val
+done
+"""
     return f"""set -uo pipefail
 export HOME=/home/ec2-user
 export XDG_CACHE_HOME=/home/ec2-user/.cache
@@ -220,7 +251,7 @@ pip install -q -r requirements.txt || fail "deps install failed"
 # numpy<2 pin to match other spot workloads (pyarrow compiled against 1.x).
 pip install -q 'numpy<2' || fail "numpy pin failed"
 mkdir -p "$(dirname {log})"
-set +e
+{rag_secrets_block}set +e
 {collector_cmd} 2>&1 | tee -a {log}
 rc=${{PIPESTATUS[0]}}
 set -e

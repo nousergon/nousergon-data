@@ -14,6 +14,10 @@ Usage:
 
     # Ingest only new records since last run
     python -m rag.pipelines.ingest_theses --db-path /path/to/research.db --since 2026-03-01
+
+    # v2 signals theses, restricted to the corpus scope (holdings ∪ active
+    # candidates ∪ top-60 signals board — config#2943)
+    python -m rag.pipelines.ingest_theses --signals --scope holdings+candidates+board60 --since 2026-07-05
 """
 
 from __future__ import annotations
@@ -23,6 +27,12 @@ import json
 import logging
 import sqlite3
 from datetime import date
+
+from rag.pipelines._corpus_scope import (
+    DEFAULT_BUCKET,
+    add_scope_arg,
+    resolve_corpus_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,11 +259,21 @@ def ingest_signals_theses(
     bucket: str = "alpha-engine-research",
     since: str | None = None,
     dry_run: bool = False,
+    scope: set[str] | None = None,
 ) -> dict:
     """Ingest thesis summaries from v2 signals.json files on S3.
 
     The v2 sector-team architecture (quant + qual sub-scores) writes thesis
     content to signals/{date}/signals.json rather than SQLite agent_reports.
+
+    Args:
+        scope: config#2943 — restrict ingestion to this ticker set (holdings
+            ∪ active candidates ∪ top-60 signals board, see
+            ``rag.pipelines._corpus_scope.resolve_corpus_scope``). ``None``
+            means no filtering (legacy full-universe behavior) — callers
+            should always pass the resolved scope in production; ``None``
+            is retained only so existing direct-call tests don't have to
+            thread a scope through.
 
     Returns summary dict with counts.
     """
@@ -262,7 +282,7 @@ def ingest_signals_theses(
     from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
     s3 = boto3.client("s3")
-    results = {"signals_theses": 0, "skipped_dedup": 0, "chunks_total": 0}
+    results = {"signals_theses": 0, "skipped_dedup": 0, "chunks_total": 0, "skipped_out_of_scope": 0}
 
     # List signal dates
     resp = s3.list_objects_v2(Bucket=bucket, Prefix="signals/", Delimiter="/")
@@ -290,6 +310,9 @@ def ingest_signals_theses(
 
         for entry in universe:
             ticker = _field(entry, "ticker", "")
+            if scope is not None and ticker.upper() not in scope:
+                results["skipped_out_of_scope"] += 1
+                continue
             # Quant-envelope signals (stance_source="quant_envelope_producer") carry
             # thesis_summary=null by design — no LLM narrative to embed — so a null
             # thesis normalises to "" and the <50-char guard skips them cleanly
@@ -356,12 +379,19 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest thesis history into RAG store")
     parser.add_argument("--db-path", type=str, help="Path to research.db (for legacy agent_reports)")
     parser.add_argument("--signals", action="store_true", help="Ingest v2 theses from signals.json on S3")
+    # Shared --scope flag definition (config#2943) — this ingestor has no
+    # --tickers (it's driven by iterating signals.json's universe, not a
+    # ticker list), so it uses add_scope_arg directly rather than the
+    # resolve_tickers_from_args wrapper the other 5 ingestors use.
+    add_scope_arg(parser)
+    parser.add_argument("--bucket", type=str, default=DEFAULT_BUCKET)
     parser.add_argument("--since", type=str, help="Only ingest records from this date forward (YYYY-MM-DD)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     if args.signals:
-        results = ingest_signals_theses(since=args.since, dry_run=args.dry_run)
+        scope = resolve_corpus_scope(bucket=args.bucket) if args.scope else None
+        results = ingest_signals_theses(bucket=args.bucket, since=args.since, dry_run=args.dry_run, scope=scope)
         print(json.dumps(results, indent=2))
     elif args.db_path:
         results = ingest_theses(args.db_path, since=args.since, dry_run=args.dry_run)

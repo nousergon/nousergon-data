@@ -47,6 +47,12 @@ from typing import Any
 
 import pandas as pd
 
+from rag.pipelines._corpus_scope import (
+    DEFAULT_BUCKET,
+    add_scope_arg,
+    resolve_tickers_from_args,
+)
+
 logger = logging.getLogger(__name__)
 
 _RAG_DOC_TYPE = "13F"
@@ -334,16 +340,13 @@ def main():
         help="Comma-separated ticker allowlist (default: all tickers in "
              "the inst_ownership table).",
     )
-    grp.add_argument(
-        "--from-signals", action="store_true",
-        help="Restrict to tickers in the latest signals.json on S3.",
-    )
+    add_scope_arg(grp)
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Discover + format but don't write to S3/RAG.",
     )
     parser.add_argument(
-        "--bucket", type=str, default="alpha-engine-research",
+        "--bucket", type=str, default=DEFAULT_BUCKET,
     )
     args = parser.parse_args()
 
@@ -353,13 +356,10 @@ def main():
     s3 = boto3.client("s3")
 
     tickers: list[str] | None = None
-    if args.tickers:
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-    elif args.from_signals:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket, s3_client=s3)
+    if args.tickers or args.scope:
+        tickers = resolve_tickers_from_args(args, s3_client=s3)
         if not tickers:
-            logger.error("[ingest_13f] --from-signals requested but no tickers found — aborting")
+            logger.error("[ingest_13f] --scope holdings+candidates+board60 requested but no tickers found — aborting")
             return
 
     inst_df = read_inst_ownership_parquet(s3_client=s3, bucket=args.bucket)

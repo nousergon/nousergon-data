@@ -211,22 +211,59 @@ class TestRunNewsPipelineCli:
         from rag.pipelines import run_news_pipeline
 
         with patch(
-            "rag.pipelines._signals_universe.load_signals_tickers",
-            return_value=[],
+            "rag.pipelines._corpus_scope.resolve_corpus_scope",
+            return_value=set(),
         ):
             monkeypatch.setattr(
                 sys, "argv",
-                ["run_news_pipeline", "--from-signals"],
+                ["run_news_pipeline", "--scope", "holdings+candidates+board60"],
             )
             rc = run_news_pipeline.main()
         assert rc == 1
+
+    def test_scope_flag_resolves_via_shared_resolver(self, monkeypatch):
+        """config#2943: --scope holdings+candidates+board60 must resolve
+        through the shared corpus-scope resolver, NOT the retired
+        whole-universe --from-signals path."""
+        from rag.pipelines import run_news_pipeline
+
+        with patch.object(
+            run_news_pipeline, "_run_nlp",
+            return_value=_empty_nlp_output(),
+        ), patch(
+            "rag.pipelines.run_news_pipeline._load_ticker_name_map",
+            return_value={},
+        ), patch(
+            "collectors.news_aggregator.NewsAggregator"
+        ) as mock_agg_cls, patch(
+            "data.derived.news_aggregates.aggregate_and_write"
+        ) as mock_aaw, patch(
+            "rag.pipelines.ingest_news.ingest_articles"
+        ) as mock_rag_ingest, patch(
+            "rag.pipelines._corpus_scope.resolve_corpus_scope",
+            return_value={"AAPL", "MSFT"},
+        ) as mock_resolve, patch("boto3.client"):
+            mock_agg_cls.return_value.fetch.return_value = []
+            mock_aaw.return_value = ("data/news_aggregates/x.parquet", _empty_df())
+            mock_rag_ingest.return_value = {
+                "n_articles_input": 0, "n_documents_attempted": 0,
+                "n_documents_skipped_exists": 0, "n_documents_skipped_empty_text": 0,
+                "n_documents_ingested": 0, "n_failures": 0,
+            }
+            monkeypatch.setattr(
+                sys, "argv",
+                ["run_news_pipeline", "--scope", "holdings+candidates+board60"],
+            )
+            rc = run_news_pipeline.main()
+        assert rc == 0
+        assert mock_resolve.called
 
     def test_required_args_mutually_exclusive(self, monkeypatch, capsys):
         from rag.pipelines import run_news_pipeline
 
         monkeypatch.setattr(
             sys, "argv",
-            ["run_news_pipeline"],  # neither --tickers nor --from-signals
+            ["run_news_pipeline"],  # neither --tickers nor --scope
         )
         with pytest.raises(SystemExit):
             run_news_pipeline.main()
