@@ -3,24 +3,59 @@
 Pure-logic coverage (month window, forward-only projection, diff rows, fixed
 rows, Neon metric walker) plus a full handler run against fake boto3 clients
 and a canned HTTP router — asserting the rollup artifact shape, per-provider
-rows, error fencing (one dead provider must not blank the others), and the
-first-writer-wins baseline/snapshot writes.
+rows, error fencing (one dead provider must not blank the others), the
+first-writer-wins baseline/snapshot writes, and the config#2843 over-budget
+rising-edge Telegram alert (first breach fires once, sustained breach stays
+quiet, drop-then-rebreach re-arms).
 
 Run standalone: ``python3 -m pytest test_handler.py -q`` (deploy.sh preflights
-this before every package+ship; only dep beyond stdlib is boto3, which the
-Lambda runtime provides in prod).
+this before every package+ship). Hermetic: `nousergon_lib` +
+`flow_doctor_telegram` are git-only / bundled deps this suite does not require
+installed — they are stubbed in sys.modules BEFORE `import index` (mirrors the
+sibling flow-doctor consumers' tests, e.g. overseer-liveness-probe). The
+notify path is a no-op stub by default; alert-specific tests monkeypatch
+``index.notify_via_flow_doctor`` directly to assert call/no-call.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# ── Stub nousergon_lib + flow_doctor_telegram before importing index ──────────
+_ng = types.ModuleType("nousergon_lib")
+_ng_fleet = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+
+
+class _FleetTelegramTopic:
+    CRITICAL = "CRITICAL"
+    OPS_HEALTH = "OPS_HEALTH"
+
+
+_ng_fleet.FleetTelegramTopic = _FleetTelegramTopic
+_ng.flow_doctor_fleet = _ng_fleet
+sys.modules.setdefault("nousergon_lib", _ng)
+sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
+
+_fdt = types.ModuleType("flow_doctor_telegram")
+_fdt.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+sys.modules["flow_doctor_telegram"] = _fdt
+
+from _shared.hermetic_import_guard import (  # noqa: E402
+    assert_hermetic_imports_satisfied,
+)
+
+assert_hermetic_imports_satisfied(__file__)
+
 import index  # noqa: E402
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)  # July = 31 days
@@ -438,3 +473,160 @@ class TestHandler:
         monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, fail_ce))
         with pytest.raises(RuntimeError, match="all provider adapters failed"):
             index.handler({}, None)
+
+
+# ---------------------------------------------------------------------------
+# Over-budget Telegram alert (config#2843) — rising-edge per provider/month
+# ---------------------------------------------------------------------------
+
+def _row_with_pace(key: str, pace: str | None, **kw) -> dict:
+    row = index._row(key, key.upper())
+    row.update(pace=pace, mtd_cost_usd=10.0, projected_month_end_usd=20.0,
+               budget_usd=15.0)
+    row.update(kw)
+    return row
+
+
+class TestOverBudgetAlert:
+    PERIOD = "2026-07"
+
+    def test_first_breach_alerts_once(self, monkeypatch):
+        """A provider's FIRST flip to pace="over" this month fires exactly
+        one Telegram ping."""
+        s3 = FakeS3({})
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == ["aws"]
+        notify.assert_called_once()
+        state = json.loads(s3.store["expenses/alert_state/2026-07.json"])
+        assert state["providers"] == {"aws": True}
+
+    def test_sustained_breach_stays_quiet(self, monkeypatch):
+        """Once a provider is already recorded as breached this month, a
+        SECOND run that still reports pace="over" must NOT re-alert."""
+        store = {"expenses/alert_state/2026-07.json": json.dumps(
+            {"period": "2026-07", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == []
+        notify.assert_not_called()
+        state = json.loads(s3.store["expenses/alert_state/2026-07.json"])
+        assert state["providers"] == {"aws": True}  # still recorded breached
+
+    def test_drop_then_rebreach_rearms(self, monkeypatch):
+        """A provider that drops back under budget re-arms — the NEXT flip
+        to over must alert again (not treated as still-breached)."""
+        store = {"expenses/alert_state/2026-07.json": json.dumps(
+            {"period": "2026-07", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+
+        # Run 1: drops back under — no alert, state clears the flag.
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "under")])
+        assert result["alerted"] == []
+        notify.assert_not_called()
+        state = json.loads(s3.store["expenses/alert_state/2026-07.json"])
+        assert state["providers"] == {"aws": False}
+
+        # Run 2: re-breaches in the SAME month — must alert again (re-armed).
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == ["aws"]
+        notify.assert_called_once()
+
+    def test_new_calendar_month_state_key_isolated(self, monkeypatch):
+        """State is keyed per calendar-month period — a provider breached in
+        June must alert fresh in July even with no June cleanup."""
+        store = {"expenses/alert_state/2026-06.json": json.dumps(
+            {"period": "2026-06", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(
+            s3, "2026-07", [_row_with_pace("aws", "over")])
+        assert result["alerted"] == ["aws"]
+        notify.assert_called_once()
+
+    def test_multiple_providers_independent(self, monkeypatch):
+        """Each provider's rising-edge state is independent — one already-
+        breached provider must not suppress a different provider's fresh
+        breach, nor vice versa."""
+        store = {"expenses/alert_state/2026-07.json": json.dumps(
+            {"period": "2026-07", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(s3, self.PERIOD, [
+            _row_with_pace("aws", "over"),      # already breached — quiet
+            _row_with_pace("neon", "over"),     # fresh breach — alerts
+            _row_with_pace("openrouter", "under"),  # never breached — quiet
+        ])
+        assert result["alerted"] == ["neon"]
+        assert notify.call_count == 1
+
+    def test_non_over_pace_never_alerts(self, monkeypatch):
+        """under / fixed / None paces must never trigger a ping."""
+        s3 = FakeS3({})
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(s3, self.PERIOD, [
+            _row_with_pace("aws", "under"),
+            _row_with_pace("claude_max", "fixed"),
+            _row_with_pace("deepseek", None),
+        ])
+        assert result["alerted"] == []
+        notify.assert_not_called()
+
+    def test_alert_pass_failure_never_raises(self, monkeypatch):
+        """A bug in the alert pass (e.g. state read/write blowing up in a way
+        _load/_save don't already fence) must not propagate — this is a
+        notification-only enhancement layered after a successful rollup."""
+        s3 = FakeS3({})
+
+        def _boom(*a, **k):
+            raise RuntimeError("unexpected alert-pass bug")
+
+        monkeypatch.setattr(index, "_load_alert_state", _boom)
+        result = index.run_over_budget_alerts(s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == []
+        assert "error" in result
+
+    def test_handler_integration_fires_on_over_pace(self, env, monkeypatch):
+        """End-to-end: the handler's Neon AND github_org rows both go "over"
+        in the default env fixture (Neon: 3 GB projected ~5.6 GB > 5 GB quota;
+        github_org: 1400 private minutes @ 53% elapsed → ~2630 > 2000 included
+        minutes — see test_full_run) — the alert pass must fire for both and
+        record state in the rollup bucket."""
+        s3, store = env
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.handler({}, None)
+        assert set(result["alerts"]["alerted"]) == {"neon", "github_org"}
+        assert notify.call_count == 2
+        state = json.loads(store["expenses/alert_state/2026-07.json"])
+        assert state["providers"]["neon"] is True
+        assert state["providers"]["github_org"] is True
+
+    def test_handler_integration_quiet_when_no_over_pace(self, env, monkeypatch):
+        """Loosening the Neon quota AND the github_org included-minutes budget
+        removes the fixture's only two "over" rows — the alert pass must then
+        stay quiet end-to-end, while sustained per-provider state (from a
+        prior run) suppresses nothing new because nothing breaches."""
+        s3, store = env
+        ssm = index.boto3._by_name["ssm"]
+        ssm.params[index.SSM_NEON_QUOTA_GB] = "500"  # 3 GB used, nowhere near breach
+        budgets = json.loads(store["config/expense_budgets.json"])
+        budgets["providers"]["github_org"]["included_minutes"] = 20000  # 1400 well under
+        store["config/expense_budgets.json"] = json.dumps(budgets).encode()
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.handler({}, None)
+        assert result["alerts"]["alerted"] == []
+        notify.assert_not_called()
