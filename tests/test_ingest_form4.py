@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from rag.pipelines import _cik_lookup
 from rag.pipelines.ingest_form4 import (
     DEFAULT_S3_PREFIX,
     SCHEMA_VERSION,
@@ -33,6 +34,19 @@ from rag.pipelines.ingest_form4 import (
     transactions_to_dataframe,
     write_form4_parquet,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cik_file_cache(tmp_path, monkeypatch):
+    """config#2956: ``_get_cik`` now falls back to a shared ``/tmp`` file
+    cache (see ``_cik_lookup.load_cik_map``) when the in-memory
+    ``_CIK_CACHE`` is cold. Point every test at a per-test tmp path so
+    tests never read/write the real cache file or leak state between
+    runs — this file's tests monkeypatch ``_CIK_CACHE = {}`` specifically
+    to force a fresh fetch through the mocked ``http``, which requires
+    the file cache to also be cold.
+    """
+    monkeypatch.setattr(_cik_lookup, "DEFAULT_CACHE_PATH", str(tmp_path / "cik_cache.json"))
 
 
 # ── In-memory S3 mock (reused pattern from PR A.2 tests) ───────────────

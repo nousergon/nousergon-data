@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import logging
 from datetime import date
+from typing import Any
 
 import pandas as pd
 
@@ -221,12 +222,24 @@ def ingest_inst_ownership(
 
     ticker_allowlist = {t.upper() for t in tickers} if tickers else None
 
+    # Pass 1: resolve dedup/allowlist/dry-run skips and build the list of
+    # rows that actually need an embedding. config#2956 deliverable 3 —
+    # accumulate ALL pending chunk bodies and call ``embed_texts_fn`` ONCE
+    # (it already batches internally in blocks of up to 128) instead of
+    # once PER row, which was the previous N-embedding-calls-per-run shape.
+    pending: list[dict[str, Any]] = []
     for _, row in inst_ownership_df.iterrows():
         ticker = str(row.get("ticker") or "").upper()
         quarter = row.get("quarter")
         n_holding = row.get("n_funds_holding", 0) or 0
 
-        if not ticker or not quarter or not n_holding:
+        # A missing `quarter` in a DataFrame whose OTHER rows have a
+        # string quarter gets upcast by pandas to float NaN (not None) —
+        # and `not float("nan")` is False (NaN is truthy), so the guard
+        # below silently let a NaN quarter through to `_quarter_end_date`,
+        # crashing on `int("nan"[:4])`. Pre-existing bug, unrelated to
+        # config#2956 but caught while touching this loop for batching.
+        if not ticker or not quarter or pd.isna(quarter) or not n_holding:
             stats["n_documents_skipped_no_data"] += 1
             continue
         if ticker_allowlist is not None and ticker not in ticker_allowlist:
@@ -250,23 +263,46 @@ def ingest_inst_ownership(
             stats["n_documents_ingested"] += 1
             continue
 
-        try:
-            chunks = [{
-                "content": body,
-                "section_label": "13f_ownership_summary",
-            }]
-            embeddings = embed_texts_fn([chunks[0]["content"]])
-            chunks[0]["embedding"] = embeddings[0]
+        pending.append({
+            "ticker": ticker,
+            "quarter": quarter,
+            "filed_date": filed_date,
+            "title": title,
+            "chunk": {"content": body, "section_label": "13f_ownership_summary"},
+        })
 
+    if pending:
+        try:
+            embeddings = embed_texts_fn([item["chunk"]["content"] for item in pending])
+        except Exception as e:
+            # A batch-level embedding failure (e.g. Voyage API outage)
+            # fails every pending document this run — isolated per-run,
+            # not per-document, since there is now one shared API call.
+            stats["n_failures"] += len(pending)
+            logger.warning(
+                "[ingest_13f] batch embedding failed for %d pending "
+                "document(s): %s", len(pending), e,
+            )
+            pending = []
+        else:
+            for item, embedding in zip(pending, embeddings):
+                item["chunk"]["embedding"] = embedding
+
+    # Pass 2: ingest each document, isolating per-document failures so
+    # one bad write doesn't drop the rest of the batch.
+    for item in pending:
+        ticker = item["ticker"]
+        quarter = item["quarter"]
+        try:
             doc_id = ingest_document_fn(
                 ticker=ticker,
                 sector=ticker_to_sector.get(ticker),
                 doc_type=_RAG_DOC_TYPE,
                 source=_RAG_SOURCE,
-                filed_date=filed_date,
-                title=title,
+                filed_date=item["filed_date"],
+                title=item["title"],
                 url=None,
-                chunks=chunks,
+                chunks=[item["chunk"]],
             )
             if doc_id:
                 stats["n_documents_ingested"] += 1

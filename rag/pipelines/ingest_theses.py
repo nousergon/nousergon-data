@@ -85,6 +85,19 @@ def _load_investment_theses(db_path: str, since: str | None = None) -> list[dict
     return rows
 
 
+def _field(entry: dict, key: str, default):
+    """Read an entry field, normalising both an ABSENT key and an explicit JSON `null` to `default`.
+
+    `dict.get(key, default)` only substitutes `default` when `key` is absent; an
+    explicit JSON `null` (which producers like quant_envelope_producer write for
+    several signals.json entry fields, not just thesis_summary) yields `None`
+    straight through, which then blows up downstream `len()`/`.get()` calls
+    (config#2938 follow-on).
+    """
+    value = entry.get(key)
+    return default if value is None else value
+
+
 def _agent_type_to_section(agent_type: str) -> str:
     """Map agent_type to a section label for retrieval filtering."""
     return {
@@ -276,8 +289,12 @@ def ingest_signals_theses(
         market_regime = data.get("market_regime", "")
 
         for entry in universe:
-            ticker = entry.get("ticker", "")
-            thesis = entry.get("thesis_summary", "")
+            ticker = _field(entry, "ticker", "")
+            # Quant-envelope signals (stance_source="quant_envelope_producer") carry
+            # thesis_summary=null by design — no LLM narrative to embed — so a null
+            # thesis normalises to "" and the <50-char guard skips them cleanly
+            # instead of raising `len(None)` (config#2938 follow-on, 2026-07-18).
+            thesis = _field(entry, "thesis_summary", "")
             if not ticker or len(thesis) < 50:
                 continue
 
@@ -290,12 +307,16 @@ def ingest_signals_theses(
                 results["signals_theses"] += 1
                 continue
 
-            score = entry.get("score", "")
-            signal = entry.get("signal", "")
-            conviction = entry.get("conviction", "")
-            sub_scores = entry.get("sub_scores", {})
-            quant = sub_scores.get("quant", "")
-            qual = sub_scores.get("qual", "")
+            # Sibling fields may also carry explicit null from the same producer;
+            # route every read through `_field` so a null anywhere in the entry
+            # can't crash ingestion or silently embed the literal string 'None'.
+            score = _field(entry, "score", "")
+            signal = _field(entry, "signal", "")
+            conviction = _field(entry, "conviction", "")
+            sub_scores = _field(entry, "sub_scores", {})
+            quant = _field(sub_scores, "quant", "")
+            qual = _field(sub_scores, "qual", "")
+            sector = _field(entry, "sector", None)
 
             enriched = (
                 f"[{ticker} | {filed_date} | Signal: {signal} | Score: {score} | "
@@ -310,7 +331,7 @@ def ingest_signals_theses(
 
             doc_id = ingest_document(
                 ticker=ticker,
-                sector=entry.get("sector"),
+                sector=sector,
                 doc_type=doc_type,
                 source="alpha_engine",
                 filed_date=filed_date,

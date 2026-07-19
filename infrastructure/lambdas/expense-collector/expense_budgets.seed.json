@@ -5,11 +5,12 @@
   "providers": {
     "aws": {
       "label": "AWS",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 100.0
     },
     "anthropic_api": {
       "label": "Anthropic API",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 0.0,
+      "note": "budget set to $0 deliberately — Brian is shifting Anthropic-API-billed usage to OpenRouter models (2026-07-17 decision)"
     },
     "claude_max": {
       "label": "Claude Max 20x subscription",
@@ -18,20 +19,21 @@
     },
     "openrouter": {
       "label": "OpenRouter",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 20.0
     },
     "deepseek": {
       "label": "DeepSeek",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 10.0
     },
     "neon": {
       "label": "Neon Postgres",
-      "monthly_budget_usd": null
+      "monthly_budget_usd": 15.0,
+      "note": "mtd_cost_usd is computed from data-transfer overage only (500 GB/mo free egress, then $0.10/GB — neon.com/pricing, verified 2026-07-17); compute ($0.106/CU-hour) and storage ($0.35/GB-month) render unknown in detail.cost_components_unavailable because the project detail API exposes no CU-size or current-storage-size field to price them from (config#2913). No fixed_monthly_usd is set — if a manually-confirmed paid-plan invoice needs to override this estimate, set fixed_monthly_usd and replace this note."
     },
     "github_org": {
       "label": "GitHub (nousergon org)",
-      "monthly_budget_usd": null,
-      "included_minutes": 2000
+      "monthly_budget_usd": 5.0,
+      "included_minutes": 3000
     },
     "github_user": {
       "label": "GitHub (cipher813)",

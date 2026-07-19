@@ -41,31 +41,37 @@ infrastructure/iam/
 ├── check-drift.py
 ├── README.md
 ├── alpha-engine-step-functions-role.json
+├── alpha-engine-step-functions-role.trust.json
 ├── alpha-engine-eventbridge-sfn-role.json
+├── alpha-engine-eventbridge-sfn-role.trust.json
 └── github-actions-lambda-deploy.json
 ```
 
 The filename (minus `.json`) is the IAM role name; the inline policy
-name on AWS is `{role-name}-policy` (enforced by `apply.sh`).
+name on AWS is `{role-name}-policy` (enforced by `apply.sh`). A
+`<role-name>.trust.json` file is that role's assume-role (trust) policy
+snapshot — see "Trust policies + role creation" below.
 
 ## Usage
 
 ```bash
-# Apply every policy
+# Apply every inline policy + trust snapshot
 ./infrastructure/iam/apply.sh
 
-# Apply one specific role
+# Apply one specific role (both its .json and .trust.json, whichever exist)
 ./infrastructure/iam/apply.sh alpha-engine-step-functions-role
 
 # Print planned commands without executing
 ./infrastructure/iam/apply.sh --dry-run
 
-# Check drift against live AWS
+# Check drift against live AWS (inline policies + trust documents)
 ./infrastructure/iam/check-drift.py
 ```
 
-`apply.sh` calls `aws iam put-role-policy`, which is idempotent —
-re-running overwrites the existing inline policy on the role.
+`apply.sh` calls `aws iam put-role-policy` for `*.json` (idempotent —
+re-running overwrites the existing inline policy on the role) and
+`aws iam update-assume-role-policy` for `*.trust.json` (also idempotent
+— it writes the full trust document).
 
 ## Single-writer rule
 
@@ -82,27 +88,40 @@ regression class.
 
 ## Trust policies + role creation
 
-Initial role creation is out of scope (handled inline in the deploy
-scripts that need them — `infrastructure/deploy_step_function.sh` for the
-SF + EB-SFN roles). `apply.sh` only manages the **inline permission
-documents** on roles that already exist.
+Initial role creation stays in the deploy script that needs it
+(`infrastructure/deploy_step_function.sh` for the SF + EB-SFN roles) —
+`apply.sh` never creates a role, only ensures its inline policy + trust
+document once the role exists.
 
-**Exception — `github-actions-lambda-deploy.trust.json` (reference copy).**
-The OIDC trust policy for the shared `github-actions-lambda-deploy` role
-(which repos may assume it from GitHub Actions) was historically manual /
-uncodified. The `*.trust.json` file is a version-tracked snapshot of that
-trust policy so additions are reviewable. `apply.sh` does NOT apply it
-(it's an assume-role-policy, not an inline policy). Apply a trust-policy
-change explicitly:
+**`*.trust.json` snapshots (config#2826).** Every role whose trust is
+bootstrapped inline in a deploy script has a version-tracked
+`<role-name>.trust.json` snapshot here — the single source of truth the
+bootstrapping script(s) read via `file://infrastructure/iam/<role>.trust.json`
+instead of keeping their own inline copy:
 
-```
-aws iam update-assume-role-policy --role-name github-actions-lambda-deploy --policy-document file://infrastructure/iam/github-actions-lambda-deploy.trust.json
-```
+- `alpha-engine-step-functions-role.trust.json` — read by
+  `deploy_step_function.sh`'s one-time `create-role` bootstrap.
+- `alpha-engine-eventbridge-sfn-role.trust.json` — read by BOTH
+  `deploy_step_function.sh`'s bootstrap AND `deploy-infrastructure.sh`'s
+  step 3b idempotent re-assertion (config#2413/#2826 — this role backs a
+  CFN `AWS::Scheduler::Schedule` target, so its trust must be re-verified
+  on every CI deploy, not just asserted once at creation time).
 
-When a new repo needs to auto-deploy, add its
-`repo:nousergon/<repo>:ref:refs/heads/main` (+ `:pull_request`) entry to
-the trust JSON AND add its resource ARNs to the permission JSON, then
-apply both.
+`apply.sh` applies every `*.trust.json` via `update-assume-role-policy`;
+`check-drift.py` diffs each against the role's live
+`AssumeRolePolicyDocument`.
+
+**`github-actions-lambda-deploy` is NOT in the set above.** Its OIDC trust
+policy is provisioned entirely out-of-band (no deploy script in this repo
+creates or re-asserts it — `infrastructure/deploy.sh` explicitly documents
+this as a one-time manual operation) and no committed document, code path,
+or readable live state on this box exists that this repo can derive it
+from. A prior note in this file claimed a `github-actions-lambda-deploy.trust.json`
+"reference copy" existed — it did not (`git log --all` shows no such file
+was ever committed); that claim is corrected here. Codifying that role's
+trust snapshot needs a human with IAM read/console access to run
+`aws iam get-role --role-name github-actions-lambda-deploy --query Role.AssumeRolePolicyDocument`
+and commit the actual live document as a follow-up.
 
 ## Drift detection
 
@@ -111,9 +130,13 @@ PR touching `infrastructure/iam/**`, daily at 09:30 UTC, and on
 manual `workflow_dispatch`.
 
 Auth: OIDC via the shared `github-actions-iam-drift-check` role (defined
-in alpha-engine; trust policy permits both alpha-engine and
-alpha-engine-data); read-only `iam:ListRolePolicies` + `iam:GetRolePolicy`
-scoped to the codified roles only.
+in `crucible-executor`; trust policy permits both `crucible-executor` and
+this repo); read-only `iam:ListRolePolicies` + `iam:GetRolePolicy` +
+`iam:GetRole` scoped to the codified roles only — confirmed live
+(`crucible-executor/infrastructure/iam/github-actions-iam-drift-check/iam-readonly.json`)
+already grants `iam:GetRole` on both `alpha-engine-step-functions-role` and
+`alpha-engine-eventbridge-sfn-role`, so the new trust-drift check needs no
+additional IAM grant.
 
 ## When you add a new inline policy
 

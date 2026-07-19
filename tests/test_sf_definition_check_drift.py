@@ -78,16 +78,16 @@ def fake_repo(cd, tmp_path, monkeypatch):
 # ── codified map against the real repo ──────────────────────────────────────
 
 
-def test_map_covers_all_six_orchestrated_state_machines(cd):
+def test_map_covers_all_four_orchestrated_state_machines(cd):
+    # alpha-engine-config-I2890 (2026-07-17): the I2544/I2545 advisory +
+    # Sunday-modelzoo child SFs were retired (splits reversed — the weekly SF
+    # runs the full inline pattern again), so the map is back to four.
     names = {e["sf_name"] for e in cd.SF_DEFINITIONS}
     assert names == {
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
         "alpha-engine-groom-dispatch",
-        # alpha-engine-config-I2544/I2545: advisory + Sunday-modelzoo child SFs.
-        "ne-weekly-advisory-pipeline",
-        "ne-modelzoo-sunday-pipeline",
     }
 
 
