@@ -60,6 +60,13 @@ _CHUNK_SIZE = 400
 _CHUNK_OVERLAP = 50
 
 # ── CIK lookup (shared with ingest_sec_filings) ────────────────────────────
+#
+# config#2956: backed by the shared ``/tmp`` file cache (see
+# ``_cik_lookup.load_cik_map``) so a cold in-memory cache in THIS process
+# doesn't re-download company_tickers.json if another pipeline step
+# already fetched it this run/day.
+
+from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -67,18 +74,8 @@ _CIK_CACHE: dict[str, str] = {}
 def _get_cik(ticker: str) -> str | None:
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
-    try:
-        resp = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=_SEC_HEADERS, timeout=10,
-        )
-        if resp.status_code == 200:
-            for entry in resp.json().values():
-                _CIK_CACHE[entry.get("ticker", "").upper()] = str(entry.get("cik_str", ""))
-            return _CIK_CACHE.get(ticker.upper())
-    except Exception as e:
-        logger.warning("CIK lookup failed: %s", e)
-    return None
+    _CIK_CACHE.update(load_cik_map(http=requests, headers=_SEC_HEADERS))
+    return _CIK_CACHE.get(ticker.upper())
 
 
 def _search_8k_filings(ticker: str, lookback_days: int = 365) -> list[dict]:
