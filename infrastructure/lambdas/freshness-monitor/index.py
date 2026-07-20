@@ -173,8 +173,9 @@ ALERTS_ENABLED = (
 #
 # 1. Rows may declare `critical_while_champion_arm: [<arm>, ...]` — effective
 #    severity is coerced to critical at probe time while the live champion
-#    pointer (config/producer_champion.json, field `champion_arm` — the same
-#    pointer crucible-executor's champion.py reads) names a listed arm. A
+#    pointer (config/producer_champion.json, schema_version-1 field
+#    `champion` — the same key crucible-executor's champion.py
+#    load_champion_pointer reads) names a listed arm. A
 #    pointer read failure coerces listed rows to critical too: fail toward
 #    paging, never toward silence.
 # 2. A severity=warning row confirmed-missing for WARNING_ESCALATION_RUNS
@@ -307,11 +308,15 @@ def _load_champion_arm(s3_client: Any) -> tuple[str | None, bool]:
     try:
         obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=CHAMPION_POINTER_KEY)
         pointer = json.loads(obj["Body"].read())
-        arm = pointer.get("champion_arm")
+        # schema_version-1 pointer key is `champion` (verified against the
+        # live object AND crucible-executor champion.py's own read —
+        # pointer["champion"]). The original I3086 patch read a
+        # `champion_arm` key that never existed in the pointer schema.
+        arm = pointer.get("champion")
         if isinstance(arm, str) and arm:
             return arm, False
         logger.warning(
-            "champion pointer at %s has no usable champion_arm field: %r",
+            "champion pointer at %s has no usable `champion` field: %r",
             CHAMPION_POINTER_KEY, pointer,
         )
         return None, True
