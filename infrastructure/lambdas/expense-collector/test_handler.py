@@ -758,7 +758,8 @@ class TestReconcileAnthropic:
 
         def _fake_http(url, headers=None):
             seen_urls.append(url)
-            return {"data": [{"results": [{"amount": "3.50"}]}], "has_more": False}
+            # cost_report amounts are CENTS (config-I2840): 350 cents = $3.50
+            return {"data": [{"results": [{"amount": "350"}]}], "has_more": False}
 
         monkeypatch.setattr(index, "_http_json", _fake_http)
         prior_doc = {"providers": [{"key": "anthropic_api", "mtd_cost_usd": 3.0,
@@ -768,6 +769,23 @@ class TestReconcileAnthropic:
         assert row["actual_final"] == pytest.approx(3.50)
         assert "starting_at=2026-06-01" in seen_urls[0]
         assert "ending_before=2026-07-01" in seen_urls[0]
+
+    def test_admin_api_amounts_are_cents_not_dollars(self, monkeypatch):
+        """Regression for the 100x overstatement found live 2026-07-20
+        (config-I2840): cost_report `amount` is in currency minor units.
+        981.60 (cents) must land as $9.82, not $981.60."""
+        mw = index._month_window(NOW)
+
+        def _fake_http(url, headers=None):
+            return {"data": [{"results": [{"amount": "981.60"},
+                                          {"amount": "18.40"}]}],
+                    "has_more": False}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        row = index.collect_anthropic(
+            mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert row["mtd_cost_usd"] == pytest.approx(10.0)
+        assert row["source"] == "admin_api"
 
     def test_fallback_bounds_to_full_prior_month_days(self, monkeypatch):
         """No admin key ⇒ client-telemetry fallback must sum through the
