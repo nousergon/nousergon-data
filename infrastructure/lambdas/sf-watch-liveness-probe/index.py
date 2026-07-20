@@ -152,11 +152,12 @@ _WATCH_PREFIXES: dict[str, str] = {
     "ne-weekly-freshness-pipeline": "consolidated/saturday_sf_watch",
     "ne-preopen-trading-pipeline": "consolidated/weekday_sf_watch",
     "ne-postclose-trading-pipeline": "consolidated/eod_sf_watch",
-    # alpha-engine-config-I2544/I2545 (2026-07-14): added in lockstep with
-    # saturday-sf-watch-dispatcher's PIPELINES + sf-watch-spot-dispatcher's
-    # own _WATCH_PREFIXES copy (test_sf_watch_defer_prefix_lockstep.py).
-    "ne-weekly-advisory-pipeline": "consolidated/weekly-advisory_sf_watch",
-    "ne-modelzoo-sunday-pipeline": "consolidated/modelzoo-sunday_sf_watch",
+    # alpha-engine-config-I2890 (2026-07-17): ne-weekly-advisory-pipeline and
+    # ne-modelzoo-sunday-pipeline (added in lockstep 2026-07-14 per
+    # I2544/I2545) were retired live (config#2890 re-inlined both back into
+    # this Saturday SF) — removed here in the same lockstep-required move
+    # together with saturday-sf-watch-dispatcher's PIPELINES and
+    # sf-watch-spot-dispatcher's own _WATCH_PREFIXES copy (config#2937).
 }
 # The statuses the watch's EventBridge rule matches (deploy.sh EVENT_PATTERN);
 # the saturday dispatcher itself applies the ABORTED operator-abort carve-out.

@@ -144,12 +144,17 @@ if $BOOTSTRAP; then
     fi
     # Input must be a JSON-ESCAPED string inside the target JSON.
     INPUT_ESCAPED=$(printf '%s' "$INPUT" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+    # config#2902: zero-retry on the router-targeting schedule — AWS Scheduler
+    # defaults to MaximumRetryAttempts=185, which would re-dispatch this
+    # payload for up to a day on any transient router error. The router's
+    # clean-JSON-never-raise contract + watch-plane Errors alarm are the
+    # intended failure surface, not scheduler-level retry.
     run aws scheduler "${VERB}" \
       --name "${SCHED_NAME}" \
       --schedule-expression "cron(0 ${HH} * * ? *)" \
       --flexible-time-window '{"Mode":"OFF"}' \
       --description "Overseer alert-drain ${slot} UTC daily via the overseer-dispatcher router (alpha-engine-config-I2824)" \
-      --target "{\"Arn\":\"${ROUTER_ARN}\",\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}\",\"Input\":${INPUT_ESCAPED}}" \
+      --target "{\"Arn\":\"${ROUTER_ARN}\",\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}\",\"Input\":${INPUT_ESCAPED},\"RetryPolicy\":{\"MaximumRetryAttempts\":0,\"MaximumEventAgeInSeconds\":60}}" \
       --region "${REGION}" > /dev/null || echo "  WARN: ${VERB} ${SCHED_NAME} failed"
   done
 fi

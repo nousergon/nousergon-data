@@ -681,3 +681,261 @@ class TestOverBudgetAlert:
         result = index.handler({}, None)
         assert result["alerts"]["alerted"] == []
         notify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Month-close reconciliation (alpha-engine-config#2849)
+# ---------------------------------------------------------------------------
+
+class TestPriorMonthWindow:
+    def test_prior_month_from_mid_month(self):
+        pmw = index._prior_month_window(NOW)  # NOW = 2026-07-17
+        assert pmw["period"] == "2026-06"
+        assert pmw["start"] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+        assert pmw["end"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+        assert pmw["elapsed_frac"] == 1.0
+
+    def test_prior_month_from_january(self):
+        pmw = index._prior_month_window(datetime(2026, 1, 15, tzinfo=timezone.utc))
+        assert pmw["period"] == "2025-12"
+        assert pmw["start"] == datetime(2025, 12, 1, tzinfo=timezone.utc)
+        assert pmw["end"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class TestReconciliationRow:
+    PRIOR_DOC = {"providers": [
+        {"key": "aws", "mtd_cost_usd": 40.0, "projected_month_end_usd": 45.0},
+    ]}
+
+    def test_delta_against_last_recorded_mtd(self):
+        row = index._reconciliation_row("aws", self.PRIOR_DOC, 50.0)
+        assert row["projected_last_seen"] == 45.0
+        assert row["accrued_mtd_final"] == 40.0
+        assert row["actual_final"] == 50.0
+        assert row["delta_usd"] == pytest.approx(10.0)
+        assert row["delta_pct"] == pytest.approx(0.25)
+        assert row["status"] == "ok"
+
+    def test_missing_prior_doc_yields_nulls(self):
+        row = index._reconciliation_row("aws", None, 50.0)
+        assert row["projected_last_seen"] is None
+        assert row["accrued_mtd_final"] is None
+        assert row["delta_usd"] is None
+        assert row["delta_pct"] is None
+        assert row["actual_final"] == 50.0
+
+    def test_zero_accrued_nonzero_actual_is_full_drift(self):
+        row = index._reconciliation_row(
+            "aws", {"providers": [{"key": "aws", "mtd_cost_usd": 0.0,
+                                   "projected_month_end_usd": None}]}, 12.0)
+        assert row["delta_pct"] == 1.0
+
+    def test_not_available_status_carries_note(self):
+        row = index._reconciliation_row("neon", self.PRIOR_DOC, None,
+                                        status="not_available", note="no historical endpoint")
+        assert row["status"] == "not_available"
+        assert row["note"] == "no historical endpoint"
+        assert row["actual_final"] is None
+
+
+class TestReconcileAws:
+    def test_reconciles_full_prior_month(self, monkeypatch):
+        monkeypatch.setattr(index, "boto3", FakeBoto3(FakeS3({}), FakeSSM({}), FakeCE()))
+        pmw = index._prior_month_window(NOW)
+        prior_doc = {"providers": [{"key": "aws", "mtd_cost_usd": 10.0,
+                                    "projected_month_end_usd": 20.0}]}
+        row = index.reconcile_aws(pmw, {}, prior_doc)
+        # FakeCE.get_cost_and_usage always returns EC2 8.10 + S3 4.24 = 12.34
+        assert row["actual_final"] == pytest.approx(12.34)
+        assert row["accrued_mtd_final"] == 10.0
+        assert row["delta_usd"] == pytest.approx(2.34)
+
+
+class TestReconcileAnthropic:
+    def test_reuses_admin_api_with_bounded_window(self, monkeypatch):
+        pmw = index._prior_month_window(NOW)
+        seen_urls = []
+
+        def _fake_http(url, headers=None):
+            seen_urls.append(url)
+            return {"data": [{"results": [{"amount": "3.50"}]}], "has_more": False}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        prior_doc = {"providers": [{"key": "anthropic_api", "mtd_cost_usd": 3.0,
+                                    "projected_month_end_usd": 3.0}]}
+        row = index.reconcile_anthropic(
+            pmw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None, prior_doc)
+        assert row["actual_final"] == pytest.approx(3.50)
+        assert "starting_at=2026-06-01" in seen_urls[0]
+        assert "ending_before=2026-07-01" in seen_urls[0]
+
+    def test_fallback_bounds_to_full_prior_month_days(self, monkeypatch):
+        """No admin key ⇒ client-telemetry fallback must sum through the
+        PRIOR month's last day (30 for June), not ``now.day`` (17, in July)."""
+        pmw = index._prior_month_window(NOW)
+        cost_jsonl = json.dumps({"cost_usd": 5.0}).encode()
+        store = {f"decision_artifacts/_cost_raw/2026-06-30/run/a.jsonl": cost_jsonl}
+        s3 = FakeS3(store)
+        prior_doc = {"providers": [{"key": "anthropic_api", "mtd_cost_usd": 4.0,
+                                    "projected_month_end_usd": None}]}
+        row = index.reconcile_anthropic(pmw, {}, {}, s3, prior_doc)
+        assert row["actual_final"] == pytest.approx(5.0)
+
+
+class TestReconcileCounterDiff:
+    def test_diffs_two_month_start_baselines(self):
+        store = {
+            "expenses/baselines/2026-06.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 30.0}}).encode(),
+            "expenses/baselines/2026-07.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 42.5}}).encode(),
+        }
+        s3 = FakeS3(store)
+        prior_doc = {"providers": [{"key": "openrouter", "mtd_cost_usd": 11.0,
+                                    "projected_month_end_usd": 12.0}]}
+        row = index.reconcile_counter_diff(
+            s3, "2026-06", "2026-07", "openrouter", "openrouter_total_usage", prior_doc)
+        assert row["actual_final"] == pytest.approx(12.5)
+        assert row["status"] == "ok"
+
+    def test_deepseek_diffs_already_oriented_counter(self):
+        """deepseek_neg_balance is stored as -balance (rises as spend
+        accrues, per ensure_baseline/collect_deepseek) — a plain forward diff
+        of the two baselines already yields positive spend, no extra sign
+        flip needed."""
+        store = {
+            "expenses/baselines/2026-06.json": json.dumps(
+                {"counters": {"deepseek_neg_balance": -20.0}}).encode(),
+            "expenses/baselines/2026-07.json": json.dumps(
+                {"counters": {"deepseek_neg_balance": -15.0}}).encode(),
+        }
+        s3 = FakeS3(store)
+        row = index.reconcile_counter_diff(
+            s3, "2026-06", "2026-07", "deepseek", "deepseek_neg_balance", None)
+        assert row["actual_final"] == pytest.approx(5.0)
+
+    def test_missing_baseline_is_not_available(self):
+        s3 = FakeS3({})
+        row = index.reconcile_counter_diff(
+            s3, "2026-06", "2026-07", "openrouter", "openrouter_total_usage", None)
+        assert row["status"] == "not_available"
+        assert row["actual_final"] is None
+
+
+class TestReconcileNeon:
+    def test_always_not_available(self):
+        row = index.reconcile_neon({"providers": [{"key": "neon", "mtd_cost_usd": 1.0}]})
+        assert row["status"] == "not_available"
+        assert "historical" in row["note"] or "current consumption period" in row["note"]
+        assert row["actual_final"] is None
+
+
+class TestReconcileGithub:
+    def test_targets_prior_month_year_month(self, monkeypatch):
+        pmw = index._prior_month_window(NOW)
+        seen = {}
+
+        def _fake_http(url, headers=None):
+            seen["url"] = url
+            return {"usageItems": [
+                {"product": "Actions", "unitType": "Minutes", "quantity": 900,
+                 "netAmount": 2.0, "repositoryName": "alpha-engine-config"},
+            ]}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        monkeypatch.setattr(index, "_private_repo_names",
+                            lambda account, kind, headers: {"alpha-engine-config"})
+        secrets = {index.SSM_GITHUB_TOKEN: "ghp-xxx"}
+        prior_doc = {"providers": [{"key": "github_org", "mtd_cost_usd": 1.5,
+                                    "projected_month_end_usd": 3.0}]}
+        row = index.reconcile_github(pmw, {}, secrets, account=index.GITHUB_ORG,
+                                     kind="org", prior_doc=prior_doc)
+        assert "year=2026&month=6" in seen["url"]
+        assert row["actual_final"] == pytest.approx(2.0)
+
+    def test_not_configured_passthrough(self, monkeypatch):
+        pmw = index._prior_month_window(NOW)
+        row = index.reconcile_github(pmw, {}, {}, account=index.GITHUB_USER,
+                                     kind="user", prior_doc=None)
+        assert row["status"] == "not_configured"
+
+
+class TestRunReconciliation:
+    def test_writes_reconciliation_artifact_and_flags_drift(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        prior_doc = {
+            "schema_version": 1, "period": "2026-06",
+            "providers": [
+                {"key": "aws", "mtd_cost_usd": 5.0, "projected_month_end_usd": 6.0},
+            ],
+        }
+        store = {
+            "expenses/monthly/2026-06.json": json.dumps(prior_doc).encode(),
+            "expenses/baselines/2026-06.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 30.0,
+                              "deepseek_neg_balance": -20.0}}).encode(),
+            "expenses/baselines/2026-07.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 42.5,
+                              "deepseek_neg_balance": -15.0}}).encode(),
+        }
+        s3 = FakeS3(store)
+        ssm = FakeSSM({})
+        # FakeCE always returns 12.34 for get_cost_and_usage → aws delta vs
+        # prior_doc's 5.0 accrued is large enough to flag past the threshold.
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "_http_json", http_router({}))  # anthropic/github → error rows
+        result = index.run_reconciliation(s3, NOW, {}, {})
+        assert result["period"] == "2026-06"
+        doc = json.loads(store["expenses/reconciliation/2026-06.json"])
+        assert doc["period"] == "2026-06"
+        assert doc["providers"]["aws"]["actual_final"] == pytest.approx(12.34)
+        assert "aws" in doc["flagged"]  # (12.34-5.0)/5.0 = 146% >> 8% threshold
+        assert doc["providers"]["neon"]["status"] == "not_available"
+        # openrouter/deepseek reconciled purely from the two baselines above,
+        # with zero HTTP calls (the unrouted http_router({}) would raise if hit).
+        assert doc["providers"]["openrouter"]["actual_final"] == pytest.approx(12.5)
+        assert doc["providers"]["deepseek"]["actual_final"] == pytest.approx(5.0)
+
+    def test_one_provider_failure_does_not_blank_others(self, monkeypatch):
+        """Mirrors the live collect fence: a reconcile_* exception for one
+        provider must not prevent the others from being written."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        s3 = FakeS3({})
+        ssm = FakeSSM({})
+
+        def _boom(*a, **k):
+            raise RuntimeError("CE down")
+
+        monkeypatch.setattr(index, "reconcile_aws", _boom)
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "_http_json", http_router({}))
+        result = index.run_reconciliation(s3, NOW, {}, {})
+        doc = json.loads(s3.store["expenses/reconciliation/2026-06.json"])
+        assert doc["providers"]["aws"]["status"] == "error"
+        assert "CE down" in doc["providers"]["aws"]["note"]
+        assert doc["providers"]["neon"]["status"] == "not_available"
+
+
+class TestHandlerReconcileMode:
+    def test_handler_mode_reconcile_dispatches(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        s3 = FakeS3({})
+        ssm = FakeSSM({})
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "_http_json", http_router({}))
+        result = index.handler({"mode": "reconcile"}, None)
+        assert result["period"] == "2026-06"
+        assert "expenses/reconciliation/2026-06.json" in s3.store
+
+    def test_handler_default_mode_is_collect(self, env):
+        """Missing/empty event must behave exactly as before this feature —
+        the twice-daily Scheduler rule's Input ("{}"​) is unchanged."""
+        s3, store = env
+        result = index.handler({}, None)
+        assert result["period"] == "2026-07"  # collect-mode shape, not reconcile's
+        assert "providers" in result and isinstance(result["providers"], int)
+
+    def test_handler_unknown_mode_raises(self, env):
+        s3, store = env
+        with pytest.raises(ValueError, match="unknown expense-collector event mode"):
+            index.handler({"mode": "bogus"}, None)

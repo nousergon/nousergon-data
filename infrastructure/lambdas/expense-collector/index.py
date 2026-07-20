@@ -45,6 +45,24 @@ Outputs (bucket ``alpha-engine-research``):
     (first-writer-wins, backfilled per-counter as new providers appear)
   - ``expenses/snapshots/{date}.json``   — first reading of each day's raw
     counters (future trend charts; conditional PUT, first-writer-wins)
+  - ``expenses/reconciliation/{YYYY-MM}.json`` — month-close true-up
+    (alpha-engine-config#2849): once the just-closed month's providers have
+    finalized, each provider's FINAL actual is re-queried and compared to what
+    was last projected/accrued for that month. Producer: this Lambda's
+    ``reconcile`` mode (see below). Consumer: crucible-dashboard's Expenses
+    page "Reconciliation (prior months)" section.
+
+Two invocation modes, dispatched off ``event["mode"]`` (default
+``"collect"``) — the established pattern for this Lambda's own scheduling
+(one function, two EventBridge Scheduler rules with different ``Input``; see
+``deploy.sh``'s ``SCHED_NAMES``/``SCHED_CRONS``/``SCHED_INPUTS``):
+  - ``"collect"`` (default) — the twice-daily live MTD rollup described above.
+  - ``"reconcile"`` — month-close true-up, scheduled ~03:00 UTC on the 2nd of
+    each month (after providers finalize the prior month). Re-queries each
+    provider's adapter with a CLOSED prior-month window (never re-derives a
+    provider's own arithmetic — same principle as the AWS forecast fix:
+    anchor to what the provider reports) and diffs against the prior month's
+    already-recorded ``expenses/monthly/{YYYY-MM}.json`` rollup.
 
 Failure posture (CLAUDE.md no-silent-fails): each provider adapter is
 independently fenced — a single provider API outage must not blank the other
@@ -96,6 +114,14 @@ BASELINE_PREFIX = "expenses/baselines/"
 SNAPSHOT_PREFIX = "expenses/snapshots/"
 COST_RAW_PREFIX = "decision_artifacts/_cost_raw/"
 ALERT_STATE_PREFIX = "expenses/alert_state/"
+RECONCILIATION_PREFIX = "expenses/reconciliation/"
+
+# Month-close reconciliation (alpha-engine-config#2849) — |delta_pct| beyond
+# this is "visible drift", not rounding/timing noise. Matches the console's
+# highlight threshold in shared/expense_view.py (kept in lockstep — a
+# reconciliation row this Lambda flags but the console renders unhighlighted,
+# or vice versa, would be worse than either being wrong alone).
+RECONCILIATION_DELTA_PCT_THRESHOLD = 0.08
 
 # Over-budget Telegram alert (config#2843) — notification only, OPS_HEALTH
 # topic (this is an advisory pace signal, not a critical incident; unlike the
@@ -353,17 +379,12 @@ def _load_ssm(names: list[str]) -> dict[str, str]:
 # Provider adapters
 # ---------------------------------------------------------------------------
 
-def collect_aws(mw: dict, budgets: dict) -> dict:
-    ce = boto3.client("ce", region_name="us-east-1")
-    start = mw["start"].strftime("%Y-%m-%d")
-    now = _now_utc()
-    end = (now.replace(hour=0, minute=0, second=0, microsecond=0)
-           .strftime("%Y-%m-%d"))
-    next_month = (mw["start"].replace(day=28) + timedelta(days=4)).replace(day=1)
-    row = _row("aws", "AWS", source="cost_explorer")
-    if end <= start:  # first UTC day of the month — CE window would be empty
-        row.update(mtd_cost_usd=0.0, note="month just started — Cost Explorer window empty")
-        return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
+def _ce_unblended_by_service(ce, start: str, end: str) -> dict[str, float]:
+    """Shared Cost Explorer ``get_cost_and_usage`` call (grouped by SERVICE,
+    MONTHLY granularity) — used both for the live current-month MTD read
+    (``collect_aws``) and the closed-prior-month reconciliation re-query
+    (``reconcile_aws``), so the two never drift on how a service total is
+    summed."""
     resp = ce.get_cost_and_usage(
         TimePeriod={"Start": start, "End": end}, Granularity="MONTHLY",
         Metrics=["UnblendedCost"],
@@ -375,6 +396,21 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
             svc = g["Keys"][0]
             by_service[svc] = by_service.get(svc, 0.0) + float(
                 g["Metrics"]["UnblendedCost"]["Amount"])
+    return by_service
+
+
+def collect_aws(mw: dict, budgets: dict) -> dict:
+    ce = boto3.client("ce", region_name="us-east-1")
+    start = mw["start"].strftime("%Y-%m-%d")
+    now = _now_utc()
+    end = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+           .strftime("%Y-%m-%d"))
+    next_month = (mw["start"].replace(day=28) + timedelta(days=4)).replace(day=1)
+    row = _row("aws", "AWS", source="cost_explorer")
+    if end <= start:  # first UTC day of the month — CE window would be empty
+        row.update(mtd_cost_usd=0.0, note="month just started — Cost Explorer window empty")
+        return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
+    by_service = _ce_unblended_by_service(ce, start, end)
     mtd = round(sum(by_service.values()), 2)
     top = dict(sorted(by_service.items(), key=lambda kv: -kv[1])[:8])
     row.update(mtd_cost_usd=mtd,
@@ -400,13 +436,21 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
     return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
 
 
-def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3) -> dict:
+def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
+                      end: datetime | None = None, last_day: int | None = None) -> dict:
+    """``end``/``last_day`` default to the live current-month read (open-ended
+    Admin API window; fallback loop runs through "today"). Reconciliation
+    (``reconcile_anthropic``) passes both bounded to the CLOSED prior month so
+    this same adapter — same parsing, same fallback — re-queries a finalized
+    window instead of duplicating either code path."""
     row = _row("anthropic_api", "Anthropic API")
     admin_key = secrets.get(SSM_ANTHROPIC_ADMIN)
     if admin_key:
         starting = mw["start"].strftime("%Y-%m-%dT00:00:00Z")
         url = ("https://api.anthropic.com/v1/organizations/cost_report"
                f"?starting_at={starting}&limit=31")
+        if end is not None:
+            url += f"&ending_before={end.strftime('%Y-%m-%dT00:00:00Z')}"
         headers = {"x-api-key": admin_key, "anthropic-version": "2023-06-01"}
         total, page, pages = 0.0, None, 0
         while pages < 10:
@@ -422,9 +466,9 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3) -> dict:
         return _finish_usd_row(row, mw, _budget_usd(budgets, "anthropic_api"))
     # Fallback: research-fleet client telemetry (per-call JSONL, cost_usd per row).
     total, n_days = 0.0, 0
-    now = _now_utc()
+    last_day = last_day if last_day is not None else _now_utc().day
     paginator = s3.get_paginator("list_objects_v2")
-    for day in range(1, now.day + 1):
+    for day in range(1, last_day + 1):
         date_str = f"{mw['period']}-{day:02d}"
         for page_ in paginator.paginate(Bucket=BUCKET,
                                         Prefix=f"{COST_RAW_PREFIX}{date_str}/"):
@@ -628,12 +672,19 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
 
 
 def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
-                   kind: str) -> dict:
+                   kind: str, target_year: int | None = None,
+                   target_month: int | None = None) -> dict:
     """One row per billing account (org + personal are separate meters with
     separate included-minutes quotas — they are deliberately NOT merged).
     Enhanced billing platform only: the legacy ``settings/billing/actions``
     endpoints are 410-Gone/404 for both accounts (verified 2026-07-17), so the
-    included-minutes quota comes from the budgets SSoT."""
+    included-minutes quota comes from the budgets SSoT.
+
+    ``target_year``/``target_month`` default to the live current month; the
+    billing-usage endpoint already scopes its whole response server-side by
+    these two params, so reconciliation (``reconcile_github``) reuses this
+    same adapter unchanged for a closed prior month — just pass that month's
+    year/month instead of "now"."""
     key = f"github_{kind}"
     row = _row(key, f"GitHub ({account} {kind})", source="billing_usage_api")
     # Personal-account billing needs its own user-scoped PAT ("Plan: read");
@@ -650,9 +701,11 @@ def collect_github(mw: dict, budgets: dict, secrets: dict, *, account: str,
     base = ("https://api.github.com/organizations/" if kind == "org"
             else "https://api.github.com/users/")
     now = _now_utc()
+    year = target_year if target_year is not None else now.year
+    month = target_month if target_month is not None else now.month
     try:
         doc = _http_json(f"{base}{account}/settings/billing/usage"
-                         f"?year={now.year}&month={now.month}", headers)
+                         f"?year={year}&month={month}", headers)
     except RuntimeError as exc:
         if kind == "user" and SSM_GITHUB_USER_PAT not in secrets \
                 and ("HTTP 404" in str(exc) or "HTTP 403" in str(exc)):
@@ -784,6 +837,197 @@ def fixed_rows(budgets: dict, produced_keys: set[str]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Month-close reconciliation (alpha-engine-config#2849)
+#
+# Re-queries each provider's OWN adapter (or, for openrouter/deepseek, the
+# already-written month-start baseline docs) for the just-CLOSED prior
+# month's finalized actual, then diffs it against what the prior month's own
+# ``expenses/monthly/{YYYY-MM}.json`` rollup last recorded — never re-derives
+# a provider's arithmetic from scratch (same anchor-to-provider principle the
+# AWS forecast fix codified). Neon has no closed-period historical read on
+# this API tier (its adapter only ever sees the CURRENT consumption period) —
+# reconciled as "not_available" rather than guessed.
+# ---------------------------------------------------------------------------
+
+def _prior_month_window(now: datetime) -> dict:
+    """The most recently CLOSED calendar month (UTC) as of ``now`` — same
+    shape as ``_month_window`` (period id + start), plus ``end`` (first
+    instant of ``now``'s month = the exclusive upper bound of the prior
+    month). ``elapsed_frac`` is always 1.0: a closed month has nothing left
+    to project."""
+    this_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prior_end = this_month_start
+    prior_start = (prior_end - timedelta(days=1)).replace(day=1)
+    days = calendar.monthrange(prior_start.year, prior_start.month)[1]
+    return {
+        "period": prior_start.strftime("%Y-%m"),
+        "start": prior_start,
+        "end": prior_end,
+        "total_seconds": days * 86400.0,
+        "elapsed_frac": 1.0,
+    }
+
+
+def _last_recorded_row(prior_doc: dict | None, key: str) -> dict:
+    """The prior month's own rollup row for ``key`` (``mtd_cost_usd`` at
+    whatever time the last day-of-month collect run happened = "accrued MTD
+    final" per the issue's field name; ``projected_month_end_usd`` = "last
+    seen" projection) — read directly, never re-derived."""
+    if not prior_doc:
+        return {}
+    for row in prior_doc.get("providers", []):
+        if row.get("key") == key:
+            return row
+    return {}
+
+
+def _reconciliation_row(key: str, prior_doc: dict | None, actual_final: float | None,
+                        *, status: str = "ok", note: str | None = None) -> dict:
+    last = _last_recorded_row(prior_doc, key)
+    projected_last_seen = last.get("projected_month_end_usd")
+    accrued_mtd_final = last.get("mtd_cost_usd")
+    delta_usd = delta_pct = None
+    if actual_final is not None and accrued_mtd_final is not None:
+        delta_usd = round(actual_final - accrued_mtd_final, 2)
+        if accrued_mtd_final:
+            delta_pct = round(delta_usd / abs(accrued_mtd_final), 4)
+        elif actual_final:
+            delta_pct = 1.0  # accrued was 0 but the final actual wasn't — full drift
+    return {
+        "projected_last_seen": projected_last_seen,
+        "accrued_mtd_final": accrued_mtd_final,
+        "actual_final": round(actual_final, 2) if actual_final is not None else None,
+        "delta_usd": delta_usd,
+        "delta_pct": delta_pct,
+        "status": status,
+        "note": note,
+    }
+
+
+def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None) -> dict:
+    ce = boto3.client("ce", region_name="us-east-1")
+    by_service = _ce_unblended_by_service(
+        ce, prior_mw["start"].strftime("%Y-%m-%d"), prior_mw["end"].strftime("%Y-%m-%d"))
+    return _reconciliation_row("aws", prior_doc, round(sum(by_service.values()), 2))
+
+
+def reconcile_anthropic(prior_mw: dict, budgets: dict, secrets: dict, s3,
+                        prior_doc: dict | None) -> dict:
+    days = calendar.monthrange(prior_mw["start"].year, prior_mw["start"].month)[1]
+    row = collect_anthropic({**prior_mw, "elapsed_frac": 1.0}, budgets, secrets, s3,
+                            end=prior_mw["end"], last_day=days)
+    return _reconciliation_row("anthropic_api", prior_doc, row.get("mtd_cost_usd"))
+
+
+def reconcile_counter_diff(s3, prior_period: str, current_period: str, key: str,
+                           counter_key: str, prior_doc: dict | None) -> dict:
+    """OpenRouter/DeepSeek: zero new HTTP calls. The current month's own
+    month-start baseline (``expenses/baselines/{current_period}.json``,
+    written first-writer-wins on the 1st) IS the exact end-of-prior-month
+    counter reading; diffed against the prior month's own start baseline it
+    gives the prior month's full-month counter delta — the same quantity the
+    live adapter computes MTD, just over the now-closed full window. Both
+    stored counters (``openrouter_total_usage``, ``deepseek_neg_balance``)
+    are already oriented to INCREASE with spend (deepseek's is ``-balance``,
+    per ``ensure_baseline``/``collect_deepseek``) — a plain forward diff, no
+    extra sign handling needed here."""
+    prior_base = _s3_json(s3, f"{BASELINE_PREFIX}{prior_period}.json")
+    current_base = _s3_json(s3, f"{BASELINE_PREFIX}{current_period}.json")
+    if not prior_base or not current_base:
+        return _reconciliation_row(
+            key, prior_doc, None, status="not_available",
+            note="missing month-start baseline for prior or current period — "
+                 "cannot diff a closed-month counter window")
+    prior_val = (prior_base.get("counters") or {}).get(counter_key)
+    current_val = (current_base.get("counters") or {}).get(counter_key)
+    if prior_val is None or current_val is None:
+        return _reconciliation_row(
+            key, prior_doc, None, status="not_available",
+            note=f"counter {counter_key} absent from one of the two baselines")
+    actual_final = round(max(current_val - prior_val, 0.0), 4)
+    return _reconciliation_row(
+        key, prior_doc, actual_final,
+        note="counter-diff of two already-written month-start baselines — "
+             "exact unless a top-up/consumption landed in the instant between "
+             "month rollover and this run")
+
+
+def reconcile_neon(prior_doc: dict | None) -> dict:
+    """Neon's Launch-plan API exposes only the CURRENT consumption period
+    (``consumption_history`` is Scale-plan-only, 403/404 verified live) —
+    there is no closed-period historical read to re-query, so reconciliation
+    is marked not_available rather than approximated from snapshots (Neon's
+    own period boundaries aren't calendar-month-aligned)."""
+    return _reconciliation_row(
+        "neon", prior_doc, None, status="not_available",
+        note="Neon's API exposes only the current consumption period — no "
+             "historical/closed-period endpoint is reachable on this plan")
+
+
+def reconcile_github(prior_mw: dict, budgets: dict, secrets: dict, *, account: str,
+                     kind: str, prior_doc: dict | None) -> dict:
+    row = collect_github(prior_mw, budgets, secrets, account=account, kind=kind,
+                         target_year=prior_mw["start"].year,
+                         target_month=prior_mw["start"].month)
+    key = f"github_{kind}"
+    if row["status"] == "not_configured":
+        return _reconciliation_row(key, prior_doc, None, status="not_configured",
+                                   note=row.get("error"))
+    if row["status"] == "error":
+        return _reconciliation_row(key, prior_doc, None, status="error", note=row.get("error"))
+    return _reconciliation_row(key, prior_doc, row.get("mtd_cost_usd"))
+
+
+def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
+    """Month-close true-up entry point (``event["mode"] == "reconcile"``).
+    Writes ``expenses/reconciliation/{prior-period}.json`` and returns a
+    summary. Each provider is independently fenced (mirrors the ``fenced``
+    closure in ``handler`` — one provider's re-query failing must not blank
+    the others' reconciliation rows)."""
+    prior_mw = _prior_month_window(now)
+    prior_doc = _s3_json(s3, f"{MONTHLY_PREFIX}{prior_mw['period']}.json")
+    providers: dict[str, dict] = {}
+
+    def fenced(key: str, fn) -> None:
+        try:
+            providers[key] = fn()
+        except Exception as exc:  # noqa: BLE001 — one provider's re-query outage
+            # must not blank the others' reconciliation rows.
+            logger.exception("reconciliation for %s failed", key)
+            providers[key] = _reconciliation_row(key, prior_doc, None, status="error",
+                                                 note=str(exc)[:300])
+
+    fenced("aws", lambda: reconcile_aws(prior_mw, budgets, prior_doc))
+    fenced("anthropic_api",
+          lambda: reconcile_anthropic(prior_mw, budgets, secrets, s3, prior_doc))
+    fenced("openrouter", lambda: reconcile_counter_diff(
+        s3, prior_mw["period"], now.strftime("%Y-%m"), "openrouter",
+        "openrouter_total_usage", prior_doc))
+    fenced("deepseek", lambda: reconcile_counter_diff(
+        s3, prior_mw["period"], now.strftime("%Y-%m"), "deepseek",
+        "deepseek_neg_balance", prior_doc))
+    fenced("neon", lambda: reconcile_neon(prior_doc))
+    fenced("github_org", lambda: reconcile_github(
+        prior_mw, budgets, secrets, account=GITHUB_ORG, kind="org", prior_doc=prior_doc))
+    fenced("github_user", lambda: reconcile_github(
+        prior_mw, budgets, secrets, account=GITHUB_USER, kind="user", prior_doc=prior_doc))
+
+    flagged = [k for k, r in providers.items()
+              if r.get("delta_pct") is not None
+              and abs(r["delta_pct"]) > RECONCILIATION_DELTA_PCT_THRESHOLD]
+    doc = {
+        "schema_version": 1,
+        "period": prior_mw["period"],
+        "as_of": now.isoformat(),
+        "providers": providers,
+        "delta_pct_threshold": RECONCILIATION_DELTA_PCT_THRESHOLD,
+        "flagged": flagged,
+    }
+    _put_json(s3, f"{RECONCILIATION_PREFIX}{prior_mw['period']}.json", doc)
+    return {"period": prior_mw["period"], "providers": len(providers), "flagged": flagged}
+
+
+# ---------------------------------------------------------------------------
 # Counters (lifetime/balance readings) + baseline
 # ---------------------------------------------------------------------------
 
@@ -860,6 +1104,32 @@ def write_snapshot(s3, counters: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+    """Dispatches on ``event.get("mode")`` — one Lambda, two EventBridge
+    Scheduler rules with different ``Input`` (this codebase's established
+    scheduling pattern; see ``deploy.sh``'s ``SCHED_NAMES``/``SCHED_CRONS``/
+    ``SCHED_INPUTS``, not a new mechanism):
+      - ``"collect"`` (default, incl. ``{}``/missing — preserves the existing
+        twice-daily invocation's ``Input: "{}"`` unchanged) — the live MTD
+        rollup.
+      - ``"reconcile"`` — month-close true-up (alpha-engine-config#2849),
+        scheduled ~03:00 UTC on the 2nd of each month."""
+    mode = (event or {}).get("mode", "collect")
+    if mode == "reconcile":
+        return _reconcile(event, context)
+    if mode != "collect":
+        raise ValueError(f"unknown expense-collector event mode: {mode!r}")
+    return _collect(event, context)
+
+
+def _reconcile(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+    now = _now_utc()
+    s3 = boto3.client("s3", region_name=REGION)
+    budgets = _s3_json(s3, BUDGETS_KEY) or {}
+    secrets = _load_ssm(SSM_PARAMS)
+    return run_reconciliation(s3, now, budgets, secrets)
+
+
+def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     now = _now_utc()
     mw = _month_window(now)
     s3 = boto3.client("s3", region_name=REGION)

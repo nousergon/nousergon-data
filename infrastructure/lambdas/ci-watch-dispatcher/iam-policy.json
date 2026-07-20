@@ -113,6 +113,23 @@
           "ec2:ResourceTag/Name": "alpha-engine-ci-watch-spot"
         }
       }
+    },
+    {
+      "Sid": "ListCiWatchSignatureMarkersForRepeatSkip",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "ci_watch/_control/signatures/*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadCiWatchSignatureMarkersForRepeatSkip",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/ci_watch/_control/signatures/*"
     }
   ]
 }
