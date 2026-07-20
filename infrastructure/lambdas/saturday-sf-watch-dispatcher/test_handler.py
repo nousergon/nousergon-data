@@ -861,15 +861,19 @@ def test_fast_path_preflight_excluded(fast_path_on):
     assert result["fast_path"]["reason"] == "preflight"
 
 
-# ── Shepherd ruling (Brian, 2026-07-18) + fast-path self-loop guard ─────────
+# ── Shepherd ruling (Brian, 2026-07-18) + config#2953 closeout ──────────────
 #
-# watch-rerun-* failures DISPATCH: the overseer shepherds the whole incident
-# arc, reruns included (the 2026-07-18 arc showed the old config#2003
-# suppression benched the autonomous loop after the first recovery rerun —
-# bugs #3-#5 all fell to the operator by structure). The 2026-07-08 pile-on
-# config#2003 fixed is now bounded by the config#2269 per-day dispatch
-# ceiling + the charter's same-error rule. Only fast-path-rerun-* (this
-# Lambda's own deterministic rerun) still suppresses — self-loop guard.
+# Both watch-rerun-* and fast-path-rerun-* failures DISPATCH: the overseer
+# shepherds the whole incident arc, reruns included (the 2026-07-18 arc
+# showed the old config#2003 suppression benched the autonomous loop after
+# the first recovery rerun — bugs #3-#5 all fell to the operator by
+# structure). fast-path-rerun-* was left suppressed at the time as the "one
+# remaining suppressed-and-stalled path"; config#2953 closes it — a
+# fast-path rerun that itself fails means the deterministic transient-
+# signature guess was wrong, a genuine new incident. The 2026-07-08 pile-on
+# config#2003 fixed is bounded by the config#2269 per-day dispatch ceiling +
+# the charter's same-error rule for both rerun kinds now, not a name-based
+# suppression.
 
 
 def test_watch_rerun_named_execution_dispatches_fresh_agent(monkeypatch):
@@ -902,9 +906,11 @@ def test_watch_rerun_named_execution_dispatches_fresh_agent(monkeypatch):
     assert ev["dispatch_suppressed"] is None
 
 
-def test_fast_path_rerun_still_suppresses_self_loop(monkeypatch):
-    """The Lambda's OWN deterministic rerun (`fast-path-rerun-*`) must not
-    re-dispatch on failure — self-loop guard survives the shepherd ruling."""
+def test_fast_path_rerun_failure_now_dispatches_fresh_agent(monkeypatch):
+    """config#2953: the Lambda's OWN deterministic rerun (`fast-path-rerun-*`)
+    failing now summons a fresh agent, closing the last suppressed-and-stalled
+    path the shepherd ruling named — bounded by the config#2269 ceiling +
+    charter same-error rule, same as watch-rerun-* since 2026-07-18."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     fired = {"called": False}
@@ -920,21 +926,22 @@ def test_fast_path_rerun_still_suppresses_self_loop(monkeypatch):
             _event("FAILED", sm_arn=EOD_ARN, name="fast-path-rerun-2026-07-08-1"), None
         )
 
-    assert result["agent_dispatch"] == {
-        "dispatched": False, "reason": "operator_recovery_rerun",
-    }
-    assert result["action"] == "observe"
-    assert fired["called"] is False
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["action"] == "dispatched"
+    assert fired["called"] is True
     written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    assert written["events"][-1]["dispatch_suppressed"] == "operator_recovery_rerun"
+    ev = written["events"][-1]
+    assert ev["execution_name"] == "fast-path-rerun-2026-07-08-1"
+    assert ev["dispatch_suppressed"] is None
 
 
 def test_second_watch_rerun_same_day_gated_only_by_escalation_flag_or_ceiling(monkeypatch):
     """Post-shepherd: a second same-day watch-rerun failure is no longer
     suppressed AS a rerun. With a prior `escalated` event and the
-    DISPATCH_AFTER_ESCALATION opt-out at its default (false), the
-    already_escalated_today gate still holds; with the flag true, it
-    dispatches (bounded by the config#2269 ceiling)."""
+    DISPATCH_AFTER_ESCALATION opt-out explicitly set false (pre-shepherd
+    posture), the already_escalated_today gate still holds; with the flag
+    true (config#2953's new default), it dispatches (bounded by the
+    config#2269 ceiling)."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
@@ -945,7 +952,7 @@ def test_second_watch_rerun_same_day_gated_only_by_escalation_flag_or_ceiling(mo
         ],
     }
 
-    # Default (DISPATCH_AFTER_ESCALATION=false): escalation gate holds.
+    # Operator opt-out (DISPATCH_AFTER_ESCALATION=false): escalation gate holds.
     monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", False)
     factory, _, s3 = _make_clients(existing=existing)
     with patch("index.boto3.client", side_effect=factory):
@@ -967,10 +974,10 @@ def test_second_watch_rerun_same_day_gated_only_by_escalation_flag_or_ceiling(mo
 
 
 
-def test_fast_path_named_rerun_execution_also_suppresses_dispatch(monkeypatch):
-    """This Lambda's OWN fast-path-rerun-* naming (config#1900) is included in
-    the recovery-rerun prefix allowlist — a fast-path rerun that itself later
-    fails must not summon an agent either (it's already a recovery attempt)."""
+def test_fast_path_named_rerun_execution_also_dispatches_on_weekday(monkeypatch):
+    """config#2953: this Lambda's OWN fast-path-rerun-* naming (config#1900)
+    no longer suppresses on ANY cadence — a fast-path rerun that itself later
+    fails summons a fresh agent, same as any other failure."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     fired = {"called": False}
@@ -983,10 +990,8 @@ def test_fast_path_named_rerun_execution_also_suppresses_dispatch(monkeypatch):
         result = index.handler(
             _event("FAILED", sm_arn=WEEKDAY_ARN, name="fast-path-rerun-2026-07-08-093000"), None
         )
-    assert result["agent_dispatch"] == {
-        "dispatched": False, "reason": "operator_recovery_rerun",
-    }
-    assert fired["called"] is False
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert fired["called"] is True
 
 
 def test_name_merely_containing_rerun_still_dispatches(monkeypatch):
@@ -1007,12 +1012,13 @@ def test_name_merely_containing_rerun_still_dispatches(monkeypatch):
     assert written["events"][-1]["dispatch_suppressed"] is None
 
 
-def test_second_failure_after_escalation_suppresses_dispatch_by_default(monkeypatch):
-    """(b) Same-day same-pipeline dedup for ESCALATED incidents: once today's
-    watch-log for this pipeline already has an `action: escalated` event
-    (human-gated, e.g. IAM), a SECOND failure of the SAME pipeline that day —
-    even with an ordinary execution name, not just a watch-rerun-* name —
-    gets watch-log + Telegram but NO agent dispatch by default."""
+def test_second_failure_after_escalation_dispatches_by_default_shepherd_posture(monkeypatch):
+    """config#2953: SF_WATCH_DISPATCH_AFTER_ESCALATION now defaults true (the
+    shepherd ruling — the overseer owns the whole incident arc, post-
+    escalation repeats included). A SECOND failure of the SAME pipeline that
+    day, with a prior `escalated` event and NO explicit flag override,
+    dispatches a fresh agent — bounded by the config#2269 ceiling, not this
+    flag, in the default posture."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     fired = {"called": False}
@@ -1038,33 +1044,32 @@ def test_second_failure_after_escalation_suppresses_dispatch_by_default(monkeypa
             _event("FAILED", sm_arn=EOD_ARN, name="eod-2026-07-08-2"), None
         )
 
-    assert result["agent_dispatch"] == {
-        "dispatched": False, "reason": "already_escalated_today",
-    }
-    assert fired["called"] is False
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert fired["called"] is True
 
     written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
     assert len(written["events"]) == 2  # accumulated, not overwritten
     ev = written["events"][-1]
     assert ev["execution_name"] == "eod-2026-07-08-2"
-    assert ev["dispatch_suppressed"] == "already_escalated_today"
-
-    # Telegram receipt STILL fires (observability stays).
-    assert result["telegram_sent"] is True
-    index.notify_via_flow_doctor.assert_called_once()
-    text = index.notify_via_flow_doctor.call_args.args[0]
-    assert "DISPATCH SUPPRESSED" in text
+    assert ev["dispatch_suppressed"] is None
 
 
-def test_escalation_kill_switch_restores_dispatch_when_set(monkeypatch):
-    """EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true opts back into the OLD
-    ask-forgiveness behavior: a second same-day failure dispatches normally
-    even after an escalated event, when the operator has explicitly set the
-    env override."""
+def test_escalation_opt_out_suppresses_dispatch_when_set_false(monkeypatch):
+    """config#2953: SF_WATCH_DISPATCH_AFTER_ESCALATION=false opts OUT of the
+    shepherd default, restoring the pre-2026-07-18 posture — a second
+    same-day failure after an `escalated` event suppresses the agent
+    dispatch (watch-log + Telegram receipt still fire) when the operator has
+    explicitly set the env override to false."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", True)
+    monkeypatch.setattr(index, "DISPATCH_AFTER_ESCALATION", False)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
-    monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
+    fired = {"called": False}
+
+    def fake_urlopen(req, timeout=None):
+        fired["called"] = True
+        return _FakeResp()
+
+    monkeypatch.setattr(index.urllib.request, "urlopen", fake_urlopen)
     existing = {
         "schema_version": 1,
         "events": [{"action": "escalated", "execution_name": "eod-2026-07-08-1"}],
@@ -1074,17 +1079,25 @@ def test_escalation_kill_switch_restores_dispatch_when_set(monkeypatch):
         result = index.handler(
             _event("FAILED", sm_arn=EOD_ARN, name="eod-2026-07-08-2"), None
         )
-    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["agent_dispatch"] == {
+        "dispatched": False, "reason": "already_escalated_today",
+    }
+    assert fired["called"] is False
     written = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    assert written["events"][-1]["dispatch_suppressed"] is None
+    assert written["events"][-1]["dispatch_suppressed"] == "already_escalated_today"
+
+    # Telegram receipt STILL fires (observability stays).
+    assert result["telegram_sent"] is True
+    index.notify_via_flow_doctor.assert_called_once()
+    text = index.notify_via_flow_doctor.call_args.args[0]
+    assert "DISPATCH SUPPRESSED" in text
 
 
 def test_first_failure_of_pipeline_day_still_dispatches_normally(monkeypatch):
-    """Regression guard: neither config#2003 carve-out fires for the FIRST
-    failure of a pipeline/day with an ordinary execution name and an empty
-    watch-log — the issue explicitly requires the first failure is never
-    suppressed, only post-escalation repeats and operator-recovery-named
-    executions."""
+    """Regression guard: the remaining config#2003 carve-out (already-
+    escalated-today) never fires for the FIRST failure of a pipeline/day
+    with an ordinary execution name and an empty watch-log — the issue
+    explicitly requires the first failure is never suppressed."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())

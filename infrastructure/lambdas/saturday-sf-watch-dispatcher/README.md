@@ -48,31 +48,36 @@ and is never logged.
 4. Flip the flag:
    `aws lambda update-function-configuration --function-name alpha-engine-saturday-sf-watch-dispatcher --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=true}' --query LastUpdateStatus --output text`.
 
-## Dispatch suppression (config#2003)
+## Dispatch suppression (config#2003, closed out by config#2953)
 
-Two carve-outs stop a **second** agent from being dispatched for an incident
-already being handled. Both still write the watch-log event AND send the
+One carve-out stops a **second** agent from being dispatched for an incident
+already being handled. It still writes the watch-log event AND sends the
 (SILENT) Telegram receipt — `mode: DISPATCH SUPPRESSED` — recording the
 decision in `dispatch_suppressed` (never a silent skip); only the
 `repository_dispatch` call itself is withheld.
 
-1. **Operator-recovery reruns.** An execution named after the watch's own
-   recommended recovery-rerun convention (`watch-rerun-<date>-<n>`) or this
-   Lambda's own fast-path rerun (`fast-path-rerun-<date>-<hms>`) is a recovery
-   attempt already in progress, not a fresh incident. Prefix-matched via
-   `RECOVERY_RERUN_NAME_PREFIXES` in `index.py`.
-   (Observed 2026-07-08, EOD incident config#1446/#1464: the watch escalated
-   the original failure, then dispatched two MORE agents for the operator's
-   own `watch-rerun-2026-07-08-1`/`-2` recovery reruns — the naming
-   convention the watch itself recommended.)
-2. **Same-day post-escalation repeats.** Once this pipeline's watch-log for
+1. **Same-day post-escalation repeats.** Once this pipeline's watch-log for
    today already has an `action: escalated` event (human-gated, e.g. IAM), a
-   subsequent failure of the same pipeline that day suppresses by default —
-   the human is already engaged. Kill-switch:
-   `EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true` restores the old
-   dispatch-every-failure behavior.
+   subsequent failure of the same pipeline that day suppresses **only if the
+   operator has explicitly opted out**. Flag: `SF_WATCH_DISPATCH_AFTER_ESCALATION`
+   (`EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION` honored one more release), default
+   **true** since config#2953 (Brian's 2026-07-18 shepherd ruling — the
+   overseer owns the whole incident arc by default); set `false` to restore
+   the pre-shepherd dispatch-suppressed-after-escalation posture.
 
-Neither carve-out suppresses the **first** failure of a pipeline/day.
+This carve-out never suppresses the **first** failure of a pipeline/day.
+
+**Retired (config#2953): operator-recovery-rerun name suppression.** Until
+2026-07-19 an execution named after the watch's own recommended
+recovery-rerun convention (`watch-rerun-<date>-<n>`) or this Lambda's own
+fast-path rerun (`fast-path-rerun-<date>-<hms>`) was treated as a recovery
+attempt already in progress and never re-dispatched. `watch-rerun-*` started
+dispatching on 2026-07-18 (Brian's shepherd ruling, the 2026-07-08 EOD
+incident config#1446/#1464 pile-on it originally guarded against is now
+bounded by the config#2269 ceiling instead); `fast-path-rerun-*` was the
+last suppressed-and-stalled path and config#2953 closed it the same way — a
+fast-path rerun failing means the deterministic transient-signature guess
+was wrong, a genuine new incident the overseer should shepherd.
 
 ## Mechanical per-cadence dispatch ceiling (config#2269)
 
@@ -93,10 +98,9 @@ Ceilings (env, config defaults — **not** operator flags, not preserved across
 redeploys; change via PR): `SF_WATCH_MAX_DISPATCHES_SATURDAY=8`,
 `SF_WATCH_MAX_DISPATCHES_WEEKDAY=2`, `SF_WATCH_MAX_DISPATCHES_EOD=2`
 (the charter's Brian-ruled per-cadence budgets, 2026-07-11). The ceiling
-composes with the config#2003 suppressions and the charter-side budget — it
-is the outermost runaway backstop, and it still applies when
-`EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true` opts back into post-escalation
-dispatch.
+composes with the config#2003 suppression and the charter-side budget — it
+is the outermost runaway backstop, and it still applies in the default
+`SF_WATCH_DISPATCH_AFTER_ESCALATION=true` shepherd posture.
 
 ## Why it's not a second notifier
 
