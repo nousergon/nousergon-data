@@ -1637,7 +1637,7 @@ def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
     specs, _r, arms = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
-            b'{"champion_arm": "scanner_predictor_direct"}',
+            b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
     })
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
@@ -1652,7 +1652,7 @@ def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
     import index
     specs, _r, arms = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
-        index.CHAMPION_POINTER_KEY: b'{"champion_arm": "think_tank"}',
+        index.CHAMPION_POINTER_KEY: b'{"schema_version": 1, "champion": "think_tank"}',
     })
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
