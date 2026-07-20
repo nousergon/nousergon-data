@@ -3472,13 +3472,13 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "executionTimeout": [
-            "3600"
+            "7200"
           ],
           "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{}',$.preflight_args))"
         },
-        "TimeoutSeconds": 3600
+        "TimeoutSeconds": 7200
       },
-      "TimeoutSeconds": 3660,
+      "TimeoutSeconds": 7260,
       "Retry": [
         {
           "ErrorEquals": [
