@@ -457,7 +457,13 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
             doc = _http_json(url + (f"&page={page}" if page else ""), headers)
             for bucket in doc.get("data", []):
                 for res in bucket.get("results", []):
-                    total += float(res.get("amount", 0) or 0)
+                    # cost_report `amount` is in CENTS (currency minor units),
+                    # not dollars — verified live 2026-07-20 against list
+                    # prices: 9.8M Haiku input tokens reported amount=981.60
+                    # (= $9.82 at $1/MTok), uniformly 100x across every line
+                    # item. Summing as USD overstated the row 100x
+                    # (alpha-engine-config-I2840).
+                    total += float(res.get("amount", 0) or 0) / 100.0
             pages += 1
             if not doc.get("has_more"):
                 break
