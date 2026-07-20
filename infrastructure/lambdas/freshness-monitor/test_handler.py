@@ -1571,9 +1571,215 @@ def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
     artifact_id; artifacts without a block are absent from the map."""
     fake_s3._registry_body = _RECOVERY_REGISTRY
     import index
-    specs, recovery = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, recovery, critical_arms = index.load_registry_with_recovery(
+        fake_s3, "b", "k")
     assert len(specs) == 2
     assert set(recovery) == {"closes_recoverable"}
     assert recovery["closes_recoverable"]["type"] == "step_function"
+    assert critical_arms == {}
     # Back-compat: load_registry still returns just the list.
     assert len(index.load_registry(fake_s3, "b", "k")) == 2
+
+
+# ── config-I3086: dynamic severity + warning escalation ─────────────────────
+
+
+_CHAMPION_ARM_REGISTRY = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  calendar_aware: true
+artifacts:
+  - artifact_id: champion_feed
+    s3_key_template: "predictor/research_free_backfill/feed.parquet"
+    cadence: saturday_sf
+    sla_minutes_after_cron: 60
+    severity: warning
+    owner_repo: alpha-engine-test
+    created_at: 2025-01-01
+    critical_while_champion_arm:
+      - scanner_predictor_direct
+  - artifact_id: plain_warning
+    s3_key_template: "path/{date}/plain.json"
+    cadence: saturday_sf
+    sla_minutes_after_cron: 60
+    severity: warning
+    owner_repo: alpha-engine-test
+    created_at: 2025-01-01
+"""
+
+
+def _keyed_get_object(fake_s3, extra: dict[str, bytes]) -> None:
+    """Route get_object by key: registry body by default, `extra` overrides.
+    A key mapped to None raises (simulates a read failure)."""
+    def _get(*, Bucket, Key):
+        if Key in extra:
+            body = extra[Key]
+            if body is None:
+                raise RuntimeError(f"injected read failure for {Key}")
+            return {"Body": io.BytesIO(body)}
+        return {"Body": io.BytesIO(fake_s3._registry_body)}
+    fake_s3.get_object.side_effect = _get
+
+
+def test_load_registry_parses_critical_while_champion_arm(fake_s3):
+    fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
+    import index
+    _specs, _recovery, critical_arms = index.load_registry_with_recovery(
+        fake_s3, "b", "k")
+    assert critical_arms == {"champion_feed": ["scanner_predictor_direct"]}
+
+
+def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
+    fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
+    import index
+    specs, _r, arms = index.load_registry_with_recovery(fake_s3, "b", "k")
+    _keyed_get_object(fake_s3, {
+        index.CHAMPION_POINTER_KEY:
+            b'{"champion_arm": "scanner_predictor_direct"}',
+    })
+    coerced_specs, coerced_ids = index.apply_dynamic_severity(
+        fake_s3, specs, arms)
+    by_id = {s.artifact_id: s for s in coerced_specs}
+    assert by_id["champion_feed"].severity == "critical"
+    assert by_id["plain_warning"].severity == "warning"
+    assert coerced_ids == {"champion_feed"}
+
+
+def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
+    fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
+    import index
+    specs, _r, arms = index.load_registry_with_recovery(fake_s3, "b", "k")
+    _keyed_get_object(fake_s3, {
+        index.CHAMPION_POINTER_KEY: b'{"champion_arm": "think_tank"}',
+    })
+    coerced_specs, coerced_ids = index.apply_dynamic_severity(
+        fake_s3, specs, arms)
+    assert coerced_ids == set()
+    assert all(s.severity == "warning" for s in coerced_specs)
+
+
+def test_dynamic_severity_pointer_read_failure_fails_toward_critical(fake_s3):
+    """An unreadable champion pointer must coerce LISTED rows to critical —
+    fail toward paging, never toward silence."""
+    fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
+    import index
+    specs, _r, arms = index.load_registry_with_recovery(fake_s3, "b", "k")
+    _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
+    coerced_specs, coerced_ids = index.apply_dynamic_severity(
+        fake_s3, specs, arms)
+    by_id = {s.artifact_id: s for s in coerced_specs}
+    assert coerced_ids == {"champion_feed"}
+    assert by_id["champion_feed"].severity == "critical"
+    assert by_id["plain_warning"].severity == "warning"
+
+
+def test_dynamic_severity_no_listed_rows_skips_pointer_read(fake_s3):
+    """No registry row lists a champion arm → the pointer is never read."""
+    import index
+    calls = []
+    fake_s3.get_object.side_effect = lambda **kw: calls.append(kw)
+    specs_out, coerced = index.apply_dynamic_severity(fake_s3, [], {})
+    assert specs_out == [] and coerced == set()
+    assert calls == []
+
+
+def _warning_spec_and_missing_result(index):
+    from nousergon_lib.artifact_freshness import CheckResult
+    spec = index.ArtifactSpec(
+        artifact_id="champion_feed",
+        s3_bucket="alpha-engine-research",
+        s3_key_template="predictor/research_free_backfill/feed.parquet",
+        cadence="saturday_sf",
+        sla_minutes_after_cron=60,
+        severity="warning",
+        owner_repo="alpha-engine-test",
+        created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(
+        state="missing",
+        reason="not found",
+        canonical_key=spec.s3_key_template,
+        sla_violated_by_minutes=120,
+    )
+    return spec, result
+
+
+def test_maybe_alert_warning_escalates_after_threshold(monkeypatch, fixed_now):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+    spec, result = _warning_spec_and_missing_result(index)
+    assert index._maybe_alert(
+        spec, result, fixed_now,
+        consecutive_miss_runs=index.WARNING_ESCALATION_RUNS) is True
+    body = publish_mock.call_args.args[0]
+    assert "escalated_from=warning" in body
+    assert publish_mock.call_args.kwargs["severity"] == "critical"
+
+
+def test_maybe_alert_warning_below_threshold_stays_console_only(
+        monkeypatch, fixed_now):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock()
+    monkeypatch.setattr(index, "publish", publish_mock)
+    spec, result = _warning_spec_and_missing_result(index)
+    assert index._maybe_alert(
+        spec, result, fixed_now,
+        consecutive_miss_runs=index.WARNING_ESCALATION_RUNS - 1) is False
+    publish_mock.assert_not_called()
+
+
+def test_probe_pass_miss_counter_increments_and_resets(fake_s3, monkeypatch,
+                                                       fixed_now):
+    """The counter carries prev+1 on a confirmed miss and resets to 0 on a
+    fresh probe — verified through _run_probe_pass with a stubbed probe."""
+    import index
+    from nousergon_lib.artifact_freshness import CheckResult
+    spec, missing_result = _warning_spec_and_missing_result(index)
+    monkeypatch.setattr(index, "_check_one",
+                        lambda s3c, sp, now: (missing_result, None))
+    _pairs, _a, _d, _e, counts = index._run_probe_pass(
+        fake_s3, [spec], {}, fixed_now, {"champion_feed": 2})
+    assert counts == {"champion_feed": 3}
+
+    fresh_result = CheckResult(
+        state="fresh", reason="ok", canonical_key=spec.s3_key_template)
+    monkeypatch.setattr(index, "_check_one",
+                        lambda s3c, sp, now: (fresh_result, None))
+    _pairs, _a, _d, _e, counts = index._run_probe_pass(
+        fake_s3, [spec], {}, fixed_now, {"champion_feed": 7})
+    assert counts == {"champion_feed": 0}
+
+
+def test_prev_miss_counts_roundtrip_via_check_results(fake_s3, fixed_now):
+    """_serialize_check_results persists consecutive_miss_runs and
+    _load_prev_miss_counts reads them back — the counter needs no new
+    state surface."""
+    import index
+    spec, result = _warning_spec_and_missing_result(index)
+    payload = index._serialize_check_results(
+        [(spec, result)], fixed_now,
+        miss_counts={"champion_feed": 2}, coerced_ids={"champion_feed"})
+    row = payload["results"][0]
+    assert row["consecutive_miss_runs"] == 2
+    assert row["severity_dynamic"] is True
+    _keyed_get_object(fake_s3, {
+        index.CHECK_RESULTS_KEY: json.dumps(payload).encode(),
+    })
+    assert index._load_prev_miss_counts(fake_s3) == {"champion_feed": 2}
+
+
+def test_prev_miss_counts_missing_file_resets(fake_s3):
+    import index
+    _keyed_get_object(fake_s3, {index.CHECK_RESULTS_KEY: None})
+    assert index._load_prev_miss_counts(fake_s3) == {}

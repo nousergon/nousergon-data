@@ -30,7 +30,11 @@ invocation:
      collapses 4×/hour retries to one alert per cycle per artifact.
      **``severity=warning`` registry rows are console-only** (written to
      ``check_results.json``; no SNS/Telegram — see ARTIFACT_REGISTRY
-     "dashboard-only" convention).
+     "dashboard-only" convention) — with two config-I3086 exceptions:
+     a row listing the live champion arm in ``critical_while_champion_arm``
+     is coerced to critical at probe time, and a warning row
+     confirmed-missing for ``WARNING_ESCALATION_RUNS`` consecutive sweeps
+     escalates to the critical page path.
   6. **OBSERVE-mode gate**: when env
      ``FRESHNESS_MONITOR_ENABLED`` is anything other than
      ``"true"`` (case-insensitive), alerts are suppressed but the
@@ -52,6 +56,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from dataclasses import replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -160,6 +165,27 @@ ALERTS_ENABLED = (
     os.environ.get("FRESHNESS_MONITOR_ENABLED", "false").lower() == "true"
 )
 
+# config-I3086 — dynamic severity + warning escalation. Two post-detection
+# gaps surfaced by the 2026-07-20 stale-champion-feed incident (config-I3053):
+# a row's declared severity is static while "hard-blocks downstream" is a
+# dynamic property of the promoted champion arm, and a severity=warning miss
+# is console-only forever no matter how long it persists.
+#
+# 1. Rows may declare `critical_while_champion_arm: [<arm>, ...]` — effective
+#    severity is coerced to critical at probe time while the live champion
+#    pointer (config/producer_champion.json, field `champion_arm` — the same
+#    pointer crucible-executor's champion.py reads) names a listed arm. A
+#    pointer read failure coerces listed rows to critical too: fail toward
+#    paging, never toward silence.
+# 2. A severity=warning row confirmed-missing for WARNING_ESCALATION_RUNS
+#    consecutive evaluated sweeps escalates to the critical page path. The
+#    counter is carried in check_results.json (`consecutive_miss_runs`), so
+#    no new state surface is introduced.
+CHAMPION_POINTER_KEY = os.environ.get(
+    "CHAMPION_POINTER_KEY", "config/producer_champion.json"
+)
+WARNING_ESCALATION_RUNS = int(os.environ.get("WARNING_ESCALATION_RUNS", "3"))
+
 # ArtifactSpec field set — used to strip extra YAML keys (e.g., the
 # top-level `defaults` shape carries `s3_bucket` which we want, but a
 # future schema extension would otherwise pollute the constructor).
@@ -227,16 +253,20 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
 
 def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
-) -> tuple[list[ArtifactSpec], dict[str, dict]]:
+) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]]]:
     """Like :func:`load_registry`, but also returns the per-artifact
-    ``recovery:`` spec map (config#1240) keyed by ``artifact_id``.
+    ``recovery:`` spec map (config#1240) and the
+    ``critical_while_champion_arm`` map (config-I3086), both keyed by
+    ``artifact_id``.
 
     ``ArtifactSpec`` is a frozen lib dataclass without a ``recovery``
     field (the monitor's dispatch concern is not the substrate's
     freshness concern), so the recovery block is parsed into a parallel
-    map rather than threaded onto the spec. Artifacts without a
-    ``recovery:`` block are simply absent from the map — the dispatch
-    path treats a missing key as "no auto-remediation, page only".
+    map rather than threaded onto the spec; the champion-arm block
+    follows the same pattern. Artifacts without a block are simply
+    absent from the respective map — the dispatch path treats a missing
+    key as "no auto-remediation, page only"; the severity path treats it
+    as "static severity only".
     """
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read()
@@ -247,6 +277,7 @@ def load_registry_with_recovery(
     defaults = data.get("defaults", {}) or {}
     specs: list[ArtifactSpec] = []
     recovery_by_id: dict[str, dict] = {}
+    critical_arms_by_id: dict[str, list[str]] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
@@ -257,7 +288,102 @@ def load_registry_with_recovery(
         recovery = merged.get("recovery")
         if isinstance(recovery, dict):
             recovery_by_id[spec.artifact_id] = recovery
-    return specs, recovery_by_id
+        arms = merged.get("critical_while_champion_arm")
+        if isinstance(arms, list) and arms:
+            critical_arms_by_id[spec.artifact_id] = [str(a) for a in arms]
+    return specs, recovery_by_id, critical_arms_by_id
+
+
+# ── Dynamic severity (config-I3086) ─────────────────────────────────────────
+
+
+def _load_champion_arm(s3_client: Any) -> tuple[str | None, bool]:
+    """Read the live champion pointer. Returns ``(arm, read_failed)``.
+
+    ``read_failed=True`` on any read/parse problem — the caller coerces
+    listed rows to critical in that case (fail toward paging, never
+    toward silence).
+    """
+    try:
+        obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=CHAMPION_POINTER_KEY)
+        pointer = json.loads(obj["Body"].read())
+        arm = pointer.get("champion_arm")
+        if isinstance(arm, str) and arm:
+            return arm, False
+        logger.warning(
+            "champion pointer at %s has no usable champion_arm field: %r",
+            CHAMPION_POINTER_KEY, pointer,
+        )
+        return None, True
+    except Exception as exc:  # noqa: BLE001 — read failure must not sink the pass
+        logger.warning("champion pointer read failed (config-I3086): %s", exc)
+        return None, True
+
+
+def apply_dynamic_severity(
+    s3_client: Any,
+    specs: list[ArtifactSpec],
+    critical_arms_by_id: dict[str, list[str]],
+) -> tuple[list[ArtifactSpec], set[str]]:
+    """Coerce effective severity to ``critical`` for rows whose
+    ``critical_while_champion_arm`` names the live champion arm
+    (config-I3086). Returns ``(specs, coerced_ids)``.
+
+    Root incident: ``research_free_backfill`` was correctly
+    ``severity=warning`` at registration (observational backfill); the
+    2026-07-13 champion promotion silently made it a hard-block live
+    trade feed and nothing re-derived severity — its confirmed miss
+    stayed console-only until the weekday order pipeline hard-failed
+    (config-I3053).
+    """
+    if not critical_arms_by_id:
+        return specs, set()
+    arm, read_failed = _load_champion_arm(s3_client)
+    out: list[ArtifactSpec] = []
+    coerced: set[str] = set()
+    for spec in specs:
+        arms = critical_arms_by_id.get(spec.artifact_id)
+        if arms and spec.severity != "critical" and (read_failed or arm in arms):
+            logger.info(
+                "dynamic severity (config-I3086): %s %s→critical "
+                "(champion_arm=%s%s)",
+                spec.artifact_id, spec.severity, arm,
+                "; pointer unreadable — fail-loud coercion" if read_failed else "",
+            )
+            out.append(dc_replace(spec, severity="critical"))
+            coerced.add(spec.artifact_id)
+        else:
+            out.append(spec)
+    return out, coerced
+
+
+def _load_prev_miss_counts(s3_client: Any) -> dict[str, int]:
+    """Previous sweep's per-artifact ``consecutive_miss_runs`` counters,
+    read back from ``check_results.json`` (config-I3086 warning
+    escalation). Missing/malformed prior results reset all counters —
+    surfaced as a ::warning, never fatal."""
+    try:
+        obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=CHECK_RESULTS_KEY)
+        data = json.loads(obj["Body"].read())
+        return {
+            row["artifact_id"]: int(row.get("consecutive_miss_runs", 0))
+            for row in data.get("results", [])
+            if isinstance(row, dict) and row.get("artifact_id")
+        }
+    except Exception as exc:  # noqa: BLE001 — counter loss degrades to reset, not failure
+        logger.warning(
+            "previous check_results read failed — escalation counters reset "
+            "(config-I3086): %s", exc,
+        )
+        return {}
+
+
+def _is_confirmed_miss(result: CheckResult) -> bool:
+    """The same confirmed-miss shape the alert path fires on: an
+    alerting state past its SLA grace (probe_failed has no grace)."""
+    if result.state not in _ALERTING_STATES:
+        return False
+    return result.state == "probe_failed" or result.sla_violated_by_minutes > 0
 
 
 # ── Per-spec probe (catches per-spec errors so one bad row doesn't sink the pass) ─
@@ -288,10 +414,17 @@ def _check_one(
 
 
 def _serialize_check_results(
-    pairs: list[tuple[ArtifactSpec, CheckResult]], now: datetime
+    pairs: list[tuple[ArtifactSpec, CheckResult]], now: datetime,
+    miss_counts: dict[str, int] | None = None,
+    coerced_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
-    the dashboard surface (Phase 5)."""
+    the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
+    (config-I3086) persist the warning-escalation counters and mark rows
+    whose severity was dynamically coerced, so the dashboard can explain
+    a row paging as critical while the registry declares warning."""
+    miss_counts = miss_counts or {}
+    coerced_ids = coerced_ids or set()
     rows = []
     for spec, result in pairs:
         rows.append(
@@ -299,6 +432,8 @@ def _serialize_check_results(
                 "artifact_id": spec.artifact_id,
                 "owner_repo": spec.owner_repo,
                 "severity": spec.severity,
+                "severity_dynamic": spec.artifact_id in coerced_ids,
+                "consecutive_miss_runs": miss_counts.get(spec.artifact_id, 0),
                 "cadence": spec.cadence,
                 "canonical_key": result.canonical_key,
                 "state": result.state,
@@ -669,7 +804,8 @@ def _maybe_dispatch_recovery(
 _ALERTING_STATES = frozenset({"missing", "stale", "probe_failed"})
 
 
-def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool:
+def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
+                 consecutive_miss_runs: int = 0) -> bool:
     """Route an alert for a non-fresh probe result. Returns True if
     publish was attempted (OBSERVE-mode short-circuit returns False).
 
@@ -707,6 +843,25 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
     # missing/stale respect the spec's severity. Plan §3 invariant 6.
     severity = "critical" if result.state == "probe_failed" else spec.severity
 
+    # config-I3086 warning escalation: a warning row confirmed-missing for
+    # WARNING_ESCALATION_RUNS consecutive evaluated sweeps stops being a
+    # console-only fact and pages via the critical path. One cycle of
+    # console-only is the designed noise floor; a PERSISTENT warning is an
+    # incident nobody is looking at (the I3053 champion-feed staleness sat
+    # on dashboard page 26 for days).
+    escalated = (
+        severity == "warning"
+        and WARNING_ESCALATION_RUNS > 0
+        and consecutive_miss_runs >= WARNING_ESCALATION_RUNS
+    )
+    if escalated:
+        severity = "critical"
+        logger.info(
+            "warning-escalation (config-I3086): %s confirmed-missing for %d "
+            "consecutive sweeps — paging via critical path",
+            spec.artifact_id, consecutive_miss_runs,
+        )
+
     # Registry convention: severity=warning means dashboard/console-only —
     # the operator surface is check_results.json + this page, not ops-health
     # Telegram. Critical (and probe_failed, coerced above) pages via SNS +
@@ -729,6 +884,11 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime) -> bool
         f"sla_violated_by_minutes={result.sla_violated_by_minutes} "
         f"reason={result.reason}"
     )
+    if escalated:
+        body += (
+            f" escalated_from=warning after_consecutive_miss_runs="
+            f"{consecutive_miss_runs}"
+        )
     dedup_key = resolve_dedup_key(spec, now)
 
     publish(
@@ -1058,9 +1218,10 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         now.isoformat(), ALERTS_ENABLED,
     )
 
-    specs, recovery_by_id = load_registry_with_recovery(
+    specs, recovery_by_id, critical_arms_by_id = load_registry_with_recovery(
         s3_client, REGISTRY_BUCKET, REGISTRY_KEY
     )
+    specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
     intraday_specs = [s for s in specs if s.artifact_id in INTRADAY_ARTIFACT_IDS]
     missing_ids = INTRADAY_ARTIFACT_IDS - {s.artifact_id for s in intraday_specs}
     if missing_ids:
@@ -1069,7 +1230,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
             sorted(missing_ids),
         )
 
-    pairs, alerted, dispatched, per_spec_exceptions = _run_probe_pass(
+    pairs, alerted, dispatched, per_spec_exceptions, _miss_counts = _run_probe_pass(
         s3_client, intraday_specs, recovery_by_id, now,
     )
 
@@ -1099,7 +1260,8 @@ def _run_probe_pass(
     specs: list[ArtifactSpec],
     recovery_by_id: dict[str, dict],
     now: datetime,
-) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int]:
+    prev_miss_counts: dict[str, int] | None = None,
+) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int]]:
     """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
     alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions)``.
 
@@ -1108,11 +1270,19 @@ def _run_probe_pass(
     is which `specs` they pass in and what they do with the returned
     `pairs` (the full sweep serializes them to the shared dashboard
     surfaces; the intraday mini-rule only alerts, per `handler`'s docstring).
+
+    ``prev_miss_counts`` (config-I3086) carries the previous sweep's
+    per-artifact consecutive confirmed-miss counters; the returned
+    ``miss_counts`` is this sweep's updated map (persisted into
+    check_results.json by the daily caller — the intraday mini-rule
+    passes None and gets all-zero counters, so it never escalates).
     """
     pairs: list[tuple[ArtifactSpec, CheckResult]] = []
     alerted = 0
     dispatched = 0
     per_spec_exceptions = 0
+    prev_miss_counts = prev_miss_counts or {}
+    miss_counts: dict[str, int] = {}
     # Per-pass cache of lazily-created SF/Lambda clients (shared across the
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
@@ -1144,15 +1314,24 @@ def _run_probe_pass(
         if did_dispatch:
             dispatched += 1
 
+        # config-I3086: consecutive confirmed-miss counter (0 on any
+        # non-miss, including grace/fresh — a recovered artifact resets).
+        miss_runs = (
+            prev_miss_counts.get(spec.artifact_id, 0) + 1
+            if _is_confirmed_miss(result) else 0
+        )
+        miss_counts[spec.artifact_id] = miss_runs
+
         suppress_page = (
             did_dispatch
             and isinstance(recovery, dict)
             and recovery.get("mode", "dispatch_and_page") == "dispatch"
         )
-        if not suppress_page and _maybe_alert(spec, result, now):
+        if not suppress_page and _maybe_alert(
+                spec, result, now, consecutive_miss_runs=miss_runs):
             alerted += 1
 
-    return pairs, alerted, dispatched, per_spec_exceptions
+    return pairs, alerted, dispatched, per_spec_exceptions, miss_counts
 
 
 # ── Main handler ────────────────────────────────────────────────────────────
@@ -1192,20 +1371,27 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
-    specs, recovery_by_id = load_registry_with_recovery(
+    specs, recovery_by_id, critical_arms_by_id = load_registry_with_recovery(
         s3, REGISTRY_BUCKET, REGISTRY_KEY
     )
     logger.info(
-        "loaded %d specs from registry (%d with recovery specs)",
-        len(specs), len(recovery_by_id),
+        "loaded %d specs from registry (%d with recovery specs, %d with "
+        "champion-arm dynamic severity)",
+        len(specs), len(recovery_by_id), len(critical_arms_by_id),
     )
 
-    pairs, alerted, dispatched, per_spec_exceptions = _run_probe_pass(
-        s3, specs, recovery_by_id, now,
+    # config-I3086: dynamic severity + warning-escalation counters.
+    specs, coerced_ids = apply_dynamic_severity(s3, specs, critical_arms_by_id)
+    prev_miss_counts = _load_prev_miss_counts(s3)
+
+    pairs, alerted, dispatched, per_spec_exceptions, miss_counts = _run_probe_pass(
+        s3, specs, recovery_by_id, now, prev_miss_counts,
     )
 
     # Emit dashboard surface + self-heartbeat.
-    check_results = _serialize_check_results(pairs, now)
+    check_results = _serialize_check_results(
+        pairs, now, miss_counts=miss_counts, coerced_ids=coerced_ids,
+    )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
     _put_json(s3, REGISTRY_BUCKET, CHECK_RESULTS_KEY, check_results)
