@@ -11,7 +11,9 @@ Usage:
     df = universe.read("AAPL").data
 
 Libraries:
-    universe          — per-ticker time series (OHLCV + 53 computed features)
+    universe          — per-ticker time series (OHLCV + 53 computed features).
+                        Settled/published values only — see the bitemporal
+                        note below.
     macro             — market-wide time series (VIX, yields, commodities, macro features)
     delisted_history  — survivorship-free retention store: full OHLCV history of
                         tickers pruned from ``universe`` on delisting, so a
@@ -20,6 +22,24 @@ Libraries:
                         want only currently-tradable names and are unaffected by this
                         library's existence. See ``get_delisted_history_lib`` for the
                         record schema/contract (config#1943, Leg 3).
+    preliminary       — intraday/preliminary values, PHYSICALLY separate from
+                        ``universe`` (market-value-integrity L0/L5, config#2459).
+                        A "published report" consumer must read via
+                        ``nousergon_lib.arcticdb.read_settled_only`` (never this
+                        library directly) so it structurally cannot pull an
+                        unsettled value into a final artifact. See
+                        ``get_preliminary_lib``.
+
+Bitemporal schema (config#2459): ``to_arctic_canonical`` additively appends
+six bitemporal columns (``settled``, ``as_of``, ``source_tier``,
+``valid_date``, ``knowledge_time`` — plus the pre-existing ``source``
+column, reused rather than duplicated) to the canonical universe layout
+when present on the input frame, mirroring how ``total_return_close`` was
+added: absent on any pre-migration symbol, so this is a no-op there.
+Corrections to a previously-published settled value are written via
+``nousergon_lib.arcticdb.write_correction`` — a NEW ArcticDB version, never
+an in-place overwrite (native version history IS the correction audit
+trail; see that function's docstring).
 """
 
 from __future__ import annotations
@@ -30,7 +50,14 @@ from typing import Sequence
 
 import arcticdb as adb
 import pandas as pd
-from nousergon_lib.arcticdb import arctic_uri, open_macro_lib, open_universe_lib
+from nousergon_lib.arcticdb import (
+    BITEMPORAL_COLS,
+    PRELIMINARY_LIB,
+    arctic_uri,
+    open_macro_lib,
+    open_preliminary_lib,
+    open_universe_lib,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,8 +103,13 @@ TOTAL_RETURN_COL: str = "total_return_close"
 # offline CRSP-basis build writes a distinct scratch library
 # (e.g. ``universe_crsp``); ``get_scratch_universe_lib`` refuses these
 # names structurally so a misconfigured ``--scratch-lib`` can't clobber
-# the live universe / macro libraries the live pipeline reads.
-_LIVE_LIB_NAMES: frozenset[str] = frozenset({"universe", "macro", "delisted_history"})
+# the live universe / macro libraries the live pipeline reads. Includes
+# ``PRELIMINARY_LIB`` (config#2459) — it is a live producer target (the
+# intraday/preliminary collector writes there directly), so it is exactly
+# as off-limits to a scratch migration as ``universe``/``macro``.
+_LIVE_LIB_NAMES: frozenset[str] = frozenset(
+    {"universe", "macro", "delisted_history", PRELIMINARY_LIB}
+)
 
 _arctic_instance: adb.Arctic | None = None
 
@@ -124,6 +156,36 @@ def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     return open_macro_lib(bucket, create_if_missing=True)
 
 
+def get_preliminary_lib(bucket: str | None = None) -> adb.library.Library:
+    """Get the ``preliminary`` library — intraday/preliminary values,
+    PHYSICALLY separate from ``universe`` (market-value-integrity L0/L5,
+    config#2459).
+
+    Design decision (separate library, NOT an in-``universe`` flag —
+    mirrors ``get_delisted_history_lib``'s precedent, config#1943 Leg 3):
+        A preliminary/intraday collector writes ticks here as they arrive,
+        before they are considered settled/final. Every existing
+        live-trading and published-report consumer of ``universe`` (daily
+        append, features/compute, the morning pipeline, predictor
+        inference) keeps reading ONLY settled data with zero code change —
+        no consumer has to learn a "preliminary" flag or filter it out,
+        because this data physically never lands in ``universe`` in the
+        first place. A "published report" reader must go through
+        ``nousergon_lib.arcticdb.read_settled_only`` (never this function)
+        — that helper hard-codes the ``universe`` library and has no
+        parameter that could point it here, so a future consumer cannot
+        accidentally read preliminary data into a final artifact by
+        getting a flag wrong.
+
+    Delegates to ``nousergon_lib.arcticdb.open_preliminary_lib`` (shared
+    open chokepoint, config#804 pattern). This is a PRODUCER site, so
+    ``create_if_missing`` stays ``True`` to preserve cold-start bootstrap
+    on a fresh bucket.
+    """
+    bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
+    return open_preliminary_lib(bucket, create_if_missing=True)
+
+
 def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
     """Get a SCRATCH universe-shaped library for an offline migration build.
 
@@ -132,11 +194,12 @@ def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.librar
     an isolated library (default ``universe_crsp``) WITHOUT ever touching the
     live ``universe`` library the daily/weekly pipelines read.
 
-    Structurally refuses the live library names (``universe`` / ``macro``):
-    a scratch build must use a distinct name, so a misconfigured
-    ``--scratch-lib`` can never clobber live data. This is the single
-    chokepoint enforcing the "offline, live-untouched" contract — every
-    scratch write goes through here.
+    Structurally refuses every live library name (see ``_LIVE_LIB_NAMES``:
+    currently ``universe`` / ``macro`` / ``delisted_history`` /
+    ``preliminary``): a scratch build must use a distinct name, so a
+    misconfigured ``--scratch-lib`` can never clobber live data. This is
+    the single chokepoint enforcing the "offline, live-untouched"
+    contract — every scratch write goes through here.
     """
     if name in _LIVE_LIB_NAMES:
         raise ValueError(
@@ -251,8 +314,8 @@ def to_arctic_canonical(
     features: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Project a universe-shaped DataFrame to canonical
-    ``OHLCV_COLS + [PROVENANCE_COL] + FEATURES`` order, then strip
-    Categorical dtypes.
+    ``OHLCV_COLS + [PROVENANCE_COL] + BITEMPORAL_COLS + FEATURES`` order,
+    then strip Categorical dtypes.
 
     This is the chokepoint enforcing the universe library's column-order
     contract — every WritePayload / UpdatePayload / ``lib.write`` call
@@ -272,12 +335,27 @@ def to_arctic_canonical(
 
     Behaviour:
         - Intersect-then-reorder. Columns outside
-          ``OHLCV_COLS + [TOTAL_RETURN_COL] + [PROVENANCE_COL] + features``
-          are DROPPED (matches the prior per-site recipe).
+          ``OHLCV_COLS + [TOTAL_RETURN_COL] + [PROVENANCE_COL] +
+          BITEMPORAL_COLS + features`` are DROPPED (matches the prior
+          per-site recipe).
         - ``TOTAL_RETURN_COL`` (``total_return_close``), when present, is
           placed immediately AFTER ``Close`` (CRSP basis, PR7 config#1434).
           Absent on live universe symbols → the layout is byte-identical to
           the pre-PR7 ``OHLCV + source + features`` order there (additive).
+        - ``BITEMPORAL_COLS`` (``settled``, ``as_of``, ``source_tier``,
+          ``valid_date``, ``knowledge_time`` — market-value-integrity
+          L0/L5, config#2459) are placed immediately AFTER
+          ``PROVENANCE_COL`` ("source", which already satisfies the
+          bitemporal schema's "source" field — see
+          ``nousergon_lib.arcticdb`` module docstring for why it is reused
+          rather than duplicated) and BEFORE ``features``, present-only
+          (each column included iff present on the input frame — a
+          producer may write a subset, e.g. only ``settled`` +
+          ``as_of``). Absent on every symbol written before this PR lands
+          → the layout is byte-identical to the pre-config#2459
+          ``OHLCV [+ total_return_close] + source + features`` order
+          there (additive, same no-op-when-absent contract as
+          ``TOTAL_RETURN_COL``).
         - Empty frames pass through unchanged (no copy).
         - Frames already in canonical order and free of categoricals
           pass through unchanged (no copy).
@@ -318,6 +396,7 @@ def to_arctic_canonical(
     canonical: list[str] = (
         head
         + ([PROVENANCE_COL] if PROVENANCE_COL in df.columns else [])
+        + [c for c in BITEMPORAL_COLS if c in df.columns]
         + [f for f in features if f in df.columns]
     )
 
