@@ -5,5 +5,10 @@ boto3>=1.34.0
 # running_instance_ids raises SpotProbeError instead of failing open; index.py
 # imports and handles that exception. EXEMPTED from root-pin lockstep in
 # tests/test_lib_pin_lockstep.py (same contract reason as ci-watch-dispatcher).
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.106.0
-krepis>=0.10.2
+# v0.124.1 (config#2698, nousergon-lib#213) is the first version whose
+# launch_with_fallback falls back to on-demand on SpotQuotaExceededError
+# (account-wide spot quota, e.g. MaxSpotInstanceCountExceeded) the same way
+# it already does for SpotCapacityExhausted — bumped to the latest v0.124.5
+# tag to pick that up.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.5
+krepis>=0.14.0

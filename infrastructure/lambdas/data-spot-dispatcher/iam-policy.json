@@ -48,6 +48,27 @@
       "Condition": {
         "StringEquals": { "ec2:ResourceTag/Name": "alpha-engine-data-spot" }
       }
+    },
+    {
+      "Sid": "AlertOnSpotQuotaExceeded",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+      ]
+    },
+    {
+      "Sid": "AlertDedupMarkerStore",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
     }
   ]
 }
