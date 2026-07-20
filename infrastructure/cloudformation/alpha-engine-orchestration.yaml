@@ -307,12 +307,23 @@ Resources:
       # UTC cron on AWS::Events::Rule (no ScheduleExpressionTimezone support)
       # silently assumed PDT (UTC−7); during PST the effective PT start would
       # have shifted an hour earlier (i.e. MORE buffer, not less — benign,
-      # but not the documented 5:15 AM PT contract). EventBridge Scheduler
-      # now resolves the cron against America/Los_Angeles directly, so the
-      # 12:15 UTC-equivalent cron expression below auto-adjusts across the
-      # DST boundary and always fires at 5:15 AM PT.
+      # but not the documented 5:15 AM PT contract).
+      #
+      # CORRECTED 2026-07-20 (alpha-engine-data#<PR>): the 2026-07-14 deploy
+      # left the cron hour at the OLD bare-UTC value (12) while adding
+      # ScheduleExpressionTimezone. With ScheduleExpressionTimezone set,
+      # EventBridge Scheduler evaluates the cron fields AS LOCAL TIME IN THAT
+      # ZONE directly — it does NOT treat the expression as a UTC value to be
+      # DST-adjusted. `cron(15 12 ...)` + America/Los_Angeles therefore fired
+      # at 12:15 PM PT, not 5:15 AM PT — a ~7h miss that went undetected over
+      # the 7/18-7/19 weekend and first misfired live Mon 2026-07-20 (caught
+      # same day, recovered via a manual StartExecution; see
+      # nousergon/alpha-engine-config incident follow-up). Fix: author the
+      # cron hour directly in the target zone (5, not 12) — Scheduler's
+      # America/Los_Angeles resolution then makes it DST-aware for free
+      # across the PDT/PST boundary, same as StopTradingSchedule below.
       Description: Weekday 5:15 AM PT (DST-aware) — daily data + predictor + executor; daemon ready before 06:30 PT open
-      ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
+      ScheduleExpression: 'cron(15 5 ? * MON-FRI *)'
       ScheduleExpressionTimezone: 'America/Los_Angeles'
       FlexibleTimeWindow:
         Mode: 'OFF'
