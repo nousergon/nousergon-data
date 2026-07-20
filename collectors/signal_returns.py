@@ -15,6 +15,12 @@ Target tables in research.db:
     cutover). New horizon-agnostic columns: actual_log_alpha, horizon_days,
     correct. Legacy columns (actual_5d_return, correct_5d) dual-written
     during the transition window for backtester COALESCE fallback.
+  - score_performance_outcomes: the long-format outcome store (EPIC
+    config#1483). Written at ``_DECAY_CURVE_POLICY``'s horizons — the fleet
+    DEFAULT_POLICY's primary (21d) + diagnostic (5d) plus config#1981's
+    intermediate decay-curve diagnostics (1d/3d/10d/15d) — so the backtester's
+    alpha-decay-curve consumer has enough points between the two canonical
+    horizons to plot a real fade-over-time curve, not just two endpoints.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from datetime import date, datetime, timezone
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
+from nousergon_lib.quant.horizons import DEFAULT_POLICY, HorizonPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +43,34 @@ logger = logging.getLogger(__name__)
 # YAML setting; until then this constant is the source of truth and the
 # `forward_days` parameter on `collect` lets call sites override.
 _DEFAULT_FORWARD_DAYS = 21
+
+# config#1981 — alpha-decay-curve intermediate-horizon ladder (operator
+# ruling "Option A", 2026-07-16): score_performance_outcomes previously only
+# carried the fleet DEFAULT_POLICY's two horizons (5d diagnostic, 21d
+# primary), which is not enough points to plot a genuine decay curve. This
+# is a LOCAL policy override, constructed the same way the producer's own
+# test suite already demonstrates (test_signal_returns_outcome_records.py
+# ``HorizonPolicy(primary_horizon=21, diagnostic_horizons=(5, 10))``) —
+# deliberately NOT a change to nousergon_lib's fleet-wide DEFAULT_POLICY
+# (that constant is consumed by the predictor/evaluator/executor too; a
+# schema/label decision like widening it is out of scope here). Diagnostic
+# horizons are graceful-empty by design (HorizonPolicy contract), so any
+# entry whose universe_returns columns aren't populated yet (or an older
+# row predating this PR) is skipped, not an error — see
+# ``_backfill_outcome_records``'s per-horizon column-existence check.
+#
+# Ladder choice: 1d/3d/5d/10d/15d/21d. 5d and 21d are the pre-existing
+# canonical points; 10d already had raw universe_returns columns (added
+# for the retired legacy 10d horizon, config#1456) but was never wired into
+# the long-format outcome store. 1d/3d/15d are genuinely new
+# universe_returns columns (this PR) chosen to give roughly even coverage
+# of the first three trading weeks post-entry, where alpha decay is
+# expected to be steepest.
+_DECAY_CURVE_DIAGNOSTIC_HORIZONS: tuple[int, ...] = (1, 3, 5, 10, 15)
+_DECAY_CURVE_POLICY = HorizonPolicy(
+    primary_horizon=DEFAULT_POLICY.primary_horizon,
+    diagnostic_horizons=_DECAY_CURVE_DIAGNOSTIC_HORIZONS,
+)
 
 
 def collect(
@@ -88,7 +123,16 @@ def collect(
     # (analysis.outcome_store & peers; burn-down allowlists {} fleet-wide), so a
     # write failure must FAIL the whole collector step — the Phase-2 dual-write
     # soak that let it degrade to status:partial is retired.
-    results["backfill_outcome_records"] = _backfill_outcome_records(db_path, dry_run)
+    #
+    # Policy: _DECAY_CURVE_POLICY (config#1981), a LOCAL extension of
+    # DEFAULT_POLICY's diagnostic horizons (adds 1d/3d/10d/15d alongside the
+    # existing 5d) so the long-format store carries enough intermediate
+    # points for a real alpha-decay curve. The primary horizon (21d) is
+    # unchanged — this only adds diagnostic ROWS, no schema change, per the
+    # HorizonPolicy contract (nousergon_lib.quant.horizons).
+    results["backfill_outcome_records"] = _backfill_outcome_records(
+        db_path, dry_run, policy=_DECAY_CURVE_POLICY,
+    )
 
     # Step 2c — wide-column bookkeeping ECHO. The horizon-suffixed OUTCOME
     # columns (return_/spy_*_return/beat_spy_/log_alpha_21d) are RETIRED: no
