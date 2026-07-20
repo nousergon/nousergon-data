@@ -20,6 +20,15 @@
 # per run ⇒ ~$1.2/mo, visible in the collector's own AWS row).
 #   cron(15 0,12 * * ? *)
 #
+# Plus ONE monthly reconciliation run (alpha-engine-config#2849) — 03:00 UTC
+# on the 2nd of each month, after every provider has finalized the prior
+# month's numbers (AWS CE data lags ~24h; GitHub/Anthropic/Neon settle same-
+# day-ish; the 2nd gives every provider a full day's slack past rollover).
+# Same Lambda, same code — the ONLY difference from the twice-daily rule is
+# the Scheduler target's `Input`, which flips `event["mode"]` to "reconcile"
+# (see index.py::handler's dispatch). No separate function/deploy path.
+#   cron(0 3 2 * ? *)
+#
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
 # blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
 # fleet-wide policy after 4 IAM-clobber incidents — infrastructure/iam/README.md).
@@ -52,9 +61,15 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 SCHED_NAMES=(
   "alpha-engine-expense-collector-twicedaily"
+  "alpha-engine-expense-collector-reconcile-monthly"
 )
 SCHED_CRONS=(
   "cron(15 0,12 * * ? *)"
+  "cron(0 3 2 * ? *)"
+)
+SCHED_INPUTS=(
+  "{}"
+  "{\"mode\":\"reconcile\"}"
 )
 SCHED_PREFIX="alpha-engine-expense-collector-"
 
@@ -161,7 +176,9 @@ if $BOOTSTRAP; then
   for i in "${!SCHED_NAMES[@]}"; do
     name="${SCHED_NAMES[$i]}"
     cron="${SCHED_CRONS[$i]}"
-    target="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
+    input_json="${SCHED_INPUTS[$i]}"
+    target=$(printf '{"Arn":"%s","RoleArn":"%s","Input":%s}' \
+      "${FN_ARN}" "${SCHED_ROLE_ARN}" "$(printf '%s' "${input_json}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
       run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \

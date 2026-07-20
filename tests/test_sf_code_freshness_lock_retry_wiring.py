@@ -96,6 +96,58 @@ def test_self_heal_git_mutations_go_through_git_retry() -> None:
     assert "sudo -u ec2-user git -C $d reset" not in self_heal
 
 
+def test_self_heal_reclaim_is_detect_guarded_and_nonfatal() -> None:
+    """The ownership-reclaim chown must not be a bare, fatal `chown -R`.
+
+    2026-07-20 preopen FailExecution (recurrence of the 2026-07-08 concurrent-
+    writer class, on the one self-heal op left outside the flock protocol): the
+    self-heal's ``chown -R ec2-user:ec2-user $d`` recursed into ``$d/.venv`` and
+    raced boot-pull.service's concurrent ``pip install`` — which runs OUTSIDE the
+    shared git flock, so the flock cannot serialize it. chown -R hit a
+    ``.dist-info`` directory pip had just removed mid-upgrade
+    (``chown: cannot access '.../nousergon_lib-0.116.0.dist-info': No such file
+    or directory``), returned rc=1, and under ``set -eo pipefail`` that aborted
+    the whole gate: COMMAND_FAILED -> HandleFailure -> FailExecution, no orders.
+
+    boot-pull.sh (crucible-executor infrastructure/) already solved this exact
+    race and the gate must mirror it: (a) DETECT foreign ownership first
+    (``find $d -not -user ec2-user -print -quit``) so the clean path chowns
+    nothing and never touches the churning .venv, and (b) chown NON-FATALLY
+    (``|| ...``) so a transient pip-churn ENOENT cannot fail the gate. This is
+    NOT a fail-loud regression: a genuinely unreclaimable root-owned tree still
+    fails LOUD one line later at ``git_retry -C $d reset --hard`` (under
+    pipefail), which is the real gate the 2026-07-06 root-owned-checkout
+    incident exists to catch.
+    """
+    cmds = _gate_commands()
+    self_heal = next((c for c in cmds if "SELF-HEAL" in c), None)
+    assert self_heal is not None, "CodeFreshnessGate self-heal line missing."
+
+    # (a) DETECT-first: the reclaim is guarded by a foreign-ownership scan that
+    # short-circuits the clean path (mirrors boot-pull.sh's reclaim guard).
+    assert "find $d -not -user ec2-user -print -quit" in self_heal, (
+        "self-heal ownership reclaim must DETECT foreign ownership first "
+        "(`find $d -not -user ec2-user -print -quit`) so the common clean path "
+        "never runs chown -R over the concurrently pip-churned $d/.venv "
+        "(2026-07-20 .dist-info ENOENT race with boot-pull.service)."
+    )
+
+    # (b) NON-FATAL: the chown must have a `||` fallback so a transient ENOENT
+    # from boot-pull's concurrent .venv pip churn cannot abort the gate under
+    # `set -eo pipefail`. The bare, fatal `chown -R ...; ` form must be gone.
+    assert "chown -R ec2-user:ec2-user $d ||" in self_heal, (
+        "the ownership-reclaim chown must be NON-FATAL (`chown -R ... $d || ...`) "
+        "so a transient pip-churn ENOENT under $d/.venv can't fail the gate; the "
+        "git_retry reset below stays the fail-loud gate for a genuinely "
+        "unreclaimable root-owned tree."
+    )
+    assert "chown -R ec2-user:ec2-user $d; " not in self_heal, (
+        "the bare, FATAL `chown -R ec2-user:ec2-user $d;` form (fatal under "
+        "`set -eo pipefail`) must not return — it is exactly the 2026-07-20 "
+        "FailExecution root cause."
+    )
+
+
 def test_fetch_loop_goes_through_git_retry() -> None:
     cmds = _gate_commands()
     fetch = next((c for c in cmds if "fetch --quiet origin main" in c), None)

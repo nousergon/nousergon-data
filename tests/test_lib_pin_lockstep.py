@@ -14,6 +14,11 @@ image — the Dockerfile's hardcoded pin wins. The slim
 ``requirements-daily-news.txt`` (standalone daily-news collector on the
 dashboard box) carries its own copy of the pin and its header demands
 lockstep with ``requirements.txt`` — so it is guarded here too.
+``.github/workflows/deploy-infrastructure.yml`` also carries its own
+hardcoded ``pip install`` pin for its drift-check alerting step
+(``nousergon_lib.alerts``) and is guarded here for the same reason
+(alpha-engine-config#2999: this file drifted a full version behind
+``requirements.txt`` undetected until this test covered it).
 
 Some Lambdas have deliberate exemptions documented in their requirements.txt
 comments. These must move in lockstep within their exemption group (e.g., all
@@ -59,23 +64,30 @@ _LAMBDA_PIN_RE = re.compile(
 # Key: lambda directory name, Value: (pin version, contract reason)
 _LAMBDA_PIN_EXEMPTIONS = {
     "canary-replay-dispatcher": (
-        "v0.106.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246: same SpotProbeError "
-        "handling as ci-watch-dispatcher)",
+        "handling as ci-watch-dispatcher; bumped for config#2698 SpotQuotaExceededError "
+        "on-demand fallback, first available at v0.124.1)",
     ),
     "alert-drain-dispatcher": (
-        "v0.122.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2824: same "
-        "extra_tags atomic-launch-tagging floor as ci-watch-dispatcher, config#2292)",
+        "extra_tags atomic-launch-tagging floor as ci-watch-dispatcher, config#2292; bumped "
+        "for config#2698 SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
     "ci-watch-dispatcher": (
-        "v0.122.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
-        "bumped for extra_tags atomic-launch-tagging, config#2292)",
+        "bumped for extra_tags atomic-launch-tagging, config#2292; bumped for config#2698 "
+        "SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
     "data-spot-dispatcher": (
-        "v0.83.0",
-        "ec2_spot launch chokepoint (config#1767)",
+        "v0.124.5",
+        "ec2_spot launch chokepoint (config#1767); bumped for config#2698 "
+        "SpotQuotaExceededError availability (krepis>=0.14.0, first shipped in "
+        "krepis#28) — index.py's own _launch_instance now handles it directly "
+        "(this Lambda calls nousergon_lib.ec2_spot.launch() directly rather than "
+        "through spot_dispatch.launch_with_fallback)",
     ),
     "eod-backstop": (
         "v0.83.0",
@@ -120,12 +132,13 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.124.0",
+        "v0.124.5",
         "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
         "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409); "
         "v0.124.0 for nousergon_lib.github_app — _github_token() mints the "
         "ne-groomer App installation token first, PAT fallback (config-I2785, "
-        "nousergon-lib#220, incident config-I2784)",
+        "nousergon-lib#220, incident config-I2784); bumped to v0.124.5 for config#2698 "
+        "SpotQuotaExceededError on-demand fallback, first available at v0.124.1",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",
@@ -136,9 +149,10 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "sf-watch-spot-dispatcher": (
-        "v0.122.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
-        "bumped for extra_tags atomic-launch-tagging, config#2292)",
+        "bumped for extra_tags atomic-launch-tagging, config#2292; bumped for config#2698 "
+        "SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
     "spot-orphan-reaper": (
         "v0.97.0",
@@ -160,13 +174,18 @@ def test_requirements_and_dockerfile_pins_match():
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
     docker_pin = _read_pin("Dockerfile", _DOCKERFILE_PIN_RE)
     daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
-    assert req_pin == docker_pin == daily_news_pin, (
+    deploy_infra_pin = _read_pin(
+        ".github/workflows/deploy-infrastructure.yml", _LAMBDA_PIN_RE
+    )
+    assert req_pin == docker_pin == daily_news_pin == deploy_infra_pin, (
         f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
-        f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}. "
-        f"All three must move in lockstep — the Dockerfile strips lib from "
+        f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}, "
+        f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}. "
+        f"All four must move in lockstep — the Dockerfile strips lib from "
         f"requirements.txt before pip install, so requirements-only bumps "
-        f"don't propagate to the Lambda image, and the slim daily-news file "
-        f"carries an independent copy of the pin."
+        f"don't propagate to the Lambda image, the slim daily-news file "
+        f"carries an independent copy of the pin, and the deploy-infrastructure "
+        f"workflow's drift-check step installs its own copy directly."
     )
 
 

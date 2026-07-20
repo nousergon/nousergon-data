@@ -308,11 +308,18 @@ Resources:
       # silently assumed PDT (UTC−7); during PST the effective PT start would
       # have shifted an hour earlier (i.e. MORE buffer, not less — benign,
       # but not the documented 5:15 AM PT contract). EventBridge Scheduler
-      # now resolves the cron against America/Los_Angeles directly, so the
-      # 12:15 UTC-equivalent cron expression below auto-adjusts across the
-      # DST boundary and always fires at 5:15 AM PT.
+      # resolves the cron below against America/Los_Angeles directly, so it
+      # is written in LOCAL PT TIME (05:15), not UTC, and auto-adjusts
+      # across the DST boundary to always fire at 5:15 AM PT.
+      # INCIDENT 2026-07-20 (first weekday after the migration deployed):
+      # the migration originally kept the old UTC cron hour (15 12) while
+      # switching the timezone to America/Los_Angeles, which means 12:15 PM
+      # PT — the pipeline never fired pre-open and would have launched
+      # mid-trading-day instead. When pairing ScheduleExpressionTimezone
+      # with an expression, the expression must be converted to that zone's
+      # local time.
       Description: Weekday 5:15 AM PT (DST-aware) — daily data + predictor + executor; daemon ready before 06:30 PT open
-      ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
+      ScheduleExpression: 'cron(15 5 ? * MON-FRI *)'
       ScheduleExpressionTimezone: 'America/Los_Angeles'
       FlexibleTimeWindow:
         Mode: 'OFF'

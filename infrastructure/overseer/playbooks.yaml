@@ -90,7 +90,11 @@ playbooks:
     enabled: true
     executor_function: alpha-engine-ci-watch-dispatcher
     executor_lambda_dir: ci-watch-dispatcher
-    benign_reasons: [concurrent_skip, disabled]
+    # signature_repeat_skip (config#2862): a signature marker for (repo,
+    # today) already carries a fix_pr — the dispatcher declined to spend a
+    # fresh spot launch on a SHA-independent defect a prior box today
+    # already diagnosed+fixed. By-design decline, not a wiring bug.
+    benign_reasons: [concurrent_skip, disabled, signature_repeat_skip]
     charter: alpha-engine-config/.github/ci-watch-prompt.md
     concurrency_domain: EC2 tag lock on (repo, sha) — per-commit, not per-repo.
     supports_drill: true

@@ -1804,14 +1804,14 @@
             },
             "ReplayConcordance": {
               "Type": "Task",
-              "Comment": "Weekly cheap-model concordance Lambda (ROADMAP P0, agent-justification gate signal #3). Replays each captured DecisionArtifact in the trailing 8-week window under the configured target model(s) via langchain_anthropic.with_structured_output against the canonical agent_schemas Pydantic contract; aggregates agreement_score per (agent_id_base, target_model); emits CW metric agent_cheap_model_concordance; persists per-target summary JSON to decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json. Default target: claude-haiku-4-5 (Sonnet→Haiku concordance ≈ \"is the larger model earning its cost?\"). Runs every Saturday after RationaleClustering.",
+              "Comment": "Weekly cheap-model concordance Lambda (ROADMAP P0, agent-justification gate signal #3). Replays each captured DecisionArtifact in the trailing 8-week window under the configured target model(s) via krepis.llm.LLMClient's OpenRouter transport (alpha-engine-config-I2997, 2026-07-19 -- migrated off langchain_anthropic.ChatAnthropic) against the canonical agent_schemas Pydantic contract; aggregates agreement_score per (agent_id_base, target_model); emits CW metric agent_cheap_model_concordance; persists per-target summary JSON to decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json. Default target: deepseek/deepseek-v4-flash (cheap-model concordance vs the champion's Anthropic-tier agents). Runs every Saturday after RationaleClustering.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-replay-concordance:live",
                 "Payload": {
                   "end_time_iso.$": "$$.Execution.StartTime",
                   "target_models": [
-                    "claude-haiku-4-5"
+                    "deepseek/deepseek-v4-flash"
                   ],
                   "window_days": 56,
                   "max_artifacts": 150,
@@ -3472,13 +3472,13 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "executionTimeout": [
-            "3600"
+            "7200"
           ],
           "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{}',$.preflight_args))"
         },
-        "TimeoutSeconds": 3600
+        "TimeoutSeconds": 7200
       },
-      "TimeoutSeconds": 3660,
+      "TimeoutSeconds": 7260,
       "Retry": [
         {
           "ErrorEquals": [
