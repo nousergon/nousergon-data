@@ -129,6 +129,19 @@ class TestEvaluatorTask:
         cmds = extract_commands(states["Evaluator"])
         spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
         assert "--skip-stages=backtest,parity" in spot_cmd
+        # 2026-07-20: pit_parity was the ONE stage no SF state's flags
+        # excluded here — the three backtest states pass --no-pit-parity and
+        # Parity owns it via --pit-parity-enabled=1, but the Evaluator was
+        # forgotten, so the config#2871 pit-parity sweep (which does not
+        # marker-skip) re-ran a 2h predictor-sim walkforward inside the
+        # Evaluator's budget and SIGKILLed it twice
+        # (watch-rerun-2026-07-18-10/-11). Single-producer decomposition:
+        # alpha-engine-config-I3112.
+        assert "--no-pit-parity" in spot_cmd, (
+            "Evaluator must pass --no-pit-parity (Parity owns pit_parity); "
+            "without it the pit-parity sweep free-rides in the Evaluator's "
+            "timeout budget"
+        )
 
     def test_writes_to_evaluator_log(self, states):
         # Tee output into /var/log/evaluator.log so it's distinguishable

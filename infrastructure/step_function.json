@@ -3465,7 +3465,7 @@
     },
     "Evaluator": {
       "Type": "Task",
-      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
+      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it — the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3474,7 +3474,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
