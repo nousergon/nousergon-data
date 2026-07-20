@@ -1539,7 +1539,12 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     # drift class (one copy gets updated, the other silently doesn't).
     # Both call sites now derive from the single module-level
     # _MACRO_DAILY_TICKERS constant so SPY (and any future addition) can't
-    # drift out of one path while staying in the other.
+    # drift out of one path while staying in the other. NOTE: kept as the
+    # direct constant reference (not routed through the newer
+    # _augment_with_macro_daily_tickers helper added for config#2898) — this
+    # exact literal is pinned by
+    # test_morning_enrich_and_daily_arctic_append_share_one_macro_ticker_list's
+    # `"_MACRO_DAILY_TICKERS" in inspect.getsource(...)` source-text guard.
     tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
     logger.info("=" * 60)
@@ -2352,6 +2357,15 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         results["completed_at"] = datetime.now(timezone.utc).isoformat()
         return results
 
+    # config#2898: union with _MACRO_DAILY_TICKERS here — the evening twin
+    # (_run_daily_arctic_append, via _load_daily_universe_tickers) already
+    # did this, but this morning path never did, so SPY (and the other macro
+    # tickers) were silently absent from expected_tickers on every morning
+    # run regardless of which of the three branches above populated
+    # `tickers`. Applied post-branch so it covers the direct-read,
+    # pointer-fallback, AND Wikipedia-fallback paths uniformly.
+    tickers = _augment_with_macro_daily_tickers(tickers)
+
     logger.info("=" * 60)
     logger.info("APPENDING: ArcticDB universe (arctic-append state, %s)", target_date)
     logger.info("=" * 60)
@@ -2570,6 +2584,19 @@ _MACRO_DAILY_TICKERS = [
 ]
 
 
+def _augment_with_macro_daily_tickers(tickers: list[str]) -> list[str]:
+    """Union ``tickers`` with :data:`_MACRO_DAILY_TICKERS`, de-duplicated.
+
+    config#2898: every constructor of a ``daily_append``/``expected_tickers``
+    input must route through this ONE function, not re-inline the union —
+    two independent inline copies is exactly how the morning-arctic-append
+    caller silently diverged from the evening one and dropped SPY out of its
+    expected-ticker scope while the evening path kept it. Routing all callers
+    through here guarantees the macro tickers (SPY included) reach
+    ``expected_tickers`` regardless of which entrypoint constructed the list."""
+    return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
+
+
 def _load_daily_universe_tickers(config: dict) -> list[str]:
     """Load the daily universe (S3 constituents → Wikipedia fallback) plus the
     macro daily tickers. Shared by :func:`_run_daily` and
@@ -2594,7 +2621,7 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
     if not tickers:
         return []
-    return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
+    return _augment_with_macro_daily_tickers(tickers)
 
 
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
