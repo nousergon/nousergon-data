@@ -18,6 +18,7 @@ PR758 post-launch create_tags bounded-retry/terminate path is gone entirely.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -47,6 +48,33 @@ def _install_stubs(launch_impl, boto_clients):
     boto3_mod = types.ModuleType("boto3")
     boto3_mod.client = lambda name, **kw: boto_clients[name]
     sys.modules["boto3"] = boto3_mod
+
+
+class _FakeS3Body:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakeS3:
+    """Fake S3 client for the config#2862 signature-repeat probe.
+
+    ``objects`` maps a full S3 key to its raw JSON bytes content (signature
+    markers, mirroring scheduled-groom-dispatcher/test_handler.py's _FakeS3
+    shape for consistency across the fleet's dispatcher test suites).
+    """
+
+    def __init__(self, objects: dict | None = None):
+        self._objects = objects or {}
+
+    def list_objects_v2(self, Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        keys = [k for k in self._objects if k.startswith(Prefix)]
+        return {"Contents": [{"Key": k} for k in keys]}
+
+    def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
+        return {"Body": _FakeS3Body(self._objects[Key])}
 
 
 class _FakeWaiter:
@@ -88,12 +116,14 @@ class _FakeSsm:
         return {"Command": {"CommandId": "cmd-123"}}
 
 
-def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None):
+def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None,
+         s3_objects=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm()
     ec2 = _FakeEc2(running_instances=running_instances)
-    clients = {"ec2": ec2, "ssm": ssm}
+    s3 = _FakeS3(s3_objects)
+    clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
@@ -134,6 +164,7 @@ def _load(monkeypatch, *, launch_impl=None, env=None, running_instances=None):
     importlib.reload(index)
     index._test_ssm = ssm  # expose for assertions
     index._test_ec2 = ec2
+    index._test_s3 = s3
     return index
 
 
@@ -519,3 +550,166 @@ def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch)
     assert "sf-watch-drill" not in calls["extra_tags"]
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert '--is-drill "false"' in cmd
+
+
+# ── config#2862: signature-repeat launch dedup ───────────────────────────────
+# A SHA-independent latent infra defect fails EVERY new commit's CI, so the
+# (repo, sha) concurrency lock above can never collapse it — each of N
+# post-merge commits legitimately gets a distinct sha and its own box, even
+# though every box will independently diagnose the SAME root cause and no-op
+# as a REPEAT. These tests pin the additional pre-launch check: consult the
+# S3 signature control-plane (populated by the on-box agents themselves via
+# ci_watch_claim_attempt_signature.sh) for ANY marker under
+# ci_watch/_control/signatures/{repo}/{today}/ that already carries a
+# fix_pr — a hit skips the launch; no markers / no fix_pr yet / any read
+# failure all fail OPEN (launch proceeds), per the binding coverage-beats-
+# dedup guardrail.
+
+
+def _sig_key(idx, repo: str, sig_hash: str = "abc123def456") -> str:
+    from datetime import datetime, timezone
+
+    repo_flat = repo.replace("/", "-")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"{idx.CI_WATCH_SIGNATURES_PREFIX}/{repo_flat}/{today}/{sig_hash}.json"
+
+
+def test_known_repeat_signature_with_fix_pr_skips_launch(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-new"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    key = _sig_key(idx, "nousergon/alpha-engine-config")
+    idx._test_s3._objects[key] = json.dumps({
+        "repo": "nousergon/alpha-engine-config",
+        "signature_hash": "abc123def456",
+        "count": 3,
+        "fix_pr": "https://github.com/nousergon/nousergon-data/pull/999",
+    }).encode("utf-8")
+
+    out = idx.handler(_event(), None)
+    assert out["launched"] is False
+    assert out["reason"] == "signature_repeat_skip"
+    assert launched == []  # never even attempted a spot launch
+
+
+def test_new_unknown_signature_still_launches(monkeypatch):
+    """No markers at all for (repo, today) — brand-new/unknown failure
+    landscape — must launch normally (coverage beats dedup)."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["reason"] == "launched"
+
+
+def test_signature_marker_without_fix_pr_still_launches(monkeypatch):
+    """A signature IS already recorded today, but no fix_pr yet (still an
+    open, unresolved recurrence) — must still launch; only a KNOWN fix
+    suppresses the launch."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+    key = _sig_key(idx, "nousergon/alpha-engine-config")
+    idx._test_s3._objects[key] = json.dumps({
+        "repo": "nousergon/alpha-engine-config",
+        "signature_hash": "abc123def456",
+        "count": 1,
+        "fix_pr": None,
+    }).encode("utf-8")
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+
+
+def test_signature_probe_failure_fails_open_and_still_launches(monkeypatch):
+    """Any list/read error on the signature probe must fail OPEN — never
+    silently treated as a known repeat (binding guardrail, config#2862)."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+
+    def _boom(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        raise RuntimeError("S3 ListObjectsV2 throttled")
+
+    idx._test_s3.list_objects_v2 = _boom
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert out["reason"] == "launched"
+
+
+def test_malformed_signature_marker_fails_open_and_still_launches(monkeypatch):
+    """A marker that fails to parse as JSON must also fail open, not crash
+    the dispatch or get silently mis-treated as a repeat."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+    key = _sig_key(idx, "nousergon/alpha-engine-config")
+    idx._test_s3._objects[key] = b"{not valid json"
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+
+
+def test_signature_repeat_skip_does_not_attempt_concurrency_probe_or_ssm(monkeypatch):
+    """A signature-repeat skip is decided BEFORE the (repo, sha) concurrency
+    probe/spot launch/SSM send — none of those side effects should fire."""
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    key = _sig_key(idx, "nousergon/alpha-engine-config")
+    idx._test_s3._objects[key] = json.dumps({
+        "fix_pr": "https://github.com/nousergon/nousergon-data/pull/999",
+    }).encode("utf-8")
+
+    def _boom_describe(Filters):  # noqa: N803 — boto3 kwarg names
+        raise AssertionError("concurrency probe must not run after a signature_repeat_skip")
+
+    idx._test_ec2.describe_instances = _boom_describe
+    out = idx.handler(_event(), None)
+    assert out["launched"] is False
+    assert out["reason"] == "signature_repeat_skip"
+    assert idx._test_ssm.sent == []
+
+
+def test_signature_check_scoped_to_repo_and_today_only(monkeypatch):
+    """A fix_pr-bearing marker for a DIFFERENT repo, or a DIFFERENT (past)
+    date, must not suppress today's launch for THIS repo."""
+    from datetime import datetime, timedelta, timezone
+
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+    other_repo_key = _sig_key(idx, "nousergon/other-repo")
+    idx._test_s3._objects[other_repo_key] = json.dumps({
+        "fix_pr": "https://github.com/nousergon/nousergon-data/pull/999",
+    }).encode("utf-8")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    stale_key = f"{idx.CI_WATCH_SIGNATURES_PREFIX}/nousergon-alpha-engine-config/{yesterday}/old.json"
+    idx._test_s3._objects[stale_key] = json.dumps({
+        "fix_pr": "https://github.com/nousergon/nousergon-data/pull/111",
+    }).encode("utf-8")
+
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+
+
+def test_drill_skips_signature_probe_entirely(monkeypatch):
+    """The weekly canary drill must always exercise the real launch pipe —
+    it never consults (or is blocked by) the signature control-plane."""
+    idx = _load(
+        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-stub",  # noqa: E731
+        env={"CI_WATCH_DISPATCH_ENABLED": "true"},
+    )
+
+    def _boom_list(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
+        raise AssertionError("drill dispatch must not consult the signature control-plane")
+
+    idx._test_s3.list_objects_v2 = _boom_list
+    out = idx.handler({"is_drill": "true"}, None)
+    assert out["launched"] is True
