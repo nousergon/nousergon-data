@@ -185,7 +185,10 @@ if $BOOTSTRAP; then
   # Target is the ROUTER: the drill's ENTIRE identity (repo/sha/run_id/...) is
   # still synthesized in the executor's index.py (DRILL_REPO isolation
   # invariant), so the wrapped payload carries only {is_drill:true}.
-  CANARY_TARGET="{\"Arn\":\"${OVERSEER_ROUTER_ARN}\",\"RoleArn\":\"${OVERSEER_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"playbook\\\":\\\"ci-watch\\\",\\\"payload\\\":{\\\"is_drill\\\":\\\"true\\\"}}\"}"
+  # config#2902: zero-retry — AWS Scheduler's 185-attempt default would
+  # re-dispatch this drill payload for up to a day on any transient router
+  # error, masking real dispatch problems behind noisy re-fires.
+  CANARY_TARGET="{\"Arn\":\"${OVERSEER_ROUTER_ARN}\",\"RoleArn\":\"${OVERSEER_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"playbook\\\":\\\"ci-watch\\\",\\\"payload\\\":{\\\"is_drill\\\":\\\"true\\\"}}\",\"RetryPolicy\":{\"MaximumRetryAttempts\":0,\"MaximumEventAgeInSeconds\":60}}"
   if aws scheduler get-schedule --name "${CANARY_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
     run aws scheduler update-schedule --name "${CANARY_SCHED_NAME}" \

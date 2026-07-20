@@ -155,4 +155,17 @@ if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
 fi
 
+# ----- 4. Zero-retry inbound async-invoke config (always, idempotent) -------
+# config#2902: the router's INBOUND async-invoke surface (any future
+# InvocationType=Event caller, e.g. the I2830 M2 path) must not silently
+# double-dispatch on a platform retry — AWS's async-invoke default is 2
+# retries. Router failures are handled by the clean-JSON-never-raise
+# contract + the watch-plane Errors alarm backstop, not by AWS-level retry.
+echo "Setting zero-retry async-invoke config on ${FUNCTION_NAME}..."
+run aws lambda put-function-event-invoke-config \
+  --function-name "${FUNCTION_NAME}" \
+  --maximum-retry-attempts 0 \
+  --region "${REGION}" \
+  --query 'MaximumRetryAttempts' --output text
+
 echo "Done."
