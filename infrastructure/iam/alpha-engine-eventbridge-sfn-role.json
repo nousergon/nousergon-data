@@ -6,8 +6,7 @@
             "Action": "states:StartExecution",
             "Resource": [
                 "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
-                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
-                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-modelzoo-sunday-pipeline"
+                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
             ]
         }
     ]

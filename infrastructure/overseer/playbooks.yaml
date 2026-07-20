@@ -66,8 +66,6 @@ playbooks:
             - ne-weekly-freshness-pipeline
             - ne-preopen-trading-pipeline
             - ne-postclose-trading-pipeline
-            - ne-weekly-advisory-pipeline
-            - ne-modelzoo-sunday-pipeline
         - type: state_machines_exist
           state_machines: *sf_watch_pipelines
         - type: lambda_active
