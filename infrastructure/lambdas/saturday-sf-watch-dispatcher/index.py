@@ -78,6 +78,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 
 import boto3
+from botocore.config import Config
 
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import (
@@ -89,6 +90,13 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+# config#2902: the M2 overseer dispatch is a fire-and-forget async invoke —
+# boto3's default retry-on-throttle would double-fire this Event invoke on a
+# transient error, and the router itself is a non-idempotent dispatch entry
+# point. Zero retries here mirrors the router's own outbound-leg hardening
+# (overseer-dispatcher/index.py _EXECUTOR_INVOKE_CONFIG); a dropped invoke is
+# covered by the watch-plane Errors alarm backstop, not client-side retry.
+_OVERSEER_INVOKE_CONFIG = Config(retries={"max_attempts": 0})
 WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
 _FLOW_NAME = "saturday-sf-watch-dispatcher"
 _DB_BASENAME = "flow_doctor_saturday_sf_watch_dispatcher"
@@ -1065,7 +1073,9 @@ def _maybe_dispatch_agent(
         # P1 filing, and loud paging; this Lambda's watch-log record (already
         # written) is the local audit surface either way.
         try:
-            resp = boto3.client("lambda", region_name=REGION).invoke(
+            resp = boto3.client(
+                "lambda", region_name=REGION, config=_OVERSEER_INVOKE_CONFIG
+            ).invoke(
                 FunctionName=OVERSEER_FUNCTION,
                 InvocationType="Event",
                 Payload=json.dumps(
