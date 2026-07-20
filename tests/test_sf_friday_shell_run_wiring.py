@@ -168,7 +168,7 @@ _SPOT_STATES = {
         "/var/log/parity.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
+        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
