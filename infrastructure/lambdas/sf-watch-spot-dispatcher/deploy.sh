@@ -269,6 +269,9 @@ print(json.dumps({
     "Arn": "${OVERSEER_ROUTER_ARN}",
     "RoleArn": "${OVERSEER_SCHED_ROLE_ARN}",
     "Input": json.dumps({"playbook": "sf-watch", "payload": drill_payload}),
+    # config#2902: zero-retry — AWS Scheduler's 185-attempt default would
+    # re-dispatch this drill for up to a day on any transient router error.
+    "RetryPolicy": {"MaximumRetryAttempts": 0, "MaximumEventAgeInSeconds": 60},
 }))
 PY
 )

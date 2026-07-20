@@ -14,6 +14,11 @@ image — the Dockerfile's hardcoded pin wins. The slim
 ``requirements-daily-news.txt`` (standalone daily-news collector on the
 dashboard box) carries its own copy of the pin and its header demands
 lockstep with ``requirements.txt`` — so it is guarded here too.
+``.github/workflows/deploy-infrastructure.yml`` also carries its own
+hardcoded ``pip install`` pin for its drift-check alerting step
+(``nousergon_lib.alerts``) and is guarded here for the same reason
+(alpha-engine-config#2999: this file drifted a full version behind
+``requirements.txt`` undetected until this test covered it).
 
 Some Lambdas have deliberate exemptions documented in their requirements.txt
 comments. These must move in lockstep within their exemption group (e.g., all
@@ -160,13 +165,18 @@ def test_requirements_and_dockerfile_pins_match():
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
     docker_pin = _read_pin("Dockerfile", _DOCKERFILE_PIN_RE)
     daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
-    assert req_pin == docker_pin == daily_news_pin, (
+    deploy_infra_pin = _read_pin(
+        ".github/workflows/deploy-infrastructure.yml", _LAMBDA_PIN_RE
+    )
+    assert req_pin == docker_pin == daily_news_pin == deploy_infra_pin, (
         f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
-        f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}. "
-        f"All three must move in lockstep — the Dockerfile strips lib from "
+        f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}, "
+        f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}. "
+        f"All four must move in lockstep — the Dockerfile strips lib from "
         f"requirements.txt before pip install, so requirements-only bumps "
-        f"don't propagate to the Lambda image, and the slim daily-news file "
-        f"carries an independent copy of the pin."
+        f"don't propagate to the Lambda image, the slim daily-news file "
+        f"carries an independent copy of the pin, and the deploy-infrastructure "
+        f"workflow's drift-check step installs its own copy directly."
     )
 
 

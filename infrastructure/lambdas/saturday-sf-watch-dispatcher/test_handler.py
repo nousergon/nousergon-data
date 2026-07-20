@@ -1437,19 +1437,21 @@ def _make_clients_with_lambda(**kwargs):
     factory, sf, s3 = _make_clients(**kwargs)
     lam = MagicMock()
     lam.invoke.return_value = {"StatusCode": 202}
+    lambda_client_configs = []
 
-    def factory_with_lambda(name, region_name=None):
+    def factory_with_lambda(name, region_name=None, config=None):
         if name == "lambda":
+            lambda_client_configs.append(config)
             return lam
         return factory(name, region_name=region_name)
 
-    return factory_with_lambda, sf, s3, lam
+    return factory_with_lambda, sf, s3, lam, lambda_client_configs
 
 
 def test_m2_overseer_mode_invokes_router_not_github(monkeypatch):
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
-    factory, sf, s3, lam = _make_clients_with_lambda()
+    factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
     with patch("index.boto3.client", side_effect=factory), patch(
         "index.urllib.request.urlopen",
         side_effect=AssertionError("GitHub must NOT be called in overseer mode"),
@@ -1471,10 +1473,24 @@ def test_m2_overseer_mode_invokes_router_not_github(monkeypatch):
     assert payload["run_date"] == "2023-11-14"
 
 
+def test_m2_overseer_dispatch_uses_zero_retry_client_config(monkeypatch):
+    # config#2902: the M2 async invoke of the router must not use boto3's
+    # default retry behavior — a retried Event invoke could re-dispatch the
+    # same non-idempotent router payload.
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
+    factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED"), None)
+
+    assert len(lambda_configs) == 1
+    assert lambda_configs[0].retries == {"max_attempts": 0}
+
+
 def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
-    factory, sf, s3, lam = _make_clients_with_lambda()
+    factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
     lam.invoke.side_effect = RuntimeError("router down")
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
@@ -1488,7 +1504,7 @@ def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
 def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     assert index.M2_DISPATCH_TARGET == "repository_dispatch"
-    factory, sf, s3, lam = _make_clients_with_lambda()
+    factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
     monkeypatch.setattr(index, "_get_github_pat", MagicMock(return_value="pat"))
     resp_cm = MagicMock()
     resp_cm.__enter__ = MagicMock(return_value=MagicMock(status=204))

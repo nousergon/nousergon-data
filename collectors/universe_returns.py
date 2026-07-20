@@ -2,13 +2,19 @@
 collectors/universe_returns.py — Full-population forward-return tracking.
 
 Uses polygon.io grouped-daily endpoint to fetch OHLCV for the entire US market
-in a single API call per date. Computes 5d/10d/21d/30d/60d/90d forward returns for
-every ticker, SPY benchmark returns, and sector ETF returns for sector-relative
-analysis. 21d arithmetic + log-domain columns added 2026-05-09 to align the
-measurement substrate with the predictor's canonical 21d log-domain training
-target (see docs/private/predictor-21d-migration-260509.md). 60d/90d (return +
-SPY-relative + beat + log-domain) added 2026-06-01 (W3.1, L4469) for the
-predictor horizon study + backtester 60/90d signal-quality.
+in a single API call per date. Computes 1d/3d/5d/10d/15d/21d/30d/60d/90d forward
+returns for every ticker, SPY benchmark returns, and sector ETF returns for
+sector-relative analysis. 21d arithmetic + log-domain columns added 2026-05-09
+to align the measurement substrate with the predictor's canonical 21d
+log-domain training target (see docs/private/predictor-21d-migration-260509.md).
+60d/90d (return + SPY-relative + beat + log-domain) added 2026-06-01 (W3.1,
+L4469) for the predictor horizon study + backtester 60/90d signal-quality.
+1d/3d/15d (return + SPY-relative + beat + log-domain) added for config#1981 —
+the alpha-decay-curve intermediate-horizon ladder (operator ruling "Option A",
+2026-07-16): a real fade-over-time curve needs points BETWEEN the 5d
+diagnostic and 21d primary canonical horizons, not just the two endpoints.
+Combined with the pre-existing 10d columns, the producer now emits a full
+1/3/5/10/15/21d ladder for score_performance_outcomes to consume.
 
 This is the denominator for all lift calculations in the backtester evaluation
 framework: scanner filter lift, sector team lift, CIO lift, predictor lift,
@@ -87,6 +93,21 @@ CREATE TABLE IF NOT EXISTS universe_returns (
     sector_etf TEXT,
     sector_etf_return_5d REAL,
     beat_sector_5d INTEGER,
+    return_1d REAL,
+    return_3d REAL,
+    return_15d REAL,
+    spy_return_1d REAL,
+    spy_return_3d REAL,
+    spy_return_15d REAL,
+    beat_spy_1d INTEGER,
+    beat_spy_3d INTEGER,
+    beat_spy_15d INTEGER,
+    log_return_1d REAL,
+    log_return_3d REAL,
+    log_return_15d REAL,
+    log_spy_return_1d REAL,
+    log_spy_return_3d REAL,
+    log_spy_return_15d REAL,
     UNIQUE(ticker, eval_date)
 )
 """
@@ -111,6 +132,29 @@ _NEW_COLUMNS_60_90D = [
     ("log_return_90d", "REAL"),
     ("log_spy_return_60d", "REAL"),
     ("log_spy_return_90d", "REAL"),
+]
+
+# config#1981: 1d/3d/15d intermediate-horizon columns (return + SPY-relative +
+# beat + log) — fill the gap between the 5d diagnostic and 21d primary
+# canonical horizons so the alpha-decay-curve consumer has points to plot
+# between the two existing endpoints (10d already existed; 1d/3d/15d are the
+# genuinely new columns this ladder needed).
+_NEW_COLUMNS_DECAY_LADDER = [
+    ("return_1d", "REAL"),
+    ("return_3d", "REAL"),
+    ("return_15d", "REAL"),
+    ("spy_return_1d", "REAL"),
+    ("spy_return_3d", "REAL"),
+    ("spy_return_15d", "REAL"),
+    ("beat_spy_1d", "INTEGER"),
+    ("beat_spy_3d", "INTEGER"),
+    ("beat_spy_15d", "INTEGER"),
+    ("log_return_1d", "REAL"),
+    ("log_return_3d", "REAL"),
+    ("log_return_15d", "REAL"),
+    ("log_spy_return_1d", "REAL"),
+    ("log_spy_return_3d", "REAL"),
+    ("log_spy_return_15d", "REAL"),
 ]
 
 
@@ -315,6 +359,11 @@ def _ensure_table(db_path: str) -> None:
         for col, col_type in _NEW_COLUMNS_60_90D:
             if col not in cols:
                 conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
+        # config#1981: 1d/3d/15d decay-ladder columns — additive migration for
+        # the alpha-decay-curve intermediate-horizon backfill.
+        for col, col_type in _NEW_COLUMNS_DECAY_LADDER:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
         conn.commit()
     finally:
         conn.close()
@@ -381,9 +430,15 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
                     "return_60d, return_90d, spy_return_60d, spy_return_90d, "
                     "beat_spy_60d, beat_spy_90d, "
                     "log_return_60d, log_return_90d, log_spy_return_60d, log_spy_return_90d, "
-                    "sector_etf, sector_etf_return_5d, beat_sector_5d) "
+                    "sector_etf, sector_etf_return_5d, beat_sector_5d, "
+                    "return_1d, return_3d, return_15d, "
+                    "spy_return_1d, spy_return_3d, spy_return_15d, "
+                    "beat_spy_1d, beat_spy_3d, beat_spy_15d, "
+                    "log_return_1d, log_return_3d, log_return_15d, "
+                    "log_spy_return_1d, log_spy_return_3d, log_spy_return_15d) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row["ticker"], row["eval_date"], row["sector"], row["close_price"],
                         row["return_5d"], row["return_10d"], row["return_21d"], row["return_30d"],
@@ -396,6 +451,11 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
                         row.get("log_return_60d"), row.get("log_return_90d"),
                         row.get("log_spy_return_60d"), row.get("log_spy_return_90d"),
                         row["sector_etf"], row["sector_etf_return_5d"], row["beat_sector_5d"],
+                        row.get("return_1d"), row.get("return_3d"), row.get("return_15d"),
+                        row.get("spy_return_1d"), row.get("spy_return_3d"), row.get("spy_return_15d"),
+                        row.get("beat_spy_1d"), row.get("beat_spy_3d"), row.get("beat_spy_15d"),
+                        row.get("log_return_1d"), row.get("log_return_3d"), row.get("log_return_15d"),
+                        row.get("log_spy_return_1d"), row.get("log_spy_return_3d"), row.get("log_spy_return_15d"),
                     ),
                 )
                 inserted += 1
@@ -416,8 +476,11 @@ def _build_rows_for_date(
 ) -> list[dict]:
     """Build universe_returns rows for a single eval_date."""
     eval_dt = date.fromisoformat(eval_date)
+    fwd_1d = _add_trading_days(eval_dt, 1)
+    fwd_3d = _add_trading_days(eval_dt, 3)
     fwd_5d = _add_trading_days(eval_dt, 5)
     fwd_10d = _add_trading_days(eval_dt, 10)
+    fwd_15d = _add_trading_days(eval_dt, 15)
     fwd_21d = _add_trading_days(eval_dt, 21)
     fwd_30d = _add_trading_days(eval_dt, 30)
     fwd_60d = _add_trading_days(eval_dt, 60)
@@ -429,7 +492,10 @@ def _build_rows_for_date(
         logger.debug("Skipping %s: 5d forward date %s is in the future", eval_date, fwd_5d)
         return []
 
+    has_1d = fwd_1d < today
+    has_3d = fwd_3d < today
     has_10d = fwd_10d < today
+    has_15d = fwd_15d < today
     has_21d = fwd_21d < today
     has_30d = fwd_30d < today
     has_60d = fwd_60d < today
@@ -437,8 +503,11 @@ def _build_rows_for_date(
 
     # Fetch grouped-daily prices for eval_date and forward dates
     prices_t0 = polygon_client.get_grouped_daily(eval_date)
+    prices_1d = polygon_client.get_grouped_daily(str(fwd_1d)) if has_1d else {}
+    prices_3d = polygon_client.get_grouped_daily(str(fwd_3d)) if has_3d else {}
     prices_5d = polygon_client.get_grouped_daily(str(fwd_5d))
     prices_10d = polygon_client.get_grouped_daily(str(fwd_10d)) if has_10d else {}
+    prices_15d = polygon_client.get_grouped_daily(str(fwd_15d)) if has_15d else {}
     prices_21d = polygon_client.get_grouped_daily(str(fwd_21d)) if has_21d else {}
     prices_30d = polygon_client.get_grouped_daily(str(fwd_30d)) if has_30d else {}
     prices_60d = polygon_client.get_grouped_daily(str(fwd_60d)) if has_60d else {}
@@ -454,19 +523,28 @@ def _build_rows_for_date(
 
     # SPY benchmark
     spy_t0 = prices_t0.get("SPY", {}).get("close")
+    spy_1d = prices_1d.get("SPY", {}).get("close") if has_1d else None
+    spy_3d = prices_3d.get("SPY", {}).get("close") if has_3d else None
     spy_5d = prices_5d.get("SPY", {}).get("close")
     spy_10d = prices_10d.get("SPY", {}).get("close") if has_10d else None
+    spy_15d = prices_15d.get("SPY", {}).get("close") if has_15d else None
     spy_21d = prices_21d.get("SPY", {}).get("close") if has_21d else None
     spy_30d = prices_30d.get("SPY", {}).get("close") if has_30d else None
     spy_60d = prices_60d.get("SPY", {}).get("close") if has_60d else None
     spy_90d = prices_90d.get("SPY", {}).get("close") if has_90d else None
 
+    spy_ret_1d = _pct_return(spy_t0, spy_1d) if has_1d else None
+    spy_ret_3d = _pct_return(spy_t0, spy_3d) if has_3d else None
     spy_ret_5d = _pct_return(spy_t0, spy_5d)
     spy_ret_10d = _pct_return(spy_t0, spy_10d) if has_10d else None
+    spy_ret_15d = _pct_return(spy_t0, spy_15d) if has_15d else None
     spy_ret_21d = _pct_return(spy_t0, spy_21d) if has_21d else None
     spy_ret_30d = _pct_return(spy_t0, spy_30d) if has_30d else None
     spy_ret_60d = _pct_return(spy_t0, spy_60d) if has_60d else None
     spy_ret_90d = _pct_return(spy_t0, spy_90d) if has_90d else None
+    log_spy_ret_1d = _log_return(spy_t0, spy_1d) if has_1d else None
+    log_spy_ret_3d = _log_return(spy_t0, spy_3d) if has_3d else None
+    log_spy_ret_15d = _log_return(spy_t0, spy_15d) if has_15d else None
     log_spy_ret_21d = _log_return(spy_t0, spy_21d) if has_21d else None
     log_spy_ret_60d = _log_return(spy_t0, spy_60d) if has_60d else None
     log_spy_ret_90d = _log_return(spy_t0, spy_90d) if has_90d else None
@@ -488,19 +566,28 @@ def _build_rows_for_date(
         if close_t0 is None or close_t0 <= 0:
             continue
 
+        close_1d = prices_1d.get(ticker, {}).get("close") if has_1d else None
+        close_3d = prices_3d.get(ticker, {}).get("close") if has_3d else None
         close_5d = prices_5d.get(ticker, {}).get("close")
         close_10d = prices_10d.get(ticker, {}).get("close") if has_10d else None
+        close_15d = prices_15d.get(ticker, {}).get("close") if has_15d else None
         close_21d = prices_21d.get(ticker, {}).get("close") if has_21d else None
         close_30d = prices_30d.get(ticker, {}).get("close") if has_30d else None
         close_60d = prices_60d.get(ticker, {}).get("close") if has_60d else None
         close_90d = prices_90d.get(ticker, {}).get("close") if has_90d else None
 
+        ret_1d = _pct_return(close_t0, close_1d) if has_1d else None
+        ret_3d = _pct_return(close_t0, close_3d) if has_3d else None
         ret_5d = _pct_return(close_t0, close_5d)
         ret_10d = _pct_return(close_t0, close_10d) if has_10d else None
+        ret_15d = _pct_return(close_t0, close_15d) if has_15d else None
         ret_21d = _pct_return(close_t0, close_21d) if has_21d else None
         ret_30d = _pct_return(close_t0, close_30d) if has_30d else None
         ret_60d = _pct_return(close_t0, close_60d) if has_60d else None
         ret_90d = _pct_return(close_t0, close_90d) if has_90d else None
+        log_ret_1d = _log_return(close_t0, close_1d) if has_1d else None
+        log_ret_3d = _log_return(close_t0, close_3d) if has_3d else None
+        log_ret_15d = _log_return(close_t0, close_15d) if has_15d else None
         log_ret_21d = _log_return(close_t0, close_21d) if has_21d else None
         log_ret_60d = _log_return(close_t0, close_60d) if has_60d else None
         log_ret_90d = _log_return(close_t0, close_90d) if has_90d else None
@@ -542,6 +629,21 @@ def _build_rows_for_date(
             "sector_etf": sector_etf,
             "sector_etf_return_5d": round(etf_ret_5d, 4) if etf_ret_5d is not None else None,
             "beat_sector_5d": int(ret_5d > etf_ret_5d) if ret_5d is not None and etf_ret_5d is not None else None,
+            "return_1d": round(ret_1d, 4) if ret_1d is not None else None,
+            "return_3d": round(ret_3d, 4) if ret_3d is not None else None,
+            "return_15d": round(ret_15d, 4) if ret_15d is not None else None,
+            "spy_return_1d": round(spy_ret_1d, 4) if spy_ret_1d is not None else None,
+            "spy_return_3d": round(spy_ret_3d, 4) if spy_ret_3d is not None else None,
+            "spy_return_15d": round(spy_ret_15d, 4) if spy_ret_15d is not None else None,
+            "beat_spy_1d": int(ret_1d > spy_ret_1d) if ret_1d is not None and spy_ret_1d is not None else None,
+            "beat_spy_3d": int(ret_3d > spy_ret_3d) if ret_3d is not None and spy_ret_3d is not None else None,
+            "beat_spy_15d": int(ret_15d > spy_ret_15d) if ret_15d is not None and spy_ret_15d is not None else None,
+            "log_return_1d": round(log_ret_1d, 6) if log_ret_1d is not None else None,
+            "log_return_3d": round(log_ret_3d, 6) if log_ret_3d is not None else None,
+            "log_return_15d": round(log_ret_15d, 6) if log_ret_15d is not None else None,
+            "log_spy_return_1d": round(log_spy_ret_1d, 6) if log_spy_ret_1d is not None else None,
+            "log_spy_return_3d": round(log_spy_ret_3d, 6) if log_spy_ret_3d is not None else None,
+            "log_spy_return_15d": round(log_spy_ret_15d, 6) if log_spy_ret_15d is not None else None,
         })
 
     return rows
