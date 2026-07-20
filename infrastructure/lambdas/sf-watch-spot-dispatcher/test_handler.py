@@ -48,10 +48,16 @@ class _SpotCapacityExhausted(_SpotLaunchError):
     pass
 
 
+class _SpotQuotaExceededError(_SpotLaunchError):
+    """config#2698 — account-wide spot quota (e.g. MaxSpotInstanceCountExceeded),
+    distinct from ordinary per-pool capacity exhaustion."""
+
+
 def _install_stubs(launch_impl, boto_clients):
     ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
     ec2_spot_mod.SpotLaunchError = _SpotLaunchError
     ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
+    ec2_spot_mod.SpotQuotaExceededError = _SpotQuotaExceededError
     ec2_spot_mod.launch = launch_impl
     sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
 
