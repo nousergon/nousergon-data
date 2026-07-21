@@ -63,6 +63,13 @@ _LAMBDA_PIN_RE = re.compile(
 # documented in each Lambda's requirements.txt header comment.
 # Key: lambda directory name, Value: (pin version, contract reason)
 _LAMBDA_PIN_EXEMPTIONS = {
+    "arctic-migration-dispatcher": (
+        "v0.124.5",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I3242: same "
+        "spot-launch/concurrency-lock primitives as sf-watch-spot-dispatcher / "
+        "ci-watch-dispatcher / canary-replay-dispatcher / alert-drain-dispatcher — "
+        "same exemption group, stays in lockstep with them, not with root)",
+    ),
     "canary-replay-dispatcher": (
         "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246: same SpotProbeError "

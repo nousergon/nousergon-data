@@ -257,6 +257,37 @@ playbooks:
     supports_drill: false
     kill_switch_env: CANARY_REPLAY_DISPATCH_ENABLED
 
+  arctic-migration:
+    description: >-
+      Merge-triggered in-region ArcticDB schema-migration runner
+      (alpha-engine-config-I3242, runner half of the config-I3236 structural
+      fix; pairs with the already-merged migration framework, nousergon-data-
+      PR988). Inventory-only here (mirrors groom/canary-replay's own
+      rationale): this Lambda is invoked DIRECTLY by
+      `.github/workflows/run-arctic-migrations.yml`'s synchronous
+      `lambda invoke` on every push to main touching `migrations/**` (plus a
+      manual `workflow_dispatch` re-trigger path) — zero routing decisions
+      for the overseer-dispatcher router to make, so it keeps its own direct
+      GHA->Lambda path rather than a routed registry entry. Exists here
+      purely so the registry stays the ONE place the watch-plane surface is
+      enumerated.
+    tier: T2
+    routed: false
+    enabled: true
+    executor_function: alpha-engine-arctic-migration-dispatcher
+    executor_lambda_dir: arctic-migration-dispatcher
+    charter: nousergon-data/scripts/run_arctic_migrations.py
+    concurrency_domain: >-
+      Single lane per head migration number — EC2 tag lock on
+      Name=alpha-engine-arctic-migration-spot +
+      arctic-migration-head=<NNNN> (fail-CLOSED on a probe error, unlike the
+      fleet's other spot dispatchers' coverage-beats-dedupe posture — a
+      migration full-rewrite racing a duplicate box is a correctness risk).
+      The on-box runner ALSO refuses to start while any of the three trading
+      Step Functions has a RUNNING execution (separate, stricter mutex).
+    supports_drill: false
+    kill_switch_env: ARCTIC_MIGRATION_DISPATCH_ENABLED
+
 # ── Cross-cutting watch-plane liveness (alpha-engine-config-I2831) ────────────
 # Checks that belong to NO single playbook: the overseer-dispatcher router
 # itself + the phase-1 intake plane (setup_overseer_intake.sh, config-I2822).
