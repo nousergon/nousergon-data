@@ -306,6 +306,15 @@
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipScanner",
+        "input": "{}"
+      },
+      "id": 341,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
       "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
         "name": "Scanner",
@@ -351,6 +360,15 @@
       "id": 39
     },
     {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipSignalsEnvelope",
+        "input": "{}"
+      },
+      "timestamp": "2026-07-11T09:00:00Z",
+      "id": 391
+    },
+    {
       "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
         "name": "SignalsEnvelope",
@@ -367,6 +385,15 @@
       },
       "timestamp": "2026-07-11T09:00:00Z",
       "id": 41
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipChallengerShadow",
+        "input": "{}"
+      },
+      "timestamp": "2026-07-11T09:00:00Z",
+      "id": 411
     },
     {
       "type": "TaskStateEntered",
@@ -421,6 +448,15 @@
       },
       "timestamp": "2026-07-11T09:00:00Z",
       "id": 47
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipThinkTankCoverage",
+        "input": "{}"
+      },
+      "timestamp": "2026-07-11T09:00:00Z",
+      "id": 471
     },
     {
       "type": "TaskStateEntered",
