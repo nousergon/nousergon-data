@@ -37,18 +37,9 @@ logger = logging.getLogger(__name__)
 _CARET_SYMBOLS = {"VIX", "VIX3M", "TNX", "IRX"}
 
 # Always-download tickers (benchmarks, macro, sector ETFs)
-# config#934: the sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX)
-# are appended so the sub_sector_vs_benchmark_* features have a maintained
-# price history — these are the distinct non-XL* symbols in
-# collectors.constituents.GICS_SUBINDUSTRY_TO_ETF. Kept as a literal list here
-# (matching the sector-ETF convention on the line above) rather than imported
-# from constituents to avoid a collector→collector import at module load.
-_SUB_SECTOR_ETFS = ["SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX"]
-
 _ALWAYS_DOWNLOAD = [
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
-    *_SUB_SECTOR_ETFS,
 ]
 
 
