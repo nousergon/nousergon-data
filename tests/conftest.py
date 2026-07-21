@@ -27,6 +27,56 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ.setdefault("FLOW_DOCTOR_DISABLED", "1")
 
 
+class _FakeStampedMetaLib:
+    """A schema-meta library stamped at the current expected version — so the
+    daily_append producer's pre-append schema assert (config-I3241) passes as a
+    no-op in unit tests without touching S3. Real assert BEHAVIOUR is exercised
+    against a live LMDB library in tests/test_schema_migration_framework.py."""
+
+    def __init__(self, version: int):
+        self._v = version
+
+    def has_symbol(self, name):  # noqa: D401 - fake
+        return True
+
+    def read(self, name):
+        class _Item:
+            pass
+
+        item = _Item()
+        item.metadata = {"schema_version": self._v}
+        item.data = None
+        return item
+
+
+@pytest.fixture(autouse=True)
+def _isolate_schema_meta_from_s3(monkeypatch):
+    """Prevent daily_append's schema-version pre-append assert (config-I3241)
+    from opening the real ``universe_schema_meta`` ArcticDB library over S3 in
+    unit tests. Patches the single open-seam
+    (``builders.daily_append.get_schema_meta_lib``) to a fake stamped at the
+    live EXPECTED_SCHEMA_VERSION, so the assert is a benign no-op here and stays
+    green as the migration chain grows. Same isolation philosophy as
+    ``_isolate_secrets_from_ssm`` / the flow-doctor hard-disable above — a unit
+    test must never reach real S3. Tests that WANT to exercise the assert use a
+    real LMDB meta lib directly (test_schema_migration_framework.py)."""
+    try:
+        import builders.daily_append as _da
+        from migrations import EXPECTED_SCHEMA_VERSION
+    except Exception:
+        # daily_append / migrations not importable in this environment — nothing
+        # to isolate; let the test proceed.
+        yield
+        return
+    monkeypatch.setattr(
+        _da,
+        "get_schema_meta_lib",
+        lambda *a, **k: _FakeStampedMetaLib(EXPECTED_SCHEMA_VERSION),
+        raising=False,
+    )
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _isolate_secrets_from_ssm(monkeypatch):
     """Force every test to read secrets from env only, not SSM.

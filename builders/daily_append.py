@@ -69,6 +69,7 @@ from store.arctic_store import (
     PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
     get_universe_lib,
     get_macro_lib,
+    get_schema_meta_lib,
     to_arctic_canonical,
     to_arctic_safe,
 )
@@ -1331,10 +1332,12 @@ def _daily_append_impl(
         # surfacing two layers downstream as an EOD reconcile RuntimeError) into
         # a single actionable pre-flight error naming the pending migration.
         # SchemaVersionMismatch is a RuntimeError subclass — it propagates
-        # (fail-loud), aborting the run before any partial write.
+        # (fail-loud), aborting the run before any partial write. The meta lib
+        # is opened via get_schema_meta_lib (the mockable open-seam, mirroring
+        # get_universe_lib/get_macro_lib).
         from migrations import assert_universe_schema_current
 
-        assert_universe_schema_current(bucket)
+        assert_universe_schema_current(get_schema_meta_lib(bucket))
     else:
         universe_lib = None
         macro_lib = None

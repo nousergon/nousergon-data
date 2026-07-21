@@ -94,23 +94,23 @@ def pending_migrations(current_version: int) -> list[Migration]:
 EXPECTED_SCHEMA_VERSION: int = latest_version()
 
 
-def assert_universe_schema_current(bucket: str | None = None) -> int:
+def assert_universe_schema_current(meta_lib) -> int:
     """Producer pre-append guard: fail loud (before touching any symbol) unless
     the live universe data plane is stamped at :data:`EXPECTED_SCHEMA_VERSION`.
 
     Called by ``builders/daily_append`` (and, through it, the weekly collector)
-    right after opening the universe library. On mismatch raises
+    right after opening the universe library, with the schema-meta library
+    opened via ``store.arctic_store.get_schema_meta_lib`` (the single mockable
+    S3 open-seam — this function performs no I/O of its own). On mismatch raises
     ``store.schema_version.SchemaVersionMismatch`` naming the pending
     migration(s). Returns the effective version on success.
     """
     from store.schema_version import (
         BASELINE_SCHEMA_VERSION,
-        _open_meta_lib,
         assert_schema_version,
         read_schema_version,
     )
 
-    meta_lib = _open_meta_lib(bucket)
     current = read_schema_version(meta_lib)
     effective = BASELINE_SCHEMA_VERSION if current is None else current
     pend = [m.number for m in pending_migrations(effective)]

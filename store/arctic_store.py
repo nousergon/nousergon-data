@@ -124,6 +124,28 @@ def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     return open_macro_lib(bucket, create_if_missing=True)
 
 
+#: Dedicated library holding the ``universe`` data-plane schema-version stamp
+#: (alpha-engine-config-I3241). Kept OUT of the ``universe`` library so it never
+#: pollutes the fleet-wide ticker roster ``get_universe_symbols()`` returns
+#: (``list_symbols()`` is unfiltered) — see ``store/schema_version.py``.
+SCHEMA_META_LIB = "universe_schema_meta"
+
+
+def get_schema_meta_lib(bucket: str | None = None) -> adb.library.Library:
+    """Get the ``universe_schema_meta`` library that carries the universe data
+    plane's schema-version stamp (alpha-engine-config-I3241).
+
+    Routed through the same ``_get_arctic`` connection singleton + canonical URI
+    as every other library. ``create_if_missing=True`` so a fresh bucket
+    bootstraps cleanly (an unstamped/absent stamp is read as baseline v0 — see
+    ``store.schema_version.assert_schema_version``). This is the single
+    mockable open-seam producers use, mirroring ``get_universe_lib`` /
+    ``get_macro_lib``.
+    """
+    arctic = _get_arctic(bucket)
+    return arctic.get_library(SCHEMA_META_LIB, create_if_missing=True)
+
+
 def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
     """Get a SCRATCH universe-shaped library for an offline migration build.
 

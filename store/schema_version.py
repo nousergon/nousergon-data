@@ -48,12 +48,10 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-#: Dedicated library holding the ``universe`` data-plane schema stamp. Kept
-#: OUT of the ``universe`` library so it never pollutes the ticker roster
-#: returned by ``get_universe_symbols`` (see module docstring).
-SCHEMA_META_LIB = "universe_schema_meta"
-
-#: The single symbol inside :data:`SCHEMA_META_LIB` that carries the version.
+#: The single symbol inside the ``universe_schema_meta`` library
+#: (``store.arctic_store.SCHEMA_META_LIB`` / ``get_schema_meta_lib``) that
+#: carries the version. The library is opened via
+#: ``store.arctic_store.get_schema_meta_lib`` — the single mockable open-seam.
 SCHEMA_VERSION_SYMBOL = "schema_version"
 
 #: The version an unstamped (legacy / pre-framework) universe library is
@@ -71,21 +69,6 @@ class SchemaVersionMismatch(RuntimeError):
     early instead of cascading as per-symbol ``StreamDescriptorMismatch``."""
 
 
-def _open_meta_lib(bucket: str | None = None):
-    """Open (creating if missing) the dedicated schema-meta library.
-
-    Routed through the same ``store.arctic_store`` connection singleton /
-    canonical URI conventions as every other library so the S3
-    endpoint/path_prefix match exactly.
-    """
-    # Local import keeps this module import-cheap and avoids pulling the
-    # arcticdb connection machinery at module load for pure-unit callers.
-    from store.arctic_store import _get_arctic
-
-    arctic = _get_arctic(bucket)
-    return arctic.get_library(SCHEMA_META_LIB, create_if_missing=True)
-
-
 def read_schema_version(meta_lib) -> int | None:
     """Return the stamped universe schema version, or ``None`` if unstamped.
 
@@ -99,7 +82,7 @@ def read_schema_version(meta_lib) -> int | None:
         has = meta_lib.has_symbol(SCHEMA_VERSION_SYMBOL)
     except Exception as exc:  # pragma: no cover - arcticdb health failure
         raise RuntimeError(
-            f"failed to probe {SCHEMA_META_LIB}.{SCHEMA_VERSION_SYMBOL}: {exc}"
+            f"failed to probe universe_schema_meta.{SCHEMA_VERSION_SYMBOL}: {exc}"
         ) from exc
     if not has:
         return None
@@ -145,8 +128,7 @@ def write_schema_version(
         SCHEMA_VERSION_SYMBOL, frame, metadata=metadata, prune_previous_versions=True
     )
     log.info(
-        "Stamped %s.%s: schema_version=%d (migration %04d, %d columns)",
-        SCHEMA_META_LIB,
+        "Stamped universe_schema_meta.%s: schema_version=%d (migration %04d, %d columns)",
         SCHEMA_VERSION_SYMBOL,
         version,
         migration_number,

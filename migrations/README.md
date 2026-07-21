@@ -49,9 +49,11 @@ cannot be forgotten.
 - `migrations.pending_migrations(current)` → migrations with `.number > current`.
 - A runner discovers pending work mechanically:
   ```python
-  from store.schema_version import _open_meta_lib, read_schema_version, BASELINE_SCHEMA_VERSION
+  from store.arctic_store import get_schema_meta_lib, get_universe_lib
+  from store.schema_version import read_schema_version, BASELINE_SCHEMA_VERSION
   from migrations import pending_migrations
-  meta = _open_meta_lib(bucket)
+  meta = get_schema_meta_lib(bucket)
+  universe_lib = get_universe_lib(bucket)
   current = read_schema_version(meta)
   current = BASELINE_SCHEMA_VERSION if current is None else current
   for m in pending_migrations(current):

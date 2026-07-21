@@ -259,20 +259,18 @@ def test_baseline_migration_refuses_nonbaseline_library(universe_lib, meta_lib):
 
 
 def test_producer_wrapper_wires_expected_and_pending(monkeypatch, meta_lib):
-    """assert_universe_schema_current opens the meta lib via S3 in production;
-    here we inject the LMDB meta lib and confirm it derives EXPECTED + pending
-    from the real chain and raises when the stamp lags."""
+    """assert_universe_schema_current takes an already-opened meta lib (the
+    producer opens it via the mockable get_schema_meta_lib seam) and derives
+    EXPECTED + pending from the real chain, raising when the stamp lags."""
     import migrations as mig_pkg
-    import store.schema_version as sv
 
-    monkeypatch.setattr(sv, "_open_meta_lib", lambda bucket=None: meta_lib)
     # No stamp -> baseline 0 == EXPECTED_SCHEMA_VERSION (0 today) -> OK.
-    assert mig_pkg.assert_universe_schema_current("bkt") == mig_pkg.EXPECTED_SCHEMA_VERSION
+    assert mig_pkg.assert_universe_schema_current(meta_lib) == mig_pkg.EXPECTED_SCHEMA_VERSION
 
     # Simulate a future pending migration by forcing EXPECTED ahead of the stamp.
     write_schema_version(meta_lib, 0, migration_number=0, columns_after=("Open",))
     monkeypatch.setattr(mig_pkg, "EXPECTED_SCHEMA_VERSION", 1)
     monkeypatch.setattr(mig_pkg, "pending_migrations", lambda cur: [type("M", (), {"number": 1})()])
     with pytest.raises(SchemaVersionMismatch) as ei:
-        mig_pkg.assert_universe_schema_current("bkt")
+        mig_pkg.assert_universe_schema_current(meta_lib)
     assert "0001" in str(ei.value)
