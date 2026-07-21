@@ -2566,13 +2566,6 @@ _MACRO_DAILY_TICKERS = [
     "SPY", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
-    # config#934 — sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX),
-    # the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF.
-    # Their daily closes must land in staging/daily_closes so daily_append can
-    # write their bars to ArcticDB macro for the sub_sector_vs_benchmark_*
-    # features. Additive: unlike the XL* set, a missing bar here is non-fatal
-    # in daily_append (the feature neutral-defaults) — see daily_append.
-    "SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
 ]
 
