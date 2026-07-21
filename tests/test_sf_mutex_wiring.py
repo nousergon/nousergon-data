@@ -97,7 +97,16 @@ CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run"}
 # AcquireMutex.Next) routes into — i.e., the state that USED TO BE first
 # before this PR inserted the mutex chain in front of it.
 FORMER_FIRST_STATE_BY_SF = {
-    "saturday": ("step_function.json", "CheckShellRun"),
+    # config#2248 (2026-07-21): the mutex chain now routes into
+    # CheckSpotDispatchNeeded, not CheckShellRun directly — the new
+    # dispatch-the-launcher-spot gate (which resolves $.ec2_instance_id from
+    # either an already-present operator/rerun value or a fresh ephemeral
+    # spot) sits between the mutex and CheckShellRun, so NO execution can
+    # reach CheckShellRun / any of the 14 downstream consumer states without
+    # $.ec2_instance_id already resolved. Both the cadence-acquire path
+    # (AcquireMutex.Next) and the bypass Default converge on
+    # CheckSpotDispatchNeeded for exactly this reason.
+    "saturday": ("step_function.json", "CheckSpotDispatchNeeded"),
     "weekday": ("step_function_daily.json", "DeployDriftCheck"),
     # 2026-06-30: the EOD SF's first post-mutex state is now the re-runnability
     # guard StartTradingInstance (ec2:startInstances → SSM-readiness poll), which

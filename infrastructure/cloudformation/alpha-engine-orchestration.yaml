@@ -249,9 +249,23 @@ Resources:
           # Ad-hoc operator launches MUST set their own pipeline_role
           # (smoke / recovery / backfill / operator-replay) per the
           # taxonomy in pipeline-reporting-revamp-260524.md §6.
+          #
+          # NO ec2_instance_id (config#2248, root-cause SPOF fix): this Input
+          # used to hardcode ["${MicroInstanceId}"] — the always-on dashboard
+          # box (12 live services, persistent/stateful) — as the launcher for
+          # all 14 downstream SF states that SSM-invoke onto $.ec2_instance_id.
+          # A full disk on that box killed the entire weekly run. The SF's own
+          # CheckSpotDispatchNeeded/DispatchWeeklyFreshnessSpot states
+          # (step_function.json, right after AcquireMutex) now populate
+          # $.ec2_instance_id themselves from a FRESH ephemeral spot on every
+          # cadence execution — this Input intentionally omits the field so
+          # that dispatch path always engages. An operator wanting to target
+          # an EXISTING box explicitly still can via a manual StartExecution
+          # input carrying ec2_instance_id (the same escape hatch
+          # scripts/weekly_sf_rerun.py's rerun passthrough uses) — this cron
+          # Input is not that path.
           Input: !Sub |
             {
-              "ec2_instance_id": ["${MicroInstanceId}"],
               "sns_topic_arn": "${AlertsTopic}",
               "pipeline_role": "weekly"
             }

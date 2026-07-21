@@ -57,9 +57,17 @@ SF_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${SF_NAME}"
 SATURDAY_RULE="alpha-engine-saturday"
 SATURDAY_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${SATURDAY_RULE}"
 
-# These two MUST match the live cron target + the friday-shell Lambda inputs.
+# This MUST match the live cron target + the friday-shell Lambda inputs.
 # Pinned by tests/test_run_weekly_offcycle.py against the CFN / Lambda source.
-EC2_INSTANCE_ID="i-09b539c844515d549"
+# NO EC2_INSTANCE_ID (config#2248, root-cause SPOF fix): both builders below
+# used to hardcode the always-on dashboard box id into the same
+# $.ec2_instance_id field all 14 of the weekly SF's downstream sendCommand/
+# Lambda states key off. The SF's own CheckSpotDispatchNeeded/
+# DispatchWeeklyFreshnessSpot states (step_function.json, right after
+# AcquireMutex) now populate that field from a fresh ephemeral spot on every
+# execution — an off-cycle run reproducing the live contracts byte-for-byte
+# now means reproducing THEIR omission of ec2_instance_id too, so this
+# script's launches go through the same dispatch path as the real cron.
 SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts"
 
 # Auto re-enable infra (one-time EventBridge Scheduler job + its execution role)
@@ -130,13 +138,13 @@ next_saturday_utc() {
 
 shell_input() {
   cat <<EOF
-{"ec2_instance_id": ["${EC2_INSTANCE_ID}"], "sns_topic_arn": "${SNS_TOPIC_ARN}", "shell_run": true, "pipeline_role": "shell-run"}
+{"sns_topic_arn": "${SNS_TOPIC_ARN}", "shell_run": true, "pipeline_role": "shell-run"}
 EOF
 }
 
 full_input() {
   cat <<EOF
-{"ec2_instance_id": ["${EC2_INSTANCE_ID}"], "sns_topic_arn": "${SNS_TOPIC_ARN}", "pipeline_role": "weekly"}
+{"sns_topic_arn": "${SNS_TOPIC_ARN}", "pipeline_role": "weekly"}
 EOF
 }
 

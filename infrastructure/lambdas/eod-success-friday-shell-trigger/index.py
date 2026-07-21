@@ -62,9 +62,6 @@ SATURDAY_SF_ARN = (
 )
 EOD_SF_NAME = "ne-postclose-trading-pipeline"
 
-TRADING_EC2_INSTANCE_ID = os.environ.get(
-    "TRADING_EC2_INSTANCE_ID", "i-09b539c844515d549"
-)
 SNS_TOPIC_ARN = os.environ.get(
     "SNS_TOPIC_ARN",
     f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:alpha-engine-alerts",
@@ -86,9 +83,18 @@ def _derive_trading_day_utc_ms(stop_date_ms: int):
 
 
 def _build_shell_run_input() -> str:
+    # NO ec2_instance_id (config#2248, root-cause SPOF fix): this used to
+    # hardcode the always-on dashboard box id (despite the misleading
+    # TRADING_EC2_INSTANCE_ID name — it was never the trading box) into the
+    # SAME field all 14 of the weekly SF's downstream sendCommand/Lambda
+    # states key off. The SF's own CheckSpotDispatchNeeded/
+    # DispatchWeeklyFreshnessSpot states (step_function.json, right after
+    # AcquireMutex) now populate $.ec2_instance_id from a fresh ephemeral
+    # spot on every execution this Lambda starts — omitting the field here
+    # lets that dispatch path engage for the Friday shell-run exactly like
+    # it does for the real Saturday cron.
     return json.dumps(
         {
-            "ec2_instance_id": [TRADING_EC2_INSTANCE_ID],
             "sns_topic_arn": SNS_TOPIC_ARN,
             "shell_run": True,
             # pipeline_role="shell-run" (Option-D taxonomy): tags this

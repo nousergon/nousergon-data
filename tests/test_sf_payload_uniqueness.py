@@ -134,6 +134,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
     # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
     "Director": frozenset({"date.$", "dry_run.$"}),
+    # config#2248: launches the launcher spot that replaces the always-on
+    # dashboard box as the $.ec2_instance_id source. Empty Payload — this
+    # Lambda takes no execution-input-derived args today (force_on_demand
+    # is reserved for a future retry loop, not currently threaded from the
+    # SF); it reads its own config entirely from Lambda env vars.
+    "DispatchWeeklyFreshnessSpot": frozenset(),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload

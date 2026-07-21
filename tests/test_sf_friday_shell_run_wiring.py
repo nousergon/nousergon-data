@@ -421,29 +421,40 @@ class TestStrictSuperset:
     def test_initialize_input_routes_to_shell_run_gate(self, states):
         # 2026-05-27: L274 SF MutualExclusionGuard inserted a CheckMutexRole
         # Choice between InitializeInput and CheckShellRun. The strict-superset
-        # property holds because CheckMutexRole.Default → CheckShellRun (the
-        # bypass path that runs for any input without a cadence pipeline_role
-        # in {daily, weekly, eod, shell-run}), and AcquireMutex.Next →
-        # CheckShellRun (the cadence-role acquire path lands at the same
-        # downstream state). See tests/test_sf_mutex_wiring.py for the full
-        # mutex-chain contract.
+        # property holds because CheckMutexRole.Default and AcquireMutex.Next
+        # both converge on the same downstream state, whatever it is, so a
+        # non-cadence input and a successful cadence acquire always reach
+        # CheckShellRun via the identical path. See tests/test_sf_mutex_wiring.py
+        # for the full mutex-chain contract.
         # 2026-06-08 (L4517): the lib-pin drift gate precedes the mutex; its
         # paths converge on CheckMutexRole (see test_sf_lib_pin_drift_wiring.py),
         # so the mutex→CheckShellRun superset property below is unchanged.
         # config#830: CheckRunMode (cadence preset) precedes the lib-pin gate;
         # its Default → CheckSkipLibPinDriftCheck, so the superset chain holds.
+        # config#2248 (2026-07-21): CheckMutexRole.Default / AcquireMutex.Next
+        # now both land on CheckSpotDispatchNeeded (not CheckShellRun directly)
+        # — the new gate that resolves $.ec2_instance_id (from an already-
+        # present operator/rerun value, or a freshly dispatched ephemeral
+        # spot) before ANY execution can reach CheckShellRun. Its own
+        # IsPresent branch / Default both still ultimately reach CheckShellRun
+        # (immediately, or after the dispatch+bootstrap-poll chain), so the
+        # strict-superset property is preserved one gate further down.
         assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
         assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
         assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
-        assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
-            "Mutex bypass path must route to CheckShellRun so the shell-run "
-            "chain remains a strict superset for non-cadence inputs"
+        assert states["CheckMutexRole"]["Default"] == "CheckSpotDispatchNeeded", (
+            "Mutex bypass path must route to CheckSpotDispatchNeeded so the "
+            "shell-run chain remains a strict superset for non-cadence inputs"
         )
-        assert states["AcquireMutex"]["Next"] == "CheckShellRun", (
-            "Mutex acquire path must also land at CheckShellRun so the "
-            "shell-run chain runs after a successful cadence acquire"
+        assert states["AcquireMutex"]["Next"] == "CheckSpotDispatchNeeded", (
+            "Mutex acquire path must also land at CheckSpotDispatchNeeded so "
+            "the shell-run chain runs after a successful cadence acquire"
         )
+        # CheckSpotDispatchNeeded's own bypass (IsPresent) branch reaches
+        # CheckShellRun directly — an operator input carrying ec2_instance_id
+        # skips the dispatch entirely, preserving the strict-superset property.
+        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "CheckShellRun"
 
     def test_initialize_input_merge_expr_unchanged(self, states):
         # The run_date / sns_topic_arn defaults-under-input merge must be
@@ -1068,6 +1079,15 @@ class TestHappyPathTraversal:
         # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
         # MorningEnrich (fast fail on a dead dispatch box) — two extra states
         # in the visited order on the no-skip path.
+        # config#2248 (2026-07-21): CheckMutexRole.Default now routes through
+        # CheckSpotDispatchNeeded first. The trace's $.ec2_instance_id-absent
+        # default means the Choice's IsPresent branch is NOT taken, so the
+        # trace falls through Default -> DispatchWeeklyFreshnessSpot ->
+        # MergeWeeklyFreshnessSpotInstanceId -> WaitForWeeklyFreshnessSpotBootstrap
+        # -> CheckWeeklyFreshnessSpotBootstrapStatus (a green-trace Success ->
+        # CheckShellRun, same "resolves to Success" convention this helper
+        # already applies to every other WaitFor*/Check*Status poll loop) —
+        # five extra states in the visited order before CheckShellRun.
         assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1078,6 +1098,11 @@ class TestHappyPathTraversal:
             "PipelineContractCheck",
             "PipelineContractGate",
             "CheckMutexRole",
+            "CheckSpotDispatchNeeded",
+            "DispatchWeeklyFreshnessSpot",
+            "MergeWeeklyFreshnessSpotInstanceId",
+            "WaitForWeeklyFreshnessSpotBootstrap",
+            "CheckWeeklyFreshnessSpotBootstrapStatus",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
             "SubstrateHealthGate",
