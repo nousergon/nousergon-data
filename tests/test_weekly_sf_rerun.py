@@ -64,6 +64,10 @@ class TestDerivePlan:
         assert set(plan.skip_flags) == {
             "skip_morning_enrich",
             "skip_data_phase1",
+            "skip_scanner",
+            "skip_regime_substrate",
+            "skip_signals_envelope",
+            "skip_challenger_shadow",
             "skip_predictor_training",
         }
         assert plan.failed == ["rag_ingestion"]
@@ -81,8 +85,12 @@ class TestDerivePlan:
         assert set(plan.skip_flags) == {
             "skip_morning_enrich",
             "skip_data_phase1",
-            "skip_rag_ingestion",
+            "skip_scanner",
             "skip_regime_substrate",
+            "skip_signals_envelope",
+            "skip_challenger_shadow",
+            "skip_rag_ingestion",
+            "skip_thinktank_coverage",
             "skip_regime_retrospective_eval",
             # skip_research retired: alpha-engine-config-I2515 Phase B
             # removed the multi-agent Research state entirely.
@@ -122,8 +130,6 @@ class TestDerivePlan:
         )
         for flag, val in plan.skip_flags.items():
             assert inp[flag] is val is True
-        # every warning path still names Scanner's unavoidable re-run
-        assert any("Scanner" in w for w in plan.warnings)
 
     def test_explicit_input_run_date_wins(self, mod):
         events = _events("early_failure")
@@ -364,6 +370,97 @@ class TestStageTableLockstep:
             "parity",
         )
         assert all_states["CheckSkipBacktester"]["Default"] == "Backtester"
+
+
+# ---------------------------------------------------------------------------
+# config#3134 — mode=backtest-eval preset routes past all four lane-A gates
+# ---------------------------------------------------------------------------
+
+def _extract_preset_flags(all_states: dict) -> dict:
+    """Mechanically parse the exact skip_* literal ApplyBacktestEvalPreset
+    seeds, the same way _initialize_input_floors parses InitializeInput's
+    literal in test_sf_choice_guards.py — so this test can never silently
+    drift from the live Pass state's Parameters."""
+    expr = all_states["ApplyBacktestEvalPreset"]["Parameters"]["merged.$"]
+    start = expr.index("States.StringToJson('") + len("States.StringToJson('")
+    end = expr.index("')", start)
+    literal = expr[start:end].replace('\\"', '"')
+    return json.loads(literal)
+
+
+def _choice_next(state: dict, flags: dict) -> str:
+    """Evaluate a single-rule And[IsPresent, BooleanEquals] skip-gate Choice
+    (the shape every skip_* gate in this SF uses) against `flags` and
+    return the resulting Next state name."""
+    assert state["Type"] == "Choice"
+    rule = state["Choices"][0]
+    var = rule["And"][1]["Variable"].removeprefix("$.")
+    if flags.get(var) is True:
+        return rule["Next"]
+    return state["Default"]
+
+
+class TestBacktestEvalPresetLaneA:
+    """config#3134 acceptance: a mode=backtest-eval execution's derived
+    input must route the CheckSkip choices past all four lane-A states
+    (Scanner, SignalsEnvelope, ChallengerShadow, ThinkTankCoverage) —
+    verified directly against the SF's Choice logic, mirroring the
+    Backtester+Evaluator-only contract config#830 established for the
+    non-lane-A stages."""
+
+    @pytest.fixture(scope="class")
+    def all_states(self):
+        d = json.loads(SF_PATH.read_text())
+
+        def walk(states):
+            for name, state in states.items():
+                yield name, state
+                if state.get("Type") == "Parallel":
+                    for b in state.get("Branches", []):
+                        yield from walk(b["States"])
+                if state.get("Type") == "Map":
+                    it = state.get("Iterator") or state.get("ItemProcessor") or {}
+                    yield from walk(it.get("States", {}))
+
+        return dict(walk(d["States"]))
+
+    @pytest.fixture(scope="class")
+    def preset_flags(self, all_states):
+        return _extract_preset_flags(all_states)
+
+    def test_preset_sets_all_four_lane_a_flags_true(self, preset_flags):
+        for flag in (
+            "skip_scanner",
+            "skip_signals_envelope",
+            "skip_challenger_shadow",
+            "skip_thinktank_coverage",
+        ):
+            assert preset_flags.get(flag) is True, (
+                f"mode=backtest-eval preset must seed {flag}=true"
+            )
+
+    @pytest.mark.parametrize(
+        ("gate", "expected_skip_next"),
+        [
+            ("CheckSkipScanner", "CheckSkipRegimeSubstrate"),
+            ("CheckSkipSignalsEnvelope", "CheckSkipChallengerShadow"),
+            ("CheckSkipChallengerShadow", "CheckSkipRAGIngestion"),
+            ("CheckSkipThinkTankCoverage", "CheckSkipRegimeRetrospectiveEval"),
+        ],
+    )
+    def test_preset_flags_route_past_each_lane_a_gate(
+        self, all_states, preset_flags, gate, expected_skip_next
+    ):
+        assert _choice_next(all_states[gate], preset_flags) == expected_skip_next, (
+            f"{gate}: mode=backtest-eval's seeded flags must route past "
+            f"this lane-A gate to {expected_skip_next}"
+        )
+
+    def test_backtester_and_evaluator_are_not_skipped(self, preset_flags):
+        """config#830's original contract must still hold: the preset skips
+        lane A too now, but still runs ONLY Backtester + Evaluator."""
+        assert preset_flags.get("skip_backtester") is not True
+        assert preset_flags.get("skip_evaluator") is not True
 
 
 # ---------------------------------------------------------------------------

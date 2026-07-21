@@ -190,8 +190,9 @@ class TestParallelStatePresence:
         # ThinkTankCoverage → RegimeRetrospectiveEval → DataPhase2 → ...
         # (the multi-agent Research state and CheckSkipResearch were
         # removed; SignalsEnvelope is the chain's continuation inside
-        # Branch A).
-        assert parallel["Branches"][0]["StartAt"] == "Scanner"
+        # Branch A). config#3134: Branch A's StartAt is now CheckSkipScanner
+        # (Scanner's own new skip gate), not Scanner directly.
+        assert parallel["Branches"][0]["StartAt"] == "CheckSkipScanner"
         branch_a = parallel["Branches"][0]["States"]
         assert "SignalsEnvelope" in branch_a
 

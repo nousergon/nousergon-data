@@ -147,7 +147,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,M2_DISPATCH_TARGET=repository_dispatch,FAST_PATH_ENABLED=false,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=false,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,M2_DISPATCH_TARGET=repository_dispatch,FAST_PATH_ENABLED=false,SF_WATCH_DISPATCH_AFTER_ESCALATION=true,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -236,11 +236,20 @@ CURRENT_M2_TARGET=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" M2_DISPATCH
 # FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
 # AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
 CURRENT_FAST_PATH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" FAST_PATH_ENABLED false)
-# EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION (config#2003) is operator-owned
+# SF_WATCH_DISPATCH_AFTER_ESCALATION (config#2003, renamed from
+# EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION by config#2953 — the old name
+# implied EOD-only scope on a fleet-wide dispatcher) is operator-owned
 # exactly like the two flags above — preserved via the shared helper
 # (config#1818/#2264 class: the update call REPLACES the whole Variables
 # map, so any operator-set flag missing here silently resets on redeploy).
-CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION false)
+# Default flipped false->true (config#2953, shepherd ruling: the overseer
+# owns the incident arc by default; the config#2269 ceiling is the bound).
+# Read the OLD name's live value first as the fallback default so an
+# operator override made under the old name before this rename survives one
+# more redeploy; both names are then written in lockstep for one release so
+# either name reflects the live posture (drop EOD_* in a follow-up PR).
+CURRENT_DISPATCH_AFTER_ESCALATION_LEGACY=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION true)
+CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" SF_WATCH_DISPATCH_AFTER_ESCALATION "${CURRENT_DISPATCH_AFTER_ESCALATION_LEGACY}")
 # SF_WATCH_MAX_DISPATCHES_* (config#2269) are CONFIG DEFAULTS, not operator
 # kill-switches — deliberately NOT run through preserve_env_flag: the
 # canonical way to change a per-cadence dispatch ceiling is a PR editing
@@ -249,7 +258,7 @@ CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag "${FUNCTION_NAME}" "${REGI
 # Brian-ruled per-cadence budgets (saturday 8 / weekday 2 / eod 2).
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},M2_DISPATCH_TARGET=${CURRENT_M2_TARGET},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
+  --environment "Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=${CURRENT_DISPATCH},M2_DISPATCH_TARGET=${CURRENT_M2_TARGET},FAST_PATH_ENABLED=${CURRENT_FAST_PATH},SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION},SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

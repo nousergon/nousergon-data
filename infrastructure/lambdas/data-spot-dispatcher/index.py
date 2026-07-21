@@ -55,8 +55,9 @@ import re
 import uuid
 
 import boto3
+from krepis import alerts
 from nousergon_lib import ec2_spot
-from nousergon_lib.ec2_spot import SpotCapacityExhausted
+from nousergon_lib.ec2_spot import SpotCapacityExhausted, SpotQuotaExceededError
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -263,8 +264,13 @@ echo "[data-spot] workload {workload} complete"
 
 def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     """Launch the data spot box; spot first, on-demand fallback on capacity
-    exhaustion (a pre-open enrich the predictor reads next must not be starved by
-    a spot-capacity dip). Mirrors _launch_instance in scheduled-groom-dispatcher.
+    exhaustion OR account-wide spot quota exhaustion (config#2698 — e.g.
+    MaxSpotInstanceCountExceeded; a 2026-07-15 incident hard-failed
+    LaunchPostMarketDataSpot instead of falling back, since this launcher calls
+    ec2_spot.launch directly rather than through nousergon_lib.spot_dispatch's
+    launch_with_fallback chokepoint and had no quota-specific branch) — a
+    pre-open enrich the predictor reads next must not be starved by either. Mirrors
+    _launch_instance in scheduled-groom-dispatcher.
 
     force_on_demand=True skips the spot attempt entirely. Set by the EOD SF's
     bounded retry-on-relaunch (2026-07-14 incident: a data-spot box was
@@ -297,6 +303,21 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     except SpotCapacityExhausted:
         logger.warning(
             "spot capacity exhausted across all type x subnet pools — relaunching ON-DEMAND"
+        )
+        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
+        return iid, "on-demand"
+    except SpotQuotaExceededError as exc:
+        # Account-wide (config#2698) — distinct from ordinary capacity rotation
+        # exhaustion, so this gets its own operator page: capacity exhaustion
+        # self-heals as AWS capacity shifts, but a quota ceiling only clears via
+        # a service-quota increase, which needs a human to notice and request.
+        logger.warning("spot quota exceeded (%s) — relaunching ON-DEMAND", exc)
+        alerts.publish(
+            f"EC2 spot quota exceeded for 'alpha-engine-data-spot' in {REGION} — "
+            f"falling back to on-demand: {exc}",
+            severity="warning",
+            source="data-spot-dispatcher._launch_instance",
+            dedup_key=f"spot-quota-exceeded-{REGION}",
         )
         iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
         return iid, "on-demand"

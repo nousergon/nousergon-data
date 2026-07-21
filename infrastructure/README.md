@@ -80,12 +80,31 @@ it). This is the operational equivalent of a targeted redrive:
 
 ```
 skip_weekly_run_day_gate, skip_morning_enrich, skip_data_phase1, skip_data_phase2,
-skip_lib_pin_drift_check, skip_regime_substrate, skip_research, skip_rag_ingestion,
+skip_lib_pin_drift_check, skip_scanner, skip_signals_envelope, skip_challenger_shadow,
+skip_regime_substrate, skip_research, skip_rag_ingestion, skip_thinktank_coverage,
 skip_rationale_clustering, skip_eval_judge, skip_evaluator, skip_post_eval,
 skip_regime_retrospective_eval, skip_predictor_training, skip_predictor_backtest,
 skip_portfolio_optimizer_backtest, skip_backtester, skip_parity, skip_replay_concordance,
 skip_counterfactual, skip_aggregate_costs
 ```
+
+**Lane-A flags (config#3134)**: `skip_scanner`, `skip_signals_envelope`,
+`skip_challenger_shadow`, `skip_thinktank_coverage` extend this charter to
+the Scanner/SignalsEnvelope/ChallengerShadow/ThinkTankCoverage research
+states inside `ResearchPredictorParallel`'s branch A — previously NONE of
+the four had a skip gate, so every partial rerun (e.g. `mode=backtest-eval`,
+see below) unconditionally re-scanned `candidates.json`, re-called the
+ChallengerShadow producer, and re-attempted ThinkTankCoverage's `gap_fill`
+thesis generation (real challenger-corpus writes + OpenRouter token burn)
+regardless of what was actually being rerun. **`skip_signals_envelope` is
+the one exception to "safe to set true for a completed stage": its gate
+defaults FALSE** because SignalsEnvelope is LOAD-BEARING for a real weekly
+run (I2880 staleness guard — the executor hard-fails Monday without a
+fresh `signals.json`). It is only safe to skip on a genuine partial rerun
+(e.g. `mode=backtest-eval`, where the whole run never reaches the
+executor) or when the failed execution's history proves SignalsEnvelope
+already ran this `run_date` — never hand-set it true on an operator rerun
+that is expected to produce a live Monday signal.
 
 e.g. an execution that failed at `MorningEnrich` retries with
 `skip_weekly_run_day_gate=true` (already passed) and every other `skip_*`
