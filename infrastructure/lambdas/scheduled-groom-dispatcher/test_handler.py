@@ -1347,3 +1347,92 @@ def test_github_token_falls_back_to_pat_on_mint_failure(monkeypatch):
         "/alpha-engine/saturday_sf_watch/github_pat": "pat_value",
     })
     assert idx._github_token() == "pat_value"
+
+
+# ── config#3173: mechanical per-day dispatch ceiling ────────────────────────
+
+
+def _ledger_objects_for(count: int, date: str) -> dict:
+    return {
+        f"groom/_control/dispatch-ledger/{date}/tok-{i}.json": b"{}"
+        for i in range(count)
+    }
+
+
+def test_dispatch_ceiling_exhausted_suppresses_launch_zero_spend(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-new"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch,
+        env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 5)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "dispatch_ceiling_exhausted"
+    assert g["prior_dispatch_count"] == 5
+    assert g["dispatch_ceiling"] == 5
+    assert launched == []  # never even attempted a spot launch — zero spend
+
+
+def test_dispatch_under_ceiling_launches_and_records_ledger_entry(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 4)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+    ledger = {k: v for k, v in idx._test_s3._objects.items()
+              if k.startswith("groom/_control/dispatch-ledger/")}
+    assert len(ledger) == 1, f"expected exactly one ledger entry, got {list(ledger)}"
+    doc = json.loads(list(ledger.values())[0])
+    assert doc["run_token"] == out["groom"]["run_token"]
+    assert doc["tier_tag"]
+
+
+def test_prior_launch_count_today_ignores_other_dates(monkeypatch):
+    # Seed only a DIFFERENT date's ledger keys — none should count toward
+    # "today" (a real UTC date the test doesn't control), so the real
+    # implementation must read 0 regardless of what date it runs on.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+               s3_objects=_ledger_objects_for(9, "2000-01-01"))
+    assert idx._prior_launch_count_today() == 0
+
+
+def test_dispatch_ledger_write_failure_never_blocks_the_launch(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 0)
+
+    def _boom(**kw):
+        raise RuntimeError("S3 down")
+
+    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+
+
+def test_dispatch_ceiling_checked_after_concurrent_tier_skip(monkeypatch):
+    # A concurrent-lane skip must short-circuit BEFORE the ceiling count read
+    # — no reason to spend an S3 list call when the launch was already going
+    # to be skipped for an unrelated reason.
+    calls = {"count": 0}
+
+    def _count():
+        calls["count"] += 1
+        return 0
+
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"mid-only": ["i-already-running"]},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", _count)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["reason"] == "concurrent_tier_skip"
+    assert calls["count"] == 0
