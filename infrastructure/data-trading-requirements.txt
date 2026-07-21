@@ -1,0 +1,84 @@
+# Slim dependency set for running ONLY the trading-box-resident workloads —
+# today that means the `metron-intraday` collector
+# (`python -m collectors.metron_market_data --only-intraday`) — on the
+# always-on ae-trading instance (alpha-engine-config#1768, Phase 1).
+#
+# Why this exists: the full `requirements.txt` pulls the entire data stack
+# (arcticdb, voyageai, edgartools, embit, beautifulsoup4, jsonschema, ~1.5 GB
+# installed) even though ae-trading no longer runs the heavy weekday/EOD data
+# phases at all — those moved to ephemeral EC2 spot boxes in
+# alpha-engine-config#1767 Phase 2 (nousergon-data#643, merged + closed
+# 2026-07-20; see that issue and `alpha-engine-data-spot-dispatcher`'s own
+# `_bootstrap_command()`, which clones a FRESH checkout and builds its OWN
+# ephemeral venv from the full requirements.txt on ITS OWN disk for every
+# run). ae-trading's persistent checkout+venv is no longer SSM-invoked for
+# MorningEnrich/`builders/daily_append.py` at all post-Phase-2.
+#
+# Scope of this file, deliberately conservative: traced (not guessed, via
+# actual `import` grep of the full transitive closure) from BOTH
+# `weekly_collector.py`'s `_run_morning_enrich`/`_run_morning_arctic_append`
+# entry points AND `builders/daily_append.py` directly — the pair named in
+# alpha-engine-config#1768's own scope — rather than the strictly-smaller set
+# `collectors/metron_market_data.py` alone needs (metron-intraday never
+# touches ArcticDB; see that module's own import list). This is intentionally
+# a superset so a manual/emergency SSM invocation of morning_enrich or
+# daily_append directly on ae-trading (the venv+checkout are still present
+# per this issue's own Gotchas — "do not remove the data repo clone
+# entirely") keeps working, not just the systemd-scheduled metron-intraday
+# path. A future groom pass MAY narrow this further to the strict
+# metron-intraday-only subset (drop arcticdb + the arcticdb lib extra) once
+# the manual-fallback path is itself retired or proven unused — flagged, not
+# assumed, since this environment cannot verify live SSM runbook usage.
+#
+# Keep in lockstep with the lib pin in requirements.txt / Dockerfile /
+# requirements-daily-news.txt (tests/test_lib_pin_lockstep.py extended to
+# cover this file too — see that test).
+boto3>=1.34
+pandas>=2.0
+# openpyxl: pd.read_excel(..., engine="openpyxl") in
+# collectors/constituents.py's _fetch_ssga_membership(), reachable from
+# collect() (called directly by _run_morning_enrich) and from
+# _run_morning_arctic_append's SSGA/Wikipedia membership refresh.
+openpyxl>=3.1
+pyarrow>=25.0.0
+# yfinance: collectors/prices.py + collectors/macro.py both `import
+# yfinance as yf` at module top level; both load unconditionally via
+# weekly_collector.py's `from collectors import ...` line, so this is
+# reachable regardless of which flag-gated branch runs.
+yfinance>=1.5.1
+requests>=2.31
+# pyyaml: weekly_collector.py itself (`import yaml`) +
+# features/feature_engineer.py's _load_feature_cfg_overrides(), which runs
+# unconditionally at module-import time (daily_append.py imports
+# features.feature_engineer).
+pyyaml>=6.0.3
+numpy>=2.4.6
+# lxml: pd.read_html() backend in collectors/constituents.py's
+# _fetch_wikipedia_sectors(), reachable from collect() and from
+# _run_morning_arctic_append's Wikipedia fallback. NOTE: no bs4/jsonschema/
+# feedparser/edgartools/embit/voyageai import was found anywhere in this
+# traced closure (all confined to rag/, collectors/alternative.py,
+# collectors/signal_returns.py, collectors/crypto_balances.py — Saturday
+# phase1/phase2-only or RAG-only code paths daily_append/morning_enrich
+# never reach) — deliberately excluded.
+lxml>=6.1.1
+arcticdb>=6.18.7
+# nousergon-lib extras, traced: [arcticdb] for store/arctic_store.py's
+# nousergon_lib.arcticdb usage (daily_append.py's get_universe_lib/
+# get_macro_lib); [flow-doctor] for weekly_collector.py's module-level
+# setup_logging/get_flow_doctor import. [rag] and [contracts] are NOT
+# needed — no traced import of either extra's submodules reaches this
+# closure (nousergon_lib.contracts is only reached via
+# collectors/signal_returns.py, a Saturday-phase1-only path).
+# [series-contract] added for daily_append.py's module-level
+# `from nousergon_lib.series_contract import (...)` (alpha-engine-
+# config#2456) — the base requirements.txt's own extras list is missing
+# this too (pre-existing gap, out of scope here; noted for the record).
+nousergon-lib[arcticdb,flow-doctor,series-contract] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
+# krepis: not imported directly by any file in this closure, but
+# nousergon_lib.locks/.trading_calendar/.dates/.secrets/.yfinance_quiet/
+# .http_retry/.logging (all imported somewhere in the traced closure) are
+# thin `import krepis.<x>` re-export shims at the pinned lib tag — genuine
+# transitive runtime dependency, so pinned directly per requirements.txt's
+# own precedent.
+krepis>=0.14.0

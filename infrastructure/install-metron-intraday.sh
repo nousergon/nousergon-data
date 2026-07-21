@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Install/refresh the Metron intraday-quotes timer on the trading box (config#1023).
+# Install/refresh the Metron intraday-quotes timer (config#1023).
+#
+# Host: ae-dashboard as of alpha-engine-config#1768 Phase 1 (2026-07-21) —
+# moved off ae-trading (duplicated the intraday-price-alerts Lambda's work
+# there; ae-dashboard is always-on, same box daily-news already runs on).
+# This script is host-agnostic (no box-specific logic below), kept as the
+# manual/emergency install path; the normal path is boot-pull.sh's own
+# convergence on ae-dashboard (see that repo's infrastructure/boot-pull.sh).
 # One-time (and after unit-file edits) via SSM:
-#   aws ssm send-command --instance-ids <trading-box> --document-name AWS-RunShellScript \
+#   aws ssm send-command --instance-ids <ae-dashboard-instance-id> --document-name AWS-RunShellScript \
 #     --parameters 'commands=["sudo bash /home/ec2-user/alpha-engine-data/infrastructure/install-metron-intraday.sh"]'
 # Idempotent: re-copies units, daemon-reloads, enables + starts the timer.
 set -euo pipefail
