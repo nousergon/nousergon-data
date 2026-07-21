@@ -203,3 +203,72 @@ def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher():
         f"PIPELINES — only-registry: {sorted(registry_pipes - sibling)}, "
         f"only-dispatcher: {sorted(sibling - registry_pipes)}"
     )
+
+
+# ── sf_watch_invocation_success lockstep (alpha-engine-config-I2901) ─────────
+
+
+def _sibling_dispatcher_watch_prefixes() -> dict[str, str]:
+    """{state_machine_name: watch_prefix} parsed from saturday-sf-watch-
+    dispatcher's PIPELINES dict — the SSoT the sf_watch_invocation_success
+    check's ``pipelines`` (state_machine + watch_prefix pairs) must mirror.
+    Scopes the ``watch_prefix`` search to each pipeline's OWN segment (bounded
+    by the next top-level key, or end-of-dict) so a nested sub-dict (e.g. the
+    weekday pipeline's ``fast_path`` block) can never be mistaken for a
+    sibling's fields."""
+    text = (LAMBDAS_DIR / "saturday-sf-watch-dispatcher" / "index.py").read_text()
+    start = text.index("PIPELINES: dict")
+    end = text.index("\n}\n", start)
+    block = text[start:end]
+    matches = list(re.finditer(r'^ {4}"([\w.-]+)":\s*\{', block, re.M))
+    prefixes: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        seg_end = matches[i + 1].start() if i + 1 < len(matches) else len(block)
+        segment = block[m.end():seg_end]
+        wp = re.search(r'"watch_prefix":\s*"([^"]+)"', segment)
+        if wp:
+            prefixes[m.group(1)] = wp.group(1)
+    return prefixes
+
+
+def test_sf_watch_invocation_success_pipelines_lockstep_with_dispatcher():
+    """REGRESSION GUARD (alpha-engine-config-I2901): the sf_watch_invocation_
+    success check's per-pipeline ``watch_prefix`` must exactly match
+    saturday-sf-watch-dispatcher's PIPELINES mapping — a drifted prefix would
+    make the check read the WRONG S3 key and either false-alarm or (worse)
+    silently never find the real watch-log, defeating the whole check."""
+    checks = REGISTRY["playbooks"]["sf-watch"]["liveness"]["checks"]
+    inv = next(c for c in checks if c["type"] == "sf_watch_invocation_success")
+    registry_map = {p["state_machine"]: p["watch_prefix"] for p in inv["pipelines"]}
+    sibling_map = _sibling_dispatcher_watch_prefixes()
+    assert registry_map == sibling_map, (
+        "sf_watch_invocation_success pipelines drifted from saturday-sf-watch-"
+        f"dispatcher's PIPELINES watch_prefix mapping — registry: {registry_map}, "
+        f"dispatcher: {sibling_map}"
+    )
+    # Must cover exactly the same pipeline set as the eventbridge_rule/
+    # state_machines_exist anchor — no silent partial coverage of the 3 SFs.
+    ebr = next(c for c in checks if c["type"] == "eventbridge_rule")
+    assert set(registry_map) == set(ebr["expect_state_machines"])
+
+
+# ── scheduler_schedule_exists coverage (alpha-engine-config-I2906) ───────────
+
+
+def test_watch_plane_covers_all_four_router_scheduler_schedules():
+    """REGRESSION GUARD (alpha-engine-config-I2906): the 4 router-targeting
+    EventBridge Scheduler schedules (alert-drain x2, weekly canary-drill x2)
+    must each have a scheduler_schedule_exists entry under watch_plane_
+    liveness — a deleted/disabled schedule is otherwise invisible (a
+    DIFFERENT AWS resource from the classic `events` rules the
+    eventbridge_rule check type covers). Name+state only, deliberately no
+    target-ARN assertion (a concurrent workstream, alpha-engine-config-I2832,
+    re-points two of these schedules' targets)."""
+    checks = REGISTRY["watch_plane_liveness"]["checks"]
+    names = {c["schedule_name"] for c in checks if c["type"] == "scheduler_schedule_exists"}
+    assert names == {
+        "alpha-engine-alert-drain-1000utc",
+        "alpha-engine-alert-drain-2200utc",
+        "alpha-engine-ci-watch-canary-drill-weekly",
+        "alpha-engine-sf-watch-canary-drill-weekly",
+    }

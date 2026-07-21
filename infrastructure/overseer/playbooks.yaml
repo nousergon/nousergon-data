@@ -77,6 +77,27 @@ playbooks:
             ami_env: SF_WATCH_AMI_ID
             security_group_env: SF_WATCH_SECURITY_GROUP
             subnets_env: SF_WATCH_SUBNETS
+        # alpha-engine-config-I2901: WIRING checks above (eventbridge_rule /
+        # state_machines_exist / lambda_active) only assert the dispatcher is
+        # deployed+wired — a dispatcher that is Active + correctly targeted but
+        # CRASHES on every real invocation (2026-07-17 ListBucket/403 while
+        # loading/writing the watch-log) is invisible to them. This check is
+        # the INVOCATION-SUCCESS signal: for each mature terminal-failure
+        # execution of a watched pipeline (read from the SFs' OWN execution
+        # history — independent of the watch-log itself, so a broken writer
+        # can't hide its own breakage), the day's watch-log doc must carry a
+        # matching event record. `response_window_min` gives the async
+        # EventBridge->Lambda hop + write time to land before a miss is a
+        # finding, not a race. `watch_prefix` per pipeline mirrors
+        # saturday-sf-watch-dispatcher's PIPELINES dict verbatim (pinned by
+        # tests/test_overseer_playbook_registry.py).
+        - type: sf_watch_invocation_success
+          pipelines:
+            - {state_machine: ne-weekly-freshness-pipeline, watch_prefix: consolidated/saturday_sf_watch}
+            - {state_machine: ne-preopen-trading-pipeline, watch_prefix: consolidated/weekday_sf_watch}
+            - {state_machine: ne-postclose-trading-pipeline, watch_prefix: consolidated/eod_sf_watch}
+          response_window_min: 10
+          lookback_hours: 24
 
   ci-watch:
     description: >-
@@ -206,6 +227,36 @@ playbooks:
       with continue-on-error so one sweep's failure doesn't mask the rest.
     supports_drill: false
 
+  canary-replay:
+    description: >-
+      Saturday-replay canary (alpha-engine-config#2246): replays the 3 bug
+      classes the Friday dry-preflight is structurally blind to (filing-change
+      detection, held-thesis-update, structured-output-retry) against LIVE
+      data on a Thursday schedule AND per-PR (crucible-research/nousergon-data,
+      `canary:replay` label). Inventory-only here (alpha-engine-config-I2906):
+      this Lambda is invoked DIRECTLY by its own Thursday EventBridge rule
+      (`alpha-engine-canary-replay-thursday`, classic rule->Lambda target, NOT
+      through the overseer-dispatcher router) and synchronously by the GHA
+      per-PR shim — zero routing decisions for the router to make, same
+      rationale as `groom` above. Its OWN wiring (the Thursday rule + spot
+      launch + completion marker) is watched by the dedicated
+      `canary-replay-liveness-probe` sibling Lambda, NOT duplicated here —
+      this entry exists purely so the registry stays the ONE place the watch
+      surface is enumerated (the header claim this playbook was previously
+      missing from).
+    tier: T2
+    routed: false
+    enabled: true
+    executor_function: alpha-engine-canary-replay-dispatcher
+    executor_lambda_dir: canary-replay-dispatcher
+    charter: alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh
+    concurrency_domain: >-
+      Single lane — EC2 tag lock on Name=alpha-engine-canary-replay-spot (one
+      canary replay at a time; the deterministic run_token also gives
+      at-most-one-live-marker idempotency per ISO week / PR+sha).
+    supports_drill: false
+    kill_switch_env: CANARY_REPLAY_DISPATCH_ENABLED
+
 # ── Cross-cutting watch-plane liveness (alpha-engine-config-I2831) ────────────
 # Checks that belong to NO single playbook: the overseer-dispatcher router
 # itself + the phase-1 intake plane (setup_overseer_intake.sh, config-I2822).
@@ -226,3 +277,19 @@ watch_plane_liveness:
       rule_name: overseer-intake-cw-alarm-state
       expect_enabled: true
       expect_target_queue: nousergon-overseer-intake
+    # alpha-engine-config-I2906: the router's OWN trigger topology also
+    # includes 4 EventBridge Scheduler schedules (a DIFFERENT AWS resource
+    # from the classic `events` rules above — no `eventbridge_rule` check
+    # covers these). A deleted/disabled schedule silently stops that surface
+    # with nothing watching it. Deliberately NAME + STATE only, never target
+    # ARN: alpha-engine-config-I2832 (concurrent workstream) re-points the two
+    # weekly canary-drill schedules' targets between the executor Lambdas and
+    # this router — asserting target ARN here would race that migration.
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-alert-drain-1000utc
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-alert-drain-2200utc
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-ci-watch-canary-drill-weekly
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-sf-watch-canary-drill-weekly
