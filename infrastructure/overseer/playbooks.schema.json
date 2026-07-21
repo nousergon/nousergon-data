@@ -194,6 +194,37 @@
               }
             }
           }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "schedule_name"],
+          "properties": {
+            "type": { "const": "scheduler_schedule_exists" },
+            "schedule_name": { "type": "string", "minLength": 1 },
+            "expect_enabled": { "type": "boolean" }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "pipelines", "response_window_min", "lookback_hours"],
+          "properties": {
+            "type": { "const": "sf_watch_invocation_success" },
+            "pipelines": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["state_machine", "watch_prefix"],
+                "properties": {
+                  "state_machine": { "type": "string", "minLength": 1 },
+                  "watch_prefix": { "type": "string", "minLength": 1 }
+                }
+              }
+            },
+            "response_window_min": { "type": "integer", "minimum": 1 },
+            "lookback_hours": { "type": "integer", "minimum": 1 }
+          }
         }
       ]
     }
