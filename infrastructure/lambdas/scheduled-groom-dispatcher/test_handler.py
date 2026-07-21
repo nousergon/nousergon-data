@@ -17,6 +17,9 @@ import json
 import os
 import sys
 import types
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1436,3 +1439,243 @@ def test_dispatch_ceiling_checked_after_concurrent_tier_skip(monkeypatch):
     out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
     assert out["groom"]["reason"] == "concurrent_tier_skip"
     assert calls["count"] == 0
+
+
+# ── config-I3227: org-wide ruling:pending-exec PR demand ─────────────────────
+# Ruled PRs (config-I3199 — a binding operator ruling awaiting execution)
+# previously contributed ZERO demand to this Lambda's pre-boot per-tier
+# counts: only issues were ever enumerated, so a backlog of ruled PRs alone
+# could never clear a tier's floor or trip the anti-starvation escape valve.
+# These tests cover: the new org-wide search-primary/per-repo-fallback PR
+# enumeration itself, its wiring into both _enumerate_tier_stats and
+# _enumerate_tier_stats_fresh (counts/oldest/p0), and the acceptance-
+# criteria synthetic case from alpha-engine-config-I3227 — N ruled PRs with
+# ZERO issues still produce a launch decision once N >= floor or the escape
+# valve fires.
+
+
+class _FakeHTTPResponse:
+    """Minimal stand-in for the ``with urllib.request.urlopen(...) as resp``
+    context manager index.py's REST helpers all use."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _search_pr_item(repo, number, labels, updated_at="2026-07-20T00:00:00Z",
+                    title="ruled PR"):
+    """A GitHub /search/issues result item shape (used by both the search
+    endpoint and, identically, the /repos/{repo}/issues fallback endpoint —
+    both are issues-API-shaped, PRs included via the ``pull_request`` key)."""
+    return {
+        "number": number, "title": title,
+        "labels": [{"name": lbl} for lbl in labels],
+        "updated_at": updated_at,
+        "repository_url": f"https://api.github.com/repos/{repo}",
+        "pull_request": {"url": "https://api.github.com/dummy"},
+    }
+
+
+def _recent_iso() -> str:
+    """A timestamp well inside DEFAULT_MAX_WAIT_HOURS — never trips the
+    escape valve on its own."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def test_enumerate_ruling_pending_prs_search_primary(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    items = [_search_pr_item("nousergon/nousergon-data", 950,
+                             ["ruling:pending-exec", "complexity:mid"])]
+    calls = []
+
+    def _fake_urlopen(req, timeout=30):
+        calls.append(req.full_url)
+        assert "/search/issues?q=" in req.full_url
+        assert "org%3Anousergon" in req.full_url
+        assert "is%3Apr" in req.full_url
+        assert "ruling%3Apending-exec" in req.full_url
+        return _FakeHTTPResponse(json.dumps({"items": items}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    out = idx._enumerate_ruling_pending_prs("tok")
+    assert len(out) == 1
+    assert out[0]["repo"] == "nousergon/nousergon-data"
+    assert out[0]["number"] == 950
+    assert len(calls) == 1, "no per-repo fallback calls when search succeeds"
+
+
+def test_enumerate_ruling_pending_prs_falls_back_on_search_failure(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    search_calls = []
+
+    def _fake_urlopen(req, timeout=30):
+        url = req.full_url
+        if "/search/issues" in url:
+            search_calls.append(url)
+            raise urllib.error.URLError("search API down")
+        if url == "https://api.github.com/orgs/nousergon/repos?per_page=100&page=1":
+            return _FakeHTTPResponse(json.dumps([
+                {"full_name": "nousergon/alpha-engine-config"},
+                {"full_name": "nousergon/nousergon-data"},
+            ]).encode())
+        if url.startswith("https://api.github.com/repos/nousergon/nousergon-data/issues"):
+            return _FakeHTTPResponse(json.dumps([
+                _search_pr_item("nousergon/nousergon-data", 42, ["ruling:pending-exec"]),
+            ]).encode())
+        if url.startswith("https://api.github.com/repos/nousergon/alpha-engine-config/issues"):
+            return _FakeHTTPResponse(b"[]")
+        raise AssertionError(f"unexpected urlopen call in this test: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    out = idx._enumerate_ruling_pending_prs("tok")
+    assert len(search_calls) == 1, "search must be tried exactly once before falling back"
+    assert len(out) == 1
+    assert out[0]["repo"] == "nousergon/nousergon-data"
+    assert out[0]["number"] == 42
+
+
+def test_enumerate_ruling_pending_prs_per_repo_failure_does_not_blank_the_rest(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+
+    def _fake_urlopen(req, timeout=30):
+        url = req.full_url
+        if "/search/issues" in url:
+            raise urllib.error.URLError("search API down")
+        if url == "https://api.github.com/orgs/nousergon/repos?per_page=100&page=1":
+            return _FakeHTTPResponse(json.dumps([
+                {"full_name": "nousergon/broken-repo"},
+                {"full_name": "nousergon/nousergon-data"},
+            ]).encode())
+        if url.startswith("https://api.github.com/repos/nousergon/broken-repo/issues"):
+            raise urllib.error.URLError("this repo 404s")
+        if url.startswith("https://api.github.com/repos/nousergon/nousergon-data/issues"):
+            return _FakeHTTPResponse(json.dumps([
+                _search_pr_item("nousergon/nousergon-data", 7, ["ruling:pending-exec"]),
+            ]).encode())
+        raise AssertionError(f"unexpected urlopen call in this test: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    out = idx._enumerate_ruling_pending_prs("tok")
+    assert len(out) == 1
+    assert out[0]["number"] == 7
+
+
+def _fake_urlopen_empty_issue_pages(req, timeout=30):
+    """Every /repos/{repo}/issues?state=open (no labels= filter) call —
+    i.e. the plain BACKLOG_REPOS issue walk — returns an empty page, so a
+    test using this can isolate itself to the ruling:pending-exec PR path
+    (stubbed separately via idx._enumerate_ruling_pending_prs)."""
+    url = req.full_url
+    assert "/issues?state=open&per_page=" in url and "labels=" not in url, (
+        f"unexpected urlopen call — only the plain issue walk should run: {url}")
+    return _FakeHTTPResponse(b"[]")
+
+
+def test_enumerate_tier_stats_fresh_folds_in_ruling_pending_prs(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_prs = [
+        _search_pr_item("nousergon/nousergon-data", 900 + i,
+                        ["ruling:pending-exec", "complexity:mid"], _recent_iso())
+        for i in range(9)
+    ]
+    for pr in fake_prs:
+        pr["repo"] = "nousergon/nousergon-data"  # normally stamped by _enumerate_ruling_pending_prs
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: fake_prs)
+    counts, oldest, p0_tiers, tier_issues = idx._enumerate_tier_stats_fresh("tok")
+    assert counts == {"low": 0, "mid": 9, "high": 0}
+    assert p0_tiers == []
+    assert len(tier_issues["mid"]) == 9
+    assert all(it["title"].startswith("[PR] ") for it in tier_issues["mid"])
+    assert {it["number"] for it in tier_issues["mid"]} == {900 + i for i in range(9)}
+
+
+def test_enumerate_tier_stats_fresh_ruling_pending_pr_p0_sets_escape_valve_flag(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_pr = _search_pr_item("nousergon/nousergon-data", 901,
+                              ["ruling:pending-exec", "complexity:high", "P0"], _recent_iso())
+    fake_pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [fake_pr])
+    counts, oldest, p0_tiers, tier_issues = idx._enumerate_tier_stats_fresh("tok")
+    assert counts["high"] == 1
+    assert p0_tiers == ["high"]
+
+
+def test_enumerate_tier_stats_folds_in_ruling_pending_prs(monkeypatch):
+    # Legacy single-slot enumeration (_demand_decision's path) gets the same
+    # fold-in, for parity with the fresh-stat path used by the live
+    # demand-all schedules.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_pr = _search_pr_item("nousergon/nousergon-data", 902,
+                              ["ruling:pending-exec", "complexity:low"], _recent_iso())
+    fake_pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [fake_pr])
+    counts, oldest, has_p0 = idx._enumerate_tier_stats("tok")
+    assert counts == {"low": 1, "mid": 0, "high": 0}
+    assert has_p0 is False
+
+
+# ── acceptance criteria (alpha-engine-config-I3227): N ruling:pending-exec ───
+# PRs with ZERO issues still produce a launch decision once N >= floor or the
+# anti-starvation escape valve fires — exercised end-to-end through handler().
+
+
+def test_demand_all_launches_from_ruling_pending_prs_alone_at_floor(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_prs = []
+    for i in range(idx.ge.DEFAULT_FLOOR):  # exactly at the floor, zero issues
+        pr = _search_pr_item("nousergon/nousergon-data", 910 + i,
+                             ["ruling:pending-exec", "complexity:mid"], _recent_iso())
+        pr["repo"] = "nousergon/nousergon-data"
+        fake_prs.append(pr)
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: fake_prs)
+    out = idx.handler(_demand_event(), None)
+    launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
+    assert "mid-only" in launched_filters, out["groom"]
+    assert idx._test_ssm.sent, "a real spot box must have been dispatched"
+
+
+def test_demand_all_ruling_pending_prs_below_floor_fresh_no_launch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    pr = _search_pr_item("nousergon/nousergon-data", 920,
+                         ["ruling:pending-exec", "complexity:mid"], _recent_iso())
+    pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [pr])
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["launches"] == []
+    assert not idx._test_ssm.sent
+
+
+def test_demand_all_stale_ruling_pending_pr_fires_escape_valve(monkeypatch):
+    # A single ruled PR, zero issues, well below the floor — but its
+    # updated_at is far past DEFAULT_MAX_WAIT_HOURS (72h), so it must fire
+    # the anti-starvation escape valve exactly like an overdue actionable
+    # issue would (config-I3227 acceptance criteria).
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    pr = _search_pr_item("nousergon/nousergon-data", 921,
+                         ["ruling:pending-exec", "complexity:mid"],
+                         "2020-01-01T00:00:00Z")
+    pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [pr])
+    out = idx.handler(_demand_event(), None)
+    launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
+    assert "mid-only" in launched_filters, out["groom"]
+    launch = next(l for l in out["groom"]["launches"] if l["issue_filter"] == "mid-only")
+    assert idx._test_ssm.sent

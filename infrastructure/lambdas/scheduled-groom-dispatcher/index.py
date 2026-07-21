@@ -65,6 +65,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from flow_doctor_telegram import notify_via_flow_doctor
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from nousergon_lib import groom_eligibility as ge
@@ -107,11 +108,25 @@ GROOM_MAX_DISPATCHES_DAILY = int(os.environ.get("GROOM_MAX_DISPATCHES_DAILY", "4
 # starving lower tiers) clears the floor or an escape valve fires. Kill-switch
 # independent of GROOM_DISPATCH_ENABLED — flipping this off restores the
 # legacy unconditional slot launches without touching schedules.
+#
+# config-I3227 (2026-07-21): the enumeration ALSO counts org-wide OPEN PRs
+# labeled ge.RULING_PENDING_LABEL ("ruling:pending-exec" — config-I3199,
+# folded into groom_driver.py's on-box tier queues by config#3210) into these
+# same per-tier totals — see _enumerate_ruling_pending_prs. Before this, a
+# backlog of ruled PRs alone could never clear a tier's floor or trip the
+# anti-starvation escape valve (they contributed ZERO demand), so they only
+# ever got worked when unrelated issue demand happened to launch a run.
 DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower() == "true"
 BACKLOG_REPOS = (
     "nousergon/alpha-engine-config", "nousergon/metron-ops",
     "nousergon/vires-ops", "nousergon/telos-ops",
 )
+# config-I3227: the org this Lambda's PR enumeration searches org-wide. Never
+# a hardcoded repo list (config#2294 precedent — see alpha-engine-config's
+# scripts/groom_driver.py::open_prs()/gh_repo_enum.search_prs_org_wide, which
+# _enumerate_ruling_pending_prs below mirrors but does not import — that
+# repo's scripts/ package is not a dependency of this Lambda).
+_GH_ORG = "nousergon"
 _RESEARCH_BUCKET = "alpha-engine-research"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
@@ -645,6 +660,115 @@ def _github_token() -> str:
     return resp["Parameter"]["Value"].strip()
 
 
+def _gh_rest(path: str, token: str):
+    """Minimal authenticated GET against the GitHub REST API — mirrors this
+    module's existing per-repo issue-list transport verbatim (urllib +
+    ``token`` auth, NOT ``Bearer``: matches every other call in this file)."""
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "scheduled-groom-dispatcher"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _list_org_repos(token: str) -> list[str]:
+    """Live ``owner/name`` org-wide enumeration (``GET /orgs/{org}/repos``,
+    paginated) — the fallback path's repo list when the org-wide PR search
+    itself fails. Never a hand-maintained constant (config#2294 precedent:
+    a hardcoded list silently misses a repo created after the list was last
+    updated)."""
+    repos: list[str] = []
+    page = 1
+    while True:
+        batch = _gh_rest(f"/orgs/{_GH_ORG}/repos?per_page=100&page={page}", token)
+        if not batch:
+            break
+        repos.extend(r["full_name"] for r in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
+
+
+def _ruling_pending_prs_for_repo(repo: str, token: str) -> list[dict]:
+    """Fallback per-repo fetch: OPEN PRs on ``repo`` carrying
+    ``ge.RULING_PENDING_LABEL``. The ``/issues`` endpoint's ``labels=``
+    filter also matches issues sharing the label — keep only items carrying
+    a ``pull_request`` key, mirroring the issue/PR split every other
+    enumeration in this file already does (e.g. ``_enumerate_tier_stats``'s
+    ``"pull_request" in it`` check)."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        batch = _gh_rest(
+            f"/repos/{repo}/issues?state=open"
+            f"&labels={urllib.parse.quote(ge.RULING_PENDING_LABEL)}"
+            f"&per_page=100&page={page}", token)
+        for it in batch:
+            if "pull_request" in it:
+                out.append(it)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
+    """Org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (config-I3199 /
+    config-I3227 — binding operator rulings awaiting execution, folded into
+    every on-box tier lane by groom_driver.py's ``ruling_exec_pr_pool`` since
+    config#3210, but structurally invisible to THIS Lambda's pre-boot demand
+    count until now).
+
+    Search-primary (``GET /search/issues?q=org:{org} is:pr is:open
+    label:"..."``, paginated), falling back to a live per-repo org-wide walk
+    (never a hardcoded repo list — config#2294) only if the search call
+    itself errors. Mirrors the search-then-fallback shape
+    alpha-engine-config's ``gh_repo_enum.search_prs_org_wide`` uses for the
+    identical problem (config#2838) — reimplemented locally against this
+    Lambda's own urllib/token transport rather than imported, since that
+    repo's ``scripts/`` package is not (and must not become) a dependency of
+    this public-adjacent Lambda: it lives in the PRIVATE
+    ``alpha-engine-config`` repo.
+
+    Each returned dict is tagged ``repo`` (``owner/name``) alongside the raw
+    GitHub fields (``number``, ``title``, ``labels``, ``updated_at``) the
+    callers below already consume for issues.
+    """
+    query = f'org:{_GH_ORG} is:pr is:open label:"{ge.RULING_PENDING_LABEL}"'
+    try:
+        items: list[dict] = []
+        page = 1
+        while True:
+            batch = _gh_rest(
+                f"/search/issues?q={urllib.parse.quote(query)}&per_page=100&page={page}",
+                token)
+            results = batch.get("items", [])
+            items.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        for it in items:
+            it["repo"] = it["repository_url"].split("/repos/", 1)[1]
+        return items
+    except Exception as exc:  # noqa: BLE001 — fail-safe to the per-repo walk, never to "zero ruled PRs"
+        logger.warning(
+            "org-wide ruling:pending-exec PR search failed (%s) — falling "
+            "back to a live per-repo org walk", exc)
+        out: list[dict] = []
+        for repo in _list_org_repos(token):
+            try:
+                for it in _ruling_pending_prs_for_repo(repo, token):
+                    it["repo"] = repo
+                    out.append(it)
+            except Exception as exc2:  # noqa: BLE001 — one repo's failure must not blank the rest
+                logger.warning("ruling:pending-exec PR fetch for %s failed (%s)", repo, exc2)
+        return out
+
+
 def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     """(counts per tier, oldest wait-hours per tier, has actionable P0).
 
@@ -652,6 +776,11 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     "sitting untouched" signal for the ARCH §66 escape valve. Freshness-skip
     is NOT applied here (the on-box driver enumeration stays authoritative);
     the slight overcount only ever biases toward launching.
+
+    config-I3227: also folds in org-wide OPEN PRs labeled
+    ``ge.RULING_PENDING_LABEL`` (see ``_enumerate_ruling_pending_prs``) into
+    the SAME counts/oldest maps — a ruled-PR-only backlog now clears the
+    floor or trips the escape valve exactly like an issue-only one would.
     """
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
@@ -686,6 +815,18 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
             if len(batch) < 100:
                 break
             page += 1
+    for pr in _enumerate_ruling_pending_prs(token):
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        tier = ge.is_actionable(labels)
+        if tier is None:
+            continue
+        counts[tier] += 1
+        updated = datetime.fromisoformat(
+            str(pr.get("updated_at", "")).replace("Z", "+00:00"))
+        waited = max(0.0, (now - updated).total_seconds() / 3600.0)
+        oldest[tier] = max(oldest[tier], waited)
+        if "P0" in labels:
+            has_p0 = True
     return counts, oldest, has_p0
 
 
@@ -833,7 +974,26 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     the actual issue dicts behind each count (repo/number/title/labels/
     updated_at), consumed by ``_write_queue_manifests`` (config#2152: the
     enumerate-once queue manifest — counts and queue derive from the SAME
-    walk by construction, so they can never diverge)."""
+    walk by construction, so they can never diverge).
+
+    config-I3227: org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (see
+    ``_enumerate_ruling_pending_prs``) are folded into the SAME
+    counts/oldest/p0_tiers/tier_issues this function already builds for
+    issues — one enumeration, one set of outputs, so ``decide_trigger()``
+    sees ruled PRs and issues as one undifferentiated demand pool per tier
+    (a ruled-PR-only backlog now clears the floor or trips the anti-
+    starvation escape valve exactly like an issue-only one would; the
+    escape valve is generic over ANY tier's oldest wait, so a ruled PR that
+    has sat past ``max_wait_hours`` fires it the same way an actionable P0
+    issue does — no separate carve-out needed). Fresh-skip applies to ruled
+    PRs identically to issues: a PR groom_driver.py's ``ruling_exec_pr_pool``
+    already worked and left an engagement disposition for (via the same
+    (repo, number) key) is debounced the same 72h window; a PR with no
+    matching engagement record is simply never skipped. PR titles are
+    prefixed ``[PR] `` in ``tier_issues``, mirroring the disambiguation
+    convention ``groom_driver.py``'s ``gated_reverify_pr_pool``/
+    ``ruling_exec_pr_pool`` already use for the identical PR-vs-issue
+    ambiguity."""
     engagements = _load_recent_engagements()
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
@@ -878,6 +1038,27 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
             if len(batch) < 100:
                 break
             page += 1
+    for pr in _enumerate_ruling_pending_prs(token):
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        tier = ge.is_actionable(labels)
+        if tier is None:
+            continue
+        is_p0 = "P0" in labels
+        pr_repo = pr.get("repo", "")
+        updated_epoch = datetime.fromisoformat(
+            str(pr.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
+        engaged = engagements.get((pr_repo, pr.get("number")))
+        if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
+            continue
+        counts[tier] += 1
+        tier_issues[tier].append({
+            "repo": pr_repo, "number": pr.get("number"),
+            "title": f"[PR] {pr.get('title', '')}", "labels": labels,
+            "updated_at": str(pr.get("updated_at", "")),
+        })
+        oldest[tier] = max(oldest[tier], (now_epoch - updated_epoch) / 3600.0)
+        if is_p0:
+            p0_tiers.add(tier)
     return counts, oldest, sorted(p0_tiers), tier_issues
 
 
