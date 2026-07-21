@@ -83,6 +83,26 @@ _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
 
+# config#3173 — mechanical per-day dispatch ceiling, generalizing the
+# config#2269 sf-watch pattern to groom. Groom already has TWO of the three
+# arc-continuity legs the config#3137 charter asks for: a box that dies
+# mid-run auto-relaunches up to config#1645's bounded retry (escalating loud
+# on exhaustion), and a trigger that never fires at all is caught by the
+# overseer-liveness-probe's run_window check reading this same
+# groom/decisions/{date}/ ledger (config#2667). The missing leg is THIS one:
+# an outermost runaway backstop bounding TOTAL launches/day across every
+# trigger + relaunch + sweep, so a broken EventBridge rule or a relaunch loop
+# gone wrong can't spot-cycle indefinitely. Default 40 is a conservative
+# multiple of the observed legitimate ceiling (3 daily cron slots x up to 3
+# co-launched tiers x up to 3 attempts each [1 + config#1645's 2 relaunches],
+# plus 3 sweep boxes x 3 attempts = ~36/day worst case under a genuinely bad
+# AWS day) — NOT a Brian-ruled number like sf-watch's config#2269 values;
+# tune via this env var in a follow-up PR if real volume needs it. Fails
+# LOUD (raises) on a ledger-count read error, mirroring this function's
+# existing fail-loud posture — silently failing open here would risk masking
+# a genuine runaway on the exact day S3 also hiccups.
+GROOM_MAX_DISPATCHES_DAILY = int(os.environ.get("GROOM_MAX_DISPATCHES_DAILY", "40"))
+
 # config#1933 demand-driven dispatch: enumerate actionable issues per tier
 # BEFORE any spot spend and launch only when the slot's queue (own tier +
 # starving lower tiers) clears the floor or an escape valve fires. Kill-switch
@@ -419,6 +439,79 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
 
 
+# config#3173 — dedicated ceiling ledger, deliberately SEPARATE from the
+# groom/decisions/{date}/ decision-record ecosystem (which has two
+# heterogeneous schemas — schema_version 1's flattened single-slot record and
+# schema_version 2's nested `decisions` list — that would need careful
+# reconciling to count launches from). One key = one launch ATTEMPT, written
+# by the dispatcher itself (never the agent), mirroring config#2269's
+# invariant that a crashed/misbehaving agent can neither reset nor starve the
+# count.
+_DISPATCH_LEDGER_PREFIX = "groom/_control/dispatch-ledger"
+
+
+def _prior_launch_count_today() -> int:
+    """Count today's already-recorded launch ATTEMPTS (config#3173) — the
+    outermost runaway backstop checked by ``_launch_groom_spot`` before any
+    new spot/on-demand spend. Fails LOUD (raises) on a read error rather than
+    failing open, matching this function's fail-loud posture."""
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    prefix = f"{_DISPATCH_LEDGER_PREFIX}/{today}/"
+    s3 = boto3.client("s3", region_name=REGION)
+    count = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix):
+        count += len(page.get("Contents", []))
+    return count
+
+
+def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str) -> None:
+    """Record a launch ATTEMPT for the daily ceiling count (config#3173).
+    Written just BEFORE the launch fires (mirroring sf-watch's watch-log
+    timing) so even a launch that subsequently fails/raises still consumes
+    budget — an attempt-then-immediately-fail loop must still trip the
+    ceiling eventually, never spin invisibly. Best-effort: a ledger-write
+    failure must never block the launch it's recording."""
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    key = f"{_DISPATCH_LEDGER_PREFIX}/{today}/{run_token}.json"
+    body = json.dumps({
+        "run_token": run_token, "tier_tag": tier_tag, "schedule": schedule_label,
+        "recorded_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — observability, never blocks dispatch
+        logger.warning("dispatch ledger write failed (non-fatal): %s", exc)
+
+
+def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
+                                       schedule_label: str) -> None:
+    """LOUD (non-silent) escalation — budget exhaustion means the day's
+    runaway backstop has fired; a human needs to look, never a silent skip."""
+    text = (
+        "🔴 Backlog groom dispatch ceiling EXHAUSTED (config#3173) — "
+        f"{prior} launches already recorded today >= ceiling {ceiling} "
+        f"(GROOM_MAX_DISPATCHES_DAILY). Suppressing this launch. lane={tier_tag} "
+        f"schedule={schedule_label}. If legitimate (a genuinely bad AWS day with "
+        "many relaunches), raise the ceiling via a PR; if NOT legitimate, "
+        "something is dispatching groom in a loop — investigate."
+    )
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="error",
+            dedup_key=f"{_FLOW_NAME}:dispatch_ceiling_exhausted:{today}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "tier_tag": tier_tag,
+                     "prior_dispatch_count": prior, "dispatch_ceiling": ceiling},
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
+
+
 def _terminate_instance(instance_id: str) -> None:
     """Best-effort terminate of a just-launched box whose post-launch steps
     failed. Without this the box orphans: it received no bootstrap, so neither
@@ -454,11 +547,33 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                 "issue_filter": issue_filter, "tier_tag": tier_tag,
                 "existing_instance_ids": existing}
 
+    # config#3173: outermost runaway backstop — checked LAST, after every
+    # other suppression, so it fires even when a caller bypasses the demand
+    # gate (queue_manifest_key / launch_decided relaunches). Counts every
+    # attempt recorded so far today via the dedicated ledger (never the
+    # agent's own output — see _prior_launch_count_today).
+    prior_dispatches = _prior_launch_count_today()
+    if prior_dispatches >= GROOM_MAX_DISPATCHES_DAILY:
+        logger.error(
+            "groom dispatch ceiling EXHAUSTED: %d prior launches today >= "
+            "ceiling %d — suppressing lane %s", prior_dispatches,
+            GROOM_MAX_DISPATCHES_DAILY, tier_tag)
+        _notify_dispatch_ceiling_exhausted(
+            prior_dispatches, GROOM_MAX_DISPATCHES_DAILY, tier_tag, schedule_label)
+        return {"launched": False, "reason": "dispatch_ceiling_exhausted",
+                "issue_filter": issue_filter, "tier_tag": tier_tag,
+                "prior_dispatch_count": prior_dispatches,
+                "dispatch_ceiling": GROOM_MAX_DISPATCHES_DAILY}
+
     # config#1645: a fresh token per launch ATTEMPT (not per schedule) — the
     # dispatch Step Function's relaunch loop calls this Lambda again with a new
     # execution, so each attempt gets its own S3 completion-marker key. A dead
     # box's stale marker (if any) can never be mistaken for THIS attempt's.
     run_token = uuid.uuid4().hex
+    # config#3173: record the attempt BEFORE the launch fires (mirrors the
+    # sf-watch watch-log timing) so a launch that itself fails/raises still
+    # consumes ceiling budget — see _write_dispatch_ledger_entry.
+    _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
     instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     logger.info("launched groom box %s (%s)", instance_id, market)
     # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
