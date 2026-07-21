@@ -143,11 +143,27 @@ SSM_NEON_QUOTA_GB = "/alpha-engine/NEON_DATA_TRANSFER_QUOTA_GB"
 SSM_GITHUB_TOKEN = "/alpha-engine/GITHUB_TOKEN"
 SSM_GITHUB_USER_PAT = "/alpha-engine/expenses/GITHUB_USER_BILLING_PAT"
 SSM_ANTHROPIC_ADMIN = "/alpha-engine/expenses/ANTHROPIC_ADMIN_KEY"
+# config#2968 quota-first CI_RUNNER_MODE auto-switch: a NARROWLY-scoped
+# write token, deliberately separate from the read-only SSM_GITHUB_TOKEN
+# above (least-privilege -- this is the only credential in this Lambda that
+# can mutate anything). Self-heals the same way SSM_GITHUB_USER_PAT does:
+# absent -> that row/mode reports not_configured, no code change needed once
+# an operator adds it.
+SSM_GITHUB_CI_RUNNER_PAT = "/alpha-engine/ci_runner_mode/GITHUB_VARIABLES_PAT"
 SSM_PARAMS = [SSM_OPENROUTER, SSM_DEEPSEEK, SSM_NEON, SSM_NEON_QUOTA_GB,
-              SSM_GITHUB_TOKEN, SSM_GITHUB_USER_PAT, SSM_ANTHROPIC_ADMIN]
+              SSM_GITHUB_TOKEN, SSM_GITHUB_USER_PAT, SSM_ANTHROPIC_ADMIN,
+              SSM_GITHUB_CI_RUNNER_PAT]
 
 GITHUB_ORG = "nousergon"
 GITHUB_USER = "cipher813"
+
+# config#2968: ride the included GHA quota first, flip to CodeBuild at 90%
+# so the overshoot window stays small; reset happens naturally next month
+# when MTD minutes reset to ~0 (no month-rollover special case needed).
+CI_RUNNER_MODE_REPO = "alpha-engine-config"
+CI_RUNNER_MODE_VAR = "CI_RUNNER_MODE"
+CI_RUNNER_MODE_BUDGET_KEY = "github_org"
+CI_RUNNER_MODE_THRESHOLD_FRAC = 0.90
 
 HTTP_TIMEOUT = 25
 # Don't call a projection before ~1 day of month has elapsed — a 2h-old month
@@ -802,6 +818,102 @@ def _private_repo_names(account: str, kind: str, headers: dict) -> set[str]:
     return names
 
 
+def _github_api_request(url: str, method: str, token: str,
+                        body: dict | None = None) -> dict | None:
+    """Method-generic GitHub API call (``_http_json`` above is GET-only).
+    Returns parsed JSON, or ``None`` for a 204 No Content (the variables
+    PATCH endpoint returns 204)."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"User-Agent": "alpha-engine-expense-collector",
+                 "Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28",
+                 **({"Content-Type": "application/json"} if data else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        snippet = exc.read()[:300].decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {exc.code} from {method} {url}: {snippet}") from exc
+
+
+def _get_repo_variable(token: str, repo: str, name: str) -> dict | None:
+    try:
+        return _github_api_request(
+            f"https://api.github.com/repos/{GITHUB_ORG}/{repo}/actions/variables/{name}",
+            "GET", token)
+    except RuntimeError as exc:
+        if "HTTP 404" in str(exc):
+            return None
+        raise
+
+
+def _set_repo_variable(token: str, repo: str, name: str, value: str) -> None:
+    _github_api_request(
+        f"https://api.github.com/repos/{GITHUB_ORG}/{repo}/actions/variables/{name}",
+        "PATCH", token, body={"name": name, "value": value})
+
+
+def check_runner_mode(mw: dict, budgets: dict, secrets: dict) -> dict:
+    """config#2968 quota-first auto-switch: keep alpha-engine-config's
+    CI_RUNNER_MODE on 'gha' (free GH-hosted minutes) until MTD private-repo
+    Actions minutes cross CI_RUNNER_MODE_THRESHOLD_FRAC of the included
+    quota (budgets SSoT, never hardcoded -- I2461/I2419 bug class), then
+    flip to 'codebuild'. Idempotent and stateless: re-derives the desired
+    mode from live billing data every call, never trusts its own last
+    write, and only issues a PATCH when the live value actually differs
+    (cheap to run hourly).
+
+    Reuses collect_github's already-built quota computation (same adapter
+    the Expenses page renders) rather than a second parallel client, so
+    this auto-switch decision and the console's own GitHub row can never
+    silently disagree."""
+    row = collect_github(mw, budgets, secrets, account=GITHUB_ORG, kind="org")
+    if row["status"] != "ok":
+        return {"status": "error", "error": row.get("error") or "collect_github non-ok status",
+                "source_row_status": row["status"]}
+    used = row["quota"]["used"]
+    limit = row["quota"]["limit"]
+    if limit is None:
+        return {"status": "error",
+                "error": f"budgets SSoT providers.{CI_RUNNER_MODE_BUDGET_KEY}.included_minutes "
+                         "missing -- cannot compute a threshold"}
+    threshold = limit * CI_RUNNER_MODE_THRESHOLD_FRAC
+    desired = "gha" if used < threshold else "codebuild"
+    base = {"used_minutes": used, "included_minutes": limit,
+            "threshold_minutes": round(threshold, 1), "desired_mode": desired}
+
+    write_token = secrets.get(SSM_GITHUB_CI_RUNNER_PAT)
+    if not write_token:
+        return {**base, "status": "not_configured",
+                "error": f"SSM {SSM_GITHUB_CI_RUNNER_PAT} missing -- needs a PAT with "
+                         f"{CI_RUNNER_MODE_REPO}'s Actions variables:write"}
+
+    try:
+        current = _get_repo_variable(write_token, CI_RUNNER_MODE_REPO, CI_RUNNER_MODE_VAR)
+        current_value = (current or {}).get("value")
+        if current_value == desired:
+            return {**base, "status": "ok", "changed": False, "mode": desired}
+        _set_repo_variable(write_token, CI_RUNNER_MODE_REPO, CI_RUNNER_MODE_VAR, desired)
+    except RuntimeError as exc:
+        # Same fencing contract as every other adapter in this file (see
+        # `fenced()` in _collect): a GitHub API hiccup on the GET/PATCH must
+        # not raise raw -- structured {"status": "error"} either surfaces
+        # through _runner_mode_check's own wrapped raise (Errors alarm pages)
+        # or, if this is ever called from a fenced context, degrades like any
+        # other row. The variable is left untouched on failure -- the toggle
+        # expression's own default (non-'gha' -> codebuild) means a stale
+        # read/write never strands the repo on uncontrolled GHA overage.
+        return {**base, "status": "error", "error": str(exc)}
+
+    logger.info("CI_RUNNER_MODE flipped %r -> %r (used=%.1f limit=%.1f threshold=%.1f)",
+               current_value, desired, used, limit, threshold)
+    return {**base, "status": "ok", "changed": True, "from_mode": current_value, "to_mode": desired}
+
+
 def _cfg_note(budgets: dict, key: str) -> str | None:
     """Operator-authored note for a provider from the budgets SSoT (surfaced on
     the row so a manual explanation — e.g. a temporary plan change — reaches the
@@ -1118,10 +1230,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         twice-daily invocation's ``Input: "{}"`` unchanged) — the live MTD
         rollup.
       - ``"reconcile"`` — month-close true-up (alpha-engine-config#2849),
-        scheduled ~03:00 UTC on the 2nd of each month."""
+        scheduled ~03:00 UTC on the 2nd of each month.
+      - ``"runner_mode_check"`` — config#2968 quota-first CI_RUNNER_MODE
+        auto-switch, scheduled hourly."""
     mode = (event or {}).get("mode", "collect")
     if mode == "reconcile":
         return _reconcile(event, context)
+    if mode == "runner_mode_check":
+        return _runner_mode_check(event, context)
     if mode != "collect":
         raise ValueError(f"unknown expense-collector event mode: {mode!r}")
     return _collect(event, context)
@@ -1133,6 +1249,23 @@ def _reconcile(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contrac
     budgets = _s3_json(s3, BUDGETS_KEY) or {}
     secrets = _load_ssm(SSM_PARAMS)
     return run_reconciliation(s3, now, budgets, secrets)
+
+
+def _runner_mode_check(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+    now = _now_utc()
+    mw = _month_window(now)
+    s3 = boto3.client("s3", region_name=REGION)
+    budgets = _s3_json(s3, BUDGETS_KEY) or {}
+    secrets = _load_ssm(SSM_PARAMS)
+    result = check_runner_mode(mw, budgets, secrets)
+    if result["status"] == "error":
+        # Fail-safe (config#2968): raise so the Lambda Errors alarm pages,
+        # but do NOT touch the variable -- the runs-on toggle expression's
+        # own default (any value other than the literal 'gha' -> codebuild)
+        # means a dead/stale controller degrades to the paid-but-cheap path,
+        # never to uncontrolled GHA overage.
+        raise RuntimeError(f"runner_mode_check failed: {result.get('error')}")
+    return result
 
 
 def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract

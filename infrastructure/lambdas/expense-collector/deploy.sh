@@ -62,14 +62,17 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 SCHED_NAMES=(
   "alpha-engine-expense-collector-twicedaily"
   "alpha-engine-expense-collector-reconcile-monthly"
+  "alpha-engine-expense-collector-runner-mode-hourly"
 )
 SCHED_CRONS=(
   "cron(15 0,12 * * ? *)"
   "cron(0 3 2 * ? *)"
+  "cron(0 * * * ? *)"
 )
 SCHED_INPUTS=(
   "{}"
   "{\"mode\":\"reconcile\"}"
+  "{\"mode\":\"runner_mode_check\"}"
 )
 SCHED_PREFIX="alpha-engine-expense-collector-"
 
