@@ -124,6 +124,28 @@ def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     return open_macro_lib(bucket, create_if_missing=True)
 
 
+#: Dedicated library holding the ``universe`` data-plane schema-version stamp
+#: (alpha-engine-config-I3241). Kept OUT of the ``universe`` library so it never
+#: pollutes the fleet-wide ticker roster ``get_universe_symbols()`` returns
+#: (``list_symbols()`` is unfiltered) — see ``store/schema_version.py``.
+SCHEMA_META_LIB = "universe_schema_meta"
+
+
+def get_schema_meta_lib(bucket: str | None = None) -> adb.library.Library:
+    """Get the ``universe_schema_meta`` library that carries the universe data
+    plane's schema-version stamp (alpha-engine-config-I3241).
+
+    Routed through the same ``_get_arctic`` connection singleton + canonical URI
+    as every other library. ``create_if_missing=True`` so a fresh bucket
+    bootstraps cleanly (an unstamped/absent stamp is read as baseline v0 — see
+    ``store.schema_version.assert_schema_version``). This is the single
+    mockable open-seam producers use, mirroring ``get_universe_lib`` /
+    ``get_macro_lib``.
+    """
+    arctic = _get_arctic(bucket)
+    return arctic.get_library(SCHEMA_META_LIB, create_if_missing=True)
+
+
 def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
     """Get a SCRATCH universe-shaped library for an offline migration build.
 
@@ -325,3 +347,35 @@ def to_arctic_canonical(
         df = df[canonical]
 
     return to_arctic_safe(df)
+
+
+def canonical_universe_columns(
+    *,
+    features: Sequence[str] | None = None,
+) -> list[str]:
+    """Return the LIVE ``universe`` library's canonical column list, derived
+    deterministically from code with no DataFrame required.
+
+    This is the single derivation of the persisted universe descriptor's
+    column set — the schema SSoT that both the schema-migration chokepoint
+    (``tests/test_schema_migration_chokepoint.py``) and the baseline
+    migration (``migrations/0000_baseline_universe_schema.py``) anchor
+    against. It is the column-only counterpart of ``to_arctic_canonical``:
+    same ordering rule, but expressed without a sample frame so a CI gate
+    can diff it against a migration's declared ``columns_after``.
+
+    The live universe symbols carry ``OHLCV_COLS + [source] + FEATURES``.
+    ``total_return_close`` (spliced after ``Close`` by ``to_arctic_canonical``
+    *when present*) is DELIBERATELY EXCLUDED: it exists only on the offline
+    CRSP-basis scratch library (``builders/migrate_universe_crsp_basis.py``),
+    never on the live ``universe`` symbols the daily/weekly producers write
+    and every downstream consumer reads. Including it would make the anchor
+    disagree with the real persisted descriptor.
+
+    Pass an explicit ``features`` only in tests that pin a synthetic schema;
+    production callers use the default (``feature_engineer.FEATURES``).
+    """
+    if features is None:
+        from features.feature_engineer import FEATURES as _FEATURES
+        features = _FEATURES
+    return list(OHLCV_COLS) + [PROVENANCE_COL] + list(features)

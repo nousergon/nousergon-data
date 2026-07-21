@@ -69,6 +69,7 @@ from store.arctic_store import (
     PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
     get_universe_lib,
     get_macro_lib,
+    get_schema_meta_lib,
     to_arctic_canonical,
     to_arctic_safe,
 )
@@ -1323,6 +1324,20 @@ def _daily_append_impl(
     if not dry_run:
         universe_lib = get_universe_lib(bucket)
         macro_lib = get_macro_lib(bucket)
+        # Schema-version pre-append assert (alpha-engine-config-I3241). Fail
+        # LOUD before touching any symbol if the persisted universe descriptor
+        # is not at the version this producer code emits — i.e. a
+        # schema-additive change was deployed without its data migration. This
+        # converts the config-I3236 failure (904/904 StreamDescriptorMismatch
+        # surfacing two layers downstream as an EOD reconcile RuntimeError) into
+        # a single actionable pre-flight error naming the pending migration.
+        # SchemaVersionMismatch is a RuntimeError subclass — it propagates
+        # (fail-loud), aborting the run before any partial write. The meta lib
+        # is opened via get_schema_meta_lib (the mockable open-seam, mirroring
+        # get_universe_lib/get_macro_lib).
+        from migrations import assert_universe_schema_current
+
+        assert_universe_schema_current(get_schema_meta_lib(bucket))
     else:
         universe_lib = None
         macro_lib = None
