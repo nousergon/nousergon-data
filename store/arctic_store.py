@@ -325,3 +325,35 @@ def to_arctic_canonical(
         df = df[canonical]
 
     return to_arctic_safe(df)
+
+
+def canonical_universe_columns(
+    *,
+    features: Sequence[str] | None = None,
+) -> list[str]:
+    """Return the LIVE ``universe`` library's canonical column list, derived
+    deterministically from code with no DataFrame required.
+
+    This is the single derivation of the persisted universe descriptor's
+    column set — the schema SSoT that both the schema-migration chokepoint
+    (``tests/test_schema_migration_chokepoint.py``) and the baseline
+    migration (``migrations/0000_baseline_universe_schema.py``) anchor
+    against. It is the column-only counterpart of ``to_arctic_canonical``:
+    same ordering rule, but expressed without a sample frame so a CI gate
+    can diff it against a migration's declared ``columns_after``.
+
+    The live universe symbols carry ``OHLCV_COLS + [source] + FEATURES``.
+    ``total_return_close`` (spliced after ``Close`` by ``to_arctic_canonical``
+    *when present*) is DELIBERATELY EXCLUDED: it exists only on the offline
+    CRSP-basis scratch library (``builders/migrate_universe_crsp_basis.py``),
+    never on the live ``universe`` symbols the daily/weekly producers write
+    and every downstream consumer reads. Including it would make the anchor
+    disagree with the real persisted descriptor.
+
+    Pass an explicit ``features`` only in tests that pin a synthetic schema;
+    production callers use the default (``feature_engineer.FEATURES``).
+    """
+    if features is None:
+        from features.feature_engineer import FEATURES as _FEATURES
+        features = _FEATURES
+    return list(OHLCV_COLS) + [PROVENANCE_COL] + list(features)
