@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sf-watch-market-hours-toggler:*"
+    },
+    {
+      "Sid": "ReadWriteSfWatchExecutorRolePolicyOnly",
+      "Effect": "Allow",
+      "Action": ["iam:GetRolePolicy", "iam:PutRolePolicy"],
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-sf-watch-executor-role"
+    }
+  ]
+}
