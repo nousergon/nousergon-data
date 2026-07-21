@@ -61,7 +61,7 @@ arcticdb>=6.18.7
 # nousergon-lib#226 registered the 9 states this repo's SF JSONs were
 # missing (2 Saturday + 7 EOD) and shipped in v0.124.8 — bumped to that tag
 # here (was v0.124.6) to unblock the new source-check test.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.8
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.9
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
