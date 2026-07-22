@@ -1571,7 +1571,7 @@ def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
     artifact_id; artifacts without a block are absent from the map."""
     fake_s3._registry_body = _RECOVERY_REGISTRY
     import index
-    specs, recovery, critical_arms, _esc = index.load_registry_with_recovery(
+    specs, recovery, critical_arms, _esc, _rem = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert len(specs) == 2
     assert set(recovery) == {"closes_recoverable"}
@@ -1626,7 +1626,7 @@ def _keyed_get_object(fake_s3, extra: dict[str, bytes]) -> None:
 def test_load_registry_parses_critical_while_champion_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    _specs, _recovery, critical_arms, _esc = index.load_registry_with_recovery(
+    _specs, _recovery, critical_arms, _esc, _rem = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert critical_arms == {"champion_feed": ["scanner_predictor_direct"]}
 
@@ -1634,7 +1634,7 @@ def test_load_registry_parses_critical_while_champion_arm(fake_s3):
 def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
             b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
@@ -1650,7 +1650,7 @@ def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
 def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY: b'{"schema_version": 1, "champion": "think_tank"}',
     })
@@ -1665,7 +1665,7 @@ def test_dynamic_severity_pointer_read_failure_fails_toward_critical(fake_s3):
     fail toward paging, never toward silence."""
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
@@ -1813,7 +1813,7 @@ artifacts:
     created_at: 2025-01-01
 """
     import index
-    _specs, _recovery, _arms, escalate = index.load_registry_with_recovery(
+    _specs, _recovery, _arms, escalate, _rem = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert escalate == {"config_scoring_weights": True}
 
@@ -2059,3 +2059,215 @@ def test_prev_issue_filed_missing_file_resets(fake_s3):
     import index
     _keyed_get_object(fake_s3, {index.CHECK_RESULTS_KEY: None})
     assert index._load_prev_issue_filed(fake_s3) == {}
+
+
+# ── config-I3282: freshness-critical → overseer drain dispatch ──────────────
+#
+# Eligibility (pinned by these tests): a row joins the pass's ONE aggregated
+# drain dispatch iff its critical page actually fired AND it has no
+# `recovery:` heal of its own AND it is not declared `remediation: operator`.
+# The dispatch is flag-gated (OBSERVE default), globally cooldown-deduped via
+# an S3 marker, async (Event) to the overseer router, and independently
+# trapped so a failure can never sink the sweep.
+
+_DRAIN_REGISTRY = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  calendar_aware: true
+  severity: warning
+artifacts:
+  - artifact_id: crit_dispatchable
+    s3_key_template: "staging/dispatchable/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    severity: critical
+    remediation: dispatch-diagnose
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+  - artifact_id: crit_operator
+    s3_key_template: "staging/operator/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    severity: critical
+    remediation: operator
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+  - artifact_id: crit_healed
+    s3_key_template: "staging/healed/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    severity: critical
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+    recovery:
+      type: lambda
+      target: "some-backfill-fn"
+  - artifact_id: warn_quiet
+    s3_key_template: "staging/quiet/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    severity: warning
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+"""
+
+
+def _run_drain_handler(monkeypatch, fake_s3, fixed_now, *, drain_enabled,
+                       registry=_DRAIN_REGISTRY):
+    """Full-sweep run with alerts ENABLED (pages fire) and recovery dispatch
+    in OBSERVE (so the `crit_healed` row's exclusion is purely declarative,
+    not an in-flight-heal artifact)."""
+    fake_s3._registry_body = registry
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.delenv("FRESHNESS_MONITOR_RECOVERY_ENABLED", raising=False)
+    if drain_enabled:
+        monkeypatch.setenv("FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED", "true")
+    else:
+        monkeypatch.delenv(
+            "FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED", raising=False
+        )
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    factory, sf, lam = _make_clients(fake_s3)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    result = index.handler({}, None)
+    return result, sf, lam, index
+
+
+def _drain_invokes(lam):
+    return [
+        c for c in lam.invoke.call_args_list
+        if c.kwargs.get("FunctionName") == "alpha-engine-overseer-dispatcher"
+    ]
+
+
+def test_load_registry_parses_remediation_map(monkeypatch, fake_s3):
+    """The loader returns the declared-lane map keyed by artifact_id;
+    undeclared rows are simply absent."""
+    import index
+    fake_s3._registry_body = _DRAIN_REGISTRY
+    _s, _r, _a, _e, remediation = index.load_registry_with_recovery(
+        fake_s3, "b", "k"
+    )
+    assert remediation == {
+        "crit_dispatchable": "dispatch-diagnose",
+        "crit_operator": "operator",
+    }
+
+
+def test_drain_dispatch_observe_mode_no_invoke(monkeypatch, fake_s3, fixed_now):
+    """Flag off (default): pages fire, but NO router invoke and NO marker —
+    the would-dispatch is log-only."""
+    result, _sf, lam, _index = _run_drain_handler(
+        monkeypatch, fake_s3, fixed_now, drain_enabled=False
+    )
+    assert result["alerted"] >= 1
+    assert result["drain_dispatch_enabled"] is False
+    assert _drain_invokes(lam) == []
+    marker_puts = [
+        k for (_, k, _) in fake_s3._put_calls
+        if k.startswith("_freshness_monitor/_dispatch/")
+    ]
+    assert marker_puts == []
+
+
+def test_drain_dispatch_fires_once_for_eligible_criticals(
+    monkeypatch, fake_s3, fixed_now
+):
+    """Flag on: the three critical rows all page, but exactly ONE router
+    invoke fires (aggregated), carrying the alert-drain playbook envelope,
+    async, and a dedup marker is written."""
+    result, _sf, lam, _index = _run_drain_handler(
+        monkeypatch, fake_s3, fixed_now, drain_enabled=True
+    )
+    assert result["alerted"] == 3  # dispatchable + operator + healed all page
+    invokes = _drain_invokes(lam)
+    assert len(invokes) == 1
+    call = invokes[0]
+    assert call.kwargs["InvocationType"] == "Event"
+    payload = json.loads(call.kwargs["Payload"])
+    assert payload["playbook"] == "alert-drain"
+    assert payload["payload"]["trigger"] == "freshness-critical"
+    assert payload["payload"]["is_drill"] == "false"
+    marker_puts = [
+        (k, body) for (_, k, body) in fake_s3._put_calls
+        if k == "_freshness_monitor/_dispatch/last_drain_dispatch.json"
+    ]
+    assert len(marker_puts) == 1
+    marker = json.loads(marker_puts[0][1])
+    # Only the declared-dispatchable row is a candidate — the operator row
+    # is page-only by declaration, the recovery row's lane is its heal.
+    assert marker["artifact_ids"] == ["crit_dispatchable"]
+
+
+def test_drain_dispatch_skips_when_no_eligible_candidates(
+    monkeypatch, fake_s3, fixed_now
+):
+    """A sweep whose only critical pages are operator-declared or
+    recovery-bearing rows dispatches nothing."""
+    registry = b"".join(
+        ln for ln in _DRAIN_REGISTRY.splitlines(keepends=True)
+    ).replace(b"remediation: dispatch-diagnose", b"remediation: operator")
+    result, _sf, lam, _index = _run_drain_handler(
+        monkeypatch, fake_s3, fixed_now, drain_enabled=True, registry=registry
+    )
+    assert result["alerted"] == 3
+    assert _drain_invokes(lam) == []
+
+
+def test_drain_dispatch_cooldown_dedup(monkeypatch, fake_s3, fixed_now):
+    """A fresh marker (within cooldown) suppresses the dispatch."""
+    fake_s3._head_returns[
+        "_freshness_monitor/_dispatch/last_drain_dispatch.json"
+    ] = {"LastModified": fixed_now}
+    _result, _sf, lam, _index = _run_drain_handler(
+        monkeypatch, fake_s3, fixed_now, drain_enabled=True
+    )
+    assert _drain_invokes(lam) == []
+
+
+def test_drain_dispatch_stale_marker_redispatches(
+    monkeypatch, fake_s3, fixed_now
+):
+    """A marker OLDER than the cooldown is a spent dispatch — fire again."""
+    from datetime import timedelta
+    fake_s3._head_returns[
+        "_freshness_monitor/_dispatch/last_drain_dispatch.json"
+    ] = {"LastModified": fixed_now - timedelta(minutes=999)}
+    _result, _sf, lam, _index = _run_drain_handler(
+        monkeypatch, fake_s3, fixed_now, drain_enabled=True
+    )
+    assert len(_drain_invokes(lam)) == 1
+
+
+def test_drain_dispatch_failure_does_not_sink_pass(
+    monkeypatch, fake_s3, fixed_now
+):
+    """A router-invoke failure is trapped: the sweep's primary deliverables
+    (alerts, heartbeat, check_results) land regardless."""
+    fake_s3._registry_body = _DRAIN_REGISTRY
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    monkeypatch.setenv("FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    lam = mock.Mock()
+    lam.invoke.side_effect = RuntimeError("router down")
+    factory, _sf, _lam = _make_clients(fake_s3, lambda_mock=lam)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
+    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    result = index.handler({}, None)  # must not raise
+
+    assert result["alerted"] == 3
+    put_keys = [k for (_, k, _) in fake_s3._put_calls]
+    assert "_freshness_monitor/heartbeat.json" in put_keys
+    assert "_freshness_monitor/check_results.json" in put_keys
