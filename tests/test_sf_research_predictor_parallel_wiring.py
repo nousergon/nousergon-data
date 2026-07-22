@@ -719,6 +719,27 @@ class TestPerBranchErrorIsolation:
             "BranchAFailed"
         ]
 
+    def test_thinktank_coverage_is_non_blocking(self, branch_a):
+        """config#3218 (§119 rule 3): CLAUDE.md asserts ThinkTankCoverage's
+        gap_fill top-up is observe-only and must never halt the pipeline —
+        this pins that claim against the live SF wiring instead of leaving
+        it a doc-only assumption. The Catch must route to the SAME state as
+        the success path's Next (CheckSkipRegimeRetrospectiveEval), so a
+        thesis-generation failure is silently absorbed rather than
+        detouring the run onto a different, untested path."""
+        state = branch_a["ThinkTankCoverage"]
+        catch_targets = [c["Next"] for c in state["Catch"]]
+        assert catch_targets == ["CheckSkipRegimeRetrospectiveEval"]
+        assert catch_targets == [state["Next"]]
+        assert "BranchAFailed" not in catch_targets
+        # Failure output must be quarantined off the success ResultPath so a
+        # caught error can never masquerade as a real thinktank_result.
+        assert [c["ErrorEquals"] for c in state["Catch"]] == [["States.ALL"]]
+        assert state["ResultPath"] == "$.thinktank_result"
+        assert all(
+            c["ResultPath"] != state["ResultPath"] for c in state["Catch"]
+        )
+
     def test_predictor_failure_routes_to_branch_b_failed(self, branch_b):
         """PredictorTraining failures (Task Catch + WaitForPredictorTraining
         Catch + CheckPredictorStatus default) route through
