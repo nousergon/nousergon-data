@@ -1679,3 +1679,128 @@ def test_demand_all_stale_ruling_pending_pr_fires_escape_valve(monkeypatch):
     assert "mid-only" in launched_filters, out["groom"]
     launch = next(l for l in out["groom"]["launches"] if l["issue_filter"] == "mid-only")
     assert idx._test_ssm.sent
+
+
+# ── Quota-fallback direct invoke (3-repo feature): {"mode": "fallback",
+# "tier": "<low|mid|high>"} fired by lambda:InvokeFunction (never
+# EventBridge) when an on-box groom run winds down on mid-run Claude-quota
+# exhaustion (alpha-engine-config groom_driver.py, config#1803 classifier).
+# Purely additive: no live SCHED_INPUTS event ever carries a top-level
+# "mode" key, so this must never fire on — or change the behavior of — any
+# existing invocation shape.
+
+@pytest.mark.parametrize("tier,expected_filter", [
+    ("low", "low-only"), ("mid", "mid-only"), ("high", "high-only"),
+])
+def test_fallback_dispatch_launches_one_box_per_tier_with_deepseek_backend(
+        monkeypatch, tier, expected_filter):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    # The fallback path must SKIP demand-eligibility enumeration entirely —
+    # it is a rescue for already-in-flight work, not a fresh demand decision.
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("fallback dispatch must not re-enumerate demand")))
+    monkeypatch.setattr(idx, "_demand_decision",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("fallback dispatch must not run the demand gate")))
+    out = idx.handler({"mode": "fallback", "tier": tier}, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["issue_filter"] == expected_filter
+    assert g["backend"] == "deepseek"
+    assert len(idx._test_ssm.sent) == 1
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_BACKEND=deepseek" in cmd
+    assert f"export GROOM_ISSUE_FILTER={expected_filter}" in cmd
+    assert cmd.index("export GROOM_BACKEND") < cmd.index("groom_spot_bootstrap.sh")
+
+
+def test_fallback_dispatch_writes_own_decision_record(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"mode": "fallback", "tier": "mid", "schedule": "quota-rescue"}, None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/fallback-" in k}
+    assert len(records) == 1, f"exactly one fallback decision record expected, got {list(idx._test_s3._objects)}"
+    doc = json.loads(list(records.values())[0])
+    assert doc["schema_version"] == 2
+    assert doc["trigger"] == "quota_fallback"
+    assert doc["tier"] == "mid"
+    assert doc["backend"] == "deepseek"
+    assert doc["schedule"] == "quota-rescue"
+    assert doc["decisions"][0]["launch"] is True
+    assert doc["decisions"][0]["issue_filter"] == "mid-only"
+
+
+def test_fallback_dispatch_reuses_launch_chokepoint_concurrency_guard(monkeypatch):
+    # Reuses _launch_groom_spot verbatim — the SAME concurrency guard every
+    # other dispatch path shares must also apply here (no duplicated launch
+    # logic that could silently diverge on this new path).
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(1) or "i-new",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"high-only": ["i-live-high"]},
+    )
+    out = idx.handler({"mode": "fallback", "tier": "high"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "concurrent_tier_skip"
+    assert launched == []
+
+
+@pytest.mark.parametrize("bad_tier", [None, "", "bogus", "sweep", "low-only"])
+def test_fallback_dispatch_invalid_tier_raises(monkeypatch, bad_tier):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    event = {"mode": "fallback"}
+    if bad_tier is not None:
+        event["tier"] = bad_tier
+    with pytest.raises(ValueError):
+        idx.handler(event, None)
+    assert not idx._test_ssm.sent  # fail loud BEFORE any spend, never a partial launch
+
+
+def test_fallback_dispatch_tier_is_case_insensitive(monkeypatch):
+    # Mirrors every other event-key resolver in this handler
+    # (_resolve_run_mode/_resolve_issue_filter/_resolve_model all .lower()) —
+    # a case-insensitive tier is intentional, not an oversight.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"mode": "fallback", "tier": "HIGH"}, None)
+    assert out["groom"]["launched"] is True
+    assert out["groom"]["issue_filter"] == "high-only"
+
+
+def test_fallback_mode_key_never_set_by_any_live_schedule_input():
+    # The discriminator (event.get("mode") == "fallback") is safe only if no
+    # live EventBridge Scheduler input ever carries a top-level "mode" key —
+    # verify that invariant directly against deploy.sh's SCHED_INPUTS (the
+    # single source of truth for what the 3 live cron triggers actually send).
+    deploy_sh = (Path(__file__).resolve().parent / "deploy.sh").read_text()
+    sched_inputs_block = deploy_sh.split("SCHED_INPUTS=(", 1)[1].split(")", 1)[0]
+    assert '"mode"' not in sched_inputs_block
+
+
+def test_normal_cron_event_unaffected_by_fallback_branch(monkeypatch):
+    # A real EventBridge-Scheduler-driven event (no "mode" key at all) must
+    # behave EXACTLY as before — the new branch is purely additive and must
+    # never intercept it, even if some other key happens to collide in future.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 0, "mid": 9, "high": 0})
+    out = idx.handler(_demand_event(), None)
+    assert "groom" in out
+    assert out["groom"]["trigger"] == "demand-all"
+    assert idx._test_ssm.sent
+    for cmd in (s["Parameters"]["commands"][0] for s in idx._test_ssm.sent):
+        assert "GROOM_BACKEND" not in cmd
+
+
+def test_legacy_direct_invoke_event_unaffected_by_fallback_branch(monkeypatch):
+    # Legacy direct invoke (no decide_only/launch_decided/mode key at all) —
+    # the pre-existing "decide AND launch in one call" shape — must also be
+    # completely untouched.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only",
+                       "model": "claude-sonnet-5"}, None)
+    assert out["groom"]["launched"] is True
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_BACKEND" not in cmd
