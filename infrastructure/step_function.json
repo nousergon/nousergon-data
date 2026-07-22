@@ -2961,6 +2961,26 @@
           "Next": "CheckSkipEvaluator"
         }
       ],
+      "Default": "CheckSkipBacktesterStageOnly"
+    },
+    "CheckSkipBacktesterStageOnly": {
+      "Type": "Choice",
+      "Comment": "Additive skip-gate (config#2362 Option A, operator-ruled 2026-07-21). Distinct from CheckSkipBacktester's legacy whole-pair skip_backtester jump above, which is left fully intact for back-compat. {\"skip_backtester_stage_only\": true} skips ONLY the Backtester SSM task itself — routing straight to CheckSkipPredictorBacktest — for the mid-tail-recovery case where Backtester already completed this run_date (its backtest/{run_date}/ artifacts already exist and are reused) but a downstream stage (PredictorBacktest / PortfolioOptimizerBacktest / Parity) failed and needs to rerun: the whole-pair skip_backtester jump cannot be used there because it would ALSO bypass the failed stage's own gate (the forbidden swallow — see scripts/weekly_sf_rerun.py's BACKTESTER_OVERSHADOWED handling), forcing an unnecessary Backtester re-burn. A scheduled/normal run never sets this flag, so Default falls through to Backtester unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_backtester_stage_only",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_backtester_stage_only",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPredictorBacktest"
+        }
+      ],
       "Default": "Backtester"
     },
     "Backtester": {

@@ -79,9 +79,12 @@ class TestDerivePlan:
         plan = mod.derive_plan(_events("tail_stage_failure"))
         assert plan.failed == ["parity"]
         # skip_backtester completed but its skip route would bypass the
-        # failed parity gate — must be DROPPED, loudly.
+        # failed parity gate — replaced with skip_backtester_stage_only
+        # (config#2362 Option A) so Backtester's SSM task isn't re-run
+        # while the tail gates still compose orthogonally.
         assert "skip_backtester" not in plan.skip_flags
-        assert any("skip_backtester DROPPED" in w for w in plan.warnings)
+        assert plan.skip_flags.get("skip_backtester_stage_only") is True
+        assert any("skip_backtester_stage_only" in n for n in plan.notes)
         assert set(plan.skip_flags) == {
             "skip_morning_enrich",
             "skip_data_phase1",
@@ -101,6 +104,7 @@ class TestDerivePlan:
             "skip_counterfactual",
             "skip_aggregate_costs",
             "skip_predictor_training",
+            "skip_backtester_stage_only",
             "skip_predictor_backtest",
             "skip_portfolio_optimizer_backtest",
         }
@@ -356,6 +360,17 @@ class TestStageTableLockstep:
                     "ValidatePredictorSkipWeightsFresh",
                 }
                 continue
+            if stage.name == "backtester_stage_only":
+                # config#2362 Option A additive gate: deliberately empty
+                # witness (it shares Backtester's work state with the
+                # "backtester" row, which already owns completion/failure
+                # detection for that physical task) — checked structurally
+                # here instead.
+                assert skip_targets == {"CheckSkipPredictorBacktest"}, (
+                    "CheckSkipBacktesterStageOnly's skip route changed — "
+                    "update the config#2362 Option A additive gate"
+                )
+                continue
             assert skip_targets & stage.witness, (
                 f"{stage.name}: skip route {skip_targets} no longer lands in "
                 f"witness {set(stage.witness)} — update STAGES"
@@ -369,7 +384,11 @@ class TestStageTableLockstep:
             "portfolio_optimizer_backtest",
             "parity",
         )
-        assert all_states["CheckSkipBacktester"]["Default"] == "Backtester"
+        # config#2362 Option A: CheckSkipBacktester's Default now falls
+        # through the additive CheckSkipBacktesterStageOnly gate before
+        # Backtester, rather than landing on Backtester directly.
+        assert all_states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
+        assert all_states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
 
 # ---------------------------------------------------------------------------

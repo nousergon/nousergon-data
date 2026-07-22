@@ -84,9 +84,25 @@ skip_lib_pin_drift_check, skip_scanner, skip_signals_envelope, skip_challenger_s
 skip_regime_substrate, skip_research, skip_rag_ingestion, skip_thinktank_coverage,
 skip_rationale_clustering, skip_eval_judge, skip_evaluator, skip_post_eval,
 skip_regime_retrospective_eval, skip_predictor_training, skip_predictor_backtest,
-skip_portfolio_optimizer_backtest, skip_backtester, skip_parity, skip_replay_concordance,
-skip_counterfactual, skip_aggregate_costs
+skip_portfolio_optimizer_backtest, skip_backtester, skip_backtester_stage_only,
+skip_parity, skip_replay_concordance, skip_counterfactual, skip_aggregate_costs
 ```
+
+**`skip_backtester_stage_only` (config#2362 Option A, operator-ruled
+2026-07-21)**: additive, distinct from `skip_backtester`'s legacy whole-pair
+jump above. `skip_backtester` bypasses BOTH the Backtester task AND the
+PredictorBacktest/PortfolioOptimizerBacktest/Parity gates after it — so it
+cannot be used for a mid-tail recovery rerun where Backtester already
+completed this `run_date` but one of those later stages failed (using
+`skip_backtester` there would ALSO skip the failed stage's own gate, the
+forbidden swallow). `skip_backtester_stage_only=true` instead skips ONLY the
+Backtester SSM task (reusing its already-written `backtest/{run_date}/`
+artifacts) while still routing through the tail gates, so the failed stage
+reruns without an unnecessary Backtester re-burn.
+`scripts/weekly_sf_rerun.py` derives this automatically: when Backtester
+completed but a `predictor_backtest` / `portfolio_optimizer_backtest` /
+`parity` failure is detected, it emits `skip_backtester_stage_only` in place
+of `skip_backtester`.
 
 **Lane-A flags (config#3134)**: `skip_scanner`, `skip_signals_envelope`,
 `skip_challenger_shadow`, `skip_thinktank_coverage` extend this charter to

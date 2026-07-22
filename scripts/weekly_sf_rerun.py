@@ -118,6 +118,11 @@ class Stage:
     work: str                      # the stage's first work state
     witness: frozenset             # entered => completed-or-skipped
     emit_skip: bool = True         # False => never emit the flag (see notes)
+    detect_failure: bool = True    # False => another Stage row already owns
+                                    # this `work` state's failure detection
+                                    # (config#2362: skip_backtester_stage_only
+                                    # shares Backtester's work state with the
+                                    # "backtester" row above it)
     note: str = ""
 
 
@@ -255,6 +260,26 @@ STAGES: tuple[Stage, ...] = (
             " CheckSkipEvaluator (legacy whole-pair semantics), bypassing"
             " the predictor-backtest / portfolio-optimizer / parity gates."
         ),
+    ),
+    Stage(
+        # config#2362 Option A (operator-ruled 2026-07-21): the additive
+        # stage-only skip gate CheckSkipBacktesterStageOnly, inserted
+        # between CheckSkipBacktester and the Backtester task itself. It
+        # shares Backtester's `work` state with the "backtester" row above,
+        # so it carries empty witness + detect_failure=False — completion
+        # and failure for the physical Backtester task are detected exactly
+        # once, by the "backtester" row. This row exists purely so (a) the
+        # TestStageTableLockstep completeness guard sees the new gate
+        # covered and (b) _simulate_reachable_works can look up
+        # effective["backtester_stage_only"] from plan.skip_flags /
+        # original_input like any other flag. derive_plan sets
+        # skip_backtester_stage_only explicitly (see the BACKTESTER_OVERSHADOWED
+        # replacement logic below) rather than via witness-driven emission.
+        "backtester_stage_only", "skip_backtester_stage_only",
+        "CheckSkipBacktesterStageOnly", "Backtester",
+        frozenset(),
+        emit_skip=False,
+        detect_failure=False,
     ),
     Stage(
         "predictor_backtest", "skip_predictor_backtest",
@@ -403,6 +428,10 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     # tail: CheckSkipBacktester's skip route OVERSHOOTS to CheckSkipEvaluator
     if effective["backtester"]:
         pass  # backtester, predictor_backtest, portfolio_optimizer_backtest, parity all bypassed
+    elif effective["backtester_stage_only"]:
+        # config#2362 Option A: only the Backtester SSM task is bypassed;
+        # the tail gates still compose orthogonally past it.
+        run_linear(["predictor_backtest", "portfolio_optimizer_backtest", "parity"])
     else:
         run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest", "parity"])
     run_linear(["evaluator", "post_eval"])
@@ -423,7 +452,7 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
                 plan.skip_flags[stage.flag] = True
             elif stage.note:
                 plan.notes.append(f"{stage.name}: {stage.note}")
-        elif stage.work in entered:
+        elif stage.detect_failure and stage.work in entered:
             plan.failed.append(stage.name)
 
     if not plan.failed:
@@ -436,19 +465,24 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
     # Anti-swallow / reachability guard: every failed stage's work must
     # actually run under the derived flags. The only overshooting gate is
     # skip_backtester (its skip route jumps the predictor-backtest /
-    # portfolio-optimizer / parity gates), so drop it when it would bypass
-    # the failed stage — the Backtester re-burn is unavoidable and LOUD.
+    # portfolio-optimizer / parity gates), so replace it with
+    # skip_backtester_stage_only when it would bypass the failed stage
+    # (config#2362 Option A, operator-ruled 2026-07-21): the additive
+    # CheckSkipBacktesterStageOnly gate skips only the Backtester SSM task
+    # (its backtest/{run_date}/ artifacts already exist and are reused) while
+    # still routing through the predictor-backtest/portfolio-optimizer/parity
+    # gates, so the failed stage reruns without re-burning Backtester.
     if "skip_backtester" in plan.skip_flags and any(
         f in plan.failed for f in BACKTESTER_OVERSHADOWED
     ):
         del plan.skip_flags["skip_backtester"]
-        plan.warnings.append(
-            "skip_backtester DROPPED although Backtester completed: its skip "
-            "route jumps straight to CheckSkipEvaluator and would bypass the "
+        plan.skip_flags["skip_backtester_stage_only"] = True
+        plan.notes.append(
+            "skip_backtester replaced with skip_backtester_stage_only: "
+            "Backtester completed but its whole-pair skip route would bypass "
             f"failed stage(s) {[f for f in plan.failed if f in BACKTESTER_OVERSHADOWED]} "
-            "— the forbidden swallow. Backtester will re-run (duplicate spot "
-            "spend, idempotent same-run_date artifacts). SF-topology gap; "
-            "see the config#2277 PR body."
+            "— skipping only the Backtester SSM task (reusing its "
+            "already-written artifacts) instead of re-burning it. config#2362."
         )
 
     reachable = _simulate_reachable_works(plan.skip_flags, original_input)
