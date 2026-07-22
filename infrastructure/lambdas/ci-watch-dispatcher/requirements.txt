@@ -14,5 +14,10 @@ boto3>=1.34.0
 # accepts extra_tags). No [flow-doctor] extra needed — this Lambda sends no
 # Telegram of its own (the synchronous GHA caller reads the return value
 # directly; see index.py docstring).
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.122.0
-krepis>=0.12.0
+# v0.124.1 (config#2698, nousergon-lib#213) is the first version whose
+# launch_with_fallback falls back to on-demand on SpotQuotaExceededError
+# (account-wide spot quota, e.g. MaxSpotInstanceCountExceeded) the same way
+# it already does for SpotCapacityExhausted — bumped to the latest v0.124.5
+# tag to pick that up.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.5
+krepis>=0.14.0

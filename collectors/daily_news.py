@@ -127,15 +127,24 @@ def _build_aggregator():
     constructors or the SEC company-name fetch touching the network.
     """
     from collectors.news_aggregator_async import AsyncNewsAggregator
+    from collectors.news_sources.fetch_budget import DAILY_NEWS_MAX_FETCH_SECONDS
     from collectors.news_sources.gdelt import GdeltNewsAdapter
     from collectors.news_sources.polygon import PolygonNewsAdapter
     from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
     from rag.pipelines.run_news_pipeline import _load_ticker_name_map
 
+    # config#2938 ruling 1 — the DAILY digest tolerates partial coverage: give
+    # BOTH throttle-prone sources the same tight bail-early budget so a slow
+    # Polygon sweep (5 req/min) degrades this pull's breadth instead of blowing
+    # daily-news.service's TimeoutStartSec with zero digest. GDELT already
+    # defaulted to this budget (config#2813); Polygon was the uncovered gap.
     return AsyncNewsAggregator(
         sources=[
-            PolygonNewsAdapter(),
-            GdeltNewsAdapter(ticker_name_map=_load_ticker_name_map()),
+            PolygonNewsAdapter(max_fetch_seconds=DAILY_NEWS_MAX_FETCH_SECONDS),
+            GdeltNewsAdapter(
+                ticker_name_map=_load_ticker_name_map(),
+                max_fetch_seconds=DAILY_NEWS_MAX_FETCH_SECONDS,
+            ),
             YahooRssNewsAdapter(),
         ]
     )

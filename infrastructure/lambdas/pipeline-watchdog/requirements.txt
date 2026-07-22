@@ -1,4 +1,4 @@
 # config#1742 T2 — flow-doctor forum-topic routing for pipeline-watchdog alerts.
 # trading_calendar + alerts.publish (SNS-only; Telegram via flow_doctor_telegram).
 nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
-krepis>=0.10.2
+krepis>=0.15.0

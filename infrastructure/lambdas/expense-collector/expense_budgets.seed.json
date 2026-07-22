@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "_doc": "Budgets/quotas SSoT for the expense-collector Lambda + console Expenses page. Live copy: s3://alpha-engine-research/config/expense_budgets.json (operator-edited: aws s3 cp expense_budgets.seed.json s3://alpha-engine-research/config/expense_budgets.json — or edit the live object directly). monthly_budget_usd null = no budget line (row shows spend without over/under pacing). fixed_monthly_usd on a key with no live adapter renders a flat-subscription row, so future subscriptions are config-only additions.",
-  "updated": "2026-07-17",
+  "updated": "2026-07-19",
   "providers": {
     "aws": {
       "label": "AWS",
@@ -9,8 +9,8 @@
     },
     "anthropic_api": {
       "label": "Anthropic API",
-      "monthly_budget_usd": 0.0,
-      "note": "budget set to $0 deliberately — Brian is shifting Anthropic-API-billed usage to OpenRouter models (2026-07-17 decision)"
+      "monthly_budget_usd": 10.0,
+      "note": "small carve-out (2026-07-19 decision, config-I2997) — every direct-Anthropic call site except EvalJudge Batches migrated to OpenRouter; EvalJudge Batches is a deliberate sole exception (50% batch discount has no OpenRouter equivalent). Live MTD spend at time of this change was $5.16 (source=client_telemetry, projected month-end $8.64), all attributable to EvalJudge post-migration — budget set to $10 to cover that pace without flagging the retained exception as overage. Revisit if EvalJudge batch volume changes materially."
     },
     "claude_max": {
       "label": "Claude Max 20x subscription",
@@ -27,7 +27,8 @@
     },
     "neon": {
       "label": "Neon Postgres",
-      "monthly_budget_usd": 15.0
+      "monthly_budget_usd": 15.0,
+      "note": "mtd_cost_usd is computed from data-transfer overage only (500 GB/mo free egress, then $0.10/GB — neon.com/pricing, verified 2026-07-17); compute ($0.106/CU-hour) and storage ($0.35/GB-month) render unknown in detail.cost_components_unavailable because the project detail API exposes no CU-size or current-storage-size field to price them from (config#2913). No fixed_monthly_usd is set — if a manually-confirmed paid-plan invoice needs to override this estimate, set fixed_monthly_usd and replace this note."
     },
     "github_org": {
       "label": "GitHub (nousergon org)",

@@ -48,6 +48,27 @@ ALERT_RULE_NAME="overseer-intake-alert-events"
 CW_ALARM_RULE_NAME="overseer-intake-cw-alarm-state"
 RETENTION_SECONDS=1209600  # 14 days (SQS maximum)
 MAX_RECEIVE_COUNT=5
+# VisibilityTimeout (alpha-engine-config-I2904): the SQS default is 30s.
+# The charter's per-incident workflow (diagnose -> PR -> ledger -> THEN
+# delete) takes minutes by design (2026-07-17 first live drain: real
+# incidents ran multi-minute). At 30s, every real incident's message
+# re-became visible mid-processing, got re-pulled under a NEW receipt handle
+# (invalidating the one STEP 4 held), survived to MAX_RECEIVE_COUNT=5, and
+# landed in the DLQ misreported as a "dropped alert" it never was.
+# 1800s (30 min) is chosen as the p99 per-incident processing ceiling
+# (diagnose + open PR + write ledger record for one incident, observed
+# well under this in the 2026-07-17 drain) with headroom. It interacts with
+# MAX_RECEIVE_COUNT=5 (redrive to the DLQ) as follows: with the deterministic
+# ingest wrapper (scripts/alert_drain_ingest.py, alpha-engine-config)
+# `ChangeMessageVisibility`-heartbeating an incident that runs long, the
+# receive count only climbs on a GENUINE crash-loop / redelivery (the box
+# dying mid-incident before a heartbeat or the ledger write), never on a
+# false timeout expiry — so DLQ arrival keeps meaning "this incident
+# actually failed repeatedly," not "the timeout was too short." Applied
+# LIVE 2026-07-17 ~22:30 UTC (operator-authorized, ahead of this script
+# update); this codifies that live change so a future re-run of this
+# idempotent script doesn't drift back to the 30s default.
+VISIBILITY_TIMEOUT_SECONDS=1800
 
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
@@ -88,15 +109,17 @@ DLQ_URL=$(aws sqs get-queue-url --queue-name "$DLQ_NAME" --region "$REGION" --qu
 DLQ_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${DLQ_NAME}"
 
 REDRIVE_POLICY="{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"${MAX_RECEIVE_COUNT}\\\"}"
-ensure_queue "$QUEUE_NAME" "{\"MessageRetentionPeriod\":\"${RETENTION_SECONDS}\",\"RedrivePolicy\":\"${REDRIVE_POLICY}\"}"
+ensure_queue "$QUEUE_NAME" "{\"MessageRetentionPeriod\":\"${RETENTION_SECONDS}\",\"RedrivePolicy\":\"${REDRIVE_POLICY}\",\"VisibilityTimeout\":\"${VISIBILITY_TIMEOUT_SECONDS}\"}"
 QUEUE_URL=$(aws sqs get-queue-url --queue-name "$QUEUE_NAME" --region "$REGION" --query QueueUrl --output text 2>/dev/null || echo "")
 QUEUE_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${QUEUE_NAME}"
 
-# Upsert retention + redrive on pre-existing queues too (idempotent re-runs
-# after parameter changes).
+# Upsert retention + redrive + visibility-timeout on pre-existing queues too
+# (idempotent re-runs after parameter changes — this is also what re-applies
+# VISIBILITY_TIMEOUT_SECONDS if it's ever hand-changed live and needs
+# reconciling back to the SSoT here).
 if [[ "$DRY_RUN" == "0" && -n "$QUEUE_URL" ]]; then
   aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --region "$REGION" \
-    --attributes "{\"MessageRetentionPeriod\":\"${RETENTION_SECONDS}\",\"RedrivePolicy\":\"${REDRIVE_POLICY}\"}"
+    --attributes "{\"MessageRetentionPeriod\":\"${RETENTION_SECONDS}\",\"RedrivePolicy\":\"${REDRIVE_POLICY}\",\"VisibilityTimeout\":\"${VISIBILITY_TIMEOUT_SECONDS}\"}"
 fi
 
 # ── 3. Rule on the custom bus: krepis alert events → queue ──────────────────

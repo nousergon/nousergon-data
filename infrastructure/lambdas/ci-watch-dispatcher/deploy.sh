@@ -20,7 +20,12 @@
 # sibling agent is creating in alpha-engine-config, deliberately NOT the
 # shared trading alpha-engine-executor-role) + ssm:SendCommand. The BOX reads
 # its own run secrets (PAT) via ITS instance profile, so this Lambda needs no
-# secret access of its own.
+# secret access of its own. As of config#2862 it also needs read-only
+# s3:ListBucket/s3:GetObject scoped to
+# alpha-engine-research/ci_watch/_control/signatures/* — a small ADDITIVE IAM
+# grant (not a new role) to consult the signature-repeat launch dedup control-
+# plane before spending a spot launch on a known-fixed, still-recurring
+# root cause; see index.py's SIGNATURE-REPEAT LAUNCH DEDUP docstring section.
 #
 # Managed OUTSIDE CloudFormation (same rationale as the sibling dispatchers):
 # keeps the github-actions-lambda-deploy OIDC role's blast radius narrow — it
@@ -185,7 +190,10 @@ if $BOOTSTRAP; then
   # Target is the ROUTER: the drill's ENTIRE identity (repo/sha/run_id/...) is
   # still synthesized in the executor's index.py (DRILL_REPO isolation
   # invariant), so the wrapped payload carries only {is_drill:true}.
-  CANARY_TARGET="{\"Arn\":\"${OVERSEER_ROUTER_ARN}\",\"RoleArn\":\"${OVERSEER_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"playbook\\\":\\\"ci-watch\\\",\\\"payload\\\":{\\\"is_drill\\\":\\\"true\\\"}}\"}"
+  # config#2902: zero-retry — AWS Scheduler's 185-attempt default would
+  # re-dispatch this drill payload for up to a day on any transient router
+  # error, masking real dispatch problems behind noisy re-fires.
+  CANARY_TARGET="{\"Arn\":\"${OVERSEER_ROUTER_ARN}\",\"RoleArn\":\"${OVERSEER_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"playbook\\\":\\\"ci-watch\\\",\\\"payload\\\":{\\\"is_drill\\\":\\\"true\\\"}}\",\"RetryPolicy\":{\"MaximumRetryAttempts\":0,\"MaximumEventAgeInSeconds\":60}}"
   if aws scheduler get-schedule --name "${CANARY_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
     run aws scheduler update-schedule --name "${CANARY_SCHED_NAME}" \

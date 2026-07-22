@@ -150,6 +150,64 @@ class TestPolygonNewsAdapter:
         assert len(out) == 1
         assert out[0].vendor_article_id == "good"
 
+    # ── config#2938: Polygon wall-clock time budget ─────────────────────
+
+    def test_time_budget_stops_before_exhausting_all_tickers(self):
+        """config#2938 — the per-ticker loop must bail at ``max_fetch_seconds``
+        and return whatever it collected, so aggregation + digest/RAG write
+        still run within the caller's deadline (mirrors the GDELT guard)."""
+        fake_client = MagicMock()
+        fake_client._get.return_value = {"results": []}
+        clock = {"n": 0}
+
+        def fake_monotonic():
+            clock["n"] += 1
+            # calls: deadline calc (1), then one check per ticker i>0
+            return 0.0 if clock["n"] <= 3 else 1_000_000.0
+
+        adapter = PolygonNewsAdapter(
+            client=fake_client, max_fetch_seconds=100.0, monotonic=fake_monotonic
+        )
+        out = adapter.fetch([f"T{i}" for i in range(10)])
+        assert fake_client._get.call_count < 10
+        assert fake_client._get.call_count >= 1
+        assert out == []
+
+    def test_time_budget_never_checked_before_first_ticker(self):
+        """Even a zero/negative budget must attempt the FIRST ticker — the
+        guard only skips the remainder."""
+        fake_client = MagicMock()
+        fake_client._get.return_value = {"results": []}
+        adapter = PolygonNewsAdapter(
+            client=fake_client, max_fetch_seconds=0.0, monotonic=lambda: 0.0
+        )
+        adapter.fetch(["AAPL", "MSFT", "GOOG"])
+        assert fake_client._get.call_count == 1
+
+    def test_sustained_throttle_bails_at_budget_not_after_all_tickers(self):
+        """config#2938 core regression — a sustained Polygon 429 storm (the
+        2026-07-18 daily + weekly-SF SIGKILL) must NOT run the unbounded loop
+        past the caller's deadline. The adapter bails at its budget and returns
+        (partial), never hanging until the outer timeout kills it with zero
+        output."""
+        fake_client = MagicMock()
+        fake_client._get.side_effect = RuntimeError(
+            "Rate limited after 4 retries"
+        )
+        ticks = {"t": 0.0}
+
+        def fake_monotonic():
+            v = ticks["t"]
+            ticks["t"] += 10.0  # ~10s of wall-clock "elapsed" per 429 wait
+            return v
+
+        adapter = PolygonNewsAdapter(
+            client=fake_client, max_fetch_seconds=45.0, monotonic=fake_monotonic
+        )
+        out = adapter.fetch([f"T{i}" for i in range(1000)])
+        assert fake_client._get.call_count < 1000
+        assert out == []
+
 
 # ── GDELT adapter ──────────────────────────────────────────────────────
 

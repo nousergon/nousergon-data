@@ -155,12 +155,6 @@
       "Resource": "*"
     },
     {
-      "Sid": "StartAdvisoryChildPipeline",
-      "Effect": "Allow",
-      "Action": "states:StartExecution",
-      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-advisory-pipeline"
-    },
-    {
       "Sid": "StartEodSelfHealReplay",
       "Effect": "Allow",
       "Action": "states:StartExecution",

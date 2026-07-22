@@ -102,9 +102,10 @@ def test_regime_substrate_payload_is_produce_action() -> None:
 def test_check_skip_regime_substrate_routes_correctly() -> None:
     """alpha-engine-config-I2515 Phase B: RegimeSubstrate now runs BEFORE
     the RAG chain (moved ahead of RAG/ThinkTank) so SignalsEnvelope reads a
-    same-day regime label. Skip path lands on SignalsEnvelope directly
-    (RegimeSubstrate's compute is skipped, but the envelope still runs
-    reading whatever regime artifact already exists)."""
+    same-day regime label. config#3134: the skip path now lands on
+    CheckSkipSignalsEnvelope (the new gate in front of SignalsEnvelope)
+    rather than SignalsEnvelope directly, so the envelope's own skip flag
+    is honored on every path into it, not just the RegimeSubstrate-ran path."""
     sf = _sf()
     states = _flat_states(sf)
     assert "CheckSkipRegimeSubstrate" in states
@@ -114,57 +115,61 @@ def test_check_skip_regime_substrate_routes_correctly() -> None:
     skip_choice = state["Choices"][0]
     skip_vars = skip_choice["And"]
     assert any(c.get("Variable") == "$.skip_regime_substrate" for c in skip_vars)
-    assert skip_choice["Next"] == "SignalsEnvelope"
+    assert skip_choice["Next"] == "CheckSkipSignalsEnvelope"
 
 
 def test_post_rag_control_flow_lands_on_thinktank_coverage() -> None:
     """alpha-engine-config-I2515 Phase B: ThinkTankCoverage moved to run
     AFTER the RAG chain (was between Scanner and RAG) so its theses read
-    the fresh corpus. Both post-RAG routes must point at ThinkTankCoverage
-    now, not CheckSkipRegimeSubstrate (which runs BEFORE RAG in the new
+    the fresh corpus. config#3134: both post-RAG routes now point at
+    CheckSkipThinkTankCoverage (the new gate in front of ThinkTankCoverage)
+    rather than CheckSkipRegimeSubstrate (which runs BEFORE RAG in the new
     order). Catches a refactor that re-introduces the stale-corpus bug."""
     sf = _sf()
     states = _flat_states(sf)
     # CheckSkipRAGIngestion's skip-branch
     skip_choice = states["CheckSkipRAGIngestion"]["Choices"][0]
-    assert skip_choice["Next"] == "ThinkTankCoverage", (
-        "CheckSkipRAGIngestion skip path must land on ThinkTankCoverage"
+    assert skip_choice["Next"] == "CheckSkipThinkTankCoverage", (
+        "CheckSkipRAGIngestion skip path must land on CheckSkipThinkTankCoverage"
     )
     # CheckRAGIngestionStatus's success branch
     success_choice = next(
         c for c in states["CheckRAGIngestionStatus"]["Choices"]
         if c.get("StringEquals") == "Success"
     )
-    assert success_choice["Next"] == "ThinkTankCoverage", (
-        "CheckRAGIngestionStatus success path must land on ThinkTankCoverage"
+    assert success_choice["Next"] == "CheckSkipThinkTankCoverage", (
+        "CheckRAGIngestionStatus success path must land on CheckSkipThinkTankCoverage"
     )
 
 
 def test_regime_substrate_failure_is_non_blocking() -> None:
     """Stage A observe-only contract: RegimeSubstrate failure must NOT
     halt the pipeline. alpha-engine-config-I2515 Phase B: the
-    Catch[States.ALL] now routes to SignalsEnvelope (RegimeSubstrate's new
+    Catch[States.ALL] routes toward SignalsEnvelope (RegimeSubstrate's new
     direct successor, moved ahead of RAG/ThinkTank) so the load-bearing
-    envelope producer still gets a chance to run."""
+    envelope producer still gets a chance to run. config#3134: retargeted
+    to CheckSkipSignalsEnvelope, the new gate immediately in front of it."""
     sf = _sf()
     states = _flat_states(sf)
     catches = states["RegimeSubstrate"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "SignalsEnvelope", (
+    assert states_all["Next"] == "CheckSkipSignalsEnvelope", (
         "RegimeSubstrate Catch[States.ALL] must route to "
-        "SignalsEnvelope (non-blocking), not HandleFailure "
+        "CheckSkipSignalsEnvelope (non-blocking), not HandleFailure "
         "(blocking). Stage A is observe-only; a regime substrate failure "
         "must not halt downstream."
     )
 
 
 def test_regime_substrate_next_is_signals_envelope() -> None:
-    """alpha-engine-config-I2515 Phase B: Success path lands on
+    """alpha-engine-config-I2515 Phase B: Success path lands toward
     SignalsEnvelope (moved ahead of RAG/ThinkTank so the envelope's
-    market_regime field reads a same-day regime label)."""
+    market_regime field reads a same-day regime label). config#3134:
+    retargeted to CheckSkipSignalsEnvelope, the new gate immediately in
+    front of it."""
     sf = _sf()
     states = _flat_states(sf)
-    assert states["RegimeSubstrate"]["Next"] == "SignalsEnvelope"
+    assert states["RegimeSubstrate"]["Next"] == "CheckSkipSignalsEnvelope"
 
 
 def test_regime_substrate_timeout_is_reasonable() -> None:
@@ -256,7 +261,9 @@ def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
     # The chain is no longer at top level — it forks parallel to Branch B.
     par = sf["States"]["ResearchPredictorParallel"]
     assert par["Type"] == "Parallel"
-    assert par["Branches"][0]["StartAt"] == "Scanner"
+    # config#3134: Branch A's StartAt is now CheckSkipScanner (Scanner's
+    # own skip gate), not Scanner directly.
+    assert par["Branches"][0]["StartAt"] == "CheckSkipScanner"
     assert "CheckSkipRegimeRetrospectiveEval" not in sf["States"]
     assert "Scanner" not in sf["States"]
 
