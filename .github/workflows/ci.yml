@@ -10,6 +10,27 @@ on:
   merge_group:
 
 jobs:
+  # config#2949: nousergon-data-PR936 shipped a `set -u` unbound-variable bug
+  # (MAX_RUNTIME_EXPLICIT read outside every assignment path) with fully
+  # green CI — the repo's shell-script guards are grep-based wiring tests;
+  # nothing else here statically analyzes bash. shellcheck (SC2154 et al.)
+  # catches genuine unbound/typo'd/quoting bugs, though NOT every instance of
+  # this exact incident's shape (a variable assigned only inside one `case`
+  # arm of an arg-parse loop, then read unconditionally afterward — shellcheck's
+  # dataflow analysis is whole-scope, not branch-path-sensitive, so it doesn't
+  # flag that specific pattern; verified locally against the pre-fix PR936
+  # revision, which shellcheck --severity=error and even the optional
+  # check-unassigned-uppercase check both pass clean on). That branch-path gap
+  # is closed instead by tests/test_shell_arg_parse_default_init.py (config#2949).
+  # error-severity only, so a warning-noise cleanup never gates unrelated PRs;
+  # ubuntu-latest ships shellcheck preinstalled, no third-party action needed.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck (infrastructure/*.sh, error severity)
+        run: shellcheck --severity=error infrastructure/*.sh
+
   test:
     runs-on: ubuntu-latest
 

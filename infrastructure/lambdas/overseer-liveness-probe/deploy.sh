@@ -20,6 +20,16 @@
 # dedup state key + dynamodb on the flow-doctor store. NO InvokeFunction / EC2
 # mutate — this probe never acts.
 #
+# alpha-engine-config-I2901/I2906 (2026-07-21): added states:ListExecutions +
+# states:DescribeExecution (sf-watch invocation-success check) + s3:GetObject
+# on the 3 sf-watch watch-log prefixes + scheduler:GetSchedule (the 4
+# router-targeting EventBridge Scheduler schedules) to iam-policy.json. These
+# grants are NOT yet applied to the live role — an operator must re-run
+# `deploy.sh --bootstrap` (idempotent put-role-policy) to pick them up. Until
+# then the two new check types will AccessDenied (fail-loud) on their next
+# scheduled invocation once this code is deployed — see the PR body for why
+# the code deploy itself is ALSO held pending that same bootstrap pass.
+#
 # Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
 # cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
 # config-drift + run-window check, not tied to any pipeline's own schedule:

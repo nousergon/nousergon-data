@@ -63,24 +63,38 @@ _LAMBDA_PIN_RE = re.compile(
 # documented in each Lambda's requirements.txt header comment.
 # Key: lambda directory name, Value: (pin version, contract reason)
 _LAMBDA_PIN_EXEMPTIONS = {
+    "arctic-migration-dispatcher": (
+        "v0.124.5",
+        "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I3242: same "
+        "spot-launch/concurrency-lock primitives as sf-watch-spot-dispatcher / "
+        "ci-watch-dispatcher / canary-replay-dispatcher / alert-drain-dispatcher — "
+        "same exemption group, stays in lockstep with them, not with root)",
+    ),
     "canary-replay-dispatcher": (
-        "v0.106.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246: same SpotProbeError "
-        "handling as ci-watch-dispatcher)",
+        "handling as ci-watch-dispatcher; bumped for config#2698 SpotQuotaExceededError "
+        "on-demand fallback, first available at v0.124.1)",
     ),
     "alert-drain-dispatcher": (
-        "v0.122.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2824: same "
-        "extra_tags atomic-launch-tagging floor as ci-watch-dispatcher, config#2292)",
+        "extra_tags atomic-launch-tagging floor as ci-watch-dispatcher, config#2292; bumped "
+        "for config#2698 SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
     "ci-watch-dispatcher": (
-        "v0.122.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
-        "bumped for extra_tags atomic-launch-tagging, config#2292)",
+        "bumped for extra_tags atomic-launch-tagging, config#2292; bumped for config#2698 "
+        "SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
     "data-spot-dispatcher": (
-        "v0.83.0",
-        "ec2_spot launch chokepoint (config#1767)",
+        "v0.124.5",
+        "ec2_spot launch chokepoint (config#1767); bumped for config#2698 "
+        "SpotQuotaExceededError availability (krepis>=0.14.0, first shipped in "
+        "krepis#28) — index.py's own _launch_instance now handles it directly "
+        "(this Lambda calls nousergon_lib.ec2_spot.launch() directly rather than "
+        "through spot_dispatch.launch_with_fallback)",
     ),
     "eod-backstop": (
         "v0.83.0",
@@ -125,12 +139,15 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.124.0",
+        "v0.124.10",
         "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
         "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409); "
         "v0.124.0 for nousergon_lib.github_app — _github_token() mints the "
         "ne-groomer App installation token first, PAT fallback (config-I2785, "
-        "nousergon-lib#220, incident config-I2784)",
+        "nousergon-lib#220, incident config-I2784); bumped to v0.124.5 for config#2698 "
+        "SpotQuotaExceededError on-demand fallback, first available at v0.124.1; "
+        "bumped to v0.124.10 for ge.RULING_PENDING_LABEL — org-wide "
+        "ruling:pending-exec PR demand counting (config-I3227, nousergon-lib#232)",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",
@@ -141,9 +158,10 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "sf-watch-spot-dispatcher": (
-        "v0.122.0",
+        "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
-        "bumped for extra_tags atomic-launch-tagging, config#2292)",
+        "bumped for extra_tags atomic-launch-tagging, config#2292; bumped for config#2698 "
+        "SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
     "spot-orphan-reaper": (
         "v0.97.0",

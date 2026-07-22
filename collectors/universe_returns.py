@@ -382,6 +382,24 @@ def _get_existing_dates(db_path: str, today: date | None = None) -> set[str]:
     on the next run. INSERT OR REPLACE in `_insert_rows` overwrites the
     full row idempotently — re-fetching polygon prices for the same eval_date
     yields the same historical close, so the 5d/10d/30d cells are unchanged.
+
+    KNOWN GAP (config#2972, confirmed separate from the 21d investigation —
+    NOT fixed here, scoped as a follow-up): this gating only ever checks
+    return_5d/return_21d. A date that already has both populated is marked
+    "existing" (skippable) permanently, even though its 60d/90d columns
+    (_NEW_COLUMNS_60_90D, added by #357 well after this function was
+    written) may still be NULL and their forward windows may not have
+    closed yet at the time 21d was graded. Combined with
+    `_trading_days_to_process`'s bounded max_lookback walk (default 90
+    trading days from `today`), any date whose 21d window closed outside
+    that walk depth never gets reconsidered for 60d/90d backfill at all.
+    This is the actual, confirmed reason log_return_60d/log_return_90d are
+    NULL fleet-wide as of this writing — a real but pre-existing/separate
+    bug from the 21d "gap" this docstring's neighboring logic addresses.
+    A proper fix needs its own gating column (e.g. a 4th MAX(...60d...) /
+    MAX(...90d...) CASE clause here) sized against its own lookback horizon;
+    left as a follow-up rather than folded into this PR to keep the fix
+    scoped to the investigated issue.
     """
     today = today or date.today()
     conn = sqlite3.connect(db_path)

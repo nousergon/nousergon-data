@@ -20,7 +20,12 @@
 # sibling agent is creating in alpha-engine-config, deliberately NOT the
 # shared trading alpha-engine-executor-role) + ssm:SendCommand. The BOX reads
 # its own run secrets (PAT) via ITS instance profile, so this Lambda needs no
-# secret access of its own.
+# secret access of its own. As of config#2862 it also needs read-only
+# s3:ListBucket/s3:GetObject scoped to
+# alpha-engine-research/ci_watch/_control/signatures/* — a small ADDITIVE IAM
+# grant (not a new role) to consult the signature-repeat launch dedup control-
+# plane before spending a spot launch on a known-fixed, still-recurring
+# root cause; see index.py's SIGNATURE-REPEAT LAUNCH DEDUP docstring section.
 #
 # Managed OUTSIDE CloudFormation (same rationale as the sibling dispatchers):
 # keeps the github-actions-lambda-deploy OIDC role's blast radius narrow — it
