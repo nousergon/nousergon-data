@@ -23,9 +23,12 @@ Module-specific roles live in their owning repo's `infrastructure/iam/`:
 | `github-actions-iam-drift-check` | `alpha-engine` (workflow-specific) |
 
 This repo's own lambda exec roles (`infrastructure/lambdas/<name>/iam-policy.json`,
-one per lambda) are a separate, module-specific layer covered by
-`check-drift.py --lambdas-only` but each applied by its own lambda's
-`deploy.sh`, not this directory's `apply.sh`. Every `deploy.sh --apply-iam`
+one per lambda) are a separate, module-specific layer applied by each
+lambda's own `deploy.sh`, not this directory's `apply.sh`. Automated drift
+detection for this layer (`check-drift.py --lambdas-only`) is not live yet —
+tracked in `nousergon-data#784` (still open) — so `deploy.sh --apply-iam`
+is the operator's own responsibility to re-run after editing an
+`iam-policy.json`, until #784 lands. Every `deploy.sh --apply-iam`
 re-applies just that lambda's inline policy (config#2825) — use it after
 editing an `iam-policy.json` instead of the slower, more side-effectful
 `--bootstrap`, which previously was the ONLY path that re-applied it and is
