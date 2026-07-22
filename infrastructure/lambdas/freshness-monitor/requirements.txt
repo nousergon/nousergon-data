@@ -2,5 +2,5 @@
 # Substrate bumped to v0.85.0 for event_driven cadence + liveness_via (config#1718/#1726).
 # Bumping this is a substrate-change PR — not a code-only refresh.
 nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.85.0
-krepis>=0.10.2
+krepis>=0.15.0
 pyyaml>=6.0

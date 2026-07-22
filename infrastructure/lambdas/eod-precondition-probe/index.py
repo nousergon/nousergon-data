@@ -34,6 +34,22 @@ a read against a write.
 Grep-anchor for the producer side: ``FEATURE_STORE_FRESHNESS_SENTINEL_KEY`` /
 ``MACRO_FRESHNESS_SENTINEL_KEY`` in ``builders/daily_append.py``.
 
+ADDITIVE universe-close check (config#3237): the macro sentinel above only
+proves SPY's macro-benchmark close (from the ``macro`` ArcticDB library) is
+verified for run_date — it says nothing about the OTHER held positions'
+closes, which ``executor/eod_reconcile.py`` reads from the ``universe``
+library (SPY is ALSO a `universe` member as a held position, per
+alpha-engine-data#245, but the other held tickers — ADBE/AMD/COIN/TWLO as of
+2026-07-21 — never touch ``macro`` at all). 2026-07-21 (config#3236): the
+`universe` append failed 100% while the macro sentinel stayed present, so
+this probe reported ``precondition_met: true`` and reconcile hard-crashed
+instead of routing to the self-heal loop. Fix: this probe now ALSO reads
+``feature_store/_universe_close_freshness.json`` (written by
+``_write_universe_close_freshness_sentinel`` in ``builders/daily_append.py``,
+config#3237) and requires it too — ``precondition_met`` is the AND of both
+checks, since eod_reconcile.py's per-run needs are the union of both
+libraries' run_date rows.
+
 The EOD ASL calls this Lambda twice per healing cycle: once before
 ``CheckSkipEODReconcile`` (the initial gap detection) and once per heal-loop
 iteration after a re-dispatched workload completes (``HealReProbe``) — see
@@ -75,6 +91,21 @@ MACRO_FRESHNESS_SENTINEL_KEY = os.environ.get(
 # because that is the ONE key _spy_close reads — a probe stricter than the
 # actual consumer would produce false negatives on genuinely-fine days.
 REQUIRED_KEY = os.environ.get("EOD_PROBE_REQUIRED_KEY", "SPY")
+# config#3237: the `universe`-library counterpart to the macro sentinel
+# above — required ADDITIVELY (see module docstring "ADDITIVE universe-close
+# check").
+UNIVERSE_FRESHNESS_SENTINEL_KEY = os.environ.get(
+    "EOD_PROBE_UNIVERSE_SENTINEL_KEY", "feature_store/_universe_close_freshness.json"
+)
+# Sanity floor, not a per-ticker membership check — this Lambda has no
+# visibility into which specific tickers are currently held (that's
+# executor-side SQLite state), so it cannot require particular symbols the
+# way REQUIRED_KEY does for the single-symbol macro sentinel. Requiring a
+# non-zero verified count still catches the 2026-07-21 class (100% universe
+# append failure => the sentinel is never written at all => precondition_met
+# is False on absence alone, same as the macro check) plus any producer
+# regression that writes the sentinel with a suspicious zero count.
+UNIVERSE_MIN_VERIFIED_COUNT = int(os.environ.get("EOD_PROBE_UNIVERSE_MIN_VERIFIED_COUNT", "1"))
 # Heal-loop deadline: 09:00 UTC the day after run_date (deliverable #3(d)).
 HEAL_DEADLINE_HOUR_UTC = int(os.environ.get("EOD_PROBE_HEAL_DEADLINE_HOUR_UTC", "9"))
 
@@ -126,18 +157,39 @@ def _evaluate(sentinel: dict | None, run_date: str) -> tuple[bool, str]:
     return True, f"{REQUIRED_KEY} verified present for run_date={run_date}"
 
 
+def _evaluate_universe(sentinel: dict | None, run_date: str) -> tuple[bool, str]:
+    """Returns (precondition_met, reason) for the universe-close sentinel
+    (config#3237) — see module docstring "ADDITIVE universe-close check"."""
+    if sentinel is None:
+        return False, f"no universe-close-freshness sentinel found at s3://{BUCKET}/{UNIVERSE_FRESHNESS_SENTINEL_KEY}"
+    sentinel_run_date = sentinel.get("run_date")
+    if sentinel_run_date != run_date:
+        return False, (
+            f"universe sentinel run_date={sentinel_run_date!r} does not match requested "
+            f"run_date={run_date!r} (stale or wrong-day sentinel)"
+        )
+    verified_ticker_count = sentinel.get("verified_ticker_count") or 0
+    if verified_ticker_count < UNIVERSE_MIN_VERIFIED_COUNT:
+        return False, (
+            f"universe sentinel for run_date={run_date} verified_ticker_count="
+            f"{verified_ticker_count} below floor {UNIVERSE_MIN_VERIFIED_COUNT}"
+        )
+    return True, f"universe verified_ticker_count={verified_ticker_count} present for run_date={run_date}"
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Step Function Task handler. ``event`` = ``{"run_date": "YYYY-MM-DD"}``.
 
     Returns::
 
         {
-          "precondition_met": bool,
-          "reason": str,
+          "precondition_met": bool,     # AND of the macro AND universe checks
+          "reason": str,                # combined, names which check(s) failed
           "run_date": str,
-          "deadline_iso": str,       # 09:00 UTC day-after-run_date
-          "past_deadline": bool,     # now() > deadline_iso
-          "sentinel": dict | None,   # raw sentinel for forensics
+          "deadline_iso": str,          # 09:00 UTC day-after-run_date
+          "past_deadline": bool,        # now() > deadline_iso
+          "sentinel": dict | None,          # raw macro sentinel for forensics
+          "universe_sentinel": dict | None, # raw universe sentinel for forensics
         }
 
     Raises on any non-"absent" S3 failure — the ASL Task's own Catch decides
@@ -152,7 +204,23 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     s3client = boto3.client("s3", region_name=REGION)
     sentinel = _read_sentinel(s3client, BUCKET, MACRO_FRESHNESS_SENTINEL_KEY)
-    precondition_met, reason = _evaluate(sentinel, run_date)
+    macro_met, macro_reason = _evaluate(sentinel, run_date)
+
+    universe_sentinel = _read_sentinel(s3client, BUCKET, UNIVERSE_FRESHNESS_SENTINEL_KEY)
+    universe_met, universe_reason = _evaluate_universe(universe_sentinel, run_date)
+
+    precondition_met = macro_met and universe_met
+    if precondition_met:
+        reason = f"macro: {macro_reason}; universe: {universe_reason}"
+    else:
+        # Name only the failing check(s) — a reader shouldn't have to parse
+        # a passing check's reason to find the actual blocker.
+        failures = []
+        if not macro_met:
+            failures.append(f"macro: {macro_reason}")
+        if not universe_met:
+            failures.append(f"universe: {universe_reason}")
+        reason = "; ".join(failures)
 
     deadline_iso = _heal_deadline_iso(run_date)
     now = datetime.now(timezone.utc)
@@ -170,4 +238,5 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "deadline_iso": deadline_iso,
         "past_deadline": past_deadline,
         "sentinel": sentinel,
+        "universe_sentinel": universe_sentinel,
     }
