@@ -2057,15 +2057,23 @@ def test_fallback_dispatch_backend_independent_of_primary_tiers_env(monkeypatch)
     assert out["groom"]["backend"] == "deepseek"
 
 
-def test_deploy_sh_ships_primary_deepseek_tiers_unarmed():
-    # Structural pin: neither of the two `--environment 'Variables={...}'`
-    # calls may set a live value for GROOM_PRIMARY_DEEPSEEK_TIERS — arming
-    # requires a reviewed PR (mirrors the GROOM_MAX_DISPATCHES_DAILY
-    # precedent immediately above it in deploy.sh), never a console-only
-    # edit that the next code-only deploy would silently wipe anyway.
+def test_deploy_sh_arms_primary_deepseek_tiers_low_mid():
+    # Structural pin, INVERTED at arming (2026-07-22, config-I3488 step 3 —
+    # Brian's DeepSeek-primary ruling, config-I3479): BOTH `--environment
+    # 'Variables={...}'` calls must now carry GROOM_PRIMARY_DEEPSEEK_TIERS
+    # with the value DOUBLE-QUOTED ("low,mid") — a raw comma inside CLI
+    # shorthand splits map entries and fails ParamValidation (verified live).
+    # This guards against (a) silent DISARM by a deploy.sh refactor dropping
+    # the var from one or both maps, and (b) re-introducing the unquoted form.
+    # Disarming is a deliberate reviewed PR that flips this pin back.
     deploy_sh = (
         Path(__file__).resolve().parent / "deploy.sh"
     ).read_text()
-    for line in deploy_sh.splitlines():
-        if "--environment 'Variables=" in line:
-            assert "GROOM_PRIMARY_DEEPSEEK_TIERS=" not in line
+    armed_lines = [
+        line for line in deploy_sh.splitlines()
+        if "--environment 'Variables=" in line
+        and not line.lstrip().startswith("#")  # doc comment references the pattern too
+    ]
+    assert len(armed_lines) == 2
+    for line in armed_lines:
+        assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"' in line
