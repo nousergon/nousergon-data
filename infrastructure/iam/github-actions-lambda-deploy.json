@@ -35,14 +35,16 @@
       "Sid": "LambdaUpdate",
       "Effect": "Allow",
       "Action": [
-        "lambda:UpdateFunctionCode",
-        "lambda:UpdateFunctionConfiguration",
+        "lambda:CreateAlias",
+        "lambda:CreateFunction",
         "lambda:GetFunction",
         "lambda:GetFunctionConfiguration",
+        "lambda:GetFunctionEventInvokeConfig",
         "lambda:PublishVersion",
+        "lambda:PutFunctionEventInvokeConfig",
         "lambda:UpdateAlias",
-        "lambda:CreateFunction",
-        "lambda:CreateAlias"
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration"
       ],
       "Resource": [
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
