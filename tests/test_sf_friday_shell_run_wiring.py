@@ -121,6 +121,10 @@ _EXPECTED_SKIPS = {
     # (and its CheckSkipDriftDetection gate) were collapsed when drift was
     # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
+    # config#2362 Option A (operator-ruled 2026-07-21): additive gate that
+    # skips only the Backtester SSM task, distinct from skip_backtester's
+    # legacy whole-pair jump above.
+    "skip_backtester_stage_only",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
     # and PortfolioOptimizerBacktest (L4472 split) previously had no skip gate, and

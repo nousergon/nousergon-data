@@ -924,7 +924,11 @@ class TestInboundRewireAndDownstreamUnchanged:
         assert "DriftDetection" not in states
         assert "CheckSkipDriftDetection" not in states
         assert states["CheckBranchOutcomes"]["Default"] == "CheckSkipBacktester"
-        assert states["CheckSkipBacktester"]["Default"] == "Backtester"
+        # config#2362 Option A: CheckSkipBacktester's Default now falls
+        # through the additive CheckSkipBacktesterStageOnly gate before
+        # Backtester.
+        assert states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
+        assert states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
     def test_backtester_after_parallel_join_and_reachable(self, sf):
         """Walk the top-level happy path (Parallel as a single node);
