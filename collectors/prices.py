@@ -15,13 +15,23 @@ at the splice point. Full rewrite guarantees internal consistency.
 
 Index tickers (VIX, TNX, IRX): not available on polygon free tier — always
 fetched via yfinance with ^ prefix.
+
+Staleness is trading-day-exact (nousergon_lib.dates.is_fresh_in_trading_days),
+not a calendar-day delta with a fixed weekend buffer (config#2756). The prior
+calendar-day check was calibrated for the weekly-only Saturday cadence; a
+fixed "+2 days for weekends" buffer throttles refresh frequency independent of
+the caller's actual invocation cadence, so calling ``collect()`` daily under
+that check still only refreshed tickers every 3-4 calendar days. Trading-day
+arithmetic keeps "stale" meaning the same thing (more than N NYSE sessions
+behind) whether ``collect()`` runs weekly (full-universe rebuild) or daily
+(only the handful of tickers that missed a session get the full 10y rewrite).
 """
 
 from __future__ import annotations
 
 import logging
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -51,6 +61,7 @@ def collect(
     staleness_threshold_days: int = 3,
     batch_size: int = 50,
     dry_run: bool = False,
+    reference_date: str | date | None = None,
 ) -> dict:
     """
     Identify stale tickers and refresh their price cache parquets.
@@ -63,9 +74,13 @@ def collect(
         tickers: full universe of tickers to maintain
         s3_prefix: S3 key prefix for price cache parquets
         fetch_period: yfinance period string for full refresh
-        staleness_threshold_days: business days before a parquet is stale
+        staleness_threshold_days: NYSE trading sessions before a parquet is stale
         batch_size: tickers per yfinance batch download
         dry_run: if True, identify stale tickers but don't fetch/upload
+        reference_date: trading day staleness is measured against (ISO string
+            or ``date``). Defaults to today's UTC calendar date — pass the
+            caller's ``run_date`` explicitly so a re-run against a fixed date
+            is deterministic across weekly and daily invocations.
 
     Returns:
         dict with status, refreshed count, errors
@@ -75,7 +90,9 @@ def collect(
 
     # ── Fast staleness check via S3 metadata ─────────────────────────────────
     # Instead of downloading all parquets, just list them and check last-modified
-    stale = _find_stale_fast(s3, bucket, s3_prefix, all_tickers, staleness_threshold_days)
+    stale = _find_stale_fast(
+        s3, bucket, s3_prefix, all_tickers, staleness_threshold_days, reference_date,
+    )
 
     if not stale:
         logger.info("Price cache is current — no refresh needed (%d tickers checked)", len(all_tickers))
@@ -125,15 +142,21 @@ def _find_stale_fast(
     prefix: str,
     all_tickers: list[str],
     staleness_threshold_days: int,
+    reference_date: str | date | None = None,
 ) -> list[str]:
     """
     Fast staleness check using S3 object metadata (no downloads).
 
-    Lists all parquets in the cache, checks LastModified timestamp.
-    Any ticker with no parquet or parquet older than threshold is stale.
+    Lists all parquets in the cache, checks LastModified timestamp against
+    ``reference_date`` on the NYSE trading-day axis (nousergon_lib.dates.
+    is_fresh_in_trading_days) — holiday/weekend-aware, so the same
+    ``staleness_threshold_days`` value means "N trading sessions behind"
+    whether this runs weekly or daily. Any ticker with no parquet, or a
+    parquet more than ``staleness_threshold_days`` sessions stale, is stale.
     """
-    now = datetime.now(timezone.utc)
-    threshold = timedelta(days=staleness_threshold_days + 2)  # calendar days buffer for weekends
+    from nousergon_lib.dates import is_fresh_in_trading_days
+
+    reference = reference_date if reference_date is not None else datetime.now(timezone.utc).date()
 
     # Build map of ticker -> last modified from S3 listing
     existing: dict[str, datetime] = {}
@@ -153,7 +176,9 @@ def _find_stale_fast(
         last_mod = existing.get(ticker)
         if last_mod is None:
             stale.append(ticker)
-        elif (now - last_mod) > threshold:
+        elif not is_fresh_in_trading_days(
+            last_mod.date(), reference, max_stale=staleness_threshold_days,
+        ):
             stale.append(ticker)
 
     return stale

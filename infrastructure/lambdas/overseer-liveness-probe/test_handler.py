@@ -478,6 +478,202 @@ def test_run_window_single_silent_death_not_masked_by_later_success():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# scheduler_schedule_exists
+# ══════════════════════════════════════════════════════════════════════════
+
+_SCHED_SPEC = {"type": "scheduler_schedule_exists", "schedule_name": "alpha-engine-alert-drain-1000utc"}
+
+
+def test_scheduler_schedule_exists_clean():
+    sched = MagicMock()
+    sched.get_schedule.return_value = {"Name": "alpha-engine-alert-drain-1000utc", "State": "ENABLED"}
+    with patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
+        problems, _ = index._check_scheduler_schedule_exists(_SCHED_SPEC, NOW)
+    assert problems == []
+
+
+def test_scheduler_schedule_missing():
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("ResourceNotFoundException")
+    with patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
+        problems, _ = index._check_scheduler_schedule_exists(_SCHED_SPEC, NOW)
+    assert len(problems) == 1 and "does NOT EXIST" in problems[0]
+
+
+def test_scheduler_schedule_disabled_is_a_problem():
+    sched = MagicMock()
+    sched.get_schedule.return_value = {"Name": "alpha-engine-alert-drain-1000utc", "State": "DISABLED"}
+    with patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
+        problems, _ = index._check_scheduler_schedule_exists(_SCHED_SPEC, NOW)
+    assert any("not ENABLED" in p for p in problems)
+
+
+def test_scheduler_schedule_unexpected_error_raises():
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("ThrottlingException")
+    with patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
+        with pytest.raises(FakeClientError):
+            index._check_scheduler_schedule_exists(_SCHED_SPEC, NOW)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# sf_watch_invocation_success
+# ══════════════════════════════════════════════════════════════════════════
+
+_SFI_SPEC = {
+    "type": "sf_watch_invocation_success",
+    "pipelines": [
+        {"state_machine": "ne-weekly-freshness-pipeline", "watch_prefix": "consolidated/saturday_sf_watch"},
+    ],
+    "response_window_min": 10,
+    "lookback_hours": 24,
+}
+
+_SFI_EXEC_ARN = f"arn:aws:states:{REG}:{ACCT}:execution:ne-weekly-freshness-pipeline:run1"
+
+
+def _sfn_for_invocation_success(executions, describe_input=None, describe_raises=None):
+    """Serves ``executions`` only for the FAILED statusFilter call (matching
+    real-world single-status fixtures below) and an empty page for
+    TIMED_OUT/ABORTED — the real check queries all 3 status filters
+    unconditionally, so a naive return_value-for-everything mock would
+    triple-count each fixture execution."""
+    sfn = MagicMock()
+
+    def _list_executions(**kwargs):
+        if kwargs.get("statusFilter") == "FAILED":
+            return {"executions": executions}
+        return {"executions": []}
+
+    sfn.list_executions.side_effect = _list_executions
+    if describe_raises:
+        sfn.describe_execution.side_effect = FakeClientError(describe_raises)
+    else:
+        sfn.describe_execution.return_value = {"input": json.dumps(describe_input or {})}
+    return sfn
+
+
+def _mature_execution(stop_offset_min=30, name="run1", status="FAILED", arn=_SFI_EXEC_ARN):
+    return {
+        "executionArn": arn,
+        "name": name,
+        "status": status,
+        "startDate": NOW - timedelta(hours=1),
+        "stopDate": NOW - timedelta(minutes=stop_offset_min),
+    }
+
+
+def test_sf_watch_invocation_success_event_recorded_is_clean():
+    execu = _mature_execution()
+    sfn = _sfn_for_invocation_success([execu], describe_input={"run_date": "2026-07-17"})
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": _Body(json.dumps(
+        {"events": [{"execution_arn": _SFI_EXEC_ARN}]}).encode())}
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+    assert problems == []
+    s3.get_object.assert_called_once_with(
+        Bucket=index.WATCH_BUCKET, Key="consolidated/saturday_sf_watch/2026-07-17.json")
+
+
+def test_sf_watch_invocation_success_missing_event_is_a_finding():
+    execu = _mature_execution()
+    sfn = _sfn_for_invocation_success([execu], describe_input={"run_date": "2026-07-17"})
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": _Body(json.dumps({"events": []}).encode())}
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+    assert len(problems) == 1 and "NO" in problems[0] and "matching watch-log event" in problems[0]
+
+
+def test_sf_watch_invocation_success_no_watch_log_at_all_is_a_finding():
+    """The exact 2026-07-17 incident class: the dispatcher never even wrote a
+    fresh watch-log for the day (crashed before its PRIMARY write)."""
+    execu = _mature_execution()
+    sfn = _sfn_for_invocation_success([execu], describe_input={"run_date": "2026-07-17"})
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("NoSuchKey")
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+    assert len(problems) == 1
+
+
+def test_sf_watch_invocation_success_immature_failure_skipped():
+    """A failure younger than response_window_min is NOT yet a finding — the
+    dispatcher may still be mid-flight."""
+    execu = _mature_execution(stop_offset_min=2)  # 2 min ago, window is 10 min
+    sfn = _sfn_for_invocation_success([execu])
+    s3 = MagicMock()
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+    assert problems == []
+    s3.get_object.assert_not_called()
+
+
+def test_sf_watch_invocation_success_run_date_falls_back_to_start_date():
+    """A malformed/absent run_date in the execution input degrades to the
+    startDate's calendar date (mirrors the producer's own tolerant fallback)."""
+    execu = _mature_execution()
+    execu["startDate"] = datetime(2026, 7, 16, 23, 0, tzinfo=timezone.utc)
+    sfn = _sfn_for_invocation_success([execu], describe_input={})  # no run_date key
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": _Body(json.dumps(
+        {"events": [{"execution_arn": _SFI_EXEC_ARN}]}).encode())}
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+    assert problems == []
+    s3.get_object.assert_called_once_with(
+        Bucket=index.WATCH_BUCKET, Key="consolidated/saturday_sf_watch/2026-07-16.json")
+
+
+def test_sf_watch_invocation_success_list_executions_unexpected_error_raises():
+    execu = _mature_execution()
+    sfn = MagicMock()
+    sfn.list_executions.side_effect = FakeClientError("AccessDenied")
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=MagicMock()):
+        with pytest.raises(FakeClientError):
+            index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+
+
+def test_sf_watch_invocation_success_watch_log_read_unexpected_error_raises():
+    """The exact 2026-07-17 bug class from the DISPATCHER side, verified from
+    the PROBE side too: a 403/AccessDenied reading the watch-log must RAISE,
+    never be treated as 'no events yet' (which would hide the crash)."""
+    execu = _mature_execution()
+    sfn = _sfn_for_invocation_success([execu], describe_input={"run_date": "2026-07-17"})
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("AccessDenied")
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        with pytest.raises(FakeClientError):
+            index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+
+
+def test_sf_watch_invocation_success_pagination_stops_past_horizon():
+    fresh = _mature_execution(stop_offset_min=30, name="fresh")
+    stale = dict(_mature_execution(stop_offset_min=30, name="stale"))
+    stale["stopDate"] = NOW - timedelta(hours=48)  # older than 24h lookback
+    sfn = MagicMock()
+
+    def _list_executions(**kwargs):
+        if kwargs.get("statusFilter") == "FAILED":
+            assert "nextToken" not in kwargs, "pagination must stop once past horizon"
+            return {"executions": [fresh, stale], "nextToken": "should-not-be-used"}
+        return {"executions": []}
+
+    sfn.list_executions.side_effect = _list_executions
+    sfn.describe_execution.return_value = {"input": json.dumps({"run_date": "2026-07-17"})}
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": _Body(json.dumps(
+        {"events": [{"execution_arn": _SFI_EXEC_ARN}]}).encode())}
+    with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
+    assert problems == []
+    # Only the in-horizon execution triggers a describe/get_object call — the
+    # stale one is excluded and pagination stops (nextToken never consulted).
+    assert sfn.describe_execution.call_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # aggregation, dedup, handler, registry
 # ══════════════════════════════════════════════════════════════════════════
 

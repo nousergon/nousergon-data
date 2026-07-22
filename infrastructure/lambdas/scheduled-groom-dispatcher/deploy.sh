@@ -233,6 +233,11 @@ if $BOOTSTRAP; then
   fi
 
   # --- 2b. Lambda function ---
+  # GROOM_MAX_DISPATCHES_DAILY (config#3173, generalizing config#2269's
+  # sf-watch pattern): pinned here (not left to index.py's own default) so a
+  # live env tweak never silently survives a redeploy — same rationale as
+  # sf-watch's SF_WATCH_MAX_DISPATCHES_* (config#1818 lesson). Change via a
+  # PR editing this value, not a console edit.
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
@@ -244,7 +249,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -405,7 +410,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

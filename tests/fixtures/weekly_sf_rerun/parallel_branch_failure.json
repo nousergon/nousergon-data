@@ -306,6 +306,15 @@
    "timestamp": "2026-07-11T09:00:00Z"
   },
   {
+   "type": "ChoiceStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipScanner",
+    "input": "{}"
+   },
+   "id": 341,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
    "type": "TaskStateEntered",
    "stateEnteredEventDetails": {
     "name": "Scanner",
@@ -321,6 +330,87 @@
     "output": "{}"
    },
    "id": 36,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipRegimeSubstrate",
+    "input": "{}"
+   },
+   "id": 361,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "TaskStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "RegimeSubstrate",
+    "input": "{}"
+   },
+   "id": 362,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "TaskStateExited",
+   "stateExitedEventDetails": {
+    "name": "RegimeSubstrate",
+    "output": "{}"
+   },
+   "id": 363,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipSignalsEnvelope",
+    "input": "{}"
+   },
+   "id": 364,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "TaskStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "SignalsEnvelope",
+    "input": "{}"
+   },
+   "id": 365,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "TaskStateExited",
+   "stateExitedEventDetails": {
+    "name": "SignalsEnvelope",
+    "output": "{}"
+   },
+   "id": 366,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipChallengerShadow",
+    "input": "{}"
+   },
+   "id": 367,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "TaskStateEntered",
+   "stateEnteredEventDetails": {
+    "name": "ChallengerShadow",
+    "input": "{}"
+   },
+   "id": 368,
+   "timestamp": "2026-07-11T09:00:00Z"
+  },
+  {
+   "type": "TaskStateExited",
+   "stateExitedEventDetails": {
+    "name": "ChallengerShadow",
+    "output": "{}"
+   },
+   "id": 369,
    "timestamp": "2026-07-11T09:00:00Z"
   },
   {
