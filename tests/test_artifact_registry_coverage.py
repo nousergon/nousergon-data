@@ -95,12 +95,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "builders/migrate_universe_feature_order.py": 1,
     # overseer/_control/completed/arctic-migration-<head>.json — the migration
     # runner's per-run completion marker (alpha-engine-config-I3242). Like the
-    # alert-drain/sf-watch completion markers it mirrors, this is an
-    # EVENT-DRIVEN dispatch-control artifact (written once per merge-triggered
-    # migration run), NOT a periodic freshness-SLA artifact — registered as a
-    # control-plane row in alpha-engine-config/private-docs/
-    # ARTIFACT_REGISTRY.yaml (no freshness SLA); pinned here to force operator
-    # review of any new PUT site in the runner.
+    # alert-drain/sf-watch completion markers it mirrors (also unregistered),
+    # this is an EVENT-DRIVEN dispatch-control artifact (written once per
+    # merge-triggered migration run), NOT a periodic freshness-SLA artifact —
+    # ARTIFACT_REGISTRY.yaml carries only cadence/SLA rows, so like the
+    # migrate_universe_* audit PUTs above it is grandfathered out of the
+    # registry and pinned here only to force operator review of any new PUT
+    # site in the runner.
     "scripts/run_arctic_migrations.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
