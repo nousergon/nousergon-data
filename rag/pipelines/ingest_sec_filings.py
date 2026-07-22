@@ -48,6 +48,15 @@ _CHUNK_OVERLAP = 50
 
 
 # ── CIK lookup ───────────────────────────────────────────────────────────────
+#
+# config#2956: the process-level ``_CIK_CACHE`` dict below only lives for
+# ONE pipeline step (each is a separate ``python -m`` invocation), so a
+# cold cache used to always re-download the ~10k-entry company_tickers.json
+# from EDGAR. ``_cik_lookup.load_cik_map`` backs a cold in-memory cache
+# with a shared ``/tmp`` file cache (mtime TTL) so only the FIRST step in a
+# run (or day) actually hits EDGAR.
+
+from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -57,22 +66,8 @@ def _get_cik(ticker: str) -> str | None:
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
 
-    try:
-        resp = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=_SEC_HEADERS,
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            for entry in data.values():
-                t = entry.get("ticker", "").upper()
-                cik = str(entry.get("cik_str", ""))
-                _CIK_CACHE[t] = cik
-            return _CIK_CACHE.get(ticker.upper())
-    except Exception as e:
-        logger.warning("CIK lookup failed: %s", e)
-    return None
+    _CIK_CACHE.update(load_cik_map(http=requests, headers=_SEC_HEADERS))
+    return _CIK_CACHE.get(ticker.upper())
 
 
 # ── Filing search via EDGAR submissions API ──────────────────────────────────

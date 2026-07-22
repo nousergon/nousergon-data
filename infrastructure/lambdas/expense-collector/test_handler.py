@@ -3,24 +3,59 @@
 Pure-logic coverage (month window, forward-only projection, diff rows, fixed
 rows, Neon metric walker) plus a full handler run against fake boto3 clients
 and a canned HTTP router — asserting the rollup artifact shape, per-provider
-rows, error fencing (one dead provider must not blank the others), and the
-first-writer-wins baseline/snapshot writes.
+rows, error fencing (one dead provider must not blank the others), the
+first-writer-wins baseline/snapshot writes, and the config#2843 over-budget
+rising-edge Telegram alert (first breach fires once, sustained breach stays
+quiet, drop-then-rebreach re-arms).
 
 Run standalone: ``python3 -m pytest test_handler.py -q`` (deploy.sh preflights
-this before every package+ship; only dep beyond stdlib is boto3, which the
-Lambda runtime provides in prod).
+this before every package+ship). Hermetic: `nousergon_lib` +
+`flow_doctor_telegram` are git-only / bundled deps this suite does not require
+installed — they are stubbed in sys.modules BEFORE `import index` (mirrors the
+sibling flow-doctor consumers' tests, e.g. overseer-liveness-probe). The
+notify path is a no-op stub by default; alert-specific tests monkeypatch
+``index.notify_via_flow_doctor`` directly to assert call/no-call.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# ── Stub nousergon_lib + flow_doctor_telegram before importing index ──────────
+_ng = types.ModuleType("nousergon_lib")
+_ng_fleet = types.ModuleType("nousergon_lib.flow_doctor_fleet")
+
+
+class _FleetTelegramTopic:
+    CRITICAL = "CRITICAL"
+    OPS_HEALTH = "OPS_HEALTH"
+
+
+_ng_fleet.FleetTelegramTopic = _FleetTelegramTopic
+_ng.flow_doctor_fleet = _ng_fleet
+sys.modules.setdefault("nousergon_lib", _ng)
+sys.modules.setdefault("nousergon_lib.flow_doctor_fleet", _ng_fleet)
+
+_fdt = types.ModuleType("flow_doctor_telegram")
+_fdt.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-defined]
+sys.modules["flow_doctor_telegram"] = _fdt
+
+from _shared.hermetic_import_guard import (  # noqa: E402
+    assert_hermetic_imports_satisfied,
+)
+
+assert_hermetic_imports_satisfied(__file__)
+
 import index  # noqa: E402
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)  # July = 31 days
@@ -224,6 +259,57 @@ class TestNeonPeriodPacing:
         assert row["mtd_cost_usd"] == 19.0
         assert row["projected_month_end_usd"] == 19.0
         assert row["note"] == "Launch plan — TEMPORARY"
+
+    def test_computed_transfer_overage_cost(self, monkeypatch):
+        """No fixed_monthly_usd override configured (config#2913): mtd_cost_usd
+        must be a REAL computed estimate from data-transfer overage — 500 GB/mo
+        free egress, then $0.10/GB (neon.com/pricing, verified 2026-07-17) — not
+        the fabricated flat $19/mo the row used to hard-set regardless of usage.
+        600 GB used, full-month period, NOW at exactly 50% elapsed ⇒ 100 GB
+        overage MTD ($10.00), straight-line-projected usage 1200 GB month-end
+        ⇒ 700 GB overage ($70.00)."""
+        monkeypatch.setattr(index, "_now_utc",
+                            lambda: datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {
+                "name": "nousergon", "data_transfer_bytes": 600_000_000_000,
+                "compute_time_seconds": 7200, "written_data_bytes": 5_000_000_000,
+                "consumption_period_start": "2026-07-01T00:00:00Z",
+                "consumption_period_end": "2026-08-01T00:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        mw = index._month_window(datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        row = index.collect_neon(mw, {}, {index.SSM_NEON: "k"})
+        assert row["mtd_cost_usd"] == pytest.approx(10.0)
+        assert row["projected_month_end_usd"] == pytest.approx(70.0)
+        assert row["detail"]["data_transfer_cost_usd"] == pytest.approx(10.0)
+
+    def test_compute_and_storage_surface_as_unknown_not_zero(self, monkeypatch):
+        """Compute (no CU-size field to convert compute_time_seconds into
+        CU-hours) and storage (written_data_bytes is cumulative writes, not a
+        point-in-time size — no logical_size_bytes field) are genuinely
+        uncomputable from this endpoint: they must render None/unknown and be
+        named in detail.cost_components_unavailable, never fabricated as 0 or
+        silently dropped from the row (config#2913 fail-loud discipline)."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router({
+            "/api/v2/projects/p1": {"project": {
+                "name": "nousergon", "data_transfer_bytes": 8_000_000,
+                "compute_time_seconds": 7200, "written_data_bytes": 5_000_000_000,
+                "consumption_period_start": "2026-07-01T00:00:00Z",
+                "consumption_period_end": "2026-08-01T00:00:00Z"}},
+            "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        }))
+        row = index.collect_neon(index._month_window(NOW), {}, {index.SSM_NEON: "k"})
+        assert row["detail"]["compute_cost_usd"] is None
+        assert row["detail"]["storage_cost_usd"] is None
+        unavailable = {c["component"] for c in row["detail"]["cost_components_unavailable"]}
+        assert unavailable == {"compute", "storage"}
+        assert "unknown" in row["note"] or "cost_components_unavailable" in row["note"]
+        # Negligible transfer (8 MB, well under the 500 GB free tier) ⇒ the
+        # ONE computable line item is legitimately $0 — distinct from "unknown".
+        assert row["mtd_cost_usd"] == 0.0
+        assert row["detail"]["data_transfer_cost_usd"] == 0.0
 
 
 class TestFixedRows:
@@ -438,3 +524,436 @@ class TestHandler:
         monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, fail_ce))
         with pytest.raises(RuntimeError, match="all provider adapters failed"):
             index.handler({}, None)
+
+
+# ---------------------------------------------------------------------------
+# Over-budget Telegram alert (config#2843) — rising-edge per provider/month
+# ---------------------------------------------------------------------------
+
+def _row_with_pace(key: str, pace: str | None, **kw) -> dict:
+    row = index._row(key, key.upper())
+    row.update(pace=pace, mtd_cost_usd=10.0, projected_month_end_usd=20.0,
+               budget_usd=15.0)
+    row.update(kw)
+    return row
+
+
+class TestOverBudgetAlert:
+    PERIOD = "2026-07"
+
+    def test_first_breach_alerts_once(self, monkeypatch):
+        """A provider's FIRST flip to pace="over" this month fires exactly
+        one Telegram ping."""
+        s3 = FakeS3({})
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == ["aws"]
+        notify.assert_called_once()
+        state = json.loads(s3.store["expenses/alert_state/2026-07.json"])
+        assert state["providers"] == {"aws": True}
+
+    def test_sustained_breach_stays_quiet(self, monkeypatch):
+        """Once a provider is already recorded as breached this month, a
+        SECOND run that still reports pace="over" must NOT re-alert."""
+        store = {"expenses/alert_state/2026-07.json": json.dumps(
+            {"period": "2026-07", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == []
+        notify.assert_not_called()
+        state = json.loads(s3.store["expenses/alert_state/2026-07.json"])
+        assert state["providers"] == {"aws": True}  # still recorded breached
+
+    def test_drop_then_rebreach_rearms(self, monkeypatch):
+        """A provider that drops back under budget re-arms — the NEXT flip
+        to over must alert again (not treated as still-breached)."""
+        store = {"expenses/alert_state/2026-07.json": json.dumps(
+            {"period": "2026-07", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+
+        # Run 1: drops back under — no alert, state clears the flag.
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "under")])
+        assert result["alerted"] == []
+        notify.assert_not_called()
+        state = json.loads(s3.store["expenses/alert_state/2026-07.json"])
+        assert state["providers"] == {"aws": False}
+
+        # Run 2: re-breaches in the SAME month — must alert again (re-armed).
+        result = index.run_over_budget_alerts(
+            s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == ["aws"]
+        notify.assert_called_once()
+
+    def test_new_calendar_month_state_key_isolated(self, monkeypatch):
+        """State is keyed per calendar-month period — a provider breached in
+        June must alert fresh in July even with no June cleanup."""
+        store = {"expenses/alert_state/2026-06.json": json.dumps(
+            {"period": "2026-06", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(
+            s3, "2026-07", [_row_with_pace("aws", "over")])
+        assert result["alerted"] == ["aws"]
+        notify.assert_called_once()
+
+    def test_multiple_providers_independent(self, monkeypatch):
+        """Each provider's rising-edge state is independent — one already-
+        breached provider must not suppress a different provider's fresh
+        breach, nor vice versa."""
+        store = {"expenses/alert_state/2026-07.json": json.dumps(
+            {"period": "2026-07", "providers": {"aws": True}}).encode()}
+        s3 = FakeS3(store)
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(s3, self.PERIOD, [
+            _row_with_pace("aws", "over"),      # already breached — quiet
+            _row_with_pace("neon", "over"),     # fresh breach — alerts
+            _row_with_pace("openrouter", "under"),  # never breached — quiet
+        ])
+        assert result["alerted"] == ["neon"]
+        assert notify.call_count == 1
+
+    def test_non_over_pace_never_alerts(self, monkeypatch):
+        """under / fixed / None paces must never trigger a ping."""
+        s3 = FakeS3({})
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.run_over_budget_alerts(s3, self.PERIOD, [
+            _row_with_pace("aws", "under"),
+            _row_with_pace("claude_max", "fixed"),
+            _row_with_pace("deepseek", None),
+        ])
+        assert result["alerted"] == []
+        notify.assert_not_called()
+
+    def test_alert_pass_failure_never_raises(self, monkeypatch):
+        """A bug in the alert pass (e.g. state read/write blowing up in a way
+        _load/_save don't already fence) must not propagate — this is a
+        notification-only enhancement layered after a successful rollup."""
+        s3 = FakeS3({})
+
+        def _boom(*a, **k):
+            raise RuntimeError("unexpected alert-pass bug")
+
+        monkeypatch.setattr(index, "_load_alert_state", _boom)
+        result = index.run_over_budget_alerts(s3, self.PERIOD, [_row_with_pace("aws", "over")])
+        assert result["alerted"] == []
+        assert "error" in result
+
+    def test_handler_integration_fires_on_over_pace(self, env, monkeypatch):
+        """End-to-end: the handler's Neon AND github_org rows both go "over"
+        in the default env fixture (Neon: 3 GB projected ~5.6 GB > 5 GB quota;
+        github_org: 1400 private minutes @ 53% elapsed → ~2630 > 2000 included
+        minutes — see test_full_run) — the alert pass must fire for both and
+        record state in the rollup bucket."""
+        s3, store = env
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.handler({}, None)
+        assert set(result["alerts"]["alerted"]) == {"neon", "github_org"}
+        assert notify.call_count == 2
+        state = json.loads(store["expenses/alert_state/2026-07.json"])
+        assert state["providers"]["neon"] is True
+        assert state["providers"]["github_org"] is True
+
+    def test_handler_integration_quiet_when_no_over_pace(self, env, monkeypatch):
+        """Loosening the Neon quota AND the github_org included-minutes budget
+        removes the fixture's only two "over" rows — the alert pass must then
+        stay quiet end-to-end, while sustained per-provider state (from a
+        prior run) suppresses nothing new because nothing breaches."""
+        s3, store = env
+        ssm = index.boto3._by_name["ssm"]
+        ssm.params[index.SSM_NEON_QUOTA_GB] = "500"  # 3 GB used, nowhere near breach
+        budgets = json.loads(store["config/expense_budgets.json"])
+        budgets["providers"]["github_org"]["included_minutes"] = 20000  # 1400 well under
+        store["config/expense_budgets.json"] = json.dumps(budgets).encode()
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        result = index.handler({}, None)
+        assert result["alerts"]["alerted"] == []
+        notify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Month-close reconciliation (alpha-engine-config#2849)
+# ---------------------------------------------------------------------------
+
+class TestPriorMonthWindow:
+    def test_prior_month_from_mid_month(self):
+        pmw = index._prior_month_window(NOW)  # NOW = 2026-07-17
+        assert pmw["period"] == "2026-06"
+        assert pmw["start"] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+        assert pmw["end"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+        assert pmw["elapsed_frac"] == 1.0
+
+    def test_prior_month_from_january(self):
+        pmw = index._prior_month_window(datetime(2026, 1, 15, tzinfo=timezone.utc))
+        assert pmw["period"] == "2025-12"
+        assert pmw["start"] == datetime(2025, 12, 1, tzinfo=timezone.utc)
+        assert pmw["end"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class TestReconciliationRow:
+    PRIOR_DOC = {"providers": [
+        {"key": "aws", "mtd_cost_usd": 40.0, "projected_month_end_usd": 45.0},
+    ]}
+
+    def test_delta_against_last_recorded_mtd(self):
+        row = index._reconciliation_row("aws", self.PRIOR_DOC, 50.0)
+        assert row["projected_last_seen"] == 45.0
+        assert row["accrued_mtd_final"] == 40.0
+        assert row["actual_final"] == 50.0
+        assert row["delta_usd"] == pytest.approx(10.0)
+        assert row["delta_pct"] == pytest.approx(0.25)
+        assert row["status"] == "ok"
+
+    def test_missing_prior_doc_yields_nulls(self):
+        row = index._reconciliation_row("aws", None, 50.0)
+        assert row["projected_last_seen"] is None
+        assert row["accrued_mtd_final"] is None
+        assert row["delta_usd"] is None
+        assert row["delta_pct"] is None
+        assert row["actual_final"] == 50.0
+
+    def test_zero_accrued_nonzero_actual_is_full_drift(self):
+        row = index._reconciliation_row(
+            "aws", {"providers": [{"key": "aws", "mtd_cost_usd": 0.0,
+                                   "projected_month_end_usd": None}]}, 12.0)
+        assert row["delta_pct"] == 1.0
+
+    def test_not_available_status_carries_note(self):
+        row = index._reconciliation_row("neon", self.PRIOR_DOC, None,
+                                        status="not_available", note="no historical endpoint")
+        assert row["status"] == "not_available"
+        assert row["note"] == "no historical endpoint"
+        assert row["actual_final"] is None
+
+
+class TestReconcileAws:
+    def test_reconciles_full_prior_month(self, monkeypatch):
+        monkeypatch.setattr(index, "boto3", FakeBoto3(FakeS3({}), FakeSSM({}), FakeCE()))
+        pmw = index._prior_month_window(NOW)
+        prior_doc = {"providers": [{"key": "aws", "mtd_cost_usd": 10.0,
+                                    "projected_month_end_usd": 20.0}]}
+        row = index.reconcile_aws(pmw, {}, prior_doc)
+        # FakeCE.get_cost_and_usage always returns EC2 8.10 + S3 4.24 = 12.34
+        assert row["actual_final"] == pytest.approx(12.34)
+        assert row["accrued_mtd_final"] == 10.0
+        assert row["delta_usd"] == pytest.approx(2.34)
+
+
+class TestReconcileAnthropic:
+    def test_reuses_admin_api_with_bounded_window(self, monkeypatch):
+        pmw = index._prior_month_window(NOW)
+        seen_urls = []
+
+        def _fake_http(url, headers=None):
+            seen_urls.append(url)
+            # cost_report amounts are CENTS (config-I2840): 350 cents = $3.50
+            return {"data": [{"results": [{"amount": "350"}]}], "has_more": False}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        prior_doc = {"providers": [{"key": "anthropic_api", "mtd_cost_usd": 3.0,
+                                    "projected_month_end_usd": 3.0}]}
+        row = index.reconcile_anthropic(
+            pmw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None, prior_doc)
+        assert row["actual_final"] == pytest.approx(3.50)
+        assert "starting_at=2026-06-01" in seen_urls[0]
+        assert "ending_before=2026-07-01" in seen_urls[0]
+
+    def test_admin_api_amounts_are_cents_not_dollars(self, monkeypatch):
+        """Regression for the 100x overstatement found live 2026-07-20
+        (config-I2840): cost_report `amount` is in currency minor units.
+        981.60 (cents) must land as $9.82, not $981.60."""
+        mw = index._month_window(NOW)
+
+        def _fake_http(url, headers=None):
+            return {"data": [{"results": [{"amount": "981.60"},
+                                          {"amount": "18.40"}]}],
+                    "has_more": False}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        row = index.collect_anthropic(
+            mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert row["mtd_cost_usd"] == pytest.approx(10.0)
+        assert row["source"] == "admin_api"
+
+    def test_fallback_bounds_to_full_prior_month_days(self, monkeypatch):
+        """No admin key ⇒ client-telemetry fallback must sum through the
+        PRIOR month's last day (30 for June), not ``now.day`` (17, in July)."""
+        pmw = index._prior_month_window(NOW)
+        cost_jsonl = json.dumps({"cost_usd": 5.0}).encode()
+        store = {f"decision_artifacts/_cost_raw/2026-06-30/run/a.jsonl": cost_jsonl}
+        s3 = FakeS3(store)
+        prior_doc = {"providers": [{"key": "anthropic_api", "mtd_cost_usd": 4.0,
+                                    "projected_month_end_usd": None}]}
+        row = index.reconcile_anthropic(pmw, {}, {}, s3, prior_doc)
+        assert row["actual_final"] == pytest.approx(5.0)
+
+
+class TestReconcileCounterDiff:
+    def test_diffs_two_month_start_baselines(self):
+        store = {
+            "expenses/baselines/2026-06.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 30.0}}).encode(),
+            "expenses/baselines/2026-07.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 42.5}}).encode(),
+        }
+        s3 = FakeS3(store)
+        prior_doc = {"providers": [{"key": "openrouter", "mtd_cost_usd": 11.0,
+                                    "projected_month_end_usd": 12.0}]}
+        row = index.reconcile_counter_diff(
+            s3, "2026-06", "2026-07", "openrouter", "openrouter_total_usage", prior_doc)
+        assert row["actual_final"] == pytest.approx(12.5)
+        assert row["status"] == "ok"
+
+    def test_deepseek_diffs_already_oriented_counter(self):
+        """deepseek_neg_balance is stored as -balance (rises as spend
+        accrues, per ensure_baseline/collect_deepseek) — a plain forward diff
+        of the two baselines already yields positive spend, no extra sign
+        flip needed."""
+        store = {
+            "expenses/baselines/2026-06.json": json.dumps(
+                {"counters": {"deepseek_neg_balance": -20.0}}).encode(),
+            "expenses/baselines/2026-07.json": json.dumps(
+                {"counters": {"deepseek_neg_balance": -15.0}}).encode(),
+        }
+        s3 = FakeS3(store)
+        row = index.reconcile_counter_diff(
+            s3, "2026-06", "2026-07", "deepseek", "deepseek_neg_balance", None)
+        assert row["actual_final"] == pytest.approx(5.0)
+
+    def test_missing_baseline_is_not_available(self):
+        s3 = FakeS3({})
+        row = index.reconcile_counter_diff(
+            s3, "2026-06", "2026-07", "openrouter", "openrouter_total_usage", None)
+        assert row["status"] == "not_available"
+        assert row["actual_final"] is None
+
+
+class TestReconcileNeon:
+    def test_always_not_available(self):
+        row = index.reconcile_neon({"providers": [{"key": "neon", "mtd_cost_usd": 1.0}]})
+        assert row["status"] == "not_available"
+        assert "historical" in row["note"] or "current consumption period" in row["note"]
+        assert row["actual_final"] is None
+
+
+class TestReconcileGithub:
+    def test_targets_prior_month_year_month(self, monkeypatch):
+        pmw = index._prior_month_window(NOW)
+        seen = {}
+
+        def _fake_http(url, headers=None):
+            seen["url"] = url
+            return {"usageItems": [
+                {"product": "Actions", "unitType": "Minutes", "quantity": 900,
+                 "netAmount": 2.0, "repositoryName": "alpha-engine-config"},
+            ]}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        monkeypatch.setattr(index, "_private_repo_names",
+                            lambda account, kind, headers: {"alpha-engine-config"})
+        secrets = {index.SSM_GITHUB_TOKEN: "ghp-xxx"}
+        prior_doc = {"providers": [{"key": "github_org", "mtd_cost_usd": 1.5,
+                                    "projected_month_end_usd": 3.0}]}
+        row = index.reconcile_github(pmw, {}, secrets, account=index.GITHUB_ORG,
+                                     kind="org", prior_doc=prior_doc)
+        assert "year=2026&month=6" in seen["url"]
+        assert row["actual_final"] == pytest.approx(2.0)
+
+    def test_not_configured_passthrough(self, monkeypatch):
+        pmw = index._prior_month_window(NOW)
+        row = index.reconcile_github(pmw, {}, {}, account=index.GITHUB_USER,
+                                     kind="user", prior_doc=None)
+        assert row["status"] == "not_configured"
+
+
+class TestRunReconciliation:
+    def test_writes_reconciliation_artifact_and_flags_drift(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        prior_doc = {
+            "schema_version": 1, "period": "2026-06",
+            "providers": [
+                {"key": "aws", "mtd_cost_usd": 5.0, "projected_month_end_usd": 6.0},
+            ],
+        }
+        store = {
+            "expenses/monthly/2026-06.json": json.dumps(prior_doc).encode(),
+            "expenses/baselines/2026-06.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 30.0,
+                              "deepseek_neg_balance": -20.0}}).encode(),
+            "expenses/baselines/2026-07.json": json.dumps(
+                {"counters": {"openrouter_total_usage": 42.5,
+                              "deepseek_neg_balance": -15.0}}).encode(),
+        }
+        s3 = FakeS3(store)
+        ssm = FakeSSM({})
+        # FakeCE always returns 12.34 for get_cost_and_usage → aws delta vs
+        # prior_doc's 5.0 accrued is large enough to flag past the threshold.
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "_http_json", http_router({}))  # anthropic/github → error rows
+        result = index.run_reconciliation(s3, NOW, {}, {})
+        assert result["period"] == "2026-06"
+        doc = json.loads(store["expenses/reconciliation/2026-06.json"])
+        assert doc["period"] == "2026-06"
+        assert doc["providers"]["aws"]["actual_final"] == pytest.approx(12.34)
+        assert "aws" in doc["flagged"]  # (12.34-5.0)/5.0 = 146% >> 8% threshold
+        assert doc["providers"]["neon"]["status"] == "not_available"
+        # openrouter/deepseek reconciled purely from the two baselines above,
+        # with zero HTTP calls (the unrouted http_router({}) would raise if hit).
+        assert doc["providers"]["openrouter"]["actual_final"] == pytest.approx(12.5)
+        assert doc["providers"]["deepseek"]["actual_final"] == pytest.approx(5.0)
+
+    def test_one_provider_failure_does_not_blank_others(self, monkeypatch):
+        """Mirrors the live collect fence: a reconcile_* exception for one
+        provider must not prevent the others from being written."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        s3 = FakeS3({})
+        ssm = FakeSSM({})
+
+        def _boom(*a, **k):
+            raise RuntimeError("CE down")
+
+        monkeypatch.setattr(index, "reconcile_aws", _boom)
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "_http_json", http_router({}))
+        result = index.run_reconciliation(s3, NOW, {}, {})
+        doc = json.loads(s3.store["expenses/reconciliation/2026-06.json"])
+        assert doc["providers"]["aws"]["status"] == "error"
+        assert "CE down" in doc["providers"]["aws"]["note"]
+        assert doc["providers"]["neon"]["status"] == "not_available"
+
+
+class TestHandlerReconcileMode:
+    def test_handler_mode_reconcile_dispatches(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        s3 = FakeS3({})
+        ssm = FakeSSM({})
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "_http_json", http_router({}))
+        result = index.handler({"mode": "reconcile"}, None)
+        assert result["period"] == "2026-06"
+        assert "expenses/reconciliation/2026-06.json" in s3.store
+
+    def test_handler_default_mode_is_collect(self, env):
+        """Missing/empty event must behave exactly as before this feature —
+        the twice-daily Scheduler rule's Input ("{}"​) is unchanged."""
+        s3, store = env
+        result = index.handler({}, None)
+        assert result["period"] == "2026-07"  # collect-mode shape, not reconcile's
+        assert "providers" in result and isinstance(result["providers"], int)
+
+    def test_handler_unknown_mode_raises(self, env):
+        s3, store = env
+        with pytest.raises(ValueError, match="unknown expense-collector event mode"):
+            index.handler({"mode": "bogus"}, None)

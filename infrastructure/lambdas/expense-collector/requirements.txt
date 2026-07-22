@@ -1,0 +1,5 @@
+# alpha-engine-config#2843 — flow-doctor OPS_HEALTH Telegram routing for the
+# over-budget pacing alert. Pinned to v0.83.0, matching the other single-topic
+# (OPS_HEALTH-only, no CRITICAL) flow-doctor consumers in this fleet (e.g.
+# saturday-integrity-sentinel, sf-watch-liveness-probe, pipeline-watchdog).
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0

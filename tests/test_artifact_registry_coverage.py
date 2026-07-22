@@ -68,7 +68,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
     # an ORDINARY S3 ArtifactSpec in ARTIFACT_REGISTRY.yaml, no changes to
     # nousergon_lib.artifact_freshness or its probe machinery).
-    "builders/daily_append.py": 4,
+    "builders/daily_append.py": 5,
     # 3 -> 4 on alpha-engine-config-I2702 (2026-07-15): a second, separate
     # freshness sentinel — feature_store/_macro_freshness.json — written
     # after the macro/SPY readback-verification block succeeds. Deliberately
@@ -84,6 +84,17 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # register feature_store/_macro_freshness.json in alpha-engine-config/
     # private-docs/ARTIFACT_REGISTRY.yaml alongside the existing
     # feature_store/_freshness.json entry.
+    # 4 -> 5 on config#3237 (2026-07-22): a third freshness sentinel —
+    # feature_store/_universe_close_freshness.json — written after
+    # _scan_universe_and_emit_freshness_receipt's readback confirms each
+    # in-scope symbol's run_date-EXACT row (distinct from the loose
+    # N-trading-day receipt above). Consumed by
+    # infrastructure/lambdas/eod-precondition-probe, ANDed with the macro
+    # sentinel's check (2026-07-21 config#3236: a 100% universe-append
+    # failure alongside a healthy macro sentinel previously produced a false
+    # precondition_met=true). Registered as feature_store_universe_close_
+    # freshness_sentinel in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml alongside feature_store_freshness_sentinel.
     # builders/migrate_universe_crsp_basis_audit/{ts}.json — the per-ticker CRSP
     # reconciliation REPORT (corporate-actions PR7-7a, config#1434). Like the
     # other one-off migration-audit PUTs (feature_order / vwap below), this is an
@@ -93,6 +104,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # here only to force operator review of the new PUT site.
     "builders/migrate_universe_crsp_basis.py": 1,
     "builders/migrate_universe_feature_order.py": 1,
+    # overseer/_control/completed/arctic-migration-<head>.json — the migration
+    # runner's per-run completion marker (alpha-engine-config-I3242). Like the
+    # alert-drain/sf-watch completion markers it mirrors (also unregistered),
+    # this is an EVENT-DRIVEN dispatch-control artifact (written once per
+    # merge-triggered migration run), NOT a periodic freshness-SLA artifact —
+    # ARTIFACT_REGISTRY.yaml carries only cadence/SLA rows, so like the
+    # migrate_universe_* audit PUTs above it is grandfathered out of the
+    # registry and pinned here only to force operator review of any new PUT
+    # site in the runner.
+    "scripts/run_arctic_migrations.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for

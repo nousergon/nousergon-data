@@ -90,15 +90,23 @@ _EXPECTED_SKIPS = {
     "skip_lib_pin_drift_check",
     "skip_morning_enrich",
     "skip_data_phase1",
+    # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
+    # ThinkTankCoverage each got their own CheckSkip* gate — previously
+    # NONE of the four had one, so every partial rerun unconditionally
+    # re-ran all four regardless of flags. skip_signals_envelope's gate
+    # DEFAULTS FALSE (SignalsEnvelope is LOAD-BEARING — I2880 staleness
+    # guard — unlike the other three, which are safe defaults-false too
+    # but carry no comparable live-run hazard).
+    "skip_scanner",
+    "skip_signals_envelope",
+    "skip_challenger_shadow",
     "skip_rag_ingestion",
+    "skip_thinktank_coverage",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",
     # skip_research retired: alpha-engine-config-I2515 Phase B removed the
     # multi-agent Research state (and its CheckSkipResearch gate) entirely
-    # — there is no longer a Lambda invocation to skip. SignalsEnvelope,
-    # its load-bearing replacement, has no skip gate (mirrors Scanner's
-    # own unconditional posture — it is now a same-day-freshness producer,
-    # not an ad-hoc-rerun-optional step).
+    # — there is no longer a Lambda invocation to skip.
     "skip_data_phase2",
     "skip_eval_judge",
     "skip_rationale_clustering",
@@ -113,6 +121,10 @@ _EXPECTED_SKIPS = {
     # (and its CheckSkipDriftDetection gate) were collapsed when drift was
     # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
+    # config#2362 Option A (operator-ruled 2026-07-21): additive gate that
+    # skips only the Backtester SSM task, distinct from skip_backtester's
+    # legacy whole-pair jump above.
+    "skip_backtester_stage_only",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
     # and PortfolioOptimizerBacktest (L4472 split) previously had no skip gate, and
@@ -168,7 +180,7 @@ _SPOT_STATES = {
         "/var/log/parity.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
+        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the

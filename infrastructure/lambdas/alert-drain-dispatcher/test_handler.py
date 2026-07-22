@@ -122,3 +122,23 @@ class TestBootstrapCommand:
         assert "infrastructure/alert_drain_spot_bootstrap.sh" in cmd
         assert "--run-id" in cmd and "--is-drill" in cmd
         assert index.DRAIN_GH_PAT_SSM in cmd
+
+
+def test_model_threaded_into_bootstrap_export():
+    """config-I3293: a router-injected model lands as the DRAIN_MODEL export
+    in the SSM bootstrap command; absent, the export is empty (run script's
+    inline default applies via its :- expansion)."""
+    import index
+    cmd = index._bootstrap_command("drain-x", "false", "claude-sonnet-5")
+    assert 'export DRAIN_MODEL="claude-sonnet-5"' in cmd
+    cmd_default = index._bootstrap_command("drain-x", "false")
+    assert 'export DRAIN_MODEL=""' in cmd_default
+
+
+def test_malformed_model_rejected():
+    """Shell-injection guard: a model failing _MODEL_RE is a clean
+    invalid_event decline, never interpolated into the SSM command."""
+    import index
+    out = index.handler({"trigger": "x", "model": 'claude-$(rm -rf /)'}, None)
+    assert out == {"launched": False, "reason": "invalid_event",
+                   "error": out["error"]}

@@ -77,6 +77,18 @@ class TestStatesPresent:
             "Scanner runs unconditionally — gates belong at the consumer "
             "side (Phase 4/5), not the producer side."
         )
+        # config#3134's CheckSkipScanner does NOT violate this principle:
+        # unlike CheckEnableStandaloneScanner (an "enable" gate that
+        # defaults absence to NOT running — silently disabling
+        # observation), CheckSkipScanner is a `skip_*` operator/preset
+        # flag that DEFAULTS to running (Default: Scanner) — the same
+        # shape as every other skip_* gate in this SF (skip_rag_ingestion,
+        # skip_regime_substrate, etc.), added for the same reason: a
+        # partial/assessment rerun (mode=backtest-eval) that needs none of
+        # lane A must not re-scan and overwrite the day's candidates.json.
+        # It is inert (absent/false = Scanner runs) on every normal or
+        # unflagged execution.
+        assert states["CheckSkipScanner"]["Default"] == "Scanner"
 
 
 # ── Lambda target + payload ───────────────────────────────────────────────
@@ -160,9 +172,10 @@ class TestEdges:
             "ResearchPredictorParallel (config#885: Scanner moved into "
             "Branch A as its StartAt)."
         )
-        # Scanner remains the unconditional head of Branch A.
+        # Scanner remains the head of Branch A (config#3134: now reached
+        # via its own CheckSkipScanner gate, which defaults to running it).
         par = sf["States"]["ResearchPredictorParallel"]
-        assert par["Branches"][0]["StartAt"] == "Scanner"
+        assert par["Branches"][0]["StartAt"] == "CheckSkipScanner"
 
     def test_data_phase1_success_path_routes_to_parallel(self, sf):
         status = sf["States"]["CheckDataPhase1Status"]
@@ -176,7 +189,7 @@ class TestEdges:
             "chain into Branch A so it runs parallel to PredictorTraining."
         )
         par = sf["States"]["ResearchPredictorParallel"]
-        assert par["Branches"][0]["StartAt"] == "Scanner"
+        assert par["Branches"][0]["StartAt"] == "CheckSkipScanner"
 
     def test_scanner_success_routes_to_regime_substrate_skip_gate(self, states):
         # config-I2515 Phase B: ThinkTankCoverage moved to run AFTER the RAG

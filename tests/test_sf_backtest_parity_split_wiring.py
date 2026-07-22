@@ -120,7 +120,11 @@ class TestChainOrdering:
     CheckSkipEvaluator (existing downstream unchanged)."""
 
     def test_skip_backtester_default_runs_backtester(self, states):
-        assert states["CheckSkipBacktester"]["Default"] == "Backtester"
+        # config#2362 Option A: CheckSkipBacktester's Default now falls
+        # through the additive CheckSkipBacktesterStageOnly gate before
+        # Backtester (still runs Backtester on a scheduled/normal run).
+        assert states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
+        assert states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
     def test_skip_backtester_whole_pair_routes_to_evaluator_skipgate(self, states):
         """{"skip_backtester": true} keeps its original whole-pair

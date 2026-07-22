@@ -52,8 +52,22 @@ on:
 # data-transfer quota (config-I2780). The newest head is the only one whose
 # verdict matters; cancel the stale poll and let the dispatcher's server-side
 # dedupe decline the stale launch.
+#
+# The shared group above only applies to events that can actually reach the
+# `canary` job (opened/reopened, or labeled with canary:replay itself). A
+# `labeled` event for any OTHER label (e.g. the groom bot tagging
+# `source:groom` moments after opening the PR) is already a structural no-op
+# — the `label` job's own `if:` skips it outright — but it still fires a
+# NEW workflow run in the SAME concurrency group, and cancel-in-progress
+# kills the real in-flight `opened` run before it can finish, leaving a
+# `cancelled` conclusion on the `label`/`canary` checks instead of a clean
+# pass/skip. Route those irrelevant events into their own per-run group so
+# they can never cancel a run that matters.
 concurrency:
-  group: canary-replay-${{ github.event.pull_request.number }}
+  group: >-
+    ${{ (github.event.action != 'labeled' || github.event.label.name == 'canary:replay')
+        && format('canary-replay-{0}', github.event.pull_request.number)
+        || format('canary-replay-noop-{0}-{1}', github.event.pull_request.number, github.run_id) }}
   cancel-in-progress: true
 
 permissions:
