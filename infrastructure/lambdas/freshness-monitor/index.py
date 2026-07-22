@@ -143,6 +143,43 @@ RECOVERY_DISPATCH_ENABLED = (
     == "true"
 )
 
+# config-I3282 — freshness-critical → overseer drain dispatch (phase 1;
+# Brian directive 2026-07-22). Every CRITICAL page from a row whose declared
+# response lane is NOT `remediation: operator` (and that has no `recovery:`
+# heal of its own in flight) triggers ONE event-time alert-drain run through
+# the overseer router, instead of the critical sitting in the intake queue
+# until the next scheduled drain (10:00/22:00 UTC — today's four criticals
+# waited ~10h). The drain agent consumes the whole queue, so a sweep that
+# pages several criticals dispatches ONCE, and the router's alert-drain
+# playbook + the executor's EC2 tag lock (concurrent_skip benign) guard
+# overlap. Async Event invoke — the router owns escalation on executor
+# failure (mirrors saturday-sf-watch-dispatcher's M2 posture).
+#
+# Rows with a `recovery:` block are EXCLUDED: their declared lane is the
+# auto-backfill heal, and a drain on top of an in-flight heal is redundant.
+# Rows with no declaration at all (only reachable via warning-escalation or
+# probe_failed coercion — the PR-time completeness check requires a lane on
+# every statically-critical row) DEFAULT to dispatch: a critical page nobody
+# declared a response for is exactly the case that must not sit unactioned.
+DRAIN_DISPATCH_ENABLED = (
+    os.environ.get("FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED", "false").lower()
+    == "true"
+)
+DRAIN_DISPATCH_MARKER_KEY = (
+    "_freshness_monitor/_dispatch/last_drain_dispatch.json"
+)
+# One drain covers every critical in the queue at launch; the cooldown only
+# bounds how often a PERSISTENTLY-critical sweep can relaunch one. Sized to
+# the drain's own runtime ceiling (3h watchdog) would starve genuinely new
+# incidents; 120min matches the recovery cooldown's retry philosophy.
+DRAIN_DISPATCH_COOLDOWN_MINUTES = int(
+    os.environ.get("DRAIN_DISPATCH_COOLDOWN_MINUTES", "120")
+)
+OVERSEER_DISPATCHER_FUNCTION = os.environ.get(
+    "OVERSEER_DISPATCHER_FUNCTION", "alpha-engine-overseer-dispatcher"
+)
+DRAIN_PLAYBOOK = os.environ.get("FRESHNESS_DRAIN_PLAYBOOK", "alert-drain")
+
 # CloudWatch namespace for the per-cycle completion rollup metric. Shares
 # the substrate-health namespace so cycle-completion + substrate-row health
 # graph together. Dimensioned by Cadence only (low-cardinality, alarm-able).
@@ -279,12 +316,14 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
 
 def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
-) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]], dict[str, bool]]:
+) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]],
+           dict[str, bool], dict[str, str]]:
     """Like :func:`load_registry`, but also returns the per-artifact
     ``recovery:`` spec map (config#1240), the
-    ``critical_while_champion_arm`` map (config-I3086), and the
-    ``escalate_to_issue`` map (config#2055 Gap 2), all keyed by
-    ``artifact_id``.
+    ``critical_while_champion_arm`` map (config-I3086), the
+    ``escalate_to_issue`` map (config#2055 Gap 2), and the
+    ``remediation:`` declared-response-lane map (config-I3282), all keyed
+    by ``artifact_id``.
 
     ``ArtifactSpec`` is a frozen lib dataclass without a ``recovery``
     field (the monitor's dispatch concern is not the substrate's
@@ -307,6 +346,7 @@ def load_registry_with_recovery(
     recovery_by_id: dict[str, dict] = {}
     critical_arms_by_id: dict[str, list[str]] = {}
     escalate_to_issue_by_id: dict[str, bool] = {}
+    remediation_by_id: dict[str, str] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
@@ -322,7 +362,11 @@ def load_registry_with_recovery(
             critical_arms_by_id[spec.artifact_id] = [str(a) for a in arms]
         if merged.get("escalate_to_issue") is True:
             escalate_to_issue_by_id[spec.artifact_id] = True
-    return specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id
+        remediation = merged.get("remediation")
+        if isinstance(remediation, str) and remediation:
+            remediation_by_id[spec.artifact_id] = remediation
+    return (specs, recovery_by_id, critical_arms_by_id,
+            escalate_to_issue_by_id, remediation_by_id)
 
 
 # ── Dynamic severity (config-I3086) ─────────────────────────────────────────
@@ -860,6 +904,115 @@ def _maybe_dispatch_recovery(
         "DISPATCHED %s recovery for %s (state=%s) target=%s",
         recovery.get("type"), spec.artifact_id, result.state,
         recovery.get("target"),
+    )
+    return True
+
+
+# ── Freshness-critical → overseer drain dispatch (config-I3282 phase 1) ─────
+
+
+def _drain_dispatch_in_cooldown(s3_client: Any, now: datetime) -> bool:
+    """True if a drain-dispatch marker exists within the cooldown window.
+
+    Global (not per-artifact): one drain consumes the WHOLE intake queue, so
+    every critical paged before (or shortly after) the launch is covered by
+    the same run. Fail-closed on non-404 HEAD errors, mirroring
+    :func:`_recovery_already_dispatched` — a transient S3 blip must not
+    trigger a dispatch storm.
+    """
+    try:
+        resp = s3_client.head_object(
+            Bucket=REGISTRY_BUCKET, Key=DRAIN_DISPATCH_MARKER_KEY
+        )
+    except Exception as exc:  # noqa: BLE001 — classify by error code
+        code = str(
+            getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        )
+        status = getattr(exc, "response", {}).get("ResponseMetadata", {}).get(
+            "HTTPStatusCode", 0
+        )
+        if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return False  # no marker → first dispatch
+        logger.warning(
+            "drain-dispatch marker HEAD failed (%s) — assuming in-flight to "
+            "avoid a dispatch storm", exc,
+        )
+        return True
+    lm = resp.get("LastModified")
+    if lm is None:
+        return True
+    age_min = (now - lm).total_seconds() / 60.0
+    return age_min < DRAIN_DISPATCH_COOLDOWN_MINUTES
+
+
+def _maybe_dispatch_drain(
+    s3_client: Any,
+    aws_clients: dict[str, Any],
+    candidate_ids: list[str],
+    now: datetime,
+) -> bool:
+    """Event-time overseer drain dispatch for this sweep's critical pages
+    (config-I3282 phase 1). Called ONCE per pass with every artifact whose
+    critical page fired and whose declared lane admits dispatch.
+
+    Returns ``True`` iff a dispatch was performed. Fires only when ALL of:
+      - ``candidate_ids`` is non-empty;
+      - :data:`DRAIN_DISPATCH_ENABLED` (OBSERVE-mode gate — logs the
+        would-dispatch and writes NO marker / calls NO AWS when off);
+      - no dispatch marker within the cooldown window (global dedup — one
+        drain covers the whole queue).
+
+    The router invoke is async (``Event``): the overseer-dispatcher owns
+    verdict handling and escalation (P1 + loud page) end-to-end, exactly as
+    it does for saturday-sf-watch-dispatcher's M2 dispatches. The marker is
+    written BEFORE the invoke (same crash-ordering argument as the recovery
+    marker: err toward not-re-dispatching).
+    """
+    if not candidate_ids:
+        return False
+
+    if not DRAIN_DISPATCH_ENABLED:
+        logger.info(
+            "OBSERVE-mode (drain-dispatch): would dispatch playbook=%s via %s "
+            "for %d critical page(s): %s",
+            DRAIN_PLAYBOOK, OVERSEER_DISPATCHER_FUNCTION,
+            len(candidate_ids), sorted(candidate_ids),
+        )
+        return False
+
+    if _drain_dispatch_in_cooldown(s3_client, now):
+        logger.info(
+            "drain dispatch in cooldown — %d critical page(s) (%s) covered by "
+            "the in-flight/recent drain",
+            len(candidate_ids), sorted(candidate_ids),
+        )
+        return False
+
+    _put_json(
+        s3_client, REGISTRY_BUCKET, DRAIN_DISPATCH_MARKER_KEY,
+        {
+            "dispatched_at": now.isoformat(),
+            "artifact_ids": sorted(candidate_ids),
+            "playbook": DRAIN_PLAYBOOK,
+        },
+    )
+
+    lam = aws_clients.get("lambda")
+    if lam is None:
+        lam = boto3.client("lambda")
+        aws_clients["lambda"] = lam
+    lam.invoke(
+        FunctionName=OVERSEER_DISPATCHER_FUNCTION,
+        InvocationType="Event",  # async; the router owns escalation
+        Payload=json.dumps({
+            "playbook": DRAIN_PLAYBOOK,
+            "payload": {"trigger": "freshness-critical", "is_drill": "false"},
+        }).encode("utf-8"),
+    )
+    logger.info(
+        "DISPATCHED overseer playbook=%s via %s for %d critical page(s): %s",
+        DRAIN_PLAYBOOK, OVERSEER_DISPATCHER_FUNCTION,
+        len(candidate_ids), sorted(candidate_ids),
     )
     return True
 
@@ -1446,7 +1599,8 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         now.isoformat(), ALERTS_ENABLED,
     )
 
-    specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id = (
+    (specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id,
+     remediation_by_id) = (
         load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
@@ -1460,6 +1614,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
 
     pairs, alerted, dispatched, per_spec_exceptions, _miss_counts = _run_probe_pass(
         s3_client, intraday_specs, recovery_by_id, now,
+        remediation_by_id=remediation_by_id,
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -1489,9 +1644,15 @@ def _run_probe_pass(
     recovery_by_id: dict[str, dict],
     now: datetime,
     prev_miss_counts: dict[str, int] | None = None,
+    remediation_by_id: dict[str, str] | None = None,
 ) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int]]:
     """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
     alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions)``.
+
+    config-I3282: after the walk, one aggregated event-time drain dispatch
+    fires for the pass's critical pages (see :func:`_maybe_dispatch_drain`
+    for the eligibility + dedup semantics) — independently trapped like the
+    per-artifact recovery dispatches, so it can never sink the pass.
 
     Shared verbatim by the daily full-registry sweep and the intraday
     mini-rule (config#1297) — the only difference between the two callers
@@ -1510,7 +1671,9 @@ def _run_probe_pass(
     dispatched = 0
     per_spec_exceptions = 0
     prev_miss_counts = prev_miss_counts or {}
+    remediation_by_id = remediation_by_id or {}
     miss_counts: dict[str, int] = {}
+    drain_candidates: list[str] = []
     # Per-pass cache of lazily-created SF/Lambda clients (shared across the
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
@@ -1555,9 +1718,36 @@ def _run_probe_pass(
             and isinstance(recovery, dict)
             and recovery.get("mode", "dispatch_and_page") == "dispatch"
         )
+        paged = False
         if not suppress_page and _maybe_alert(
                 spec, result, now, consecutive_miss_runs=miss_runs):
             alerted += 1
+            paged = True
+
+        # config-I3282 — collect this pass's dispatch-eligible critical
+        # pages. `_maybe_alert` returns True ONLY on an actual critical
+        # publish (warnings and OBSERVE mode return False), so `paged` is
+        # already the effective-severity gate. Excluded: rows with a
+        # `recovery:` heal of their own (their declared lane), and rows
+        # declared `remediation: operator` (page-only by declaration).
+        if (
+            paged
+            and spec.artifact_id not in recovery_by_id
+            and remediation_by_id.get(spec.artifact_id) != "operator"
+        ):
+            drain_candidates.append(spec.artifact_id)
+
+    # One aggregated event-time drain per pass (config-I3282), trapped so a
+    # dispatch failure can never sink the pass's primary deliverables. The
+    # critical page(s) above already fired, so the operator surface exists
+    # regardless of this leg's outcome.
+    try:
+        _maybe_dispatch_drain(s3_client, aws_clients, drain_candidates, now)
+    except Exception as drain_exc:  # noqa: BLE001 — side effect; pages already fired, this ERROR + the un-drained queue are the recording surfaces
+        logger.error(
+            "FRESHNESS_DRAIN_DISPATCH_FAILED for %s (non-fatal): %s",
+            sorted(drain_candidates), drain_exc, exc_info=True,
+        )
 
     return pairs, alerted, dispatched, per_spec_exceptions, miss_counts
 
@@ -1599,14 +1789,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
-    specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id = (
+    (specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id,
+     remediation_by_id) = (
         load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     logger.info(
         "loaded %d specs from registry (%d with recovery specs, %d with "
-        "champion-arm dynamic severity, %d flagged for issue escalation)",
+        "champion-arm dynamic severity, %d flagged for issue escalation, "
+        "%d with declared remediation lanes)",
         len(specs), len(recovery_by_id), len(critical_arms_by_id),
-        len(escalate_to_issue_by_id),
+        len(escalate_to_issue_by_id), len(remediation_by_id),
     )
 
     # config-I3086: dynamic severity + warning-escalation counters.
@@ -1615,6 +1807,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     pairs, alerted, dispatched, per_spec_exceptions, miss_counts = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,
+        remediation_by_id=remediation_by_id,
     )
 
     # config#2055 Gap 2: extended-staleness -> Decision Queue P1. Runs after
@@ -1695,6 +1888,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "counts": heartbeat["counts"],
         "alerts_enabled": ALERTS_ENABLED,
         "recovery_dispatch_enabled": RECOVERY_DISPATCH_ENABLED,
+        "drain_dispatch_enabled": DRAIN_DISPATCH_ENABLED,
         "alerted": alerted,
         "dispatched": dispatched,
         "issues_filed": issues_filed_this_run,
