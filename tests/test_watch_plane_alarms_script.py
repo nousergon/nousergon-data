@@ -1,5 +1,7 @@
 """Pins the watch-plane Lambda alarm setup script (config#2266; roster
-extended to 8 functions + an intake-queue age alarm by config-I2900/I2910).
+extended to 8 functions + an intake-queue age alarm by config-I2900/I2910;
+extended to 9 functions by alpha-engine-config-I3242's arctic-migration-
+dispatcher onboarding).
 
 setup_watch_plane_alarms.sh puts CloudWatch Errors + Throttles alarms on each
 of the watch-plane Lambdas — the components whose job is to notice fleet
@@ -53,7 +55,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All eight watch-plane Lambdas must be alarmed."""
+    """All nine watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -71,6 +73,10 @@ class TestWatchPlaneCoverage:
             # (the same "new Lambda, forgot to onboard it" miss, twice).
             "alpha-engine-alert-drain-dispatcher",
             "alpha-engine-substrate-health-gate",
+            # Added alpha-engine-config-I3242: the merge-triggered in-region
+            # ArcticDB migration runner — onboarded in the SAME PR that ships it,
+            # per this file's own header convention.
+            "alpha-engine-arctic-migration-dispatcher",
         ],
     )
     def test_lambda_is_present(self, script_text, fn_name):
@@ -85,7 +91,7 @@ class TestWatchPlaneCoverage:
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 8
+        assert block.count('"alpha-engine-') == 9
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text

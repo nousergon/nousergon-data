@@ -77,6 +77,11 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # substrate-health-gate (weekly-pipeline SsmDiskProbe gate) added config-I2900
 # — both were Active with zero alarm coverage; see the onboarding-checklist
 # comment above the header of this file.
+# arctic-migration-dispatcher added alpha-engine-config-I3242 (merge-triggered
+# in-region ArcticDB migration runner) — onboarded in the SAME PR that ships
+# it, per this file's own header convention. (Comment kept OUT of the array
+# literal below so the tests/test_watch_plane_alarms_script.py block-parser
+# isn't confused by a stray `)` inside the block.)
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
@@ -86,6 +91,7 @@ declare -A WATCH_PLANE_FUNCTIONS=(
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
   ["alert-drain-dispatcher"]="alpha-engine-alert-drain-dispatcher"
   ["substrate-health-gate"]="alpha-engine-substrate-health-gate"
+  ["arctic-migration-dispatcher"]="alpha-engine-arctic-migration-dispatcher"
 )
 
 echo "Configuring watch-plane Lambda alarms"
