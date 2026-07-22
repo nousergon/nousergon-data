@@ -68,7 +68,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
     # an ORDINARY S3 ArtifactSpec in ARTIFACT_REGISTRY.yaml, no changes to
     # nousergon_lib.artifact_freshness or its probe machinery).
-    "builders/daily_append.py": 4,
+    "builders/daily_append.py": 5,
     # 3 -> 4 on alpha-engine-config-I2702 (2026-07-15): a second, separate
     # freshness sentinel — feature_store/_macro_freshness.json — written
     # after the macro/SPY readback-verification block succeeds. Deliberately
@@ -84,6 +84,17 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # register feature_store/_macro_freshness.json in alpha-engine-config/
     # private-docs/ARTIFACT_REGISTRY.yaml alongside the existing
     # feature_store/_freshness.json entry.
+    # 4 -> 5 on config#3237 (2026-07-22): a third freshness sentinel —
+    # feature_store/_universe_close_freshness.json — written after
+    # _scan_universe_and_emit_freshness_receipt's readback confirms each
+    # in-scope symbol's run_date-EXACT row (distinct from the loose
+    # N-trading-day receipt above). Consumed by
+    # infrastructure/lambdas/eod-precondition-probe, ANDed with the macro
+    # sentinel's check (2026-07-21 config#3236: a 100% universe-append
+    # failure alongside a healthy macro sentinel previously produced a false
+    # precondition_met=true). Registered as feature_store_universe_close_
+    # freshness_sentinel in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml alongside feature_store_freshness_sentinel.
     # builders/migrate_universe_crsp_basis_audit/{ts}.json — the per-ticker CRSP
     # reconciliation REPORT (corporate-actions PR7-7a, config#1434). Like the
     # other one-off migration-audit PUTs (feature_order / vwap below), this is an
