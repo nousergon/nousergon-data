@@ -48,6 +48,25 @@ uncovered — but the degradation is recorded loudly (`dedupe_degraded: true`
 in the returned verdict + an ERROR log naming the probe error). This guard
 is an optimization against duplicate spend, never a correctness gate.
 
+SIGNATURE-REPEAT LAUNCH DEDUP (config#2862): the (repo, sha) lock above is
+blind to a SHA-INDEPENDENT latent infra defect — one that fails EVERY new
+commit's CI regardless of content, so per-SHA dedup can never collapse it
+(2026-07-17: one missing IAM trust relationship, 11 red deploys, 11 spot
+launches, even though every box independently diagnosed the SAME root cause
+and no-op'd as a `REPEAT`). Before the (repo, sha) probe above, this
+dispatcher additionally checks whether ANY signature marker under
+`ci_watch/_control/signatures/{repo}/{today}/` (the S3 control-plane the
+on-box agents themselves populate via
+`alpha-engine-config/scripts/ci_watch_claim_attempt_signature.sh`, STEP 0.6
+of `.github/ci-watch-prompt.md`) already carries a non-null `fix_pr` — see
+`_known_fixed_signature_exists()` for the full rationale (including why the
+"compute the signature before dispatch" layer config#2862 also named is
+infeasible: notify-ci-failure.yml has zero per-repo diagnostic knowledge to
+derive a matching signature with). A hit returns
+`{"launched": false, "reason": "signature_repeat_skip"}`. Same
+coverage-beats-dedup posture as the probe above: no markers, no fix_pr yet,
+or ANY list/read failure all fail OPEN (launch proceeds).
+
 IAM PROFILE — deliberately NOT `alpha-engine-executor-profile` (shared with
 the live trading executor). Uses `alpha-engine-ci-watch-executor-profile`, a
 dedicated instance profile a sibling agent is creating in
@@ -63,11 +82,14 @@ until the new code + IAM are deployed AND a sibling agent's GHA workflow
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import uuid
 from datetime import datetime, timezone
+
+import boto3
 
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import (  # SpotProbeError: nousergon-lib >= 0.106.0
@@ -128,6 +150,99 @@ CI_WATCH_SHA_TAG_KEY = "ci-watch-sha"
 # (sf-watch-drill) — one fleet-wide drill marker every consumer can filter
 # on, not a per-dispatcher variant.
 CI_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
+
+# ── Signature-repeat launch dedup (config#2862) ──────────────────────────────
+# WHY: the (repo, sha) concurrency lock above is deliberately narrow — two
+# DIFFERENT commits failing CI independently must each get their own box
+# (see CONCURRENCY LOCK note). But a SHA-INDEPENDENT latent infra defect
+# (e.g. a missing IAM trust relationship that fails a CFN deploy rollback on
+# every single post-merge commit regardless of content) defeats that lock
+# entirely: each new commit's SHA is novel, so N consecutive broken commits
+# launch N boxes even though every one of them will independently diagnose
+# the SAME root cause, compute the SAME signature via
+# alpha-engine-config/scripts/ci_watch_signature_hash.sh (STEP 0.6 of
+# .github/ci-watch-prompt.md), and no-op as a `REPEAT` (2026-07-17: one
+# missing `scheduler.amazonaws.com` trust, 11 red deploys, 11 spot launches).
+#
+# WHY THIS IS THE FALLBACK, NOT THE "PREFERRED" LAYER: config#2862 named a
+# preferred layer where nousergon-lib's notify-ci-failure.yml computes
+# `signature_hash` BEFORE dispatch and passes it in the client_payload. That
+# is infeasible as scoped: notify-ci-failure.yml is a generic reusable
+# workflow shared by every fleet repo with zero domain knowledge of any
+# repo's canaries/CFN stacks/failure taxonomy — its client_payload is just
+# {repo, sha, run_id, run_url, workflow, branch}. Computing a signature that
+# matches what the on-box agent would independently derive requires the
+# agent's own diagnosis (gh run view --log-failed, canary/CFN/step
+# classification, the canonical-mode registry) — work that only happens
+# AFTER a box is already up. So this dispatcher instead consults the
+# EXISTING signature control-plane THOSE agents already populate
+# (ci_watch_claim_attempt_signature.sh, config#2395) for ANY already-fixed
+# signature recorded for (repo, today) — no new pre-dispatch signal needed
+# from nousergon-lib at all.
+#
+# MECHANISM: before launching, list
+# s3://{CI_WATCH_SIGNATURES_BUCKET}/ci_watch/_control/signatures/{repo_flat}/{utc_date}/
+# (written by every ci-watch box that reaches STEP 0.6 for this repo today)
+# and read each marker. If ANY marker already carries a non-null `fix_pr`,
+# skip the launch — a fix is already known for at least one of today's
+# distinct root causes on this repo, so a fresh box is very likely just
+# going to independently re-derive a REPEAT and no-op (a box that hits a
+# genuinely NEW, still-unfixed signature will still find nothing with
+# fix_pr set for ITS signature — but see the guardrail below).
+#
+# COVERAGE-BEATS-DEDUP GUARDRAIL (binding, config#2862): this is an
+# optimization against duplicate spend, never a correctness gate — mirrors
+# the existing `dedupe_degraded` posture (config#2267 site 1). A brand-new
+# repo-wide signature landscape (no markers yet, or markers present but none
+# carry a fix_pr) MUST launch. ANY probe/list/read failure (throttling,
+# malformed marker JSON, access error) MUST fail OPEN (launch) — never
+# silently treated as "known repeat." This dedup layer is coarser than a
+# true per-signature match (it skips on ANY known-fixed signature for the
+# repo today, not specifically the launching box's own eventual signature) —
+# a deliberate, documented tradeoff: the alternative (compute the real
+# signature pre-dispatch) is the infeasible "preferred" layer above, and a
+# slightly coarser skip that still fails open on anything uncertain is far
+# better than the N-boxes-for-one-defect status quo this issue tracks.
+CI_WATCH_SIGNATURES_BUCKET = os.environ.get("CI_WATCH_SIGNATURES_BUCKET", "alpha-engine-research")
+CI_WATCH_SIGNATURES_PREFIX = os.environ.get(
+    "CI_WATCH_SIGNATURES_PREFIX", "ci_watch/_control/signatures"
+)
+
+
+def _known_fixed_signature_exists(repo: str) -> bool:
+    """True iff at least one signature marker for (repo, today) already
+    records a non-null `fix_pr` — i.e. a prior box today already diagnosed
+    and fixed a recurring root cause on this repo. Any list/read failure (or
+    simply no markers / no fix_pr yet) returns False — the caller launches;
+    coverage beats dedup (see module-level guardrail note above)."""
+    now = datetime.now(timezone.utc)
+    repo_flat = repo.replace("/", "-")
+    prefix = f"{CI_WATCH_SIGNATURES_PREFIX}/{repo_flat}/{now:%Y-%m-%d}/"
+    try:
+        s3 = boto3.client("s3", region_name=REGION)
+        resp = s3.list_objects_v2(Bucket=CI_WATCH_SIGNATURES_BUCKET, Prefix=prefix)
+        for obj in resp.get("Contents", []) or []:
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            marker = json.loads(
+                s3.get_object(Bucket=CI_WATCH_SIGNATURES_BUCKET, Key=key)["Body"].read()
+            )
+            if marker.get("fix_pr"):
+                logger.info(
+                    "ci-watch signature-repeat-skip candidate: %s already has "
+                    "fix_pr=%s for repo=%s", key, marker.get("fix_pr"), repo,
+                )
+                return True
+        return False
+    except Exception as exc:  # noqa: BLE001 — fail OPEN, never block a launch
+        logger.error(
+            "ci-watch signature probe FAILED for repo=%s prefix=%s — failing "
+            "OPEN (launching as normal; coverage beats dedup): %s: %s",
+            repo, prefix, type(exc).__name__, exc,
+        )
+        return False
+
 
 # ── Canary drill identity (config#2223) ──────────────────────────────────────
 # DRILL-vs-REAL ISOLATION INVARIANT: a drill's (repo, sha) lock key is ALWAYS
@@ -361,6 +476,19 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     if not DISPATCH_ENABLED:
         logger.warning("CI_WATCH_DISPATCH_ENABLED=false — ci-watch spot NOT launched")
         return {"launched": False, "reason": "disabled"}
+
+    # Signature-repeat launch dedup (config#2862). Skipped entirely for
+    # drills — DRILL_REPO is a synthetic repo with no real signature
+    # markers (so this would always no-op anyway), and the weekly canary's
+    # whole purpose is to exercise the REAL launch pipe unconditionally.
+    if is_drill != "true" and _known_fixed_signature_exists(repo):
+        logger.warning(
+            "ci-watch signature-repeat-skip for %s — a signature already "
+            "recorded a fix_pr for a failure on this repo today; skipping "
+            "launch (coverage beats dedup — see module docstring guardrail)",
+            repo,
+        )
+        return {"launched": False, "reason": "signature_repeat_skip"}
 
     dedupe_degraded = False
     dedupe_probe_error = ""

@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Nousergon Overseer playbook registry v1",
+  "description": "Contract for infrastructure/overseer/playbooks.yaml (alpha-engine-config-I2823). Additive-only evolution: new fields must be optional; renames/removals require a schema_version bump. The optional `liveness` (per-playbook) and `watch_plane_liveness` (top-level) blocks (alpha-engine-config-I2831) drive the registry-driven overseer-liveness-probe — added additively, schema_version unchanged. The optional `trigger_type` discriminant (alpha-engine-config-I2928 Phase 3) models a second trigger topology for `routed: false` inventory-only entries that have NO Lambda at all (pure GitHub Actions cron, e.g. the gate-due-sweep.yml daily job) — it defaults to `lambda_dispatch` when absent, so every entry written before this field existed remains valid unchanged; `github_actions_cron` entries require `workflow_file`/`repo` instead of the executor_*/kill_switch_env fields.",
+  "type": "object",
+  "required": ["schema_version", "playbooks"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "playbooks": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z0-9-]{1,40}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "description", "tier", "routed", "enabled",
+          "concurrency_domain", "supports_drill"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string", "minLength": 10 },
+          "tier": { "enum": ["T0", "T1", "T2", "T3"] },
+          "routed": { "type": "boolean" },
+          "enabled": { "type": "boolean" },
+          "trigger_type": {
+            "enum": ["lambda_dispatch", "github_actions_cron"],
+            "description": "Discriminant for the entry's trigger topology. Defaults to lambda_dispatch when absent — every entry written before this field existed stays valid unchanged (additive-only evolution). github_actions_cron marks entries with NO Lambda at all (pure GHA cron); those require workflow_file/repo instead of the executor_*/kill_switch_env fields."
+          },
+          "executor_function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
+          "executor_lambda_dir": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+          "benign_reasons": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-z_]+$" },
+            "minItems": 1
+          },
+          "charter": { "type": "string" },
+          "concurrency_domain": { "type": "string" },
+          "supports_drill": { "type": "boolean" },
+          "kill_switch_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "workflow_file": {
+            "type": "string",
+            "pattern": "^\\.github/workflows/[a-z0-9_-]+\\.ya?ml$",
+            "description": "Path (in `repo`) to the GitHub Actions workflow file that IS this entry's trigger — only meaningful when trigger_type is github_actions_cron."
+          },
+          "repo": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+$",
+            "description": "Short name (no org prefix) of the repo the entry's workflow_file/executor lives in, when it differs from the implicit nousergon-data home of this registry."
+          },
+          "schedule_cron": {
+            "type": "string",
+            "minLength": 9,
+            "description": "Literal cron expression from the workflow_file's `on.schedule`, for humans reading the registry — not parsed/enforced by tooling."
+          },
+          "liveness": { "$ref": "#/$defs/liveness_block" }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "routed": { "const": true } } },
+            "then": { "required": ["benign_reasons"] }
+          },
+          {
+            "if": {
+              "not": {
+                "properties": { "trigger_type": { "const": "github_actions_cron" } },
+                "required": ["trigger_type"]
+              }
+            },
+            "then": {
+              "required": ["executor_function", "executor_lambda_dir", "kill_switch_env"]
+            }
+          },
+          {
+            "if": {
+              "properties": { "trigger_type": { "const": "github_actions_cron" } },
+              "required": ["trigger_type"]
+            },
+            "then": {
+              "required": ["workflow_file", "repo"]
+            }
+          }
+        ]
+      }
+    },
+    "watch_plane_liveness": { "$ref": "#/$defs/liveness_block" }
+  },
+  "$defs": {
+    "liveness_block": {
+      "description": "A set of read-only liveness checks the overseer-liveness-probe runs for this playbook (or, at top level, for the cross-cutting intake/dispatcher plane). Each check is a discriminated union on `type`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checks"],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/check" }
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["type", "rule_name"],
+          "properties": {
+            "type": { "const": "eventbridge_rule" },
+            "rule_name": { "type": "string", "minLength": 1 },
+            "event_bus_name": { "type": "string", "minLength": 1 },
+            "expect_enabled": { "type": "boolean" },
+            "expect_target_function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
+            "expect_target_queue": { "type": "string", "minLength": 1 },
+            "expect_state_machines": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "state_machines"],
+          "properties": {
+            "type": { "const": "state_machines_exist" },
+            "state_machines": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "function"],
+          "properties": {
+            "type": { "const": "lambda_active" },
+            "function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
+            "report_kill_switch": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+            "launch_config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ami_env", "security_group_env", "subnets_env"],
+              "properties": {
+                "ami_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+                "security_group_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+                "subnets_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" }
+              }
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "queue_name"],
+          "properties": {
+            "type": { "const": "sqs_queue_exists" },
+            "queue_name": { "type": "string", "minLength": 1 },
+            "expect_dlq": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "type", "label", "artifact_prefix",
+            "ceiling_min", "margin_min", "lookback_hours", "schedule"
+          ],
+          "properties": {
+            "type": { "const": "run_window" },
+            "label": { "type": "string", "minLength": 1 },
+            "artifact_prefix": { "type": "string", "minLength": 1 },
+            "decision_record_prefix": { "type": "string", "minLength": 1 },
+            "ceiling_min": { "type": "integer", "minimum": 1 },
+            "margin_min": { "type": "integer", "minimum": 0 },
+            "lookback_hours": { "type": "integer", "minimum": 1 },
+            "schedule": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["hour", "minute", "dows"],
+                "properties": {
+                  "hour": { "type": "integer", "minimum": 0, "maximum": 23 },
+                  "minute": { "type": "integer", "minimum": 0, "maximum": 59 },
+                  "dows": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "integer", "minimum": 0, "maximum": 6 }
+                  },
+                  "label": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "schedule_name"],
+          "properties": {
+            "type": { "const": "scheduler_schedule_exists" },
+            "schedule_name": { "type": "string", "minLength": 1 },
+            "expect_enabled": { "type": "boolean" }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "pipelines", "response_window_min", "lookback_hours"],
+          "properties": {
+            "type": { "const": "sf_watch_invocation_success" },
+            "pipelines": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["state_machine", "watch_prefix"],
+                "properties": {
+                  "state_machine": { "type": "string", "minLength": 1 },
+                  "watch_prefix": { "type": "string", "minLength": 1 }
+                }
+              }
+            },
+            "response_window_min": { "type": "integer", "minimum": 1 },
+            "lookback_hours": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

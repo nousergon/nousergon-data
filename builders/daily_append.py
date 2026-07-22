@@ -69,6 +69,7 @@ from store.arctic_store import (
     PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
     get_universe_lib,
     get_macro_lib,
+    get_schema_meta_lib,
     to_arctic_canonical,
     to_arctic_safe,
 )
@@ -82,6 +83,20 @@ from validators.price_validator import (
     ANOMALY_INTRABAR_INCONSISTENT,
     DEFAULT_BLOCK_ANOMALY_TYPES,
     validate_today_row,
+)
+# L2 per-series data-contract gates (alpha-engine-config#2456): calendar-
+# aware continuity, vol-scaled outlier, and calendar-monotonic checks that
+# validate_today_row/validate_parquet above do not cover (see
+# series_contract's module docstring for the full delta). Supplements,
+# does not replace, the existing block/warn plumbing above — schema/sanity
+# are also run for parity with a repo that has no price_validator, but
+# ``price_validator``'s OHLC/intrabar/volume checks remain this repo's
+# authoritative source for the checks it already owns.
+from nousergon_lib.series_contract import (
+    GATE_NAMES as _L2_GATE_NAMES,
+    DEFAULT_BLOCK_GATES as _L2_DEFAULT_BLOCK_GATES,
+    quarantine_decision as _l2_quarantine_decision,
+    validate_series as _l2_validate_series,
 )
 
 log = logging.getLogger(__name__)
@@ -277,6 +292,70 @@ UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
 
+# Verify-by-artifact precondition sentinel for the EOD self-heal loop —
+# the `universe`-library counterpart to MACRO_FRESHNESS_SENTINEL_KEY below
+# (config#3237). UNIVERSE_FRESHNESS_RECEIPT_KEY above answers "is every
+# universe symbol within N trading days of fresh" (a loose staleness
+# tolerance, deliberately >0 so a single slow ticker doesn't halt the SF);
+# eod_reconcile.py's held-position closing-price read needs a STRICTER,
+# run_date-EXACT answer — "did TODAY's row land for the universe library",
+# because a ticker that's 1-2 trading days stale (well within the
+# UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS tolerance, so it does not raise
+# UniverseFreshnessViolation) still makes eod_reconcile.py hard-fail with
+# "no row for {run_date}" if it happens to be a held position. This sentinel
+# is the artifact `eod-precondition-probe` needs to catch that gap and route
+# to the self-heal loop instead of a hard `FailExecution` — see the Lambda's
+# docstring for the full rationale (mirrors the config#1787 Option-B
+# producer-side-readback pattern the macro sentinel already established).
+UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY = "feature_store/_universe_close_freshness.json"
+
+
+def _write_universe_close_freshness_sentinel(
+    s3, bucket: str, *, run_date: str, verified_ticker_count: int, total_symbols_checked: int,
+) -> dict:
+    """Write the ArcticDB universe-close freshness sentinel (config#3237).
+
+    Called ONLY from the tail of `_scan_universe_and_emit_freshness_receipt`,
+    after that scan has already read back every in-scope symbol's latest row
+    and confirmed none is stale beyond the tolerance threshold (raises
+    `UniverseFreshnessViolation` otherwise, in which case this is never
+    reached) — same "only write after independent readback confirms it"
+    posture `_write_macro_freshness_sentinel` documents.
+
+    Best-effort/non-fatal, matching both sibling sentinel writers: a write
+    failure here is an observability gap for the probe (which then correctly
+    reports precondition_met=False and the self-heal loop retries), never a
+    reason to fail a daily_append run whose real ArcticDB writes already
+    succeeded and were already verified above.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_date": run_date,
+        "verified_ticker_count": verified_ticker_count,
+        "total_symbols_checked": total_symbols_checked,
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB universe-close freshness sentinel to s3://%s/%s "
+            "(run_date=%s, verified_ticker_count=%d/%d)",
+            bucket, UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY, run_date,
+            verified_ticker_count, total_symbols_checked,
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB universe-close freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE — the EOD precondition probe will correctly "
+            "report precondition_met=False and the self-heal loop will retry): %s", exc,
+        )
+    return sentinel
+
 # ArcticDB freshness-monitor sentinel (config#1787, Brian's 2026-07-08
 # Option-B ruling). A small, UNCONDITIONAL S3 marker written on every
 # successful daily_append ArcticDB write — deliberately separate from
@@ -425,6 +504,42 @@ def _load_block_anomaly_types() -> frozenset[str]:
         raise RuntimeError(
             f"DAILY_APPEND_BLOCK_ANOMALY_TYPES contains unknown anomaly types: "
             f"{sorted(unknown)}. Known types: {sorted(ALL_ANOMALY_TYPES)}"
+        )
+    return frozenset(parsed)
+
+
+def _load_l2_block_gates() -> frozenset[str]:
+    """Read ``DAILY_APPEND_L2_BLOCK_GATES`` env var or fall back to
+    ``nousergon_lib.series_contract.DEFAULT_BLOCK_GATES``.
+
+    Mirrors :func:`_load_block_anomaly_types`'s override contract for the
+    new L2 series-contract gates (schema / sanity / staleness / continuity
+    / outlier / calendar_monotonic). Default block set is schema / sanity /
+    calendar_monotonic (unambiguous corruption); staleness / continuity /
+    outlier default to alarm-and-allow since they can legitimately arise
+    from an operational gap or a real market event, not just corruption.
+    Format: JSON list of gate name strings. Unknown names raise.
+    """
+    raw = os.environ.get("DAILY_APPEND_L2_BLOCK_GATES", "").strip()
+    if not raw:
+        return _L2_DEFAULT_BLOCK_GATES
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"DAILY_APPEND_L2_BLOCK_GATES is not valid JSON: {exc}. "
+            f"Expected a JSON list of gate name strings."
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+        raise RuntimeError(
+            f"DAILY_APPEND_L2_BLOCK_GATES must be a JSON list of strings, "
+            f"got {parsed!r}"
+        )
+    unknown = set(parsed) - set(_L2_GATE_NAMES)
+    if unknown:
+        raise RuntimeError(
+            f"DAILY_APPEND_L2_BLOCK_GATES contains unknown gate names: "
+            f"{sorted(unknown)}. Known gates: {sorted(_L2_GATE_NAMES)}"
         )
     return frozenset(parsed)
 
@@ -587,6 +702,7 @@ def _scan_universe_and_emit_freshness_receipt(
     universe_lib,
     max_stale_trading_days: int = UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS,
     expected_tickers: list[str] | None = None,
+    run_date: str | None = None,
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
     last-row date must be within ``max_stale_trading_days`` NYSE sessions
@@ -599,6 +715,12 @@ def _scan_universe_and_emit_freshness_receipt(
     themselves on every Lambda invocation. The 2026-05-01 weekday SF
     timeout cascade traced back to PR #68 adding this same scan to the
     predictor inference preflight, multiplying the cost.
+
+    Also writes ``s3://{bucket}/feature_store/_universe_close_freshness.json``
+    (config#3237) when ``run_date`` is given: unlike the loose ``N``-trading-
+    day receipt above, this sentinel is a strict run_date-exact readback
+    count, reusing this scan's already-fetched per-symbol tail rows (no
+    extra ArcticDB reads) — see ``_write_universe_close_freshness_sentinel``.
 
     On any stale: hard-raises ``RuntimeError`` so the SF MorningEnrich
     step fails. The 2026-04-21 ASGN/MOH incident class — partial-write
@@ -746,6 +868,20 @@ def _scan_universe_and_emit_freshness_receipt(
         "Universe-freshness receipt written: n=%d all_fresh stalest=%s(%d trading-d) scan=%.1fs",
         len(syms), stalest[0], stalest[2], scan_seconds,
     )
+
+    if run_date is not None:
+        # Strict run_date-EXACT count, distinct from the >= threshold above:
+        # a symbol 1-2 trading days stale passes the loose check (does not
+        # raise) but must NOT count as "verified for run_date" here — that's
+        # exactly the gap config#3237 found (eod_reconcile.py needs THIS
+        # day's row, not "recently fresh enough").
+        verified_ticker_count = sum(1 for _, last_date_iso, _ in ages if last_date_iso == run_date)
+        _write_universe_close_freshness_sentinel(
+            s3, bucket, run_date=run_date,
+            verified_ticker_count=verified_ticker_count,
+            total_symbols_checked=len(syms),
+        )
+
     return receipt
 
 
@@ -1273,6 +1409,20 @@ def _daily_append_impl(
     if not dry_run:
         universe_lib = get_universe_lib(bucket)
         macro_lib = get_macro_lib(bucket)
+        # Schema-version pre-append assert (alpha-engine-config-I3241). Fail
+        # LOUD before touching any symbol if the persisted universe descriptor
+        # is not at the version this producer code emits — i.e. a
+        # schema-additive change was deployed without its data migration. This
+        # converts the config-I3236 failure (904/904 StreamDescriptorMismatch
+        # surfacing two layers downstream as an EOD reconcile RuntimeError) into
+        # a single actionable pre-flight error naming the pending migration.
+        # SchemaVersionMismatch is a RuntimeError subclass — it propagates
+        # (fail-loud), aborting the run before any partial write. The meta lib
+        # is opened via get_schema_meta_lib (the mockable open-seam, mirroring
+        # get_universe_lib/get_macro_lib).
+        from migrations import assert_universe_schema_current
+
+        assert_universe_schema_current(get_schema_meta_lib(bucket))
     else:
         universe_lib = None
         macro_lib = None
@@ -1713,9 +1863,20 @@ def _daily_append_impl(
     quality_counts_by_type: dict[str, int] = {}
     quality_blocked_details: list[tuple[str, str]] = []  # (ticker, anomaly_type)
 
+    # L2 series-contract counters (alpha-engine-config#2456) — separate from
+    # the validate_today_row counters above since the two gates run
+    # independently and can each block/warn on the same row for different
+    # reasons; keeping them distinct preserves per-surface attribution in
+    # the aggregated end-of-run record.
+    n_l2_quarantined = 0  # rows refused by the L2 series-contract gate
+    n_l2_alarmed = 0      # rows written but flagged (alarm, no quarantine)
+    l2_counts_by_gate: dict[str, int] = {}
+    l2_quarantined_details: list[tuple[str, str]] = []  # (ticker, gate_name)
+
     # Read DAILY_APPEND_BLOCK_ANOMALY_TYPES once per run (raises on malformed
     # JSON / unknown types — fail fast before the chunked pass begins).
     block_anomaly_types = _load_block_anomaly_types()
+    l2_block_gates = _load_l2_block_gates()
 
     # ── Corporate-action basis-consistency guard setup (PR4, config#1433) ────
     # Build the registry + the registered splits grouped by ticker ONCE.
@@ -2104,6 +2265,58 @@ def _daily_append_impl(
                         )
                     n_quality_warned += 1
 
+                # ── L2 series-contract gate (alpha-engine-config#2456) ────
+                # Supplements validate_today_row above with the three checks
+                # it doesn't cover: calendar-aware continuity (vs.
+                # validate_parquet's naive calendar-DAY gap heuristic),
+                # vol-scaled outlier (vs. validate_today_row's fixed
+                # MAX_DAILY_RETURN=0.50), and calendar-monotonic (no
+                # existing equivalent). schema/sanity also run here for
+                # parity with the shared-lib module's full six-gate
+                # contract, even though price_validator's OHLC/negative-
+                # close checks above already cover this repo's write path
+                # for those two. Runs against hist+today_row combined so
+                # continuity/outlier/monotonic see real trailing history,
+                # not just the single new row.
+                #
+                # today_row's date REPLACES any existing hist row at the
+                # same date rather than being concatenated alongside it —
+                # the MorningEnrich overwrite contract (skip_if_exists=
+                # False, the default) intentionally re-writes today's row
+                # when it's already in hist (polygon settling yfinance's
+                # NaN-VWAP placeholder); that legitimate overwrite must not
+                # look like a duplicate-date corruption to
+                # calendar_monotonic. drop(..., errors="ignore") is a
+                # no-op on the common append-at-head case (today_ts not
+                # yet in hist.index).
+                if not hist.empty:
+                    l2_series = pd.concat(
+                        [hist.drop(index=today_row.index, errors="ignore"), today_row]
+                    ).sort_index()
+                else:
+                    l2_series = today_row
+                l2_report = _l2_validate_series(
+                    l2_series, ticker, as_of=today_ts.date(),
+                )
+                l2_decision = _l2_quarantine_decision(
+                    l2_report, block_gates=l2_block_gates,
+                )
+                if l2_decision.alarm:
+                    for r in l2_report.failing:
+                        log.warning(
+                            "L2 series-contract %s %s.%s: %s",
+                            "QUARANTINE" if r.gate in l2_decision.blocking_gates
+                            else "WARN",
+                            ticker, r.gate, r.reason,
+                        )
+                        l2_counts_by_gate[r.gate] = l2_counts_by_gate.get(r.gate, 0) + 1
+                    if l2_decision.quarantine:
+                        for gate_name in l2_decision.blocking_gates:
+                            l2_quarantined_details.append((ticker, gate_name))
+                        n_l2_quarantined += 1
+                        continue  # do not queue this row for write
+                    n_l2_alarmed += 1
+
                 # Defer the actual ArcticDB write — collected here so Phase 2
                 # can run them in parallel via a thread pool. The previous
                 # sequential per-ticker `_write_row_backfill_safe` call took
@@ -2276,6 +2489,36 @@ def _daily_append_impl(
                 n_quality_blocked, sorted(blocked_types), detail_list,
             )
 
+    # ── Aggregated L2 series-contract alert (one per run, not one per
+    # ticker) — mirrors the validate_today_row aggregation immediately
+    # above, same rationale (2026-06-11 EOD alert-storm note there): a
+    # systemic event (e.g. a shared-upstream gap that hits every S&P
+    # constituent) must fan out as ONE alert, not one per ticker.
+    # Quarantine (block-gate failures) is the load-bearing signal → ERROR.
+    # Non-quarantining alarms (warn-gate failures — staleness/continuity/
+    # outlier by default) still page per the issue's "quarantine + alarm,
+    # do not sit silent" requirement, but at WARNING severity — these can
+    # legitimately arise from an operational gap or a real market event,
+    # not just corruption, so they don't carry the same urgency as a
+    # quarantined row.
+    if n_l2_quarantined:
+        quarantined_gates = {g for _, g in l2_quarantined_details}
+        l2_detail_list = ", ".join(
+            f"{tkr}.{g}" for tkr, g in l2_quarantined_details[:20]
+        )
+        if len(l2_quarantined_details) > 20:
+            l2_detail_list += f", … +{len(l2_quarantined_details) - 20} more"
+        log.error(
+            "L2 series-contract quarantined %d row(s) this run (gates=%s): %s",
+            n_l2_quarantined, sorted(quarantined_gates), l2_detail_list,
+        )
+    elif n_l2_alarmed:
+        log.warning(
+            "L2 series-contract flagged %d row(s) this run (non-quarantining; "
+            "gate_counts=%s)",
+            n_l2_alarmed, dict(l2_counts_by_gate),
+        )
+
     t_total = time.time() - t0
 
     result = {
@@ -2299,6 +2542,10 @@ def _daily_append_impl(
         "tickers_quality_warned": n_quality_warned,
         "quality_anomaly_counts": dict(quality_counts_by_type),
         "quality_block_anomaly_types": sorted(block_anomaly_types),
+        "tickers_l2_quarantined": n_l2_quarantined,
+        "tickers_l2_alarmed": n_l2_alarmed,
+        "l2_gate_counts": dict(l2_counts_by_gate),
+        "l2_block_gates": sorted(l2_block_gates),
         "schema_drift_incidents": n_schema_drift[0],
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
@@ -2308,11 +2555,13 @@ def _daily_append_impl(
     log.info(
         "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d "
         "n_parquet_warmup=%d n_missing_from_closes=%d (of %d) "
-        "quality_blocked=%d quality_warned=%d anomaly_counts=%s | "
+        "quality_blocked=%d quality_warned=%d anomaly_counts=%s "
+        "l2_quarantined=%d l2_alarmed=%d l2_gate_counts=%s | "
         "macro_updated=%d sector_updated=%d | %.1fs total",
         n_ok, n_partial, n_skip, n_err, n_parquet_warmup,
         n_missing_from_closes, len(stock_tickers),
         n_quality_blocked, n_quality_warned, dict(quality_counts_by_type),
+        n_l2_quarantined, n_l2_alarmed, dict(l2_counts_by_gate),
         len(macro_updated) if not dry_run else 0,
         len(sector_updated) if not dry_run else 0,
         t_total,
@@ -2400,9 +2649,13 @@ def _daily_append_impl(
         # earlier silent skips. Emits health/universe_freshness.json so
         # consumers don't repeat this 200s scan on every Lambda
         # invocation (the cause of the 2026-05-01 SF timeout cascade).
+        # run_date=date_str also drives the strict run_date-exact
+        # feature_store/_universe_close_freshness.json sentinel
+        # (config#3237) eod-precondition-probe reads.
         receipt = _scan_universe_and_emit_freshness_receipt(
             s3, bucket, universe_lib,
             expected_tickers=expected_tickers,
+            run_date=date_str,
         )
         result["universe_freshness_receipt"] = {
             "n_symbols_checked": receipt["n_symbols_checked"],

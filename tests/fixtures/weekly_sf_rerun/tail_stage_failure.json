@@ -306,6 +306,15 @@
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipScanner",
+        "input": "{}"
+      },
+      "id": 341,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
       "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
         "name": "Scanner",
@@ -351,6 +360,15 @@
       "id": 39
     },
     {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipSignalsEnvelope",
+        "input": "{}"
+      },
+      "timestamp": "2026-07-11T09:00:00Z",
+      "id": 391
+    },
+    {
       "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
         "name": "SignalsEnvelope",
@@ -367,6 +385,15 @@
       },
       "timestamp": "2026-07-11T09:00:00Z",
       "id": 41
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipChallengerShadow",
+        "input": "{}"
+      },
+      "timestamp": "2026-07-11T09:00:00Z",
+      "id": 411
     },
     {
       "type": "TaskStateEntered",
@@ -421,6 +448,15 @@
       },
       "timestamp": "2026-07-11T09:00:00Z",
       "id": 47
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipThinkTankCoverage",
+        "input": "{}"
+      },
+      "timestamp": "2026-07-11T09:00:00Z",
+      "id": 471
     },
     {
       "type": "TaskStateEntered",
@@ -495,82 +531,82 @@
       "id": 55
     },
     {
-      "type": "TaskStateEntered",
+      "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "StartAdvisoryPipeline",
+        "name": "CheckSkipEvalJudge",
         "input": "{}"
       },
       "id": 56,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "StartAdvisoryPipeline",
-        "output": "{}"
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ComputeEvalCadence",
+        "input": "{}"
       },
       "id": 57,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "PassStateEntered",
+      "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "BranchAComplete",
+        "name": "CheckMonthlyCadence",
         "input": "{}"
       },
       "id": 58,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
+      "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckSkipPredictorTraining",
+        "name": "EvalJudgeSubmitWeekly",
         "input": "{}"
       },
       "id": 59,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "PredictorTraining",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "EvalJudgeSubmitWeekly",
+        "output": "{}"
       },
       "id": 60,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "PredictorTraining",
-        "output": "{}"
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "EvalJudgeProcess",
+        "input": "{}"
       },
       "id": 61,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "CheckPredictorStatus",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "EvalJudgeProcess",
+        "output": "{}"
       },
       "id": 62,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "PassStateEntered",
+      "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "BranchBComplete",
+        "name": "EvalRollingMean",
         "input": "{}"
       },
       "id": 63,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "PassStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "AggregateBranchOutcomes",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "EvalRollingMean",
+        "output": "{}"
       },
       "id": 64,
       "timestamp": "2026-07-11T09:00:00Z"
@@ -578,80 +614,80 @@
     {
       "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckBranchOutcomes",
+        "name": "CheckSkipRationaleClustering",
         "input": "{}"
       },
       "id": 65,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
+      "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckSkipBacktester",
+        "name": "RationaleClustering",
         "input": "{}"
       },
       "id": 66,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "Backtester",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "RationaleClustering",
+        "output": "{}"
       },
       "id": 67,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "Backtester",
-        "output": "{}"
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipReplayConcordance",
+        "input": "{}"
       },
       "id": 68,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
+      "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckBacktesterStatus",
+        "name": "ReplayConcordance",
         "input": "{}"
       },
       "id": 69,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "CheckSkipPredictorBacktest",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "ReplayConcordance",
+        "output": "{}"
       },
       "id": 70,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateEntered",
+      "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "PredictorBacktest",
+        "name": "CheckSkipCounterfactual",
         "input": "{}"
       },
       "id": 71,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "PredictorBacktest",
-        "output": "{}"
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "Counterfactual",
+        "input": "{}"
       },
       "id": 72,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "CheckPredictorBacktestStatus",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "Counterfactual",
+        "output": "{}"
       },
       "id": 73,
       "timestamp": "2026-07-11T09:00:00Z"
@@ -659,7 +695,7 @@
     {
       "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckSkipPortfolioOptimizerBacktest",
+        "name": "CheckSkipAggregateCosts",
         "input": "{}"
       },
       "id": 74,
@@ -668,7 +704,7 @@
     {
       "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "PortfolioOptimizerBacktest",
+        "name": "AggregateCosts",
         "input": "{}"
       },
       "id": 75,
@@ -677,16 +713,16 @@
     {
       "type": "TaskStateExited",
       "stateExitedEventDetails": {
-        "name": "PortfolioOptimizerBacktest",
+        "name": "AggregateCosts",
         "output": "{}"
       },
       "id": 76,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
+      "type": "PassStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckPortfolioOptimizerBacktestStatus",
+        "name": "BranchAComplete",
         "input": "{}"
       },
       "id": 77,
@@ -695,7 +731,7 @@
     {
       "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckSkipParity",
+        "name": "CheckSkipPredictorTraining",
         "input": "{}"
       },
       "id": 78,
@@ -704,7 +740,7 @@
     {
       "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "Parity",
+        "name": "PredictorTraining",
         "input": "{}"
       },
       "id": 79,
@@ -713,61 +749,61 @@
     {
       "type": "TaskStateExited",
       "stateExitedEventDetails": {
-        "name": "Parity",
+        "name": "PredictorTraining",
         "output": "{}"
       },
       "id": 80,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateEntered",
+      "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "WaitForParity",
+        "name": "CheckPredictorStatus",
         "input": "{}"
       },
       "id": 81,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "WaitForParity",
-        "output": "{}"
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ResolveZooSpecs",
+        "input": "{}"
       },
       "id": 82,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "CheckParityStatus",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "ResolveZooSpecs",
+        "output": "{}"
       },
       "id": 83,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "PassStateEntered",
+      "type": "TaskStateEntered",
       "stateEnteredEventDetails": {
-        "name": "ExtractParityError",
+        "name": "ModelZooSelect",
         "input": "{}"
       },
       "id": 84,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "PassStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "NormalizeFailureContext",
-        "input": "{}"
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "ModelZooSelect",
+        "output": "{}"
       },
       "id": 85,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
+      "type": "PassStateEntered",
       "stateEnteredEventDetails": {
-        "name": "NormalizeFailureContextRepin",
+        "name": "BranchBComplete",
         "input": "{}"
       },
       "id": 86,
@@ -776,10 +812,217 @@
     {
       "type": "PassStateEntered",
       "stateEnteredEventDetails": {
-        "name": "NormalizeFailureContextRealLabel",
+        "name": "AggregateBranchOutcomes",
         "input": "{}"
       },
       "id": 87,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckBranchOutcomes",
+        "input": "{}"
+      },
+      "id": 88,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipBacktester",
+        "input": "{}"
+      },
+      "id": 89,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "Backtester",
+        "input": "{}"
+      },
+      "id": 90,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "Backtester",
+        "output": "{}"
+      },
+      "id": 91,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckBacktesterStatus",
+        "input": "{}"
+      },
+      "id": 92,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipPredictorBacktest",
+        "input": "{}"
+      },
+      "id": 93,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PredictorBacktest",
+        "input": "{}"
+      },
+      "id": 94,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "PredictorBacktest",
+        "output": "{}"
+      },
+      "id": 95,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckPredictorBacktestStatus",
+        "input": "{}"
+      },
+      "id": 96,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipPortfolioOptimizerBacktest",
+        "input": "{}"
+      },
+      "id": 97,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PortfolioOptimizerBacktest",
+        "input": "{}"
+      },
+      "id": 98,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "PortfolioOptimizerBacktest",
+        "output": "{}"
+      },
+      "id": 99,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckPortfolioOptimizerBacktestStatus",
+        "input": "{}"
+      },
+      "id": 100,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipParity",
+        "input": "{}"
+      },
+      "id": 101,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "Parity",
+        "input": "{}"
+      },
+      "id": 102,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "Parity",
+        "output": "{}"
+      },
+      "id": 103,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForParity",
+        "input": "{}"
+      },
+      "id": 104,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateExited",
+      "stateExitedEventDetails": {
+        "name": "WaitForParity",
+        "output": "{}"
+      },
+      "id": 105,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckParityStatus",
+        "input": "{}"
+      },
+      "id": 106,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ExtractParityError",
+        "input": "{}"
+      },
+      "id": 107,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "NormalizeFailureContext",
+        "input": "{}"
+      },
+      "id": 108,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "NormalizeFailureContextRepin",
+        "input": "{}"
+      },
+      "id": 109,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "NormalizeFailureContextRealLabel",
+        "input": "{}"
+      },
+      "id": 110,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -788,7 +1031,7 @@
         "name": "HandleFailure",
         "input": "{}"
       },
-      "id": 88,
+      "id": 111,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -797,7 +1040,7 @@
         "name": "HandleFailure",
         "output": "{}"
       },
-      "id": 89,
+      "id": 112,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -806,7 +1049,7 @@
         "name": "FailExecution",
         "input": "{}"
       },
-      "id": 90,
+      "id": 113,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -815,7 +1058,7 @@
         "error": "PipelineFailure",
         "cause": "..."
       },
-      "id": 91,
+      "id": 114,
       "timestamp": "2026-07-11T09:00:00Z"
     }
   ]

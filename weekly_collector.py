@@ -68,7 +68,7 @@ _load_dotenv()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
-from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint, get_flow_doctor
 from nousergon_lib.phase_registry import PhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
 # lift of the five inline _find_config / load_config / config_loader copies into
@@ -413,6 +413,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     staleness_threshold_days=price_cfg.get("staleness_threshold_days", 3),
                     batch_size=price_cfg.get("refresh_batch_size", 50),
                     dry_run=dry_run,
+                    reference_date=run_date,
                 ),
                 supports_auto_skip=False,
             )
@@ -2598,11 +2599,15 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
 
 
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
-    """Daily mode: capture today's OHLCV closes for all tracked tickers."""
+    """Daily mode: capture today's OHLCV closes for all tracked tickers, plus
+    (config#2756) refresh reference/price_cache/*.parquet for any ticker that
+    missed a trading session — keeps the cache daily-fresh instead of the
+    prior Saturday-only cadence."""
     bucket = config["bucket"]
     run_date = args.date or default_run_date()
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
+    price_cfg = config.get("price_cache", {})
     reg = _build_registry(config, args, run_date)
 
     results: dict = {
@@ -2658,6 +2663,44 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         verify_artifact_exists=True,
         bucket=bucket,
     )
+
+    # ── Price cache refresh (config#2756 — daily cadence) ───────────────────
+    # reference/price_cache/*.parquet previously only refreshed on the
+    # Saturday DataPhase1 run, so metron_market_data.collect_history's
+    # 1-trading-day price_cache staleness gate (data#693) only cleared on
+    # Monday; Tue-Fri the whole universe fell back to an independent
+    # yfinance fetch. Running the same collector here (Mon-Fri EOD) keeps
+    # the cache within `daily_staleness_threshold_days` trading sessions on
+    # every weekday. _find_stale_fast is trading-day-exact (config#2756), so
+    # in steady state only tickers that actually missed a session (new
+    # listings, corporate actions, a prior-day miss) pay the full 10y
+    # yfinance rewrite — most weekdays this list is empty.
+    if bool(price_cfg.get("daily_enabled", True)):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: price cache (daily)")
+        logger.info("=" * 60)
+        results["collectors"]["prices"] = _phase_collect(
+            reg, "prices",
+            lambda: prices.collect(
+                bucket=bucket,
+                tickers=tickers,
+                s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
+                fetch_period=price_cfg.get("fetch_period", "10y"),
+                staleness_threshold_days=price_cfg.get("daily_staleness_threshold_days", 1),
+                batch_size=price_cfg.get("refresh_batch_size", 50),
+                dry_run=dry_run,
+                reference_date=run_date,
+            ),
+            supports_auto_skip=False,
+        )
+        # Same unconditional sentinel the Saturday run writes (config#2350) —
+        # now also written on a successful weekday refresh so the freshness
+        # monitor sees the true (now-daily) cadence.
+        if not dry_run and results["collectors"]["prices"].get("status") == "ok":
+            _write_price_cache_freshness_sentinel(
+                boto3.client("s3"), bucket,
+                writer="nousergon-data:weekly_collector.py:daily",
+            )
 
     # Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
     # `alpha-engine-data` is the single market-data ground truth for the NE system;
@@ -3331,6 +3374,23 @@ def main() -> None:
         raise SystemExit(0)
 
     results = run_weekly(config, args)
+
+    # config#646 (Option A): write the flow's end-of-run status() snapshot to
+    # s3://alpha-engine-research/_flow_doctor/heartbeat/data-collector/{date}.json
+    # so the dashboard System Health consumer can read it. emit_heartbeat soft-
+    # fails (returns None, never raises); fires here — after run_weekly() and
+    # before the exit-code decision — so the heartbeat lands on every completed
+    # run (ok, partial, or failing). config["bucket"] is the research bucket
+    # (RESEARCH_BUCKET default "alpha-engine-research"; see preflight.py:197),
+    # which is where the dashboard reads heartbeats from.
+    # hasattr guard: emit_heartbeat only exists in flow-doctor >=0.6.2. The 5
+    # producing repos deploy independently, so a version-skewed box could hold
+    # an older lib (the #646 arc historically pinned 0.6.0rc3, which lacks it)
+    # — guarding on the method's presence keeps this forward/backward-compatible
+    # during the phased rollout so it can never AttributeError a production run.
+    fd = get_flow_doctor()
+    if fd and hasattr(fd, "emit_heartbeat"):
+        fd.emit_heartbeat(bucket=config["bucket"])
 
     # Hard-fail on any non-ok status — strict form of the no-silent-fails
     # rule applied while the system is unstable. `partial` previously exited

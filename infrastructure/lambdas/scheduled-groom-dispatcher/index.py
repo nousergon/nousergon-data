@@ -65,6 +65,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from flow_doctor_telegram import notify_via_flow_doctor
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from nousergon_lib import groom_eligibility as ge
@@ -82,24 +83,62 @@ _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
 
+# config#3173 — mechanical per-day dispatch ceiling, generalizing the
+# config#2269 sf-watch pattern to groom. Groom already has TWO of the three
+# arc-continuity legs the config#3137 charter asks for: a box that dies
+# mid-run auto-relaunches up to config#1645's bounded retry (escalating loud
+# on exhaustion), and a trigger that never fires at all is caught by the
+# overseer-liveness-probe's run_window check reading this same
+# groom/decisions/{date}/ ledger (config#2667). The missing leg is THIS one:
+# an outermost runaway backstop bounding TOTAL launches/day across every
+# trigger + relaunch + sweep, so a broken EventBridge rule or a relaunch loop
+# gone wrong can't spot-cycle indefinitely. Default 40 is a conservative
+# multiple of the observed legitimate ceiling (3 daily cron slots x up to 3
+# co-launched tiers x up to 3 attempts each [1 + config#1645's 2 relaunches],
+# plus 3 sweep boxes x 3 attempts = ~36/day worst case under a genuinely bad
+# AWS day) — NOT a Brian-ruled number like sf-watch's config#2269 values;
+# tune via this env var in a follow-up PR if real volume needs it. Fails
+# LOUD (raises) on a ledger-count read error, mirroring this function's
+# existing fail-loud posture — silently failing open here would risk masking
+# a genuine runaway on the exact day S3 also hiccups.
+GROOM_MAX_DISPATCHES_DAILY = int(os.environ.get("GROOM_MAX_DISPATCHES_DAILY", "40"))
+
 # config#1933 demand-driven dispatch: enumerate actionable issues per tier
 # BEFORE any spot spend and launch only when the slot's queue (own tier +
 # starving lower tiers) clears the floor or an escape valve fires. Kill-switch
 # independent of GROOM_DISPATCH_ENABLED — flipping this off restores the
 # legacy unconditional slot launches without touching schedules.
+#
+# config-I3227 (2026-07-21): the enumeration ALSO counts org-wide OPEN PRs
+# labeled ge.RULING_PENDING_LABEL ("ruling:pending-exec" — config-I3199,
+# folded into groom_driver.py's on-box tier queues by config#3210) into these
+# same per-tier totals — see _enumerate_ruling_pending_prs. Before this, a
+# backlog of ruled PRs alone could never clear a tier's floor or trip the
+# anti-starvation escape valve (they contributed ZERO demand), so they only
+# ever got worked when unrelated issue demand happened to launch a run.
 DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower() == "true"
 BACKLOG_REPOS = (
     "nousergon/alpha-engine-config", "nousergon/metron-ops",
     "nousergon/vires-ops", "nousergon/telos-ops",
 )
+# config-I3227: the org this Lambda's PR enumeration searches org-wide. Never
+# a hardcoded repo list (config#2294 precedent — see alpha-engine-config's
+# scripts/groom_driver.py::open_prs()/gh_repo_enum.search_prs_org_wide, which
+# _enumerate_ruling_pending_prs below mirrors but does not import — that
+# repo's scripts/ package is not a dependency of this Lambda).
+_GH_ORG = "nousergon"
 _RESEARCH_BUCKET = "alpha-engine-research"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
-# t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
-# on capacity error. Cheap-first type order biases pool selection toward price.
+# t4g .medium/.large (arm64/Graviton) across all 6 default-VPC subnets; the lib
+# CLI rotates on capacity error. Cheap-first type order biases toward price.
+# Graviton is ~20% cheaper than the prior t3.medium at equal perf and the Compute
+# Savings Plan (instance-family-agnostic) already covers it — cost-I2864. CRITICAL:
+# every type here MUST be arm64 to match the arm64 AMI below — an arm64 AMI will
+# not boot on an x86 instance type (and vice-versa).
 INSTANCE_TYPES = [
     t.strip()
-    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t3.medium,t3a.medium,t2.medium").split(",")
+    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t4g.medium,t4g.large").split(",")
     if t.strip()
 ]
 SUBNETS = [
@@ -111,7 +150,7 @@ SUBNETS = [
     ).split(",")
     if s.strip()
 ]
-AMI_ID = os.environ.get("GROOM_AMI_ID", "ami-0c421724a94bba6d6")  # Amazon Linux 2023 x86_64
+AMI_ID = os.environ.get("GROOM_AMI_ID", "ami-02e447f4c654c7179")  # Amazon Linux 2023 arm64/Graviton (cost-I2864)
 KEY_NAME = os.environ.get("GROOM_KEY_NAME", "alpha-engine-key")
 SECURITY_GROUP = os.environ.get("GROOM_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
 IAM_PROFILE = os.environ.get("GROOM_IAM_PROFILE", "alpha-engine-executor-profile")
@@ -400,6 +439,79 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
 
 
+# config#3173 — dedicated ceiling ledger, deliberately SEPARATE from the
+# groom/decisions/{date}/ decision-record ecosystem (which has two
+# heterogeneous schemas — schema_version 1's flattened single-slot record and
+# schema_version 2's nested `decisions` list — that would need careful
+# reconciling to count launches from). One key = one launch ATTEMPT, written
+# by the dispatcher itself (never the agent), mirroring config#2269's
+# invariant that a crashed/misbehaving agent can neither reset nor starve the
+# count.
+_DISPATCH_LEDGER_PREFIX = "groom/_control/dispatch-ledger"
+
+
+def _prior_launch_count_today() -> int:
+    """Count today's already-recorded launch ATTEMPTS (config#3173) — the
+    outermost runaway backstop checked by ``_launch_groom_spot`` before any
+    new spot/on-demand spend. Fails LOUD (raises) on a read error rather than
+    failing open, matching this function's fail-loud posture."""
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    prefix = f"{_DISPATCH_LEDGER_PREFIX}/{today}/"
+    s3 = boto3.client("s3", region_name=REGION)
+    count = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix):
+        count += len(page.get("Contents", []))
+    return count
+
+
+def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str) -> None:
+    """Record a launch ATTEMPT for the daily ceiling count (config#3173).
+    Written just BEFORE the launch fires (mirroring sf-watch's watch-log
+    timing) so even a launch that subsequently fails/raises still consumes
+    budget — an attempt-then-immediately-fail loop must still trip the
+    ceiling eventually, never spin invisibly. Best-effort: a ledger-write
+    failure must never block the launch it's recording."""
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    key = f"{_DISPATCH_LEDGER_PREFIX}/{today}/{run_token}.json"
+    body = json.dumps({
+        "run_token": run_token, "tier_tag": tier_tag, "schedule": schedule_label,
+        "recorded_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — observability, never blocks dispatch
+        logger.warning("dispatch ledger write failed (non-fatal): %s", exc)
+
+
+def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
+                                       schedule_label: str) -> None:
+    """LOUD (non-silent) escalation — budget exhaustion means the day's
+    runaway backstop has fired; a human needs to look, never a silent skip."""
+    text = (
+        "🔴 Backlog groom dispatch ceiling EXHAUSTED (config#3173) — "
+        f"{prior} launches already recorded today >= ceiling {ceiling} "
+        f"(GROOM_MAX_DISPATCHES_DAILY). Suppressing this launch. lane={tier_tag} "
+        f"schedule={schedule_label}. If legitimate (a genuinely bad AWS day with "
+        "many relaunches), raise the ceiling via a PR; if NOT legitimate, "
+        "something is dispatching groom in a loop — investigate."
+    )
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="error",
+            dedup_key=f"{_FLOW_NAME}:dispatch_ceiling_exhausted:{today}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "tier_tag": tier_tag,
+                     "prior_dispatch_count": prior, "dispatch_ceiling": ceiling},
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
+
+
 def _terminate_instance(instance_id: str) -> None:
     """Best-effort terminate of a just-launched box whose post-launch steps
     failed. Without this the box orphans: it received no bootstrap, so neither
@@ -435,11 +547,33 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                 "issue_filter": issue_filter, "tier_tag": tier_tag,
                 "existing_instance_ids": existing}
 
+    # config#3173: outermost runaway backstop — checked LAST, after every
+    # other suppression, so it fires even when a caller bypasses the demand
+    # gate (queue_manifest_key / launch_decided relaunches). Counts every
+    # attempt recorded so far today via the dedicated ledger (never the
+    # agent's own output — see _prior_launch_count_today).
+    prior_dispatches = _prior_launch_count_today()
+    if prior_dispatches >= GROOM_MAX_DISPATCHES_DAILY:
+        logger.error(
+            "groom dispatch ceiling EXHAUSTED: %d prior launches today >= "
+            "ceiling %d — suppressing lane %s", prior_dispatches,
+            GROOM_MAX_DISPATCHES_DAILY, tier_tag)
+        _notify_dispatch_ceiling_exhausted(
+            prior_dispatches, GROOM_MAX_DISPATCHES_DAILY, tier_tag, schedule_label)
+        return {"launched": False, "reason": "dispatch_ceiling_exhausted",
+                "issue_filter": issue_filter, "tier_tag": tier_tag,
+                "prior_dispatch_count": prior_dispatches,
+                "dispatch_ceiling": GROOM_MAX_DISPATCHES_DAILY}
+
     # config#1645: a fresh token per launch ATTEMPT (not per schedule) — the
     # dispatch Step Function's relaunch loop calls this Lambda again with a new
     # execution, so each attempt gets its own S3 completion-marker key. A dead
     # box's stale marker (if any) can never be mistaken for THIS attempt's.
     run_token = uuid.uuid4().hex
+    # config#3173: record the attempt BEFORE the launch fires (mirrors the
+    # sf-watch watch-log timing) so a launch that itself fails/raises still
+    # consumes ceiling budget — see _write_dispatch_ledger_entry.
+    _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
     instance_id, market = _launch_instance(force_on_demand=force_on_demand)
     logger.info("launched groom box %s (%s)", instance_id, market)
     # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
@@ -526,6 +660,115 @@ def _github_token() -> str:
     return resp["Parameter"]["Value"].strip()
 
 
+def _gh_rest(path: str, token: str):
+    """Minimal authenticated GET against the GitHub REST API — mirrors this
+    module's existing per-repo issue-list transport verbatim (urllib +
+    ``token`` auth, NOT ``Bearer``: matches every other call in this file)."""
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "scheduled-groom-dispatcher"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _list_org_repos(token: str) -> list[str]:
+    """Live ``owner/name`` org-wide enumeration (``GET /orgs/{org}/repos``,
+    paginated) — the fallback path's repo list when the org-wide PR search
+    itself fails. Never a hand-maintained constant (config#2294 precedent:
+    a hardcoded list silently misses a repo created after the list was last
+    updated)."""
+    repos: list[str] = []
+    page = 1
+    while True:
+        batch = _gh_rest(f"/orgs/{_GH_ORG}/repos?per_page=100&page={page}", token)
+        if not batch:
+            break
+        repos.extend(r["full_name"] for r in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
+
+
+def _ruling_pending_prs_for_repo(repo: str, token: str) -> list[dict]:
+    """Fallback per-repo fetch: OPEN PRs on ``repo`` carrying
+    ``ge.RULING_PENDING_LABEL``. The ``/issues`` endpoint's ``labels=``
+    filter also matches issues sharing the label — keep only items carrying
+    a ``pull_request`` key, mirroring the issue/PR split every other
+    enumeration in this file already does (e.g. ``_enumerate_tier_stats``'s
+    ``"pull_request" in it`` check)."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        batch = _gh_rest(
+            f"/repos/{repo}/issues?state=open"
+            f"&labels={urllib.parse.quote(ge.RULING_PENDING_LABEL)}"
+            f"&per_page=100&page={page}", token)
+        for it in batch:
+            if "pull_request" in it:
+                out.append(it)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
+    """Org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (config-I3199 /
+    config-I3227 — binding operator rulings awaiting execution, folded into
+    every on-box tier lane by groom_driver.py's ``ruling_exec_pr_pool`` since
+    config#3210, but structurally invisible to THIS Lambda's pre-boot demand
+    count until now).
+
+    Search-primary (``GET /search/issues?q=org:{org} is:pr is:open
+    label:"..."``, paginated), falling back to a live per-repo org-wide walk
+    (never a hardcoded repo list — config#2294) only if the search call
+    itself errors. Mirrors the search-then-fallback shape
+    alpha-engine-config's ``gh_repo_enum.search_prs_org_wide`` uses for the
+    identical problem (config#2838) — reimplemented locally against this
+    Lambda's own urllib/token transport rather than imported, since that
+    repo's ``scripts/`` package is not (and must not become) a dependency of
+    this public-adjacent Lambda: it lives in the PRIVATE
+    ``alpha-engine-config`` repo.
+
+    Each returned dict is tagged ``repo`` (``owner/name``) alongside the raw
+    GitHub fields (``number``, ``title``, ``labels``, ``updated_at``) the
+    callers below already consume for issues.
+    """
+    query = f'org:{_GH_ORG} is:pr is:open label:"{ge.RULING_PENDING_LABEL}"'
+    try:
+        items: list[dict] = []
+        page = 1
+        while True:
+            batch = _gh_rest(
+                f"/search/issues?q={urllib.parse.quote(query)}&per_page=100&page={page}",
+                token)
+            results = batch.get("items", [])
+            items.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        for it in items:
+            it["repo"] = it["repository_url"].split("/repos/", 1)[1]
+        return items
+    except Exception as exc:  # noqa: BLE001 — fail-safe to the per-repo walk, never to "zero ruled PRs"
+        logger.warning(
+            "org-wide ruling:pending-exec PR search failed (%s) — falling "
+            "back to a live per-repo org walk", exc)
+        out: list[dict] = []
+        for repo in _list_org_repos(token):
+            try:
+                for it in _ruling_pending_prs_for_repo(repo, token):
+                    it["repo"] = repo
+                    out.append(it)
+            except Exception as exc2:  # noqa: BLE001 — one repo's failure must not blank the rest
+                logger.warning("ruling:pending-exec PR fetch for %s failed (%s)", repo, exc2)
+        return out
+
+
 def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     """(counts per tier, oldest wait-hours per tier, has actionable P0).
 
@@ -533,6 +776,11 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     "sitting untouched" signal for the ARCH §66 escape valve. Freshness-skip
     is NOT applied here (the on-box driver enumeration stays authoritative);
     the slight overcount only ever biases toward launching.
+
+    config-I3227: also folds in org-wide OPEN PRs labeled
+    ``ge.RULING_PENDING_LABEL`` (see ``_enumerate_ruling_pending_prs``) into
+    the SAME counts/oldest maps — a ruled-PR-only backlog now clears the
+    floor or trips the escape valve exactly like an issue-only one would.
     """
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
@@ -567,6 +815,18 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
             if len(batch) < 100:
                 break
             page += 1
+    for pr in _enumerate_ruling_pending_prs(token):
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        tier = ge.is_actionable(labels)
+        if tier is None:
+            continue
+        counts[tier] += 1
+        updated = datetime.fromisoformat(
+            str(pr.get("updated_at", "")).replace("Z", "+00:00"))
+        waited = max(0.0, (now - updated).total_seconds() / 3600.0)
+        oldest[tier] = max(oldest[tier], waited)
+        if "P0" in labels:
+            has_p0 = True
     return counts, oldest, has_p0
 
 
@@ -714,7 +974,26 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     the actual issue dicts behind each count (repo/number/title/labels/
     updated_at), consumed by ``_write_queue_manifests`` (config#2152: the
     enumerate-once queue manifest — counts and queue derive from the SAME
-    walk by construction, so they can never diverge)."""
+    walk by construction, so they can never diverge).
+
+    config-I3227: org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (see
+    ``_enumerate_ruling_pending_prs``) are folded into the SAME
+    counts/oldest/p0_tiers/tier_issues this function already builds for
+    issues — one enumeration, one set of outputs, so ``decide_trigger()``
+    sees ruled PRs and issues as one undifferentiated demand pool per tier
+    (a ruled-PR-only backlog now clears the floor or trips the anti-
+    starvation escape valve exactly like an issue-only one would; the
+    escape valve is generic over ANY tier's oldest wait, so a ruled PR that
+    has sat past ``max_wait_hours`` fires it the same way an actionable P0
+    issue does — no separate carve-out needed). Fresh-skip applies to ruled
+    PRs identically to issues: a PR groom_driver.py's ``ruling_exec_pr_pool``
+    already worked and left an engagement disposition for (via the same
+    (repo, number) key) is debounced the same 72h window; a PR with no
+    matching engagement record is simply never skipped. PR titles are
+    prefixed ``[PR] `` in ``tier_issues``, mirroring the disambiguation
+    convention ``groom_driver.py``'s ``gated_reverify_pr_pool``/
+    ``ruling_exec_pr_pool`` already use for the identical PR-vs-issue
+    ambiguity."""
     engagements = _load_recent_engagements()
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
@@ -759,6 +1038,27 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
             if len(batch) < 100:
                 break
             page += 1
+    for pr in _enumerate_ruling_pending_prs(token):
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        tier = ge.is_actionable(labels)
+        if tier is None:
+            continue
+        is_p0 = "P0" in labels
+        pr_repo = pr.get("repo", "")
+        updated_epoch = datetime.fromisoformat(
+            str(pr.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
+        engaged = engagements.get((pr_repo, pr.get("number")))
+        if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
+            continue
+        counts[tier] += 1
+        tier_issues[tier].append({
+            "repo": pr_repo, "number": pr.get("number"),
+            "title": f"[PR] {pr.get('title', '')}", "labels": labels,
+            "updated_at": str(pr.get("updated_at", "")),
+        })
+        oldest[tier] = max(oldest[tier], (now_epoch - updated_epoch) / 3600.0)
+        if is_p0:
+            p0_tiers.add(tier)
     return counts, oldest, sorted(p0_tiers), tier_issues
 
 
@@ -850,8 +1150,10 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
     invocation) previously wrote NO ``groom/decisions/{date}/*.json`` record at
     all — unlike the ``demand-all`` full-mode path, which always has via
     ``_write_trigger_record``/``_write_skip_record``. That left the dispatch
-    decision log — the ground-truth input ``groom-liveness-probe`` now reads
-    (config#2667) to detect a silently-missing run artifact — structurally
+    decision log — the ground-truth input the ``overseer-liveness-probe``
+    ``run_window`` check now reads (config#2667; the reader moved off the
+    retired groom-liveness-probe in I2831) to detect a silently-missing run
+    artifact — structurally
     blind to sweep dispatches: a sweep box that died silently after this
     Lambda logged "dispatched" left no trace for the probe to even know a
     trigger had fired.

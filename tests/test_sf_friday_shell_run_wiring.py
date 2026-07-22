@@ -73,10 +73,6 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
-# alpha-engine-config-I2544: the eval-judge chain's dry-path control-var
-# wiring lives here now (lifted verbatim — Payload/Retry/Catch semantics
-# preserved byte-for-byte).
-_ADVISORY_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_advisory.json"
 _CFN_PATH = (
     _REPO_ROOT / "infrastructure" / "cloudformation"
     / "alpha-engine-orchestration.yaml"
@@ -94,27 +90,41 @@ _EXPECTED_SKIPS = {
     "skip_lib_pin_drift_check",
     "skip_morning_enrich",
     "skip_data_phase1",
+    # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
+    # ThinkTankCoverage each got their own CheckSkip* gate — previously
+    # NONE of the four had one, so every partial rerun unconditionally
+    # re-ran all four regardless of flags. skip_signals_envelope's gate
+    # DEFAULTS FALSE (SignalsEnvelope is LOAD-BEARING — I2880 staleness
+    # guard — unlike the other three, which are safe defaults-false too
+    # but carry no comparable live-run hazard).
+    "skip_scanner",
+    "skip_signals_envelope",
+    "skip_challenger_shadow",
     "skip_rag_ingestion",
+    "skip_thinktank_coverage",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",
     # skip_research retired: alpha-engine-config-I2515 Phase B removed the
     # multi-agent Research state (and its CheckSkipResearch gate) entirely
-    # — there is no longer a Lambda invocation to skip. SignalsEnvelope,
-    # its load-bearing replacement, has no skip gate (mirrors Scanner's
-    # own unconditional posture — it is now a same-day-freshness producer,
-    # not an ad-hoc-rerun-optional step).
+    # — there is no longer a Lambda invocation to skip.
     "skip_data_phase2",
-    # skip_eval_judge/skip_rationale_clustering/skip_replay_concordance/
-    # skip_counterfactual/skip_aggregate_costs retired here:
-    # alpha-engine-config-I2544 lifted the whole eval-judge chain (+
-    # ReportCard/Director) into the async ne-weekly-advisory-pipeline
-    # child SF — these gates no longer exist in THIS SF at all. See
-    # test_sf_advisory_pipeline_wiring.py for their coverage there.
+    "skip_eval_judge",
+    "skip_rationale_clustering",
+    "skip_replay_concordance",
+    "skip_counterfactual",
+    # Added 2026-05-25 (ROADMAP L1146 — SF-wire aggregate_costs.py CLI).
+    # Observability skip; independent of the three above per the
+    # CheckSkipAggregateCosts comment.
+    "skip_aggregate_costs",
     "skip_predictor_training",
     # config#902: skip_drift_detection was removed — the DriftDetection state
     # (and its CheckSkipDriftDetection gate) were collapsed when drift was
     # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
+    # config#2362 Option A (operator-ruled 2026-07-21): additive gate that
+    # skips only the Backtester SSM task, distinct from skip_backtester's
+    # legacy whole-pair jump above.
+    "skip_backtester_stage_only",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
     # and PortfolioOptimizerBacktest (L4472 split) previously had no skip gate, and
@@ -170,7 +180,7 @@ _SPOT_STATES = {
         "/var/log/parity.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
+        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
@@ -191,21 +201,19 @@ _SPOT_STATES = {
 # _SPOT_STATES) routed dry via --preflight-only, not a Lambda dry flag.
 # alpha-engine-config-I2515 Phase B removed the multi-agent Research state
 # entirely — its "Research" entry here is retired along with it.
-# SignalsEnvelope/ChallengerShadow (its replacements) do NOT thread
-# $.research_dry (their Payloads carry no dry-run signal, mirroring
-# ThinkTankCoverage's own no-dry-flag convention), so neither is added here.
+# ChallengerShadow still threads no dry-run signal (mirroring ThinkTankCoverage's
+# no-dry-flag convention). SignalsEnvelope, however, threads a preflight signal
+# (config-I2916) — NOT via this _DRY_LAMBDA_STATES map, because it is NOT a
+# full dry short-circuit: preflight.$=$.research_dry keeps the read/build/write
+# path LIVE and only downgrades the I2880 board-staleness guard to a WARN on the
+# Friday dry-Scanner preflight. That distinct wiring is pinned by
+# test_signals_envelope_preflight_signal below, not by the dry-flag map.
 # state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
     "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
     "RegimeSubstrate": ("action.$", "$.regime_action"),
     "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),
-}
-
-# alpha-engine-config-I2544: the eval-judge chain + agent-justification
-# triple moved to the async advisory child SF (step_function_advisory.json)
-# — same dry-flag wiring, verified against that file by
-# TestAdvisoryByteIdenticalAbsentPath below instead of this file's `sf`.
-_ADVISORY_DRY_LAMBDA_STATES = {
+    # Skip-exception rewire — eval-judge chain + agent-justification triple.
     "EvalJudgeSubmitFirstSaturday": ("dry_run_llm.$", "$.research_dry"),
     "EvalJudgeSubmitWeekly": ("dry_run_llm.$", "$.research_dry"),
     "EvalJudgePoll": ("dry_run_llm.$", "$.research_dry"),
@@ -729,61 +737,54 @@ class TestByteIdenticalAbsentPath:
             f"follows the control var); got {payload.get(payload_key)!r}"
         )
 
+    def test_signals_envelope_preflight_signal(self, sf):
+        """config-I2916: SignalsEnvelope threads preflight.$=$.research_dry so the
+        Friday-PM dry-Scanner preflight downgrades the signals-envelope Lambda's
+        I2880 universe-board fallback-staleness guard from a hard raise to a WARN
+        (the dated board is intentionally absent on the dry preflight, so the
+        ~5-trading-day-stale prior-Saturday fallback is EXPECTED there).
 
-class TestAdvisoryByteIdenticalAbsentPath:
-    """alpha-engine-config-I2544: same dry-flag-follows-control-var
-    invariant as TestByteIdenticalAbsentPath, re-pointed at the eval-judge
-    chain's new home (the advisory child SF's wrapper Parallel branch).
-    research_dry is threaded into the child's input by the parent SF's
-    StartAdvisoryPipeline dispatch (see
-    test_sf_research_predictor_parallel_wiring.py), so the same absent-path
-    identity argument holds."""
-
-    @pytest.fixture(scope="class")
-    def advisory_sf(self) -> dict:
-        return json.loads(_ADVISORY_SF_PATH.read_text())
-
-    def _state(self, advisory_sf: dict, name: str) -> dict:
-        states = advisory_sf["States"]
-        if name in states:
-            return states[name]
-        wrapper = states["AdvisoryPipelineWrapper"]
-        inner = wrapper["Branches"][0]["States"]
-        if name in inner:
-            return inner[name]
-        raise KeyError(name)
-
-    @pytest.mark.parametrize(
-        "name,payload_key,ref", sorted(
-            (n, k, r) for n, (k, r) in _ADVISORY_DRY_LAMBDA_STATES.items()
+        This is DISTINCT from a full dry short-circuit: the key is `preflight`,
+        NOT `dry_run_llm` (which is_dry() would use to return before any S3
+        access). SignalsEnvelope's read/build/write path stays LIVE on the
+        preflight (bootstrap/transport smoke is the preflight's whole point);
+        only the one expected-stale-fallback condition is relaxed. On the real
+        Saturday run research_dry=false → preflight=false → the guard is fully
+        in force.
+        """
+        payload = self._state(sf, "SignalsEnvelope")["Parameters"]["Payload"]
+        assert payload.get("preflight.$") == "$.research_dry", (
+            "SignalsEnvelope.Payload must thread preflight.$=$.research_dry so the "
+            "Friday preflight relaxes the I2880 board-staleness guard to a WARN; "
+            f"got {payload.get('preflight.$')!r}"
         )
-    )
-    def test_dry_lambda_payload_references_control_var(
-        self, advisory_sf, name, payload_key, ref
-    ):
-        st = self._state(advisory_sf, name)
-        payload = st["Parameters"]["Payload"]
-        assert payload.get(payload_key) == ref, (
-            f"{name}.Payload[{payload_key}] must be {ref} (so the dry flag "
-            f"follows the control var); got {payload.get(payload_key)!r}"
+        # It must NOT reuse dry_run_llm — that would short-circuit the read path
+        # entirely (is_dry), defeating the transport smoke this state exists for.
+        assert "dry_run_llm.$" not in payload, (
+            "SignalsEnvelope must NOT thread dry_run_llm (full S3 short-circuit); "
+            "the config-I2916 fix keeps the read path live via a distinct "
+            "`preflight` signal."
         )
+        # run_date must still flow so the (live) read keys off the same date.
+        assert payload.get("run_date.$") == "$.run_date"
 
 
 class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
-        # alpha-engine-config-I2544: ReportCard + Director were LIFTED out
-        # of this SF's tail into the async ne-weekly-advisory-pipeline child
-        # SF (dispatched earlier via StartAdvisoryPipeline, right after
-        # DataPhase2 — see test_sf_research_predictor_parallel_wiring.py).
-        # The substrate check's Success edge (and its Degraded fallback)
-        # now converge DIRECTLY on the notify gate — there is nothing left
-        # in this SF's tail to route through. Their own ReportCard->Director
-        # ->notify wiring (unchanged, byte-for-byte preserved) is covered by
-        # test_sf_advisory_pipeline_wiring.py::TestReportCardAndDirectorWiring
-        # and its preflight-dry-run coverage by
-        # test_sf_advisory_pipeline_wiring.py::
-        # TestReportCardAndDirectorWiring::test_report_card_and_director_payload_shape_unchanged.
-        # config#2276: the substrate poll resolves to a terminal status first.
+        # The substrate check flows into two non-fatal advisory states (evaluator
+        # Report Card v2, then the Director) before the notify gate. ReportCard's
+        # SUCCESS Next feeds the Director; its Catch routes to
+        # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
+        # failed silently for 9 days pre-fix) which then continues to
+        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify;
+        # its Catch routes to PublishDirectorDegraded (same config#2302 shape) which
+        # then continues to CheckShellRunNotify. The path to the notify gate is
+        # preserved whether grading/advisory succeed or fail. On the Friday preflight
+        # the states still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) —
+        # they are not skipped — so the success edge is identical on real + preflight
+        # runs.
+        # config#2276: the substrate poll resolves to a terminal status
+        # first; its Success edge is what feeds ReportCard.
         assert (
             states["WaitForWeeklySubstrateHealthCheck"]["Next"]
             == "CheckSubstrateHealthCheckStatus"
@@ -793,25 +794,43 @@ class TestConsolidatedNotify:
             for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
             if r.get("StringEquals") == "Success"
         )
-        assert substrate_success["Next"] == "CheckShellRunNotify"
-        assert states["SubstrateHealthCheckDegraded"]["Next"] == "CheckShellRunNotify"
-        assert "ReportCard" not in states
-        assert "Director" not in states
+        assert substrate_success["Next"] == "ReportCard"
+        report_card = states["ReportCard"]
+        assert report_card["Next"] == "Director"
+        assert all(c["Next"] == "PublishReportCardDegraded" for c in report_card["Catch"])
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        director = states["Director"]
+        assert director["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "PublishDirectorDegraded" for c in director["Catch"])
+        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
 
-    def test_advisory_tail_dry_run_coverage_relocated(self, states):
-        """ROADMAP L4504 / alpha-engine-config-I2544: the ReportCard/
-        Director dry-execute-on-preflight invariant (both payloads thread
-        dry_run.$=$.research_dry so the Friday preflight runs a no-write /
-        no-Opus probe rather than polluting the shared carry-over ledger)
-        is unchanged, but ReportCard/Director no longer live in THIS SF —
-        see test_sf_advisory_pipeline_wiring.py::TestReportCardAndDirectorWiring
-        ::test_report_card_and_director_payload_shape_unchanged for the
-        re-pointed assertion."""
+    def test_advisory_tail_runs_dry_on_preflight(self, states):
+        """ROADMAP L4504: ReportCard + Director were added after the shell-run
+        keystone and were given NO dry path — their payloads only carried {date},
+        and the Director Lambda gates solely on DIRECTOR_ENABLED. Left ungated,
+        the Friday-PM Preflight Pipeline would run ReportCard for real (writing a
+        degenerate, mostly-N/A card) and, once DIRECTOR_ENABLED is flipped on,
+        fire a REAL Opus Director call that merges that plan into the SHARED,
+        non-date-scoped carry-over ledger (director/carryover_ledger.json),
+        polluting the state the real Saturday run reads.
+
+        Fix (keystone-consistent: dry-execute, don't skip): both payloads thread
+        dry_run.$=$.research_dry — the canonical shell-run-dry signal, false on the
+        real Saturday run / true on the preflight. The handlers then run a no-write
+        (ReportCard) / no-Opus-no-write probe (Director) on the preflight, still
+        exercising container boot / imports / IAM / S3-read. Mirrors the other
+        advisory Lambdas (eval-judge / rationale-clustering / replay-concordance /
+        counterfactual) which all run dry via $.research_dry rather than skipping.
+        """
         for state_name in ("ReportCard", "Director"):
-            assert state_name not in states, (
-                f"{state_name} still present at top level — alpha-engine-"
-                "config-I2544 lifted it into step_function_advisory.json"
+            payload = states[state_name]["Parameters"]["Payload"]
+            assert payload.get("dry_run.$") == "$.research_dry", (
+                f"{state_name}.Payload must thread dry_run.$=$.research_dry so the "
+                f"Friday preflight runs it dry (no write / no Opus call); got "
+                f"{payload.get('dry_run.$')!r}"
             )
+            # date must still flow so the dry run keys off the same RUN_DATE.
+            assert payload.get("date.$") == "$.run_date"
 
     def test_shell_run_notify_reuses_sns_substrate(self, states):
         """NotifyShellRunComplete surfaces the user-facing 'Saturday
@@ -1062,9 +1081,9 @@ class TestHappyPathTraversal:
         # PipelineContractGate's pass-through, before CheckMutexRole — four
         # extra states in the visited order.
         # config#2249: CheckSkipMorningEnrich.Default now routes through the
-        # new SubstrateHealthGate -> CheckSubstrateHealthGate pre-check
-        # before MorningEnrich (verdict=HEALTHY on a green trace) — two
-        # extra states in the visited order.
+        # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
+        # MorningEnrich (fast fail on a dead dispatch box) — two extra states
+        # in the visited order on the no-skip path.
         assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",

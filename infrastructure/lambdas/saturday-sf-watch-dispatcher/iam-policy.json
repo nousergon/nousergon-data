@@ -24,6 +24,12 @@
       ]
     },
     {
+      "Sid": "InvokeOverseerRouter",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-overseer-dispatcher"
+    },
+    {
       "Sid": "AgentDispatchPAT",
       "Effect": "Allow",
       "Action": ["ssm:GetParameter"],
@@ -39,9 +45,7 @@
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-advisory-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-modelzoo-sunday-pipeline:*"
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
       ]
     },
     {
@@ -49,6 +53,17 @@
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
+    },
+    {
+      "Sid": "WatchLogArtifactList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["consolidated/*_sf_watch/*"]
+        }
+      }
     },
     {
       "Sid": "FastPathRerun",

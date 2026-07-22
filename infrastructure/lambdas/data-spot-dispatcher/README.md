@@ -9,8 +9,11 @@ executor daemon.
 This **mirrors the Saturday spot pattern**: it is the SF-invokable twin of
 `scheduled-groom-dispatcher` (which itself mirrors the fleet gold-standard
 `infrastructure/spot_data_weekly.sh`). It launches a spot via
-`nousergon_lib.ec2_spot.launch()` (on-demand fallback on capacity exhaustion),
-waits for the SSM agent to come Online, fires an **async detached**
+`nousergon_lib.ec2_spot.launch()` (on-demand fallback on capacity exhaustion OR
+account-wide spot quota exhaustion, e.g. `MaxSpotInstanceCountExceeded` —
+config#2698 — with an operator page on the quota case since it only clears via
+a human-requested service-quota increase), waits for the SSM agent to come
+Online, fires an **async detached**
 `ssm send-command`, and returns immediately. The box self-terminates
 (`InstanceInitiatedShutdownBehavior=terminate` + an in-bootstrap watchdog); the
 invoking Step Function polls `ssm:GetCommandInvocation` to a terminal status.
@@ -57,7 +60,10 @@ failure must NOT block daemon start (weekday) or reconcile + instance-stop (EOD)
 - **Lambda execution role:** `iam-policy.json` (ec2:RunInstances / CreateTags /
   Describe*, iam:PassRole for the executor role, ssm:SendCommand /
   DescribeInstanceInformation, ec2:TerminateInstances scoped to the
-  `alpha-engine-data-spot` tag).
+  `alpha-engine-data-spot` tag; plus sns:Publish on `alpha-engine-alerts` +
+  ssm:GetParameter on the Telegram secrets + s3:GetObject/PutObject on the
+  `_alerts/_dedup/*` marker prefix, config#2698, for the quota-exceeded
+  operator page).
 - **SF execution role delta:** `sf-execution-iam-policy.json` +
   `../../iam/alpha-engine-step-functions-role.json` grants
   `lambda:InvokeFunction` on `alpha-engine-data-spot-dispatcher*` and reuses the

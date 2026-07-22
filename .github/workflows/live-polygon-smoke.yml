@@ -15,6 +15,8 @@ name: Live Polygon Smoke
 # secret get a clean skip (the script exits 0 when the env var is
 # unset) rather than a failing CI status.
 
+permissions: {}
+
 on:
   pull_request:
     branches: [main]

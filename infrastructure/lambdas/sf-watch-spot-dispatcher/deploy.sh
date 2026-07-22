@@ -54,6 +54,13 @@ DEFER_ROLE_NAME="alpha-engine-sf-watch-defer-scheduler-role"
 DEFER_POLICY_NAME="alpha-engine-sf-watch-defer-scheduler-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
+# The Wednesday canary drill now fires THROUGH the Overseer router
+# (alpha-engine-config-I2832), so the full production dispatch path — the one
+# every real dispatch takes since I2823 — is what the drill exercises, not
+# just this executor's launch leg. Router ARN + the shared router-invoke
+# scheduler role (created idempotently below).
+OVERSEER_ROUTER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:alpha-engine-overseer-dispatcher"
+source "${SCRIPT_DIR}/../_shared/ensure_overseer_scheduler_role.sh"
 DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
 # Launch-config pins (config#2265): the DEPLOYED env is the observable source
 # of truth the sf-watch-liveness-probe reads (it verifies these AMI/SG/subnet
@@ -215,25 +222,31 @@ EOF
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # --- 2c. Weekly canary drill schedule (config#2223) ---
-  # Exercises the WHOLE dispatch pipe (Lambda IAM -> scoped RunInstances ->
-  # SSM -> bootstrap start) without a real SF failure. The box short-circuits
-  # before the agent and writes the _canary heartbeat the Fleet Status page
-  # escalates on when missed. Reuses the defer-scheduler role (created in 2a2
-  # above) — its policy is exactly "invoke THIS function", which is all the
-  # canary schedule needs; no new role. Idempotent create-or-update, mirrors
-  # sf-watch-liveness-probe/deploy.sh's scheduler style.
+  # --- 2c-pre. Shared router-invoke scheduler role (I2832) ---
+  OVERSEER_SCHED_ROLE_ARN=$(ensure_overseer_scheduler_role "${REGION}" "${ACCOUNT_ID}" run)
+  if ! $DRY_RUN; then echo "  Waiting 10s for scheduler role propagation..."; sleep 10; fi
+
+  # --- 2c. Weekly canary drill schedule (config#2223; routed via I2832) ---
+  # Exercises the WHOLE production dispatch pipe (router -> registry lookup ->
+  # executor Lambda IAM -> scoped RunInstances -> SSM -> bootstrap start)
+  # without a real SF failure — the SAME path every real saturday-sf-failure
+  # takes since I2823. The box short-circuits before the agent and writes the
+  # _canary heartbeat the Fleet Status page escalates on when missed. Uses the
+  # shared router-invoke scheduler role (2c-pre), NOT the defer-scheduler role
+  # (which stays scoped to its real defer-not-drop self-reinvoke purpose).
   CANARY_SCHED_NAME="alpha-engine-sf-watch-canary-drill-weekly"
   CANARY_CRON="cron(0 15 ? * WED *)"
-  FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
   # Static Input: run_date is deliberately ABSENT — the handler ALWAYS
   # synthesizes a drill-scoped run_date (drill-YYYY-MM-DD) so no payload can
   # carry a real run_date into a drill (see index.py DRILL_RUN_DATE_PREFIX).
   # The execution_arn is synthetic but ARN-shaped (allowlist-valid); the
   # drill never touches it.
+  # Target is the ROUTER (I2832): the drill payload is wrapped in the
+  # {playbook, payload} router envelope so the drill traverses router ->
+  # registry lookup -> executor, exactly as a real saturday-sf-failure does.
   CANARY_TARGET=$(python3 - <<PY
 import json
-payload = {
+drill_payload = {
     "is_drill": "true",
     "pipeline_name": "ne-weekly-freshness-pipeline",
     "cadence_slug": "saturday",
@@ -241,9 +254,12 @@ payload = {
     "cause": "synthetic weekly canary drill of the dispatch pipe (config#2223) - not a real failure",
 }
 print(json.dumps({
-    "Arn": "${FN_ARN}",
-    "RoleArn": "${DEFER_ROLE_ARN}",
-    "Input": json.dumps(payload),
+    "Arn": "${OVERSEER_ROUTER_ARN}",
+    "RoleArn": "${OVERSEER_SCHED_ROLE_ARN}",
+    "Input": json.dumps({"playbook": "sf-watch", "payload": drill_payload}),
+    # config#2902: zero-retry — AWS Scheduler's 185-attempt default would
+    # re-dispatch this drill for up to a day on any transient router error.
+    "RetryPolicy": {"MaximumRetryAttempts": 0, "MaximumEventAgeInSeconds": 60},
 }))
 PY
 )

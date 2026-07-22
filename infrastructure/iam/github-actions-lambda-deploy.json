@@ -195,6 +195,12 @@
       ]
     },
     {
+      "Sid": "InfraDeployEventBridgeSchedulerTrust",
+      "Effect": "Allow",
+      "Action": "iam:UpdateAssumeRolePolicy",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-eventbridge-sfn-role"
+    },
+    {
       "Sid": "InfraDeployResourceRead",
       "Effect": "Allow",
       "Action": [

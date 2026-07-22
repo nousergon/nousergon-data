@@ -299,3 +299,127 @@ class TestIngestInstOwnership:
             "n_documents_ingested",
             "n_failures",
         }
+
+
+# ── Batched embeddings (config#2956 deliverable 3) ──────────────────────
+
+
+class TestBatchedEmbeddings:
+    def test_one_embed_call_for_multiple_pending_rows(self):
+        """The N-row batch must call embed_texts_fn ONCE with all N chunk
+        bodies, not once per row (the previous shape)."""
+        df = pd.DataFrame([
+            _make_row(ticker="AAPL"),
+            _make_row(ticker="MSFT"),
+            _make_row(ticker="GOOGL"),
+        ])
+        embed = MagicMock(return_value=[[0.1], [0.2], [0.3]])
+        ingest = MagicMock(side_effect=lambda **kw: f"doc-{kw['ticker']}")
+
+        stats = ingest_inst_ownership(
+            df,
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+
+        embed.assert_called_once()
+        (texts_arg,), _ = embed.call_args
+        assert len(texts_arg) == 3
+        assert stats["n_documents_ingested"] == 3
+
+    def test_each_row_gets_its_own_embedding_by_position(self):
+        df = pd.DataFrame([
+            _make_row(ticker="AAPL"),
+            _make_row(ticker="MSFT"),
+        ])
+        embed = MagicMock(return_value=[["embA"], ["embB"]])
+        ingest = MagicMock(return_value="doc-id")
+
+        ingest_inst_ownership(
+            df,
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+
+        calls_by_ticker = {c.kwargs["ticker"]: c.kwargs["chunks"][0]["embedding"] for c in ingest.call_args_list}
+        assert calls_by_ticker["AAPL"] == ["embA"]
+        assert calls_by_ticker["MSFT"] == ["embB"]
+
+    def test_skipped_existing_rows_excluded_from_embed_batch(self):
+        df = pd.DataFrame([
+            _make_row(ticker="AAPL"),
+            _make_row(ticker="MSFT"),
+        ])
+        embed = MagicMock(return_value=[["embA"]])
+        exists = MagicMock(side_effect=lambda ticker, *a: ticker == "MSFT")
+
+        stats = ingest_inst_ownership(
+            df,
+            embed_texts_fn=embed,
+            document_exists_fn=exists,
+            ingest_document_fn=MagicMock(return_value="doc"),
+        )
+
+        (texts_arg,), _ = embed.call_args
+        assert len(texts_arg) == 1
+        assert stats["n_documents_skipped_exists"] == 1
+        assert stats["n_documents_ingested"] == 1
+
+    def test_no_embed_call_when_nothing_pending(self):
+        df = pd.DataFrame([_make_row(ticker="AAPL")])
+        embed = MagicMock()
+
+        ingest_inst_ownership(
+            df,
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=True),
+            ingest_document_fn=MagicMock(),
+        )
+
+        embed.assert_not_called()
+
+    def test_batch_level_embed_failure_counts_all_pending_as_failures(self):
+        df = pd.DataFrame([
+            _make_row(ticker="AAPL"),
+            _make_row(ticker="MSFT"),
+        ])
+        embed = MagicMock(side_effect=RuntimeError("voyage API down"))
+        ingest = MagicMock()
+
+        stats = ingest_inst_ownership(
+            df,
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+
+        assert stats["n_failures"] == 2
+        assert stats["n_documents_ingested"] == 0
+        ingest.assert_not_called()
+
+    def test_per_document_ingest_failure_still_isolated_after_batching(self):
+        df = pd.DataFrame([
+            _make_row(ticker="AAPL"),
+            _make_row(ticker="MSFT"),
+            _make_row(ticker="GOOGL"),
+        ])
+
+        def ingest_side_effect(*, ticker, **kw):
+            if ticker == "MSFT":
+                raise RuntimeError("pgvector temporary failure")
+            return f"doc-{ticker}"
+
+        embed = MagicMock(return_value=[[0.0], [0.0], [0.0]])
+        ingest = MagicMock(side_effect=ingest_side_effect)
+
+        stats = ingest_inst_ownership(
+            df,
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+        assert stats["n_documents_ingested"] == 2
+        assert stats["n_failures"] == 1
+        embed.assert_called_once()

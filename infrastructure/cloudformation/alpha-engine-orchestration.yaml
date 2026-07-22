@@ -209,57 +209,6 @@ Resources:
               LogGroupArn: !GetAtt PreopenTradingLogGroup.Arn
 
   # --------------------------------------------------------------------------
-  # Step Functions — Weekly Advisory Pipeline (alpha-engine-config-I2544)
-  # --------------------------------------------------------------------------
-  # Async child of SaturdayPipeline — the eval-judge chain / EvalRollingMean /
-  # RationaleClustering / ReplayConcordance / Counterfactual / AggregateCosts /
-  # ReportCard / Director, decoupled from the Saturday critical path.
-  # SaturdayPipeline's StartAdvisoryPipeline state fires this fire-and-forget
-  # (states:startExecution, NOT .sync) once DataPhase2 completes. NOT an
-  # EventBridge target — it has no cron trigger of its own. Same
-  # single-writer contract (config#2273) as SaturdayPipeline/WeekdayPipeline —
-  # see infrastructure/step_function_advisory.json's top-level Comment.
-  AdvisoryPipeline:
-    Type: AWS::StepFunctions::StateMachine
-    Properties:
-      StateMachineName: ne-weekly-advisory-pipeline
-      RoleArn: !Ref StepFunctionsRoleArn
-      DefinitionS3Location:
-        Bucket: alpha-engine-research
-        Key: infrastructure/step_function_advisory.json
-      LoggingConfiguration:
-        Level: ERROR
-        IncludeExecutionData: true
-        Destinations:
-          - CloudWatchLogsLogGroup:
-              LogGroupArn: !GetAtt WeeklyAdvisoryLogGroup.Arn
-
-  # --------------------------------------------------------------------------
-  # Step Functions — ModelZoo Sunday Pipeline (alpha-engine-config-I2545)
-  # --------------------------------------------------------------------------
-  # The model-zoo rotation (ResolveZooSpecs → ModelZooTrainMap →
-  # ModelZooSelect), moved off Saturday to its own Sunday 09:00 UTC trigger
-  # (Brian-ruled 2026-07-14 — see ModelZooSundayTrigger below). Ends with a
-  # re-invoke of the crucible-evaluator grading Lambda as the persistent-dash
-  # re-grade. Triggered directly by EventBridge — unlike AdvisoryPipeline
-  # above, this one IS an EventBridge target (it has no upstream SF to fire
-  # it fire-and-forget from).
-  ModelZooSundayPipeline:
-    Type: AWS::StepFunctions::StateMachine
-    Properties:
-      StateMachineName: ne-modelzoo-sunday-pipeline
-      RoleArn: !Ref StepFunctionsRoleArn
-      DefinitionS3Location:
-        Bucket: alpha-engine-research
-        Key: infrastructure/step_function_modelzoo.json
-      LoggingConfiguration:
-        Level: ERROR
-        IncludeExecutionData: true
-        Destinations:
-          - CloudWatchLogsLogGroup:
-              LogGroupArn: !GetAtt ModelZooSundayLogGroup.Arn
-
-  # --------------------------------------------------------------------------
   # EventBridge Rules — Pipeline Triggers
   # --------------------------------------------------------------------------
   SaturdayTrigger:
@@ -359,11 +308,18 @@ Resources:
       # silently assumed PDT (UTC−7); during PST the effective PT start would
       # have shifted an hour earlier (i.e. MORE buffer, not less — benign,
       # but not the documented 5:15 AM PT contract). EventBridge Scheduler
-      # now resolves the cron against America/Los_Angeles directly, so the
-      # 12:15 UTC-equivalent cron expression below auto-adjusts across the
-      # DST boundary and always fires at 5:15 AM PT.
+      # resolves the cron below against America/Los_Angeles directly, so it
+      # is written in LOCAL PT TIME (05:15), not UTC, and auto-adjusts
+      # across the DST boundary to always fire at 5:15 AM PT.
+      # INCIDENT 2026-07-20 (first weekday after the migration deployed):
+      # the migration originally kept the old UTC cron hour (15 12) while
+      # switching the timezone to America/Los_Angeles, which means 12:15 PM
+      # PT — the pipeline never fired pre-open and would have launched
+      # mid-trading-day instead. When pairing ScheduleExpressionTimezone
+      # with an expression, the expression must be converted to that zone's
+      # local time.
       Description: Weekday 5:15 AM PT (DST-aware) — daily data + predictor + executor; daemon ready before 06:30 PT open
-      ScheduleExpression: 'cron(15 12 ? * MON-FRI *)'
+      ScheduleExpression: 'cron(15 5 ? * MON-FRI *)'
       ScheduleExpressionTimezone: 'America/Los_Angeles'
       FlexibleTimeWindow:
         Mode: 'OFF'
@@ -392,34 +348,6 @@ Resources:
             "StateMachineArn": "${WeekdayPipeline}",
             "Input": "{\"ec2_instance_id\": [\"${MicroInstanceId}\"], \"trading_instance_id\": [\"${TradingInstanceId}\"], \"sns_topic_arn\": \"${AlertsTopic}\", \"pipeline_role\": \"daily\"}"
           }
-
-  # alpha-engine-config-I2545: ModelZoo Sunday trigger. Brian-ruled
-  # 2026-07-14 — 09:00 UTC gives a full day of retry headroom before Monday
-  # 12:45 UTC preopen (ne-preopen-trading-pipeline). Independent of
-  # SaturdayTrigger (no dependency edge in EventBridge; ordering is purely
-  # "the day after Saturday" by construction of the two separate cron
-  # expressions — no explicit day-of-week arithmetic needed since Sunday
-  # always immediately follows Saturday).
-  ModelZooSundayTrigger:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: alpha-engine-modelzoo-sunday
-      Description: Sunday 09:00 UTC — model-zoo rotation + persistent-dash re-grade (moved off Saturday, alpha-engine-config-I2545)
-      ScheduleExpression: 'cron(0 9 ? * SUN *)'
-      State: ENABLED
-      Targets:
-        # SINGLE TARGET PER RULE — see SaturdayTrigger's Targets comment for
-        # the 2026-05-26 duplicate-target incident that codified this
-        # invariant fleet-wide.
-        - Id: modelzoo-sunday-pipeline
-          Arn: !Ref ModelZooSundayPipeline
-          RoleArn: !Ref EventBridgeSfnRoleArn
-          Input: !Sub |
-            {
-              "ec2_instance_id": ["${MicroInstanceId}"],
-              "sns_topic_arn": "${AlertsTopic}",
-              "pipeline_role": "modelzoo-sunday"
-            }
 
   # --------------------------------------------------------------------------
   # EventBridge Rules — Independent Triggers
@@ -879,22 +807,6 @@ Resources:
       LogGroupName: /aws/stepfunctions/ne-preopen-trading-pipeline
       RetentionInDays: 30
 
-  # alpha-engine-config-I2544/I2545: log groups for the two new child SFs,
-  # same CFN-owned pattern (+ 30-day retention) as the two above — both new
-  # SFs are CFN AWS::StepFunctions::StateMachine resources (unlike the
-  # script-managed EOD pipeline), so their log groups are CFN resources too.
-  WeeklyAdvisoryLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /aws/stepfunctions/ne-weekly-advisory-pipeline
-      RetentionInDays: 30
-
-  ModelZooSundayLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /aws/stepfunctions/ne-modelzoo-sunday-pipeline
-      RetentionInDays: 30
-
   # The SF MutualExclusionGuard (L274) fails a duplicate-trigger execution with a
   # terminal `MutexConflict` Fail — visible today only in SF execution history +
   # the SNS HandleFailure email. These metric-filters + alarms add a CloudWatch
@@ -1100,14 +1012,6 @@ Outputs:
   WeekdayPipelineArn:
     Value: !Ref WeekdayPipeline
     Description: Weekday pipeline state machine ARN
-
-  AdvisoryPipelineArn:
-    Value: !Ref AdvisoryPipeline
-    Description: Weekly advisory child pipeline state machine ARN (alpha-engine-config-I2544)
-
-  ModelZooSundayPipelineArn:
-    Value: !Ref ModelZooSundayPipeline
-    Description: ModelZoo Sunday child pipeline state machine ARN (alpha-engine-config-I2545)
 
   ExecutionMutexTableName:
     Value: !Ref ExecutionMutexTable

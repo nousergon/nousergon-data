@@ -67,9 +67,7 @@ SAT_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 DAILY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 EOD_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 GROOM_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-ADVISORY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-MODELZOO_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$GROOM_STAMPED' '$ADVISORY_STAMPED' '$MODELZOO_STAMPED'" EXIT
+trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$GROOM_STAMPED'" EXIT
 python3 -c "
 import json, sys
 path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -111,26 +109,6 @@ if orig.startswith('[git:'):
 d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
 json.dump(d, open(path_out, 'w'), indent=2)
 " "$SCRIPT_DIR/step_function_groom.json" "$GROOM_STAMPED" "$GIT_SHA"
-python3 -c "
-import json, sys
-path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
-d = json.load(open(path_in))
-orig = d.get('Comment', '')
-if orig.startswith('[git:'):
-    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
-d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
-json.dump(d, open(path_out, 'w'), indent=2)
-" "$SCRIPT_DIR/step_function_advisory.json" "$ADVISORY_STAMPED" "$GIT_SHA"
-python3 -c "
-import json, sys
-path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
-d = json.load(open(path_in))
-orig = d.get('Comment', '')
-if orig.startswith('[git:'):
-    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
-d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
-json.dump(d, open(path_out, 'w'), indent=2)
-" "$SCRIPT_DIR/step_function_modelzoo.json" "$MODELZOO_STAMPED" "$GIT_SHA"
 
 # ── 2b. Validate-ALL preflight BEFORE any S3 upload or update (config#1897) ──
 # All-or-nothing gate. `aws stepfunctions validate-state-machine-definition` is
@@ -143,12 +121,10 @@ json.dump(d, open(path_out, 'w'), indent=2)
 # step 3 — means a bad definition fails the deploy while NOTHING has been applied
 # yet, so the fleet's SFs are never left stamped at mixed SHAs (the 2026-07-07
 # incident, #676 → #677, where the weekly SF updated before the daily SF was
-# rejected). We validate ALL SIX and only then abort, so one run surfaces every
-# bad definition rather than one-at-a-time. (Rebased onto main's
-# config#1897/I2544/I2545 child-pipeline split 2026-07-15: the advisory and
-# modelzoo children are stamped/uploaded/applied by this same script, so they
-# must be covered by the same all-or-nothing gate — a subset here would repeat
-# exactly the class of gap this preflight exists to close.)
+# rejected). We validate ALL FOUR and only then abort, so one run surfaces every
+# bad definition rather than one-at-a-time. (alpha-engine-config-I2890
+# 2026-07-17: the I2544/I2545 advisory + modelzoo child SFs were RETIRED —
+# splits reversed; the weekly SF carries the full inline pattern again.)
 #
 # Per the AWS API contract we key the pass/fail decision ONLY on the `result`
 # field (OK | FAIL) — AWS explicitly documents that diagnostic codes/wording may
@@ -188,8 +164,6 @@ validate_sf_definition "$SAT_STAMPED"      "Weekly-freshness pipeline"      || V
 validate_sf_definition "$DAILY_STAMPED"    "Pre-open trading pipeline"       || VALIDATION_FAILED=true
 validate_sf_definition "$EOD_STAMPED"      "Post-close trading pipeline"     || VALIDATION_FAILED=true
 validate_sf_definition "$GROOM_STAMPED"    "Backlog groom pipeline"          || VALIDATION_FAILED=true
-validate_sf_definition "$ADVISORY_STAMPED" "Weekly advisory child pipeline"  || VALIDATION_FAILED=true
-validate_sf_definition "$MODELZOO_STAMPED" "ModelZoo Sunday child pipeline"  || VALIDATION_FAILED=true
 if $VALIDATION_FAILED; then
     echo ""
     echo "  ERROR: one or more Step Function definitions failed validation (see above)."
@@ -205,8 +179,6 @@ aws s3 cp "$SAT_STAMPED" "s3://$BUCKET/infrastructure/step_function.json" --quie
 aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json" --quiet
 aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
 aws s3 cp "$GROOM_STAMPED" "s3://$BUCKET/infrastructure/step_function_groom.json" --quiet
-aws s3 cp "$ADVISORY_STAMPED" "s3://$BUCKET/infrastructure/step_function_advisory.json" --quiet
-aws s3 cp "$MODELZOO_STAMPED" "s3://$BUCKET/infrastructure/step_function_modelzoo.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
 # ── 3. Update Step Function definitions (existence-aware) ────────────────────
@@ -229,8 +201,6 @@ GROOM_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-
 # alpha-engine-config-I2544/I2545: CFN-managed pair, same update-if-present/
 # defer-to-CFN-if-absent pattern as SAT_ARN/DAILY_ARN (both are
 # AWS::StepFunctions::StateMachine resources in the CFN template now).
-ADVISORY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-advisory-pipeline"
-MODELZOO_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-modelzoo-sunday-pipeline"
 # Shared SF execution role (the CFN StepFunctionsRoleArn default; all three
 # orchestration SFs run under it). Used only for the EOD create-if-absent path.
 SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-step-functions-role"
@@ -310,8 +280,6 @@ EOD_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":
 # includeExecutionData=true, the CFN-owned per-SF log groups).
 SAT_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-weekly-freshness-pipeline:*"}}]}'
 DAILY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-preopen-trading-pipeline:*"}}]}'
-ADVISORY_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-weekly-advisory-pipeline:*"}}]}'
-MODELZOO_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:'"$REGION"':'"$ACCOUNT_ID"':log-group:/aws/stepfunctions/ne-modelzoo-sunday-pipeline:*"}}]}'
 
 # config#2748-adjacent: groom-dispatch ERROR-level logging was enabled live
 # 2026-07-16 (ad hoc, outside this script) to aid debugging active groom-driver
@@ -330,8 +298,6 @@ GROOM_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":false,"destination
 
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline" "$SAT_LOGGING_CONFIG"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline" "$DAILY_LOGGING_CONFIG"
-update_or_defer_to_cfn "$ADVISORY_ARN" "$ADVISORY_STAMPED" "Weekly advisory child pipeline" "$ADVISORY_LOGGING_CONFIG"
-update_or_defer_to_cfn "$MODELZOO_ARN" "$MODELZOO_STAMPED" "ModelZoo Sunday child pipeline" "$MODELZOO_LOGGING_CONFIG"
 update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline" "$EOD_LOGGING_CONFIG"
 # CORRECTED 2026-07-12: was alpha-engine-groom-pipeline (the OLD name) — the EventBridge
 # Scheduler targets alpha-engine-groom-dispatch (created by the scheduled-groom-dispatcher
@@ -339,6 +305,47 @@ update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post
 # updating the orphaned groom-pipeline name instead of the live groom-dispatch, which is
 # why PRs #761 and #763's SF definition fixes had zero live effect on actual groom runs.
 update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Backlog groom dispatch" "$GROOM_LOGGING_CONFIG"
+
+# ── 3b. Ensure EventBridge Scheduler trust on the SF-target role (config#2413) ─
+# The CFN template's WeekdayPipelineSchedule (AWS::Scheduler::Schedule, migrated
+# from AWS::Events::Rule in #816) is fired by EventBridge Scheduler, which — at
+# CreateSchedule/UpdateSchedule time — validates that its RoleArn
+# (EventBridgeSfnRoleArn → alpha-engine-eventbridge-sfn-role) is assumable by
+# scheduler.amazonaws.com. Before #816 this role backed only AWS::Events::Rule
+# targets, so its trust policy listed only events.amazonaws.com. The
+# scheduler.amazonaws.com grant was added ONLY to the manual deploy_step_function.sh
+# (no CI workflow runs it) — so the FIRST post-merge run of THIS workflow deploys
+# the Scheduler resource against a role that does not yet trust it, and the CREATE
+# rolls the stack back (UPDATE_ROLLBACK_COMPLETE). A `--no-execute-changeset` dry
+# run does NOT exercise the target-role trust, which is why #816 validated clean
+# but failed on live apply.
+#
+# Ensuring the trust HERE — idempotently, before the CFN deploy, mirroring the
+# log-group prerequisites above and deploy_step_function.sh's own bootstrap —
+# makes this workflow self-sufficient: it no longer depends on a human having run
+# deploy_step_function.sh out-of-band, and it survives a role/DR rebuild. The role
+# is shared by BOTH the still-live SaturdayTrigger (events.amazonaws.com) and the
+# now-Scheduler weekday trigger (scheduler.amazonaws.com), so both principals must
+# be listed. update-assume-role-policy is idempotent (writes the full document);
+# the role always exists live (SaturdayTrigger depends on it), so no create-role
+# is attempted here — that keeps the GHA deploy role's IAM grant minimal
+# (iam:UpdateAssumeRolePolicy on this one role — see
+# infrastructure/iam/github-actions-lambda-deploy.json).
+#
+# config#2826: the trust document itself lives in ONE place —
+# infrastructure/iam/alpha-engine-eventbridge-sfn-role.trust.json — the same
+# version-tracked snapshot deploy_step_function.sh's own bootstrap reads and
+# apply.sh/check-drift.py operate on. This step reads that file instead of
+# carrying its own inline copy, closing the exact class of drift that caused
+# this gap in the first place (two hand-maintained literals of the same
+# trust document, one of them missing a principal).
+EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
+EB_TRUST_FILE="$SCRIPT_DIR/iam/${EB_ROLE_NAME}.trust.json"
+echo "  Ensuring $EB_ROLE_NAME trusts events.amazonaws.com + scheduler.amazonaws.com (idempotent)..."
+aws iam update-assume-role-policy \
+    --role-name "$EB_ROLE_NAME" \
+    --policy-document "file://$EB_TRUST_FILE" \
+    --region "$REGION"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""

@@ -1,26 +1,21 @@
-"""Pins the AggregateCosts Lambda wiring in the weekly advisory child SF.
+"""Pins the AggregateCosts Lambda wiring in the Saturday Step Functions JSON.
 
 ROADMAP L1146 — SF-wire ``scripts/aggregate_costs.py`` CLI. The
 companion alpha-engine-research PR adds the
 ``alpha-engine-research-aggregate-costs:live`` Lambda; this test only
 asserts the SF wiring.
 
-alpha-engine-config-I2544 (2026-07-14): AggregateCosts (and the whole
-eval-judge chain it terminates) was LIFTED out of the main SF's Branch A
-into the async ne-weekly-advisory-pipeline child SF, fired fire-and-forget
-right after DataPhase2. Its own Payload/Retry/Catch/Next semantics are
-preserved byte-for-byte; the only rewired edge is the terminal target,
-since this child SF has no Parallel join / branch terminal of its own:
+Pin the chain end of Branch A:
 
     ... Counterfactual → CheckSkipAggregateCosts → AggregateCosts
-                                                 → ReportCard
+                                                 → BranchAComplete
 
-(pre-lift this was ``→ BranchAComplete``). The aggregator must still sit
-AFTER the entire LLM chain (eval-judge / rationale-clustering / replay-
-concordance / counterfactual) so every upstream LLM-emitting state has
-finished writing its ``_cost_raw/{date}/*.jsonl`` rows by the time the
-aggregator runs. Catches regressions like: a future SF refactor that drops
-the new state, or reroutes Counterfactual back to ReportCard bypassing
+The aggregator must sit AFTER the entire LLM chain (Research /
+eval-judge / rationale-clustering / replay-concordance / counterfactual)
+so every upstream LLM-emitting state has finished writing its
+``_cost_raw/{date}/*.jsonl`` rows by the time the aggregator runs.
+Catches regressions like: a future SF refactor that drops the new
+state, or reroutes Counterfactual back to BranchAComplete bypassing
 the aggregator.
 """
 
@@ -33,7 +28,7 @@ import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_advisory.json"
+_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
 
 
 @pytest.fixture(scope="module")
@@ -102,14 +97,13 @@ class TestLambdaTarget:
 
 
 class TestFailureIsolation:
-    def test_catch_routes_to_report_card(self, states):
+    def test_catch_routes_to_branch_a_complete(self, states):
         # Cost telemetry is observability — aggregator failure must NOT
         # halt the pipeline. Mirrors the rationale-clustering Catch.
-        # alpha-engine-config-I2544: was BranchAComplete pre-lift.
         catches = states["AggregateCosts"]["Catch"]
         assert len(catches) >= 1
         assert any(
-            c["Next"] == "ReportCard"
+            c["Next"] == "BranchAComplete"
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
@@ -141,9 +135,8 @@ class TestEdges:
         # Counterfactual failure must STILL run the aggregator —
         # upstream LLM cost rows are independent of counterfactual's
         # success. (The aggregator's own Catch routes to
-        # ReportCard (alpha-engine-config-I2544: was BranchAComplete
-        # pre-lift) so a downstream failure-of-failure can't ladder back
-        # into the failed counterfactual error path.)
+        # BranchAComplete so a downstream failure-of-failure can't
+        # ladder back into the failed counterfactual error path.)
         cf = states["Counterfactual"]
         catches = cf["Catch"]
         assert any(
@@ -170,18 +163,16 @@ class TestEdges:
         assert len(skip_choices) == 1
         assert skip_choices[0]["Next"] == "CheckSkipAggregateCosts"
 
-    def test_aggregate_costs_success_routes_to_report_card(self, states):
-        # alpha-engine-config-I2544: was BranchAComplete pre-lift.
-        assert states["AggregateCosts"]["Next"] == "ReportCard"
+    def test_aggregate_costs_success_routes_to_branch_a_complete(self, states):
+        assert states["AggregateCosts"]["Next"] == "BranchAComplete"
 
-    def test_check_skip_aggregate_costs_skip_routes_to_report_card(
+    def test_check_skip_aggregate_costs_skip_routes_to_branch_a_complete(
         self, states,
     ):
-        # alpha-engine-config-I2544: was BranchAComplete pre-lift.
         skip = states["CheckSkipAggregateCosts"]
         skip_choices = skip["Choices"]
         assert len(skip_choices) == 1
-        assert skip_choices[0]["Next"] == "ReportCard"
+        assert skip_choices[0]["Next"] == "BranchAComplete"
 
     def test_check_skip_aggregate_costs_default_is_aggregate_costs(self, states):
         assert states["CheckSkipAggregateCosts"]["Default"] == "AggregateCosts"

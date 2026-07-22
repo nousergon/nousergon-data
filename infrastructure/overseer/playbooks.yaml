@@ -1,0 +1,326 @@
+# Nousergon Overseer playbook registry — SSoT for the fleet's failure-response
+# paths (alpha-engine-config-I2823, epic alpha-engine-config-I2821).
+#
+# Consumed by:
+#   - infrastructure/lambdas/overseer-dispatcher (bundled into its zip at
+#     deploy time) — routes dispatch requests to the executor Lambda and
+#     handles verdict escalation.
+#   - tests/test_overseer_playbook_registry.py — schema + cross-reference
+#     contract (executor lambda dirs exist, benign_reasons present on routed
+#     entries).
+#
+# Contract: playbooks.schema.json (sibling file). Additive-only evolution —
+# new OPTIONAL fields are fine; renames/removals require a schema_version bump
+# and a dispatcher release that reads both.
+#
+# `routed: false` entries are inventory-only: they appear here so the registry
+# is the ONE place the watch plane's surface is enumerated (probes/alarms/
+# dashboards can iterate it), but the overseer-dispatcher refuses to route to
+# them (they have their own trigger topology, e.g. groom's demand-driven
+# EventBridge cron — a cron→router hop would add a failure mode with zero
+# routing decisions to make).
+
+schema_version: 1
+
+playbooks:
+  sf-watch:
+    description: >-
+      Diagnose+fix+rerun agent for a fleet Step Function terminal failure.
+      Triage/suppression policy (watch-log, attempt ceilings, fast path) lives
+      UPSTREAM in alpha-engine-saturday-sf-watch-dispatcher; this playbook is
+      the launch leg it dispatches when an agent is warranted.
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-sf-watch-spot-dispatcher
+    executor_lambda_dir: sf-watch-spot-dispatcher
+    # Executor verdict `reason` values that are by-design declines — the
+    # router treats them as success (no P1, no page). Anything else with
+    # launched!=true escalates. NOTE: unlike ci-watch, this executor has no
+    # `concurrent_skip` — defer-not-drop (config#2226) replaced it with
+    # `deferred`/`recovered` (+ `drill_concurrent_skip` for drills); the
+    # registry lockstep test pins this list to the executor's literals.
+    benign_reasons: [disabled, deferred, recovered, drill_concurrent_skip]
+    charter: alpha-engine-config/.github/sf-watch-prompt.md
+    concurrency_domain: >-
+      EC2 tag lock on (cadence_slug, pipeline_name, run_date); defer-not-drop
+      via one-shot EventBridge Scheduler self-reinvoke (config#2226).
+    supports_drill: true
+    kill_switch_env: SF_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
+    # Wiring-integrity checks the overseer-liveness-probe runs (I2831). These
+    # migrated verbatim from sf-watch-liveness-probe's per-probe constants — the
+    # registry is now the ONE place this surface is enumerated. The pipeline
+    # list is a YAML anchor so it is declared ONCE and stays lockstep with
+    # saturday-sf-watch-dispatcher's PIPELINES (pinned by
+    # tests/test_overseer_playbook_registry.py). The reclaim-checker (config#2270)
+    # + disabled-window sweep (config#2257) ACTION paths are NOT here — they stay
+    # in the slimmed sf-watch-liveness-probe (their EC2-event trigger topology +
+    # 45 pinned tests; full migration tracked as a follow-up).
+    liveness:
+      checks:
+        - type: eventbridge_rule
+          rule_name: alpha-engine-saturday-sf-watch-failed
+          expect_enabled: true
+          expect_target_function: alpha-engine-saturday-sf-watch-dispatcher
+          expect_state_machines: &sf_watch_pipelines
+            - ne-weekly-freshness-pipeline
+            - ne-preopen-trading-pipeline
+            - ne-postclose-trading-pipeline
+        - type: state_machines_exist
+          state_machines: *sf_watch_pipelines
+        - type: lambda_active
+          function: alpha-engine-saturday-sf-watch-dispatcher
+        - type: lambda_active
+          function: alpha-engine-sf-watch-spot-dispatcher
+          report_kill_switch: SF_WATCH_DISPATCH_ENABLED
+          launch_config:
+            ami_env: SF_WATCH_AMI_ID
+            security_group_env: SF_WATCH_SECURITY_GROUP
+            subnets_env: SF_WATCH_SUBNETS
+        # alpha-engine-config-I2901: WIRING checks above (eventbridge_rule /
+        # state_machines_exist / lambda_active) only assert the dispatcher is
+        # deployed+wired — a dispatcher that is Active + correctly targeted but
+        # CRASHES on every real invocation (2026-07-17 ListBucket/403 while
+        # loading/writing the watch-log) is invisible to them. This check is
+        # the INVOCATION-SUCCESS signal: for each mature terminal-failure
+        # execution of a watched pipeline (read from the SFs' OWN execution
+        # history — independent of the watch-log itself, so a broken writer
+        # can't hide its own breakage), the day's watch-log doc must carry a
+        # matching event record. `response_window_min` gives the async
+        # EventBridge->Lambda hop + write time to land before a miss is a
+        # finding, not a race. `watch_prefix` per pipeline mirrors
+        # saturday-sf-watch-dispatcher's PIPELINES dict verbatim (pinned by
+        # tests/test_overseer_playbook_registry.py).
+        - type: sf_watch_invocation_success
+          pipelines:
+            - {state_machine: ne-weekly-freshness-pipeline, watch_prefix: consolidated/saturday_sf_watch}
+            - {state_machine: ne-preopen-trading-pipeline, watch_prefix: consolidated/weekday_sf_watch}
+            - {state_machine: ne-postclose-trading-pipeline, watch_prefix: consolidated/eod_sf_watch}
+          response_window_min: 10
+          lookback_hours: 24
+
+  ci-watch:
+    description: >-
+      Diagnose+fix agent for a fleet main-branch CI failure. Fired from GHA
+      (nousergon-lib notify-ci-failure.yml -> repository_dispatch ->
+      sf-watch.yml ci-watch-dispatch job -> this router).
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-ci-watch-dispatcher
+    executor_lambda_dir: ci-watch-dispatcher
+    # signature_repeat_skip (config#2862): a signature marker for (repo,
+    # today) already carries a fix_pr — the dispatcher declined to spend a
+    # fresh spot launch on a SHA-independent defect a prior box today
+    # already diagnosed+fixed. By-design decline, not a wiring bug.
+    benign_reasons: [concurrent_skip, disabled, signature_repeat_skip]
+    charter: alpha-engine-config/.github/ci-watch-prompt.md
+    concurrency_domain: EC2 tag lock on (repo, sha) — per-commit, not per-repo.
+    supports_drill: true
+    kill_switch_env: CI_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
+    # The ci-watch executor's own liveness (was checked as part of
+    # sf-watch-liveness-probe's spot-dispatch leg; now attributed to its own
+    # playbook). Kill-switch value REPORTED, never alerted.
+    liveness:
+      checks:
+        - type: lambda_active
+          function: alpha-engine-ci-watch-dispatcher
+          report_kill_switch: CI_WATCH_DISPATCH_ENABLED
+
+  alert-drain:
+    description: >-
+      Twice-daily Overseer alert-drain (epic I2821 phase 3, config-I2824):
+      consumes the nousergon-overseer-intake queue + S3 fallback, classifies
+      incidents into the T0-T3 authority tiers per the alert-drain charter,
+      acts within charter authority (v1: PRs, issues, SF reruns only), writes
+      the drain ledger. Fired by EventBridge Scheduler (10:00 + 22:00 UTC)
+      THROUGH this router.
+    tier: T2
+    routed: true
+    enabled: true
+    executor_function: alpha-engine-alert-drain-dispatcher
+    executor_lambda_dir: alert-drain-dispatcher
+    benign_reasons: [concurrent_skip, disabled]
+    charter: alpha-engine-config/.github/alert-drain-prompt.md
+    concurrency_domain: >-
+      Single lane — EC2 tag lock on Name=alpha-engine-alert-drain-spot (one
+      drain at a time; overlap would double-process queue messages).
+    supports_drill: true
+    kill_switch_env: ALERT_DRAIN_DISPATCH_ENABLED
+    # The alert-drain executor's own liveness. Its intake queue + the two
+    # intake EventBridge rules are cross-cutting infra, checked under the
+    # top-level watch_plane_liveness block below.
+    liveness:
+      checks:
+        - type: lambda_active
+          function: alpha-engine-alert-drain-dispatcher
+          report_kill_switch: ALERT_DRAIN_DISPATCH_ENABLED
+
+  groom:
+    description: >-
+      Backlog groom, both legs of the SAME executor Lambda/SF (config#2201,
+      config-I2928 Phase 3): (1) the three daily fixed-cron EventBridge
+      triggers running the tier/decision-record groom proper, and (2) the
+      demand-driven end-of-SF Haiku PR-sweep leg (`groom_run.sh --mode
+      sweep`, fired by scripts/groom_driver.py after a fleet Step Function
+      completes rather than on a schedule). Inventory-only here: both legs'
+      trigger topology is scheduler/event-driven with zero routing decisions,
+      so both keep their direct EventBridge->Lambda path rather than a
+      separate registry line — see the liveness comment below for why sweep
+      needs no dedicated check either.
+    tier: T2
+    routed: false
+    enabled: true
+    executor_function: alpha-engine-scheduled-groom-dispatcher
+    executor_lambda_dir: scheduled-groom-dispatcher
+    charter: alpha-engine-config/scripts/groom_run.sh
+    concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
+    supports_drill: false
+    kill_switch_env: GROOM_DISPATCH_ENABLED
+    # Run-window accounting migrated from groom-liveness-probe (config#2414/#2667):
+    # for each MATURE expected trigger (fixed-cron schedule below UNION the
+    # dispatcher's own groom/decisions/ log, covering sweep-mode which has no
+    # cron), assert an S3 run artifact's run_start landed in [T, T+ceiling+margin].
+    # A trigger with no covering artifact = a silent groom death → problem line.
+    # `schedule` MIRRORS scheduled-groom-dispatcher/deploy.sh SCHED_CRONS — the
+    # registry is now the SSoT (was GROOM_SCHEDULE env / _DEFAULT_SCHEDULE const).
+    liveness:
+      checks:
+        - type: run_window
+          label: groom
+          artifact_prefix: groom/
+          decision_record_prefix: groom/decisions/
+          ceiling_min: 360   # groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS (360 min)
+          margin_min: 45     # box boot + report latency slack
+          lookback_hours: 30
+          schedule:
+            - {hour: 1, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "01:00 daily (Sonnet high-only)"}
+            - {hour: 7, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "07:00 daily (Sonnet mid-only)"}
+            - {hour: 19, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "19:00 daily (Haiku low-only)"}
+
+  gate-sweeps:
+    description: >-
+      Daily backlog gate-maintenance sweep train (config-I2928 Phase 3):
+      gate_due_sweep.py (Re-exam date arrival flagging), gate_dependency_sweep.py
+      (gate:dependency re-admission), gate_sf_run_sweep.py (gate:*-sf
+      re-admission on SF success), gate_data_sweep.py (gate:data auto-lift +
+      gate:device Re-exam maintenance), gate_milestone_sweep.py (gate:milestone
+      auto-clear), check_definition_drift_sweep.py (SF definition drift
+      backstop), complexity_gate_boundary_lint.py (complexity:ultra <->
+      gate:decision boundary lint), gate_ask_block_sweep.py (Decision Queue
+      Ask-block completeness), groom_gate_park.py --resurface (groom:parked
+      issue resurface). Inventory-only here: NO Lambda is involved at all — this
+      is a pure GitHub Actions scheduled workflow in a DIFFERENT repo
+      (alpha-engine-config), so it has no overseer-dispatcher routing surface
+      and no executor_function/kill_switch_env to speak of.
+    tier: T3
+    routed: false
+    enabled: true
+    trigger_type: github_actions_cron
+    workflow_file: .github/workflows/gate-due-sweep.yml
+    repo: alpha-engine-config
+    schedule_cron: "30 13 * * *"
+    charter: alpha-engine-config/scripts/gate_due_sweep.py
+    concurrency_domain: >-
+      Single GHA concurrency group `gate-due-sweep` (cancel-in-progress:
+      false) — the workflow's own steps run sequentially in one job, most
+      with continue-on-error so one sweep's failure doesn't mask the rest.
+    supports_drill: false
+
+  canary-replay:
+    description: >-
+      Saturday-replay canary (alpha-engine-config#2246): replays the 3 bug
+      classes the Friday dry-preflight is structurally blind to (filing-change
+      detection, held-thesis-update, structured-output-retry) against LIVE
+      data on a Thursday schedule AND per-PR (crucible-research/nousergon-data,
+      `canary:replay` label). Inventory-only here (alpha-engine-config-I2906):
+      this Lambda is invoked DIRECTLY by its own Thursday EventBridge rule
+      (`alpha-engine-canary-replay-thursday`, classic rule->Lambda target, NOT
+      through the overseer-dispatcher router) and synchronously by the GHA
+      per-PR shim — zero routing decisions for the router to make, same
+      rationale as `groom` above. Its OWN wiring (the Thursday rule + spot
+      launch + completion marker) is watched by the dedicated
+      `canary-replay-liveness-probe` sibling Lambda, NOT duplicated here —
+      this entry exists purely so the registry stays the ONE place the watch
+      surface is enumerated (the header claim this playbook was previously
+      missing from).
+    tier: T2
+    routed: false
+    enabled: true
+    executor_function: alpha-engine-canary-replay-dispatcher
+    executor_lambda_dir: canary-replay-dispatcher
+    charter: alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh
+    concurrency_domain: >-
+      Single lane — EC2 tag lock on Name=alpha-engine-canary-replay-spot (one
+      canary replay at a time; the deterministic run_token also gives
+      at-most-one-live-marker idempotency per ISO week / PR+sha).
+    supports_drill: false
+    kill_switch_env: CANARY_REPLAY_DISPATCH_ENABLED
+
+  arctic-migration:
+    description: >-
+      Merge-triggered in-region ArcticDB schema-migration runner
+      (alpha-engine-config-I3242, runner half of the config-I3236 structural
+      fix; pairs with the already-merged migration framework, nousergon-data-
+      PR988). Inventory-only here (mirrors groom/canary-replay's own
+      rationale): this Lambda is invoked DIRECTLY by
+      `.github/workflows/run-arctic-migrations.yml`'s synchronous
+      `lambda invoke` on every push to main touching `migrations/**` (plus a
+      manual `workflow_dispatch` re-trigger path) — zero routing decisions
+      for the overseer-dispatcher router to make, so it keeps its own direct
+      GHA->Lambda path rather than a routed registry entry. Exists here
+      purely so the registry stays the ONE place the watch-plane surface is
+      enumerated.
+    tier: T2
+    routed: false
+    enabled: true
+    executor_function: alpha-engine-arctic-migration-dispatcher
+    executor_lambda_dir: arctic-migration-dispatcher
+    charter: nousergon-data/scripts/run_arctic_migrations.py
+    concurrency_domain: >-
+      Single lane per head migration number — EC2 tag lock on
+      Name=alpha-engine-arctic-migration-spot +
+      arctic-migration-head=<NNNN> (fail-CLOSED on a probe error, unlike the
+      fleet's other spot dispatchers' coverage-beats-dedupe posture — a
+      migration full-rewrite racing a duplicate box is a correctness risk).
+      The on-box runner ALSO refuses to start while any of the three trading
+      Step Functions has a RUNNING execution (separate, stricter mutex).
+    supports_drill: false
+    kill_switch_env: ARCTIC_MIGRATION_DISPATCH_ENABLED
+
+# ── Cross-cutting watch-plane liveness (alpha-engine-config-I2831) ────────────
+# Checks that belong to NO single playbook: the overseer-dispatcher router
+# itself + the phase-1 intake plane (setup_overseer_intake.sh, config-I2822).
+# Today only CW alarms cover these — the probe now asserts their wiring too.
+watch_plane_liveness:
+  checks:
+    - type: lambda_active
+      function: alpha-engine-overseer-dispatcher
+    - type: sqs_queue_exists
+      queue_name: nousergon-overseer-intake
+      expect_dlq: nousergon-overseer-intake-dlq
+    - type: eventbridge_rule
+      rule_name: overseer-intake-alert-events
+      event_bus_name: nousergon-alerts
+      expect_enabled: true
+      expect_target_queue: nousergon-overseer-intake
+    - type: eventbridge_rule
+      rule_name: overseer-intake-cw-alarm-state
+      expect_enabled: true
+      expect_target_queue: nousergon-overseer-intake
+    # alpha-engine-config-I2906: the router's OWN trigger topology also
+    # includes 4 EventBridge Scheduler schedules (a DIFFERENT AWS resource
+    # from the classic `events` rules above — no `eventbridge_rule` check
+    # covers these). A deleted/disabled schedule silently stops that surface
+    # with nothing watching it. Deliberately NAME + STATE only, never target
+    # ARN: alpha-engine-config-I2832 (concurrent workstream) re-points the two
+    # weekly canary-drill schedules' targets between the executor Lambdas and
+    # this router — asserting target ARN here would race that migration.
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-alert-drain-1000utc
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-alert-drain-2200utc
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-ci-watch-canary-drill-weekly
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-sf-watch-canary-drill-weekly
