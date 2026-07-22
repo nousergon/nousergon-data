@@ -99,7 +99,37 @@
         ]
       }
     },
-    "watch_plane_liveness": { "$ref": "#/$defs/liveness_block" }
+    "watch_plane_liveness": { "$ref": "#/$defs/liveness_block" },
+    "alert_classes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "config-I3211 — one row per distinct fleet notification class: which intake path the overseer sees it on and the declared response. intake:none rows MUST carry migration_issue or operator_reason (no undeclared drain-blind class).",
+      "items": {
+        "type": "object",
+        "required": ["class", "source", "severities", "intake", "response"],
+        "additionalProperties": false,
+        "properties": {
+          "class": { "type": "string", "pattern": "^[a-z0-9_]{3,60}$" },
+          "source": { "type": "string", "minLength": 3 },
+          "severities": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "enum": ["info", "warning", "error", "critical", "alarm", "dynamic"] }
+          },
+          "intake": { "enum": ["bus", "cw-alarm", "none"] },
+          "response": { "type": "string", "pattern": "^(drain-queue|operator|playbook:[a-z0-9-]+)$" },
+          "migration_issue": { "type": "string", "pattern": "^[a-z0-9-]+-I[0-9]+$" },
+          "operator_reason": { "type": "string", "minLength": 15 }
+        },
+        "if": { "properties": { "intake": { "const": "none" } } },
+        "then": {
+          "anyOf": [
+            { "required": ["migration_issue"] },
+            { "required": ["operator_reason"] }
+          ]
+        }
+      }
+    }
   },
   "$defs": {
     "liveness_block": {
