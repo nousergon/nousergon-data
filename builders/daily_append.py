@@ -292,6 +292,70 @@ UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
 
+# Verify-by-artifact precondition sentinel for the EOD self-heal loop —
+# the `universe`-library counterpart to MACRO_FRESHNESS_SENTINEL_KEY below
+# (config#3237). UNIVERSE_FRESHNESS_RECEIPT_KEY above answers "is every
+# universe symbol within N trading days of fresh" (a loose staleness
+# tolerance, deliberately >0 so a single slow ticker doesn't halt the SF);
+# eod_reconcile.py's held-position closing-price read needs a STRICTER,
+# run_date-EXACT answer — "did TODAY's row land for the universe library",
+# because a ticker that's 1-2 trading days stale (well within the
+# UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS tolerance, so it does not raise
+# UniverseFreshnessViolation) still makes eod_reconcile.py hard-fail with
+# "no row for {run_date}" if it happens to be a held position. This sentinel
+# is the artifact `eod-precondition-probe` needs to catch that gap and route
+# to the self-heal loop instead of a hard `FailExecution` — see the Lambda's
+# docstring for the full rationale (mirrors the config#1787 Option-B
+# producer-side-readback pattern the macro sentinel already established).
+UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY = "feature_store/_universe_close_freshness.json"
+
+
+def _write_universe_close_freshness_sentinel(
+    s3, bucket: str, *, run_date: str, verified_ticker_count: int, total_symbols_checked: int,
+) -> dict:
+    """Write the ArcticDB universe-close freshness sentinel (config#3237).
+
+    Called ONLY from the tail of `_scan_universe_and_emit_freshness_receipt`,
+    after that scan has already read back every in-scope symbol's latest row
+    and confirmed none is stale beyond the tolerance threshold (raises
+    `UniverseFreshnessViolation` otherwise, in which case this is never
+    reached) — same "only write after independent readback confirms it"
+    posture `_write_macro_freshness_sentinel` documents.
+
+    Best-effort/non-fatal, matching both sibling sentinel writers: a write
+    failure here is an observability gap for the probe (which then correctly
+    reports precondition_met=False and the self-heal loop retries), never a
+    reason to fail a daily_append run whose real ArcticDB writes already
+    succeeded and were already verified above.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_date": run_date,
+        "verified_ticker_count": verified_ticker_count,
+        "total_symbols_checked": total_symbols_checked,
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB universe-close freshness sentinel to s3://%s/%s "
+            "(run_date=%s, verified_ticker_count=%d/%d)",
+            bucket, UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY, run_date,
+            verified_ticker_count, total_symbols_checked,
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB universe-close freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE — the EOD precondition probe will correctly "
+            "report precondition_met=False and the self-heal loop will retry): %s", exc,
+        )
+    return sentinel
+
 # ArcticDB freshness-monitor sentinel (config#1787, Brian's 2026-07-08
 # Option-B ruling). A small, UNCONDITIONAL S3 marker written on every
 # successful daily_append ArcticDB write — deliberately separate from
@@ -638,6 +702,7 @@ def _scan_universe_and_emit_freshness_receipt(
     universe_lib,
     max_stale_trading_days: int = UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS,
     expected_tickers: list[str] | None = None,
+    run_date: str | None = None,
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
     last-row date must be within ``max_stale_trading_days`` NYSE sessions
@@ -650,6 +715,12 @@ def _scan_universe_and_emit_freshness_receipt(
     themselves on every Lambda invocation. The 2026-05-01 weekday SF
     timeout cascade traced back to PR #68 adding this same scan to the
     predictor inference preflight, multiplying the cost.
+
+    Also writes ``s3://{bucket}/feature_store/_universe_close_freshness.json``
+    (config#3237) when ``run_date`` is given: unlike the loose ``N``-trading-
+    day receipt above, this sentinel is a strict run_date-exact readback
+    count, reusing this scan's already-fetched per-symbol tail rows (no
+    extra ArcticDB reads) — see ``_write_universe_close_freshness_sentinel``.
 
     On any stale: hard-raises ``RuntimeError`` so the SF MorningEnrich
     step fails. The 2026-04-21 ASGN/MOH incident class — partial-write
@@ -797,6 +868,20 @@ def _scan_universe_and_emit_freshness_receipt(
         "Universe-freshness receipt written: n=%d all_fresh stalest=%s(%d trading-d) scan=%.1fs",
         len(syms), stalest[0], stalest[2], scan_seconds,
     )
+
+    if run_date is not None:
+        # Strict run_date-EXACT count, distinct from the >= threshold above:
+        # a symbol 1-2 trading days stale passes the loose check (does not
+        # raise) but must NOT count as "verified for run_date" here — that's
+        # exactly the gap config#3237 found (eod_reconcile.py needs THIS
+        # day's row, not "recently fresh enough").
+        verified_ticker_count = sum(1 for _, last_date_iso, _ in ages if last_date_iso == run_date)
+        _write_universe_close_freshness_sentinel(
+            s3, bucket, run_date=run_date,
+            verified_ticker_count=verified_ticker_count,
+            total_symbols_checked=len(syms),
+        )
+
     return receipt
 
 
@@ -2564,9 +2649,13 @@ def _daily_append_impl(
         # earlier silent skips. Emits health/universe_freshness.json so
         # consumers don't repeat this 200s scan on every Lambda
         # invocation (the cause of the 2026-05-01 SF timeout cascade).
+        # run_date=date_str also drives the strict run_date-exact
+        # feature_store/_universe_close_freshness.json sentinel
+        # (config#3237) eod-precondition-probe reads.
         receipt = _scan_universe_and_emit_freshness_receipt(
             s3, bucket, universe_lib,
             expected_tickers=expected_tickers,
+            run_date=date_str,
         )
         result["universe_freshness_receipt"] = {
             "n_symbols_checked": receipt["n_symbols_checked"],
