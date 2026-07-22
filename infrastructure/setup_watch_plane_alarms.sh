@@ -77,6 +77,15 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # substrate-health-gate (weekly-pipeline SsmDiskProbe gate) added config-I2900
 # — both were Active with zero alarm coverage; see the onboarding-checklist
 # comment above the header of this file.
+# pipeline-watchdog, canary-replay-liveness-probe, saturday-integrity-sentinel,
+# freshness-monitor, sweep-artifact-monitor added config#3240 (found during
+# the same I2900 onboarding sweep, scoped out of that issue to avoid silent
+# scope creep). Three of the five (pipeline-watchdog, saturday-integrity-
+# sentinel, freshness-monitor) already carry a separate Errors-only alarm via
+# setup_changelog_observability_alarms.sh routed to the PRIMARY alpha-engine-
+# alerts topic (Phase B "watch-the-watchers", config#1273) — that alarm stays;
+# it does not satisfy the independent-backstop-topic argument this script
+# exists for (see header), so both alarms are intentional, not duplicative.
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
@@ -86,6 +95,11 @@ declare -A WATCH_PLANE_FUNCTIONS=(
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
   ["alert-drain-dispatcher"]="alpha-engine-alert-drain-dispatcher"
   ["substrate-health-gate"]="alpha-engine-substrate-health-gate"
+  ["pipeline-watchdog"]="alpha-engine-pipeline-watchdog"
+  ["canary-replay-liveness-probe"]="alpha-engine-canary-replay-liveness-probe"
+  ["saturday-integrity-sentinel"]="alpha-engine-saturday-integrity-sentinel"
+  ["freshness-monitor"]="alpha-engine-freshness-monitor"
+  ["sweep-artifact-monitor"]="alpha-engine-sweep-artifact-monitor"
 )
 
 echo "Configuring watch-plane Lambda alarms"
