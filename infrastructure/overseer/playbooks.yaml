@@ -32,6 +32,17 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
+    # config-I3293 — model/wake/cadence are REGISTRY-DECLARED (this file is
+    # the one place that answers "what model runs this agent, what wakes it,
+    # on what cadence"). `model` is LIVE config, not documentation: the
+    # overseer-dispatcher injects it into the executor payload and the
+    # executor threads it to the run script's `--model`; the run script's
+    # inline default is the fallback ONLY for non-router invocation paths.
+    model: claude-opus-4-8
+    wake:
+      - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
+      - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
+    cadence: "event-driven only — no scheduled wake"
     executor_function: alpha-engine-sf-watch-spot-dispatcher
     executor_lambda_dir: sf-watch-spot-dispatcher
     # Executor verdict `reason` values that are by-design declines — the
@@ -107,6 +118,10 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
+    model: claude-opus-4-8   # config-I3293 — registry-declared, router-injected
+    wake:
+      - "gha:nousergon-lib notify-ci-failure.yml -> repository_dispatch -> sf-watch.yml ci-watch-dispatch job -> this router (main-branch CI failure)"
+    cadence: "event-driven only — no scheduled wake (deprecation to drain intake tracked: config-I2845)"
     executor_function: alpha-engine-ci-watch-dispatcher
     executor_lambda_dir: ci-watch-dispatcher
     # signature_repeat_skip (config#2862): a signature marker for (repo,
@@ -129,15 +144,21 @@ playbooks:
 
   alert-drain:
     description: >-
-      Twice-daily Overseer alert-drain (epic I2821 phase 3, config-I2824):
-      consumes the nousergon-overseer-intake queue + S3 fallback, classifies
-      incidents into the T0-T3 authority tiers per the alert-drain charter,
-      acts within charter authority (v1: PRs, issues, SF reruns only), writes
-      the drain ledger. Fired by EventBridge Scheduler (10:00 + 22:00 UTC)
-      THROUGH this router.
+      The Overseer's non-urgent queue processor (epic I2821 phase 3,
+      config-I2824): consumes the nousergon-overseer-intake queue + S3
+      fallback, classifies incidents into the T0-T3 authority tiers per the
+      alert-drain charter, acts within charter authority (v1: PRs, issues,
+      SF reruns only), writes the drain ledger. Fired 4x daily by
+      EventBridge Scheduler THROUGH this router, plus event-time for
+      freshness CRITICALs (config-I3282).
     tier: T2
     routed: true
     enabled: true
+    model: claude-sonnet-5   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
+    wake:
+      - "scheduler:alpha-engine-alert-drain-0400utc/1000utc/1600utc/2200utc (4x-daily non-urgent queue drain, Brian ruling 2026-07-22)"
+      - "event-time: freshness-monitor CRITICAL page -> router (trigger=freshness-critical, config-I3282)"
+    cadence: "4x daily 04:00/10:00/16:00/22:00 UTC + event-time on freshness criticals"
     executor_function: alpha-engine-alert-drain-dispatcher
     executor_lambda_dir: alert-drain-dispatcher
     benign_reasons: [concurrent_skip, disabled]
@@ -172,6 +193,13 @@ playbooks:
     routed: false
     enabled: true
     executor_function: alpha-engine-scheduled-groom-dispatcher
+    # Model is complexity-tiered per issue (Haiku=low / Sonnet=mid+high), set
+    # per-run by groom_driver — deliberately NOT the router-injected `model:`
+    # field, which only applies to routed playbooks (config-I3293).
+    wake:
+      - "eventbridge: three daily fixed crons 01:00/07:00/19:00 UTC (demand-driven tier launches)"
+      - "demand: end-of-SF Haiku PR-sweep leg (groom_run.sh --mode pr_sweep)"
+    cadence: "3x daily fixed crons + end-of-SF sweep leg"
     executor_lambda_dir: scheduled-groom-dispatcher
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
@@ -248,6 +276,9 @@ playbooks:
     routed: false
     enabled: true
     executor_function: alpha-engine-canary-replay-dispatcher
+    wake:
+      - "scheduler:alpha-engine-ci-watch-canary-drill-weekly + alpha-engine-sf-watch-canary-drill-weekly (Wednesday drills; router re-point tracked config-I2832)"
+    cadence: "weekly Wednesday drills; liveness tick every 15min (eventbridge:alpha-engine-canary-replay-liveness-probe-tick)"
     executor_lambda_dir: canary-replay-dispatcher
     charter: alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh
     concurrency_domain: >-
@@ -275,6 +306,9 @@ playbooks:
     routed: false
     enabled: true
     executor_function: alpha-engine-arctic-migration-dispatcher
+    wake:
+      - "gha: nousergon-data migrations/ path-filtered workflow on merge (ARCH §120) + manual workflow_dispatch"
+    cadence: "event-driven (merge-triggered); no scheduled wake"
     executor_lambda_dir: arctic-migration-dispatcher
     charter: nousergon-data/scripts/run_arctic_migrations.py
     concurrency_domain: >-
@@ -317,7 +351,11 @@ watch_plane_liveness:
     # weekly canary-drill schedules' targets between the executor Lambdas and
     # this router — asserting target ARN here would race that migration.
     - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-alert-drain-0400utc
+    - type: scheduler_schedule_exists
       schedule_name: alpha-engine-alert-drain-1000utc
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-alert-drain-1600utc
     - type: scheduler_schedule_exists
       schedule_name: alpha-engine-alert-drain-2200utc
     - type: scheduler_schedule_exists

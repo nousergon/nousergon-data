@@ -304,6 +304,8 @@ _RUN_ID_RE = re.compile(r"^[0-9]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,200}$")
 _WORKFLOW_RE = re.compile(r"^[A-Za-z0-9 _./:()-]{1,200}$")
 _BOOL_RE = re.compile(r"^(true|false)$")
+# config-I3293 — registry-declared agent model (router-injected); optional.
+_MODEL_RE = re.compile(r"^claude-[a-z0-9.-]{1,60}$")
 
 
 class _InvalidEvent(ValueError):
@@ -326,7 +328,7 @@ def _optional(event: dict, key: str, pattern: "re.Pattern[str]", default: str = 
     return val
 
 
-def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str]:
+def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str, str]:
     """Validate the GHA payload's CI fields; raises _InvalidEvent on any
     missing/malformed field (caught once, at the handler, and converted to a
     clean launched:false — see module docstring's synchronous contract).
@@ -338,9 +340,13 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
     real (repo, sha) into a drill's lock/marker keys. See the DRILL_REPO
     isolation invariant above."""
     is_drill = _optional(event, "is_drill", _BOOL_RE, default="false")
+    # model (config-I3293): registry-declared agent model injected by the
+    # overseer router; optional — empty means the run script's inline default
+    # applies. Regex-validated so the f-string export cannot inject shell.
+    model = _optional(event, "model", _MODEL_RE)
     if is_drill == "true":
         return (DRILL_REPO, _drill_sha(datetime.now(timezone.utc)), "0",
-                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill)
+                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill, model)
     repo = _require(event, "repo", _REPO_RE)
     sha = _require(event, "sha", _SHA_RE)
     run_id = _require(event, "run_id", _RUN_ID_RE)
@@ -352,12 +358,12 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
         # under `set -u` it could expand as a positional param (same gotcha
         # groom's run_url note documents) and abort the prelude.
         raise _InvalidEvent(f"missing/malformed 'run_url' in event: {run_url!r}")
-    return repo, sha, run_id, run_url, workflow, branch, is_drill
+    return repo, sha, run_id, run_url, workflow, branch, is_drill, model
 
 
 def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
                        workflow: str, branch: str, run_token: str,
-                       is_drill: str = "false") -> str:
+                       is_drill: str = "false", model: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     ci_watch_spot_bootstrap.sh entrypoint (built by a sibling agent in
     alpha-engine-config). Any prelude failure shuts the box down so a botched
@@ -373,6 +379,7 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
     ``_send_bootstrap``, and the handler's returned JSON)."""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
+export CI_WATCH_MODEL="{model}"
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
 export HOME=/root
 fail() {{ echo "[ci-watch-prelude] FATAL: $1"; shutdown -h now; exit 1; }}
@@ -430,12 +437,12 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url: str,
                     workflow: str, branch: str, run_token: str,
-                    is_drill: str = "false") -> str:
+                    is_drill: str = "false", model: str = "") -> str:
     """Fire the async, detached SSM command that runs CI-watch + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token,
-                           is_drill=is_drill),
+                           is_drill=is_drill, model=model),
         comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -469,7 +476,7 @@ def _terminate_instance(instance_id: str) -> None:
 
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
-                          is_drill: str = "false") -> dict:
+                          is_drill: str = "false", model: str = "") -> dict:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -543,7 +550,8 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     try:
         _wait_ssm_online(instance_id)
         command_id = _send_bootstrap(instance_id, repo, sha, run_id, run_url,
-                                     workflow, branch, run_token, is_drill=is_drill)
+                                     workflow, branch, run_token, is_drill=is_drill,
+                                     model=model)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false
         _terminate_instance(instance_id)
         logger.error("ci-watch post-launch step failed for %s: %s: %s",
@@ -597,7 +605,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     try:
-        repo, sha, run_id, run_url, workflow, branch, is_drill = _resolve_event_fields(event)
+        repo, sha, run_id, run_url, workflow, branch, is_drill, model = _resolve_event_fields(event)
     except _InvalidEvent as exc:
         logger.error("invalid ci-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
@@ -607,4 +615,4 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         repo, sha, run_id, workflow, branch, is_drill,
     )
     return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch,
-                                 is_drill=is_drill)
+                                 is_drill=is_drill, model=model)
