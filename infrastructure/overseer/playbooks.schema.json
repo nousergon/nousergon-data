@@ -38,6 +38,22 @@
           "concurrency_domain": { "type": "string" },
           "supports_drill": { "type": "boolean" },
           "kill_switch_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "model": {
+            "type": "string",
+            "pattern": "^claude-[a-z0-9.-]+$",
+            "description": "config-I3293 — the Claude model this playbook's agent runs. LIVE config, not documentation: the overseer-dispatcher injects it into the executor payload as `model`; executors thread it to the run script. The run script's inline default is the fallback only for non-router invocation paths. Required (via registry test, not schema) on every routed playbook whose executor launches a claude-CLI agent."
+          },
+          "wake": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 10 },
+            "minItems": 1,
+            "description": "config-I3293 — human-readable enumeration of everything that launches this playbook's agent (eventbridge rules, scheduler schedules, event-time dispatch paths). Names of scheduler:/eventbridge: resources mentioned here should also appear in a liveness check; the registry test pins the drain-schedule set."
+          },
+          "cadence": {
+            "type": "string",
+            "minLength": 5,
+            "description": "config-I3293 — one-line answer to 'is there a scheduled wake, and when' (e.g. 'event-driven only', '4x daily 04:00/10:00/16:00/22:00 UTC + event-time on freshness criticals')."
+          },
           "workflow_file": {
             "type": "string",
             "pattern": "^\\.github/workflows/[a-z0-9_-]+\\.ya?ml$",

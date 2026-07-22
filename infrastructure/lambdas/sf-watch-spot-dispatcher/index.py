@@ -234,6 +234,8 @@ _RUN_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _FAILED_STATE_RE = re.compile(r"^[A-Za-z0-9 _.:()/-]{0,200}$")
 _WATCH_LOG_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]{0,300}$")
 _BOOL_RE = re.compile(r"^(true|false)$")
+# config-I3293 — registry-declared agent model (router-injected); optional.
+_MODEL_RE = re.compile(r"^claude-[a-z0-9.-]{1,60}$")
 
 
 class _InvalidEvent(ValueError):
@@ -284,6 +286,11 @@ def _resolve_event_fields(event: dict) -> dict:
     # to launch_with_fallback(force_on_demand=...), present in the pinned
     # nousergon-lib v0.106.0). Boolean-validated like is_preflight.
     force_on_demand = _optional(event, "force_on_demand", _BOOL_RE, default="false")
+    # model (config-I3293): the registry-declared agent model injected by the
+    # overseer router from playbooks.yaml. Optional — empty means the run
+    # script's inline default applies (non-router invocation fallback).
+    # Regex-validated so its f-string interpolation cannot inject shell.
+    model = _optional(event, "model", _MODEL_RE)
     # cause: deliberately unvalidated — arbitrary AWS text, base64-encoded
     # before it ever reaches a shell command (see _bootstrap_command).
     cause = str(event.get("cause") or "")
@@ -298,6 +305,7 @@ def _resolve_event_fields(event: dict) -> dict:
         "is_preflight": is_preflight,
         "is_drill": is_drill,
         "force_on_demand": force_on_demand,
+        "model": model,
         "cause": cause,
     }
 
@@ -337,7 +345,8 @@ exec bash infrastructure/sf_watch_spot_bootstrap.sh \
   --state-machine-arn "{fields['state_machine_arn']}" --execution-arn "{fields['execution_arn']}" \
   --run-date "{fields['run_date']}" --failed-state "{fields['failed_state']}" \
   --cause-b64 "{cause_b64}" --watch-log-key "{fields['watch_log_key']}" \
-  --is-preflight "{fields['is_preflight']}" --is-drill "{fields['is_drill']}"
+  --is-preflight "{fields['is_preflight']}" --is-drill "{fields['is_drill']}" \
+  --model "{fields.get('model', '')}"
 """
 
 
