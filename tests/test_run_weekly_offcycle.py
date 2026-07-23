@@ -76,7 +76,11 @@ def test_shell_input_contract() -> None:
     obj = _dry_run_input("shell")
     assert obj["shell_run"] is True
     assert obj["pipeline_role"] == "shell-run"
-    assert obj["ec2_instance_id"] == ["i-09b539c844515d549"]
+    # config#2248: ec2_instance_id is intentionally ABSENT — the weekly SF's
+    # own CheckSpotDispatchNeeded/DispatchWeeklyFreshnessSpot states populate
+    # it from a fresh ephemeral spot; this script no longer hardcodes the
+    # always-on dashboard box id.
+    assert "ec2_instance_id" not in obj
     assert obj["sns_topic_arn"].endswith(":alpha-engine-alerts")
 
 
@@ -84,7 +88,7 @@ def test_full_input_contract() -> None:
     obj = _dry_run_input("full")
     assert obj["pipeline_role"] == "weekly"
     assert "shell_run" not in obj, "full weekly run must NOT set shell_run"
-    assert obj["ec2_instance_id"] == ["i-09b539c844515d549"]
+    assert "ec2_instance_id" not in obj  # config#2248 — see test_shell_input_contract
     assert obj["sns_topic_arn"].endswith(":alpha-engine-alerts")
 
 
@@ -95,13 +99,17 @@ def test_full_input_matches_live_cron_target() -> None:
     # Narrow to the Input: !Sub | heredoc (the surrounding region carries a
     # comment mentioning "shell_run mode" that is not part of the target input).
     after_input = block.split("Input:", 1)[1]
-    # The JSON closes with a "}" on its own (dedented) line; the inline
-    # ${MicroInstanceId} braces are not line-leading, so this stops correctly.
+    # The JSON closes with a "}" on its own (dedented) line, so this stops
+    # correctly at the first line-leading "}" after "Input:".
     m = re.search(r".*?\n\s*\}", after_input, re.DOTALL)
     assert m, "could not isolate the SaturdayTrigger Input JSON"
     input_block = m.group(0)
     assert '"pipeline_role": "weekly"' in input_block
     assert "shell_run" not in input_block
+    # config#2248: the live cron Input no longer carries ec2_instance_id
+    # either — both sides of the contract (CFN + this offcycle runner) went
+    # through the dispatch path together.
+    assert "ec2_instance_id" not in input_block
     assert _dry_run_input("full")["pipeline_role"] == "weekly"
 
 

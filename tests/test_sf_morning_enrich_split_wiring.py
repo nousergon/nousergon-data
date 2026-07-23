@@ -72,17 +72,24 @@ class TestChainOrdering:
     def test_initialize_input_routes_to_morning_enrich_skipgate(self, states):
         # 2026-05-27: L274 SF MutualExclusionGuard inserted CheckMutexRole
         # between InitializeInput and CheckShellRun. The strict-superset
-        # property still holds: CheckMutexRole.Default → CheckShellRun,
-        # whose Default is the pre-spine target CheckSkipMorningEnrich. The
-        # real Saturday run (no shell_run + with pipeline_role='weekly' that
-        # acquires the mutex; or any non-cadence role that bypasses) still
-        # reaches the MorningEnrich skip-gate first — MorningEnrich still
-        # precedes DataPhase1.
+        # property still holds: CheckMutexRole.Default eventually reaches
+        # CheckShellRun, whose Default is the pre-spine target
+        # CheckSkipMorningEnrich. The real Saturday run (no shell_run + with
+        # pipeline_role='weekly' that acquires the mutex; or any non-cadence
+        # role that bypasses) still reaches the MorningEnrich skip-gate
+        # first — MorningEnrich still precedes DataPhase1.
         # 2026-06-08: L4517 inserted the lib-pin drift gate as the first
         # workload gate; its skip/check/gate Defaults converge on CheckMutexRole, so the
         # downstream mutex→CheckShellRun→CheckSkipMorningEnrich chain is unchanged.
         # config#830: a cadence-preset gate (CheckRunMode) now precedes the lib-pin
         # gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the chain holds.
+        # config#2248 (2026-07-21): CheckMutexRole.Default and AcquireMutex.Next
+        # now both land on CheckSpotDispatchNeeded, not CheckShellRun directly —
+        # the new gate that resolves $.ec2_instance_id before ANY execution can
+        # reach CheckShellRun (either immediately, if already present, or after
+        # dispatching+polling a fresh ephemeral spot). See
+        # tests/test_sf_mutex_wiring.py for the full mutex-chain contract and
+        # tests/test_sf_friday_shell_run_wiring.py for the dispatch-chain trace.
         assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate", (
             "InitializeInput hands off to the config#1824 run-day gate, whose "
             "bypass Default -> CheckRunMode (config#830 cadence preset); "
@@ -90,14 +97,22 @@ class TestChainOrdering:
             "gate); see tests/test_sf_lib_pin_drift_wiring.py for the gate→mutex chain"
         )
         assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
-        assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
-            "Mutex bypass must route to CheckShellRun so the pre-mutex "
-            "downstream chain is byte-identical for operator/missing-role inputs"
+        assert states["CheckMutexRole"]["Default"] == "CheckSpotDispatchNeeded", (
+            "Mutex bypass must route to CheckSpotDispatchNeeded so the "
+            "pre-mutex downstream chain is byte-identical for operator/"
+            "missing-role inputs"
         )
-        assert states["AcquireMutex"]["Next"] == "CheckShellRun", (
-            "Mutex acquire path must also land at CheckShellRun so cadence "
-            "runs reach the same downstream chain after grabbing the mutex"
+        assert states["AcquireMutex"]["Next"] == "CheckSpotDispatchNeeded", (
+            "Mutex acquire path must also land at CheckSpotDispatchNeeded so "
+            "cadence runs reach the same downstream chain after grabbing the "
+            "mutex"
         )
+        # CheckSpotDispatchNeeded's IsPresent branch reaches CheckShellRun
+        # directly (operator override skips the dispatch); its Default
+        # dispatches a fresh spot and reaches CheckShellRun after the
+        # bootstrap-poll chain resolves — either way CheckShellRun.Default is
+        # still the pre-spine target.
+        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "CheckShellRun"
         assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich", (
             "CheckShellRun.Default must be CheckSkipMorningEnrich so the "
             "real Saturday run is byte-identical pre-spine."

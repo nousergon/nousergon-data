@@ -3,7 +3,7 @@
     {
       "type": "ExecutionStarted",
       "executionStartedEventDetails": {
-        "input": "{\"ec2_instance_id\": [\"i-09b539c844515d549\"], \"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"pipeline_role\": \"weekly\"}"
+        "input": "{\"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"pipeline_role\": \"weekly\"}"
       },
       "id": 1,
       "timestamp": "2026-07-11T09:00:00Z"
@@ -21,7 +21,7 @@
       "type": "PassStateExited",
       "stateExitedEventDetails": {
         "name": "InitializeInput",
-        "output": "{\"ec2_instance_id\": [\"i-09b539c844515d549\"], \"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"pipeline_role\": \"weekly\", \"run_date\": \"2026-07-11\", \"preflight_args\": \"\", \"research_dry\": false, \"data_phase2_dry\": false, \"regime_action\": \"produce\", \"pipeline_label\": \"\", \"skip_weekly_run_day_gate\": false}"
+        "output": "{\"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"pipeline_role\": \"weekly\", \"run_date\": \"2026-07-11\", \"preflight_args\": \"\", \"research_dry\": false, \"data_phase2_dry\": false, \"regime_action\": \"produce\", \"pipeline_label\": \"\", \"skip_weekly_run_day_gate\": false}"
       },
       "id": 3,
       "timestamp": "2026-07-11T09:00:00Z"

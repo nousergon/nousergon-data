@@ -437,7 +437,7 @@
           "Next": "ComputeMutexTtl"
         }
       ],
-      "Default": "CheckShellRun"
+      "Default": "CheckSpotDispatchNeeded"
     },
     "ComputeMutexTtl": {
       "Type": "Pass",
@@ -500,12 +500,12 @@
             "States.ALL"
           ],
           "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review.",
-          "Next": "CheckShellRun",
+          "Next": "CheckSpotDispatchNeeded",
           "ResultPath": "$.mutex_error"
         }
       ],
       "ResultPath": "$.mutex_result",
-      "Next": "CheckShellRun"
+      "Next": "CheckSpotDispatchNeeded"
     },
     "MutexConflict": {
       "Type": "Fail",
@@ -4475,6 +4475,171 @@
         "verdict.$": "$.substrate_gate_result.gate.verdict",
         "reason.$": "$.substrate_gate_result.gate.reason",
         "detail.$": "$.substrate_gate_result.gate.message"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "CheckSpotDispatchNeeded": {
+      "Type": "Choice",
+      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) — it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it).",
+      "Choices": [
+        {
+          "Variable": "$.ec2_instance_id",
+          "IsPresent": true,
+          "Next": "CheckShellRun"
+        }
+      ],
+      "Default": "DispatchWeeklyFreshnessSpot"
+    },
+    "DispatchWeeklyFreshnessSpot": {
+      "Type": "Task",
+      "Comment": "config#2248: launch a fresh ephemeral spot to act as this execution's launcher box (replaces the always-on dashboard box i-09b539c844515d549 as the $.ec2_instance_id source). The Lambda clones all four repos + builds the dashboard venv ASYNCHRONOUSLY (fires the SSM bootstrap command and returns immediately — it does not block on the multi-minute clone+venv-build, keeping this Task well inside Lambda's 15-minute ceiling). WaitForWeeklyFreshnessSpotBootstrap (next) polls that bootstrap command to a terminal SSM status before any of the 14 downstream consumer states can reference the returned instance id. Fail-loud like every other Task in this SF: a launch/SSM failure here routes to NormalizeFailureContext -> HandleFailure -- there is no fail-open branch (unlike data-spot-dispatcher's weekday/EOD posture) because the weekly pipeline cannot run AT ALL without a launcher box.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-freshness-spot-dispatcher",
+        "Payload": {}
+      },
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2248: the launcher-box launch itself (spot capacity rotation, SSM-online wait) can transiently fail the same way any other spot dispatch in this fleet does — one backed-off retry before falling into the fail-loud Catch below.",
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExtractWeeklyFreshnessSpotDispatchError",
+          "ResultPath": "$.weekly_freshness_spot_error"
+        }
+      ],
+      "ResultSelector": {
+        "instance_id.$": "$.Payload.instance_id",
+        "market.$": "$.Payload.market",
+        "command_id.$": "$.Payload.command_id",
+        "run_token.$": "$.Payload.run_token"
+      },
+      "ResultPath": "$.weekly_freshness_spot_result",
+      "Next": "MergeWeeklyFreshnessSpotInstanceId"
+    },
+    "MergeWeeklyFreshnessSpotInstanceId": {
+      "Type": "Pass",
+      "Comment": "config#2248: lift $.weekly_freshness_spot_result.instance_id into $.ec2_instance_id as a ONE-ELEMENT ARRAY -- every one of the 14 downstream consumer states (13 sendCommand InstanceIds.$ + SubstrateHealthGate's instance_id.$=$.ec2_instance_id[0] Payload) expects exactly this [\"i-...\"] shape, unchanged from when it was a hardcoded EventBridge Input literal.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.weekly_freshness_spot_result.instance_id)), false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "WaitForWeeklyFreshnessSpotBootstrap"
+    },
+    "WaitForWeeklyFreshnessSpotBootstrap": {
+      "Type": "Task",
+      "Comment": "Poll the launcher-box bootstrap (clone x4 repos + build dashboard venv) SSM command until complete. Mirrors WaitForMorningEnrich's poll-loop idiom exactly.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.weekly_freshness_spot_result.command_id",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NormalizeFailureContext",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.weekly_freshness_spot_poll",
+      "Next": "CheckWeeklyFreshnessSpotBootstrapStatus"
+    },
+    "CheckWeeklyFreshnessSpotBootstrapStatus": {
+      "Type": "Choice",
+      "Comment": "Bootstrap-complete gate: only once the clone+venv SSM command reaches Success may the SF proceed into CheckShellRun / any of the 14 consumer states -- otherwise MorningEnrich's git pull / venv python invocation would race an incomplete bootstrap.",
+      "Choices": [
+        {
+          "Variable": "$.weekly_freshness_spot_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckShellRun"
+        },
+        {
+          "Variable": "$.weekly_freshness_spot_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "WeeklyFreshnessSpotBootstrapWait"
+        },
+        {
+          "Variable": "$.weekly_freshness_spot_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "WeeklyFreshnessSpotBootstrapWait"
+        }
+      ],
+      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+    },
+    "WeeklyFreshnessSpotBootstrapWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForWeeklyFreshnessSpotBootstrap"
+    },
+    "ExtractWeeklyFreshnessSpotBootstrapError": {
+      "Type": "Pass",
+      "Comment": "Normalize a non-Success bootstrap SSM poll into $.error. Mirrors ExtractMorningEnrichError -- the soft-failure path from CheckWeeklyFreshnessSpotBootstrapStatus.Default does not populate $.error, only Task Catch blocks do. Fail-loud: the launcher box's clone/venv setup failing means the weekly run cannot proceed at all, so this routes to the same HandleFailure path as every other extract normalizer.",
+      "Parameters": {
+        "phase": "WeeklyFreshnessSpotBootstrap",
+        "source": "CheckWeeklyFreshnessSpotBootstrapStatus.Default",
+        "poll.$": "$.weekly_freshness_spot_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "ExtractWeeklyFreshnessSpotDispatchError": {
+      "Type": "Pass",
+      "Comment": "Normalize a DispatchWeeklyFreshnessSpot Task Catch into $.error for HandleFailure's States.Format/JsonToString template. Mirrors the existing Extract*Error -> NormalizeFailureContext convention used by every other Task/Choice failure path in this SF (see ExtractLibPinDriftError / ExtractMorningEnrichError).",
+      "Parameters": {
+        "phase": "DispatchWeeklyFreshnessSpot",
+        "source": "DispatchWeeklyFreshnessSpot.Catch",
+        "error.$": "$.weekly_freshness_spot_error"
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"

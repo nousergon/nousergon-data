@@ -104,7 +104,11 @@ def test_friday_eod_success_fires_saturday_sf_with_shell_run_input():
 
     input_dict = _json.loads(call_kwargs["input"])
     assert input_dict["shell_run"] is True
-    assert input_dict["ec2_instance_id"] == [index.TRADING_EC2_INSTANCE_ID]
+    # config#2248: ec2_instance_id is intentionally ABSENT — the weekly SF's
+    # own CheckSpotDispatchNeeded/DispatchWeeklyFreshnessSpot states populate
+    # it from a fresh ephemeral spot; this Lambda no longer hardcodes the
+    # always-on dashboard box id.
+    assert "ec2_instance_id" not in input_dict
     assert input_dict["sns_topic_arn"] == index.SNS_TOPIC_ARN
     # pipeline_role="shell-run" surface-contract tag (parity with the retired
     # cron rule per ROADMAP L4055) so page-25 role filters bucket the dry-pass.
