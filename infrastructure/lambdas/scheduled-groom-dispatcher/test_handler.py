@@ -317,13 +317,22 @@ def test_deploy_schedule_high_only_carries_pr_budget():
     deploy_sh = (
         Path(__file__).resolve().parent / "deploy.sh"
     ).read_text()
-    assert '"pr_budget":100' in deploy_sh or '"pr_budget": 100' in deploy_sh
-    # Haiku/Sonnet-mid schedules must NOT inherit the high-only override.
-    low_line = next(
+    # groom-primary-deepseek (2026-07-23): every slot now launches all 3 tiers
+    # + sweep, so all SCHED_INPUTS carry pr_budget for the high tier box.
+    sched_inputs_lines = [
         line for line in deploy_sh.splitlines()
-        if "low-only" in line and "SCHED_INPUTS" not in line
+        if "SCHED_INPUTS" in line or line.strip().startswith("'{\"run_mode\"")
+    ]
+    pr_budget_lines = [
+        line for line in sched_inputs_lines
+        if "pr_budget" in line
+    ]
+    # All 3 daily SCHED_INPUTS have pr_budget (every slot launches high tier).
+    # The weekly gated-reverify SCHED_INPUTS does not.
+    assert len(pr_budget_lines) == 3, (
+        f"expected 3 daily SCHED_INPUTS entries with pr_budget (one per slot), "
+        f"got {len(pr_budget_lines)}: {pr_budget_lines}"
     )
-    assert "pr_budget" not in low_line
 
 
 # ── Usage pacing dismantled (Brian ruling 2026-07-14) ───────────────────────
