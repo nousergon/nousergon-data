@@ -1799,11 +1799,66 @@
                     "States.ALL"
                   ],
                   "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
-                  "Next": "CheckSkipRationaleClustering",
+                  "Next": "CheckSkipPerturbationBattery",
                   "ResultPath": "$.eval_rolling_mean_error"
                 }
               ],
               "ResultPath": "$.eval_rolling_mean_result",
+              "Next": "CheckSkipPerturbationBattery"
+            },
+            "CheckSkipPerturbationBattery": {
+              "Type": "Choice",
+              "Comment": "Skip-gate. {\"skip_perturbation_battery\": true} bypasses the weekly judge-sensitivity scorecard Lambda (config#752 Phase B — used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the corruption dimensions in crucible-research evals/perturbation.py). Standalone invocation of the Lambda is always available regardless of this flag.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_perturbation_battery",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_perturbation_battery",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRationaleClustering"
+                }
+              ],
+              "Default": "PerturbationBattery"
+            },
+            "PerturbationBattery": {
+              "Type": "Task",
+              "Comment": "Weekly judge-sensitivity scorecard Lambda (config#752 Phase B, Brian's 2026-07-22 operator ruling). Re-judges a fixed reference set + per-dimension synthetic corruptions on the eval-judge image and writes decision_artifacts/_perturbation/_report/{date,latest}/sensitivity.{json,md} for the backtester evaluator email — the between-PR drift catcher (Phase A's paths-filtered live smoke only catches per-PR regressions). Runs alongside the other eval-judge-chain observability stages (EvalRollingMean/RationaleClustering/ReplayConcordance/Counterfactual), immediately after EvalRollingMean since both are judge-quality (not agent-behavior) signals.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-perturbation-battery:live",
+                "Payload": {
+                  "dry_run_llm.$": "$.research_dry"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 60,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval observability layer — failures must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
+                  "Next": "CheckSkipRationaleClustering",
+                  "ResultPath": "$.perturbation_battery_error"
+                }
+              ],
+              "ResultPath": "$.perturbation_battery_result",
               "Next": "CheckSkipRationaleClustering"
             },
             "CheckSkipRationaleClustering": {
