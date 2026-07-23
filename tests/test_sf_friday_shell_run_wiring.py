@@ -1076,6 +1076,10 @@ class TestHappyPathTraversal:
         # composed directly after LibPinDriftGate's pass-through (no drift ->
         # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
         # violation) — two extra states in the visited order.
+        # config#2348: the evaluator Lambda-SHA drift gate pair (grading Lambda
+        # then director Lambda) is now composed directly after
+        # PipelineContractGate's pass-through, before CheckMutexRole — four
+        # extra states in the visited order.
         # config#2249: CheckSkipMorningEnrich.Default now routes through the
         # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
         # MorningEnrich (fast fail on a dead dispatch box) — two extra states
@@ -1089,6 +1093,10 @@ class TestHappyPathTraversal:
             "LibPinDriftGate",
             "PipelineContractCheck",
             "PipelineContractGate",
+            "EvaluatorDeployDriftCheck",
+            "EvaluatorDeployDriftGate",
+            "EvaluatorDirectorDeployDriftCheck",
+            "EvaluatorDirectorDeployDriftGate",
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",

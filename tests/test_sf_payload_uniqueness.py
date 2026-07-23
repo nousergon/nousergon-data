@@ -80,6 +80,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#693 (L4595): pre-spend pipeline-contract preflight gate, wired
     # directly after LibPinDriftGate's pass-through (predictor-inference Lambda).
     "PipelineContractCheck": frozenset({"action"}),
+    # config#2348: pre-spend evaluator Lambda-SHA drift gate pair, wired
+    # directly after PipelineContractGate's pass-through. Two separate Lambda
+    # invokes (grading, then director) — each checks its OWN :live alias's
+    # baked GIT_SHA against origin/main independently.
+    "EvaluatorDeployDriftCheck": frozenset({"action"}),
+    "EvaluatorDirectorDeployDriftCheck": frozenset({"action"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
