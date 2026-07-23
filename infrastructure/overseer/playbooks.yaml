@@ -362,3 +362,261 @@ watch_plane_liveness:
       schedule_name: alpha-engine-ci-watch-canary-drill-weekly
     - type: scheduler_schedule_exists
       schedule_name: alpha-engine-sf-watch-canary-drill-weekly
+
+# ── Alert-class registry (config-I3211; Brian directive 2026-07-22) ──────────
+# One row per DISTINCT notification class the fleet emits. This answers, in
+# one read: what can page, on which intake path the overseer sees it, and
+# what the declared response is. Inventory verified 2026-07-22 by fleet-wide
+# sweep (all 10 repos) + live AWS checks. Contract:
+#   intake: bus       — rides the krepis chokepoint -> nousergon-alerts ->
+#                       intake SQS (drain consumes; criticals also eligible
+#                       for event-time dispatch per artifact registry
+#                       remediation declarations, config-I3282)
+#   intake: cw-alarm  — CloudWatch ALARM-state tap on the default bus (zero
+#                       per-class code; covers every CW alarm)
+#   intake: none      — DRAIN-BLIND. Forbidden without either a
+#                       migration_issue (tracked path onto the bus) or an
+#                       operator_reason (explicit page-only/informational
+#                       declaration). CI-enforced.
+#   response: drain-queue        — the alert-drain charter's T0-T3 tiers
+#   response: playbook:<name>    — a routed playbook responds (must exist)
+#   response: operator           — declared human-only
+# The drain charter's runtime backstop treats an intake event whose source
+# matches NO row here as a T3 finding (registry drift caught at run time;
+# the cross-repo static chokepoint is tracked separately).
+
+alert_classes:
+  # ── executor (crucible-executor) ──
+  - class: executor_turnover_tripwire
+    source: "alpha-engine/executor/turnover_tripwire.py"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: executor_optimizer_shadow_rebalance
+    source: "alpha-engine/executor/optimizer_shadow.py"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: executor_order_book_rationale_write
+    source: "alpha-engine/executor/main.py"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+
+  # ── backtester (crucible-backtester) ──
+  - class: backtester_executor_opt_rejected
+    source: "alpha-engine-backtester/evaluate.py::_run_executor_opt"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: backtester_empty_param_sweep
+    source: "alpha-engine-backtester/backtest.py"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: backtester_stance_drift
+    source: "alpha-engine-backtester/analysis/stance_distribution.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: backtester_cost_anomaly
+    source: "alpha-engine-backtester/analysis/cost_report.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: backtester_champion_promotion
+    # NOTE stale 'crucible-backtester/' prefix in the emitter literal —
+    # config-I3302 renames it; row updated when that lands.
+    source: "crucible-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: backtester_live_key_reconciliation
+    source: "alpha-engine-backtester/optimizer/live_key_reconciliation.py"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+  - class: backtester_pit_parity
+    source: "alpha-engine-backtester/pit_parity"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: backtester_input_quality
+    source: "alpha-engine-backtester/analysis/input_quality.py"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+
+  # ── predictor (crucible-predictor) ──
+  - class: predictor_risk_model_persist
+    source: "alpha-engine-predictor/training/train_handler.py::risk_model_persist"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: predictor_model_zoo
+    source: "alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select"
+    severities: [info, warning, critical]
+    intake: bus
+    response: drain-queue
+  - class: predictor_predictions_write
+    source: "alpha-engine-predictor/inference/stages/write_output.py::write_predictions"
+    severities: [warning, critical]
+    intake: bus
+    response: drain-queue
+  - class: predictor_observe_calibration
+    source: "predictor.inference.observe_calibration"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+
+  # ── research (crucible-research) ──
+  - class: research_score_aggregator_gap
+    source: "research:score_aggregator"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_archive_writer_quarantine
+    source: "research:archive_writer"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: research_daemon_down
+    source: "research:alerts_handler"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+
+  # ── data plane (nousergon-data) ──
+  - class: data_constituents_drift
+    source: "alpha-engine-data/validators/constituents_drift_check.py"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: data_phase_marker_sweep
+    source: "alpha-engine-data/validators/phase_marker_sweep.py"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: data_spot_quota_fallback
+    source: "data-spot-dispatcher._launch_instance"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: lib_spot_quota_fallback
+    source: "nousergon_lib.spot_dispatch.launch_with_fallback"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: canary_replay_liveness
+    source: "canary-replay-liveness-probe"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+  - class: pipeline_watchdog_stuck_sf
+    source: "alpha-engine-pipeline-watchdog"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: overseer_dispatch_escalation
+    source: "overseer-dispatcher"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+  - class: freshness_monitor_staleness
+    # CRITICALs additionally trigger EVENT-TIME drain dispatch per the
+    # artifact registry's remediation declarations (config-I3282) — this is
+    # the one class with a faster-than-queue declared response.
+    source: "freshness-monitor"
+    severities: [dynamic]
+    intake: bus
+    response: playbook:alert-drain
+  - class: data_sf_definition_drift
+    source: "alpha-engine-data/infrastructure/step-functions/check-definition-drift.py"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+
+  # ── groom (alpha-engine-config emitter) ──
+  - class: groom_lifecycle_bus_events
+    source: "groom:*"   # dynamic groom:<repo>@main labels, error + audit-warning
+    severities: [error, warning]
+    intake: bus
+    response: drain-queue
+
+  # ── CloudWatch alarms (blanket row — the tap covers every alarm) ──
+  - class: cw_alarms_all
+    # 18 CFN-defined alarms verified 2026-07-22 (heartbeats x7, Lambda
+    # errors/no-invocations, mutex conflicts x3, health checks, daily-heal,
+    # unscored-buy-candidates, sns-publish-failed). SNS email delivery to the
+    # backstop topic is unchanged; email-only-backstop hardening is
+    # alpha-engine-config-I2899.
+    source: "cloudwatch-alarm:*"
+    severities: [alarm]
+    intake: cw-alarm
+    response: drain-queue
+
+  # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
+  - class: executor_emergency_shutdown
+    source: "raw-sns:executor/emergency_shutdown.py"
+    severities: [critical]
+    intake: none
+    response: operator
+    migration_issue: alpha-engine-config-I2908   # highest-value migration: a live emergency shutdown is invisible to the overseer today
+  - class: substrate_health_raw_sns
+    source: "raw-sns:nousergon_lib/transparency.py"
+    severities: [error]
+    intake: none
+    response: operator
+    migration_issue: alpha-engine-config-I2908
+  - class: predictor_drift_raw_sns
+    source: "raw-sns:predictor/monitoring/drift_detector.py"
+    severities: [dynamic]
+    intake: none
+    response: operator
+    migration_issue: alpha-engine-config-I2908
+  - class: ci_runner_lambda_raw_telegram
+    source: "raw-telegram:ci-runner-dispatcher-lambdas"
+    severities: [error]
+    intake: none
+    response: operator
+    migration_issue: alpha-engine-config-I2909
+  - class: governance_script_raw_telegram
+    source: "raw-telegram:operator_triage_digest|neon_usage_monitor|check_doc_staleness"
+    severities: [info, warning, critical]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Deliberate hermetic governance pings (no repo imports by design);
+      doc-staleness auto-verify loop tracked separately (config-I3061).
+  - class: groom_dispatch_telegram_only
+    source: "flow-doctor:scheduled-groom-dispatcher"
+    severities: [info, error, warning]
+    intake: none
+    response: operator
+    migration_issue: alpha-engine-config-I2928
+  - class: sf_completion_telegram
+    source: "flow-doctor:sf-telegram-notifier"
+    severities: [dynamic]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Informational SF-completion notices (T0 class by definition — failures
+      route via sf-watch, not this notifier).
+  - class: expense_collector_telegram
+    source: "flow-doctor:expense-collector"
+    severities: [warning]
+    intake: none
+    response: operator
+    operator_reason: Budget-usage notice; page-only by design (no automated response exists or is wanted for spend review).
+  - class: fleet_email_digests
+    source: "email:eod|backtester|director|research|training digests"
+    severities: [info]
+    intake: none
+    response: operator
+    operator_reason: Informational digests via the krepis email chokepoint; console deep-links are the response surface.
+  - class: predictor_retrain_email
+    source: "email:backtester/analysis/retrain_alert.py"
+    severities: [warning]
+    intake: none
+    response: operator
+    migration_issue: alpha-engine-config-I3302   # also bypasses the email chokepoint itself
