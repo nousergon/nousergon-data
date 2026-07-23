@@ -205,6 +205,34 @@ def test_rewrite_aborts_on_nonconforming_projection(universe_lib):
         )
 
 
+def test_rewrite_new_columns_fn_computes_per_symbol_recompute(universe_lib, meta_lib):
+    """``new_columns_fn`` (config#934 RECOMPUTE backfill support) — unlike
+    ``new_columns``' uniform fill, it is called per-symbol with that symbol's
+    own pre-migration history and can retro-compute a DISTINCT value per
+    symbol, proving a real (non-NaN) backfill policy is mechanically
+    supported end to end."""
+    _seed_old_schema(universe_lib, symbols=("AAA", "BBB"))
+    cols_after = tuple(OHLCV_COLS) + (PROVENANCE_COL,) + tuple(_NEW_FEATURES)
+
+    def _recompute(symbol: str, df: pd.DataFrame) -> dict:
+        # Distinct per-symbol value derived from the symbol's own history —
+        # the shape a real RECOMPUTE migration (migrations/0001) uses.
+        return {"feat_c_new": (df["feat_a"] * 0 + len(symbol)).astype("float32")}
+
+    n = rewrite_symbols_full(
+        universe_lib,
+        expected_columns=cols_after,
+        new_columns_fn=_recompute,
+        project=lambda df: to_arctic_canonical(df, features=_NEW_FEATURES),
+    )
+    assert n == 2
+    aaa = universe_lib.read("AAA").data
+    bbb = universe_lib.read("BBB").data
+    assert (aaa["feat_c_new"] == float(len("AAA"))).all()
+    assert (bbb["feat_c_new"] == float(len("BBB"))).all()
+    assert aaa["feat_c_new"].dtype == np.float32
+
+
 # ── Version stamp semantics ──────────────────────────────────────────────────
 
 
@@ -264,7 +292,10 @@ def test_producer_wrapper_wires_expected_and_pending(monkeypatch, meta_lib):
     EXPECTED + pending from the real chain, raising when the stamp lags."""
     import migrations as mig_pkg
 
-    # No stamp -> baseline 0 == EXPECTED_SCHEMA_VERSION (0 today) -> OK.
+    # No stamp -> baseline 0 == EXPECTED_SCHEMA_VERSION -> OK. Pinned via
+    # monkeypatch (not the real ambient chain) so this stays true regardless
+    # of how many real forward migrations exist in the repo at test time.
+    monkeypatch.setattr(mig_pkg, "EXPECTED_SCHEMA_VERSION", 0)
     assert mig_pkg.assert_universe_schema_current(meta_lib) == mig_pkg.EXPECTED_SCHEMA_VERSION
 
     # Simulate a future pending migration by forcing EXPECTED ahead of the stamp.
