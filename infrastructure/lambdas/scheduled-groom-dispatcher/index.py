@@ -574,6 +574,9 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "existing_instance_ids": existing_ids},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
@@ -647,6 +650,9 @@ def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "prior_dispatch_count": prior, "dispatch_ceiling": ceiling},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
@@ -1030,6 +1036,9 @@ def _notify_demand_trigger_failed(exc: Exception, schedule_label: str) -> None:
             flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "error": str(exc)},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as notify_exc:  # noqa: BLE001 — secondary observability
         logger.warning("trigger-failed Telegram failed (non-fatal): %s", notify_exc)
@@ -1050,6 +1059,9 @@ def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, **decision.as_record()},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("demand-skip Telegram failed (non-fatal): %s", exc)

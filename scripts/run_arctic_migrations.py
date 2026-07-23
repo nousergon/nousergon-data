@@ -256,6 +256,12 @@ def notify(
             topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
             db_basename="arctic_migration",
             context={**context, "outcome": outcome},
+            # No playbooks.yaml alert_classes row exists yet for this source
+            # (config-I3513 audit finding — this is a script, not a Lambda,
+            # so it has no AWS_LAMBDA_FUNCTION_NAME fallback either; before
+            # this fix its events resolved source=None entirely). Matches
+            # this call's own flow_name; follow-up filed to add a row.
+            source="arctic-migration",
         )
     except Exception as exc:  # noqa: BLE001 — notification must never mask the real outcome
         log.warning("Telegram notify FAILED (non-fatal): %s: %s", type(exc).__name__, exc)

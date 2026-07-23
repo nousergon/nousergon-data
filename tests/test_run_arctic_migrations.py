@@ -358,6 +358,34 @@ def test_notify_never_raises_even_when_the_sink_import_is_broken(mod, monkeypatc
     )
 
 
+def test_notify_passes_explicit_source_to_notify_via_flow_doctor(mod, monkeypatch):
+    """Regression guard for config-I3513: notify() must pass an explicit
+    ``source=`` to ``notify_via_flow_doctor``, matching its own
+    ``flow_name`` ("arctic-migration"). Before this fix it passed no
+    ``source`` at all — and unlike a Lambda, this script has no
+    ``AWS_LAMBDA_FUNCTION_NAME`` fallback either, so the resulting bus
+    event's attribution resolved to ``None`` entirely."""
+    lambdas_dir = str(REPO_ROOT / "infrastructure" / "lambdas")
+    monkeypatch.syspath_prepend(lambdas_dir)
+    import flow_doctor_telegram as fdt
+
+    calls = []
+
+    def _fake_notify(*args, **kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(fdt, "notify_via_flow_doctor", _fake_notify)
+
+    mod.notify(
+        outcome="success", severity="info", text="hi", dedup_key="k",
+        context={"merged_sha": "a" * 40},
+    )
+    assert len(calls) == 1
+    assert calls[0]["source"] == "arctic-migration"
+    assert calls[0]["flow_name"] == "arctic-migration"
+
+
 # ── write_completion_marker() best-effort swallow ────────────────────────
 
 

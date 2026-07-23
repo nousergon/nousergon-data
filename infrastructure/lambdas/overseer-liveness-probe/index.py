@@ -818,6 +818,14 @@ def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> 
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
             context={"problems": len(problems), "kill_switches": kill_switches or {}},
+            # No playbooks.yaml alert_classes row exists yet for this Lambda's
+            # own identity (config-I3513 audit finding) — note this is
+            # DISTINCT from the registered `overseer_dispatch_escalation`
+            # class (source "overseer-dispatcher"), which belongs to the
+            # separate overseer-dispatcher Lambda. Using _FLOW_NAME is still
+            # strictly correct (this Lambda's own naming convention);
+            # follow-up filed to add a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still returned
         logger.warning("overseer liveness alert Telegram send failed (non-fatal): %s", exc)
