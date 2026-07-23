@@ -11,11 +11,14 @@ practice:
   * daily-news: the deploy-on-merge workflow (deploy-daily-news-units.yml)
     could fail silently, or someone could hand-edit the on-box unit file
     without touching the repo.
-  * metron-intraday: relies on the trading box picking up the repo copy at
-    its next boot-pull run (2026-07-13 operator ruling on config#2352,
-    "queue on merge, apply on next boot") — a box that stays up unusually
-    long, or a boot-pull systemd-sync regression, could leave it stale
-    for longer than the "pages within a day" acceptance bar.
+  * metron-intraday: moved from ae-trading to ae-dashboard
+    (alpha-engine-config#1768 Phase 1, 2026-07-21) — now relies on the
+    (always-on) dashboard box picking up the repo copy at its next
+    boot-pull run, same "queue on merge, apply on next boot" convergence
+    model as the trading box used before the move (2026-07-13 operator
+    ruling on config#2352). A box that stays up unusually long, or a
+    boot-pull systemd-sync regression, could leave it stale for longer
+    than the "pages within a day" acceptance bar.
 
 This script is a same-box, read-only comparison — it runs AS a systemd timer
 ON the box that owns the units (no cross-box SSM reach, no new IAM grant:
@@ -50,8 +53,9 @@ INSTALLED_DIR = Path("/etc/systemd/system")
 
 # Which units THIS box is expected to have installed. Both daily-news and
 # metron-intraday units live in the repo, but a given box only ever installs
-# the ones relevant to it (dashboard box: daily-news; trading box:
-# metron-intraday) — install-daily-news.sh / install-metron-intraday.sh are
+# the ones relevant to it (dashboard box: both daily-news AND, as of
+# alpha-engine-config#1768 Phase 1, metron-intraday too — trading no longer
+# hosts it) — install-daily-news.sh / install-metron-intraday.sh are
 # each other's only callers of the corresponding pair. This script probes
 # whichever of the two pairs is ALREADY present on disk (a box that has
 # never installed a unit is not "drifted", it's simply not that unit's

@@ -19,6 +19,12 @@ hardcoded ``pip install`` pin for its drift-check alerting step
 (``nousergon_lib.alerts``) and is guarded here for the same reason
 (alpha-engine-config#2999: this file drifted a full version behind
 ``requirements.txt`` undetected until this test covered it).
+``infrastructure/data-trading-requirements.txt`` (slim metron-intraday /
+morning_enrich / daily_append subset installed on the ae-trading box,
+alpha-engine-config#1768 Phase 1) carries its own copy of the pin for the
+same reason the daily-news file does — added here rather than left to
+drift silently, since a NEW requirements file is invisible to this test
+unless explicitly wired in.
 
 Some Lambdas have deliberate exemptions documented in their requirements.txt
 comments. These must move in lockstep within their exemption group (e.g., all
@@ -183,18 +189,23 @@ def test_requirements_and_dockerfile_pins_match():
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
     docker_pin = _read_pin("Dockerfile", _DOCKERFILE_PIN_RE)
     daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
+    data_trading_pin = _read_pin(
+        "infrastructure/data-trading-requirements.txt", _REQUIREMENTS_PIN_RE
+    )
     deploy_infra_pin = _read_pin(
         ".github/workflows/deploy-infrastructure.yml", _LAMBDA_PIN_RE
     )
-    assert req_pin == docker_pin == daily_news_pin == deploy_infra_pin, (
+    assert req_pin == docker_pin == daily_news_pin == data_trading_pin == deploy_infra_pin, (
         f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
         f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}, "
+        f"infrastructure/data-trading-requirements.txt={data_trading_pin!r}, "
         f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}. "
-        f"All four must move in lockstep — the Dockerfile strips lib from "
+        f"All five must move in lockstep — the Dockerfile strips lib from "
         f"requirements.txt before pip install, so requirements-only bumps "
-        f"don't propagate to the Lambda image, the slim daily-news file "
-        f"carries an independent copy of the pin, and the deploy-infrastructure "
-        f"workflow's drift-check step installs its own copy directly."
+        f"don't propagate to the Lambda image, the slim daily-news and "
+        f"data-trading files each carry an independent copy of the pin, and "
+        f"the deploy-infrastructure workflow's drift-check step installs its "
+        f"own copy directly."
     )
 
 
