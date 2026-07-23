@@ -139,7 +139,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.124.10",
+        "v0.124.13",
         "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
         "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409); "
         "v0.124.0 for nousergon_lib.github_app — _github_token() mints the "
@@ -147,7 +147,10 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "nousergon-lib#220, incident config-I2784); bumped to v0.124.5 for config#2698 "
         "SpotQuotaExceededError on-demand fallback, first available at v0.124.1; "
         "bumped to v0.124.10 for ge.RULING_PENDING_LABEL — org-wide "
-        "ruling:pending-exec PR demand counting (config-I3227, nousergon-lib#232)",
+        "ruling:pending-exec PR demand counting (config-I3227, nousergon-lib#232); "
+        "bumped to v0.124.13 for nousergon-lib#236 (retire fresh_skip_active, "
+        "config#2146, groom-eligibility-2146-structural) — the first tag "
+        "published after that PR merged",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",
