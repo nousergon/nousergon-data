@@ -76,16 +76,49 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/sf_watch_liveness/*"
     },
     {
+      "Sid": "ListSfWatchLivenessPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["consolidated/sf_watch_liveness/*"]
+        }
+      }
+    },
+    {
       "Sid": "ReclaimCheckerCompletionMarkers",
       "Effect": "Allow",
       "Action": ["s3:GetObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/sf_watch/_control/completed/*"
     },
     {
+      "Sid": "ListSfWatchControlPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["sf_watch/_control/completed/*"]
+        }
+      }
+    },
+    {
       "Sid": "ReclaimCheckerWatchLogRW",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
+    },
+    {
+      "Sid": "ListConsolidatedSfWatchPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["consolidated/*_sf_watch/*"]
+        }
+      }
     },
     {
       "Sid": "ReclaimCheckerInvokeSpotDispatcher",

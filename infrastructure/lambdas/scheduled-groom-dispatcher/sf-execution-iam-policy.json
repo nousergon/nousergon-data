@@ -29,6 +29,17 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/completed/*"
     },
     {
+      "Sid": "ListGroomControlPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["groom/_control/completed/*"]
+        }
+      }
+    },
+    {
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": [
