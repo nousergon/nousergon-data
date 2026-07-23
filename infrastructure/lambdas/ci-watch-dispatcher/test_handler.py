@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import types
+from urllib.parse import urlparse
 
 import pytest
 
@@ -261,7 +262,9 @@ def test_dispatch_record_written_for_ci_watch_liveness_probe(monkeypatch):
     assert record["repo"] == "nousergon/alpha-engine-config"
     assert record["sha"] == "abc1234def5678900000000000000000000abcd"
     assert record["run_id"]
-    assert record["run_url"].startswith("https://github.com")
+    parsed_run_url = urlparse(record["run_url"])
+    assert parsed_run_url.scheme == "https"
+    assert parsed_run_url.netloc == "github.com"
     assert record["workflow"]
     assert record["branch"]
     assert record["instance_id"] == out["instance_id"]
