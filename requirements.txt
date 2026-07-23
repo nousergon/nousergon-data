@@ -55,7 +55,13 @@ arcticdb>=6.18.7
 # once that release ships; until then this repo's test suite exercises the
 # wiring against an editable install of the nousergon-lib branch (see this
 # PR's description) rather than a real pip-installable pin.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
+# RESOLVED (config#2957): nousergon-lib#225 merged 2026-07-19, v0.124.13 is
+# the first tagged release that includes it (and is the same tag the grooms
+# lockstep test enforces across all four install surfaces). The pin below
+# was deliberately left at v0.124.6 while #225 was in-flight — now bumped
+# to v0.124.13 so the code's external_id kwarg calls resolve at runtime,
+# not just through injected fakes.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.13
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

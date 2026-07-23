@@ -223,6 +223,90 @@ class TestSingleTickerIngest:
         embed.assert_not_called()
 
 
+# ── external_id dedup (config#2957) ─────────────────────────────────────
+
+
+class TestExternalIdDedup:
+    def test_document_exists_called_with_external_id(self):
+        """config#2957: document_exists_fn must be called with the
+        article's canonical_fingerprint as external_id so per-article
+        (not just per-day) dedup is possible."""
+        article = _make_article(fingerprint="fp-xyz", tickers=("AAPL",))
+        exists = MagicMock(return_value=False)
+        ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=MagicMock(return_value=[[0.0]]),
+            document_exists_fn=exists,
+            ingest_document_fn=MagicMock(return_value="doc"),
+        )
+        exists.assert_called_once_with("AAPL", "news", date(2026, 5, 13), "news_polygon", "fp-xyz")
+
+    def test_ingest_document_called_with_external_id(self):
+        """config#2957: ingest_document_fn must receive external_id so
+        the new per-article partial unique index actually dedups."""
+        article = _make_article(fingerprint="fp-abc", tickers=("AAPL",))
+        ingest = MagicMock(return_value="doc")
+        ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=MagicMock(return_value=[[0.0]]),
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+        assert ingest.call_args.kwargs["external_id"] == "fp-abc"
+
+    def test_two_distinct_same_day_articles_both_attempted_with_different_external_id(self):
+        """config#2957 acceptance: two distinct same-day articles for one
+        ticker/source must each get their own dedup identity — a fake
+        document_exists keyed on (ticker, external_id) (mirroring the new
+        partial unique index) lets BOTH persist instead of the second
+        silently colliding on the old (ticker, source, day)-only key."""
+        a1 = _make_article(fingerprint="fp-1", tickers=("AAPL",), title="Apple headline 1")
+        a2 = _make_article(fingerprint="fp-2", tickers=("AAPL",), title="Apple headline 2")
+
+        seen_external_ids: set[str] = set()
+
+        def fake_exists(ticker, doc_type, filed_date, source, external_id=None):
+            return external_id in seen_external_ids
+
+        def fake_ingest(*, external_id, **kw):
+            seen_external_ids.add(external_id)
+            return f"doc-{external_id}"
+
+        stats = ingest_articles(
+            [a1, a2],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=MagicMock(return_value=[[0.0]]),
+            document_exists_fn=fake_exists,
+            ingest_document_fn=fake_ingest,
+        )
+        assert stats["n_documents_ingested"] == 2
+        assert stats["n_documents_skipped_exists"] == 0
+
+    def test_same_article_reingested_dedups_via_external_id(self):
+        """config#2957 acceptance: re-ingesting the SAME article (same
+        fingerprint) still dedups, even against a fake keyed on
+        (ticker, external_id) rather than just (ticker, source, day)."""
+        article = _make_article(fingerprint="fp-same", tickers=("AAPL",))
+        seen_external_ids = {"fp-same"}  # already ingested in a prior run
+        exists = MagicMock(side_effect=lambda t, dt, fd, s, external_id=None: external_id in seen_external_ids)
+        embed = MagicMock()
+        ingest = MagicMock()
+
+        stats = ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=exists,
+            ingest_document_fn=ingest,
+        )
+        assert stats["n_documents_skipped_exists"] == 1
+        assert stats["n_documents_ingested"] == 0
+        embed.assert_not_called()
+        ingest.assert_not_called()
+
+
 # ── Multi-ticker article ────────────────────────────────────────────────
 
 
