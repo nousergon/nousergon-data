@@ -957,3 +957,120 @@ class TestHandlerReconcileMode:
         s3, store = env
         with pytest.raises(ValueError, match="unknown expense-collector event mode"):
             index.handler({"mode": "bogus"}, None)
+
+
+# ---------------------------------------------------------------------------
+# config#2968: quota-first CI_RUNNER_MODE auto-switch
+# ---------------------------------------------------------------------------
+
+def _gh_row(status="ok", used=0.0, limit=3000.0, error=None):
+    return {"status": status, "quota": {"used": used, "limit": limit}, "error": error}
+
+
+class TestCheckRunnerMode:
+    BUDGETS = {"providers": {"github_org": {"included_minutes": 3000}}}
+    MW = {"period": "2026-07"}
+
+    def test_below_threshold_flips_stale_codebuild_to_gha(self, monkeypatch):
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=2000.0))
+        monkeypatch.setattr(index, "_get_repo_variable", lambda *a, **k: {"value": "codebuild"})
+        calls = []
+        monkeypatch.setattr(index, "_set_repo_variable",
+                            lambda token, repo, name, value: calls.append(value))
+        secrets = {index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"}
+        result = index.check_runner_mode(self.MW, self.BUDGETS, secrets)
+        assert result["status"] == "ok"
+        assert result["changed"] is True
+        assert result["to_mode"] == "gha"
+        assert calls == ["gha"]
+
+    def test_at_or_above_threshold_flips_to_codebuild(self, monkeypatch):
+        # used == threshold exactly (2700.0 of 3000 * 0.90) must NOT be
+        # treated as "< threshold".
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=2700.0))
+        monkeypatch.setattr(index, "_get_repo_variable", lambda *a, **k: {"value": "gha"})
+        calls = []
+        monkeypatch.setattr(index, "_set_repo_variable",
+                            lambda token, repo, name, value: calls.append(value))
+        secrets = {index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"}
+        result = index.check_runner_mode(self.MW, self.BUDGETS, secrets)
+        assert result["desired_mode"] == "codebuild"
+        assert result["changed"] is True
+        assert calls == ["codebuild"]
+
+    def test_noop_when_live_value_already_matches_desired(self, monkeypatch):
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=100.0))
+        monkeypatch.setattr(index, "_get_repo_variable", lambda *a, **k: {"value": "gha"})
+        monkeypatch.setattr(index, "_set_repo_variable",
+                            lambda *a, **k: pytest.fail("must not PATCH when already correct"))
+        secrets = {index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"}
+        result = index.check_runner_mode(self.MW, self.BUDGETS, secrets)
+        assert result["status"] == "ok"
+        assert result["changed"] is False
+        assert result["mode"] == "gha"
+
+    def test_variable_never_created_reads_as_unset_not_gha(self, monkeypatch):
+        """A brand-new repo variable: _get_repo_variable returns None (404).
+        Must be treated as "not gha" (i.e. codebuild-equivalent), not crash."""
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=100.0))
+        monkeypatch.setattr(index, "_get_repo_variable", lambda *a, **k: None)
+        calls = []
+        monkeypatch.setattr(index, "_set_repo_variable",
+                            lambda token, repo, name, value: calls.append(value))
+        secrets = {index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"}
+        result = index.check_runner_mode(self.MW, self.BUDGETS, secrets)
+        assert result["changed"] is True
+        assert calls == ["gha"]
+
+    def test_missing_write_token_is_not_configured_not_error(self, monkeypatch):
+        """Self-heals like SSM_GITHUB_USER_PAT: absent param degrades to
+        not_configured (no page), never a hard error, until an operator adds
+        the SSM param — same contract as the rest of this Lambda's secrets."""
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=100.0))
+        monkeypatch.setattr(index, "_get_repo_variable",
+                            lambda *a, **k: pytest.fail("must not call GitHub without a token"))
+        result = index.check_runner_mode(self.MW, self.BUDGETS, {})
+        assert result["status"] == "not_configured"
+        assert index.SSM_GITHUB_CI_RUNNER_PAT in result["error"]
+        assert result["desired_mode"] == "gha"  # still computed, just can't act on it
+
+    def test_missing_included_minutes_is_error(self, monkeypatch):
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=100.0, limit=None))
+        secrets = {index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"}
+        result = index.check_runner_mode(self.MW, {"providers": {}}, secrets)
+        assert result["status"] == "error"
+        assert "included_minutes" in result["error"]
+
+    def test_collect_github_error_propagates(self, monkeypatch):
+        monkeypatch.setattr(index, "collect_github",
+                            lambda *a, **k: _gh_row(status="error", error="HTTP 500 from github"))
+        secrets = {index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"}
+        result = index.check_runner_mode(self.MW, self.BUDGETS, secrets)
+        assert result["status"] == "error"
+        assert "HTTP 500" in result["error"]
+
+
+class TestHandlerRunnerModeCheckMode:
+    def test_handler_mode_runner_mode_check_dispatches(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        s3 = FakeS3({"config/expense_budgets.json":
+                     json.dumps({"providers": {"github_org": {"included_minutes": 3000}}})})
+        ssm = FakeSSM({index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"})
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=50.0))
+        monkeypatch.setattr(index, "_get_repo_variable", lambda *a, **k: {"value": "gha"})
+        result = index.handler({"mode": "runner_mode_check"}, None)
+        assert result["status"] == "ok"
+        assert result["changed"] is False
+
+    def test_handler_raises_on_runner_mode_check_error(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        s3 = FakeS3({"config/expense_budgets.json": json.dumps({"providers": {}})})
+        ssm = FakeSSM({index.SSM_GITHUB_CI_RUNNER_PAT: "pat-xxx"})
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "collect_github", lambda *a, **k: _gh_row(used=50.0))
+        monkeypatch.setattr(index, "_get_repo_variable",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("HTTP 401 from GET ...: Bad credentials")))
+        with pytest.raises(RuntimeError, match="runner_mode_check failed"):
+            index.handler({"mode": "runner_mode_check"}, None)
