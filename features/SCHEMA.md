@@ -120,6 +120,9 @@ parity.
 | `sector_vs_spy_5d` | decimal return (bare-named convention) | `sector_etf_5d - SPY_5d` | predictor |
 | `sector_vs_spy_10d` | decimal return (bare-named convention) | `sector_etf_10d - SPY_10d` | predictor |
 | `sector_vs_spy_20d` | decimal return (bare-named convention) | `sector_etf_20d - SPY_20d` | predictor |
+| `sub_sector_vs_benchmark_5d` | decimal return (bare-named convention) | `sub_sector_etf_5d - SPY_5d` (sub-sector ETF via sub_sector_etf_map, falls back to sector ETF) | predictor |
+| `sub_sector_vs_benchmark_10d` | decimal return (bare-named convention) | `sub_sector_etf_10d - SPY_10d` (sub-sector ETF via sub_sector_etf_map, falls back to sector ETF) | predictor |
+| `sub_sector_vs_benchmark_20d` | decimal return (bare-named convention) | `sub_sector_etf_20d - SPY_20d` (sub-sector ETF via sub_sector_etf_map, falls back to sector ETF) | predictor |
 | `price_accel` | decimal (5d return − 20d return) | `momentum_5d - momentum_20d` | predictor |
 | `ema_cross_8_21` | ratio (bare-named convention, `EMA8/EMA21 - 1`) | `EMA(8) / EMA(21) - 1` | predictor |
 | `atr_14_pct` | decimal pct (`_pct` suffix) | `ATR(14) / close` | predictor + scanner (consumer ×100 to display %) |
