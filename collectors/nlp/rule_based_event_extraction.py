@@ -1,5 +1,5 @@
 """Rule-based event extractor — deterministic replacement for the
-Haiku-backed ``AnthropicEventExtractor``.
+prior LLM-backed event extractor.
 
 Maps a NewsArticle to one-or-more :class:`EventFlag` records using
 two zero-cost signals already on the wire:
@@ -183,7 +183,7 @@ class RuleBasedEventExtractor:
 
     Implements the :class:`EventExtractor` Protocol (duck-typed; the
     ``name`` + ``extract`` shape matches). Drop-in replacement for
-    :class:`collectors.nlp.event_extraction.AnthropicEventExtractor`.
+    the prior LLM-backed event extractor it replaced.
 
     Stateless — safe to share across threads / async tasks. Construction
     is cheap (no model load, no API client, no warm-up).
