@@ -31,4 +31,14 @@ boto3>=1.34.0
 # Lambda's _enumerate_ruling_pending_prs/_enumerate_tier_stats(_fresh)
 # (config-I3227) reference it directly and WILL AttributeError against
 # v0.124.9 or earlier (verified: v0.124.9 predates commit 50e22c4).
+# PENDING (config#2146, this PR, gate:dependency on nousergon-lib PR
+# feat/groom-eligibility-2146-structural merging + a new tag publishing):
+# this Lambda's own code no longer calls ge.fresh_skip_active/
+# ge.FRESH_SKIP_HOURS at all (both retired from the lib in that PR) — the
+# 72h fresh-skip cooldown is gone, disposition-structural eligibility
+# (ge.is_actionable) is the only gate left. This pin still points at
+# v0.124.10 deliberately: bump it to the first tag published AFTER that lib
+# PR merges before taking this PR out of draft (the current pin still HAS
+# fresh_skip_active, so this Lambda runs correctly either way in the
+# meantime — the removed call sites just mean it was never exercised).
 nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.10
