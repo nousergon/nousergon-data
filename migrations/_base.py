@@ -149,17 +149,30 @@ def rewrite_symbols_full(
     *,
     expected_columns: tuple[str, ...],
     new_columns: dict[str, Any] | None = None,
+    new_columns_fn: Callable[[str, pd.DataFrame], dict[str, Any]] | None = None,
     project: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
 ) -> int:
     """FULL-WRITE every symbol in ``lib`` to the ``expected_columns`` schema.
 
     This is the ONLY descriptor-crossing primitive (config#2459): each symbol's
-    complete history is read, widened with ``new_columns`` (name -> fill value;
-    e.g. ``np.nan`` for a not-retro-computable additive column), re-projected to
-    the canonical order via ``project`` (defaults to
+    complete history is read, widened with ``new_columns``/``new_columns_fn``,
+    re-projected to the canonical order via ``project`` (defaults to
     ``store.arctic_store.to_arctic_canonical``), then written with
     ``write_batch(prune_previous_versions=True)``. ``update()`` is deliberately
     NOT used — it cannot evolve a static-schema descriptor.
+
+    ``new_columns``: name -> uniform fill value (e.g. ``np.float32("nan")`` for
+    a not-retro-computable additive column) — applied identically to every
+    symbol.
+
+    ``new_columns_fn``: ``(symbol, df) -> {name: value_or_series}`` — called
+    per-symbol AFTER ``new_columns`` is applied, for a RECOMPUTE backfill
+    policy where the new column's history is retro-computed from real data
+    rather than filled. ``df`` is the symbol's full pre-migration history
+    (its existing persisted columns, e.g. ``sector_vs_spy_*``, are readable
+    for reuse); a returned ``pd.Series`` is assigned by index-alignment, a
+    scalar is broadcast. Only columns not already present in ``df`` are set,
+    same precedence as ``new_columns``.
 
     Idempotent: re-running against already-migrated symbols re-derives the same
     canonical frame and rewrites it in place. Returns the number of symbols
@@ -187,6 +200,11 @@ def rewrite_symbols_full(
                     # (whose feature columns are float32) — the exact trap this
                     # dtype discipline prevents.
                     df[col] = np.full(len(df), fill)
+        if new_columns_fn:
+            computed = new_columns_fn(sym, df)
+            for col, value in computed.items():
+                if col not in df.columns:
+                    df[col] = value
         canonical = project(df)
         got = tuple(canonical.columns)
         if got != expected_columns:

@@ -1,7 +1,8 @@
 """Pins the watch-plane Lambda alarm setup script (config#2266; roster
 extended to 8 functions + an intake-queue age alarm by config-I2900/I2910;
 extended to 9 functions by alpha-engine-config-I3242's arctic-migration-
-dispatcher onboarding).
+dispatcher onboarding; extended to 11 functions by config#3173's
+ci-watch-liveness-probe + alert-drain-liveness-probe onboarding).
 
 setup_watch_plane_alarms.sh puts CloudWatch Errors + Throttles alarms on each
 of the watch-plane Lambdas — the components whose job is to notice fleet
@@ -55,7 +56,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All nine watch-plane Lambdas must be alarmed."""
+    """All eleven watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -63,6 +64,12 @@ class TestWatchPlaneCoverage:
             "alpha-engine-saturday-sf-watch-dispatcher",
             "alpha-engine-sf-watch-spot-dispatcher",
             "alpha-engine-ci-watch-dispatcher",
+            # Added config#3173: mid-run spot-reclaim checkers for the
+            # ci-watch and alert-drain families, mirroring
+            # sf-watch-liveness-probe's config#2270 mechanism — onboarded in
+            # the same PR that ships them.
+            "alpha-engine-ci-watch-liveness-probe",
+            "alpha-engine-alert-drain-liveness-probe",
             "alpha-engine-sf-watch-liveness-probe",
             # The registry-driven unified probe (alpha-engine-config-I2831) — its
             # own Errors metric is the dead-probe backstop the fail-loud contract
@@ -91,7 +98,7 @@ class TestWatchPlaneCoverage:
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 9
+        assert block.count('"alpha-engine-') == 11
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
