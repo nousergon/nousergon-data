@@ -61,6 +61,14 @@ jobs:
           python3 infrastructure/lambdas/changelog-incident-mirror/test_handler.py
           python3 infrastructure/lambdas/changelog-cloudwatch-mirror/test_handler.py
 
+      # Repo-wide _shared/ guards that are not per-lambda test_handler.py files,
+      # so the glob step above never picks them up. Bare unittest, no
+      # pytest/boto3 needed. alpha-engine-config#3189: pins that every
+      # box-launching dispatcher has terminate-on-failure coverage.
+      - name: Run shared lambda guard tests
+        run: |
+          python3 infrastructure/lambdas/_shared/test_terminate_coverage.py
+
       # config#1759: the two suites above were the ONLY lambda handler tests
       # that ran pre-merge — every other infrastructure/lambdas/*/test_handler.py
       # (groom-liveness-probe, freshness-monitor, scheduled-groom-dispatcher,
