@@ -943,6 +943,11 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
                 "failed_state": record.get("failed_state"),
             },
             silent_topic=FleetTelegramTopic.OPS_HEALTH,
+            # No playbooks.yaml alert_classes row exists yet for this
+            # Lambda's own identity (config-I3513 audit finding). Using
+            # _FLOW_NAME is still strictly correct; follow-up filed to add
+            # a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("watch Telegram record failed (non-fatal): %s", exc)
@@ -987,6 +992,11 @@ def _escalate_budget_exhausted(record: dict, key: str, pipeline_name: str, run_d
                 "prior_dispatch_count": record.get("prior_dispatch_count"),
                 "dispatch_ceiling": record.get("dispatch_ceiling"),
             },
+            # No playbooks.yaml alert_classes row exists yet for this
+            # Lambda's own identity (config-I3513 audit finding). Using
+            # _FLOW_NAME is still strictly correct; follow-up filed to add
+            # a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; suppression already recorded in the watch-log
         logger.warning("budget-exhausted escalation Telegram send failed (non-fatal): %s", exc)

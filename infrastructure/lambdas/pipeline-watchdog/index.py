@@ -388,6 +388,11 @@ def _check_sf(
         topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
         context={"sf_label": sf_label, "sf_arn": sf_arn},
+        # Must match the SNS/bus alerts.publish() source= above exactly —
+        # both paths alert on the same event, and the registered
+        # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
+        # string (config-I3513).
+        source="alpha-engine-pipeline-watchdog",
     )
     logger.warning(
         "watchdog ALERT: sf=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",

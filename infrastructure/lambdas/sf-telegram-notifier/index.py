@@ -217,6 +217,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
             "status": status,
         },
         silent_topic=FleetTelegramTopic.PIPELINE,
+        # Matches playbooks.yaml's registered `sf_completion_telegram` class
+        # source exactly (config-I3513).
+        source="flow-doctor:sf-telegram-notifier",
     )
 
     return {

@@ -328,6 +328,9 @@ def _alert_over_budget(row: dict, period: str) -> bool:
             text, silent=False, severity="warning", dedup_key=dedup_key,
             flow_name=_FLOW_NAME, topics=_ALERT_TOPICS, db_basename=_DB_BASENAME,
             context={"provider": row["key"], "period": period, "pace": row["pace"]},
+            # Matches playbooks.yaml's registered `expense_collector_telegram`
+            # class source exactly (config-I3513).
+            source="flow-doctor:expense-collector",
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface only
         logger.warning("over-budget alert Telegram send failed (non-fatal): %s", exc)

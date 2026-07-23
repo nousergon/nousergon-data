@@ -136,6 +136,113 @@ def test_real_notify_via_flow_doctor_does_not_refuse_real_owner_repo(monkeypatch
     get_fd_mock.assert_called_once()
 
 
+# ── source= propagation (config-I3513) ──────────────────────────────────────
+#
+# ``notify_via_flow_doctor`` has no way to pass ``source`` down to
+# ``krepis.telegram.send_message`` (which has no such parameter — it always
+# calls ``krepis.fleet_events.emit_alert_event`` with no explicit source, so
+# attribution resolves via ``_resolve_source``: explicit arg (never supplied
+# on this path) > ``KREPIS_EVENT_SOURCE`` env > Lambda runtime identity). The
+# fix sets ``KREPIS_EVENT_SOURCE`` for the duration of the call — these tests
+# exercise the REAL module directly (mirroring the two tests above), never
+# the file's hermetic stub.
+
+
+def test_notify_via_flow_doctor_sets_krepis_event_source_env_during_call(monkeypatch):
+    """An explicit ``source=`` must be visible as ``KREPIS_EVENT_SOURCE`` in
+    the environment at the moment the Telegram send actually fires — this is
+    the only lever available to attribute the resulting bus event correctly,
+    since ``krepis.telegram.send_message`` has no ``source`` parameter."""
+    monkeypatch.delenv("KREPIS_EVENT_SOURCE", raising=False)
+    seen_source = {}
+
+    def _fake_send_message(text, *, disable_notification=False):
+        seen_source["value"] = os.environ.get("KREPIS_EVENT_SOURCE")
+        return True
+
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", mock.Mock(return_value=None))
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", _fake_send_message)
+
+    result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+        "text", silent=False, severity="error", dedup_key="k",
+        flow_name="freshness-monitor", topics=(), db_basename="db",
+        source="freshness-monitor",
+    )
+    assert result is True
+    assert seen_source["value"] == "freshness-monitor"
+    # Restored to unset after the call — a warm Lambda container must never
+    # leak one invocation's source into the next.
+    assert os.environ.get("KREPIS_EVENT_SOURCE") is None
+
+
+def test_notify_via_flow_doctor_no_source_leaves_krepis_event_source_untouched(monkeypatch):
+    """Omitting ``source`` (the pre-fix default) must not touch
+    ``KREPIS_EVENT_SOURCE`` at all — preserves whatever env-level
+    attribution (or lack thereof) was already in effect, matching the
+    documented backward-compat contract."""
+    monkeypatch.delenv("KREPIS_EVENT_SOURCE", raising=False)
+    seen_source = {}
+
+    def _fake_send_message(text, *, disable_notification=False):
+        seen_source["value"] = os.environ.get("KREPIS_EVENT_SOURCE")
+        return True
+
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", mock.Mock(return_value=None))
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", _fake_send_message)
+
+    result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+        "text", silent=False, severity="error", dedup_key="k",
+        flow_name="freshness-monitor", topics=(), db_basename="db",
+    )
+    assert result is True
+    assert seen_source["value"] is None
+    assert "KREPIS_EVENT_SOURCE" not in os.environ
+
+
+def test_notify_via_flow_doctor_restores_prior_krepis_event_source(monkeypatch):
+    """A caller invoked inside a warm container that already has
+    ``KREPIS_EVENT_SOURCE`` set (e.g. by an outer chokepoint) must get that
+    prior value back afterward, not have it wiped or left as this call's
+    override."""
+    monkeypatch.setenv("KREPIS_EVENT_SOURCE", "some-outer-source")
+
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", mock.Mock(return_value=None))
+    monkeypatch.setattr(_real_flow_doctor_telegram, "send_message", mock.Mock(return_value=True))
+
+    _real_flow_doctor_telegram.notify_via_flow_doctor(
+        "text", silent=False, severity="error", dedup_key="k",
+        flow_name="freshness-monitor", topics=(), db_basename="db",
+        source="inner-source",
+    )
+    assert os.environ.get("KREPIS_EVENT_SOURCE") == "some-outer-source"
+
+
+def test_notify_via_flow_doctor_sets_source_across_primary_flow_doctor_path(monkeypatch):
+    """The override must also cover the primary ``fd.notify_event`` path
+    (not just the ``fd is None`` fallback to ``send_message``) — that path
+    is what a real, configured flow-doctor instance takes in production."""
+    monkeypatch.delenv("KREPIS_EVENT_SOURCE", raising=False)
+    seen_source = {}
+
+    fake_fd = mock.Mock()
+
+    def _fake_notify_event(subject, *, body, severity, context, dedup_key):
+        seen_source["value"] = os.environ.get("KREPIS_EVENT_SOURCE")
+        return "report-id-123"
+
+    fake_fd.notify_event.side_effect = _fake_notify_event
+    monkeypatch.setattr(_real_flow_doctor_telegram, "get_flow_doctor", mock.Mock(return_value=fake_fd))
+
+    result = _real_flow_doctor_telegram.notify_via_flow_doctor(
+        "text", silent=False, severity="error", dedup_key="k",
+        flow_name="freshness-monitor", topics=(), db_basename="db",
+        source="freshness-monitor",
+    )
+    assert result is True
+    assert seen_source["value"] == "freshness-monitor"
+    assert os.environ.get("KREPIS_EVENT_SOURCE") is None
+
+
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 
@@ -707,6 +814,46 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
     assert call.kwargs["dedup_key"] == "freshness_x_2026-W22"
     notify_mock.assert_called_once()
     assert notify_mock.call_args.kwargs["dedup_key"] == "freshness_x_2026-W22"
+
+
+def test_maybe_alert_telegram_path_carries_freshness_monitor_source(monkeypatch, fixed_now):
+    """Regression guard for config-I3513: the Telegram path's
+    ``notify_via_flow_doctor`` call must carry ``source="freshness-monitor"``,
+    matching the SNS/bus ``publish(source=...)`` call exactly. Before the
+    fix, the Telegram path passed no ``source`` at all, so attribution
+    silently fell back to the Lambda's runtime ``AWS_LAMBDA_FUNCTION_NAME``
+    identity (``alpha-engine-freshness-monitor``) — a string matching NO row
+    in ``playbooks.yaml``'s ``alert_classes`` (confirmed live: 7 of 10
+    intake events unclassified)."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(
+        state="missing", sla_violated_by_minutes=120,
+        canonical_key="k/2026-05-30", reason="absent",
+    )
+    publish_mock = mock.Mock()
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+    assert index._maybe_alert(spec, result, fixed_now) is True
+
+    publish_mock.assert_called_once()
+    assert publish_mock.call_args.kwargs["source"] == "freshness-monitor"
+    notify_mock.assert_called_once()
+    assert notify_mock.call_args.kwargs["source"] == "freshness-monitor"
+    # Both paths alert on the SAME event — the two sources must match
+    # exactly, or Overseer alert-drain sees them as different classes.
+    assert publish_mock.call_args.kwargs["source"] == notify_mock.call_args.kwargs["source"]
 
 
 def test_maybe_alert_warning_missing_console_only(monkeypatch, fixed_now):

@@ -194,6 +194,13 @@ def _notify(verdict: dict, key: str, run_date: str) -> bool:
             db_basename=_DB_BASENAME,
             context={"run_date": run_date, "go": go, "uncertain": uncertain},
             silent_topic=FleetTelegramTopic.OPS_HEALTH,
+            # No playbooks.yaml alert_classes row exists yet for this Lambda's
+            # own identity (config-I3513 audit finding) — using _FLOW_NAME is
+            # still strictly correct (matches this Lambda's own naming
+            # convention, consistent with every other caller in this repo)
+            # even though the event will currently classify as unregistered
+            # in Overseer until a row is added. Follow-up filed to add one.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("integrity Telegram failed (non-fatal): %s", exc)

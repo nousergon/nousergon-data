@@ -1131,6 +1131,10 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
             "state": result.state,
             "owner_repo": spec.owner_repo,
         },
+        # Must match the SNS/bus path's source= above exactly — both paths
+        # alert on the same event, and the registered `freshness_monitor_staleness`
+        # class in playbooks.yaml keys on this string (config-I3513).
+        source="freshness-monitor",
     )
     return True
 
