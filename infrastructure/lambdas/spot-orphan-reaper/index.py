@@ -103,6 +103,19 @@ WATCH_KINDS: tuple[WatchKind, ...] = (
         label="SF-watch",
         result_key="sf_watch_incomplete_reaps",
     ),
+    # config#3173: alert-drain had ZERO incomplete-reap coverage — a drain box
+    # whose on-box watchdog failed to arm silently ate the fleet-wide age cap
+    # with nobody told (the same class of miss ci-watch/sf-watch already
+    # close here). completion_prefix + the single alert-drain-run-id
+    # discriminator tag match scripts/alert_drain_run.sh's completion_key()
+    # exactly (`overseer/_control/completed/alert-drain-{run_id}.json`).
+    WatchKind(
+        tag_name="alpha-engine-alert-drain-spot",
+        completion_prefix="overseer/_control/completed/alert-drain-",
+        discriminator_tag_keys=("alert-drain-run-id",),
+        label="Alert-drain",
+        result_key="alert_drain_incomplete_reaps",
+    ),
 )
 _WATCH_KIND_BY_TAG_NAME: dict[str, WatchKind] = {wk.tag_name: wk for wk in WATCH_KINDS}
 _ALL_DISCRIMINATOR_TAG_KEYS: tuple[str, ...] = tuple(

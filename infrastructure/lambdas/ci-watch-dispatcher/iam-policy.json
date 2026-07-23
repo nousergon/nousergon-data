@@ -130,6 +130,12 @@
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::alpha-engine-research/ci_watch/_control/signatures/*"
+    },
+    {
+      "Sid": "WriteCiWatchDispatchRecordForReclaimChecker",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/ci_watch/_control/dispatched/*"
     }
   ]
 }
