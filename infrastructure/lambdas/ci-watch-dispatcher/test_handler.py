@@ -74,6 +74,7 @@ class _FakeS3:
 
     def __init__(self, objects: dict | None = None):
         self._objects = objects or {}
+        self.puts: list[dict] = []
 
     def list_objects_v2(self, Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
         keys = [k for k in self._objects if k.startswith(Prefix)]
@@ -81,6 +82,10 @@ class _FakeS3:
 
     def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
         return {"Body": _FakeS3Body(self._objects[Key])}
+
+    def put_object(self, Bucket, Key, Body, ContentType=None):  # noqa: N803 — boto3 kwarg names
+        self.puts.append({"Bucket": Bucket, "Key": Key, "Body": Body, "ContentType": ContentType})
+        return {}
 
 
 class _FakeWaiter:
@@ -234,6 +239,52 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     assert "token" in sent["Comment"]
 
     assert sent["Parameters"]["executionTimeout"] == [str(idx.MAX_RUNTIME_SECONDS)]
+
+
+def test_dispatch_record_written_for_ci_watch_liveness_probe(monkeypatch):
+    """config#3173: right after a successful launch, the full dispatch fields
+    land at ci_watch/_control/dispatched/{repo}-{sha}.json — the sibling
+    ci-watch-liveness-probe Lambda's ONLY way to reconstruct a relaunch if
+    this box is reclaimed mid-run (it has no watch-log to read from, unlike
+    Fleet-SF Watch)."""
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+
+    puts = idx._test_s3.puts
+    assert len(puts) == 1
+    assert puts[0]["Key"] == (
+        "ci_watch/_control/dispatched/nousergon-alpha-engine-config-"
+        "abc1234def5678900000000000000000000abcd.json"
+    )
+    record = json.loads(puts[0]["Body"])
+    assert record["repo"] == "nousergon/alpha-engine-config"
+    assert record["sha"] == "abc1234def5678900000000000000000000abcd"
+    assert record["run_id"]
+    assert record["run_url"].startswith("https://github.com")
+    assert record["workflow"]
+    assert record["branch"]
+    assert record["instance_id"] == out["instance_id"]
+
+
+def test_dispatch_record_skipped_for_drill(monkeypatch):
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(is_drill="true"), None)
+    assert out["launched"] is True
+    assert idx._test_s3.puts == []
+
+
+def test_dispatch_record_write_failure_does_not_block_launch(monkeypatch):
+    """Best-effort: a broken S3 write must never fail the primary dispatch —
+    it only degrades the reclaim checker to its own escalation path later."""
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+
+    def _boom(Bucket, Key, Body, ContentType=None):  # noqa: N803
+        raise RuntimeError("S3 outage")
+
+    idx._test_s3.put_object = _boom
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
 
 
 def test_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
