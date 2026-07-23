@@ -72,9 +72,12 @@ this function exists) — see the PR body's deploy plan.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import (
@@ -134,6 +137,19 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("ARCTIC_MIGRATION_MAX_RUNTIME_SECONDS",
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("ARCTIC_MIGRATION_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("ARCTIC_MIGRATION_CW_LOG_GROUP", "/alpha-engine/arctic-migration-spot")
 
+# ── Defer-not-drop config (config#2226, mirroring sf-watch-spot-dispatcher) ──
+# When a launched box writes `refused_mutex_active`, the defer cycle re-checks
+# the marker periodically. On each deferred re-check that still finds mutex
+# held, we launch a FRESH box (which re-evaluates the mutex against live state)
+# AND create a one-shot safety-net schedule for the next check. On exhaustion
+# (gen >= DEFER_MAX_GENERATION) the migration escalates to a P1.
+DEFER_DELAY_SECONDS = int(os.environ.get("ARCTIC_MIGRATION_DEFER_DELAY_SECONDS", "900"))  # 15 min
+DEFER_MAX_GENERATION = int(os.environ.get("ARCTIC_MIGRATION_DEFER_MAX_GENERATION", "3"))
+DEFER_ROLE_ARN = os.environ.get("ARCTIC_MIGRATION_DEFER_ROLE_ARN", "")
+DEFER_ROLE_NAME = "alpha-engine-arctic-migration-defer-scheduler-role"
+DEFER_SCHEDULE_GROUP = os.environ.get("ARCTIC_MIGRATION_DEFER_SCHEDULE_GROUP", "default")
+COMPLETION_BUCKET = os.environ.get("ARCTIC_MIGRATION_COMPLETION_BUCKET", "alpha-engine-research")
+
 TAG_NAME = "alpha-engine-arctic-migration-spot"
 HEAD_TAG_KEY = "arctic-migration-head"
 
@@ -161,6 +177,242 @@ def _resolve_event_fields(event: dict) -> dict:
         )
     return {"merged_sha": merged_sha, "head_migration_number": int(head_raw)}
 
+
+# ── Defer-not-drop helpers (mirror sf-watch-spot-dispatcher's config#2226 pattern) ──
+
+
+def _completion_marker_key(head_migration_number: int) -> str:
+    """S3 key for the migration run's terminal-state marker (mirrors
+    scripts/run_arctic_migrations.py's ``completion_marker_key``)."""
+    return (
+        f"overseer/_control/completed/"
+        f"arctic-migration-{head_migration_number:04d}.json"
+    )
+
+
+def _defer_schedule_name(head_migration_number: int, generation: int) -> str:
+    """Deterministic one-shot schedule name for (head, generation) — the
+    determinism IS the idempotency lock: a duplicate defer attempt for the same
+    key+generation hits ConflictException and is treated as already-deferred.
+    EventBridge Scheduler caps Name at 64 chars; the readable form overflows
+    for 6-digit head numbers (51 chars — fine), but the digest fallback is
+    here for completeness, mirroring sf-watch-spot-dispatcher's same pattern."""
+    name = f"arctic-migration-defer-{head_migration_number:04d}-g{generation}"
+    if len(name) <= 64:
+        return name
+    digest = hashlib.sha256(
+        f"arctic-migration-{head_migration_number}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"arctic-migration-defer-{digest}-g{generation}"
+
+
+def _is_scheduler_conflict(exc: Exception) -> bool:
+    """True when the Scheduler API says the schedule already exists — matched
+    by exception class name AND botocore error code (covers both the real
+    boto3 ConflictException class and a generic ClientError carrying it)."""
+    if type(exc).__name__ == "ConflictException":
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return response.get("Error", {}).get("Code") == "ConflictException"
+    return False
+
+
+def _read_completion_marker(
+    head_migration_number: int,
+    bucket: str = COMPLETION_BUCKET,
+    region: str = REGION,
+) -> dict | None:
+    """Read the migration-run completion marker from S3. Returns None if
+    the marker doesn't exist yet (box still running or never wrote one) or
+    if the read fails (logged, non-fatal)."""
+    import boto3  # defer import: not needed on every invocation
+
+    key = _completion_marker_key(head_migration_number)
+    try:
+        resp = boto3.client("s3", region_name=region).get_object(
+            Bucket=bucket, Key=key
+        )
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except boto3.client("s3").exceptions.NoSuchKey:
+        return None
+    except Exception as exc:  # noqa: BLE001 — non-fatal; caller treats None as "in flight"
+        logger.warning(
+            "completion marker read FAILED for s3://%s/%s (non-fatal, treating "
+            "as in-flight): %s: %s",
+            bucket, key, type(exc).__name__, exc,
+        )
+        return None
+
+
+def _schedule_defer_check(
+    fields: dict, generation: int, context,
+) -> tuple[str | None, str]:
+    """Create a ONE-SHOT EventBridge Scheduler schedule that re-invokes this
+    same Lambda with ``defer_generation=generation`` after
+    DEFER_DELAY_SECONDS, so the deferred invocation can re-check the
+    completion marker and decide whether to launch a fresh box or escalate.
+    Returns (schedule_name, fire_at_iso) on success, or (None, error_message)
+    on failure — the caller returns `defer_schedule_failed` for the latter.
+
+    ``_is_scheduler_conflict`` idempotency: a duplicate call for the same
+    (head, generation) returns the existing schedule name with
+    ``already_scheduled=True`` as an info-logged no-op (the earlier schedule
+    already covers this re-check)."""
+    schedule_name = _defer_schedule_name(
+        fields["head_migration_number"], generation,
+    )
+    function_arn = str(getattr(context, "invoked_function_arn", "") or "")
+    if not function_arn:
+        logger.error(
+            "defer schedule FAILED for head %d gen %d: "
+            "no invoked_function_arn on the Lambda context",
+            fields["head_migration_number"], generation,
+        )
+        return None, "no invoked_function_arn on context"
+
+    # Target the UNQUALIFIED function ARN so the deferred invoke always runs
+    # the live code (mirrors sf-watch-spot-dispatcher).
+    target_arn = ":".join(function_arn.split(":")[:7])
+    role_arn = DEFER_ROLE_ARN or (
+        f"arn:aws:iam::{function_arn.split(':')[4]}:role/{DEFER_ROLE_NAME}"
+    )
+
+    payload = {
+        "merged_sha": fields["merged_sha"],
+        "head_migration_number": fields["head_migration_number"],
+    }
+    payload["defer_generation"] = generation
+    fire_at = datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECONDS)
+
+    import boto3  # noqa: F811 — defer import (not needed every invocation)
+
+    try:
+        boto3.client("scheduler", region_name=REGION).create_schedule(
+            Name=schedule_name,
+            GroupName=DEFER_SCHEDULE_GROUP,
+            # at() with no ScheduleExpressionTimezone is UTC — matches fire_at.
+            ScheduleExpression=f"at({fire_at.strftime('%Y-%m-%dT%H:%M:%S')})",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            ActionAfterCompletion="DELETE",  # one-shot: self-deletes after firing
+            Description=(
+                f"arctic-migration defer-not-drop re-check (config#2226): head "
+                f"{fields['head_migration_number']:04d} generation {generation}"
+            ),
+            Target={
+                "Arn": target_arn,
+                "RoleArn": role_arn,
+                "Input": json.dumps(payload),
+                "RetryPolicy": {
+                    "MaximumRetryAttempts": 3,
+                    "MaximumEventAgeInSeconds": 3600,
+                },
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — synchronous contract: clean JSON verdict, never raise
+        if _is_scheduler_conflict(exc):
+            logger.info(
+                "defer schedule %s already exists — treating as already-scheduled "
+                "(carries forward the prior re-check window)",
+                schedule_name,
+            )
+            # Return the schedule_name as a signal so the caller can surface
+            # it in the verdict; the concurrent creation is benign.
+            return schedule_name, "already_exists"
+        logger.error(
+            "defer schedule creation FAILED for %s (%s: %s) — this defer "
+            "cycle will NOT auto-retry; escalation applies",
+            schedule_name, type(exc).__name__, exc,
+        )
+        return None, f"{type(exc).__name__}: {exc}"
+
+    logger.warning(
+        "defer schedule %s created: re-invokes at %sZ (head %04d, gen %d)",
+        schedule_name, fire_at.strftime("%Y-%m-%dT%H:%M:%S"),
+        fields["head_migration_number"], generation,
+    )
+    return schedule_name, fire_at.isoformat()
+
+
+# ---- Deferred-invocation handler (called by the one-shot schedule) ---------
+
+
+def _handle_deferred(fields: dict, defer_generation: int, context) -> dict:
+    """Handle a deferred re-invoke: read the completion marker and decide
+    whether to launch a fresh box (mutex likely cleared), defer again, or
+    escalate to P1 on exhaustion.
+
+    Returns a terminal verdict dict — the caller (``handler``) returns it
+    directly without entering the normal launch flow."""
+    marker = _read_completion_marker(fields["head_migration_number"])
+
+    if marker is None:
+        # No marker yet — the original (or a prior deferred) box is still
+        # running (or never wrote one). Don't interfere; return recovered.
+        logger.info(
+            "deferred check (head %04d, gen %d): no completion marker yet — "
+            "migration in flight, treating as recovered",
+            fields["head_migration_number"], defer_generation,
+        )
+        return {
+            "launched": False, "reason": "recovered",
+            "marker_state": None, "defer_generation": defer_generation,
+        }
+
+    marker_state = str(marker.get("state") or "unknown")
+    if marker_state != "refused_mutex_active":
+        # The migration reached a different terminal state (success/failure/
+        # noop_up_to_date/refused_mutex_probe_failed) — no further action
+        # needed from the defer cycle.
+        logger.info(
+            "deferred check (head %04d, gen %d): marker state=%s — recovered",
+            fields["head_migration_number"], defer_generation, marker_state,
+        )
+        return {
+            "launched": False, "reason": "recovered",
+            "marker_state": marker_state, "defer_generation": defer_generation,
+        }
+
+    # Marker still says refused_mutex_active.
+    if defer_generation >= DEFER_MAX_GENERATION:
+        logger.error(
+            "arctic-migration defer EXHAUSTED at generation %d for head %04d "
+            "(merged_sha=%s) — mutex still held after %d attempts; manual "
+            "triage and re-trigger needed",
+            defer_generation, fields["head_migration_number"],
+            fields["merged_sha"], defer_generation,
+        )
+        return {
+            "launched": False, "reason": "defer_exhausted",
+            "defer_generation": defer_generation,
+            "head_migration_number": fields["head_migration_number"],
+            "merged_sha": fields["merged_sha"],
+        }
+
+    # Create the NEXT safety-net schedule BEFORE launching, so a launch-
+    # time failure doesn't drop the retry chain.
+    sched_name, sched_info = _schedule_defer_check(
+        fields, defer_generation + 1, context,
+    )
+    if sched_name is None:
+        # Schedule creation failed — the defer chain is broken. Log loud
+        # and return defer_schedule_failed so the caller can escalate.
+        return {
+            "launched": False, "reason": "defer_schedule_failed",
+            "error": sched_info, "defer_generation": defer_generation,
+            "head_migration_number": fields["head_migration_number"],
+        }
+
+    # Safety-net schedule is in place. Now try to launch a fresh box that
+    # will re-evaluate the mutex against LIVE pipeline state.
+    logger.warning(
+        "deferred (head %04d, gen %d): marker still refuses — launching "
+        "fresh box; safety-net schedule %s re-checks at gen %d",
+        fields["head_migration_number"], defer_generation,
+        sched_name, defer_generation + 1,
+    )
+    # Fall through to the normal launch path below.
+    return None  # signal to handler: proceed with normal launch
 
 def _bootstrap_command(fields: dict) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone nousergon-data at
@@ -259,15 +511,34 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="arctic-migration")
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict, context) -> dict:
     """Synchronous handler invoked once per push to nousergon-data main that
     touches migrations/** (`.github/workflows/run-arctic-migrations.yml`'s
-    `lambda invoke --invocation-type RequestResponse`). `event` carries
-    `{"merged_sha": <40-hex sha>, "head_migration_number": <int>}`. Returns
-    `{"launched": bool, "reason": str, ...}` — read DIRECTLY by the GHA job as
-    its branch signal. Every anticipated failure mode is a clean return, never
-    an exception — see module docstring's synchronous contract."""
+    `lambda invoke --invocation-type RequestResponse`). ``event`` carries
+    ``{"merged_sha": <40-hex sha>, "head_migration_number": <int>}``.
+    Returns ``{"launched": bool, "reason": str, ...}`` — read DIRECTLY by the
+    GHA job as its branch signal. Every anticipated failure mode is a clean
+    return, never an exception — see module docstring's synchronous contract.
+
+    DEFERRED INVOCATIONS (config#2226, this issue's auto-retry): a
+    one-shot EventBridge Scheduler schedule fires with the same payload plus
+    ``defer_generation: <int>``. On deferred re-invoke, ``_handle_deferred``
+    reads the S3 completion marker and decides whether to launch a fresh box
+    (mutex likely cleared), defer again (mutex still held, generation < max),
+    or escalate (generation exhausted)."""
     event = event or {}
+
+    # Parse defer_generation (0 or absent = normal invocation)
+    try:
+        defer_generation = int(str(event.get("defer_generation") or 0))
+        if defer_generation < 0:
+            raise ValueError(defer_generation)
+    except ValueError:
+        logger.error("invalid arctic-migration event: malformed defer_generation %r",
+                      event.get("defer_generation"))
+        return {"launched": False, "reason": "invalid_event",
+                "error": f"malformed defer_generation: {event.get('defer_generation')!r}"}
+
     if not DISPATCH_ENABLED:
         logger.warning("ARCTIC_MIGRATION_DISPATCH_ENABLED=false — migration spot NOT launched")
         return {"launched": False, "reason": "disabled"}
@@ -277,6 +548,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     except _InvalidEvent as exc:
         logger.error("invalid arctic-migration event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
+
+    # Deferred re-invoke: read completion marker, decide next action.
+    if defer_generation >= 1:
+        verdict = _handle_deferred(fields, defer_generation, context)
+        if verdict is not None:
+            # One of: recovered, defer_exhausted, or defer_schedule_failed
+            return verdict
+        # verdict is None -> fall through to normal launch (the safety-net
+        # schedule was already created by _handle_deferred above).
 
     head = fields["head_migration_number"]
 
@@ -329,6 +609,17 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "arctic-migration dispatched: instance=%s market=%s command=%s head=%d sha=%s",
         instance_id, market, command_id, head, fields["merged_sha"],
     )
+
+    # Arm the defer-not-drop safety-net (config#2226): create a one-shot
+    # schedule that re-checks the completion marker in DEFER_DELAY_SECONDS.
+    # For the FIRST launch (defer_generation == 0) we create the initial
+    # schedule; for deferred re-launches the safety-net was already created
+    # by _handle_deferred above. Non-fatal: a schedule-creation failure is
+    # logged but does NOT flip launched to false — the primary deliverable
+    # (the migration box being in flight) is already achieved.
+    if defer_generation == 0:
+        _schedule_defer_check(fields, 1, context)
+
     return {
         "launched": True,
         "reason": "launched",

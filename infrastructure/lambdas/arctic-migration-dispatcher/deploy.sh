@@ -46,9 +46,19 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 FN_TIMEOUT=600
 FN_MEMORY=256
 
+# Defer-not-drop scheduler role (config#2226 / config-I3254): assumed by
+# EventBridge Scheduler to re-invoke this Lambda for the auto-retry cycle.
+DEFER_ROLE_NAME="alpha-engine-arctic-migration-defer-scheduler-role"
+DEFER_POLICY_NAME="alpha-engine-arctic-migration-defer-scheduler-policy"
+
+# Role ARN for the defer-not-drop scheduler: derived once after ACCOUNT_ID
+# is resolved; populated by --bootstrap, overridable after deployment via
+# env update, and preserved by preserve_env_flags below.
+DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
+
 lambda_env_json() {
   # $1 = ARCTIC_MIGRATION_DISPATCH_ENABLED value (true|false)
-  printf '{"Variables":{"LOG_LEVEL":"INFO","ARCTIC_MIGRATION_DISPATCH_ENABLED":"%s"}}' "$1"
+  printf '{"Variables":{"LOG_LEVEL":"INFO","ARCTIC_MIGRATION_DISPATCH_ENABLED":"%s","ARCTIC_MIGRATION_DEFER_ROLE_ARN":"%s"}}' "$1" "${DEFER_ROLE_ARN}"
 }
 LAMBDA_ENV_BOOTSTRAP="$(lambda_env_json true)"
 
@@ -143,6 +153,31 @@ if $BOOTSTRAP; then
     echo "  Waiting 10s for IAM role propagation..."
     sleep 10
   fi
+
+  # --- 2a2. EventBridge Scheduler invoke role (defer-not-drop, config#2226) ---
+  # Assumed by scheduler.amazonaws.com to fire the one-shot deferred
+  # re-invokes of the migration dispatcher; may ONLY invoke this function.
+  DEFER_TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${DEFER_ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  Creating IAM role: ${DEFER_ROLE_NAME}"
+    run aws iam create-role \
+      --role-name "${DEFER_ROLE_NAME}" \
+      --assume-role-policy-document "${DEFER_TRUST_POLICY}" \
+      --description "EventBridge Scheduler role: fire one-shot arctic-migration defer-not-drop re-invokes (config-I3254)" \
+      --query 'Role.RoleName' --output text
+  else
+    echo "  IAM role exists: ${DEFER_ROLE_NAME}"
+  fi
+
+  echo "  Applying inline policy: ${DEFER_POLICY_NAME}"
+  DEFER_INVOKE_POLICY=$(cat <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":["arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}","arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}:*"]}]}
+EOF
+)
+  run aws iam put-role-policy \
+    --role-name "${DEFER_ROLE_NAME}" \
+    --policy-name "${DEFER_POLICY_NAME}" \
+    --policy-document "${DEFER_INVOKE_POLICY}"
 
   # --- 2b. Lambda function ---
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
