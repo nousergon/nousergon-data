@@ -84,14 +84,40 @@ fi
 echo "Using PYTHON_BIN=$PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 
 START_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+RUN_DATE="$(date -u '+%Y-%m-%d')"
 
 echo "========================================"
 echo "RAG Weekly Ingestion — $(date -u '+%Y-%m-%d %H:%M UTC')"
 echo "========================================"
 
+# ── Inner-step progress telemetry (config-I2966, Brian directive 2026-07-18)
+# ─────────────────────────────────────────────────────────────────────────
+# Writes s3://alpha-engine-research/health/rag_ingestion_progress/{RUN_DATE}.json
+# between each step below so the Fleet Status console strip can render
+# "step N/10: <label>" for this off-box, multi-hour SSM stage instead of a
+# single opaque RUNNING dot (registered as artifact_id rag_ingestion_progress
+# in alpha-engine-config ARTIFACT_REGISTRY.yaml).
+#
+# DELIBERATE no-silent-fails DEVIATION: `|| echo "WARN ..."` swallows a
+# failed progress PUT here — unlike every other step in this script, which
+# hard-aborts under `set -euo pipefail` on its own failure. This is
+# intentional and narrow: the progress marker is telemetry ABOUT the
+# pipeline, not pipeline output the fleet depends on — losing one tick
+# degrades the console's step readout to slightly-stale, it must never
+# abort a multi-hour ingestion run over a transient S3 PUT hiccup. Every
+# ingest_* pipeline call below remains a hard fail on its own error.
+emit_progress() {
+    local step="$1" of="$2" label="$3"
+    $PYTHON_BIN -m rag.pipelines.emit_progress \
+        --run-date "$RUN_DATE" --step "$step" --of "$of" --label "$label" \
+        --started-at "$START_TIME" \
+        || echo "WARN: rag_ingestion_progress PUT failed for step $step/$of ($label) — telemetry only, continuing"
+}
+
 # ── Step 0: Preflight — fail fast on env / connectivity drift ────────────────
 echo ""
 echo "==> Step 0/10: Preflight checks..."
+emit_progress 0 10 "preflight"
 $PYTHON_BIN -m rag.preflight
 
 # Friday shell-run dry path: stop HERE, immediately after the existing
@@ -111,22 +137,26 @@ fi
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
 echo "==> Step 1/10: SEC filings (10-K/10-Q)..."
+emit_progress 1 10 "sec_filings"
 $PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
 # ── Step 2: 8-K material events ─────────────────────────────────────────────
 echo ""
 echo "==> Step 2/10: 8-K material events..."
+emit_progress 2 10 "8k_events"
 $PYTHON_BIN -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365 $DRY_RUN
 
 # ── Step 3: Earnings transcripts (Finnhub) ──────────────────────────────────
 # FINNHUB_API_KEY is verified by preflight; no runtime skip branch.
 echo ""
 echo "==> Step 3/10: Earnings transcripts (Finnhub)..."
+emit_progress 3 10 "earnings_transcripts"
 $PYTHON_BIN -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ticker 8 $DRY_RUN
 
 # ── Step 4: Thesis history (v2 quant/qual from signals.json) ─────────────────
 echo ""
 echo "==> Step 4/10: Thesis history..."
+emit_progress 4 10 "thesis_history"
 SINCE=$(date -u -d '14 days ago' '+%Y-%m-%d' 2>/dev/null || date -u -v-14d '+%Y-%m-%d')
 $PYTHON_BIN -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
 
@@ -151,6 +181,7 @@ fi
 # structured aggregates parquet → ingest article narrative to RAG corpus.
 echo ""
 echo "==> Step 5/10: News pipeline..."
+emit_progress 5 10 "news"
 $PYTHON_BIN -m rag.pipelines.run_news_pipeline --from-signals --hours 168 $DRY_RUN
 
 # ── Step 6: Form 4 insider transactions (Wave 1 Gate A) ──────────────────────
@@ -158,6 +189,7 @@ $PYTHON_BIN -m rag.pipelines.run_news_pipeline --from-signals --hours 168 $DRY_R
 # s3://alpha-engine-research/data/insider_transactions/{date}.parquet
 echo ""
 echo "==> Step 6/10: Form 4 insider transactions..."
+emit_progress 6 10 "form4_insider"
 $PYTHON_BIN -m rag.pipelines.ingest_form4 --from-signals --lookback-days 90 $DRY_RUN
 
 # ── Step 7: 13F institutional ownership (config#2428) ───────────────────────
@@ -170,6 +202,7 @@ $PYTHON_BIN -m rag.pipelines.ingest_form4 --from-signals --lookback-days 90 $DRY
 # by regulation, so an empty quarter is expected, not an error.
 echo ""
 echo "==> Step 7/10: 13F institutional ownership..."
+emit_progress 7 10 "inst_ownership_13f"
 $PYTHON_BIN -m rag.pipelines.ingest_13f --from-signals $DRY_RUN
 
 # ── Step 8: Analyst pipeline (Wave 1 Gate A) ─────────────────────────────────
@@ -178,11 +211,13 @@ $PYTHON_BIN -m rag.pipelines.ingest_13f --from-signals $DRY_RUN
 # Revisions become meaningful after ~4 weekly snapshots (Gate B in ROADMAP).
 echo ""
 echo "==> Step 8/10: Analyst snapshot + revisions..."
+emit_progress 8 10 "analyst_pipeline"
 $PYTHON_BIN -m rag.pipelines.run_analyst_pipeline --from-signals $DRY_RUN
 
 # ── Step 9: Filing change detection ──────────────────────────────────────────
 echo ""
 echo "==> Step 9/10: Filing change detection..."
+emit_progress 9 10 "filing_changes"
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
 else
@@ -192,6 +227,7 @@ fi
 # ── Step 10: Manifest emit (presentation-layer source of truth) ─────────────
 echo ""
 echo "==> Step 10/10: Emit corpus manifest..."
+emit_progress 10 10 "manifest_emit"
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3
 else
