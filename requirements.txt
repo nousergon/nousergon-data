@@ -3,7 +3,7 @@ pandas>=2.0
 openpyxl>=3.1
 pyarrow>=25.0.0
 yfinance>=1.5.1
-requests>=2.31
+requests>=2.34.2
 pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
