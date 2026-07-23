@@ -11,12 +11,23 @@
 #
 # IAM (iam-policy.json): logs + ssm:GetParameter(s) for provider keys +
 # ce:GetCostAndUsage/GetCostForecast + s3 Get/Put under expenses/* + s3 Get on
-# config/expense_budgets.json and decision_artifacts/_cost_raw/*.
+# config/expense_budgets.json and decision_artifacts/_cost_raw/* + Telegram
+# SSM params and the flow-doctor DynamoDB dedup store (config#2843 over-budget
+# alert).
 #
 # Cadence (UTC): twice daily — 00:15 (captures the month-start baseline within
 # 15 min of rollover) and 12:15. Cost Explorer bills $0.01/request (2 CE calls
 # per run ⇒ ~$1.2/mo, visible in the collector's own AWS row).
 #   cron(15 0,12 * * ? *)
+#
+# Plus ONE monthly reconciliation run (alpha-engine-config#2849) — 03:00 UTC
+# on the 2nd of each month, after every provider has finalized the prior
+# month's numbers (AWS CE data lags ~24h; GitHub/Anthropic/Neon settle same-
+# day-ish; the 2nd gives every provider a full day's slack past rollover).
+# Same Lambda, same code — the ONLY difference from the twice-daily rule is
+# the Scheduler target's `Input`, which flips `event["mode"]` to "reconcile"
+# (see index.py::handler's dispatch). No separate function/deploy path.
+#   cron(0 3 2 * ? *)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
 # blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
@@ -50,9 +61,15 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 SCHED_NAMES=(
   "alpha-engine-expense-collector-twicedaily"
+  "alpha-engine-expense-collector-reconcile-monthly"
 )
 SCHED_CRONS=(
   "cron(15 0,12 * * ? *)"
+  "cron(0 3 2 * ? *)"
+)
+SCHED_INPUTS=(
+  "{}"
+  "{\"mode\":\"reconcile\"}"
 )
 SCHED_PREFIX="alpha-engine-expense-collector-"
 
@@ -83,12 +100,26 @@ python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print(
 # Shared provision-then-run mechanism (config#2381 — never hand-roll this
 # step). boto3 passed explicitly: the tests do a real `import index` against
 # real boto3 (the fakes are monkeypatched onto the module, not sys.modules).
+# `-r requirements.txt` added alongside it (config#2843: index.py now imports
+# flow_doctor_telegram / nousergon_lib.* at module scope for the over-budget
+# alert) — matches the sibling flow-doctor consumers' deploy.sh gates (e.g.
+# overseer-liveness-probe) even though test_handler.py's own sys.modules stubs
+# for those two modules take precedence at import time; installing the real
+# package here still keeps this gate's dep list matching requirements.txt.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}" boto3
+run_handler_tests "${SCRIPT_DIR}" boto3 -r "${SCRIPT_DIR}/requirements.txt"
 
-# ----- 1. Package: zip handler (stdlib + runtime boto3 only — no pip deps) ---
+# ----- 1. Package: pip install runtime deps + zip handler --------------------
+# No longer stdlib-only (config#2843): nousergon-lib[flow-doctor] is now a
+# real runtime import via flow_doctor_telegram.py (shared sibling module).
+
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+echo "Installing runtime deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -145,7 +176,9 @@ if $BOOTSTRAP; then
   for i in "${!SCHED_NAMES[@]}"; do
     name="${SCHED_NAMES[$i]}"
     cron="${SCHED_CRONS[$i]}"
-    target="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
+    input_json="${SCHED_INPUTS[$i]}"
+    target=$(printf '{"Arn":"%s","RoleArn":"%s","Input":%s}' \
+      "${FN_ARN}" "${SCHED_ROLE_ARN}" "$(printf '%s' "${input_json}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
       run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \

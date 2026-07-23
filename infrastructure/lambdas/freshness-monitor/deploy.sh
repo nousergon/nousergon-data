@@ -188,12 +188,14 @@ if $BOOTSTRAP; then
     #
     # config#1240 auto-remediation: FRESHNESS_MONITOR_RECOVERY_ENABLED defaults
     # OFF (OBSERVE) — a fresh bootstrap LOGS the would-dispatch but calls no
-    # SF/Lambda and writes no marker. The dispatch path is flipped live ONLY
-    # after the end-to-end drill validates it (delete a recent load-bearing
-    # artifact, confirm the monitor auto-dispatches the correct backfill):
+    # SF/Lambda and writes no marker. Same for config-I3282's
+    # FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED (critical-page → overseer
+    # alert-drain dispatch). Each dispatch path is flipped live ONLY after its
+    # end-to-end drill validates it — and the routine-deploy env update below
+    # MERGES with the live env, so a flipped flag survives redeploys:
     #   aws lambda update-function-configuration \
     #     --function-name alpha-engine-freshness-monitor \
-    #     --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FRESHNESS_MONITOR_RECOVERY_ENABLED=true}'
+    #     --environment 'Variables={...existing...,FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED=true}'
     run aws lambda create-function \
       --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 \
@@ -342,10 +344,32 @@ fi
 
 echo "✓ Code deployed."
 
-echo "Updating Lambda environment (flow-doctor SSM hydration; preserve alert flags)..."
+# MERGE, don't overwrite (config-I3282; same silent-flag-wipe class as the
+# M2_DISPATCH_TARGET lesson): operator-flipped flags on the live function
+# (FRESHNESS_MONITOR_RECOVERY_ENABLED, FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED,
+# cooldown overrides) must SURVIVE a routine redeploy. The previous hardcoded
+# Variables={...} map silently reverted every non-listed flag to its code
+# default on each deploy. Deploy-owned keys below still win on collision.
+echo "Updating Lambda environment (merge — preserve operator-set flags)..."
+LIVE_ENV=$(aws lambda get-function-configuration \
+  --function-name "${FUNCTION_NAME}" --region "${REGION}" \
+  --query 'Environment.Variables' --output json 2>/dev/null || echo '{}')
+MERGED_ENV=$(python3 - "$LIVE_ENV" <<'PYEOF'
+import json, sys
+live = json.loads(sys.argv[1] or "null") or {}
+deploy_owned = {
+    "LOG_LEVEL": "INFO",
+    "FRESHNESS_MONITOR_ENABLED": "true",
+    "FLOW_DOCTOR_ENABLED": "1",
+    "ALPHA_ENGINE_DEPLOYED": "1",
+}
+live.update(deploy_owned)
+print(json.dumps({"Variables": live}))
+PYEOF
+)
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment "${MERGED_ENV}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

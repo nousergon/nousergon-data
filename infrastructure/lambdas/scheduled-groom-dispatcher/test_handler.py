@@ -17,6 +17,9 @@ import json
 import os
 import sys
 import types
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -34,6 +37,11 @@ class _SpotCapacityExhausted(_SpotLaunchError):
     pass
 
 
+class _SpotQuotaExceededError(_SpotLaunchError):
+    """config#2698 — account-wide spot quota (e.g. MaxSpotInstanceCountExceeded),
+    distinct from ordinary per-pool capacity exhaustion."""
+
+
 class _GitHubAppTokenError(RuntimeError):
     """Mirrors nousergon_lib.github_app.GitHubAppTokenError (config-I2785)."""
 
@@ -44,6 +52,7 @@ def _install_stubs(launch_impl, boto_clients):
     ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
     ec2_spot_mod.SpotLaunchError = _SpotLaunchError
     ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
+    ec2_spot_mod.SpotQuotaExceededError = _SpotQuotaExceededError
     ec2_spot_mod.launch = launch_impl
     sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
 
@@ -1341,3 +1350,730 @@ def test_github_token_falls_back_to_pat_on_mint_failure(monkeypatch):
         "/alpha-engine/saturday_sf_watch/github_pat": "pat_value",
     })
     assert idx._github_token() == "pat_value"
+
+
+# ── config#3173: mechanical per-day dispatch ceiling ────────────────────────
+
+
+def _ledger_objects_for(count: int, date: str) -> dict:
+    return {
+        f"groom/_control/dispatch-ledger/{date}/tok-{i}.json": b"{}"
+        for i in range(count)
+    }
+
+
+def test_dispatch_ceiling_exhausted_suppresses_launch_zero_spend(monkeypatch):
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-new"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch,
+        env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 5)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "dispatch_ceiling_exhausted"
+    assert g["prior_dispatch_count"] == 5
+    assert g["dispatch_ceiling"] == 5
+    assert launched == []  # never even attempted a spot launch — zero spend
+
+
+def test_dispatch_under_ceiling_launches_and_records_ledger_entry(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 4)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+    ledger = {k: v for k, v in idx._test_s3._objects.items()
+              if k.startswith("groom/_control/dispatch-ledger/")}
+    assert len(ledger) == 1, f"expected exactly one ledger entry, got {list(ledger)}"
+    doc = json.loads(list(ledger.values())[0])
+    assert doc["run_token"] == out["groom"]["run_token"]
+    assert doc["tier_tag"]
+
+
+def test_prior_launch_count_today_ignores_other_dates(monkeypatch):
+    # Seed only a DIFFERENT date's ledger keys — none should count toward
+    # "today" (a real UTC date the test doesn't control), so the real
+    # implementation must read 0 regardless of what date it runs on.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+               s3_objects=_ledger_objects_for(9, "2000-01-01"))
+    assert idx._prior_launch_count_today() == 0
+
+
+def test_dispatch_ledger_write_failure_never_blocks_the_launch(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 0)
+
+    def _boom(**kw):
+        raise RuntimeError("S3 down")
+
+    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+
+
+def test_dispatch_ceiling_checked_after_concurrent_tier_skip(monkeypatch):
+    # A concurrent-lane skip must short-circuit BEFORE the ceiling count read
+    # — no reason to spend an S3 list call when the launch was already going
+    # to be skipped for an unrelated reason.
+    calls = {"count": 0}
+
+    def _count():
+        calls["count"] += 1
+        return 0
+
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"mid-only": ["i-already-running"]},
+    )
+    monkeypatch.setattr(idx, "_prior_launch_count_today", _count)
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["reason"] == "concurrent_tier_skip"
+    assert calls["count"] == 0
+
+
+# ── config-I3227: org-wide ruling:pending-exec PR demand ─────────────────────
+# Ruled PRs (config-I3199 — a binding operator ruling awaiting execution)
+# previously contributed ZERO demand to this Lambda's pre-boot per-tier
+# counts: only issues were ever enumerated, so a backlog of ruled PRs alone
+# could never clear a tier's floor or trip the anti-starvation escape valve.
+# These tests cover: the new org-wide search-primary/per-repo-fallback PR
+# enumeration itself, its wiring into both _enumerate_tier_stats and
+# _enumerate_tier_stats_fresh (counts/oldest/p0), and the acceptance-
+# criteria synthetic case from alpha-engine-config-I3227 — N ruled PRs with
+# ZERO issues still produce a launch decision once N >= floor or the escape
+# valve fires.
+
+
+class _FakeHTTPResponse:
+    """Minimal stand-in for the ``with urllib.request.urlopen(...) as resp``
+    context manager index.py's REST helpers all use."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _search_pr_item(repo, number, labels, updated_at="2026-07-20T00:00:00Z",
+                    title="ruled PR"):
+    """A GitHub /search/issues result item shape (used by both the search
+    endpoint and, identically, the /repos/{repo}/issues fallback endpoint —
+    both are issues-API-shaped, PRs included via the ``pull_request`` key)."""
+    return {
+        "number": number, "title": title,
+        "labels": [{"name": lbl} for lbl in labels],
+        "updated_at": updated_at,
+        "repository_url": f"https://api.github.com/repos/{repo}",
+        "pull_request": {"url": "https://api.github.com/dummy"},
+    }
+
+
+def _recent_iso() -> str:
+    """A timestamp well inside DEFAULT_MAX_WAIT_HOURS — never trips the
+    escape valve on its own."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def test_enumerate_ruling_pending_prs_search_primary(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    items = [_search_pr_item("nousergon/nousergon-data", 950,
+                             ["ruling:pending-exec", "complexity:mid"])]
+    calls = []
+
+    def _fake_urlopen(req, timeout=30):
+        calls.append(req.full_url)
+        assert "/search/issues?q=" in req.full_url
+        assert "org%3Anousergon" in req.full_url
+        assert "is%3Apr" in req.full_url
+        assert "ruling%3Apending-exec" in req.full_url
+        return _FakeHTTPResponse(json.dumps({"items": items}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    out = idx._enumerate_ruling_pending_prs("tok")
+    assert len(out) == 1
+    assert out[0]["repo"] == "nousergon/nousergon-data"
+    assert out[0]["number"] == 950
+    assert len(calls) == 1, "no per-repo fallback calls when search succeeds"
+
+
+def test_enumerate_ruling_pending_prs_falls_back_on_search_failure(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    search_calls = []
+
+    def _fake_urlopen(req, timeout=30):
+        url = req.full_url
+        if "/search/issues" in url:
+            search_calls.append(url)
+            raise urllib.error.URLError("search API down")
+        if url == "https://api.github.com/orgs/nousergon/repos?per_page=100&page=1":
+            return _FakeHTTPResponse(json.dumps([
+                {"full_name": "nousergon/alpha-engine-config"},
+                {"full_name": "nousergon/nousergon-data"},
+            ]).encode())
+        if url.startswith("https://api.github.com/repos/nousergon/nousergon-data/issues"):
+            return _FakeHTTPResponse(json.dumps([
+                _search_pr_item("nousergon/nousergon-data", 42, ["ruling:pending-exec"]),
+            ]).encode())
+        if url.startswith("https://api.github.com/repos/nousergon/alpha-engine-config/issues"):
+            return _FakeHTTPResponse(b"[]")
+        raise AssertionError(f"unexpected urlopen call in this test: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    out = idx._enumerate_ruling_pending_prs("tok")
+    assert len(search_calls) == 1, "search must be tried exactly once before falling back"
+    assert len(out) == 1
+    assert out[0]["repo"] == "nousergon/nousergon-data"
+    assert out[0]["number"] == 42
+
+
+def test_enumerate_ruling_pending_prs_per_repo_failure_does_not_blank_the_rest(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+
+    def _fake_urlopen(req, timeout=30):
+        url = req.full_url
+        if "/search/issues" in url:
+            raise urllib.error.URLError("search API down")
+        if url == "https://api.github.com/orgs/nousergon/repos?per_page=100&page=1":
+            return _FakeHTTPResponse(json.dumps([
+                {"full_name": "nousergon/broken-repo"},
+                {"full_name": "nousergon/nousergon-data"},
+            ]).encode())
+        if url.startswith("https://api.github.com/repos/nousergon/broken-repo/issues"):
+            raise urllib.error.URLError("this repo 404s")
+        if url.startswith("https://api.github.com/repos/nousergon/nousergon-data/issues"):
+            return _FakeHTTPResponse(json.dumps([
+                _search_pr_item("nousergon/nousergon-data", 7, ["ruling:pending-exec"]),
+            ]).encode())
+        raise AssertionError(f"unexpected urlopen call in this test: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    out = idx._enumerate_ruling_pending_prs("tok")
+    assert len(out) == 1
+    assert out[0]["number"] == 7
+
+
+def _fake_urlopen_empty_issue_pages(req, timeout=30):
+    """Every /repos/{repo}/issues?state=open (no labels= filter) call —
+    i.e. the plain BACKLOG_REPOS issue walk — returns an empty page, so a
+    test using this can isolate itself to the ruling:pending-exec PR path
+    (stubbed separately via idx._enumerate_ruling_pending_prs)."""
+    url = req.full_url
+    assert "/issues?state=open&per_page=" in url and "labels=" not in url, (
+        f"unexpected urlopen call — only the plain issue walk should run: {url}")
+    return _FakeHTTPResponse(b"[]")
+
+
+def test_enumerate_tier_stats_fresh_folds_in_ruling_pending_prs(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_prs = [
+        _search_pr_item("nousergon/nousergon-data", 900 + i,
+                        ["ruling:pending-exec", "complexity:mid"], _recent_iso())
+        for i in range(9)
+    ]
+    for pr in fake_prs:
+        pr["repo"] = "nousergon/nousergon-data"  # normally stamped by _enumerate_ruling_pending_prs
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: fake_prs)
+    counts, oldest, p0_tiers, tier_issues = idx._enumerate_tier_stats_fresh("tok")
+    assert counts == {"low": 0, "mid": 9, "high": 0}
+    assert p0_tiers == []
+    assert len(tier_issues["mid"]) == 9
+    assert all(it["title"].startswith("[PR] ") for it in tier_issues["mid"])
+    assert {it["number"] for it in tier_issues["mid"]} == {900 + i for i in range(9)}
+
+
+def test_enumerate_tier_stats_fresh_ruling_pending_pr_p0_sets_escape_valve_flag(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_pr = _search_pr_item("nousergon/nousergon-data", 901,
+                              ["ruling:pending-exec", "complexity:high", "P0"], _recent_iso())
+    fake_pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [fake_pr])
+    counts, oldest, p0_tiers, tier_issues = idx._enumerate_tier_stats_fresh("tok")
+    assert counts["high"] == 1
+    assert p0_tiers == ["high"]
+
+
+def test_enumerate_tier_stats_folds_in_ruling_pending_prs(monkeypatch):
+    # Legacy single-slot enumeration (_demand_decision's path) gets the same
+    # fold-in, for parity with the fresh-stat path used by the live
+    # demand-all schedules.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_pr = _search_pr_item("nousergon/nousergon-data", 902,
+                              ["ruling:pending-exec", "complexity:low"], _recent_iso())
+    fake_pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [fake_pr])
+    counts, oldest, has_p0 = idx._enumerate_tier_stats("tok")
+    assert counts == {"low": 1, "mid": 0, "high": 0}
+    assert has_p0 is False
+
+
+# ── acceptance criteria (alpha-engine-config-I3227): N ruling:pending-exec ───
+# PRs with ZERO issues still produce a launch decision once N >= floor or the
+# anti-starvation escape valve fires — exercised end-to-end through handler().
+
+
+def test_demand_all_launches_from_ruling_pending_prs_alone_at_floor(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    fake_prs = []
+    for i in range(idx.ge.DEFAULT_FLOOR):  # exactly at the floor, zero issues
+        pr = _search_pr_item("nousergon/nousergon-data", 910 + i,
+                             ["ruling:pending-exec", "complexity:mid"], _recent_iso())
+        pr["repo"] = "nousergon/nousergon-data"
+        fake_prs.append(pr)
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: fake_prs)
+    out = idx.handler(_demand_event(), None)
+    launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
+    assert "mid-only" in launched_filters, out["groom"]
+    assert idx._test_ssm.sent, "a real spot box must have been dispatched"
+
+
+def test_demand_all_ruling_pending_prs_below_floor_fresh_no_launch(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    pr = _search_pr_item("nousergon/nousergon-data", 920,
+                         ["ruling:pending-exec", "complexity:mid"], _recent_iso())
+    pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [pr])
+    out = idx.handler(_demand_event(), None)
+    assert out["groom"]["launches"] == []
+    assert not idx._test_ssm.sent
+
+
+def test_demand_all_stale_ruling_pending_pr_fires_escape_valve(monkeypatch):
+    # A single ruled PR, zero issues, well below the floor — but its
+    # updated_at is far past DEFAULT_MAX_WAIT_HOURS (72h), so it must fire
+    # the anti-starvation escape valve exactly like an overdue actionable
+    # issue would (config-I3227 acceptance criteria).
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
+    pr = _search_pr_item("nousergon/nousergon-data", 921,
+                         ["ruling:pending-exec", "complexity:mid"],
+                         "2020-01-01T00:00:00Z")
+    pr["repo"] = "nousergon/nousergon-data"
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [pr])
+    out = idx.handler(_demand_event(), None)
+    launched_filters = {l["issue_filter"] for l in out["groom"]["launches"]}
+    assert "mid-only" in launched_filters, out["groom"]
+    launch = next(l for l in out["groom"]["launches"] if l["issue_filter"] == "mid-only")
+    assert idx._test_ssm.sent
+
+
+# ── Quota-fallback direct invoke (3-repo feature): {"mode": "fallback",
+# "tier": "<low|mid|high>"} fired by lambda:InvokeFunction (never
+# EventBridge) when an on-box groom run winds down on mid-run Claude-quota
+# exhaustion (alpha-engine-config groom_driver.py, config#1803 classifier).
+# Purely additive: no live SCHED_INPUTS event ever carries a top-level
+# "mode" key, so this must never fire on — or change the behavior of — any
+# existing invocation shape.
+
+@pytest.mark.parametrize("tier,expected_filter", [
+    ("low", "low-only"), ("mid", "mid-only"), ("high", "high-only"),
+])
+def test_fallback_dispatch_launches_one_box_per_tier_with_deepseek_backend(
+        monkeypatch, tier, expected_filter):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    # The fallback path must SKIP demand-eligibility enumeration entirely —
+    # it is a rescue for already-in-flight work, not a fresh demand decision.
+    monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
+                        lambda token: (_ for _ in ()).throw(
+                            AssertionError("fallback dispatch must not re-enumerate demand")))
+    monkeypatch.setattr(idx, "_demand_decision",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("fallback dispatch must not run the demand gate")))
+    out = idx.handler({"mode": "fallback", "tier": tier}, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["issue_filter"] == expected_filter
+    assert g["backend"] == "deepseek"
+    assert len(idx._test_ssm.sent) == 1
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_BACKEND=deepseek" in cmd
+    assert f"export GROOM_ISSUE_FILTER={expected_filter}" in cmd
+    assert cmd.index("export GROOM_BACKEND") < cmd.index("groom_spot_bootstrap.sh")
+
+
+def test_fallback_dispatch_writes_own_decision_record(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"mode": "fallback", "tier": "mid", "schedule": "quota-rescue"}, None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/fallback-" in k}
+    assert len(records) == 1, f"exactly one fallback decision record expected, got {list(idx._test_s3._objects)}"
+    doc = json.loads(list(records.values())[0])
+    assert doc["schema_version"] == 2
+    assert doc["trigger"] == "quota_fallback"
+    assert doc["tier"] == "mid"
+    assert doc["backend"] == "deepseek"
+    assert doc["schedule"] == "quota-rescue"
+    assert doc["decisions"][0]["launch"] is True
+    assert doc["decisions"][0]["issue_filter"] == "mid-only"
+
+
+def test_fallback_dispatch_reuses_launch_chokepoint_concurrency_guard(monkeypatch):
+    # Reuses _launch_groom_spot verbatim — the SAME concurrency guard every
+    # other dispatch path shares must also apply here (no duplicated launch
+    # logic that could silently diverge on this new path).
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(1) or "i-new",  # noqa: E731
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"high-only": ["i-live-high"]},
+    )
+    out = idx.handler({"mode": "fallback", "tier": "high"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "concurrent_tier_skip"
+    assert launched == []
+
+
+@pytest.mark.parametrize("bad_tier", [None, "", "bogus", "sweep", "low-only"])
+def test_fallback_dispatch_invalid_tier_raises(monkeypatch, bad_tier):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    event = {"mode": "fallback"}
+    if bad_tier is not None:
+        event["tier"] = bad_tier
+    with pytest.raises(ValueError):
+        idx.handler(event, None)
+    assert not idx._test_ssm.sent  # fail loud BEFORE any spend, never a partial launch
+
+
+def test_fallback_dispatch_tier_is_case_insensitive(monkeypatch):
+    # Mirrors every other event-key resolver in this handler
+    # (_resolve_run_mode/_resolve_issue_filter/_resolve_model all .lower()) —
+    # a case-insensitive tier is intentional, not an oversight.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"mode": "fallback", "tier": "HIGH"}, None)
+    assert out["groom"]["launched"] is True
+    assert out["groom"]["issue_filter"] == "high-only"
+
+
+def test_fallback_mode_key_never_set_by_any_live_schedule_input():
+    # The discriminator (event.get("mode") == "fallback") is safe only if no
+    # live EventBridge Scheduler input ever carries a top-level "mode" key —
+    # verify that invariant directly against deploy.sh's SCHED_INPUTS (the
+    # single source of truth for what the 3 live cron triggers actually send).
+    deploy_sh = (Path(__file__).resolve().parent / "deploy.sh").read_text()
+    sched_inputs_block = deploy_sh.split("SCHED_INPUTS=(", 1)[1].split(")", 1)[0]
+    assert '"mode"' not in sched_inputs_block
+
+
+def test_normal_cron_event_unaffected_by_fallback_branch(monkeypatch):
+    # A real EventBridge-Scheduler-driven event (no "mode" key at all) must
+    # behave EXACTLY as before — the new branch is purely additive and must
+    # never intercept it, even if some other key happens to collide in future.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 0, "mid": 9, "high": 0})
+    out = idx.handler(_demand_event(), None)
+    assert "groom" in out
+    assert out["groom"]["trigger"] == "demand-all"
+    assert idx._test_ssm.sent
+    for cmd in (s["Parameters"]["commands"][0] for s in idx._test_ssm.sent):
+        assert "GROOM_BACKEND" not in cmd
+
+
+def test_legacy_direct_invoke_event_unaffected_by_fallback_branch(monkeypatch):
+    # Legacy direct invoke (no decide_only/launch_decided/mode key at all) —
+    # the pre-existing "decide AND launch in one call" shape — must also be
+    # completely untouched.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only",
+                       "model": "claude-sonnet-5"}, None)
+    assert out["groom"]["launched"] is True
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_BACKEND" not in cmd
+
+
+# ── alpha-engine-config-I3479: PRIMARY-mode DeepSeek backend selection for
+# SCHEDULED low/mid tier launches (GROOM_PRIMARY_DEEPSEEK_TIERS, ships
+# UNARMED). Distinct from the quota-FALLBACK leg above (_handle_fallback_
+# dispatch, which always threads GROOM_BACKEND_DEEPSEEK regardless of this
+# env var — a rescue for an already-in-flight Claude run, not a pre-planned
+# routing decision) — this governs the demand-all / single-tier-demand-gate /
+# decide_only / launch_decided SCHEDULED-dispatch paths only. Sweep-mode and
+# mode=fallback are UNCHANGED.
+
+
+def test_primary_backend_for_armed_selects_deepseek_when_every_tier_qualifies(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    assert idx._primary_backend_for(("low",)) == "deepseek"
+    assert idx._primary_backend_for(("mid",)) == "deepseek"
+    assert idx._primary_backend_for(("mid", "low")) == "deepseek"
+
+
+def test_primary_backend_for_armed_any_high_in_bundle_blocks_it(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    assert idx._primary_backend_for(("high",)) is None
+    # A high+mid attach-upward bundle: mid alone WOULD qualify, but any-high
+    # in the bundle blocks the WHOLE box (one box, one provider).
+    assert idx._primary_backend_for(("mid", "high")) is None
+
+
+def test_primary_backend_for_empty_tiers_is_none(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    assert idx._primary_backend_for(()) is None
+
+
+def test_primary_backend_for_unarmed_env_always_none(monkeypatch):
+    # Default (no env var at all) — the SHIPPED state.
+    idx = _load(monkeypatch, env={})
+    assert idx._primary_backend_for(("low",)) is None
+    assert idx._primary_backend_for(("low", "mid")) is None
+
+
+def test_primary_backend_env_unset_omits_backend_on_demand_all(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    for e in out["groom"]["launches"]:
+        assert "backend" not in e
+    for d in out["groom"]["decisions"]:
+        assert "backend" not in d
+    for cmd in (s["Parameters"]["commands"][0] for s in idx._test_ssm.sent):
+        assert "GROOM_BACKEND" not in cmd
+
+
+def test_primary_backend_env_unset_omits_backend_on_demand_gate(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    _stub_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                       "issue_filter": "mid-only", "schedule": "0 7 * * *"}, None)
+    assert "backend" not in out["groom"]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_BACKEND" not in cmd
+
+
+def test_primary_backend_armed_pure_low_bundle_routes_deepseek(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    low_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "low-only")
+    assert low_entry["backend"] == "deepseek"
+    low_decision = next(d for d in out["groom"]["decisions"] if d["issue_filter"] == "low-only")
+    assert low_decision["backend"] == "deepseek"
+    low_cmd = next(
+        s["Parameters"]["commands"][0] for s in idx._test_ssm.sent
+        if "export GROOM_ISSUE_FILTER=low-only" in s["Parameters"]["commands"][0]
+    )
+    assert "export GROOM_BACKEND=deepseek" in low_cmd
+
+
+def test_primary_backend_armed_pure_mid_bundle_routes_deepseek(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    mid_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "mid-only")
+    assert mid_entry["backend"] == "deepseek"
+
+
+def test_primary_backend_armed_low_plus_mid_bundle_routes_deepseek(monkeypatch):
+    # Thin-pool bundling (no standalone high): 5 low + 6 mid + 0 high -> ONE
+    # "mid+low" bundle. Every tier in the bundle qualifies -> deepseek.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
+    out = idx.handler(_demand_event(), None)
+    ls = out["groom"]["launches"]
+    assert len(ls) == 1 and ls[0]["issue_filter"] == "mid+low"
+    assert ls[0]["backend"] == "deepseek"
+    assert out["groom"]["decisions"][0]["backend"] == "deepseek"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_BACKEND=deepseek" in cmd
+
+
+def test_primary_backend_armed_high_only_bundle_stays_claude(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    high_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "high-only")
+    assert "backend" not in high_entry
+    high_decision = next(d for d in out["groom"]["decisions"] if d["issue_filter"] == "high-only")
+    assert "backend" not in high_decision
+    high_cmd = next(
+        s["Parameters"]["commands"][0] for s in idx._test_ssm.sent
+        if "export GROOM_ISSUE_FILTER=high-only" in s["Parameters"]["commands"][0]
+    )
+    assert "GROOM_BACKEND" not in high_cmd
+
+
+def test_primary_backend_armed_high_plus_mid_bundle_stays_claude(monkeypatch):
+    # config#2409 attach-upward: mid (thin) rides UP into high's standalone
+    # run when there's no standalone mid run of its own -> tiers=(mid, high).
+    # mid alone WOULD qualify for DeepSeek, but any-high blocks the whole
+    # bundle — one box, one provider, high stays on the Max plan by ruling.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 3, "high": 10})
+    out = idx.handler(_demand_event(), None)
+    bundle = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "high+mid")
+    assert "backend" not in bundle
+    bundle_decision = next(d for d in out["groom"]["decisions"] if d["issue_filter"] == "high+mid")
+    assert "backend" not in bundle_decision
+    # The separate low-only standalone run in the SAME trigger DOES qualify.
+    low_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "low-only")
+    assert low_entry["backend"] == "deepseek"
+
+
+def test_primary_backend_demand_gate_decision_record_includes_backend_when_armed(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    monkeypatch.setattr(idx, "_github_token", lambda: "tok")
+    monkeypatch.setattr(idx, "_enumerate_tier_stats",
+                        lambda token: ({"low": 8, "mid": 9, "high": 10}, {}, False))
+    monkeypatch.setattr(idx, "_notify_demand_skip", lambda *a, **k: None)
+    idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                "issue_filter": "mid-only", "schedule": "0 7 * * *"}, None)
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and k.endswith("/mid.json")}
+    assert len(records) == 1
+    doc = json.loads(list(records.values())[0])
+    assert doc["backend"] == "deepseek"
+
+
+def test_decide_only_single_tier_includes_backend_when_armed(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
+                       "issue_filter": "mid-only", "schedule": "0 7 * * *",
+                       "decide_only": True}, None)
+    assert out["decide"]["launches"] == [
+        {"model": "claude-sonnet-5", "issue_filter": "mid-only", "backend": "deepseek"}
+    ]
+    assert idx._test_ssm.sent == []
+
+
+def test_decide_only_demand_all_includes_backend_when_armed(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
+    out = idx.handler({**_demand_event(), "decide_only": True}, None)
+    by_filter = {e["issue_filter"]: e for e in out["decide"]["launches"]}
+    assert by_filter["low-only"]["backend"] == "deepseek"
+    assert by_filter["mid-only"]["backend"] == "deepseek"
+    assert "backend" not in by_filter["high-only"]
+    assert idx._test_ssm.sent == []
+
+
+def test_launch_decided_backend_round_trip_deepseek(monkeypatch):
+    # Simulates the SF Map's wholesale per-item merge: a decide_only entry
+    # carrying "backend": "deepseek" (see test above) round-trips into the
+    # matching launch_decided invocation's event.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-sonnet-5",
+        "issue_filter": "low-only", "backend": "deepseek",
+        "launch_decided": True,
+    }, None)
+    g = out["groom"]
+    assert g["launched"] is True
+    assert g["backend"] == "deepseek"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "export GROOM_BACKEND=deepseek" in cmd
+    records = {k: v for k, v in idx._test_s3._objects.items()
+               if k.startswith("groom/decisions/") and "/sweep-" in k}
+    assert len(records) == 1
+    doc = json.loads(list(records.values())[0])
+    assert doc["decisions"][0]["backend"] == "deepseek"
+
+
+def test_launch_decided_backend_case_insensitive(monkeypatch):
+    # Mirrors every other event-key resolver in this handler.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({
+        "run_mode": "full", "schedule": "x", "issue_filter": "low-only",
+        "backend": "DeepSeek", "launch_decided": True,
+    }, None)
+    assert out["groom"]["backend"] == "deepseek"
+
+
+def test_launch_decided_backend_absent_stays_claude(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({
+        "run_mode": "full", "schedule": "x", "issue_filter": "low-only",
+        "launch_decided": True,
+    }, None)
+    assert "backend" not in out["groom"]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_BACKEND" not in cmd
+
+
+@pytest.mark.parametrize("bad_backend", ["claude", "deepseek-typo", "openrouter", "anthropic"])
+def test_launch_decided_invalid_backend_raises(monkeypatch, bad_backend):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    with pytest.raises(ValueError):
+        idx.handler({
+            "run_mode": "full", "schedule": "x", "issue_filter": "low-only",
+            "backend": bad_backend, "launch_decided": True,
+        }, None)
+    assert not idx._test_ssm.sent  # fail loud BEFORE any spend
+
+
+def test_sweep_launch_decided_stays_claude_even_when_primary_armed(monkeypatch):
+    # Sweep dispatches never carry a "backend" key in their event (the SF's
+    # DispatchEndOfSfSweep state never sets one) — arming
+    # GROOM_PRIMARY_DEEPSEEK_TIERS must not retroactively affect them, since
+    # sweep boxes never go through _primary_backend_for at all.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    out = idx.handler(dict(_SWEEP_SF_EVENT), None)
+    assert "backend" not in out["groom"]
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert "GROOM_BACKEND" not in cmd
+
+
+def test_fallback_dispatch_backend_independent_of_primary_tiers_env(monkeypatch):
+    # The quota-fallback leg (_handle_fallback_dispatch) always threads
+    # GROOM_BACKEND_DEEPSEEK regardless of GROOM_PRIMARY_DEEPSEEK_TIERS —
+    # even for "high", which PRIMARY-mode would never route to DeepSeek.
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
+                                  "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
+    out = idx.handler({"mode": "fallback", "tier": "high"}, None)
+    assert out["groom"]["backend"] == "deepseek"
+
+
+def test_deploy_sh_arms_primary_deepseek_tiers_low_mid():
+    # Structural pin, INVERTED at arming (2026-07-22, config-I3488 step 3 —
+    # Brian's DeepSeek-primary ruling, config-I3479): BOTH `--environment
+    # 'Variables={...}'` calls must now carry GROOM_PRIMARY_DEEPSEEK_TIERS
+    # with the value DOUBLE-QUOTED ("low,mid") — a raw comma inside CLI
+    # shorthand splits map entries and fails ParamValidation (verified live).
+    # This guards against (a) silent DISARM by a deploy.sh refactor dropping
+    # the var from one or both maps, and (b) re-introducing the unquoted form.
+    # Disarming is a deliberate reviewed PR that flips this pin back.
+    deploy_sh = (
+        Path(__file__).resolve().parent / "deploy.sh"
+    ).read_text()
+    armed_lines = [
+        line for line in deploy_sh.splitlines()
+        if "--environment 'Variables=" in line
+        and not line.lstrip().startswith("#")  # doc comment references the pattern too
+    ]
+    assert len(armed_lines) == 2
+    for line in armed_lines:
+        assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"' in line

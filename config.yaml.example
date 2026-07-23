@@ -18,12 +18,14 @@
 # S3 bucket (shared across all alpha-engine modules)
 bucket: alpha-engine-research
 
-# Price cache settings (Phase 1)
+# Price cache settings (Phase 1 + daily EOD, config#2756)
 price_cache:
   s3_prefix: predictor/price_cache/
   slim_prefix: predictor/price_cache_slim/
   fetch_period: "10y"               # yfinance period for full refresh
-  staleness_threshold_days: 3       # business days before a parquet is considered stale
+  staleness_threshold_days: 3       # NYSE trading sessions before a parquet is considered stale (weekly Phase-1 run)
+  daily_enabled: true               # also refresh the price cache from the Mon-Fri --daily EOD run
+  daily_staleness_threshold_days: 1 # NYSE trading sessions tolerance on the daily run — matches metron_market_data's PRICE_CACHE_MAX_STALE_TRADING_DAYS gate (data#693)
   slim_lookback_days: 730           # calendar days for slim cache (2 years)
   refresh_batch_size: 50            # tickers per yfinance batch download
 

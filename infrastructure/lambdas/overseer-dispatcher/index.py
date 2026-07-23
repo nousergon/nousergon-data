@@ -312,6 +312,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     function_name = spec["executor_function"]
     executor_payload = _stringify_bools(payload)
+    # config-I3293 — the registry is the SSoT for the agent's model: inject
+    # the playbook's declared `model` into the executor payload unless the
+    # caller explicitly overrode it (drills/operator invokes may). Executors
+    # thread it to the run script's --model; absent both, the run script's
+    # inline default applies (non-router invocation fallback).
+    if spec.get("model") and "model" not in executor_payload:
+        executor_payload["model"] = spec["model"]
     started_at = datetime.now(timezone.utc).isoformat()
     try:
         verdict = _invoke_executor(function_name, executor_payload)

@@ -20,13 +20,24 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/feature_store/_macro_freshness.json"
     },
     {
+      "Sid": "ReadUniverseCloseFreshnessSentinel",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/feature_store/_universe_close_freshness.json"
+    },
+    {
       "Sid": "ListBucketForSentinel404",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringEquals": {
-          "s3:prefix": "feature_store/_macro_freshness.json"
+          "s3:prefix": [
+            "feature_store/_macro_freshness.json",
+            "feature_store/_universe_close_freshness.json"
+          ]
         }
       }
     }
