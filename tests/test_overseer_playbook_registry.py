@@ -267,8 +267,101 @@ def test_watch_plane_covers_all_four_router_scheduler_schedules():
     checks = REGISTRY["watch_plane_liveness"]["checks"]
     names = {c["schedule_name"] for c in checks if c["type"] == "scheduler_schedule_exists"}
     assert names == {
+        "alpha-engine-alert-drain-0400utc",
         "alpha-engine-alert-drain-1000utc",
+        "alpha-engine-alert-drain-1600utc",
         "alpha-engine-alert-drain-2200utc",
         "alpha-engine-ci-watch-canary-drill-weekly",
         "alpha-engine-sf-watch-canary-drill-weekly",
     }
+
+
+# ── model/wake/cadence declaration (config-I3293) ────────────────────────────
+
+
+def test_every_routed_playbook_declares_model_wake_cadence():
+    """config-I3293: the registry is the ONE place that answers 'what model
+    runs this agent, what wakes it, on what cadence'. Every routed playbook
+    (its agent is launched THROUGH the router, so the router can inject the
+    declared model) must carry all three fields; the schema alone keeps them
+    optional (inventory-only entries may omit `model` — e.g. groom's
+    complexity-tiered per-run choice is deliberately not router-injected)."""
+    for name, spec in REGISTRY["playbooks"].items():
+        if not spec.get("routed"):
+            continue
+        assert spec.get("model", "").startswith("claude-"), (
+            f"routed playbook {name!r} missing a registry-declared model "
+            f"(config-I3293) — the run script's inline default would silently "
+            f"become undeclared live config"
+        )
+        assert spec.get("wake"), f"routed playbook {name!r} missing wake declaration"
+        assert spec.get("cadence"), f"routed playbook {name!r} missing cadence declaration"
+
+
+def test_drain_wake_names_all_four_schedules():
+    """The alert-drain wake declaration and the watch_plane_liveness
+    scheduler checks must agree on the 4x-daily schedule set — a schedule
+    added to one surface but not the other is drift."""
+    wake_text = " ".join(REGISTRY["playbooks"]["alert-drain"]["wake"])
+    checks = REGISTRY["watch_plane_liveness"]["checks"]
+    drain_scheds = {
+        c["schedule_name"] for c in checks
+        if c["type"] == "scheduler_schedule_exists" and "alert-drain" in c["schedule_name"]
+    }
+    assert len(drain_scheds) == 4
+    for sched in drain_scheds:
+        hour_token = sched.rsplit("-", 1)[-1]  # e.g. '0400utc'
+        assert hour_token in wake_text, (
+            f"drain schedule {sched} not reflected in the wake declaration"
+        )
+
+
+# ── alert-class registry (config-I3211) ──────────────────────────────────────
+
+
+def test_alert_classes_present_and_unique():
+    """The alert-class registry exists and class ids are unique — this is
+    the fleet's declared answer to 'what notifications exist and what
+    responds to each' (Brian directive 2026-07-22)."""
+    rows = REGISTRY.get("alert_classes")
+    assert rows, "alert_classes section missing from playbooks.yaml"
+    ids = [r["class"] for r in rows]
+    assert len(ids) == len(set(ids)), "duplicate alert class ids"
+
+
+def test_no_undeclared_drain_blind_class():
+    """Every intake:none row must carry a migration_issue (tracked path onto
+    the bus) or an operator_reason (explicit page-only declaration). A
+    drain-blind class with neither is the exact I3211 defect."""
+    for r in REGISTRY["alert_classes"]:
+        if r["intake"] == "none":
+            assert r.get("migration_issue") or r.get("operator_reason"), (
+                f"alert class {r['class']!r} is drain-blind (intake: none) "
+                f"with no migration_issue or operator_reason"
+            )
+
+
+def test_alert_class_playbook_refs_exist():
+    """A response of playbook:<name> must reference a real, routed playbook."""
+    for r in REGISTRY["alert_classes"]:
+        resp = r["response"]
+        if resp.startswith("playbook:"):
+            name = resp.split(":", 1)[1]
+            spec = REGISTRY["playbooks"].get(name)
+            assert spec and spec.get("routed"), (
+                f"alert class {r['class']!r} responds via playbook {name!r} "
+                f"which is missing or not routed"
+            )
+
+
+def test_known_bus_sources_have_rows():
+    """Spot-pin the highest-value bus sources from the 2026-07-22 fleet
+    inventory — the classes most recently exercised live. (The full
+    cross-repo static completeness chokepoint is tracked separately; this
+    keeps the registry honest for the sources we KNOW page.)"""
+    sources = " ".join(r["source"] for r in REGISTRY["alert_classes"])
+    for known in ("freshness-monitor", "overseer-dispatcher",
+                  "research:alerts_handler",
+                  "alpha-engine-backtester/optimizer/live_key_reconciliation.py",
+                  "cloudwatch-alarm:*"):
+        assert known in sources, f"known emitter {known!r} has no alert-class row"

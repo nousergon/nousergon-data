@@ -55,9 +55,32 @@ def _aws_iam(*args: str) -> dict | list | str:
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
+def _normalize_unordered_lists(node):
+    """Recursively sort string-lists — IAM treats Action/Resource/
+    Principal.Service (and every other policy-document string array) as
+    UNORDERED sets, and AWS returns them in arbitrary, unstable order.
+    First bitten 2026-07-22: GetRole started returning
+    ["scheduler.amazonaws.com","events.amazonaws.com"] for a trust doc
+    codified in the opposite order — same set, red drift finding, every PR
+    blocked. Only lists that are entirely strings are sorted; mixed/object
+    lists (e.g. Statement arrays) keep their order — Statement order is
+    semantically meaningful for readers even though IAM ORs them, and the
+    codified file controls it."""
+    if isinstance(node, dict):
+        return {k: _normalize_unordered_lists(v) for k, v in node.items()}
+    if isinstance(node, list):
+        if node and all(isinstance(x, str) for x in node):
+            return sorted(node)
+        return [_normalize_unordered_lists(x) for x in node]
+    return node
+
+
 def _canonical_json(doc: dict) -> str:
-    """Canonical JSON for byte-stable comparison: sorted keys, no extra ws."""
-    return json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    """Canonical JSON for byte-stable comparison: sorted keys, sorted
+    string-set arrays (see _normalize_unordered_lists), no extra ws."""
+    return json.dumps(
+        _normalize_unordered_lists(doc), sort_keys=True, separators=(",", ":")
+    )
 
 
 def _check_role(role_file: Path) -> list[str]:

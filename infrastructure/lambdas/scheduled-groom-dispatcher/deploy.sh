@@ -226,6 +226,26 @@ if $BOOTSTRAP; then
   # live env tweak never silently survives a redeploy — same rationale as
   # sf-watch's SF_WATCH_MAX_DISPATCHES_* (config#1818 lesson). Change via a
   # PR editing this value, not a console edit.
+  #
+  # GROOM_PRIMARY_DEEPSEEK_TIERS (alpha-engine-config-I3479, PRIMARY-mode
+  # DeepSeek backend selection for scheduled low/mid groom launches):
+  # ARMED 2026-07-22 (config-I3488 step 3, Brian's DeepSeek-primary ruling) —
+  # present in BOTH Variables maps below with the value DOUBLE-QUOTED
+  # ("low,mid"): a raw comma inside CLI shorthand splits map entries and fails
+  # ParamValidation (verified live 2026-07-22). Disarm = remove it from both
+  # maps in a reviewed PR (empty/absent = feature off in index.py).
+  # Original design note (pre-arming): DELIBERATELY ABSENT from the Variables map below — index.py's own
+  # `os.environ.get("GROOM_PRIMARY_DEEPSEEK_TIERS", "")` default ("" =
+  # feature OFF) governs, same as GROOM_DEMAND_GATE_ENABLED and GROOM_BACKEND
+  # today. This is intentional, not an oversight: every deploy's
+  # update-function-configuration call below REPLACES the ENTIRE Variables
+  # map (see step 3), so a value set live via console/CLI would be silently
+  # WIPED by the next code-only merge-triggered deploy — arming this MUST be
+  # a reviewed PR that adds `GROOM_PRIMARY_DEEPSEEK_TIERS=low,mid` to BOTH
+  # `--environment 'Variables={...}'` strings below (mirrors the
+  # GROOM_MAX_DISPATCHES_DAILY precedent immediately above), never a
+  # console-only edit. See index.py's module docstring / `_primary_backend_
+  # for` for the full contract.
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
@@ -237,7 +257,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -398,7 +418,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then
