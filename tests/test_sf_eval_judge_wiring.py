@@ -534,16 +534,17 @@ class TestEvalRollingMean:
         # TimeoutSeconds must equal that ceiling.
         assert states["EvalRollingMean"]["TimeoutSeconds"] == 300
 
-    def test_success_continues_to_rationale_clustering_gate(self, states):
-        # Rolling-mean converges to CheckSkipRationaleClustering (the
-        # gate in front of the cross-week clustering Lambda) rather
-        # than directly to SaturdayHealthCheck.
-        assert states["EvalRollingMean"]["Next"] == "CheckSkipRationaleClustering"
+    def test_success_continues_to_perturbation_battery_gate(self, states):
+        # Rolling-mean converges to CheckSkipPerturbationBattery (config#752
+        # Phase B — the gate in front of the weekly judge-sensitivity
+        # scorecard Lambda) rather than directly to CheckSkipRationaleClustering
+        # or SaturdayHealthCheck.
+        assert states["EvalRollingMean"]["Next"] == "CheckSkipPerturbationBattery"
 
-    def test_catch_routes_to_rationale_clustering_gate_not_failure(self, states):
+    def test_catch_routes_to_perturbation_battery_gate_not_failure(self, states):
         catch = states["EvalRollingMean"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "CheckSkipRationaleClustering"
+        assert catch["Next"] == "CheckSkipPerturbationBattery"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
@@ -551,6 +552,69 @@ class TestEvalRollingMean:
         # AWS-side transient errors (ServiceException / Throttling),
         # not on application errors.
         retry = states["EvalRollingMean"]["Retry"][0]
+        assert "Lambda.ServiceException" in retry["ErrorEquals"]
+        assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
+        assert retry["MaxAttempts"] == 1
+
+
+# ── Perturbation battery (judge-sensitivity scorecard) skip-gate + state ──
+# config#752 Phase B, Brian's 2026-07-22 operator ruling.
+
+
+class TestSkipPerturbationBattery:
+    def test_skip_flag_bypasses_to_rationale_clustering_gate(self, states):
+        """Skipping the perturbation battery must NOT also skip rationale
+        clustering — independent observability paths (battery = judge
+        sensitivity; clustering = agent rationale templating). The skip
+        path lands on CheckSkipRationaleClustering rather than
+        SaturdayHealthCheck so the clustering Lambda still fires unless
+        its own skip flag is set."""
+        skip = states["CheckSkipPerturbationBattery"]
+        choice = skip["Choices"][0]
+        and_clauses = choice["And"]
+        assert any(
+            c.get("Variable") == "$.skip_perturbation_battery"
+            and c.get("BooleanEquals") is True
+            for c in and_clauses
+        )
+        assert choice["Next"] == "CheckSkipRationaleClustering"
+        assert choice["Next"] != "SaturdayHealthCheck"
+
+    def test_default_runs_perturbation_battery(self, states):
+        assert states["CheckSkipPerturbationBattery"]["Default"] == "PerturbationBattery"
+
+
+class TestPerturbationBattery:
+    def test_invokes_live_alias(self, states):
+        params = states["PerturbationBattery"]["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-research-perturbation-battery:live"
+
+    def test_payload_threads_research_dry(self, states):
+        # The handler's dry_run_llm skips the battery wholly (it is
+        # entirely live-LLM — no meaningful dry computation), so it
+        # reuses the canonical $.research_dry shell-run-dry signal like
+        # the rest of the eval-judge chain.
+        payload = states["PerturbationBattery"]["Parameters"]["Payload"]
+        assert payload["dry_run_llm.$"] == "$.research_dry"
+
+    def test_timeout_matches_lambda_cap(self, states):
+        # Battery Lambda is configured with timeout=900s (the AWS Lambda
+        # ceiling — alpha-engine-research infrastructure/deploy.sh,
+        # deploy_perturbation_battery, matching deploy_eval_judge's
+        # sizing) — SF state TimeoutSeconds must equal that ceiling.
+        assert states["PerturbationBattery"]["TimeoutSeconds"] == 900
+
+    def test_success_continues_to_rationale_clustering_gate(self, states):
+        assert states["PerturbationBattery"]["Next"] == "CheckSkipRationaleClustering"
+
+    def test_catch_routes_to_rationale_clustering_gate_not_failure(self, states):
+        catch = states["PerturbationBattery"]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "CheckSkipRationaleClustering"
+        assert catch["Next"] != "HandleFailure"
+
+    def test_retries_on_transient_lambda_errors(self, states):
+        retry = states["PerturbationBattery"]["Retry"][0]
         assert "Lambda.ServiceException" in retry["ErrorEquals"]
         assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
         assert retry["MaxAttempts"] == 1

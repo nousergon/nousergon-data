@@ -110,6 +110,8 @@ _EXPECTED_SKIPS = {
     "skip_data_phase2",
     "skip_eval_judge",
     "skip_rationale_clustering",
+    # config#752 Phase B: weekly judge-sensitivity scorecard skip-gate.
+    "skip_perturbation_battery",
     "skip_replay_concordance",
     "skip_counterfactual",
     # Added 2026-05-25 (ROADMAP L1146 — SF-wire aggregate_costs.py CLI).
@@ -219,6 +221,7 @@ _DRY_LAMBDA_STATES = {
     "EvalJudgePoll": ("dry_run_llm.$", "$.research_dry"),
     "EvalJudgeProcess": ("dry_run_llm.$", "$.research_dry"),
     "RationaleClustering": ("dry_run_llm.$", "$.research_dry"),
+    "PerturbationBattery": ("dry_run_llm.$", "$.research_dry"),
     "ReplayConcordance": ("dry_run_llm.$", "$.research_dry"),
     "Counterfactual": ("dry_run_llm.$", "$.research_dry"),
 }

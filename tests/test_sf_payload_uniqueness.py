@@ -111,6 +111,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         {"batch_id.$", "dry_run_llm.$", "plan_s3_key.$"}
     ),
     "EvalRollingMean": frozenset({"end_time_iso.$"}),
+    "PerturbationBattery": frozenset({"dry_run_llm.$"}),
     "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
     "ReplayConcordance": frozenset(
         {
