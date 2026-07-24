@@ -203,7 +203,7 @@ def _run_nlp(articles):
     regex against the ``DEFAULT_EVENT_CATEGORIES`` taxonomy. Zero
     LLM calls, zero API spend, zero new dependencies.
 
-    Replaced ``AnthropicEventExtractor`` 2026-05-25 per
+    Replaced the prior LLM-backed event extractor 2026-05-25 per
     ``[[preference_llm_calls_confined_to_research_module]]`` after the
     audit found the Haiku output was aggregated to scalar/list summaries
     before any research consumer touched it (rich structured per-article

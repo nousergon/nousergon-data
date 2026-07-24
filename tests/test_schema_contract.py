@@ -253,7 +253,14 @@ _GRANDFATHERED_BARE_FIELDS: frozenset[str] = frozenset({
     "dist_from_52w_high", "momentum_5d", "rel_volume_ratio",
     "return_vs_spy_5d", "dist_from_52w_low", "vol_ratio_10_60",
     "bollinger_pct", "sector_vs_spy_5d", "sector_vs_spy_10d",
-    "sector_vs_spy_20d", "price_accel", "ema_cross_8_21", "atr_14_pct",
+    "sector_vs_spy_20d",
+    # config#934 — sub-sector benchmark-relative momentum. Bare-named for the
+    # same reason as the sector_vs_spy_* family above: a decimal excess return
+    # over a fixed horizon (the _5d/_10d/_20d suffix names the WINDOW, not
+    # units). Follows the identical convention as its sector-level sibling.
+    "sub_sector_vs_benchmark_5d", "sub_sector_vs_benchmark_10d",
+    "sub_sector_vs_benchmark_20d",
+    "price_accel", "ema_cross_8_21", "atr_14_pct",
     "realized_vol_20d", "realized_vol_63d", "volume_trend",
     "obv_slope_10d", "rsi_slope_5d", "volume_price_div",
     "return_60d", "return_120d", "overnight_return_5d",

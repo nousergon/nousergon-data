@@ -140,6 +140,13 @@ FEATURES = [
     "sector_vs_spy_5d",
     "sector_vs_spy_10d",
     "sector_vs_spy_20d",
+    # config#934 — sub-sector benchmark-relative momentum. Same shape/math as
+    # sector_vs_spy_* one GICS level finer: the sub-sector ETF's (SMH/IGV/
+    # XBI/…) excess return over SPY, falling back to the sector ETF (so ==
+    # sector_vs_spy_*) for sub-industries with no liquid proxy.
+    "sub_sector_vs_benchmark_5d",
+    "sub_sector_vs_benchmark_10d",
+    "sub_sector_vs_benchmark_20d",
     # v1.3 additions — macro regime features
     "yield_10y",
     "yield_curve_slope",
@@ -321,6 +328,7 @@ def compute_features(
     spy_series: pd.Series | None = None,
     vix_series: pd.Series | None = None,
     sector_etf_series: pd.Series | None = None,
+    sub_sector_etf_series: pd.Series | None = None,
     tnx_series: pd.Series | None = None,
     irx_series: pd.Series | None = None,
     gld_series: pd.Series | None = None,
@@ -354,6 +362,11 @@ def compute_features(
     spy_series : SPY Close prices (DatetimeIndex).
     vix_series : VIX Close prices (DatetimeIndex).
     sector_etf_series : Sector ETF Close prices (DatetimeIndex).
+    sub_sector_etf_series : Sub-sector benchmark ETF Close prices
+        (DatetimeIndex), e.g. SMH for a Semiconductors ticker (config#934).
+        Resolved by the caller from ``sub_sector_etf_map`` — falls back to
+        the ticker's sector ETF for sub-industries with no liquid proxy, in
+        which case ``sub_sector_vs_benchmark_*`` equals ``sector_vs_spy_*``.
     tnx_series : 10Y Treasury yield in percent (DatetimeIndex).
     irx_series : 3M T-bill yield in percent (DatetimeIndex).
     gld_series : GLD Close prices (DatetimeIndex).
@@ -581,6 +594,34 @@ def compute_features(
         df["sector_vs_spy_5d"] = 0.0
         df["sector_vs_spy_10d"] = 0.0
         df["sector_vs_spy_20d"] = 0.0
+
+    # Sub-sector benchmark ETF vs SPY (5d/10d/20d) — config#934. Mirrors the
+    # sector_vs_spy block above EXACTLY (same horizons, same math): the
+    # sub-sector benchmark ETF's excess return over SPY. The caller resolves
+    # the ETF from sub_sector_etf_map, which falls back to the ticker's
+    # sector ETF when the GICS sub-industry has no liquid proxy — so in the
+    # fallback case sub_sector_etf_series IS sector_etf_series and these
+    # columns equal sector_vs_spy_*, one level finer otherwise (e.g. SMH for
+    # a Semiconductors name vs. the whole-Tech XLK).
+    if sub_sector_etf_series is not None:
+        subsec_aligned = sub_sector_etf_series.reindex(df.index)
+        subsec_mom_5d = (subsec_aligned / subsec_aligned.shift(_mom_short)) - 1.0
+        subsec_mom_10d = (subsec_aligned / subsec_aligned.shift(10)) - 1.0
+        subsec_mom_20d = (subsec_aligned / subsec_aligned.shift(_mom_long)) - 1.0
+        if spy_mom_5d is not None:
+            spy_mom_10d = (spy_aligned / spy_aligned.shift(10)) - 1.0
+            spy_mom_20d = (spy_aligned / spy_aligned.shift(_mom_long)) - 1.0
+            df["sub_sector_vs_benchmark_5d"] = subsec_mom_5d - spy_mom_5d
+            df["sub_sector_vs_benchmark_10d"] = subsec_mom_10d - spy_mom_10d
+            df["sub_sector_vs_benchmark_20d"] = subsec_mom_20d - spy_mom_20d
+        else:
+            df["sub_sector_vs_benchmark_5d"] = subsec_mom_5d
+            df["sub_sector_vs_benchmark_10d"] = subsec_mom_10d
+            df["sub_sector_vs_benchmark_20d"] = subsec_mom_20d
+    else:
+        df["sub_sector_vs_benchmark_5d"] = 0.0
+        df["sub_sector_vs_benchmark_10d"] = 0.0
+        df["sub_sector_vs_benchmark_20d"] = 0.0
 
     # ── v1.3 features — macro regime ──────────────────────────────────────────
 

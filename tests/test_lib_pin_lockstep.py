@@ -82,11 +82,21 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "extra_tags atomic-launch-tagging floor as ci-watch-dispatcher, config#2292; bumped "
         "for config#2698 SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
     ),
+    "alert-drain-liveness-probe": (
+        "v0.83.0",
+        "flow-doctor forum-topic routing (config#1742) — mirrors "
+        "sf-watch-liveness-probe's reclaim-checker exactly (config#3173)",
+    ),
     "ci-watch-dispatcher": (
         "v0.124.5",
         "nousergon_lib.spot_dispatch chokepoint (config#2267: SpotProbeError handling; "
         "bumped for extra_tags atomic-launch-tagging, config#2292; bumped for config#2698 "
         "SpotQuotaExceededError on-demand fallback, first available at v0.124.1)",
+    ),
+    "ci-watch-liveness-probe": (
+        "v0.83.0",
+        "flow-doctor forum-topic routing (config#1742) — mirrors "
+        "sf-watch-liveness-probe's reclaim-checker exactly (config#3173)",
     ),
     "data-spot-dispatcher": (
         "v0.124.5",
