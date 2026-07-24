@@ -432,6 +432,13 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # the run through DeepSeek instead of Claude — this Lambda passes the flag
     # through verbatim, it does not select the DeepSeek model itself.
     backend_export = f"export GROOM_BACKEND={backend}\n" if backend else ""
+    # Arming the DeepSeek fallback dispatch: when a Claude-backed groom run
+    # hits quota exhaustion, the on-box groom_run.sh checks this flag and —
+    # if enabled — invokes this Lambda again with mode=fallback to launch a
+    # DeepSeek rescue box. Safe to enable unconditionally: DeepSeek-backed
+    # runs never trigger Claude quota signatures, so the flag is harmless
+    # there but critical for high-tier Claude runs (I3483 companion).
+    fallback_enabled_export = "export GROOM_DEEPSEEK_FALLBACK_ENABLED=true\n"
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -454,7 +461,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}{backend_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 

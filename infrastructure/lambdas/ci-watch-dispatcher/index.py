@@ -208,6 +208,59 @@ CI_WATCH_SIGNATURES_PREFIX = os.environ.get(
     "CI_WATCH_SIGNATURES_PREFIX", "ci_watch/_control/signatures"
 )
 
+# ── Dispatch record for the mid-run reclaim checker (config#3173) ───────────
+# WHY: ci-watch has no equivalent of Fleet-SF Watch's per-run watch-log — a
+# box's own completion marker (ci_watch/_control/completed/{repo}-{sha}.json,
+# written by scripts/ci_watch_run.sh) is the ONLY durable record of a
+# dispatch, and it is written at the END. A box reclaimed by AWS mid-run
+# (before completing, sometimes before even starting the charter) previously
+# left NOTHING for anything to recover from — the completion marker never
+# lands, the (repo, sha) tags on the terminated instance are the only trace,
+# and neither carries run_id/run_url/workflow/branch. This record is written
+# right after a successful launch (mirrors the atomic-with-launch discipline
+# config#2292 already established for the discriminator tags) so a sibling
+# ci-watch-liveness-probe Lambda (EC2 reclaim-event target, mirroring
+# sf-watch-liveness-probe's config#2270 mid-run spot-reclaim checker) can
+# reconstruct the original dispatch fields and relaunch once, ceiling-bounded
+# at exactly one relaunch, escalating loud on a second death — closing the
+# "box died with no re-dispatch or escalation" gap config#3173 tracks for the
+# ci-watch family. Best-effort (never blocks/fails the primary dispatch): a
+# write failure only degrades the reclaim checker to its own "unreconstructable
+# dispatch fields" LOUD escalation path, it never masks the launch itself.
+# Skipped for drills — DRILL_REPO is synthetic and a drill box's reclaim is
+# already covered by its own _canary heartbeat channel (config#2223), never a
+# repair to retry.
+CI_WATCH_DISPATCHED_PREFIX = os.environ.get(
+    "CI_WATCH_DISPATCHED_PREFIX", "ci_watch/_control/dispatched"
+)
+
+
+def _write_dispatch_record(repo: str, sha: str, run_id: str, run_url: str,
+                           workflow: str, branch: str, instance_id: str) -> None:
+    """Best-effort S3 record of this dispatch's full event fields, keyed the
+    same way the completion marker and spot-orphan-reaper's WATCH_KINDS entry
+    key ci-watch (repo/sha, '/' flattened to '-'). Read back by
+    ci-watch-liveness-probe on a mid-run reclaim to reconstruct the fields
+    needed to relaunch. Never raises — see module note above."""
+    key = f"{CI_WATCH_DISPATCHED_PREFIX}/{repo.replace('/', '-')}-{sha}.json"
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=CI_WATCH_SIGNATURES_BUCKET,
+            Key=key,
+            Body=json.dumps({
+                "repo": repo, "sha": sha, "run_id": run_id, "run_url": run_url,
+                "workflow": workflow, "branch": branch, "instance_id": instance_id,
+                "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+        logger.warning(
+            "ci-watch dispatch-record write failed for %s@%s (non-fatal — a "
+            "later mid-run reclaim for this box would escalate loud instead "
+            "of relaunching): %s: %s", repo, sha, type(exc).__name__, exc,
+        )
+
 
 def _known_fixed_signature_exists(repo: str) -> bool:
     """True iff at least one signature marker for (repo, today) already
@@ -541,6 +594,13 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     # as extra_tags into the RunInstances TagSpecifications, so the box is
     # never observably untagged. No post-launch create_tags step remains to
     # retry or fail here.
+
+    # config#3173: record the dispatch fields NOW (right after launch, before
+    # the SSM round trip) so a mid-run reclaim — possible from this point
+    # forward — has something to reconstruct a relaunch from. Skipped for
+    # drills (see _write_dispatch_record docstring).
+    if is_drill != "true":
+        _write_dispatch_record(repo, sha, run_id, run_url, workflow, branch, instance_id)
 
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —

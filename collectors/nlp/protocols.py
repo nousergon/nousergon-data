@@ -130,9 +130,11 @@ class EventFlag(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     extractor: str = Field(
-        description="Extractor slug: 'anthropic_haiku' | "
+        description="Extractor slug: 'rule_based' (the only wired "
+                    "extractor — RuleBasedEventExtractor, see "
+                    "rule_based_event_extraction.py) | "
                     "'gdelt_native' (when we use vendor-native event "
-                    "codes) | 'rule_based'."
+                    "codes)."
     )
     article_fingerprint: str
     category: str = Field(
