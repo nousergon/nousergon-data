@@ -485,6 +485,45 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+  # config#3305 static-chokepoint registration: crucible-research
+  # ``publish_observe_alert`` call sites detected during the cross-repo
+  # completeness sweep. All are secondary observability (non-fatal, no
+  # downstream blocking) — matched via wildcard rows where call sites
+  # share a namespace pattern.
+  - class: research_runner_observe_alerts
+    source: "research-runner:*"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_challenger_producers
+    source: "research:challenger_producers"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_producer_leaderboard_alerts
+    source: "research:producer_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_scanner_leaderboard_alerts
+    source: "research:scanner_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_signals_envelope_rejected
+    # NOTE: this class emits via ``alerts.publish`` with explicit
+    # ``severity="error"`` (not ``publish_observe_alert``), so its
+    # effective severity is error — higher than the wildcard rows
+    # above that use ``publish_observe_alert`` (warning-level).
+    source: "signals-envelope"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: research_signals_envelope_handler_observe_alerts
+    source: "signals_envelope_handler:*"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
 
   # ── data plane (nousergon-data) ──
   - class: data_constituents_drift
