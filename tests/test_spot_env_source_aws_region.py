@@ -53,19 +53,16 @@ _SCRIPTS = [
 # original 9 sourcing sites, 6 (PredictorTraining, Backtester,
 # PredictorBacktest, PortfolioOptimizerBacktest, Parity, Evaluator) remain in
 # step_function.json; the other 3 (ResolveZooSpecs, TrainSpecDispatch,
-# ModelZooSelect) were lifted verbatim into the new
-# step_function_modelzoo.json child SF (ne-modelzoo-sunday-pipeline,
-# alpha-engine-config-I2545) and still sourced .env there pre-rebase, so that
-# file is added here too. step_function_advisory.json (the other child SF
-# split out the same day) never sourced .env — its lifted states are the
-# eval-judge/ReportCard/Director chain, none of which ran a spot_train.sh/
-# spot_backtest.sh/training.model_zoo shell — so it is intentionally NOT
-# added.
+# ModelZooSelect) were lifted into step_function_modelzoo.json then later
+# re-inlined into step_function.json (config#2890). step_function_advisory.json
+# (the other child SF split out the same day) never sourced .env — its lifted
+# states are the eval-judge/ReportCard/Director chain, none of which ran a
+# spot_train.sh/spot_backtest.sh/training.model_zoo shell — so it is
+# intentionally NOT added.
 _STEP_FUNCTIONS = [
     _REPO_ROOT / "infrastructure" / "step_function_daily.json",
     _REPO_ROOT / "infrastructure" / "step_function_eod.json",
     _REPO_ROOT / "infrastructure" / "step_function.json",
-    _REPO_ROOT / "infrastructure" / "step_function_modelzoo.json",
 ]
 
 
