@@ -212,7 +212,7 @@ class TestPaths:
         # terminates the execution directly — a fully-green run (no gap ever
         # detected, $.degraded_summary never set) routes through
         # CheckDegradedOutcome to the ordinary NormalSucceeded terminal.
-        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
+        assert order[-4:] == ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_full_skip_still_stops_the_instance(self, states):
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN})
@@ -225,7 +225,7 @@ class TestPaths:
         # test_operator_replay_still_honors_skips below.
         assert order == [
             "ProbeEODReconcilePrecondition", "StopTradingInstance",
-            "CheckDegradedOutcome", "NormalSucceeded",
+            "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
         ]
 
     def test_skip_refresh_resumes_at_data_spot(self, states):
@@ -237,7 +237,7 @@ class TestPaths:
         assert "RefreshExecutorDeploy" not in order
         assert order[0] == "InitDataSpotRetryCounter"
         assert order[1] == "LaunchPostMarketDataSpot"
-        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
+        assert order[-4:] == ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_skip_data_phase_resumes_at_snapshot(self, states):
         # config#1767: skip_post_market_data now skips the ENTIRE spot data phase
@@ -247,7 +247,7 @@ class TestPaths:
         assert "LaunchPostMarketDataSpot" not in order
         assert "LaunchPostMarketArcticAppendSpot" not in order
         assert order[0] == "CaptureSnapshot"
-        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
+        assert order[-4:] == ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_happy_path_runs_data_phase_on_spot(self, states):
         # config#1767: the EOD data phase runs as spot-launch states, in order,
@@ -268,7 +268,7 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role="eod")
         for task in (c[1] for c in _CHAIN):
             assert task in order, f"{task} was skipped despite non-replay role"
-        assert order[-3:] == ["StopTradingInstance", "CheckDegradedOutcome", "NormalSucceeded"]
+        assert order[-4:] == ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_all_skips_inert_when_role_absent(self, states):
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role=None)
@@ -287,7 +287,7 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         # unconditionally) before its own skip_eod_reconcile flag takes over.
         assert order == [
             "ProbeEODReconcilePrecondition", "StopTradingInstance",
-            "CheckDegradedOutcome", "NormalSucceeded",
+            "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
         ]
 
     _walk = TestPaths._walk

@@ -1720,14 +1720,60 @@
             }
           ],
           "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on the degraded path (SetDegradedFlag) — on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
-          "Next": "DegradedSucceeded"
+          "Next": "WriteCompletionMarkerDegraded"
         }
       ],
-      "Default": "NormalSucceeded"
+      "Default": "WriteCompletionMarkerNormal"
+    },
+    "WriteCompletionMarkerNormal": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the normal outcome, immediately before the distinct NormalSucceeded terminal (config-I2702 deliverable #4 keeps Normal/Degraded as separate named states for the console/notification signal — this marker preserves that split rather than converging them, since both routes must still each reach their own named Succeed). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-postclose-trading-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "NormalSucceeded"
     },
     "NormalSucceeded": {
       "Type": "Succeed",
       "Comment": "The ordinary, fully-green terminal — EODReconcile ran (or was validly skipped via an operator-replay skip_eod_reconcile flag), nothing degraded."
+    },
+    "WriteCompletionMarkerDegraded": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the distinct DegradedSucceeded terminal (config-I2702 deliverable #4 keeps Normal/Degraded as separate named states for the console/notification signal — this marker preserves that split rather than converging them, since both routes must still each reach their own named Succeed). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-postclose-trading-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "DegradedSucceeded"
     },
     "DegradedSucceeded": {
       "Type": "Succeed",

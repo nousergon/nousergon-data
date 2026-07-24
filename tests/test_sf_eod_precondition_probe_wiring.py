@@ -197,8 +197,12 @@ class TestDegradedTerminalState:
         assert guard == {"Variable": "$.degraded_summary.degraded", "IsPresent": True}
         assert comparison["Variable"] == "$.degraded_summary.degraded"
         assert comparison["BooleanEquals"] is True
-        assert c["Next"] == "DegradedSucceeded"
-        assert cdo["Default"] == "NormalSucceeded"
+        # config#2857: both outcomes now route through their own
+        # SF-envelope completion marker before their distinct Succeed state.
+        assert c["Next"] == "WriteCompletionMarkerDegraded"
+        assert cdo["Default"] == "WriteCompletionMarkerNormal"
+        assert states["WriteCompletionMarkerNormal"]["Next"] == "NormalSucceeded"
+        assert states["WriteCompletionMarkerDegraded"]["Next"] == "DegradedSucceeded"
 
     def test_two_distinct_succeed_states_exist(self, states):
         assert states["NormalSucceeded"]["Type"] == "Succeed"
@@ -207,13 +211,13 @@ class TestDegradedTerminalState:
 
     def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_succeeded(self, states):
         # Structural sanity: DegradedSucceeded is reachable ONLY via
-        # CheckDegradedOutcome, which is reachable ONLY via StopTradingInstance
-        # — there is no direct edge from anywhere else in the file.
+        # WriteCompletionMarkerDegraded, which is reachable ONLY via
+        # CheckDegradedOutcome — there is no direct edge from anywhere else.
         producers = [
             name for name, st in states.items()
             if "DegradedSucceeded" in _targets(st)
         ]
-        assert producers == ["CheckDegradedOutcome"]
+        assert producers == ["WriteCompletionMarkerDegraded"]
 
 
 # ── Deliverable #3: closed self-heal loop ────────────────────────────────────
