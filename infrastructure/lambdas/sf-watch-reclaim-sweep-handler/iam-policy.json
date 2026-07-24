@@ -9,7 +9,7 @@
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sf-watch-liveness-probe:*"
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sf-watch-reclaim-sweep-handler:*"
     },
     {
       "Sid": "TelegramSecretsSSM",
@@ -73,7 +73,7 @@
       "Sid": "LivenessDedupState",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/sf_watch_liveness/*"
+      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/sf_watch_reclaim_sweep/*"
     },
     {
       "Sid": "ReclaimCheckerCompletionMarkers",

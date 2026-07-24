@@ -252,7 +252,7 @@ PIPELINES: dict[str, dict[str, object]] = {
     # the advisory tail + ModelZoo rotation were re-inlined into this single
     # Saturday SF (config#2890 / nousergon-data PR#926). Their registry
     # entries were removed here in lockstep with playbooks.yaml's
-    # `sf_watch_pipelines` anchor, sf-watch-liveness-probe's and
+    # `sf_watch_pipelines` anchor, sf-watch-reclaim-sweep-handler's and
     # sf-watch-spot-dispatcher's `_WATCH_PREFIXES` copies, and the 5 IAM
     # grant files referencing the now-dead ARNs (config#2937).
     #
@@ -367,7 +367,7 @@ def _already_escalated_today(existing_events: list[dict]) -> bool:
 #                        present in historical fixtures.
 #   fast_path_rerun    — this Lambda's own deterministic rerun (config#1900);
 #                        charter STEP 2 counts these against the same budget.
-#   reclaim_relaunch   — sf-watch-liveness-probe's mid-run spot-reclaim
+#   reclaim_relaunch   — sf-watch-reclaim-sweep-handler's mid-run spot-reclaim
 #                        relaunch record (config#2270; same shared counter).
 # Deliberately NOT keyed on `agent_attempt`: that field is agent-enriched, so
 # an agent crash would make the count starvable (unbounded re-dispatch).
@@ -954,7 +954,7 @@ def _escalate_budget_exhausted(record: dict, key: str, pipeline_name: str, run_d
     a dispatch (config#2269). Deliberately NOT the silent ``_notify`` receipt:
     budget exhaustion means "the watch has given up on today; human needed" —
     it must page (``silent=False, severity="error"``, mirroring the watch
-    plane's loud path, e.g. sf-watch-liveness-probe's ``_alert``). Deduped per
+    plane's loud path, e.g. sf-watch-reclaim-sweep-handler's ``_alert``). Deduped per
     (pipeline, run_date) so a runaway fail-loop pages a human ONCE, not on
     every subsequent suppressed failure. Best-effort delivery surface: a
     Telegram outage logs WARNING and is returned in the handler result — the

@@ -1,4 +1,4 @@
 # config#3173 — flow-doctor forum-topic routing, same pin as
-# sf-watch-liveness-probe (this Lambda mirrors its reclaim-checker exactly).
+# sf-watch-reclaim-sweep-handler (this Lambda mirrors its reclaim-checker exactly).
 nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
 krepis>=0.10.2

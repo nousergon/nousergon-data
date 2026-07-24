@@ -59,13 +59,13 @@ playbooks:
     supports_drill: true
     kill_switch_env: SF_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
     # Wiring-integrity checks the overseer-liveness-probe runs (I2831). These
-    # migrated verbatim from sf-watch-liveness-probe's per-probe constants — the
+    # migrated verbatim from sf-watch-reclaim-sweep-handler's per-probe constants — the
     # registry is now the ONE place this surface is enumerated. The pipeline
     # list is a YAML anchor so it is declared ONCE and stays lockstep with
     # saturday-sf-watch-dispatcher's PIPELINES (pinned by
     # tests/test_overseer_playbook_registry.py). The reclaim-checker (config#2270)
     # + disabled-window sweep (config#2257) ACTION paths are NOT here — they stay
-    # in the slimmed sf-watch-liveness-probe (their EC2-event trigger topology +
+    # in the slimmed sf-watch-reclaim-sweep-handler (their EC2-event trigger topology +
     # 45 pinned tests; full migration tracked as a follow-up).
     liveness:
       checks:
@@ -134,7 +134,7 @@ playbooks:
     supports_drill: true
     kill_switch_env: CI_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
     # The ci-watch executor's own liveness (was checked as part of
-    # sf-watch-liveness-probe's spot-dispatch leg; now attributed to its own
+    # sf-watch-reclaim-sweep-handler's spot-dispatch leg; now attributed to its own
     # playbook). Kill-switch value REPORTED, never alerted.
     liveness:
       checks:

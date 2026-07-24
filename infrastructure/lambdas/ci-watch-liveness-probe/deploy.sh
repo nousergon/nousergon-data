@@ -7,13 +7,13 @@
 # on a cadence or SF-native retry. A box reclaimed mid-run previously left
 # main red with nobody told until a human noticed or a fresh commit landed.
 # This Lambda is the mid-run spot-reclaim checker for the ci-watch family,
-# mirroring sf-watch-liveness-probe's config#2270 mechanism: on an EC2 spot
+# mirroring sf-watch-reclaim-sweep-handler's config#2270 mechanism: on an EC2 spot
 # interruption or terminated state-change, check the box's completion marker;
 # if absent, relaunch ONCE (ceiling-bounded, recorded in a relaunch ledger)
 # by invoking alpha-engine-ci-watch-dispatcher directly; a SECOND death for
 # the same (repo, sha) escalates LOUD instead of relaunching again.
 #
-# No scheduled sweep here (unlike sf-watch-liveness-probe's config#2257
+# No scheduled sweep here (unlike sf-watch-reclaim-sweep-handler's config#2257
 # disabled-window sweep) — see index.py's module docstring for why that
 # doesn't apply to this family. This Lambda has exactly one trigger surface:
 # the two EC2 reclaim EventBridge rules below.
@@ -46,8 +46,8 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
 FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 
-# config#3173: dedicated rules (not a second target on sf-watch-liveness-
-# probe's rules) — keeps each Lambda's deploy.sh self-contained/idempotent
+# config#3173: dedicated rules (not a second target on sf-watch-reclaim-sweep-
+# handler's rules) — keeps each Lambda's deploy.sh self-contained/idempotent
 # without a cross-repo/cross-Lambda coupling on rule ownership. Both rules
 # match FLEET-WIDE EC2 events (neither event type is tag-scopable in the rule
 # pattern) — the handler itself filters by Name=alpha-engine-ci-watch-spot.
@@ -65,8 +65,8 @@ RECLAIM_RULE_DESCRIPTIONS=(
 )
 
 # DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
-# flag below (config#1752-style convention, matching sf-watch-liveness-
-# probe's own guard).
+# flag below (config#1752-style convention, matching sf-watch-reclaim-sweep-
+# handler's own guard).
 case "${DRY_RUN:-false}" in
   true|1|yes|TRUE|YES) DRY_RUN=true ;;
   *) DRY_RUN=false ;;

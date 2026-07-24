@@ -1,5 +1,5 @@
 """alpha-engine-alert-drain-liveness-probe — mid-run spot-reclaim checker for
-the Overseer alert-drain (config#3173, generalizing sf-watch-liveness-probe's
+the Overseer alert-drain (config#3173, generalizing sf-watch-reclaim-sweep-handler's
 config#2270 mechanism to the alert-drain family).
 
 WHY: alert-drain runs on a twice-daily EventBridge schedule, so — unlike
@@ -15,7 +15,7 @@ run the drain again (the SQS queue — not any per-run field — is the durable
 state a fresh box picks up from), so this checker is simpler than its
 ci-watch sibling.
 
-MECHANISM (mirrors sf-watch-liveness-probe's reclaim checker): EventBridge
+MECHANISM (mirrors sf-watch-reclaim-sweep-handler's reclaim checker): EventBridge
 target for `EC2 Spot Instance Interruption Warning` and `EC2 Instance
 State-change Notification` (state=terminated) events fleet-wide (neither
 event type is tag-scopable in the rule pattern — this handler filters by the
@@ -24,7 +24,7 @@ box's own Name tag). For an `alpha-engine-alert-drain-spot` box:
      atomically with launch, config#2292 — a box reaching this checker
      without it is a genuine anomaly).
   2. A `drill-`-prefixed run id (config#2223 pattern) is a canary drill, not a
-     repair — isolated below exactly like sf-watch-liveness-probe's
+     repair — isolated below exactly like sf-watch-reclaim-sweep-handler's
      `run_date.startswith("drill-")` carve-out: the missed
      `overseer/_canary/{date}.json` heartbeat is the correct alerting
      surface, not a page from this checker.
@@ -40,7 +40,7 @@ box's own Name tag). For an `alpha-engine-alert-drain-spot` box:
   5. First death: record the relaunch decision FIRST (exactly-one bound),
      THEN invoke alpha-engine-alert-drain-dispatcher DIRECTLY (bypassing the
      Overseer router and the twice-daily schedule entirely, mirroring
-     sf-watch-liveness-probe's direct invoke of the spot dispatcher) with a
+     sf-watch-reclaim-sweep-handler's direct invoke of the spot dispatcher) with a
      fresh `{"is_drill": "false", "trigger": "reclaim-relaunch"}` — the drain
      needs no fields from the dead run, only to run again.
 

@@ -8,10 +8,10 @@
 # declared `liveness` checks + the top-level `watch_plane_liveness` checks —
 # config-drift wiring (EventBridge rules / Step Functions / dispatcher Lambdas /
 # launch config) AND groom-style run-window accounting — replacing the two
-# per-probe enumerations (sf-watch-liveness-probe's wiring checks, migrated here;
+# per-probe enumerations (sf-watch-reclaim-sweep-handler's wiring checks, migrated here;
 # groom-liveness-probe, fully migrated + deleted). Read-only + silent-unless-
 # broken. The sf-watch reclaim-checker (config#2270) + disabled-window sweep
-# (config#2257) ACTION paths STAY in the slimmed sf-watch-liveness-probe.
+# (config#2257) ACTION paths STAY in the slimmed sf-watch-reclaim-sweep-handler.
 #
 # IAM (iam-policy.json): logs + ssm:GetParameter (Telegram creds) + read-only
 # events:DescribeRule/ListTargetsByRule + states:DescribeStateMachine +

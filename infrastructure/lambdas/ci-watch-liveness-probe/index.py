@@ -1,5 +1,5 @@
 """alpha-engine-ci-watch-liveness-probe — mid-run spot-reclaim checker for
-Fleet CI Watch (config#3173, generalizing sf-watch-liveness-probe's
+Fleet CI Watch (config#3173, generalizing sf-watch-reclaim-sweep-handler's
 config#2270 mechanism to the ci-watch dispatch family).
 
 WHY: ci-watch is purely EVENT-driven — a fresh box is only ever dispatched
@@ -13,7 +13,7 @@ to look or a fresh commit lands — a genuine silent stall, the exact failure
 mode alpha-engine-config#3173 (child of the #3137 stall-watchdog charter)
 asks every dispatch family to close.
 
-MECHANISM (mirrors sf-watch-liveness-probe's reclaim checker almost exactly):
+MECHANISM (mirrors sf-watch-reclaim-sweep-handler's reclaim checker almost exactly):
 this Lambda is the EventBridge target for `EC2 Spot Instance Interruption
 Warning` and `EC2 Instance State-change Notification` (state=terminated)
 events fleet-wide (neither event type can be tag-scoped in the rule pattern —
@@ -41,7 +41,7 @@ non-ci-watch instance). For a `alpha-engine-ci-watch-spot` box:
      ("unreconstructable dispatch fields") rather than guessing. Present:
      record the relaunch decision FIRST (exactly-one bound), THEN invoke
      alpha-engine-ci-watch-dispatcher DIRECTLY (bypassing the Overseer router
-     and GHA entirely, same as sf-watch-liveness-probe invokes the spot
+     and GHA entirely, same as sf-watch-reclaim-sweep-handler invokes the spot
      dispatcher directly) with the reconstructed fields — a fresh box picks
      up the same (repo, sha) with no dedup conflict (the dead box no longer
      holds the concurrency lock).
@@ -58,7 +58,7 @@ Fail-loud (CLAUDE.md no-silent-fails): DescribeTags and the ledger/marker
 reads RAISE on any error OTHER than genuine absence — a misread here would
 either duplicate a relaunch or silently drop a real stall. The Telegram send
 and the dispatcher re-invoke are the only best-effort/secondary surfaces
-(exactly like sf-watch-liveness-probe).
+(exactly like sf-watch-reclaim-sweep-handler).
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ _OPS_TOPICS = (
 )
 
 # The dispatcher this checker relaunches through directly — bypassing the
-# Overseer router and GHA entirely, mirroring sf-watch-liveness-probe's
+# Overseer router and GHA entirely, mirroring sf-watch-reclaim-sweep-handler's
 # direct invoke of the spot dispatcher.
 CI_WATCH_DISPATCHER_FUNCTION = os.environ.get(
     "CI_WATCH_DISPATCHER_FUNCTION", "alpha-engine-ci-watch-dispatcher"
@@ -109,7 +109,7 @@ RELAUNCH_LEDGER_PREFIX = "ci_watch/_control/relaunch/"
 # nothing exists to reconstruct — noise, not signal. The correct alerting
 # surface for a drill's mid-run death is its own missed
 # consolidated/ci_watch/_canary/{date}.json heartbeat (config#2223), exactly
-# mirroring sf-watch-liveness-probe's drill-isolation posture.
+# mirroring sf-watch-reclaim-sweep-handler's drill-isolation posture.
 DRILL_REPO = "nousergon/ci-watch-drill"
 
 RECLAIM_INTERRUPTION_DETAIL_TYPE = "EC2 Spot Instance Interruption Warning"
@@ -175,7 +175,7 @@ def _completion_marker_exists(s3, repo: str, sha: str) -> bool:
     OTHER error RAISES — misreading an S3 hiccup as absent would fire a
     duplicate relaunch, misreading it as present would silently drop a real
     stall (the config#2267 site-4 lesson, applied here as in
-    sf-watch-liveness-probe)."""
+    sf-watch-reclaim-sweep-handler)."""
     try:
         s3.head_object(Bucket=WATCH_BUCKET, Key=_completion_key(repo, sha))
         return True
@@ -190,7 +190,7 @@ def _read_json(s3, key: str) -> dict | None:
     (404/NoSuchKey). Any other read error RAISES. A present-but-unparseable
     object also returns None — the caller's None-handling escalates loud
     rather than guessing at a corrupted record (mirrors
-    sf-watch-liveness-probe's `_load_watch_log`)."""
+    sf-watch-reclaim-sweep-handler's `_load_watch_log`)."""
     try:
         obj = s3.get_object(Bucket=WATCH_BUCKET, Key=key)
     except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected

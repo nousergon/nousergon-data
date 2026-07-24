@@ -7,7 +7,7 @@
 # is slow (up to ~24h) and, worse, SILENT: nothing tells anyone a drain box
 # died mid-run rather than finishing cleanly. This Lambda is the mid-run
 # spot-reclaim checker for the alert-drain family, mirroring
-# sf-watch-liveness-probe's config#2270 mechanism: on an EC2 spot
+# sf-watch-reclaim-sweep-handler's config#2270 mechanism: on an EC2 spot
 # interruption or terminated state-change, check the box's completion
 # marker; if absent, relaunch ONCE (ceiling-bounded, recorded in a relaunch
 # ledger) by invoking alpha-engine-alert-drain-dispatcher directly; a SECOND

@@ -66,11 +66,11 @@ class TestWatchPlaneCoverage:
             "alpha-engine-ci-watch-dispatcher",
             # Added config#3173: mid-run spot-reclaim checkers for the
             # ci-watch and alert-drain families, mirroring
-            # sf-watch-liveness-probe's config#2270 mechanism — onboarded in
+            # sf-watch-reclaim-sweep-handler's config#2270 mechanism — onboarded in
             # the same PR that ships them.
             "alpha-engine-ci-watch-liveness-probe",
             "alpha-engine-alert-drain-liveness-probe",
-            "alpha-engine-sf-watch-liveness-probe",
+            "alpha-engine-sf-watch-reclaim-sweep-handler",
             # The registry-driven unified probe (alpha-engine-config-I2831) — its
             # own Errors metric is the dead-probe backstop the fail-loud contract
             # assumes, same as the sibling probes.
