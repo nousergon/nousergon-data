@@ -774,12 +774,12 @@
             "python executor/main.py 2>&1 | tee -a /var/log/executor.log"
           ],
           "executionTimeout": [
-            "300"
+            "600"
           ]
         },
-        "TimeoutSeconds": 300
+        "TimeoutSeconds": 600
       },
-      "TimeoutSeconds": 360,
+      "TimeoutSeconds": 660,
       "Retry": [
         {
           "ErrorEquals": [
@@ -815,7 +815,7 @@
     },
     "WaitForMorningPlanner": {
       "Type": "Task",
-      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 300s executionTimeout.",
+      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 600s executionTimeout.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
@@ -909,7 +909,7 @@
       "Comment": "Bounded poll budget exhausted on the RunMorningPlanner loop with the box still responsive (#970 shape). Stamp + alert via HandleFailure.",
       "Result": {
         "Error": "MorningPlannerPollTimeout",
-        "Cause": "RunMorningPlanner SSM command did not reach a terminal status within the bounded poll budget (~30 iterations / ~7.5 min, past the 300s executionTimeout) while the SSM agent stayed Online. See /var/log/executor.log on ae-trading."
+        "Cause": "RunMorningPlanner SSM command did not reach a terminal status within the bounded poll budget (~30 iterations / ~7.5 min, past the 600s executionTimeout) while the SSM agent stayed Online. See /var/log/executor.log on ae-trading."
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"

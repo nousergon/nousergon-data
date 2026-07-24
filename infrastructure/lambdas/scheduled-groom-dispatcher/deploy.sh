@@ -40,9 +40,10 @@
 # (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
 # config#2409 (2026-07-13): the 01:00 high-only slot moved off Opus onto Sonnet
 # — dedicated queue/budget/off-peak schedule, no longer a distinct model tier.
-#   01:00 daily     cron(0 1 * * ? *)         FULL   Sonnet, high-only      # 6pm PT, every day
-#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
-#   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
+#   04:00 daily     cron(0 4 * * ? *)         FULL   all 3 tiers + sweep    # 9pm PT, every day
+#   12:00 daily     cron(0 12 * * ? *)        FULL   all 3 tiers + sweep    # 5am PT, every day
+#   20:00 daily     cron(0 20 * * ? *)        FULL   all 3 tiers + sweep    # 1pm PT, every day
+#   Models: low=deepseek-v4-flash, mid=deepseek-v4-flash, high=deepseek-v4-pro, sweep=deepseek-v4-flash
 #   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
@@ -105,21 +106,21 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0100-daily-opus-high"
-  "alpha-engine-scheduled-groom-0700-daily-mid"
-  "alpha-engine-scheduled-groom-1900-daily-low"
+  "alpha-engine-scheduled-groom-0400-daily-high"
+  "alpha-engine-scheduled-groom-1200-daily-mid"
+  "alpha-engine-scheduled-groom-2000-daily-low"
   "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
 )
 SCHED_CRONS=(
-  "cron(0 1 * * ? *)"
-  "cron(0 7 * * ? *)"
-  "cron(0 19 * * ? *)"
+  "cron(0 4 * * ? *)"
+  "cron(0 12 * * ? *)"
+  "cron(0 20 * * ? *)"
   "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 1 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 7 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 19 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 4 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 12 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 20 * * *"}'
   '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
@@ -226,26 +227,6 @@ if $BOOTSTRAP; then
   # live env tweak never silently survives a redeploy — same rationale as
   # sf-watch's SF_WATCH_MAX_DISPATCHES_* (config#1818 lesson). Change via a
   # PR editing this value, not a console edit.
-  #
-  # GROOM_PRIMARY_DEEPSEEK_TIERS (alpha-engine-config-I3479, PRIMARY-mode
-  # DeepSeek backend selection for scheduled low/mid groom launches):
-  # ARMED 2026-07-22 (config-I3488 step 3, Brian's DeepSeek-primary ruling) —
-  # present in BOTH Variables maps below with the value DOUBLE-QUOTED
-  # ("low,mid"): a raw comma inside CLI shorthand splits map entries and fails
-  # ParamValidation (verified live 2026-07-22). Disarm = remove it from both
-  # maps in a reviewed PR (empty/absent = feature off in index.py).
-  # Original design note (pre-arming): DELIBERATELY ABSENT from the Variables map below — index.py's own
-  # `os.environ.get("GROOM_PRIMARY_DEEPSEEK_TIERS", "")` default ("" =
-  # feature OFF) governs, same as GROOM_DEMAND_GATE_ENABLED and GROOM_BACKEND
-  # today. This is intentional, not an oversight: every deploy's
-  # update-function-configuration call below REPLACES the ENTIRE Variables
-  # map (see step 3), so a value set live via console/CLI would be silently
-  # WIPED by the next code-only merge-triggered deploy — arming this MUST be
-  # a reviewed PR that adds `GROOM_PRIMARY_DEEPSEEK_TIERS=low,mid` to BOTH
-  # `--environment 'Variables={...}'` strings below (mirrors the
-  # GROOM_MAX_DISPATCHES_DAILY precedent immediately above), never a
-  # console-only edit. See index.py's module docstring / `_primary_backend_
-  # for` for the full contract.
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
@@ -257,7 +238,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -418,7 +399,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

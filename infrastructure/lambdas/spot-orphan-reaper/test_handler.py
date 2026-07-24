@@ -75,7 +75,7 @@ def index_module(monkeypatch):
 def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c5.large",
          ci_watch_repo: str | None = None, ci_watch_sha: str | None = None,
          sf_watch_cadence: str | None = None, sf_watch_pipeline: str | None = None,
-         sf_watch_run_date: str | None = None):
+         sf_watch_run_date: str | None = None, alert_drain_run_id: str | None = None):
     """Build a mock describe-instances entry."""
     tags = [{"Key": "Name", "Value": name}]
     if ci_watch_repo is not None:
@@ -88,6 +88,8 @@ def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c
         tags.append({"Key": "sf-watch-pipeline", "Value": sf_watch_pipeline})
     if sf_watch_run_date is not None:
         tags.append({"Key": "sf-watch-run-date", "Value": sf_watch_run_date})
+    if alert_drain_run_id is not None:
+        tags.append({"Key": "alert-drain-run-id", "Value": alert_drain_run_id})
     return {
         "InstanceId": instance_id,
         "InstanceType": instance_type,
@@ -352,3 +354,59 @@ class TestSfWatchIncompleteReapAlert:
         assert out["ci_watch_incomplete_reaps"] == ["i-ciwatch"]
         assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
         assert len(index_module._test_send_message.calls) == 2
+
+
+class TestAlertDrainIncompleteReapAlert:
+    """config#3173: alert-drain had ZERO incomplete-reap coverage before this —
+    additive alert scoped to ONLY Name=alpha-engine-alert-drain-spot boxes,
+    built on the same generalized WATCH_KINDS path CI-watch/SF-watch use;
+    every other tag's reap path (covered above) stays byte-for-byte
+    unaffected."""
+
+    def test_reaped_without_marker_fires_alert(self, index_module):
+        spots = [_spot("i-drain", "alpha-engine-alert-drain-spot", age_seconds=THRESHOLD + 600,
+                       alert_drain_run_id="drain-2026-07-22T1200Z")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert out["terminated"] == ["i-drain"]
+        assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
+        s3.head_object.assert_called_once_with(
+            Bucket="alpha-engine-research",
+            Key="overseer/_control/completed/alert-drain-drain-2026-07-22T1200Z.json",
+        )
+        assert len(index_module._test_send_message.calls) == 1
+        (text,), kwargs = index_module._test_send_message.calls[0]
+        assert "reaped WITHOUT completing" in text
+        assert "drain-2026-07-22T1200Z" in text
+        assert kwargs["disable_notification"] is False
+
+    def test_reaped_with_marker_present_does_not_alert(self, index_module):
+        spots = [_spot("i-drain", "alpha-engine-alert-drain-spot", age_seconds=THRESHOLD + 600,
+                       alert_drain_run_id="drain-2026-07-22T1200Z")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["terminated"] == ["i-drain"]
+        assert out["alert_drain_incomplete_reaps"] == []
+        assert index_module._test_send_message.calls == []
+
+    def test_missing_run_id_tag_treated_as_incomplete(self, index_module):
+        spots = [_spot("i-drain", "alpha-engine-alert-drain-spot", age_seconds=THRESHOLD + 600)]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
+        s3.head_object.assert_not_called()
+        assert len(index_module._test_send_message.calls) == 1
+
+    def test_all_three_watch_kinds_independently_tracked(self, index_module):
+        spots = [
+            _spot("i-ciwatch", "alpha-engine-ci-watch-spot", age_seconds=THRESHOLD + 600,
+                 ci_watch_repo="nousergon/alpha-engine-config", ci_watch_sha="abc123"),
+            _spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600,
+                 sf_watch_cadence="saturday", sf_watch_pipeline="ne-weekly-freshness-pipeline",
+                 sf_watch_run_date="2026-07-11"),
+            _spot("i-drain", "alpha-engine-alert-drain-spot", age_seconds=THRESHOLD + 600,
+                 alert_drain_run_id="drain-2026-07-22T1200Z"),
+        ]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert set(out["terminated"]) == {"i-ciwatch", "i-sfwatch", "i-drain"}
+        assert out["ci_watch_incomplete_reaps"] == ["i-ciwatch"]
+        assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
+        assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
+        assert len(index_module._test_send_message.calls) == 3

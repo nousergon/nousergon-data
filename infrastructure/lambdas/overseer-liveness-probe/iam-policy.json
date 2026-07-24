@@ -89,7 +89,9 @@
       "Effect": "Allow",
       "Action": ["scheduler:GetSchedule"],
       "Resource": [
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-0400utc",
         "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1000utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1600utc",
         "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-2200utc",
         "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-ci-watch-canary-drill-weekly",
         "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-sf-watch-canary-drill-weekly"
