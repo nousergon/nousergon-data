@@ -771,7 +771,7 @@
             "export EXPECTED_EXECUTOR_SHA=\"$(cat /home/ec2-user/.frozen_executor_sha 2>/dev/null || true)\"",
             "/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh",
             "trap 'aws s3 cp /var/log/executor.log \"s3://alpha-engine-research/_ssm_logs/executor/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python executor/main.py --dry-run 2>&1 | tee -a /var/log/executor.log"
+            "python executor/main.py 2>&1 | tee -a /var/log/executor.log"
           ],
           "executionTimeout": [
             "600"
