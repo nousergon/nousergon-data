@@ -15,7 +15,7 @@
 # adds an import to the daily-news chain, add the dep here too (the standalone
 # run will fail loud on a missing import).
 boto3>=1.34
-pandas>=2.0
+pandas>=3.0.5
 pyarrow>=25.0.0
 numpy>=2.4.6
 requests>=2.34.2
