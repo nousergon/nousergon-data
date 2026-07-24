@@ -608,6 +608,60 @@ alert_classes:
     intake: none
     response: operator
     operator_reason: Budget-usage notice; page-only by design (no automated response exists or is wanted for spend review).
+
+  # ── Telegram-only notify_via_flow_doctor emitters (config-I3513 audit, alpha-engine-config-I3683) ──
+  # These 5 sources all route through notify_via_flow_doctor → Telegram only (no
+  # SQS intake bus event). Added during the I3513 source-propagation audit when
+  # every caller gained an explicit source= parameter but no alert_classes row
+  # existed for them. All DRAIN-BLIND by design: these are operational Telegram
+  # pages/notices, not drain-queue incidents.
+  - class: saturday_integrity_sentinel_telegram
+    source: "saturday-integrity-sentinel"
+    severities: [info, warning, error]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Monday pre-open GO/NO-GO integrity page (Telegram-only by design; the
+      Saturday-sf integrity verdict is independent of the watch plane — a silent
+      sentinel can't hide its own silence).
+  - class: overseer_liveness_probe_telegram
+    source: "overseer-liveness-probe"
+    severities: [error]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Watch-plane wiring/liveness probe findings (Telegram-only by design;
+      the probe IS the watch-plane's own health-check — routing its findings
+      through the watch-plane's alert-drain would create a circular dependency).
+  - class: sf_watch_liveness_probe_telegram
+    source: "sf-watch-liveness-probe"
+    severities: [error, info]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Mid-run spot-reclaim escalation (error) + bounded-relaunch note (info),
+      Telegram-only by design (the reclaim action IS the repair; no drain-queue
+      remediation exists or is wanted for spot-reclaim events).
+  - class: saturday_sf_watch_dispatcher_telegram
+    source: "saturday-sf-watch-dispatcher"
+    severities: [error, info]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Fleet-SF watch receipts (info) + budget-exhaustion escalation (error).
+      Telegram-only by design: these are runtime watch-plane operational notices
+      emitted alongside the agent dispatch path; the agent dispatch itself is
+      already routed through its own playbook (sf-watch).
+  - class: arctic_migration_telegram
+    source: "arctic-migration"
+    severities: [critical, warning, info]
+    intake: none
+    response: operator
+    operator_reason: >-
+      EC2/GHA migration-runner outcome notices (info=noop/success,
+      warning=refused-probe, critical=failure). Telegram-only by design: this
+      is an EC2 script, not a Lambda; it has no bus-accessible IAM role and its
+      notifications are operational pages, not drain-queue incidents.
   - class: fleet_email_digests
     source: "email:eod|backtester|director|research|training digests"
     severities: [info]
