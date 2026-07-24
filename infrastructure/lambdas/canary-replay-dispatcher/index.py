@@ -134,9 +134,6 @@ CANARY_REPLAY_TAG_NAME = "alpha-engine-canary-replay-spot"
 CANARY_REPLAY_RUN_TOKEN_TAG_KEY = "canary-replay-run-token"
 MARKER_BUCKET = os.environ.get("CANARY_REPLAY_MARKER_BUCKET", "alpha-engine-research")
 
-TAG_WRITE_ATTEMPTS = int(os.environ.get("CANARY_REPLAY_TAG_WRITE_ATTEMPTS", "3"))
-TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("CANARY_REPLAY_TAG_WRITE_RETRY_DELAY_SEC", "2"))
-
 CANARY_REPLAY_GH_PAT_SSM = os.environ.get(
     "CANARY_REPLAY_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat"
 )
@@ -248,10 +245,17 @@ exec bash infrastructure/canary_replay_spot_bootstrap.sh \
 """
 
 
-def _launch_instance() -> tuple[str, str]:
+def _launch_instance(run_token: str) -> tuple[str, str]:
     """Launch the canary-replay box; spot first, on-demand fallback on
     capacity exhaustion. Raises SpotLaunchError if both are exhausted —
-    caught once by the caller and converted to a clean launched:false."""
+    caught once by the caller and converted to a clean launched:false.
+
+    The run_token discriminator tag is applied AS PART of the RunInstances
+    call (``extra_tags``) rather than as a separate post-launch
+    ``create_tags`` call — this closes the TOCTOU race between launch and
+    tag write where a second, near-simultaneous dispatch for the same
+    run_token could see no tagged instance yet and launch a duplicate box.
+    """
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -261,6 +265,7 @@ def _launch_instance() -> tuple[str, str]:
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name=CANARY_REPLAY_TAG_NAME,
         region=REGION,
+        extra_tags={CANARY_REPLAY_RUN_TOKEN_TAG_KEY: run_token},
     )
 
 
@@ -337,31 +342,6 @@ def _clear_stale_marker(run_token: str) -> None:
     )
 
 
-def _create_discriminator_tag(instance_id: str, run_token: str) -> str | None:
-    """Write the load-bearing run_token discriminator tag with a bounded
-    retry. Returns None on success, or the final error string after
-    TAG_WRITE_ATTEMPTS failures — the caller terminates the box and fails
-    the dispatch (an untagged box is invisible to the dedupe guard AND to
-    canary-replay-liveness-probe's marker-key derivation)."""
-    tags = [{"Key": CANARY_REPLAY_RUN_TOKEN_TAG_KEY, "Value": run_token}]
-    last_error = ""
-    for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
-        try:
-            boto3.client("ec2", region_name=REGION).create_tags(
-                Resources=[instance_id], Tags=tags
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001 — bounded retry; final failure is FATAL to the dispatch
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "canary-replay discriminator tag write attempt %d/%d failed for %s: %s",
-                attempt, TAG_WRITE_ATTEMPTS, instance_id, last_error,
-            )
-            if attempt < TAG_WRITE_ATTEMPTS:
-                time.sleep(TAG_WRITE_RETRY_DELAY_SEC)
-    return last_error
-
-
 def _launch_canary_replay_spot(mode: str, research_ref: str, data_ref: str,
                                run_token: str) -> dict:
     """Launch + bootstrap the canary box. SYNCHRONOUS contract: every
@@ -405,7 +385,7 @@ def _launch_canary_replay_spot(mode: str, research_ref: str, data_ref: str,
 
     dispatched_at = time.time()
     try:
-        instance_id, market = _launch_instance()
+        instance_id, market = _launch_instance(run_token)
     except SpotLaunchError as exc:
         logger.error("canary-replay spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc),
@@ -413,18 +393,6 @@ def _launch_canary_replay_spot(mode: str, research_ref: str, data_ref: str,
 
     logger.info("launched canary-replay box %s (%s) for token=%s%s", instance_id, market,
                 run_token, " dedupe_degraded=true" if dedupe_degraded else "")
-
-    tag_error = _create_discriminator_tag(instance_id, run_token)
-    if tag_error is not None:
-        _terminate_instance(instance_id)
-        logger.error(
-            "canary-replay discriminator tag write FAILED after %d attempts for %s "
-            "(token=%s) — box terminated, dispatch failed: %s",
-            TAG_WRITE_ATTEMPTS, instance_id, run_token, tag_error,
-        )
-        return {"launched": False, "reason": "tag_write_failed",
-                "instance_id": instance_id, "error": tag_error,
-                "run_token": run_token, "dedupe_degraded": dedupe_degraded}
 
     try:
         _wait_ssm_online(instance_id)

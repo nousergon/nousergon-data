@@ -6,8 +6,9 @@ sys.modules BEFORE importing index — this repo's own
 ``spot_dispatch``'s internal retry/fallback mechanics; these tests validate
 ONLY this Lambda's orchestration: event validation + deterministic
 run_token derivation, the concurrency dedupe guard, spot-launch failure
-handling, discriminator-tag retry-then-terminate, post-launch-failure
-terminate, and the kill-switch short-circuit.
+handling, launch-time extra_tags verification (config#2836 — replaced the
+separate discriminator-tag retry-then-terminate path with tag-on-create),
+post-launch-failure terminate, and the kill-switch short-circuit.
 """
 
 from __future__ import annotations
@@ -32,16 +33,17 @@ def _install_stubs(
     launch_with_fallback_impl=None,
     running_instance_ids_impl=None,
     send_async_command_impl=None,
-    create_tags_failures=0,
     wait_ssm_online_raises=None,
     delete_object_raises=None,
 ):
+    captured_extra_tags: dict[str, str] = {}
+
     spot_dispatch_mod = types.ModuleType("nousergon_lib.spot_dispatch")
     spot_dispatch_mod.SpotLaunchError = _SpotLaunchError
     spot_dispatch_mod.SpotProbeError = _SpotProbeError
 
     spot_dispatch_mod.launch_with_fallback = launch_with_fallback_impl or (
-        lambda *a, **kw: ("i-abc123", "spot")
+        lambda *a, **kw: captured_extra_tags.update(kw.get("extra_tags") or {}) or ("i-abc123", "spot")
     )
     spot_dispatch_mod.running_instance_ids = running_instance_ids_impl or (lambda *a, **kw: [])
 
@@ -66,17 +68,6 @@ def _install_stubs(
     sys.modules["nousergon_lib"] = nousergon_lib_mod
     sys.modules["nousergon_lib.spot_dispatch"] = spot_dispatch_mod
 
-    tags_created: list[tuple] = []
-    create_tags_attempts = {"n": 0}
-
-    class _FakeEc2:
-        def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
-            create_tags_attempts["n"] += 1
-            if create_tags_attempts["n"] <= create_tags_failures:
-                raise RuntimeError(f"CreateTags throttled (attempt {create_tags_attempts['n']})")
-            tags_created.append((Resources, Tags))
-            return {}
-
     deleted_keys: list[tuple] = []
 
     class _FakeS3:
@@ -89,14 +80,12 @@ def _install_stubs(
     boto3_mod = types.ModuleType("boto3")
 
     def _fake_client(name, **kw):
-        if name == "s3":
-            return _FakeS3()
-        return _FakeEc2()
+        return _FakeS3()
 
     boto3_mod.client = _fake_client
     sys.modules["boto3"] = boto3_mod
 
-    return terminated, tags_created, deleted_keys
+    return terminated, deleted_keys, captured_extra_tags
 
 
 def _reload_index():
@@ -205,22 +194,6 @@ class TestLaunchFailures:
         assert result["launched"] is False
         assert result["reason"] == "launch_failed"
 
-    def test_tag_write_retries_then_terminates_on_final_failure(self):
-        terminated, tags_created, _ = _install_stubs(create_tags_failures=99)
-        index = _reload_index()
-        result = index.handler({"mode": "scheduled"}, None)
-        assert result["launched"] is False
-        assert result["reason"] == "tag_write_failed"
-        assert terminated == ["i-abc123"]
-
-    def test_tag_write_succeeds_after_transient_failures(self):
-        terminated, tags_created, _ = _install_stubs(create_tags_failures=2)
-        index = _reload_index()
-        result = index.handler({"mode": "scheduled"}, None)
-        assert result["launched"] is True
-        assert terminated == []
-        assert len(tags_created) == 1
-
     def test_ssm_online_failure_terminates_box_and_returns_clean_failure(self):
         terminated, _, _ = _install_stubs(wait_ssm_online_raises=TimeoutError("ssm never came online"))
         index = _reload_index()
@@ -228,6 +201,35 @@ class TestLaunchFailures:
         assert result["launched"] is False
         assert result["reason"] == "post_launch_failed"
         assert terminated == ["i-abc123"]
+
+
+class TestExtraTags:
+    """run_token discriminator tags are now applied at launch time via
+    ``extra_tags`` on ``launch_with_fallback``, closing the TOCTOU race
+    between a separate ``create_tags`` call and the concurrency dedupe
+    probe (the tag is atomically present from the moment the instance
+    exists — no untagged window)."""
+
+    def test_extra_tags_contains_the_run_token(self):
+        _, _, captured = _install_stubs()
+        index = _reload_index()
+        result = index.handler({"mode": "scheduled"}, None)
+        assert captured.get("canary-replay-run-token") == result["run_token"]
+
+    def test_extra_tags_pr_mode(self):
+        _, _, captured = _install_stubs()
+        index = _reload_index()
+        result = index.handler(
+            {
+                "mode": "pr",
+                "repo": "nousergon/crucible-research",
+                "pr_number": "42",
+                "sha": "abc1234567890abc1234567890abc1234567890",
+            },
+            None,
+        )
+        assert result["launched"] is True
+        assert captured.get("canary-replay-run-token") == result["run_token"]
 
 
 class TestKillSwitch:
@@ -266,7 +268,7 @@ class TestStaleMarkerGuard:
     never observe a leftover verdict from a previous dispatch."""
 
     def test_launch_clears_the_marker_key_before_launching(self):
-        _, _, deleted_keys = _install_stubs()
+        _, deleted_keys, _ = _install_stubs()
         index = _reload_index()
         result = index.handler(
             {
@@ -307,7 +309,7 @@ class TestStaleMarkerGuard:
         # A live box is already working this exact token — its own,
         # eventual marker write is the one we want; clearing here would
         # race the live box's own in-flight completion write.
-        _, _, deleted_keys = _install_stubs(
+        _, deleted_keys, _ = _install_stubs(
             running_instance_ids_impl=lambda *a, **kw: ["i-existing"]
         )
         index = _reload_index()
