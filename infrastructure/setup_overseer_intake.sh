@@ -19,11 +19,33 @@
 #      alarms, disk alarms) with ZERO code — CloudWatch emits these events
 #      natively; no Lambda/SNS hop and no IAM on the emitting side.
 #
+# Gap identified in alpha-engine-config-I2908: every CW alarm + every
+# krepis-published alert now hits the bus, but an entire class of alerts
+# never touches either krepis chokepoint — native Step-Functions sns:publish
+# ASL states + raw boto3 sns.publish() call sites. Section 6 below bridges
+# that gap via an SNS-to-EventBridge forwarder Lambda subscribed to the
+# ``alpha-engine-alerts`` topic.
+#
 # Deliberately NOT here (epic invariant 3, alpha-engine-config-I2821): the
 # alpha-engine-alarm-backstop SNS topic and its CW alarms are untouched — the
 # last-resort backstop must never route THROUGH the bus/queue machinery it
 # watches. The default-bus rule above is an ADDITIVE tap on alarm state
 # changes; SNS delivery of every alarm is unchanged.
+#
+# Evaluation of other topics per alpha-engine-config-I2908:
+# - alpha-engine-alarm-backstop: NOT forwarded — the backstop is independent
+#   by design, and routing it through the bus it watches would violate epic
+#   I2821 invariant 3. CW alarm state-changes already reach the bus via the
+#   default-bus rule above. (Decision: leave UNforwarded.)
+# - alpha-engine-watchdog-alerts: FORWARDED via the same alpha-engine-alerts
+#   forwarder Lambda IF its messages arrive on the alpha-engine-alerts topic;
+#   if it uses a separate SNS topic as its notification surface, it would
+#   need its own subscription. Investigation (alpha-engine-config-I2908):
+#   watchdog-alerts publishes via krepis (which already hits the bus) for
+#   structured alerts and SNS for human-only paging (Telegram/SNS). The
+#   structured path already reaches the intake queue via the krepis rule
+#   above; the SNS-only path is human-facing fire-and-forget that belongs
+#   outside the drain scope. Decision: no separate forwarder needed.
 #
 # IAM for emitters is a separate concern — see
 # attach_overseer_put_events_policy.sh (creates/attaches the
@@ -181,3 +203,102 @@ fi
 echo "== Done. Bus=${BUS_ARN}"
 echo "== Queue=${QUEUE_ARN} DLQ=${DLQ_ARN}"
 echo "== Emitter IAM: run ./infrastructure/attach_overseer_put_events_policy.sh next."
+
+# ── 6. SNS forwarder: alpha-engine-alerts → nousergon-alerts bus ──────────
+# (alpha-engine-config-I2908) — bridges the gap where native Step-Functions
+# sns:publish ASL states and raw boto3 sns.publish() call sites bypass both
+# krepis chokepoints and never reach the overseer bus. The forwarder Lambda
+# subscribes to alpha-engine-alerts SNS and calls PutEvents on the
+# nousergon-alerts custom bus with source attribution.
+FORWARDER_FN="alpha-engine-alerts-forwarder"
+FORWARDER_ROLE="alpha-engine-alerts-forwarder"
+FORWARDER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FORWARDER_FN}"
+FORWARDER_PATH="infrastructure/lambdas/alpha-engine-alerts-forwarder"
+ALERTS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts"
+
+# Create the Lambda function if it doesn't exist yet (bootstrap path for
+# first-time setup, before deploy.sh is ever run).
+if ! aws lambda get-function --function-name "$FORWARDER_FN" --region "$REGION" >/dev/null 2>&1; then
+  echo "Lambda ${FORWARDER_FN}: not found — creating bootstrap function"
+
+  # Create execution role if missing
+  if ! aws iam get-role --role-name "$FORWARDER_ROLE" >/dev/null 2>&1; then
+    echo "  Creating IAM role: ${FORWARDER_ROLE}"
+    run aws iam create-role \
+      --role-name "$FORWARDER_ROLE" \
+      --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+    run aws iam attach-role-policy \
+      --role-name "$FORWARDER_ROLE" \
+      --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    run aws iam put-role-policy \
+      --role-name "$FORWARDER_ROLE" \
+      --policy-name "alpha-engine-alerts-forwarder-events" \
+      --policy-document "file://${FORWARDER_PATH}/iam-policy.json"
+    echo "  Waiting 10s for IAM propagation..."
+    sleep 10
+  fi
+
+  ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${FORWARDER_ROLE}"
+  # Create a minimal placeholder function. Deploy the actual code via deploy.sh.
+  if [[ "$DRY_RUN" == "0" ]]; then
+    cd "$(dirname "$0")"
+    TMP_DIR=$(mktemp -d)
+    cat > "$TMP_DIR/placeholder.py" << 'PYEOF'
+"""Placeholder — deploy the real handler via deploy.sh."""
+def handler(event, context):
+    return {"status": "placeholder"}
+PYEOF
+    (cd "$TMP_DIR" && zip -q /tmp/forwarder-placeholder.zip placeholder.py; mv /tmp/forwarder-placeholder.zip "$TMP_DIR/placeholder.zip")
+    run aws lambda create-function \
+      --function-name "$FORWARDER_FN" \
+      --runtime python3.12 \
+      --architectures arm64 \
+      --handler placeholder.handler \
+      --role "$ROLE_ARN" \
+      --timeout 30 --memory-size 256 \
+      --zip-file "fileb://${TMP_DIR}/placeholder.zip" \
+      --region "$REGION" > /dev/null
+    rm -rf "$TMP_DIR"
+    echo "  Lambda ${FORWARDER_FN}: created (placeholder — deploy the real handler via deploy.sh)"
+    rm -f /tmp/forwarder-placeholder.zip
+  else
+    echo "  (--dry-run) would create Lambda ${FORWARDER_FN}"
+  fi
+else
+  echo "Lambda ${FORWARDER_FN}: exists"
+fi
+
+# Subscribe forwarder Lambda to alpha-engine-alerts SNS topic (idempotent).
+EXISTING_SUB=$(aws sns list-subscriptions-by-topic \
+  --topic-arn "$ALERTS_TOPIC_ARN" --region "$REGION" \
+  --query "Subscriptions[?Endpoint=='${FORWARDER_ARN}'].SubscriptionArn | [0]" \
+  --output text 2>/dev/null || echo "None")
+if [[ "$EXISTING_SUB" == "None" ]] || [[ -z "$EXISTING_SUB" ]]; then
+  run aws sns subscribe \
+    --topic-arn "$ALERTS_TOPIC_ARN" \
+    --protocol lambda \
+    --notification-endpoint "$FORWARDER_ARN" \
+    --region "$REGION" > /dev/null
+  echo "SNS subscription: alpha-engine-alerts → ${FORWARDER_FN} (created)"
+else
+  echo "SNS subscription: alpha-engine-alerts → ${FORWARDER_FN} (exists)"
+fi
+
+# Allow SNS to invoke the forwarder Lambda (idempotent).
+if ! aws lambda get-policy --function-name "$FORWARDER_FN" --region "$REGION" \
+      --query "Policy" --output text 2>/dev/null \
+      | grep -q "sns-alerts-forwarder-invoke"; then
+  run aws lambda add-permission \
+    --function-name "$FORWARDER_FN" \
+    --statement-id sns-alerts-forwarder-invoke \
+    --action lambda:InvokeFunction \
+    --principal sns.amazonaws.com \
+    --source-arn "$ALERTS_TOPIC_ARN" \
+    --region "$REGION" > /dev/null || true  # may exist from earlier run despite idempotency check
+  echo "Lambda permission: sns.amazonaws.com → ${FORWARDER_FN} (added)"
+else
+  echo "Lambda permission: sns.amazonaws.com → ${FORWARDER_FN} (exists)"
+fi
+
+echo "== Forwarder ${FORWARDER_FN} ready."
+echo "== Deploy actual code: bash ${FORWARDER_PATH}/deploy.sh"
