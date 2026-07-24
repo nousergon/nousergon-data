@@ -43,7 +43,7 @@
 #   04:00 daily     cron(0 4 * * ? *)         FULL   all 3 tiers + sweep    # 9pm PT, every day
 #   12:00 daily     cron(0 12 * * ? *)        FULL   all 3 tiers + sweep    # 5am PT, every day
 #   20:00 daily     cron(0 20 * * ? *)        FULL   all 3 tiers + sweep    # 1pm PT, every day
-#   Models: low=deepseek-v4-flash, mid=deepseek-v4-flash, high=claude-sonnet-5, sweep=claude-haiku-4-5
+#   Models: low=deepseek-v4-flash, mid=deepseek-v4-flash, high=deepseek-v4-pro, sweep=deepseek-v4-flash
 #   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
@@ -238,7 +238,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -399,7 +399,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then
