@@ -15,6 +15,7 @@
 # Usage:
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh           # update code only
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --bootstrap   # first-time create + wire all subscriptions
+#   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --wire-subs   # (re)apply subscription filters only
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --dry-run     # show actions, do not apply
 #   bash infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh --smoke       # publish a synthetic ERROR log + verify entry
@@ -35,6 +36,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-changelog-cloudwatch-mirror"
 ROLE_NAME="alpha-engine-changelog-cloudwatch-mirror-role"
 POLICY_NAME="alpha-engine-changelog-cloudwatch-mirror-policy"
@@ -88,6 +90,7 @@ case "${DRY_RUN:-false}" in
   *) DRY_RUN=false ;;
 esac
 BOOTSTRAP=false
+APPLY_IAM=false
 WIRE_SUBS=false
 SMOKE=false
 AUDIT_TARGETS=false
@@ -95,6 +98,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --wire-subs) WIRE_SUBS=true ;;
     --smoke) SMOKE=true ;;
     --audit-targets) AUDIT_TARGETS=true ;;
@@ -178,6 +182,14 @@ if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
 fi
 
 # ----- 1. Bootstrap (first-time only) ---------------------------------------
+
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
