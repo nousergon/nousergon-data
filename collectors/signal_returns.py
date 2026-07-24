@@ -134,6 +134,15 @@ def collect(
         db_path, dry_run, policy=_DECAY_CURVE_POLICY,
     )
 
+    # Step 2c' — coverage assertion (config#1860): WARN with counts when a
+    # resolved-age score_performance signal date has zero
+    # score_performance_outcomes rows post-run. Best-effort observability,
+    # not load-bearing — catches a future backfill blind spot (like the
+    # 2026-04-04/04-11/04-12 gap discovered only via months-later forensics)
+    # the SAME cycle it happens.
+    if not dry_run:
+        results["outcome_store_coverage"] = _check_outcome_store_coverage(db_path)
+
     # Step 2c — wide-column bookkeeping ECHO. The horizon-suffixed OUTCOME
     # columns (return_/spy_*_return/beat_spy_/log_alpha_21d) are RETIRED: no
     # longer written now that the long store is primary and consumers are cut
@@ -751,6 +760,121 @@ def _backfill_outcome_records(
         # system and MUST fail the collector step rather than degrade silently.
         logger.error("backfill_outcome_records failed: %s", e)
         raise
+
+
+# ── Step 2d: Outcome-store coverage assertion (config#1860) ──────────────────
+#
+# config#1860 forensics (crucible-research#389, 2026-07-06): joining 26 weeks
+# of cio_evaluations ADVANCE picks to score_performance_outcomes found 22
+# pre-June picks with ZERO outcome rows at all — three whole score_date
+# cycles (2026-04-04/04-11/04-12) silently missing from the store, discovered
+# only by an offline forensic join months later. _backfill_outcome_records
+# has no visibility into score_performance's OWN date coverage (it only reads
+# whatever rows already made it into score_performance / universe_returns),
+# so a cycle that never got seeded — S3 signals.json missing that week, a
+# universe_returns price-window gap, or any other upstream producer failure —
+# leaves no trace anywhere the collector logs. This closes that blind spot
+# the same way _emit_context_coverage_metric / _emit_horizon_grading_lag_metric
+# close theirs: a cheap, producer-side, best-effort WARN, run every cycle,
+# so a future gap is caught the SAME WEEK it happens instead of months later
+# via manual forensics.
+
+
+def _check_outcome_store_coverage(db_path: str) -> dict:
+    """WARN (with counts) when a ``score_performance`` signal date has ZERO
+    ``score_performance_outcomes`` rows after this run's backfill step.
+
+    For every distinct ``score_date`` present in ``score_performance``,
+    checks whether ``score_performance_outcomes`` has at least one row for
+    that date (any horizon). A date with score_performance rows but no
+    outcome rows at all means the whole cycle silently fell out of the
+    outcome store — as distinct from the ordinary/expected case of a recent
+    date whose forward-return windows haven't closed yet, which the
+    primary-horizon grace cutoff excludes (mirrors the existing
+    ``_newest_window_closed`` reasoning: a date that hasn't had time to
+    resolve is not a coverage gap).
+
+    Best-effort / non-fatal: this is observability, not a load-bearing
+    write path — mirrors ``_emit_context_coverage_metric``'s try/except
+    shape. Always returns a summary dict (even when zero gap dates exist)
+    so callers/tests can assert on ``gap_dates`` deterministically.
+    """
+    from nousergon_lib.trading_calendar import add_trading_days
+
+    summary: dict = {"status": "ok"}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _ensure_score_performance_outcomes_schema(conn)
+
+            signal_dates = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT score_date FROM score_performance ORDER BY score_date"
+                ).fetchall()
+            ]
+            if not signal_dates:
+                summary.update(
+                    signal_dates_checked=0, gap_dates=[], gap_counts={},
+                    note="no score_performance rows — nothing to check",
+                )
+                return summary
+
+            today = date.today()
+            outcome_dates = {
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT score_date FROM score_performance_outcomes"
+                ).fetchall()
+            }
+
+            checked = 0
+            gap_dates: list[str] = []
+            gap_counts: dict[str, int] = {}
+            for sig_date in signal_dates:
+                # Grace window: a date whose primary (21d) horizon hasn't
+                # closed yet is EXPECTED to have no outcome rows — that's
+                # normal forward-window lag, not a gap. Only flag dates old
+                # enough that the primary horizon should have resolved.
+                d = date.fromisoformat(sig_date)
+                if add_trading_days(d, DEFAULT_POLICY.primary_horizon) >= today:
+                    continue
+                checked += 1
+                if sig_date not in outcome_dates:
+                    row_count = conn.execute(
+                        "SELECT COUNT(*) FROM score_performance WHERE score_date = ?",
+                        (sig_date,),
+                    ).fetchone()[0]
+                    gap_dates.append(sig_date)
+                    gap_counts[sig_date] = row_count
+
+            summary.update(
+                signal_dates_checked=checked,
+                gap_dates=gap_dates,
+                gap_counts=gap_counts,
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "outcome_store_coverage: DB read failed — coverage-gap detection "
+            "skipped this cycle. %s", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+        return summary
+
+    if summary["gap_dates"]:
+        logger.warning(
+            "score_performance_outcomes coverage gap: %d signal date(s) with "
+            "score_performance rows but ZERO outcome rows post-run: %s "
+            "(score_performance row counts: %s). A resolved-age cycle with no "
+            "outcome rows at all means it fell out of the backfill entirely — "
+            "investigate whether score_performance seeded correctly for these "
+            "dates and whether universe_returns has their price window "
+            "(config#1860).",
+            len(summary["gap_dates"]), summary["gap_dates"], summary["gap_counts"],
+        )
+
+    return summary
 
 
 # ── Step 3: Seed predictor_outcomes ───────────────────────────────────────────

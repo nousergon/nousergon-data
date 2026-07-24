@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import time
+import urllib.request
 from collections import defaultdict
 from dataclasses import replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
@@ -142,6 +143,43 @@ RECOVERY_DISPATCH_ENABLED = (
     == "true"
 )
 
+# config-I3282 — freshness-critical → overseer drain dispatch (phase 1;
+# Brian directive 2026-07-22). Every CRITICAL page from a row whose declared
+# response lane is NOT `remediation: operator` (and that has no `recovery:`
+# heal of its own in flight) triggers ONE event-time alert-drain run through
+# the overseer router, instead of the critical sitting in the intake queue
+# until the next scheduled drain (10:00/22:00 UTC — today's four criticals
+# waited ~10h). The drain agent consumes the whole queue, so a sweep that
+# pages several criticals dispatches ONCE, and the router's alert-drain
+# playbook + the executor's EC2 tag lock (concurrent_skip benign) guard
+# overlap. Async Event invoke — the router owns escalation on executor
+# failure (mirrors saturday-sf-watch-dispatcher's M2 posture).
+#
+# Rows with a `recovery:` block are EXCLUDED: their declared lane is the
+# auto-backfill heal, and a drain on top of an in-flight heal is redundant.
+# Rows with no declaration at all (only reachable via warning-escalation or
+# probe_failed coercion — the PR-time completeness check requires a lane on
+# every statically-critical row) DEFAULT to dispatch: a critical page nobody
+# declared a response for is exactly the case that must not sit unactioned.
+DRAIN_DISPATCH_ENABLED = (
+    os.environ.get("FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED", "false").lower()
+    == "true"
+)
+DRAIN_DISPATCH_MARKER_KEY = (
+    "_freshness_monitor/_dispatch/last_drain_dispatch.json"
+)
+# One drain covers every critical in the queue at launch; the cooldown only
+# bounds how often a PERSISTENTLY-critical sweep can relaunch one. Sized to
+# the drain's own runtime ceiling (3h watchdog) would starve genuinely new
+# incidents; 120min matches the recovery cooldown's retry philosophy.
+DRAIN_DISPATCH_COOLDOWN_MINUTES = int(
+    os.environ.get("DRAIN_DISPATCH_COOLDOWN_MINUTES", "120")
+)
+OVERSEER_DISPATCHER_FUNCTION = os.environ.get(
+    "OVERSEER_DISPATCHER_FUNCTION", "alpha-engine-overseer-dispatcher"
+)
+DRAIN_PLAYBOOK = os.environ.get("FRESHNESS_DRAIN_PLAYBOOK", "alert-drain")
+
 # CloudWatch namespace for the per-cycle completion rollup metric. Shares
 # the substrate-health namespace so cycle-completion + substrate-row health
 # graph together. Dimensioned by Cadence only (low-cardinality, alarm-able).
@@ -186,6 +224,30 @@ CHAMPION_POINTER_KEY = os.environ.get(
     "CHAMPION_POINTER_KEY", "config/producer_champion.json"
 )
 WARNING_ESCALATION_RUNS = int(os.environ.get("WARNING_ESCALATION_RUNS", "3"))
+
+# config#2055 Gap 2 — key-deliverable extended-staleness escalation into the
+# Decision Queue (Brian's 2026-07-21 Option-A ruling: the Lambda files the
+# issue directly, mirroring overseer-dispatcher's `_file_p1`). A row opts in
+# via the registry's `escalate_to_issue: true` flag (parsed as a parallel
+# map, same pattern as `critical_while_champion_arm` — not a schema field on
+# the frozen lib `ArtifactSpec`). WARNING_ESCALATION_RUNS (above) already
+# promotes a persistent warning to the critical SNS/Telegram page after 3
+# daily sweeps (~3 days) — this is a SEPARATE, much longer threshold for
+# "nobody has acted on the page either": ~2 weeks of consecutive confirmed
+# misses before a P1 lands on the Decision Queue. For an `event_driven` row
+# (whose own freshness check ALWAYS short-circuits to fresh — see
+# `check_freshness`'s event-driven short-circuit — so its own
+# `consecutive_miss_runs` is always 0), the threshold is evaluated against
+# its `liveness_via` ANCHOR's miss-streak instead; see
+# `_escalate_stale_key_deliverables`.
+ISSUE_ESCALATION_RUNS = int(os.environ.get("ISSUE_ESCALATION_RUNS", "14"))
+ISSUES_REPO = os.environ.get("ISSUES_REPO", "nousergon/alpha-engine-config")
+# Same SSM param overseer-dispatcher already reads (IAM-reuse convention) —
+# no new secret, just a new grant on the existing parameter.
+GH_PAT_SSM = os.environ.get(
+    "GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat"
+)
+_ISSUE_TIMEOUT_SEC = int(os.environ.get("ISSUE_ESCALATION_TIMEOUT_SEC", "10"))
 
 # ArtifactSpec field set — used to strip extra YAML keys (e.g., the
 # top-level `defaults` shape carries `s3_bucket` which we want, but a
@@ -254,20 +316,24 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
 
 def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
-) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]]]:
+) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]],
+           dict[str, bool], dict[str, str]]:
     """Like :func:`load_registry`, but also returns the per-artifact
-    ``recovery:`` spec map (config#1240) and the
-    ``critical_while_champion_arm`` map (config-I3086), both keyed by
-    ``artifact_id``.
+    ``recovery:`` spec map (config#1240), the
+    ``critical_while_champion_arm`` map (config-I3086), the
+    ``escalate_to_issue`` map (config#2055 Gap 2), and the
+    ``remediation:`` declared-response-lane map (config-I3282), all keyed
+    by ``artifact_id``.
 
     ``ArtifactSpec`` is a frozen lib dataclass without a ``recovery``
     field (the monitor's dispatch concern is not the substrate's
     freshness concern), so the recovery block is parsed into a parallel
-    map rather than threaded onto the spec; the champion-arm block
-    follows the same pattern. Artifacts without a block are simply
-    absent from the respective map — the dispatch path treats a missing
-    key as "no auto-remediation, page only"; the severity path treats it
-    as "static severity only".
+    map rather than threaded onto the spec; the champion-arm and
+    escalate-to-issue blocks follow the same pattern. Artifacts without a
+    block are simply absent from the respective map — the dispatch path
+    treats a missing key as "no auto-remediation, page only"; the
+    severity path treats it as "static severity only"; the escalation
+    path treats it as "console/page-only, never files an issue".
     """
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read()
@@ -279,6 +345,8 @@ def load_registry_with_recovery(
     specs: list[ArtifactSpec] = []
     recovery_by_id: dict[str, dict] = {}
     critical_arms_by_id: dict[str, list[str]] = {}
+    escalate_to_issue_by_id: dict[str, bool] = {}
+    remediation_by_id: dict[str, str] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
@@ -292,7 +360,13 @@ def load_registry_with_recovery(
         arms = merged.get("critical_while_champion_arm")
         if isinstance(arms, list) and arms:
             critical_arms_by_id[spec.artifact_id] = [str(a) for a in arms]
-    return specs, recovery_by_id, critical_arms_by_id
+        if merged.get("escalate_to_issue") is True:
+            escalate_to_issue_by_id[spec.artifact_id] = True
+        remediation = merged.get("remediation")
+        if isinstance(remediation, str) and remediation:
+            remediation_by_id[spec.artifact_id] = remediation
+    return (specs, recovery_by_id, critical_arms_by_id,
+            escalate_to_issue_by_id, remediation_by_id)
 
 
 # ── Dynamic severity (config-I3086) ─────────────────────────────────────────
@@ -383,6 +457,30 @@ def _load_prev_miss_counts(s3_client: Any) -> dict[str, int]:
         return {}
 
 
+def _load_prev_issue_filed(s3_client: Any) -> dict[str, str]:
+    """Previous sweep's per-artifact filed-issue URLs (config#2055 Gap 2),
+    read back from ``check_results.json``. A present entry means an
+    escalation P1 was already filed for this artifact's CURRENT incident —
+    dedup source of truth, so a still-stale row doesn't re-file every day.
+    Missing/malformed prior results degrade to "nothing filed yet" (an
+    extra issue on next threshold-cross is a much smaller cost than a
+    counter read failure silently suppressing a real escalation forever)."""
+    try:
+        obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=CHECK_RESULTS_KEY)
+        data = json.loads(obj["Body"].read())
+        return {
+            row["artifact_id"]: row["issue_filed_url"]
+            for row in data.get("results", [])
+            if isinstance(row, dict) and row.get("artifact_id") and row.get("issue_filed_url")
+        }
+    except Exception as exc:  # noqa: BLE001 — read failure degrades to "nothing filed yet"
+        logger.warning(
+            "previous check_results read failed — issue-filed markers reset "
+            "(config#2055): %s", exc,
+        )
+        return {}
+
+
 def _is_confirmed_miss(result: CheckResult) -> bool:
     """The same confirmed-miss shape the alert path fires on: an
     alerting state past its SLA grace (probe_failed has no grace)."""
@@ -422,14 +520,20 @@ def _serialize_check_results(
     pairs: list[tuple[ArtifactSpec, CheckResult]], now: datetime,
     miss_counts: dict[str, int] | None = None,
     coerced_ids: set[str] | None = None,
+    issue_filed_by_id: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
     the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
     (config-I3086) persist the warning-escalation counters and mark rows
     whose severity was dynamically coerced, so the dashboard can explain
-    a row paging as critical while the registry declares warning."""
+    a row paging as critical while the registry declares warning.
+    ``issue_filed_by_id`` (config#2055 Gap 2) persists the extended-
+    staleness escalation's dedup marker — the URL of the P1 filed for
+    this artifact's current incident, or ``None``/absent if none is
+    in flight."""
     miss_counts = miss_counts or {}
     coerced_ids = coerced_ids or set()
+    issue_filed_by_id = issue_filed_by_id or {}
     rows = []
     for spec, result in pairs:
         rows.append(
@@ -450,6 +554,7 @@ def _serialize_check_results(
                 ),
                 "sla_violated_by_minutes": result.sla_violated_by_minutes,
                 "recovery_substituted": result.recovery_substituted,
+                "issue_filed_url": issue_filed_by_id.get(spec.artifact_id),
             }
         )
     return {
@@ -803,6 +908,115 @@ def _maybe_dispatch_recovery(
     return True
 
 
+# ── Freshness-critical → overseer drain dispatch (config-I3282 phase 1) ─────
+
+
+def _drain_dispatch_in_cooldown(s3_client: Any, now: datetime) -> bool:
+    """True if a drain-dispatch marker exists within the cooldown window.
+
+    Global (not per-artifact): one drain consumes the WHOLE intake queue, so
+    every critical paged before (or shortly after) the launch is covered by
+    the same run. Fail-closed on non-404 HEAD errors, mirroring
+    :func:`_recovery_already_dispatched` — a transient S3 blip must not
+    trigger a dispatch storm.
+    """
+    try:
+        resp = s3_client.head_object(
+            Bucket=REGISTRY_BUCKET, Key=DRAIN_DISPATCH_MARKER_KEY
+        )
+    except Exception as exc:  # noqa: BLE001 — classify by error code
+        code = str(
+            getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        )
+        status = getattr(exc, "response", {}).get("ResponseMetadata", {}).get(
+            "HTTPStatusCode", 0
+        )
+        if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return False  # no marker → first dispatch
+        logger.warning(
+            "drain-dispatch marker HEAD failed (%s) — assuming in-flight to "
+            "avoid a dispatch storm", exc,
+        )
+        return True
+    lm = resp.get("LastModified")
+    if lm is None:
+        return True
+    age_min = (now - lm).total_seconds() / 60.0
+    return age_min < DRAIN_DISPATCH_COOLDOWN_MINUTES
+
+
+def _maybe_dispatch_drain(
+    s3_client: Any,
+    aws_clients: dict[str, Any],
+    candidate_ids: list[str],
+    now: datetime,
+) -> bool:
+    """Event-time overseer drain dispatch for this sweep's critical pages
+    (config-I3282 phase 1). Called ONCE per pass with every artifact whose
+    critical page fired and whose declared lane admits dispatch.
+
+    Returns ``True`` iff a dispatch was performed. Fires only when ALL of:
+      - ``candidate_ids`` is non-empty;
+      - :data:`DRAIN_DISPATCH_ENABLED` (OBSERVE-mode gate — logs the
+        would-dispatch and writes NO marker / calls NO AWS when off);
+      - no dispatch marker within the cooldown window (global dedup — one
+        drain covers the whole queue).
+
+    The router invoke is async (``Event``): the overseer-dispatcher owns
+    verdict handling and escalation (P1 + loud page) end-to-end, exactly as
+    it does for saturday-sf-watch-dispatcher's M2 dispatches. The marker is
+    written BEFORE the invoke (same crash-ordering argument as the recovery
+    marker: err toward not-re-dispatching).
+    """
+    if not candidate_ids:
+        return False
+
+    if not DRAIN_DISPATCH_ENABLED:
+        logger.info(
+            "OBSERVE-mode (drain-dispatch): would dispatch playbook=%s via %s "
+            "for %d critical page(s): %s",
+            DRAIN_PLAYBOOK, OVERSEER_DISPATCHER_FUNCTION,
+            len(candidate_ids), sorted(candidate_ids),
+        )
+        return False
+
+    if _drain_dispatch_in_cooldown(s3_client, now):
+        logger.info(
+            "drain dispatch in cooldown — %d critical page(s) (%s) covered by "
+            "the in-flight/recent drain",
+            len(candidate_ids), sorted(candidate_ids),
+        )
+        return False
+
+    _put_json(
+        s3_client, REGISTRY_BUCKET, DRAIN_DISPATCH_MARKER_KEY,
+        {
+            "dispatched_at": now.isoformat(),
+            "artifact_ids": sorted(candidate_ids),
+            "playbook": DRAIN_PLAYBOOK,
+        },
+    )
+
+    lam = aws_clients.get("lambda")
+    if lam is None:
+        lam = boto3.client("lambda")
+        aws_clients["lambda"] = lam
+    lam.invoke(
+        FunctionName=OVERSEER_DISPATCHER_FUNCTION,
+        InvocationType="Event",  # async; the router owns escalation
+        Payload=json.dumps({
+            "playbook": DRAIN_PLAYBOOK,
+            "payload": {"trigger": "freshness-critical", "is_drill": "false"},
+        }).encode("utf-8"),
+    )
+    logger.info(
+        "DISPATCHED overseer playbook=%s via %s for %d critical page(s): %s",
+        DRAIN_PLAYBOOK, OVERSEER_DISPATCHER_FUNCTION,
+        len(candidate_ids), sorted(candidate_ids),
+    )
+    return True
+
+
 # ── Alerting (gated on ALERTS_ENABLED) ──────────────────────────────────────
 
 
@@ -909,6 +1123,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         silent=False,
         severity=severity,
         dedup_key=dedup_key,
+        source="freshness-monitor",
         flow_name=_FLOW_NAME,
         topics=_FRESHNESS_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
@@ -919,6 +1134,168 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         },
     )
     return True
+
+
+# ── Key-deliverable extended-staleness escalation (config#2055 Gap 2) ───────
+#
+# Even a confirmed critical page (above) is console/Telegram-only — nothing
+# lands where Brian triages open work. A `severity=warning` row is worse:
+# it's dashboard-only forever, no matter how long it persists (the exact
+# "sat on dashboard page 26 for days" shape config-I3086 already fixed once
+# for the *critical-page* threshold). This closes the same gap one rung
+# higher: an artifact flagged `escalate_to_issue: true` that's been
+# confirmed-missing for `ISSUE_ESCALATION_RUNS` consecutive daily sweeps
+# gets a `[P1] gate:operator` issue filed directly on the Decision Queue
+# (Brian's 2026-07-21 Option-A ruling on config#2055) — mirrors
+# `overseer-dispatcher/index.py::_file_p1` byte-for-byte (same SSM-sourced
+# PAT, same urllib POST, same repo target) rather than inventing a second
+# GitHub-issue-filing implementation.
+
+
+def _file_escalation_issue(
+    artifact_id: str, owner_repo: str, miss_runs: int, anchor_id: str,
+) -> dict:
+    """File the extended-staleness P1 on ISSUES_REPO. Best-effort — the
+    WARNING log + the returned dict (persisted into check_results.json's
+    ``issue_filed_url`` for dedup) are the other recording surfaces."""
+    try:
+        pat = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1")).get_parameter(
+            Name=GH_PAT_SSM, WithDecryption=True
+        )["Parameter"]["Value"]
+        body = "\n".join([
+            f"`{artifact_id}` (owner: `{owner_repo}`) has been confirmed-missing/"
+            f"stale for {miss_runs} consecutive daily freshness sweeps via its "
+            f"liveness proxy `{anchor_id}` — well past the point a `severity="
+            "warning` console-only page is enough; nobody has acted on it.",
+            "",
+            "**Summary:** Freshness monitor's extended-staleness escalation "
+            f"(config#2055 Gap 2) fired for `{artifact_id}` — flagged "
+            "key-deliverable, confirmed stale via its liveness proxy for "
+            f"{miss_runs}+ consecutive daily sweeps with no operator action.",
+            "**Ask:** Investigate why `{}` (or its liveness proxy `{}`) has "
+            "stopped updating, and either fix the producer or acknowledge the "
+            "staleness is expected right now.".format(artifact_id, anchor_id),
+            "**Options:** A) Investigate the producer pipeline for "
+            f"`{artifact_id}` / `{anchor_id}` now (recommended) B) Acknowledge "
+            "as expected (e.g. a genuinely quiet promotion period) and push "
+            "out the re-exam date",
+            "**SOTA:** Every key-deliverable artifact's staleness is caught "
+            "and triaged within its cadence window — no silent multi-week gaps "
+            "(the config#2054 incident this escalation path exists to prevent).",
+            "**Delta:** IS SOTA — no delta; this issue IS the triage step.",
+            "**Consequence of no action:** This artifact (or the promotion "
+            "pipeline behind it) may stay silently stalled indefinitely — the "
+            "exact config#2054 failure shape, just past the point a console "
+            "page alone was working.",
+            "",
+            f"- **Anchor (liveness proxy):** `{anchor_id}`",
+            f"- **Consecutive confirmed-miss daily sweeps:** {miss_runs} "
+            f"(threshold: {ISSUE_ESCALATION_RUNS})",
+            "- **Filed via:** alpha-engine-freshness-monitor (config#2055 Gap 2)",
+            "",
+            "Closes-when: the underlying staleness is resolved (producer fixed "
+            "and a fresh write confirmed) or explicitly acknowledged as "
+            "expected for this period.",
+        ])
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{ISSUES_REPO}/issues",
+            data=json.dumps({
+                "title": f"[P1] Freshness monitor: {artifact_id} stale for "
+                         f"{miss_runs}+ consecutive sweeps — extended staleness",
+                "body": body,
+                "labels": ["P1", "gate:operator", "area:infrastructure"],
+            }).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {pat}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "freshness-monitor",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_ISSUE_TIMEOUT_SEC) as resp:
+            issue = json.loads(resp.read())
+        logger.info(
+            "config#2055 extended-staleness P1 filed for %s: %s",
+            artifact_id, issue.get("html_url"),
+        )
+        return {"filed": True, "url": issue.get("html_url")}
+    except Exception as exc:  # noqa: BLE001 — best-effort leg; recording surfaces: this WARNING, the returned dict
+        logger.warning(
+            "config#2055 extended-staleness P1 filing FAILED for %s: %s: %s",
+            artifact_id, type(exc).__name__, exc,
+        )
+        return {"filed": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _escalate_stale_key_deliverables(
+    pairs: list[tuple[ArtifactSpec, CheckResult]],
+    miss_counts: dict[str, int],
+    escalate_to_issue_by_id: dict[str, bool],
+    prev_issue_filed: dict[str, str],
+    now: datetime,
+) -> dict[str, str | None]:
+    """For every ``escalate_to_issue``-flagged spec, file a Decision-Queue
+    P1 once its confirmed-miss streak crosses :data:`ISSUE_ESCALATION_RUNS`.
+
+    An ``event_driven`` row's OWN ``check_freshness`` result always
+    short-circuits to ``fresh`` (see the event-driven short-circuit in
+    ``nousergon_lib.artifact_freshness``), so its own ``miss_counts`` entry
+    is always 0 — the miss-streak that actually matters is its
+    ``liveness_via`` ANCHOR's, which this same sweep already computed (both
+    rows are walked in the same registry pass, so the anchor's entry is
+    always present in ``miss_counts`` by the time this runs). Non-
+    ``event_driven`` flagged rows (should any exist in future) use their
+    own miss streak directly.
+
+    Returns the artifact_id -> issue URL map to persist into
+    check_results.json (config#2055's dedup source of truth): sticky while
+    the miss-streak persists, reset to ``None`` the moment it recovers so a
+    FUTURE incident can file a fresh issue.
+    """
+    if not escalate_to_issue_by_id:
+        return {}
+    results_by_id = {spec.artifact_id: (spec, result) for spec, result in pairs}
+    issue_filed_by_id: dict[str, str | None] = {}
+    for artifact_id in escalate_to_issue_by_id:
+        pair = results_by_id.get(artifact_id)
+        if pair is None:
+            continue
+        spec, _result = pair
+        anchor_id = (
+            spec.liveness_via if spec.cadence == "event_driven" else spec.artifact_id
+        )
+        anchor_miss = miss_counts.get(anchor_id, 0)
+
+        if anchor_miss == 0:
+            # Recovered (or never missing) — clear any sticky marker so a
+            # future incident can file a fresh issue.
+            issue_filed_by_id[artifact_id] = None
+            continue
+
+        already_filed = prev_issue_filed.get(artifact_id)
+        if already_filed:
+            # Still stale, already escalated for THIS incident — carry
+            # forward, don't re-file.
+            issue_filed_by_id[artifact_id] = already_filed
+            continue
+
+        if not ALERTS_ENABLED:
+            logger.info(
+                "OBSERVE-mode: would escalate %s to Decision Queue P1 "
+                "(anchor=%s miss_runs=%d)", artifact_id, anchor_id, anchor_miss,
+            )
+            issue_filed_by_id[artifact_id] = None
+            continue
+
+        if anchor_miss < ISSUE_ESCALATION_RUNS:
+            issue_filed_by_id[artifact_id] = None
+            continue
+
+        filed = _file_escalation_issue(artifact_id, spec.owner_repo, anchor_miss, anchor_id)
+        issue_filed_by_id[artifact_id] = filed.get("url") if filed.get("filed") else None
+
+    return issue_filed_by_id
 
 
 # ── Handler ─────────────────────────────────────────────────────────────────
@@ -1223,8 +1600,9 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         now.isoformat(), ALERTS_ENABLED,
     )
 
-    specs, recovery_by_id, critical_arms_by_id = load_registry_with_recovery(
-        s3_client, REGISTRY_BUCKET, REGISTRY_KEY
+    (specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id,
+     remediation_by_id) = (
+        load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
     intraday_specs = [s for s in specs if s.artifact_id in INTRADAY_ARTIFACT_IDS]
@@ -1237,6 +1615,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
 
     pairs, alerted, dispatched, per_spec_exceptions, _miss_counts = _run_probe_pass(
         s3_client, intraday_specs, recovery_by_id, now,
+        remediation_by_id=remediation_by_id,
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -1266,9 +1645,15 @@ def _run_probe_pass(
     recovery_by_id: dict[str, dict],
     now: datetime,
     prev_miss_counts: dict[str, int] | None = None,
+    remediation_by_id: dict[str, str] | None = None,
 ) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int]]:
     """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
     alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions)``.
+
+    config-I3282: after the walk, one aggregated event-time drain dispatch
+    fires for the pass's critical pages (see :func:`_maybe_dispatch_drain`
+    for the eligibility + dedup semantics) — independently trapped like the
+    per-artifact recovery dispatches, so it can never sink the pass.
 
     Shared verbatim by the daily full-registry sweep and the intraday
     mini-rule (config#1297) — the only difference between the two callers
@@ -1287,7 +1672,9 @@ def _run_probe_pass(
     dispatched = 0
     per_spec_exceptions = 0
     prev_miss_counts = prev_miss_counts or {}
+    remediation_by_id = remediation_by_id or {}
     miss_counts: dict[str, int] = {}
+    drain_candidates: list[str] = []
     # Per-pass cache of lazily-created SF/Lambda clients (shared across the
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
@@ -1332,9 +1719,36 @@ def _run_probe_pass(
             and isinstance(recovery, dict)
             and recovery.get("mode", "dispatch_and_page") == "dispatch"
         )
+        paged = False
         if not suppress_page and _maybe_alert(
                 spec, result, now, consecutive_miss_runs=miss_runs):
             alerted += 1
+            paged = True
+
+        # config-I3282 — collect this pass's dispatch-eligible critical
+        # pages. `_maybe_alert` returns True ONLY on an actual critical
+        # publish (warnings and OBSERVE mode return False), so `paged` is
+        # already the effective-severity gate. Excluded: rows with a
+        # `recovery:` heal of their own (their declared lane), and rows
+        # declared `remediation: operator` (page-only by declaration).
+        if (
+            paged
+            and spec.artifact_id not in recovery_by_id
+            and remediation_by_id.get(spec.artifact_id) != "operator"
+        ):
+            drain_candidates.append(spec.artifact_id)
+
+    # One aggregated event-time drain per pass (config-I3282), trapped so a
+    # dispatch failure can never sink the pass's primary deliverables. The
+    # critical page(s) above already fired, so the operator surface exists
+    # regardless of this leg's outcome.
+    try:
+        _maybe_dispatch_drain(s3_client, aws_clients, drain_candidates, now)
+    except Exception as drain_exc:  # noqa: BLE001 — side effect; pages already fired, this ERROR + the un-drained queue are the recording surfaces
+        logger.error(
+            "FRESHNESS_DRAIN_DISPATCH_FAILED for %s (non-fatal): %s",
+            sorted(drain_candidates), drain_exc, exc_info=True,
+        )
 
     return pairs, alerted, dispatched, per_spec_exceptions, miss_counts
 
@@ -1376,13 +1790,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
-    specs, recovery_by_id, critical_arms_by_id = load_registry_with_recovery(
-        s3, REGISTRY_BUCKET, REGISTRY_KEY
+    (specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id,
+     remediation_by_id) = (
+        load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     logger.info(
         "loaded %d specs from registry (%d with recovery specs, %d with "
-        "champion-arm dynamic severity)",
+        "champion-arm dynamic severity, %d flagged for issue escalation, "
+        "%d with declared remediation lanes)",
         len(specs), len(recovery_by_id), len(critical_arms_by_id),
+        len(escalate_to_issue_by_id), len(remediation_by_id),
     )
 
     # config-I3086: dynamic severity + warning-escalation counters.
@@ -1391,11 +1808,22 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     pairs, alerted, dispatched, per_spec_exceptions, miss_counts = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,
+        remediation_by_id=remediation_by_id,
+    )
+
+    # config#2055 Gap 2: extended-staleness -> Decision Queue P1. Runs after
+    # the full pass so flagged `event_driven` rows can look up their
+    # `liveness_via` ANCHOR's miss-streak from this same sweep (their own
+    # `consecutive_miss_runs` is always 0 — event_driven never self-pages).
+    prev_issue_filed = _load_prev_issue_filed(s3)
+    issue_filed_by_id = _escalate_stale_key_deliverables(
+        pairs, miss_counts, escalate_to_issue_by_id, prev_issue_filed, now,
     )
 
     # Emit dashboard surface + self-heartbeat.
     check_results = _serialize_check_results(
         pairs, now, miss_counts=miss_counts, coerced_ids=coerced_ids,
+        issue_filed_by_id=issue_filed_by_id,
     )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
@@ -1445,11 +1873,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             )
             _emit_cycle_verdict_error("cw_metric_emit")
 
+    issues_filed_this_run = sum(
+        1 for aid, url in issue_filed_by_id.items()
+        if url and prev_issue_filed.get(aid) is None  # newly filed, not carried forward
+    )
     logger.info(
         "freshness-monitor complete: %s checked, %s alerted, %s dispatched, "
-        "%s per-spec exceptions, duration=%.2fs",
-        heartbeat["n_entries_checked"], alerted, dispatched, per_spec_exceptions,
-        heartbeat["duration_seconds"],
+        "%s issues filed, %s per-spec exceptions, duration=%.2fs",
+        heartbeat["n_entries_checked"], alerted, dispatched,
+        issues_filed_this_run, per_spec_exceptions, heartbeat["duration_seconds"],
     )
 
     return {
@@ -1457,8 +1889,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "counts": heartbeat["counts"],
         "alerts_enabled": ALERTS_ENABLED,
         "recovery_dispatch_enabled": RECOVERY_DISPATCH_ENABLED,
+        "drain_dispatch_enabled": DRAIN_DISPATCH_ENABLED,
         "alerted": alerted,
         "dispatched": dispatched,
+        "issues_filed": issues_filed_this_run,
         "per_spec_exceptions": per_spec_exceptions,
         "duration_seconds": heartbeat["duration_seconds"],
         "cycle_verdicts": cycle_verdicts,

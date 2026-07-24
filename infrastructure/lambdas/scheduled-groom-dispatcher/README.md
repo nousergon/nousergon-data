@@ -25,9 +25,9 @@ then self-terminates (~$2/mo).
 
 ```
 EventBridge Scheduler rules (UTC, cron)                    THIS Lambda
-  alpha-engine-scheduled-groom-0100-daily-opus-high     ─┐      1. nousergon_lib.ec2_spot.launch()
-  alpha-engine-scheduled-groom-0700-daily-mid           ─┼───▶     (spot; on-demand fallback)
-  alpha-engine-scheduled-groom-1900-daily-low           ─┘      2. wait instance running + SSM Online
+  alpha-engine-scheduled-groom-0400-daily-high          ─┐      1. nousergon_lib.ec2_spot.launch()
+  alpha-engine-scheduled-groom-1200-daily-mid           ─┼───▶     (spot; on-demand fallback)
+  alpha-engine-scheduled-groom-2000-daily-low           ─┘      2. wait instance running + SSM Online
   alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify  (Sun 09:00 UTC, Haiku gated-reverify)
                                                              3. async ssm send-command (detached):
                                                                    │
@@ -48,26 +48,23 @@ flexible-time-window) mirror `infrastructure/run_weekly_offcycle.sh`.
 
 ## Cadence
 
-| Scheduler rule | Expression (UTC) | PT | Day mask | run_mode | model | issue_filter |
-|---|---|---|---|---|---|---|
-| `…-0100-daily-opus-high`¹ | `cron(0 1 * * ? *)` | 6pm | daily (all 7) | full | claude-sonnet-5 | high-only |
-| `…-0700-daily-mid` | `cron(0 7 * * ? *)` | 12am | daily (all 7) | full | claude-sonnet-5 | mid-only |
-| `…-1900-daily-low` | `cron(0 19 * * ? *)` | 12pm | daily (all 7) | full | claude-haiku-4-5 | low-only |
-| `…-sun0900-weekly-gated-reverify` | `cron(0 9 ? * SUN *)` | 2am | Sun only | full | claude-haiku-4-5 | gated-reverify |
+| Scheduler rule | Expression (UTC) | PT | Launches |
+|---|---|---|---|
+| `…-0400-daily-high` | `cron(0 4 * * ? *)` | 9pm | **all 3 tiers**: high (Sonnet) + mid (DeepSeek Flash) + low (DeepSeek Flash) + **end-of-SF sweep** (Haiku) |
+| `…-1200-daily-mid` | `cron(0 12 * * ? *)` | 5am | same as above — all 3 tiers + sweep |
+| `…-2000-daily-low` | `cron(0 20 * * ? *)` | 1pm | same as above — all 3 tiers + sweep |
+| `…-sun0900-weekly-gated-reverify` | `cron(0 9 ? * SUN *)` | 2am Sun | **single gated-reverify lane** (Haiku) — stale gate issues only |
 
-> ¹ config#2409 (2026-07-13): the high-only slot's MODEL moved off Opus onto
-> Sonnet; the Scheduler rule NAME is left as `-opus-high` deliberately — a
-> rename would require an operator-run `--bootstrap` (see the warning above)
-> purely for a cosmetic AWS identifier, which isn't worth the live-schedule
-> churn. Rename opportunistically the next time this cadence table changes
-> for a substantive reason.
-
-> **Tier-split cadence (config#1760/#2409):** three disjoint queues — Haiku
-> on `complexity:low`, Sonnet on `complexity:mid` (+ unlabeled) and on
-> `complexity:high` (moved off Opus 2026-07-13 — see config#2409; the split
-> is queue-isolation/dedicated-attention, not a model-capability step up).
-> Requires `alpha-engine-config` driver filters (#1761) on
-> the box's cloned `main` before `--bootstrap` deploys these schedules live.
+> **Models per tier (groom-primary-deepseek, 2026-07-23):** low/mid use DeepSeek
+> V4 Flash as PRIMARY backend (nousergon-lib#241). High uses Sonnet. The
+> end-of-SF PR sweep always runs on Haiku. The weekly gated-reverify lane
+> runs on Haiku (unchanged).
+>
+> **Symmetric triggers:** every scheduled full-mode trigger evaluates the FULL
+> backlog and launches all 3 tiers (high + mid + low) independently — no floor
+> check, no bundling. Each tier gets its own spot box at its own model. After
+> all tier boxes complete (or if all were skipped), the end-of-SF sweep box
+> runs unconditionally.
 
 > **Sat-skip removed 2026-07-02, uniform 3x/day/7-days, no exceptions.** The
 > former `…-0700-sunfri` rule (`cron(0 7 ? * SUN-FRI *)`) skipped Saturday to

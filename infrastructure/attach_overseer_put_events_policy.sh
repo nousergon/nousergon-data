@@ -21,6 +21,24 @@
 # automatically — re-run this script (it is a no-op for already-attached
 # roles) or attach the managed policy in the role's own provisioning.
 #
+# alpha-engine-config-I2875/I2900 (2026-07-21): verified read-only that the
+# four roles I2875 named as missing the grant — alert-drain-dispatcher-role,
+# overseer-dispatcher-role, expense-collector-role, substrate-health-gate-role
+# — are ALL Lambda execution roles for functions whose FunctionName already
+# starts with "alpha-engine-", so step 2's existing wildcard enumeration
+# (`starts_with(FunctionName, 'alpha-engine-')`) already targets all four —
+# NO role-list change was needed here, only a re-run (see the apply manifest
+# on alpha-engine-data-PR<n>). Do NOT "fix" a future missing-role report by
+# hardcoding a static role list instead of re-running — that would silently
+# reintroduce the exact drift this script exists to close (the wildcard IS
+# the fix; a static list goes stale the moment the next Lambda is created).
+# Note: alpha-engine-overseer-dispatcher-role's OWN inline policy
+# (infrastructure/lambdas/overseer-dispatcher/iam-policy.json, Sid
+# IntakeBusEvents) already grants an equivalent events:PutEvents statement —
+# attaching the managed policy here is a harmless, redundant second path for
+# that one role, not a functional gap; the other three roles have no such
+# inline grant and functionally depend on this attach.
+#
 # Usage:
 #   ./infrastructure/attach_overseer_put_events_policy.sh [--dry-run] [extra-role-name ...]
 

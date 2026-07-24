@@ -148,9 +148,9 @@
     },
     "ApplyBacktestEvalPreset": {
       "Type": "Pass",
-      "Comment": "mode=backtest-eval ONLY (config#830). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
+      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config#3134: also seeds skip_scanner, skip_challenger_shadow, skip_thinktank_coverage true (all three are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need — a bare mode=backtest-eval run was previously re-scanning candidates.json, re-calling the ChallengerShadow producer, and re-attempting ThinkTankCoverage's gap_fill thesis generation on every partial rerun for no benefit to the assessment). ALSO seeds skip_signals_envelope true HERE ONLY — SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' — a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN — so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_thinktank_coverage\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
@@ -886,8 +886,28 @@
       "Comment": "Research and PredictorTraining are DATA-INDEPENDENT (no S3/db data flows between them — see CLAUDE.md Architecture). They previously ran sequentially ONLY to 'spread API load', a now-STALE rationale: predictor TRAINING (training/train_handler.py) reads ArcticDB + CPU LightGBM and makes NO Anthropic calls (the yfinance fallback was removed by predictor PR #6; train_handler yfinance docstrings are stale). Research's only heavy load is Anthropic. They do not contend on the rate-limited API, so they run in parallel here to decouple PredictorTraining from Research's variable <=75-min strict-retry runtime and shorten SF wall-clock. Branch A = the full Research-consuming chain (DataPhase2 + eval-judge chain + agent-justification triple), Branch B = the PredictorTraining quartet. PER-BRANCH ERROR ISOLATION: each branch ends in a branch-local Pass terminal (End:true) that records OK/FAILED as DATA — a branch NEVER throws, so SF Parallel's default cancel-all-siblings-on-error behaviour can never abandon or waste an in-flight (or completed+S3-promoted) sibling. The SF is failed AFTER the join by CheckBranchOutcomes if either branch recorded FAILED. The Parallel-level Catch is a defense-in-depth backstop for genuine SF-engine Parallel errors only (the branches themselves always succeed). (config#885: the Scanner→RAGIngestion→RegimeSubstrate→RegimeRetrospectiveEval chain was relocated FROM top-level INTO Branch A's head so PredictorTraining (Branch B) now forks parallel to it directly after DataPhase1 — Predictor ⊥ Scanner/RAG/Regime, all of which produce side-effect S3/ArcticDB artifacts, never SF-state JSON consumed by Branch B or any post-join state. Their in-branch error edges were rewired to the branch-fail path PublishResearchFailureImmediate→BranchAFailed.)",
       "Branches": [
         {
-          "StartAt": "Scanner",
+          "StartAt": "CheckSkipScanner",
           "States": {
+            "CheckSkipScanner": {
+              "Type": "Choice",
+              "Comment": "Skip-gate (config#3134). {\"skip_scanner\": true} bypasses the Scanner Lambda and jumps straight to CheckSkipRegimeSubstrate — Scanner's own convergence point on both its success and Catch edges, so skipping it is behaviorally identical to a Scanner run that did nothing. Defaults to running (Default: Scanner) so scheduled Saturday runs and any rerun that has not explicitly set the flag are unaffected. Set true by the mode=backtest-eval preset (ApplyBacktestEvalPreset): a Backtester/Evaluator-only assessment rerun needs no fresh candidates.json — the flag exists precisely so a partial rerun does not re-scan and overwrite that day's already-produced universe-board artifact (config#3134: the 2026-07-20 assessment-rerun arc overwrote candidates/2026-07-17/candidates.json six times for no benefit to the assessment being rerun).",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_scanner",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_scanner",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRegimeSubstrate"
+                }
+              ],
+              "Default": "Scanner"
+            },
             "Scanner": {
               "Type": "Task",
               "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 — alpha-engine-research #235). Reads constituents.json + feature store, runs run_quant_filter, writes the candidates.json universe-board artifact for THIS run_date (crucible-research PR425, merged). alpha-engine-config-I2515 Phase B: this write is now LOAD-BEARING — SignalsEnvelope, ChallengerShadow, and the relocated (post-RAG) ThinkTankCoverage all read the SAME-DAY board, closing the no-week-old-data invariant (config#1580 ruling). The multi-agent Research graph runner that previously consumed this artifact has been REMOVED from this SF; the champion path is scanner → predictor direct. Status contract OK / ERROR — no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true.",
@@ -927,7 +947,7 @@
             },
             "CheckSkipRegimeSubstrate": {
               "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps straight to SignalsEnvelope (config-I2515 Phase B: RAG/ThinkTank/RegimeRetrospectiveEval/DataPhase2 all now sit AFTER SignalsEnvelope in the reordered chain, so skipping substrate-compute must not skip the envelope itself — SignalsEnvelope reads whatever regime artifact already exists). Independent of skip flags for the rest of the chain — operators can skip the HMM refit while everything else still runs.",
+              "Comment": "Skip-gate. {\"skip_regime_substrate\": true} bypasses the regime substrate Lambda and jumps straight to CheckSkipSignalsEnvelope (config#3134: retargeted from a direct SignalsEnvelope jump so the new SignalsEnvelope skip-gate sits on EVERY path into SignalsEnvelope, not just the RegimeSubstrate-ran path) (config-I2515 Phase B: RAG/ThinkTank/RegimeRetrospectiveEval/DataPhase2 all now sit AFTER SignalsEnvelope in the reordered chain, so skipping substrate-compute must not skip the envelope itself — SignalsEnvelope reads whatever regime artifact already exists). Independent of skip flags for the rest of the chain — operators can skip the HMM refit while everything else still runs.",
               "Choices": [
                 {
                   "And": [
@@ -940,14 +960,14 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "SignalsEnvelope"
+                  "Next": "CheckSkipSignalsEnvelope"
                 }
               ],
               "Default": "RegimeSubstrate"
             },
             "RegimeSubstrate": {
               "Type": "Task",
-              "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. config-I2515 Phase B: now runs BEFORE SignalsEnvelope (moved ahead of RAG/ThinkTank) so the envelope's market_regime field reads a SAME-DAY regime label rather than a stale one. Observe-only at this stage — no production consumer besides the envelope reads the artifact yet. Failure is non-blocking (Catch routes to SignalsEnvelope, not HandleFailure) — a regime substrate failure must not halt the pipeline; SignalsEnvelope will read whatever regime artifact already exists.",
+              "Comment": "Regime substrate Lambda — fits a weekly 3-state HMM + composite z-score + BOCPD on macro feature history (FRED-sourced VIX/HYOAS/TNX/TWO + SPY), writes s3://alpha-engine-research/regime/{YYMMDDHHMM}.json + latest.json sidecar. config-I2515 Phase B: now runs BEFORE SignalsEnvelope (moved ahead of RAG/ThinkTank) so the envelope's market_regime field reads a SAME-DAY regime label rather than a stale one. Observe-only at this stage — no production consumer besides the envelope reads the artifact yet. Failure is non-blocking (Catch routes to CheckSkipSignalsEnvelope, config#3134's new gate, not HandleFailure) — a regime substrate failure must not halt the pipeline; SignalsEnvelope will read whatever regime artifact already exists.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-predictor-regime-substrate:live",
@@ -973,12 +993,32 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "SignalsEnvelope",
+                  "Next": "CheckSkipSignalsEnvelope",
                   "ResultPath": "$.regime_substrate_error"
                 }
               ],
               "ResultPath": "$.regime_substrate_result",
-              "Next": "SignalsEnvelope"
+              "Next": "CheckSkipSignalsEnvelope"
+            },
+            "CheckSkipSignalsEnvelope": {
+              "Type": "Choice",
+              "Comment": "Skip-gate (config#3134). {\"skip_signals_envelope\": true} bypasses the SignalsEnvelope Lambda and jumps straight to CheckSkipChallengerShadow. DEFAULTS FALSE (Default: SignalsEnvelope) — unlike every other lane-A skip flag this one is NOT safe to set true for a real weekly run: SignalsEnvelope is LOAD-BEARING (I2880 staleness guard) — the executor hard-fails Monday without a fresh signals.json, so skipping it on a scheduled Saturday run (or any run that is meant to feed the live executor) would silently ship a stale or missing signals.json. This gate exists ONLY so a partial/assessment rerun (e.g. mode=backtest-eval, which force-seeds this flag) that does not touch signals.json at all can avoid re-invoking the Lambda; it must never be hand-set true on an operator rerun that is expected to produce a live signal for Monday.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_signals_envelope",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_signals_envelope",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipChallengerShadow"
+                }
+              ],
+              "Default": "SignalsEnvelope"
             },
             "SignalsEnvelope": {
               "Type": "Task",
@@ -1023,7 +1063,27 @@
                 }
               ],
               "ResultPath": "$.signals_envelope_result",
-              "Next": "ChallengerShadow"
+              "Next": "CheckSkipChallengerShadow"
+            },
+            "CheckSkipChallengerShadow": {
+              "Type": "Choice",
+              "Comment": "Skip-gate (config#3134). {\"skip_challenger_shadow\": true} bypasses the ChallengerShadow Lambda invocation and jumps straight to CheckSkipRAGIngestion — ChallengerShadow's own Next/Catch convergence point, so skipping it is behaviorally identical to a ChallengerShadow run that did nothing. Defaults to running (Default: ChallengerShadow) so scheduled Saturday runs and unflagged reruns are unaffected. Set true by the mode=backtest-eval preset: the observe-only no_agent leaderboard shadow feed is not needed for a Backtester/Evaluator-only assessment rerun, and skipping it avoids re-invoking its LLM producer for no benefit (config#3134: the 2026-07-20 assessment-rerun arc re-called this producer on every one of six rerun attempts).",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_challenger_shadow",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_challenger_shadow",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRAGIngestion"
+                }
+              ],
+              "Default": "ChallengerShadow"
             },
             "ChallengerShadow": {
               "Type": "Task",
@@ -1063,7 +1123,7 @@
             },
             "CheckSkipRAGIngestion": {
               "Type": "Choice",
-              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to ThinkTankCoverage (config-I2515 Phase B: ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh corpus). Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
+              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipThinkTankCoverage (config#3134: retargeted from a direct ThinkTankCoverage jump so the new ThinkTankCoverage skip-gate sits on EVERY path into ThinkTankCoverage, not just the RAGIngestion-ran path) (config-I2515 Phase B: ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh corpus). Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
               "Choices": [
                 {
                   "And": [
@@ -1076,7 +1136,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "ThinkTankCoverage"
+                  "Next": "CheckSkipThinkTankCoverage"
                 }
               ],
               "Default": "RAGIngestion"
@@ -1184,7 +1244,7 @@
                 {
                   "Variable": "$.rag_ingestion_poll.Status",
                   "StringEquals": "Success",
-                  "Next": "ThinkTankCoverage"
+                  "Next": "CheckSkipThinkTankCoverage"
                 },
                 {
                   "Variable": "$.rag_ingestion_poll.Status",
@@ -1241,6 +1301,26 @@
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
+            },
+            "CheckSkipThinkTankCoverage": {
+              "Type": "Choice",
+              "Comment": "Skip-gate (config#3134). {\"skip_thinktank_coverage\": true} bypasses the ThinkTankCoverage Lambda (mode=gap_fill THESIS GENERATION — real challenger-corpus writes + OpenRouter token burn) and jumps straight to CheckSkipRegimeRetrospectiveEval — ThinkTankCoverage's own Next/Catch convergence point, so skipping it is behaviorally identical to a ThinkTankCoverage run that did nothing. Defaults to running (Default: ThinkTankCoverage) so scheduled Saturday runs and unflagged reruns are unaffected. Set true by the mode=backtest-eval preset: the observe-only gap_fill coverage top-up is not needed for a Backtester/Evaluator-only assessment rerun, and skipping it avoids real thesis-generation writes + token spend for no benefit (config#3134: the 2026-07-20 assessment-rerun arc re-attempted gap_fill on every one of six rerun attempts, bumping FIVE/BJ/HQY/PTC thesis versions before timing out at the config#3072 ceiling each time).",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_thinktank_coverage",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_thinktank_coverage",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRegimeRetrospectiveEval"
+                }
+              ],
+              "Default": "ThinkTankCoverage"
             },
             "ThinkTankCoverage": {
               "Type": "Task",
@@ -2881,6 +2961,26 @@
           "Next": "CheckSkipEvaluator"
         }
       ],
+      "Default": "CheckSkipBacktesterStageOnly"
+    },
+    "CheckSkipBacktesterStageOnly": {
+      "Type": "Choice",
+      "Comment": "Additive skip-gate (config#2362 Option A, operator-ruled 2026-07-21). Distinct from CheckSkipBacktester's legacy whole-pair skip_backtester jump above, which is left fully intact for back-compat. {\"skip_backtester_stage_only\": true} skips ONLY the Backtester SSM task itself — routing straight to CheckSkipPredictorBacktest — for the mid-tail-recovery case where Backtester already completed this run_date (its backtest/{run_date}/ artifacts already exist and are reused) but a downstream stage (PredictorBacktest / PortfolioOptimizerBacktest / Parity) failed and needs to rerun: the whole-pair skip_backtester jump cannot be used there because it would ALSO bypass the failed stage's own gate (the forbidden swallow — see scripts/weekly_sf_rerun.py's BACKTESTER_OVERSHADOWED handling), forcing an unnecessary Backtester re-burn. A scheduled/normal run never sets this flag, so Default falls through to Backtester unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_backtester_stage_only",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_backtester_stage_only",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPredictorBacktest"
+        }
+      ],
       "Default": "Backtester"
     },
     "Backtester": {
@@ -3465,7 +3565,7 @@
     },
     "Evaluator": {
       "Type": "Task",
-      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
+      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 — plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it — the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3474,7 +3574,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity{}',$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','set -a && source /home/ec2-user/.alpha-engine.env && set +a',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity{}',$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },

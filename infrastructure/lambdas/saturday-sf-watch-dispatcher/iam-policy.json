@@ -45,9 +45,7 @@
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-advisory-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-modelzoo-sunday-pipeline:*"
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
       ]
     },
     {

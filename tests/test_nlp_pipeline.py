@@ -95,7 +95,7 @@ class TestEntityMentionShape:
 class TestEventFlagShape:
     def test_construction(self):
         f = EventFlag(
-            extractor="anthropic_haiku",
+            extractor="rule_based",
             article_fingerprint="abc",
             category="merger_or_acquisition",
             description="Acquirer announces all-stock deal.",
@@ -322,7 +322,7 @@ class TestEnsureLmMasterDict:
 
 
 class TestRuleBasedEventExtractor:
-    """Rule-based replacement for the deleted ``AnthropicEventExtractor``.
+    """Rule-based replacement for the deleted LLM-backed event extractor.
 
     Mirrors the same contract: ``extract(text, article_fingerprint,
     article_tickers, article_tags=())`` → ``list[EventFlag]``. No LLM

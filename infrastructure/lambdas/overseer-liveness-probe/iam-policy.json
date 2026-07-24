@@ -39,9 +39,7 @@
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-advisory-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-modelzoo-sunday-pipeline"
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
       ]
     },
     {
@@ -54,6 +52,49 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ci-watch-dispatcher",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-alert-drain-dispatcher",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-overseer-dispatcher"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchExecutionHistory",
+      "Effect": "Allow",
+      "Action": ["states:ListExecutions"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchExecutionInput",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchLogs",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/consolidated/saturday_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/weekday_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/eod_sf_watch/*"
+      ]
+    },
+    {
+      "Sid": "ReadRouterSchedulerSchedules",
+      "Effect": "Allow",
+      "Action": ["scheduler:GetSchedule"],
+      "Resource": [
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-0400utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1000utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1600utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-2200utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-ci-watch-canary-drill-weekly",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-sf-watch-canary-drill-weekly"
       ]
     },
     {

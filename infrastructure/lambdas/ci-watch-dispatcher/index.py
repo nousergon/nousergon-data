@@ -208,6 +208,59 @@ CI_WATCH_SIGNATURES_PREFIX = os.environ.get(
     "CI_WATCH_SIGNATURES_PREFIX", "ci_watch/_control/signatures"
 )
 
+# ── Dispatch record for the mid-run reclaim checker (config#3173) ───────────
+# WHY: ci-watch has no equivalent of Fleet-SF Watch's per-run watch-log — a
+# box's own completion marker (ci_watch/_control/completed/{repo}-{sha}.json,
+# written by scripts/ci_watch_run.sh) is the ONLY durable record of a
+# dispatch, and it is written at the END. A box reclaimed by AWS mid-run
+# (before completing, sometimes before even starting the charter) previously
+# left NOTHING for anything to recover from — the completion marker never
+# lands, the (repo, sha) tags on the terminated instance are the only trace,
+# and neither carries run_id/run_url/workflow/branch. This record is written
+# right after a successful launch (mirrors the atomic-with-launch discipline
+# config#2292 already established for the discriminator tags) so a sibling
+# ci-watch-liveness-probe Lambda (EC2 reclaim-event target, mirroring
+# sf-watch-liveness-probe's config#2270 mid-run spot-reclaim checker) can
+# reconstruct the original dispatch fields and relaunch once, ceiling-bounded
+# at exactly one relaunch, escalating loud on a second death — closing the
+# "box died with no re-dispatch or escalation" gap config#3173 tracks for the
+# ci-watch family. Best-effort (never blocks/fails the primary dispatch): a
+# write failure only degrades the reclaim checker to its own "unreconstructable
+# dispatch fields" LOUD escalation path, it never masks the launch itself.
+# Skipped for drills — DRILL_REPO is synthetic and a drill box's reclaim is
+# already covered by its own _canary heartbeat channel (config#2223), never a
+# repair to retry.
+CI_WATCH_DISPATCHED_PREFIX = os.environ.get(
+    "CI_WATCH_DISPATCHED_PREFIX", "ci_watch/_control/dispatched"
+)
+
+
+def _write_dispatch_record(repo: str, sha: str, run_id: str, run_url: str,
+                           workflow: str, branch: str, instance_id: str) -> None:
+    """Best-effort S3 record of this dispatch's full event fields, keyed the
+    same way the completion marker and spot-orphan-reaper's WATCH_KINDS entry
+    key ci-watch (repo/sha, '/' flattened to '-'). Read back by
+    ci-watch-liveness-probe on a mid-run reclaim to reconstruct the fields
+    needed to relaunch. Never raises — see module note above."""
+    key = f"{CI_WATCH_DISPATCHED_PREFIX}/{repo.replace('/', '-')}-{sha}.json"
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=CI_WATCH_SIGNATURES_BUCKET,
+            Key=key,
+            Body=json.dumps({
+                "repo": repo, "sha": sha, "run_id": run_id, "run_url": run_url,
+                "workflow": workflow, "branch": branch, "instance_id": instance_id,
+                "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+        logger.warning(
+            "ci-watch dispatch-record write failed for %s@%s (non-fatal — a "
+            "later mid-run reclaim for this box would escalate loud instead "
+            "of relaunching): %s: %s", repo, sha, type(exc).__name__, exc,
+        )
+
 
 def _known_fixed_signature_exists(repo: str) -> bool:
     """True iff at least one signature marker for (repo, today) already
@@ -304,6 +357,8 @@ _RUN_ID_RE = re.compile(r"^[0-9]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,200}$")
 _WORKFLOW_RE = re.compile(r"^[A-Za-z0-9 _./:()-]{1,200}$")
 _BOOL_RE = re.compile(r"^(true|false)$")
+# config-I3293 — registry-declared agent model (router-injected); optional.
+_MODEL_RE = re.compile(r"^claude-[a-z0-9.-]{1,60}$")
 
 
 class _InvalidEvent(ValueError):
@@ -326,7 +381,7 @@ def _optional(event: dict, key: str, pattern: "re.Pattern[str]", default: str = 
     return val
 
 
-def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str]:
+def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str, str]:
     """Validate the GHA payload's CI fields; raises _InvalidEvent on any
     missing/malformed field (caught once, at the handler, and converted to a
     clean launched:false — see module docstring's synchronous contract).
@@ -338,9 +393,13 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
     real (repo, sha) into a drill's lock/marker keys. See the DRILL_REPO
     isolation invariant above."""
     is_drill = _optional(event, "is_drill", _BOOL_RE, default="false")
+    # model (config-I3293): registry-declared agent model injected by the
+    # overseer router; optional — empty means the run script's inline default
+    # applies. Regex-validated so the f-string export cannot inject shell.
+    model = _optional(event, "model", _MODEL_RE)
     if is_drill == "true":
         return (DRILL_REPO, _drill_sha(datetime.now(timezone.utc)), "0",
-                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill)
+                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill, model)
     repo = _require(event, "repo", _REPO_RE)
     sha = _require(event, "sha", _SHA_RE)
     run_id = _require(event, "run_id", _RUN_ID_RE)
@@ -352,12 +411,12 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
         # under `set -u` it could expand as a positional param (same gotcha
         # groom's run_url note documents) and abort the prelude.
         raise _InvalidEvent(f"missing/malformed 'run_url' in event: {run_url!r}")
-    return repo, sha, run_id, run_url, workflow, branch, is_drill
+    return repo, sha, run_id, run_url, workflow, branch, is_drill, model
 
 
 def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
                        workflow: str, branch: str, run_token: str,
-                       is_drill: str = "false") -> str:
+                       is_drill: str = "false", model: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     ci_watch_spot_bootstrap.sh entrypoint (built by a sibling agent in
     alpha-engine-config). Any prelude failure shuts the box down so a botched
@@ -373,6 +432,7 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
     ``_send_bootstrap``, and the handler's returned JSON)."""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
+export CI_WATCH_MODEL="{model}"
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
 export HOME=/root
 fail() {{ echo "[ci-watch-prelude] FATAL: $1"; shutdown -h now; exit 1; }}
@@ -430,12 +490,12 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url: str,
                     workflow: str, branch: str, run_token: str,
-                    is_drill: str = "false") -> str:
+                    is_drill: str = "false", model: str = "") -> str:
     """Fire the async, detached SSM command that runs CI-watch + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token,
-                           is_drill=is_drill),
+                           is_drill=is_drill, model=model),
         comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -469,7 +529,7 @@ def _terminate_instance(instance_id: str) -> None:
 
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
-                          is_drill: str = "false") -> dict:
+                          is_drill: str = "false", model: str = "") -> dict:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -535,6 +595,13 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     # never observably untagged. No post-launch create_tags step remains to
     # retry or fail here.
 
+    # config#3173: record the dispatch fields NOW (right after launch, before
+    # the SSM round trip) so a mid-run reclaim — possible from this point
+    # forward — has something to reconstruct a relaunch from. Skipped for
+    # drills (see _write_dispatch_record docstring).
+    if is_drill != "true":
+        _write_dispatch_record(repo, sha, run_id, run_url, workflow, branch, instance_id)
+
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —
     # but, unlike groom, return a clean result rather than re-raising (this
@@ -543,7 +610,8 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     try:
         _wait_ssm_online(instance_id)
         command_id = _send_bootstrap(instance_id, repo, sha, run_id, run_url,
-                                     workflow, branch, run_token, is_drill=is_drill)
+                                     workflow, branch, run_token, is_drill=is_drill,
+                                     model=model)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false
         _terminate_instance(instance_id)
         logger.error("ci-watch post-launch step failed for %s: %s: %s",
@@ -597,7 +665,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     try:
-        repo, sha, run_id, run_url, workflow, branch, is_drill = _resolve_event_fields(event)
+        repo, sha, run_id, run_url, workflow, branch, is_drill, model = _resolve_event_fields(event)
     except _InvalidEvent as exc:
         logger.error("invalid ci-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
@@ -607,4 +675,4 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         repo, sha, run_id, workflow, branch, is_drill,
     )
     return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch,
-                                 is_drill=is_drill)
+                                 is_drill=is_drill, model=model)

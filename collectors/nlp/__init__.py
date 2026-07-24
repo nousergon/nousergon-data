@@ -26,9 +26,8 @@ Today's free-tier implementations:
                                                         vendor tags (Polygon
                                                         keywords, GDELT codes)
                                                         + title-keyword regex.
-                                                        Replaced the Haiku-
-                                                        backed
-                                                        AnthropicEventExtractor
+                                                        Replaced the prior Haiku-backed
+                                                        LLM extractor
                                                         2026-05-25 per the
                                                         "LLM calls confined
                                                         to research module"

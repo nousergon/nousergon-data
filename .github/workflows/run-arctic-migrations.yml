@@ -1,0 +1,145 @@
+name: Run ArcticDB migrations
+
+# Merge-triggered in-region ArcticDB migration runner (alpha-engine-config-
+# I3242, runner half of the config-I3236 structural fix). Pairs with the
+# already-merged schema-migration FRAMEWORK (nousergon-data-PR988, config-
+# I3241/I3238): that PR made migrations discoverable, tested code
+# (migrations/NNNN_<slug>.py + the version stamp + the CI chokepoint); this
+# workflow is the thin GHA->Lambda invoke leg that makes "merge the migration"
+# and "run the migration in-region" the SAME action, with zero operator step —
+# mirroring the proven shape of alpha-engine-config's sf-watch.yml
+# `sf-watch-dispatch` job (synchronous `lambda invoke`, branch on the returned
+# JSON, file a P1 on any non-benign decline).
+#
+# ORDERING SAFETY (why this is safe without atomicity — see the I3242 issue's
+# own "why safe" note): the three fleet trading Step Functions run on FIXED
+# schedules (weekly Saturday, weekday pre-open, weekday EOD), not
+# continuously. The framework's version-stamp interlock means the worst case
+# for a slow/failed/deferred migration is a CLEANLY REFUSED producer append
+# (store.schema_version.SchemaVersionMismatch, config-I3236's own fix) that
+# pages loud — never a partial/interleaved write. The on-box runner
+# (scripts/run_arctic_migrations.py) additionally refuses to even START a
+# migration while any of the three pipelines has a RUNNING execution
+# (states:ListExecutions mutex probe, fail-CLOSED on a probe error — see that
+# script's module docstring).
+#
+# Public repo: no secrets/instance ids inline. OIDC role reused from this
+# repo's OWN established convention — `github-actions-lambda-deploy`
+# (infrastructure/iam/github-actions-lambda-deploy.json) already grants
+# `lambda:InvokeFunction` on `arn:...:function:alpha-engine-*` (the
+# `LambdaInvokeCanary` statement) alongside its existing `deploy.yml` /
+# `deploy-data-spot-dispatcher.yml` / `live-arcticdb-smoke.yml` uses — no new
+# OIDC role needed for this workflow (deliberately NOT alpha-engine-config's
+# `saturday-sf-watch-role`, which lives in a different repo/account-role
+# surface entirely).
+#
+# INERT UNTIL THE LAMBDA EXISTS: this workflow's `aws lambda invoke` 404s
+# until an operator runs `infrastructure/lambdas/arctic-migration-dispatcher/
+# deploy.sh --bootstrap` (see alpha-engine-config-I3242's PR body for the
+# exact command) — merging the PR that ships this file has ZERO live effect
+# on its own, same posture as every other operator-bootstrapped dispatcher.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+  workflow_dispatch:
+    # Manual re-trigger path — e.g. after a mutex-active refusal clears (the
+    # on-box runner's documented manual-recovery gap, see
+    # scripts/run_arctic_migrations.py's module docstring). No inputs needed:
+    # the head-migration-number step below always derives fresh from whatever
+    # migrations/ looks like at the checked-out ref.
+
+concurrency:
+  group: run-arctic-migrations-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  arctic-migration-dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Derive head migration number
+        id: head
+        run: |
+          set -euo pipefail
+          HEAD_FILE=$(ls migrations | grep -E '^[0-9]{4}_[a-z0-9_]+\.py$' | sort | tail -1)
+          if [ -z "$HEAD_FILE" ]; then
+            echo "ERROR: no migrations/NNNN_<slug>.py found — the baseline (0000) is mandatory" >&2
+            exit 1
+          fi
+          HEAD_NUM=$((10#${HEAD_FILE:0:4}))
+          echo "head_migration_number=${HEAD_NUM}" >> "$GITHUB_OUTPUT"
+          echo "Head migration: ${HEAD_FILE} (number ${HEAD_NUM})"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Invoke the arctic-migration spot dispatcher (synchronous)
+        id: dispatch
+        env:
+          MERGED_SHA: ${{ github.sha }}
+          HEAD_MIGRATION_NUMBER: ${{ steps.head.outputs.head_migration_number }}
+        run: |
+          set +e
+          PAYLOAD=$(jq -nc --arg merged_sha "$MERGED_SHA" --argjson head_migration_number "$HEAD_MIGRATION_NUMBER" \
+            '{merged_sha:$merged_sha, head_migration_number:$head_migration_number}')
+          aws lambda invoke --function-name alpha-engine-arctic-migration-dispatcher \
+            --invocation-type RequestResponse \
+            --cli-binary-format raw-in-base64-out \
+            --payload "$PAYLOAD" response.json
+          INVOKE_RC=$?
+          echo "--- response.json ---"; cat response.json 2>/dev/null || echo "(no response.json)"
+          LAUNCHED="false"
+          REASON=""
+          if [ "$INVOKE_RC" -eq 0 ]; then
+            LAUNCHED=$(jq -r '.launched // false' response.json 2>/dev/null || echo false)
+            REASON=$(jq -r '.reason // ""' response.json 2>/dev/null || echo "")
+          fi
+          echo "launched=$LAUNCHED" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "invoke_rc=$INVOKE_RC" >> "$GITHUB_OUTPUT"
+
+      # by-design declines (registry benign_reasons for the arctic-migration
+      # playbook entry: disabled, concurrent_skip) are suppressed here; every
+      # other launched:false (probe_failed / launch_failed / invalid_event /
+      # post_launch_failed / invoke error -> empty reason) files a P1 — mirrors
+      # alpha-engine-config's sf-watch-dispatch job fallback exactly.
+      - name: Report a failed dispatch as an issue
+        if: >-
+          always() && steps.dispatch.outputs.launched != 'true'
+          && steps.dispatch.outputs.reason != 'disabled'
+          && steps.dispatch.outputs.reason != 'concurrent_skip'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_MIGRATION_NUMBER: ${{ steps.head.outputs.head_migration_number }}
+        run: |
+          gh issue create --repo nousergon/alpha-engine-config \
+            --title "ArcticDB migration dispatch failed to launch (head ${HEAD_MIGRATION_NUMBER}, ${{ github.sha }})" \
+            --label P1 \
+            --body "The run-arctic-migrations.yml workflow's synchronous Lambda invoke (alpha-engine-arctic-migration-dispatcher) did not report launched=true for head_migration_number=${HEAD_MIGRATION_NUMBER} merged_sha=${{ github.sha }} (dispatch invoke_rc=${{ steps.dispatch.outputs.invoke_rc }}, reason=${{ steps.dispatch.outputs.reason }}). Either the invoke itself failed (see this job's logs) or the Lambda declined to launch a spot box. No in-region migration ran for this merge — the schema-version stamp is UNBUMPED, so the next producer append will keep refusing cleanly (config-I3236 invariant) until this is resolved and re-triggered (workflow_dispatch, or re-run this job)."
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ steps.dispatch.outputs.launched == 'true' && 'success' || 'failure' }}
+          deploy_workflow: run-arctic-migrations.yml
+
+  notify-main-failure:
+    needs: [arctic-migration-dispatch]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

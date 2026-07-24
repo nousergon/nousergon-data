@@ -43,6 +43,7 @@ from features.compute import (
     _UNIVERSE_EXTRA,
     _is_sector_etf,
     _load_sector_map,
+    _load_sub_sector_etf_map,
     _load_cached_fundamentals,
     _load_cached_alternative,
 )
@@ -69,6 +70,7 @@ from store.arctic_store import (
     PROVENANCE_COL as _CANONICAL_PROVENANCE_COL,
     get_universe_lib,
     get_macro_lib,
+    get_schema_meta_lib,
     to_arctic_canonical,
     to_arctic_safe,
 )
@@ -290,6 +292,70 @@ UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
 # nousergon_lib.dates.trading_days_stale.
 UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS = 3
 _UNIVERSE_SCAN_WORKERS = 20
+
+# Verify-by-artifact precondition sentinel for the EOD self-heal loop —
+# the `universe`-library counterpart to MACRO_FRESHNESS_SENTINEL_KEY below
+# (config#3237). UNIVERSE_FRESHNESS_RECEIPT_KEY above answers "is every
+# universe symbol within N trading days of fresh" (a loose staleness
+# tolerance, deliberately >0 so a single slow ticker doesn't halt the SF);
+# eod_reconcile.py's held-position closing-price read needs a STRICTER,
+# run_date-EXACT answer — "did TODAY's row land for the universe library",
+# because a ticker that's 1-2 trading days stale (well within the
+# UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS tolerance, so it does not raise
+# UniverseFreshnessViolation) still makes eod_reconcile.py hard-fail with
+# "no row for {run_date}" if it happens to be a held position. This sentinel
+# is the artifact `eod-precondition-probe` needs to catch that gap and route
+# to the self-heal loop instead of a hard `FailExecution` — see the Lambda's
+# docstring for the full rationale (mirrors the config#1787 Option-B
+# producer-side-readback pattern the macro sentinel already established).
+UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY = "feature_store/_universe_close_freshness.json"
+
+
+def _write_universe_close_freshness_sentinel(
+    s3, bucket: str, *, run_date: str, verified_ticker_count: int, total_symbols_checked: int,
+) -> dict:
+    """Write the ArcticDB universe-close freshness sentinel (config#3237).
+
+    Called ONLY from the tail of `_scan_universe_and_emit_freshness_receipt`,
+    after that scan has already read back every in-scope symbol's latest row
+    and confirmed none is stale beyond the tolerance threshold (raises
+    `UniverseFreshnessViolation` otherwise, in which case this is never
+    reached) — same "only write after independent readback confirms it"
+    posture `_write_macro_freshness_sentinel` documents.
+
+    Best-effort/non-fatal, matching both sibling sentinel writers: a write
+    failure here is an observability gap for the probe (which then correctly
+    reports precondition_met=False and the self-heal loop retries), never a
+    reason to fail a daily_append run whose real ArcticDB writes already
+    succeeded and were already verified above.
+    """
+    sentinel = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_date": run_date,
+        "verified_ticker_count": verified_ticker_count,
+        "total_symbols_checked": total_symbols_checked,
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY,
+            Body=json.dumps(sentinel, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "Wrote ArcticDB universe-close freshness sentinel to s3://%s/%s "
+            "(run_date=%s, verified_ticker_count=%d/%d)",
+            bucket, UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY, run_date,
+            verified_ticker_count, total_symbols_checked,
+        )
+    except Exception as exc:
+        log.warning(
+            "ArcticDB universe-close freshness sentinel write FAILED "
+            "(non-fatal, OBSERVE — the EOD precondition probe will correctly "
+            "report precondition_met=False and the self-heal loop will retry): %s", exc,
+        )
+    return sentinel
 
 # ArcticDB freshness-monitor sentinel (config#1787, Brian's 2026-07-08
 # Option-B ruling). A small, UNCONDITIONAL S3 marker written on every
@@ -637,6 +703,7 @@ def _scan_universe_and_emit_freshness_receipt(
     universe_lib,
     max_stale_trading_days: int = UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS,
     expected_tickers: list[str] | None = None,
+    run_date: str | None = None,
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
     last-row date must be within ``max_stale_trading_days`` NYSE sessions
@@ -649,6 +716,12 @@ def _scan_universe_and_emit_freshness_receipt(
     themselves on every Lambda invocation. The 2026-05-01 weekday SF
     timeout cascade traced back to PR #68 adding this same scan to the
     predictor inference preflight, multiplying the cost.
+
+    Also writes ``s3://{bucket}/feature_store/_universe_close_freshness.json``
+    (config#3237) when ``run_date`` is given: unlike the loose ``N``-trading-
+    day receipt above, this sentinel is a strict run_date-exact readback
+    count, reusing this scan's already-fetched per-symbol tail rows (no
+    extra ArcticDB reads) — see ``_write_universe_close_freshness_sentinel``.
 
     On any stale: hard-raises ``RuntimeError`` so the SF MorningEnrich
     step fails. The 2026-04-21 ASGN/MOH incident class — partial-write
@@ -796,6 +869,20 @@ def _scan_universe_and_emit_freshness_receipt(
         "Universe-freshness receipt written: n=%d all_fresh stalest=%s(%d trading-d) scan=%.1fs",
         len(syms), stalest[0], stalest[2], scan_seconds,
     )
+
+    if run_date is not None:
+        # Strict run_date-EXACT count, distinct from the >= threshold above:
+        # a symbol 1-2 trading days stale passes the loose check (does not
+        # raise) but must NOT count as "verified for run_date" here — that's
+        # exactly the gap config#3237 found (eod_reconcile.py needs THIS
+        # day's row, not "recently fresh enough").
+        verified_ticker_count = sum(1 for _, last_date_iso, _ in ages if last_date_iso == run_date)
+        _write_universe_close_freshness_sentinel(
+            s3, bucket, run_date=run_date,
+            verified_ticker_count=verified_ticker_count,
+            total_symbols_checked=len(syms),
+        )
+
     return receipt
 
 
@@ -1317,12 +1404,39 @@ def _daily_append_impl(
 
     # ── 2. Load supporting data ──────────────────────────────────────────────
     sector_map = _load_sector_map(s3, bucket)
+    # sub_sector_etf_map (config#934): ticker → sub-sector benchmark ETF
+    # (SMH/IGV/…), defaulting to the sector ETF for sub-industries with no
+    # liquid proxy. Best-effort: an empty map (file not yet written by the
+    # weekly collector) degrades sub_sector_vs_benchmark_* to neutral 0.0.
+    sub_sector_etf_map = _load_sub_sector_etf_map(s3, bucket)
+    # The distinct NON-sector sub-sector ETF symbols this run must keep fresh
+    # in ArcticDB (the XL* sector ETFs are already handled by the sector-ETF
+    # write/read loops). Derived from the map's values so the fetched symbol
+    # universe tracks whatever GICS_SUBINDUSTRY_TO_ETF currently maps — no
+    # separate hard-coded list to drift out of sync.
+    sub_sector_etf_symbols = sorted(
+        {sym for sym in sub_sector_etf_map.values() if sym and not _is_sector_etf(sym)}
+    )
     fundamentals = _load_cached_fundamentals(s3, bucket, date_str)
     alt_data = _load_cached_alternative(s3, bucket)
 
     if not dry_run:
         universe_lib = get_universe_lib(bucket)
         macro_lib = get_macro_lib(bucket)
+        # Schema-version pre-append assert (alpha-engine-config-I3241). Fail
+        # LOUD before touching any symbol if the persisted universe descriptor
+        # is not at the version this producer code emits — i.e. a
+        # schema-additive change was deployed without its data migration. This
+        # converts the config-I3236 failure (904/904 StreamDescriptorMismatch
+        # surfacing two layers downstream as an EOD reconcile RuntimeError) into
+        # a single actionable pre-flight error naming the pending migration.
+        # SchemaVersionMismatch is a RuntimeError subclass — it propagates
+        # (fail-loud), aborting the run before any partial write. The meta lib
+        # is opened via get_schema_meta_lib (the mockable open-seam, mirroring
+        # get_universe_lib/get_macro_lib).
+        from migrations import assert_universe_schema_current
+
+        assert_universe_schema_current(get_schema_meta_lib(bucket))
     else:
         universe_lib = None
         macro_lib = None
@@ -1430,6 +1544,41 @@ def _daily_append_impl(
                 raise RuntimeError(
                     f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
                 ) from exc
+
+        # Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/… . Unlike the
+        # XL* sector ETFs above (load-bearing for sector_vs_spy_* on every
+        # stock, hence hard-fail), these are ADDITIVE/best-effort: a missing
+        # bar degrades one feature family (sub_sector_vs_benchmark_*) to its
+        # neutral default for the affected stocks rather than failing the run,
+        # matching feature_engineer's None-input neutral-0.0 fallback and the
+        # HYOAS-style optional-input philosophy. Not added to
+        # macro_missing_from_closes (which drives the mandatory hard-fail).
+        for sym in sub_sector_etf_symbols:
+            bar = closes.get(sym)
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                log.warning(
+                    "Sub-sector ETF %s missing from daily closes for %s — "
+                    "sub_sector_vs_benchmark_* will neutral-default for its "
+                    "stocks (non-fatal, additive feature).",
+                    sym, date_str,
+                )
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                    mode = _write_row_backfill_safe(macro_lib, sym, new_row)
+                sector_updated.append(sym)
+                macro_write_modes[sym] = mode
+            except Exception as exc:
+                log.warning(
+                    "Sub-sector ETF %s bar write failed for %s (non-fatal — "
+                    "sub_sector_vs_benchmark_* will neutral-default): %s",
+                    sym, date_str, exc,
+                )
 
         # HYOAS (config#939, credit spreads) — best-effort, NOT added to
         # `macro_keys` above. Unlike SPY/VIX/TNX/etc. (battle-tested,
@@ -1698,6 +1847,39 @@ def _daily_append_impl(
                     # loop above; same non-monotonic-on-holiday-backfill hazard.
                     series = series[~series.index.duplicated(keep="last")].sort_index()
                 macro[sym] = series
+
+        # Sub-sector benchmark ETFs (config#934) — best-effort read, mirroring
+        # the best-effort write above. NOT a hard-fail loop like the XL*
+        # sector ETFs: a symbol absent from ArcticDB (never populated yet, or
+        # unreadable) simply leaves macro[sym] unset, and the downstream
+        # `sub_sector_etf_series = macro.get(sym)` resolves to None →
+        # sub_sector_vs_benchmark_* neutral-defaults for the affected stocks.
+        for sym in sub_sector_etf_symbols:
+            if sym in macro:
+                continue  # already loaded (e.g. also a macro_key) — don't reread
+            try:
+                mdf = macro_lib.read(sym).data
+            except Exception as exc:
+                log.warning(
+                    "Sub-sector ETF %s unreadable from ArcticDB (non-fatal — "
+                    "sub_sector_vs_benchmark_* will neutral-default): %s",
+                    sym, exc,
+                )
+                continue
+            if "Close" not in mdf.columns:
+                log.warning(
+                    "Sub-sector ETF %s has no Close column — ArcticDB schema "
+                    "drift (non-fatal, treated as missing).", sym,
+                )
+                continue
+            series = mdf["Close"].dropna()
+            ticker_close = closes.get(sym)
+            if ticker_close and not np.isnan(ticker_close["Close"]):
+                series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
+                # Re-sort after the today_ts concat — see the macro_keys loop
+                # above; same non-monotonic-on-holiday-backfill hazard.
+                series = series[~series.index.duplicated(keep="last")].sort_index()
+            macro[sym] = series
 
         # HYOAS (config#939, credit spreads) — best-effort read, mirroring
         # the best-effort write above. Not part of the mandatory
@@ -2022,6 +2204,16 @@ def _daily_append_impl(
                 # in features/feature_engineer.py.
                 sector_etf_sym = sector_map.get(ticker)
                 sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+                # Sub-sector benchmark ETF (config#934) — resolved the same way
+                # as the sector ETF above. sub_sector_etf_map falls back to the
+                # sector ETF for unmapped sub-industries, so this is often the
+                # SAME series as sector_etf_series (→ sub_sector_vs_benchmark_*
+                # == sector_vs_spy_*). None if the ETF's series never loaded
+                # (best-effort) → the feature neutral-defaults.
+                sub_sector_etf_sym = sub_sector_etf_map.get(ticker)
+                sub_sector_etf_series = (
+                    macro.get(sub_sector_etf_sym) if sub_sector_etf_sym else None
+                )
                 ticker_alt = alt_data.get(ticker, {})
 
                 featured = compute_features(
@@ -2029,6 +2221,7 @@ def _daily_append_impl(
                     spy_series=spy_series,
                     vix_series=vix_series,
                     sector_etf_series=sector_etf_series,
+                    sub_sector_etf_series=sub_sector_etf_series,
                     tnx_series=tnx_series,
                     irx_series=irx_series,
                     gld_series=gld_series,
@@ -2549,9 +2742,13 @@ def _daily_append_impl(
         # earlier silent skips. Emits health/universe_freshness.json so
         # consumers don't repeat this 200s scan on every Lambda
         # invocation (the cause of the 2026-05-01 SF timeout cascade).
+        # run_date=date_str also drives the strict run_date-exact
+        # feature_store/_universe_close_freshness.json sentinel
+        # (config#3237) eod-precondition-probe reads.
         receipt = _scan_universe_and_emit_freshness_receipt(
             s3, bucket, universe_lib,
             expected_tickers=expected_tickers,
+            run_date=date_str,
         )
         result["universe_freshness_receipt"] = {
             "n_symbols_checked": receipt["n_symbols_checked"],

@@ -45,6 +45,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from features import gen_schema_md
 from features.feature_engineer import FEATURES, compute_features
 from features.registry import CATALOG, PRIVATE_PACK_COMPUTE
 
@@ -164,6 +165,78 @@ def test_schema_md_has_no_orphan_fields():
     )
 
 
+# ── §3 generated-table drift check (alpha-engine-config#2590) ───────────────
+#
+# The tests above only check that every field NAME appears somewhere in §3.
+# They would not catch a stale Units/Compute/Consumers cell — exactly the
+# drift class that caused the avg_volume_20d incident (SCHEMA.md §1). This
+# test closes that gap: SCHEMA.md §3's table BLOCKS must be byte-identical
+# to a fresh render from registry.CATALOG's units/formula/consumers/
+# display_order fields (features/gen_schema_md.py). A PR that edits a
+# CATALOG entry's units/formula/consumers without regenerating SCHEMA.md,
+# or that hand-edits a §3 table cell without touching CATALOG, fails here.
+
+
+def test_schema_md_section_3_matches_fresh_catalog_render():
+    """SCHEMA.md §3's generated table blocks must equal a fresh CATALOG render.
+
+    Run `python3 features/gen_schema_md.py --write` and commit the result
+    to fix. Prose (lead-in paragraphs, the Factor-loadings intro + the
+    roe_zscore known-degenerate writeup, and all of §3b) is untouched by
+    the generator and is not covered by this check — only the four-column
+    `| Field | Units | Compute | Consumers |` table blocks are generated.
+    """
+    committed = gen_schema_md.SCHEMA_MD.read_text(encoding="utf-8")
+    fresh = gen_schema_md.rewrite_schema_md(committed)
+    assert committed == fresh, (
+        "features/SCHEMA.md §3 has drifted from features/registry.py::CATALOG. "
+        "Run `python3 features/gen_schema_md.py --write` and commit the "
+        "regenerated file."
+    )
+
+
+def test_gen_schema_md_render_is_deterministic():
+    """Rendering twice from the same CATALOG must produce identical output —
+    guards against any accidental nondeterminism (e.g. dict/set ordering)
+    creeping into the generator."""
+    first = gen_schema_md.render_all_tables()
+    second = gen_schema_md.render_all_tables()
+    assert first == second
+
+
+def test_gen_schema_md_covers_every_group_section():
+    """Every CATALOG group must have a corresponding §3 subsection wired
+    into the generator — catches a future new `group` value that the
+    generator doesn't know how to render."""
+    catalog_groups = {f.group for f in CATALOG}
+    generator_groups = {group for _header, group in gen_schema_md.GROUP_SECTIONS}
+    assert catalog_groups == generator_groups, (
+        "features/gen_schema_md.py::GROUP_SECTIONS is out of sync with the "
+        f"groups actually present in CATALOG. catalog={sorted(catalog_groups)} "
+        f"generator={sorted(generator_groups)}"
+    )
+
+
+def test_private_pack_row_renders_sentinel_not_formula():
+    """A private-pack CATALOG entry's rendered Compute cell must be the
+    literal sentinel text, never its (nonexistent) formula — proves the
+    generator's disclosure-format branch (SCHEMA.md §3b) independent of
+    whether any real private-pack entry exists in CATALOG today."""
+    from features.registry import FeatureEntry
+
+    entry = FeatureEntry(
+        name="dummy_private_render_check_raw",
+        group="technical",
+        description="d",
+        compute=PRIVATE_PACK_COMPUTE,
+        units="raw shares",
+        formula="",
+        consumers="predictor",
+        display_order=999,
+    )
+    assert gen_schema_md._compute_cell(entry) == "private pack"
+
+
 # ── Naming-convention sniff tests ────────────────────────────────────────────
 
 
@@ -180,7 +253,14 @@ _GRANDFATHERED_BARE_FIELDS: frozenset[str] = frozenset({
     "dist_from_52w_high", "momentum_5d", "rel_volume_ratio",
     "return_vs_spy_5d", "dist_from_52w_low", "vol_ratio_10_60",
     "bollinger_pct", "sector_vs_spy_5d", "sector_vs_spy_10d",
-    "sector_vs_spy_20d", "price_accel", "ema_cross_8_21", "atr_14_pct",
+    "sector_vs_spy_20d",
+    # config#934 — sub-sector benchmark-relative momentum. Bare-named for the
+    # same reason as the sector_vs_spy_* family above: a decimal excess return
+    # over a fixed horizon (the _5d/_10d/_20d suffix names the WINDOW, not
+    # units). Follows the identical convention as its sector-level sibling.
+    "sub_sector_vs_benchmark_5d", "sub_sector_vs_benchmark_10d",
+    "sub_sector_vs_benchmark_20d",
+    "price_accel", "ema_cross_8_21", "atr_14_pct",
     "realized_vol_20d", "realized_vol_63d", "volume_trend",
     "obv_slope_10d", "rsi_slope_5d", "volume_price_div",
     "return_60d", "return_120d", "overnight_return_5d",

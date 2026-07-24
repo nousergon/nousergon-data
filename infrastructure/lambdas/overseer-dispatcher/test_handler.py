@@ -227,3 +227,29 @@ class TestInvokeClientConfig:
         assert cfg is index._EXECUTOR_INVOKE_CONFIG
         assert cfg.retries == {"max_attempts": 0}
         assert cfg.read_timeout == 290
+
+
+class TestModelInjection:
+    """config-I3293: the registry is the SSoT for the agent's model — the
+    router injects the playbook's declared `model` into the executor payload,
+    and a caller-provided model (drill/operator override) wins."""
+
+    def test_registry_model_injected_into_executor_payload(self, index_mod):
+        index, fake_boto3 = index_mod
+        lam = _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})
+        index.handler({"playbook": "sf-watch",
+                       "payload": {"pipeline_name": "ne-weekly-freshness-pipeline",
+                                   "run_date": "2026-07-17"}}, None)
+        sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+        reg_model = index._registry()["playbooks"]["sf-watch"]["model"]
+        assert sent["model"] == reg_model
+        assert reg_model.startswith("claude-")
+
+    def test_caller_model_override_wins(self, index_mod):
+        index, fake_boto3 = index_mod
+        lam = _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})
+        index.handler({"playbook": "alert-drain",
+                       "payload": {"trigger": "operator", "model": "claude-opus-4-8"}},
+                      None)
+        sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+        assert sent["model"] == "claude-opus-4-8"
