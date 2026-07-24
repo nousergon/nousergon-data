@@ -42,6 +42,11 @@ permissions:
 
 jobs:
   drift-check:
+    # config#3495 → config#3697: skip on PR events — a PR that codifies new
+    # EventBridge rules / SF config is, by definition, ahead of live AWS
+    # pre-apply, so comparing codified-vs-live here is guaranteed drift.
+    # The post-merge reconciliation runs in sf-events-drift-post-merge.yml.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

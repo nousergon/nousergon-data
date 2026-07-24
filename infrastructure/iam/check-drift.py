@@ -20,22 +20,38 @@ so cosmetic-only differences in indentation or key order don't trip the check.
 Usage:
   ./infrastructure/iam/check-drift.py             # check every codified role
   ./infrastructure/iam/check-drift.py --role X    # check one role (both .json and .trust.json if present)
+  ./infrastructure/iam/check-drift.py --post-merge  # auto-apply drifted roles then re-check
 
 Requires AWS creds with iam:ListRolePolicies + iam:GetRolePolicy +
 iam:GetRole on the target roles. Locally: any admin profile. In CI: the
 OIDC role `github-actions-iam-drift-check` (alpha-engine repo owns it;
 trust policy allows this repo too).
+
+--post-merge (config#3495 → config#3697): a PR that codifies IAM is,
+structurally, always "drifted" pre-merge — the codified state is the NEW
+desired state, live AWS still has the OLD one, and nothing has run
+apply.sh yet. Blocking PR checks on this comparison guarantees red on
+every IAM PR. --post-merge instead: find drift as normal, run
+apply.sh <role> for each DRIFTED role only (never touching clean roles),
+then re-check just those roles. Residual drift after apply is REAL
+unexpected drift (e.g. an apply or trust-apply failure) and still fails
+the check. Requires write creds (iam:PutRolePolicy +
+iam:UpdateAssumeRolePolicy + iam:AttachRolePolicy) in addition to the
+read set above — a separate, more privileged OIDC role than the
+PR/schedule path uses.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
+APPLY_SCRIPT = SCRIPT_DIR / "apply.sh"
 
 
 def _aws_iam(*args: str) -> dict | list | str:
@@ -149,10 +165,90 @@ def _check_trust_role(trust_file: Path) -> list[str]:
     return findings
 
 
+def _apply_role(role_name: str) -> subprocess.CompletedProcess:
+    """Run apply.sh for one drifted role. Caller re-checks afterward.
+
+    apply.sh takes a bare role name (no flag) and handles both the inline
+    policy (<role>-policy) and trust document (update-assume-role-policy)
+    for that role when both <role>.json and <role>.trust.json exist.
+    """
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        sys.stderr.write("bash not found on PATH\n")
+        sys.exit(1)
+    return subprocess.run(
+        [bash_bin, str(APPLY_SCRIPT), role_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _reconcile_post_merge(
+    drifted_role_names: set[str],
+    role_file_map: dict[str, Path],
+    trust_file_map: dict[str, Path],
+) -> list[str]:
+    """Apply + re-check each drifted role. Returns residual (real) findings.
+
+    For each drifted role, runs apply.sh <role>, then re-runs _check_role
+    and/or _check_trust_role (whichever files exist for that role). A role
+    that is clean after apply is resolved; residual drift after a
+    successful apply (or an apply failure) is reported.
+    """
+    residual: list[str] = []
+    for role_name in sorted(drifted_role_names):
+        print(f"Auto-applying {role_name}...")
+        result = _apply_role(role_name)
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        if result.returncode != 0:
+            residual.append(
+                f"{role_name}: apply.sh failed (exit {result.returncode}) — "
+                f"drift NOT resolved, see apply output above"
+            )
+            continue
+
+        # Re-check inline policy if codified
+        if role_name in role_file_map:
+            recheck = _check_role(role_file_map[role_name])
+            if recheck:
+                residual.extend(
+                    f"{role_name}: inline-policy drift persists after "
+                    f"auto-apply — {f}" for f in recheck
+                )
+        # Re-check trust doc if codified
+        if role_name in trust_file_map:
+            recheck = _check_trust_role(trust_file_map[role_name])
+            if recheck:
+                residual.extend(
+                    f"{role_name}: trust-doc drift persists after "
+                    f"auto-apply — {f}" for f in recheck
+                )
+
+        if role_name not in {_role_from_finding(r) for r in residual}:
+            print(f"  resolved: {role_name}")
+
+    return residual
+
+
+def _role_from_finding(finding: str) -> str:
+    """Extract role name from a finding string like 'role-name: ...'."""
+    return finding.split(":")[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--role", help="Check one role (default: every codified role)"
+    )
+    parser.add_argument(
+        "--post-merge",
+        action="store_true",
+        help=(
+            "On drift, run apply.sh for each drifted role and re-check "
+            "before failing (config#3495 → config#3697) — see module docstring"
+        ),
     )
     args = parser.parse_args()
 
@@ -182,13 +278,44 @@ def main() -> int:
         print(f"No codified role files found under {SCRIPT_DIR} — nothing to check.")
         return 0
 
+    # Build lookup maps so _reconcile_post_merge can re-check specific roles.
+    role_file_map: dict[str, Path] = {f.stem: f for f in role_files}
+    trust_file_map: dict[str, Path] = {
+        f.name[: -len(".trust.json")]: f for f in trust_files
+    }
+
     total_findings: list[str] = []
+    drifted_role_names: set[str] = set()
     for role_file in role_files:
-        total_findings.extend(_check_role(role_file))
+        findings = _check_role(role_file)
+        if findings:
+            drifted_role_names.add(role_file.stem)
+        total_findings.extend(findings)
     for trust_file in trust_files:
-        total_findings.extend(_check_trust_role(trust_file))
+        findings = _check_trust_role(trust_file)
+        if findings:
+            drifted_role_names.add(trust_file.name[: -len(".trust.json")])
+        total_findings.extend(findings)
 
     if total_findings:
+        if args.post_merge:
+            residual = _reconcile_post_merge(
+                drifted_role_names, role_file_map, trust_file_map
+            )
+            if residual:
+                print(
+                    f"IAM drift persists after auto-apply "
+                    f"({len(residual)} finding(s)):"
+                )
+                for f in residual:
+                    print(f"  - {f}")
+                return 1
+            print(
+                f"OK: auto-applied and reconciled drift for "
+                f"{', '.join(sorted(drifted_role_names))}"
+            )
+            return 0
+
         print(f"IAM drift detected ({len(total_findings)} finding(s)):")
         for f in total_findings:
             print(f"  - {f}")
