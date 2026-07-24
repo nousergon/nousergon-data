@@ -497,7 +497,10 @@ class TestStrictSuperset:
         )
         assert nc["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
         assert nc["ResultPath"] == "$.notify_result"
-        assert nc["End"] is True
+        # config#2857: converges into the SF-envelope completion marker
+        # before ending, rather than Ending here directly.
+        assert "End" not in nc
+        assert nc["Next"] == "WriteCompletionMarker"
 
     def test_success_notify_gate_default_is_notify_complete(self, states):
         # config#2278: the real-run success edge now passes through the

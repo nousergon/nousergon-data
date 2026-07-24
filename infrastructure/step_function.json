@@ -4158,7 +4158,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "End": true
+      "Next": "WriteCompletionMarker"
     },
     "NotifyCompleteHealthDegraded": {
       "Type": "Task",
@@ -4180,7 +4180,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "End": true
+      "Next": "WriteCompletionMarker"
     },
     "NotifyCompleteGatesAndHealthDegraded": {
       "Type": "Task",
@@ -4200,6 +4200,29 @@
           "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
           "ResultPath": "$.notify_error",
           "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
+    "WriteCompletionMarker": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 5 real-completion notify paths (NotifyComplete, its degraded-catch fallback, and the 3 gate/health-degraded variants) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "End": true
@@ -4257,7 +4280,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "End": true
+      "Next": "WriteCompletionMarker"
     },
     "NotifyCompleteDegraded": {
       "Type": "Pass",
@@ -4268,7 +4291,7 @@
         "error.$": "$.notify_error"
       },
       "ResultPath": "$.notify_degraded",
-      "End": true
+      "Next": "WriteCompletionMarker"
     },
     "ExtractMorningEnrichError": {
       "Type": "Pass",
