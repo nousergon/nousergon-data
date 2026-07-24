@@ -232,7 +232,6 @@ def ingest_ticker(
         )
         if doc_id:
             ingested += 1
-            logger.info("Ingested %s Q%d %d: %d chunks", ticker, quarter, year, len(all_chunks))
 
     return ingested
 
