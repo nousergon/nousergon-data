@@ -264,11 +264,12 @@ def _primary_backend_for(tiers) -> str | None:
     """PRIMARY-mode DeepSeek selection (alpha-engine-config-I3479): returns
     ``GROOM_BACKEND_DEEPSEEK`` iff ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed
     (non-empty) AND every tier in this launch's bundle is a member of it —
-    else ``None`` (the unchanged Claude path). A bundle containing "high"
-    (e.g. a high+mid attach-upward bundle from ``ge.decide_trigger``'s
-    thin-pool bundling) therefore ALWAYS stays on Claude: high remains on
-    the Max plan by ruling, and "any-high-blocks-the-whole-bundle" means a
-    mixed bundle can never split backends mid-box (one box, one provider).
+    else ``None`` (the unchanged Claude path). A bundle containing a tier
+    NOT in the armed set therefore stays on Claude: the env var controls
+    exactly which tiers use DeepSeek primary, and "any-foreign-tier-blocks-
+    the-whole-bundle" means a mixed bundle can never split backends mid-box
+    (one box, one provider). As of 2026-07-24 all three tiers (low, mid,
+    high) are armed for DeepSeek primary.
 
     Distinct from (and orthogonal to) ``GROOM_BACKEND_DEEPSEEK``'s existing
     quota-FALLBACK use in ``_handle_fallback_dispatch`` — that path is a
