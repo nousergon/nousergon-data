@@ -2066,12 +2066,13 @@ def test_fallback_dispatch_backend_independent_of_primary_tiers_env(monkeypatch)
     assert out["groom"]["backend"] == "deepseek"
 
 
-def test_deploy_sh_arms_primary_deepseek_tiers_low_mid():
+def test_deploy_sh_arms_primary_deepseek_tiers_low_mid_high():
     # Structural pin, INVERTED at arming (2026-07-22, config-I3488 step 3 —
     # Brian's DeepSeek-primary ruling, config-I3479): BOTH `--environment
     # 'Variables={...}'` calls must now carry GROOM_PRIMARY_DEEPSEEK_TIERS
-    # with the value DOUBLE-QUOTED ("low,mid") — a raw comma inside CLI
+    # with the value DOUBLE-QUOTED ("low,mid,high") — a raw comma inside CLI
     # shorthand splits map entries and fails ParamValidation (verified live).
+    # 2026-07-24: high tier added to the armed set.
     # This guards against (a) silent DISARM by a deploy.sh refactor dropping
     # the var from one or both maps, and (b) re-introducing the unquoted form.
     # Disarming is a deliberate reviewed PR that flips this pin back.
@@ -2085,4 +2086,4 @@ def test_deploy_sh_arms_primary_deepseek_tiers_low_mid():
     ]
     assert len(armed_lines) == 2
     for line in armed_lines:
-        assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"' in line
+        assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"' in line

@@ -66,6 +66,10 @@ FX_PREFIX = "market_data/fx/"
 # History artifacts (per-symbol / per-currency) — power Metron's Performance NAV
 # reconstruction (close series) + as-of-date realized/dividend FX conversion.
 CLOSE_HISTORY_PREFIX = "market_data/close_history/"
+# Consolidated close-history artifact containing all symbols' close series + currency map
+# (one file instead of N per-ticker files — metron-ops#233). Written alongside per-ticker
+# files during the transition period; the consumer prefers this when present.
+CONSOLIDATED_CLOSE_HISTORY_KEY = f"{CLOSE_HISTORY_PREFIX}consolidated.json"
 FX_HISTORY_PREFIX = "market_data/fx_history/"
 # Factor/sector ETFs whose close-history Metron's RISK (factor model) + ATTRIBUTION
 # (Brinson sector) need. These are NOT in any held universe, so unless their history is
@@ -1085,6 +1089,15 @@ def collect_history(
             _write_json(s3_client, bucket, f"{FX_HISTORY_PREFIX}{ccy}.json", {
                 "schema_version": FX_HISTORY_SCHEMA_VERSION, "currency": ccy,
                 "base": BASE_CURRENCY, "rates": [list(p) for p in series]})
+        # Consolidated artifact (metron-ops#233): a single file with all symbols' close
+        # series + currency map, so the consumer reads one S3 get_object instead of N.
+        # Written alongside per-ticker files during the transition period.
+        _write_json(s3_client, bucket, CONSOLIDATED_CLOSE_HISTORY_KEY, {
+            "schema_version": CLOSE_HISTORY_SCHEMA_VERSION,
+            "adjustment_basis": CLOSE_HISTORY_ADJUSTMENT_BASIS,
+            "series": {sym: [list(p) for p in series] for sym, series in closes.items()},
+            "currency": {sym: ccy_by_yf.get(sym, "USD") for sym in closes},
+        })
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] history write failed: %s", e)
         return {"status": "error", "error": str(e)}
