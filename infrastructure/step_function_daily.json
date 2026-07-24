@@ -943,7 +943,10 @@
       "TimeoutSeconds": 60,
       "Retry": [
         {
-          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
           "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5,
@@ -956,11 +959,34 @@
             "States.ALL"
           ],
           "Comment": "Daemon restart failure is non-fatal — systemd boot trigger is backup",
-          "Next": "PipelineComplete",
+          "Next": "WriteCompletionMarker",
           "ResultPath": "$.daemon_error"
         }
       ],
       "ResultPath": "$.daemon_result",
+      "Next": "WriteCompletionMarker"
+    },
+    "WriteCompletionMarker": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Reached only via RunDaemon/CheckSkipRunDaemon's success Next (including RunDaemon's own best-effort daemon-restart-failure Catch, which is still an overall pipeline SUCCESS) — NotifyHolidaySkip (NYSE closed, no run occurred) and TradingDayGateFailed/HandleFailure are NOT redirected here, so a holiday skip or a real failure never satisfies the SLA. cycle_key is the execution-start date (no run_date is threaded through this SF today, unlike the Saturday SF) — safe because this pipeline always starts well after UTC midnight for its trading day. Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline (cadence weekday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-preopen-trading-pipeline/{}.json', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-preopen-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
       "Next": "PipelineComplete"
     },
     "CheckSkipMorningEnrich": {
@@ -1048,7 +1074,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "PipelineComplete"
+          "Next": "WriteCompletionMarker"
         }
       ],
       "Default": "RunDaemon"
