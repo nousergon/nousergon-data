@@ -112,10 +112,28 @@ def notify_via_flow_doctor(
     flow_name: str,
     topics: Sequence[Any],
     db_basename: str,
+    source: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     silent_topic: Any | None = None,
 ) -> bool:
-    """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``."""
+    """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``.
+
+    Args:
+        text: Notification body text.
+        silent: If True, send with notifications suppressed (Telegram silent).
+        severity: One of ``critical``, ``error``, ``warning``, ``info``.
+        dedup_key: Stable dedup key for cross-invocation cooldown.
+        flow_name: Flow doctor flow name.
+        topics: Telegram topic routing.
+        db_basename: Flow doctor store basename.
+        source: Explicit event source override. When set, ``KREPIS_EVENT_SOURCE``
+            is temporarily scoped so ``emit_alert_event``'s ``_resolve_source``
+            picks it up instead of falling through to ``AWS_LAMBDA_FUNCTION_NAME``.
+            If omitted, the caller's Lambda function name is used (the default
+            krepis behavior).
+        context: Arbitrary key-value metadata.
+        silent_topic: Optional topic for silent notifications when ``silent`` is True.
+    """
     owner_repo = (context or {}).get("owner_repo")
     if owner_repo in TEST_NAMESPACE_OWNER_REPOS:
         logger.warning(
@@ -135,11 +153,22 @@ def notify_via_flow_doctor(
         if notifier is not None:
             return notifier.send_raw(text, disable_notification=True) is not None
 
-    report_id = fd.notify_event(
-        subject,
-        body=None,
-        severity=severity,
-        context=context or {},
-        dedup_key=dedup_key,
-    )
+    # Scope the event source so krepis's _resolve_source picks up the
+    # explicit override instead of falling through to AWS_LAMBDA_FUNCTION_NAME.
+    old_source = os.environ.pop("KREPIS_EVENT_SOURCE", None)
+    if source is not None:
+        os.environ["KREPIS_EVENT_SOURCE"] = source
+    try:
+        report_id = fd.notify_event(
+            subject,
+            body=None,
+            severity=severity,
+            context=context or {},
+            dedup_key=dedup_key,
+        )
+    finally:
+        if old_source is not None:
+            os.environ["KREPIS_EVENT_SOURCE"] = old_source
+        elif source is not None:
+            os.environ.pop("KREPIS_EVENT_SOURCE", None)
     return report_id is not None
