@@ -109,3 +109,43 @@ def daily_news_timeout_start_seconds() -> int:
     ``max_fetch_seconds`` is the primary defence.
     """
     return DAILY_NEWS_MAX_FETCH_SECONDS + DAILY_NEWS_AGGREGATION_RESERVE_SECONDS
+
+
+# ── Daily CORPUS delta (rag/pipelines/run_daily_corpus_delta.sh) — config#2943 ──
+# The weekday RAG-corpus delta pass (filings delta + news delta, scoped to
+# holdings ∪ active candidates ∪ top-60 signals board — ≈100-150 tickers, NOT
+# the ~944-ticker full signals universe) runs ``run_news_pipeline.py`` — the
+# SAME sequential-Polygon-bottlenecked path the Saturday sweep uses (not the
+# CONCURRENT AsyncNewsAggregator ``daily-news.service`` uses), because it also
+# does the RAG-corpus ingest step (embeddings + pgvector write) that
+# ``daily-news.service``'s slim venv/dependency set doesn't carry. So this
+# budget is sized the same WAY the weekly one is (universe × per-ticker cost,
+# floored, capped) — just over a ~10x smaller universe, which is the whole
+# point of the scope ruling (config#2943): a ~150-ticker sequential Polygon
+# sweep is ~1900s (~31 min) worst case, comfortably inside a single-digit-
+# minutes-to-tens-of-minutes daily job, vs. the ~944-ticker weekly sweep's
+# ~3.15h.
+DAILY_CORPUS_DELTA_EXECUTION_TIMEOUT_SECONDS = 3_600  # 1h hard cap — generous
+# headroom over the ~150-ticker nominal (filings delta + ~31min Polygon leg +
+# NLP + RAG ingest), sized independently of (smaller than) the weekly 6h cap.
+
+_DAILY_CORPUS_DELTA_NON_POLYGON_RESERVE_SECONDS = 900  # filings delta + NLP + RAG-ingest write
+_DAILY_CORPUS_DELTA_NEWS_FLOOR_SECONDS = 300
+_DAILY_CORPUS_DELTA_POLYGON_CAP_SECONDS = (
+    DAILY_CORPUS_DELTA_EXECUTION_TIMEOUT_SECONDS - _DAILY_CORPUS_DELTA_NON_POLYGON_RESERVE_SECONDS
+)  # 2_700
+
+
+def daily_corpus_delta_news_max_fetch_seconds(scope_size: int) -> int:
+    """``max_fetch_seconds`` for the WEEKDAY corpus-delta Polygon news leg.
+
+    Same derivation shape as ``weekly_news_max_fetch_seconds`` (scales with
+    the LIVE scope, floored, capped) but over the config#2943 corpus SCOPE
+    (holdings ∪ active candidates ∪ top-60 board, ≈100-150 tickers) rather
+    than the full signals universe — this is the whole structural point of
+    the scope ruling: the daily (and, after config#2943, the Saturday
+    top-up) sweep is bounded by the SCOPE size, which does not grow with
+    predictor-side universe expansion.
+    """
+    raw = math.ceil(max(scope_size, 0) * POLYGON_SECONDS_PER_TICKER)
+    return int(min(max(raw, _DAILY_CORPUS_DELTA_NEWS_FLOOR_SECONDS), _DAILY_CORPUS_DELTA_POLYGON_CAP_SECONDS))

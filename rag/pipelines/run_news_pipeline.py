@@ -19,15 +19,22 @@ ergonomics of ingest_8k_filings et al.).
 
 Usage::
 
-    # Saturday SF invocation
-    python -m rag.pipelines.run_news_pipeline --from-signals
+    # Saturday SF invocation (and the daily weekday delta — config#2943)
+    python -m rag.pipelines.run_news_pipeline --scope holdings+candidates+board60
 
     # Ad-hoc for a specific population
     python -m rag.pipelines.run_news_pipeline --tickers AAPL,MSFT \\
         --hours 48 --aggregate-date 2026-05-17
 
     # Skip RAG ingest (smoke test the parquet writer only)
-    python -m rag.pipelines.run_news_pipeline --from-signals --skip-rag
+    python -m rag.pipelines.run_news_pipeline --scope holdings+candidates+board60 --skip-rag
+
+config#2943: the old ``--from-signals`` (whole ~900-ticker signals.json
+universe) is retired — replaced by ``--scope holdings+candidates+board60``,
+resolved via the shared ``rag.pipelines._corpus_scope`` module. This
+orchestrator is shared by BOTH the Saturday delta-only top-up
+(``run_weekly_ingestion.sh``, --hours 48) and the weekday daily delta
+(``run_daily_corpus_delta.sh``, --hours 24).
 """
 
 from __future__ import annotations
@@ -36,6 +43,8 @@ import argparse
 import logging
 import sys
 from datetime import date, datetime, timezone
+
+from rag.pipelines._corpus_scope import add_scope_arg, resolve_tickers_from_args
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +60,7 @@ def main() -> int:
         "--tickers", type=str,
         help="Comma-separated ticker list.",
     )
-    grp.add_argument(
-        "--from-signals", action="store_true",
-        help="Load tickers from the latest signals.json on S3 "
-             "(canonical Saturday SF posture).",
-    )
+    add_scope_arg(grp)
     parser.add_argument(
         "--hours", type=int, default=168,
         help="Lookback window in hours (default 168 = 7 days).",
@@ -81,14 +86,25 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="Fetch + log but don't write parquet or ingest to RAG.",
     )
+    parser.add_argument(
+        "--budget-profile", choices=["weekly", "daily"], default="weekly",
+        help=(
+            "config#2943: which Polygon-budget derivation to use — "
+            "'weekly' (collectors.news_sources.fetch_budget."
+            "weekly_news_max_fetch_seconds, cap 15600s / 6h envelope; the "
+            "Saturday top-up's posture) or 'daily' ("
+            "daily_corpus_delta_news_max_fetch_seconds, cap 2700s / 1h "
+            "envelope; run_daily_corpus_delta.sh's posture). Both scale "
+            "with the SAME input (len(tickers) — the resolved corpus scope, "
+            "not the full signals universe) and produce similar small "
+            "numbers at scope size, but the cap differs to match each "
+            "caller's own execution-timeout envelope."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Resolve tickers + aggregate_date ─────────────────────────
-    if args.tickers:
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-    else:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket)
+    tickers = resolve_tickers_from_args(args)
     if not tickers:
         logger.error("[run_news_pipeline] no tickers — aborting")
         return 1
@@ -106,18 +122,27 @@ def main() -> int:
     from collectors.news_sources.polygon import PolygonNewsAdapter
     from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
 
-    # config#2938 ruling 1 — the WEEKLY corpus gets FULL coverage: size the
-    # Polygon budget from the LIVE universe so the ~5-req/min sweep COMPLETES
-    # (the adapter guard is only a SIGKILL backstop). GDELT keeps its own tight
-    # default (its throttle-degrades-this-adapter posture, config#2813). The
-    # budget is kept below the RAGIngestion SSM executionTimeout so the rest of
-    # the step (NLP + RAG ingest) always runs — see fetch_budget for the
-    # derivation and its lockstep with nousergon-data's step_function.json.
-    from collectors.news_sources.fetch_budget import weekly_news_max_fetch_seconds
-    poly_budget = weekly_news_max_fetch_seconds(len(tickers))
+    # config#2938 ruling 1 — size the Polygon budget from the LIVE (scoped)
+    # ticker count so the ~5-req/min sweep COMPLETES (the adapter guard is
+    # only a SIGKILL backstop). GDELT keeps its own tight default (its
+    # throttle-degrades-this-adapter posture, config#2813). config#2943:
+    # --budget-profile picks which derivation's cap/floor matches the
+    # CALLER's own execution-timeout envelope — 'weekly' (15600s cap, the
+    # Saturday top-up's 6h envelope) or 'daily' (2700s cap, the daily
+    # delta's 1h envelope). Both take the SAME input (len(tickers), the
+    # resolved corpus scope) and are lockstep-guarded by
+    # tests/test_fetch_budget.py against their respective envelope constant.
+    from collectors.news_sources.fetch_budget import (
+        daily_corpus_delta_news_max_fetch_seconds,
+        weekly_news_max_fetch_seconds,
+    )
+    if args.budget_profile == "daily":
+        poly_budget = daily_corpus_delta_news_max_fetch_seconds(len(tickers))
+    else:
+        poly_budget = weekly_news_max_fetch_seconds(len(tickers))
     logger.info(
-        "[run_news_pipeline] weekly Polygon news budget = %ds for %d tickers",
-        poly_budget, len(tickers),
+        "[run_news_pipeline] %s Polygon news budget = %ds for %d tickers",
+        args.budget_profile, poly_budget, len(tickers),
     )
     aggregator = NewsAggregator(sources=[
         PolygonNewsAdapter(max_fetch_seconds=poly_budget),

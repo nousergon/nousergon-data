@@ -9,17 +9,21 @@ Usage:
     # Ingest recent transcripts for specific tickers
     python -m rag.pipelines.ingest_earnings_finnhub --tickers AAPL,MSFT
 
-    # Backfill from signals universe
-    python -m rag.pipelines.ingest_earnings_finnhub --from-signals
+    # Backfill from the corpus scope (holdings ∪ active candidates ∪
+    # top-60 signals board — config#2943)
+    python -m rag.pipelines.ingest_earnings_finnhub --scope holdings+candidates+board60
 
     # Dry run
     python -m rag.pipelines.ingest_earnings_finnhub --tickers AAPL --dry-run
+
+config#2943: the old ``--from-signals`` (whole ~900-ticker signals.json
+universe) is retired — replaced by ``--scope holdings+candidates+board60``,
+resolved via the shared ``rag.pipelines._corpus_scope`` module.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import time
 from datetime import date
@@ -27,6 +31,11 @@ from datetime import date
 import requests
 
 from nousergon_lib.secrets import get_secret
+from rag.pipelines._corpus_scope import (
+    DEFAULT_BUCKET,
+    add_scope_arg,
+    resolve_tickers_from_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,28 +250,17 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest earnings transcripts from Finnhub into RAG")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from latest signals.json")
+    add_scope_arg(parser)
+    parser.add_argument("--bucket", type=str, default=DEFAULT_BUCKET)
     parser.add_argument("--max-per-ticker", type=int, default=8, help="Max transcripts per ticker")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if args.tickers:
-        tickers = [t.strip().upper() for t in args.tickers.split(",")]
-    elif args.from_signals:
-        import boto3
-        s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(Bucket="alpha-engine-research", Prefix="signals/", Delimiter="/")
-        prefixes = sorted([p["Prefix"] for p in resp.get("CommonPrefixes", [])])
-        if not prefixes:
-            logger.error("No signals found on S3")
-            return
-        obj = s3.get_object(Bucket="alpha-engine-research", Key=f"{prefixes[-1]}signals.json")
-        data = json.loads(obj["Body"].read())
-        tickers = [s["ticker"] for s in data.get("universe", []) if s.get("ticker")]
-        logger.info("Loaded %d tickers from signals", len(tickers))
-    else:
-        parser.error("Provide --tickers or --from-signals")
+    tickers = resolve_tickers_from_args(args)
+    if not tickers:
+        parser.error("Provide --tickers or --scope holdings+candidates+board60")
         return
+    logger.info("Resolved %d tickers for earnings-transcript ingestion", len(tickers))
 
     total = 0
     for ticker in tickers:

@@ -17,12 +17,18 @@ import re
 from pathlib import Path
 
 from collectors.news_sources.fetch_budget import (
+    DAILY_CORPUS_DELTA_EXECUTION_TIMEOUT_SECONDS,
     DAILY_NEWS_MAX_FETCH_SECONDS,
     POLYGON_SECONDS_PER_TICKER,
     WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS,
+    daily_corpus_delta_news_max_fetch_seconds,
     daily_news_timeout_start_seconds,
     weekly_news_max_fetch_seconds,
 )
+
+# config#2943 ruling: corpus scope is holdings ∪ active candidates ∪ top-60
+# board, ≈100-150 effective tickers — used as the reference scope size below.
+_SCOPE_SIZE = 150
 
 # The universe that took down both consumers on 2026-07-18 (79 holdings ∪ 903
 # AE-signals). Used as the "current universe" reference for the completion pin.
@@ -101,3 +107,54 @@ def test_per_ticker_rate_reflects_polygon_free_tier():
     # 5 req/min = 12s/ticker; the derivation must not silently assume a faster
     # (paid-tier) rate that would under-size every budget.
     assert POLYGON_SECONDS_PER_TICKER >= 12.0
+
+
+class TestDailyCorpusDeltaBudget:
+    """config#2943: the weekday RAG-corpus delta (filings + news, scoped to
+    holdings ∪ active candidates ∪ top-60 board) runs the SAME sequential
+    run_news_pipeline.py path the Saturday sweep uses, but over a ~10x
+    smaller population — this derivation must scale + cap the same way the
+    weekly one does, just against a much smaller universe/timeout."""
+
+    def test_scales_with_scope(self):
+        assert (
+            daily_corpus_delta_news_max_fetch_seconds(150)
+            > daily_corpus_delta_news_max_fetch_seconds(20)
+        )
+
+    def test_monotonic_non_decreasing(self):
+        prev = -1
+        for n in (0, 1, 10, 60, 150, 300, 5000):
+            cur = daily_corpus_delta_news_max_fetch_seconds(n)
+            assert cur >= prev
+            prev = cur
+
+    def test_small_scope_hits_floor(self):
+        assert daily_corpus_delta_news_max_fetch_seconds(1) == daily_corpus_delta_news_max_fetch_seconds(0)
+
+    def test_completes_reference_scope_sweep(self):
+        # The ruling's ~100-150 effective-ticker scope must COMPLETE (not bail)
+        # within the derived budget.
+        nominal_crawl = _SCOPE_SIZE * 12
+        assert daily_corpus_delta_news_max_fetch_seconds(_SCOPE_SIZE) >= nominal_crawl
+
+    def test_never_exceeds_execution_timeout(self):
+        for n in (150, 2000, 100_000):
+            assert (
+                daily_corpus_delta_news_max_fetch_seconds(n)
+                < DAILY_CORPUS_DELTA_EXECUTION_TIMEOUT_SECONDS
+            )
+
+    def test_much_smaller_than_weekly_budget_at_reference_scope(self):
+        # The whole point of the config#2943 scope ruling: the daily delta
+        # (and, after the ruling, the Saturday top-up) operates over the
+        # SCOPE, not the full signals universe — so its budget at the
+        # reference scope size must be far smaller than the weekly budget
+        # at the incident-universe size (944 tickers).
+        assert (
+            daily_corpus_delta_news_max_fetch_seconds(_SCOPE_SIZE)
+            < weekly_news_max_fetch_seconds(944)
+        )
+
+    def test_execution_timeout_smaller_than_weekly_cap(self):
+        assert DAILY_CORPUS_DELTA_EXECUTION_TIMEOUT_SECONDS < WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS
