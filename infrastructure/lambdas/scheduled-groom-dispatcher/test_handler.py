@@ -820,18 +820,13 @@ def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
     assert kw["severity"] == "warning" and kw["silent"] is False
 
 
-def test_load_recent_engagements_raises_on_s3_access_denied(monkeypatch):
-    """config#2142: an engagement-scan read failure must RAISE, never degrade
-    to an empty map. The old fail-safe ``{}`` ("skip nothing") silently
-    disabled fresh-skip on every trigger from ship (2026-07-08) to 2026-07-10
-    when the role lacked ListBucket on groom/{date}/ — the dispatcher
-    advertised pre-skip counts (e.g. high=26) that deflated on-box (10)."""
+def test_load_recent_engagements_no_longer_exists(monkeypatch):
+    """config#2146: the 72h fresh-skip cooldown this engagement-horizon scan
+    fed is retired — eligibility is disposition-structural now
+    (ge.is_actionable alone). The function had no other caller, so it's
+    removed with the cooldown rather than left as dead S3-scanning weight."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    def denied(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
-        raise RuntimeError("AccessDenied: s3:ListBucket")
-    monkeypatch.setattr(idx._test_s3, "list_objects_v2", denied)
-    with pytest.raises(RuntimeError, match="AccessDenied"):
-        idx._load_recent_engagements()
+    assert not hasattr(idx, "_load_recent_engagements")
 
 
 def test_non_demand_events_keep_legacy_behavior(monkeypatch):
@@ -1135,52 +1130,43 @@ def test_launch_decided_never_exports_partition_envs(monkeypatch):
     assert "GROOM_NO_SWEEP" not in cmd
 
 
-# ── config#2038: engagement lookback + disposition set must come from the lib ──
+# ── config#2146: fresh-skip retirement — ge.is_actionable alone gates entry ──
 
 
-def test_load_recent_engagements_uses_lib_lookback_window(monkeypatch):
-    """A run artifact just inside ge.ENGAGEMENT_LOOKBACK_DAYS ago must be
-    picked up — this would be dropped by the old hardcoded range(3) whenever
-    the lib's lookback is > 3 (config#2038's actual drift: 4 vs 3)."""
-    from datetime import datetime, timedelta
-    from zoneinfo import ZoneInfo
-
-    import nousergon_lib.groom_eligibility as ge
-
-    now = datetime.now(ZoneInfo("UTC"))
-    farthest = now - timedelta(days=ge.ENGAGEMENT_LOOKBACK_DAYS - 1)
+def test_enumerate_tier_stats_fresh_no_longer_engagement_gated(monkeypatch):
+    """config#2146: a recently-touched issue is no longer excluded/deflated —
+    the 72h fresh-skip cooldown ge.fresh_skip_active used to apply here is
+    retired, and disposition-structural eligibility (ge.is_actionable) is
+    the ONLY gate left. A same-day S3 run artifact records a ``commented``
+    engagement on an issue that is ALSO still open with a mid-tier label; it
+    must still be counted (there is no engagement-horizon lookup left at
+    all — ``_load_recent_engagements`` no longer exists)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    now = datetime.now(timezone.utc)
     art = json.dumps({
-        "run_start": farthest.isoformat().replace("+00:00", "Z"),
-        "elapsed_min": 5,
+        "run_start": now.isoformat().replace("+00:00", "Z"), "elapsed_min": 5,
         "issues": [{"repo": "nousergon/alpha-engine-config", "number": 999,
                     "disposition": "commented"}],
     }).encode()
-    key = f"groom/{farthest.strftime('%Y-%m-%d')}/run1.json"
-    idx = _load(monkeypatch, s3_objects={key: art})
-    engagements = idx._load_recent_engagements()
-    assert ("nousergon/alpha-engine-config", 999) in engagements
-
-
-def test_load_recent_engagements_uses_lib_engaged_dispositions(monkeypatch):
-    """A "labeled" disposition (config#1928/#1890 — label-only edits are the
-    NORM for blocked dispositions) must count as engaged — this comes from
-    ge.ENGAGED_DISPOSITIONS, not a local hardcoded tuple that could drift."""
-    from datetime import datetime, timezone
-
-    import nousergon_lib.groom_eligibility as ge
-
-    assert "labeled" in ge.ENGAGED_DISPOSITIONS
-    now = datetime.now(timezone.utc)
-    art = json.dumps({
-        "run_start": now.isoformat().replace("+00:00", "Z"),
-        "elapsed_min": 5,
-        "issues": [{"repo": "nousergon/alpha-engine-config", "number": 998,
-                    "disposition": "labeled"}],
-    }).encode()
     key = f"groom/{now.strftime('%Y-%m-%d')}/run1.json"
-    idx = _load(monkeypatch, s3_objects={key: art})
-    engagements = idx._load_recent_engagements()
-    assert ("nousergon/alpha-engine-config", 998) in engagements
+    idx._test_s3._objects[key] = art
+    recently_updated = now.isoformat().replace("+00:00", "Z")
+
+    def fake_urlopen(req, timeout=30):
+        url = req.full_url
+        if ("/repos/nousergon/alpha-engine-config/issues?state=open&per_page="
+                in url and "page=1" in url):
+            return _FakeHTTPResponse(json.dumps([
+                {"number": 999, "labels": [{"name": "complexity:mid"}],
+                 "updated_at": recently_updated},
+            ]).encode())
+        return _FakeHTTPResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [])
+    counts, _oldest, _p0, tier_issues = idx._enumerate_tier_stats_fresh("tok")
+    assert counts["mid"] == 1
+    assert tier_issues["mid"][0]["number"] == 999
 
 
 # ── config#2152: queue manifests (observer phase) ───────────────────────────────
