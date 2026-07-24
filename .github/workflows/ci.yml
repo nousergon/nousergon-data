@@ -31,6 +31,20 @@ jobs:
       - name: shellcheck (infrastructure/*.sh, error severity)
         run: shellcheck --severity=error infrastructure/*.sh
 
+  # config#2878: S3 returns 403 AccessDenied instead of 404 NoSuchKey for
+  # GetObject on a nonexistent key when the caller lacks s3:ListBucket. Every
+  # lambda iam-policy.json that grants GetObject must also grant a matching
+  # prefix-scoped ListBucket statement so absent-key detection works correctly
+  # (fail-loud-on-403 hardening pattern). A file with a first-line comment
+  # "# skip-if-absent-key-impossible" exempts roles whose code only reads keys
+  # guaranteed to exist.
+  iam-getobject-listbucket-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check all iam-policy.json for GetObject-without-ListBucket
+        run: python3 infrastructure/lambdas/_shared/check_iam_getobject_listbucket.py
+
   test:
     runs-on: ubuntu-latest
 

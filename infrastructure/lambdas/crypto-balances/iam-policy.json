@@ -18,6 +18,17 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/metron/crypto/wallet_addresses.json"
     },
     {
+      "Sid": "ListCryptoPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["metron/crypto/*"]
+        }
+      }
+    },
+    {
       "Sid": "WriteCryptoHoldings",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],

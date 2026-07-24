@@ -48,6 +48,17 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/_alerts/_dedup/*"
     },
     {
+      "Sid": "ListAlertsDedupPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["_alerts/_dedup/*"]
+        }
+      }
+    },
+    {
       "Sid": "LoudPageSns",
       "Effect": "Allow",
       "Action": "sns:Publish",
