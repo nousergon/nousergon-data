@@ -234,5 +234,29 @@ run aws cloudwatch put-metric-alarm \
   --alarm-actions "$BACKSTOP_TOPIC_ARN" \
   --ok-actions "$BACKSTOP_TOPIC_ARN"
 
+# --- 5. Backstop Telegram forwarder (alpha-engine-config-I2899) ---------------
+# The backstop alarm topic must have a real-time channel beyond email. The
+# alpha-engine-backstop-telegram-notifier Lambda (deployed by its own deploy.sh)
+# subscribes directly to the topic and forwards every alarm to Telegram via raw
+# urllib — ZERO shared infrastructure with the smart path (no krepis, no
+# nousergon_lib, no flow-doctor, no EventBridge). Its SNS subscription is
+# managed by the topic's sole owner: setup_pipeline_deadman_alarms.sh.
+#
+# First-time deployment:
+#   bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh --bootstrap
+# After code changes:
+#   bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh
+
+FORWARDER_FUNCTION_NAME="alpha-engine-backstop-telegram-notifier"
+
+if aws lambda get-function --function-name "${FORWARDER_FUNCTION_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "  Backstop Telegram forwarder ${FORWARDER_FUNCTION_NAME} is deployed."
+  echo "  (Subscription managed by setup_pipeline_deadman_alarms.sh — the topic's sole owner.)"
+else
+  echo "  WARNING: ${FORWARDER_FUNCTION_NAME} does not exist — backstop alarm pages"
+  echo "  are email-only until it is deployed. Run:"
+  echo "    bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh --bootstrap"
+fi
+
 echo ""
 echo "Done."

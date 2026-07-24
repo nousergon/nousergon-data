@@ -74,6 +74,12 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # distinct on-call address is preferred.
 BACKSTOP_ALERT_EMAIL="${BACKSTOP_ALERT_EMAIL:-cipher813@gmail.com}"
 
+# The backstop Telegram forwarder Lambda — deploys together with the forwarder
+# at infrastructure/lambdas/backstop-telegram-notifier/deploy.sh. MUST be
+# bootstrapped before this script's Telegram subscription can succeed.
+FORWARDER_FUNCTION_NAME="alpha-engine-backstop-telegram-notifier"
+FORWARDER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FORWARDER_FUNCTION_NAME}"
+
 # The three canonical Alpha Engine orchestration state machines (per the
 # pipeline-reporting-revamp scope / crucible-dashboard views/25_Pipeline_Status.py
 # _SF_ORDER). alpha-engine-groom-pipeline is intentionally excluded — it is
@@ -121,6 +127,65 @@ if [[ -z "$EXISTING_SUBS" ]]; then
     --notification-endpoint "$BACKSTOP_ALERT_EMAIL" >/dev/null
 else
   echo "  Subscription for $BACKSTOP_ALERT_EMAIL already present."
+fi
+
+# --- 1b. Backstop Telegram forwarder subscription (I2899) -------------------
+# The email-only backstop was proven blind on 2026-07-17 (an ALARM fired at
+# 20:52 UTC, the email arrived and sat unread; Brian only learned of the
+# incident from sf-telegram-notifier's WARNING about the underlying SF failure
+# — the watch plane was down for ~40 min with zero real-time page).
+#
+# This adds an INDEPENDENT Telegram-forwarder Lambda subscribed directly to the
+# topic — raw urllib, token from SSM at invoke, no krepis/nousergon_lib
+# imports, no DynamoDB dedup, no EventBridge bus involvement (I2899 invariant
+# 3: the backstop must never involve an agent, a queue, or anything that can
+# fail non-obviously). The email subscription above is kept as the primary
+# backstop; this is a redundant fast channel.
+#
+# First-time bootstrap: run
+#   bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh --bootstrap
+# BEFORE this script so the Lambda exists to subscribe.
+#
+# Single-writer notice: the FORWARDER_FUNCTION_NAME and its SNS permission +
+# subscription are managed HERE (the topic's sole owner), not by
+# setup_watch_plane_alarms.sh or any other script.
+
+if aws lambda get-function --function-name "${FORWARDER_FUNCTION_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  # Give SNS permission to invoke the Lambda (idempotent — 2>/dev/null||true
+  # on existing statements).
+  if ! $DRY_RUN; then
+    aws lambda add-permission \
+      --function-name "${FORWARDER_FUNCTION_NAME}" \
+      --statement-id "sns-${BACKSTOP_TOPIC_NAME}" \
+      --action lambda:InvokeFunction \
+      --principal sns.amazonaws.com \
+      --source-arn "${BACKSTOP_TOPIC_ARN}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  EXISTING_LAMBDA_SUB=""
+  if ! $DRY_RUN; then
+    EXISTING_LAMBDA_SUB=$(aws sns list-subscriptions-by-topic \
+      --topic-arn "${BACKSTOP_TOPIC_ARN}" \
+      --query "Subscriptions[?Protocol=='lambda' && Endpoint=='${FORWARDER_ARN}'].SubscriptionArn" \
+      --output text --region "${REGION}" 2>/dev/null || echo "")
+  fi
+  if [[ -z "$EXISTING_LAMBDA_SUB" || "$EXISTING_LAMBDA_SUB" == "None" ]]; then
+    echo "  Subscribing ${FORWARDER_FUNCTION_NAME} to ${BACKSTOP_TOPIC_NAME}..."
+    run aws sns subscribe \
+      --region "${REGION}" \
+      --topic-arn "${BACKSTOP_TOPIC_ARN}" \
+      --protocol lambda \
+      --notification-endpoint "${FORWARDER_ARN}" \
+      --query 'SubscriptionArn' --output text
+  else
+    echo "  Telegram forwarder subscription already exists: ${EXISTING_LAMBDA_SUB}"
+  fi
+else
+  echo "  WARNING: ${FORWARDER_FUNCTION_NAME} Lambda does not exist — skipping"
+  echo "  Telegram subscription. Run the following to deploy it:"
+  echo "    bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh --bootstrap"
+  echo "  Then re-run this script to wire the subscription."
 fi
 
 # Fail fast if the topic isn't actually there before wiring alarms to it
