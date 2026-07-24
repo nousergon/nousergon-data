@@ -7,7 +7,7 @@ ONE registry-driven liveness probe for the whole fleet watch plane
 playbook (or a check) automatically extends coverage. Replaces the two per-probe
 enumerations it consolidated:
 
-- **sf-watch-liveness-probe's wiring checks** (EventBridge rule / registered-SF /
+- **sf-watch-reclaim-sweep-handler's wiring checks** (EventBridge rule / registered-SF /
   dead-state-machine / dispatcher-Lambda-health / spot launch-config drift) —
   migrated here. That Lambda is now slimmed to its reclaim/sweep **action** paths.
 - **groom-liveness-probe** — fully migrated (its per-trigger run-window
@@ -47,7 +47,7 @@ silent skip). The Telegram send + dedup-state write are best-effort.
 
 The sf-watch **reclaim-checker** (config#2270, EC2-event-triggered bounded
 relaunch) and **disabled-window sweep** (config#2257) are ACTION paths with 45
-pinned behavioral tests; they stay in the slimmed `sf-watch-liveness-probe`. A
+pinned behavioral tests; they stay in the slimmed `sf-watch-reclaim-sweep-handler`. A
 follow-up tracks their eventual migration. This probe never mutates fleet state.
 
 ## Deploy (operator-gated, outside CloudFormation)

@@ -854,7 +854,7 @@ def test_disabled_flag_short_circuits(monkeypatch):
 def test_deploy_sh_launch_config_pins_match_index_defaults(monkeypatch):
     """LOCKSTEP GUARD (config#2265): deploy.sh pins SF_WATCH_AMI_ID /
     SF_WATCH_SECURITY_GROUP / SF_WATCH_SUBNETS into the deployed Lambda env —
-    the observable source of truth sf-watch-liveness-probe reads to verify the
+    the observable source of truth sf-watch-reclaim-sweep-handler reads to verify the
     launch config (AMI/SG/subnets) still exists twice daily. The pins MUST
     equal this module's own in-code defaults, or the probe would verify a
     DIFFERENT launch config than the one an env-stripped dispatcher would

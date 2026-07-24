@@ -3,7 +3,7 @@
 # watch/overseer-plane Lambdas (config#2266; roster extended config-I2900).
 #
 # Why this exists: the watch-plane Lambdas (saturday-sf-watch-dispatcher,
-# sf-watch-spot-dispatcher, ci-watch-dispatcher, sf-watch-liveness-probe) are
+# sf-watch-spot-dispatcher, ci-watch-dispatcher, sf-watch-reclaim-sweep-handler) are
 # the components whose JOB is to notice fleet failures — and their docstrings
 # asserted that their own failures "surface via the Lambda error metric + CW
 # alarm". Until this script, NO such alarm existed: an unhandled dispatcher
@@ -68,7 +68,7 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 
 # The watch/overseer-plane Lambdas (deployed names verified against each
 # infrastructure/lambdas/<dir>/deploy.sh FUNCTION_NAME).
-# sf-watch-liveness-probe now carries ONLY its reclaim/sweep action paths
+# sf-watch-reclaim-sweep-handler now carries ONLY its reclaim/sweep action paths
 # config#2270/#2257; the wiring checks moved to the registry-driven
 # overseer-liveness-probe per alpha-engine-config-I2831. Both stay under this
 # dead-probe backstop. (Comment kept OUT of the array literal below so the
@@ -84,14 +84,14 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # isn't confused by a stray `)` inside the block.)
 # ci-watch-liveness-probe / alert-drain-liveness-probe added config#3173
 # (mid-run spot-reclaim checkers for the ci-watch and alert-drain families,
-# mirroring sf-watch-liveness-probe's config#2270 mechanism) — onboarded in
+# mirroring sf-watch-reclaim-sweep-handler's config#2270 mechanism) — onboarded in
 # the SAME PR that ships them, per this file's own header convention.
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
   ["ci-watch-dispatcher"]="alpha-engine-ci-watch-dispatcher"
   ["ci-watch-liveness-probe"]="alpha-engine-ci-watch-liveness-probe"
-  ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
+  ["sf-watch-reclaim-sweep-handler"]="alpha-engine-sf-watch-reclaim-sweep-handler"
   ["overseer-liveness-probe"]="alpha-engine-overseer-liveness-probe"
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
   ["alert-drain-dispatcher"]="alpha-engine-alert-drain-dispatcher"

@@ -63,7 +63,7 @@ OVERSEER_ROUTER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:alpha-engin
 source "${SCRIPT_DIR}/../_shared/ensure_overseer_scheduler_role.sh"
 DEFER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${DEFER_ROLE_NAME}"
 # Launch-config pins (config#2265): the DEPLOYED env is the observable source
-# of truth the sf-watch-liveness-probe reads (it verifies these AMI/SG/subnet
+# of truth the sf-watch-reclaim-sweep-handler reads (it verifies these AMI/SG/subnet
 # ids still exist twice daily and alerts loud if any key is MISSING from the
 # live env). Values MUST equal index.py's in-code defaults — a lockstep test
 # in test_handler.py (test_deploy_sh_launch_config_pins_match_index_defaults)

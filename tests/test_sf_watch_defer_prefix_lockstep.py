@@ -22,7 +22,7 @@ from pathlib import Path
 _LAMBDAS = Path(__file__).parent.parent / "infrastructure" / "lambdas"
 _SPOT_DISPATCHER = _LAMBDAS / "sf-watch-spot-dispatcher" / "index.py"
 _SATURDAY_DISPATCHER = _LAMBDAS / "saturday-sf-watch-dispatcher" / "index.py"
-_LIVENESS_PROBE = _LAMBDAS / "sf-watch-liveness-probe" / "index.py"
+_LIVENESS_PROBE = _LAMBDAS / "sf-watch-reclaim-sweep-handler" / "index.py"
 
 
 def _module_assign_value(path: Path, name: str) -> ast.expr:

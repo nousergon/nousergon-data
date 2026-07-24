@@ -1,4 +1,4 @@
-"""Unit tests for the (slimmed) sf-watch-liveness-probe index.handler.
+"""Unit tests for the (slimmed) sf-watch-reclaim-sweep-handler index.handler.
 
 Covers the two ACTION paths this Lambda retains after alpha-engine-config-I2831
 moved the read-only WIRING checks to overseer-liveness-probe:
@@ -650,7 +650,7 @@ def test_sweep_dropped_failure_redrives_through_saturday_dispatcher():
     assert payload["detail"]["name"] == "drill-1"
     assert isinstance(payload["detail"]["startDate"], int)
     assert isinstance(payload["detail"]["stopDate"], int)
-    assert payload["sf_watch_sweep"]["source"] == "sf-watch-liveness-probe"
+    assert payload["sf_watch_sweep"]["source"] == "sf-watch-reclaim-sweep-handler"
 
 
 def test_sweep_covered_execution_is_not_redriven():

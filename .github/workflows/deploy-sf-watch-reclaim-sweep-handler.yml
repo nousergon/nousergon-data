@@ -1,6 +1,6 @@
-name: Deploy sf-watch-liveness-probe
+name: Deploy sf-watch-reclaim-sweep-handler
 
-# Auto-deploy the alpha-engine-sf-watch-liveness-probe Lambda CODE on merge to
+# Auto-deploy the alpha-engine-sf-watch-reclaim-sweep-handler Lambda CODE on merge to
 # main (alpha-engine-config-I3111). Same pattern as the sibling
 # deploy-*-liveness-probe / deploy-*-dispatcher workflows: this script's
 # default/flagless run is code-only (no aws iam/scheduler writes unless
@@ -13,12 +13,12 @@ on:
   push:
     branches: [main]
     paths:
-      - 'infrastructure/lambdas/sf-watch-liveness-probe/**'
-      - '.github/workflows/deploy-sf-watch-liveness-probe.yml'
+      - 'infrastructure/lambdas/sf-watch-reclaim-sweep-handler/**'
+      - '.github/workflows/deploy-sf-watch-reclaim-sweep-handler.yml'
   workflow_dispatch:
 
 concurrency:
-  group: deploy-sf-watch-liveness-probe-main
+  group: deploy-sf-watch-reclaim-sweep-handler-main
   cancel-in-progress: false
 
 permissions:
@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy sf-watch-liveness-probe Lambda (code-only)
+    name: Deploy sf-watch-reclaim-sweep-handler Lambda (code-only)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -48,9 +48,9 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy sf-watch-liveness-probe (code-only — no --bootstrap)
+      - name: Deploy sf-watch-reclaim-sweep-handler (code-only — no --bootstrap)
         working-directory: alpha-engine-data
-        run: bash infrastructure/lambdas/sf-watch-liveness-probe/deploy.sh
+        run: bash infrastructure/lambdas/sf-watch-reclaim-sweep-handler/deploy.sh
 
       - name: Report deployed version
         working-directory: alpha-engine-data
@@ -62,7 +62,7 @@ jobs:
           # when the function does not exist yet — matching the deploy step's
           # own guard (alpha-engine-config-I2831 first-merge red-main fix).
           aws lambda get-function \
-            --function-name alpha-engine-sf-watch-liveness-probe \
+            --function-name alpha-engine-sf-watch-reclaim-sweep-handler \
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text \
             || echo "(function not bootstrapped yet — code deploy was skipped)"
@@ -72,7 +72,7 @@ jobs:
         uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
-          deploy_workflow: deploy-sf-watch-liveness-probe.yml
+          deploy_workflow: deploy-sf-watch-reclaim-sweep-handler.yml
 
   notify-main-failure:
     needs: [deploy]

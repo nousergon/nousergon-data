@@ -1,7 +1,7 @@
 """alpha-engine-overseer-liveness-probe — registry-driven wiring + run-window
 liveness check for the whole fleet watch plane (alpha-engine-config-I2831).
 
-Consolidates the two per-probe enumerations — sf-watch-liveness-probe's config
+Consolidates the two per-probe enumerations — sf-watch-reclaim-sweep-handler's config
 -drift WIRING checks and groom-liveness-probe's RUN-WINDOW accounting — into ONE
 probe that iterates ``infrastructure/overseer/playbooks.yaml``. Each playbook
 declares an OPTIONAL ``liveness.checks`` list; a top-level
@@ -11,7 +11,7 @@ the surface is no longer enumerated in per-probe Python constants.
 
 **Read-only.** The sf-watch reclaim-checker (config#2270) and disabled-window
 sweep (config#2257) are ACTION paths with their own EC2-event trigger topology
-and 45 pinned tests; they STAY in the (now slimmed) sf-watch-liveness-probe. A
+and 45 pinned tests; they STAY in the (now slimmed) sf-watch-reclaim-sweep-handler. A
 follow-up tracks their eventual migration. This probe never mutates fleet state
 — it checks wiring + run windows, dedups by problem-set CONTENT, and alerts.
 
@@ -155,7 +155,7 @@ def _on_bus(bus: str | None) -> str:
 
 def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Rule existence/state/target (+ optional stateMachineArn registration).
-    Generalizes sf-watch-liveness-probe._check_rule: the target may be a Lambda
+    Generalizes sf-watch-reclaim-sweep-handler._check_rule: the target may be a Lambda
     (``expect_target_function``) or an SQS queue (``expect_target_queue``, the
     intake rules), and the rule may live on a custom bus (``event_bus_name``).
     Fail-loud on any error code OTHER than the "does not exist" one checked for."""
@@ -221,7 +221,7 @@ def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]
 def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Each named pipeline's Step Function must actually exist — the exact
     2026-06-29 dead-ARN bug class, caught directly (ported from
-    sf-watch-liveness-probe._check_state_machines_exist)."""
+    sf-watch-reclaim-sweep-handler._check_state_machines_exist)."""
     problems: list[str] = []
     sfn = _sfn_client()
     for name in spec["state_machines"]:
@@ -241,7 +241,7 @@ def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], d
 
 def _check_launch_config(fn_name: str, lc: dict, env: dict[str, str]) -> list[str]:
     """The deregistered-AMI silent-break guard (ported from
-    sf-watch-liveness-probe._check_launch_config): assert the AMI/SG/subnets the
+    sf-watch-reclaim-sweep-handler._check_launch_config): assert the AMI/SG/subnets the
     DEPLOYED Lambda would launch with still exist, reading their ids from its
     LIVE env (no duplicated constants). Uses Filters (not Ids) so a missing
     resource is an EMPTY set, not an error code — unexpected API errors RAISE."""
@@ -301,7 +301,7 @@ def _check_lambda_active(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Function Active + LastUpdateStatus Successful. Optionally REPORTS a
     kill-switch env value (never alerted — a deliberate operator disable is
     state) and verifies launch-config resources. Ported from
-    sf-watch-liveness-probe._check_lambda_healthy + _check_spot_dispatch_leg."""
+    sf-watch-reclaim-sweep-handler._check_lambda_healthy + _check_spot_dispatch_leg."""
     fn_name = spec["function"]
     switch_key = spec.get("report_kill_switch")
     problems: list[str] = []
@@ -760,7 +760,7 @@ def _run_checks(now: datetime) -> tuple[list[str], dict[str, str]]:
     return problems, kill_switches
 
 
-# ── Dedup + alert (content-fingerprint, ported from sf-watch-liveness-probe) ──
+# ── Dedup + alert (content-fingerprint, ported from sf-watch-reclaim-sweep-handler) ──
 
 
 def _problem_fingerprint(problems: list[str]) -> str:

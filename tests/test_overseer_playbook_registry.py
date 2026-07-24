@@ -185,7 +185,7 @@ def _sibling_dispatcher_pipeline_names() -> set[str]:
 
 
 def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher():
-    """REGRESSION GUARD (moved from sf-watch-liveness-probe's own test): the
+    """REGRESSION GUARD (moved from sf-watch-reclaim-sweep-handler's own test): the
     sf-watch playbook's liveness pipeline list (the eventbridge_rule
     ``expect_state_machines`` + ``state_machines_exist`` list — ONE YAML anchor)
     must exactly match saturday-sf-watch-dispatcher's PIPELINES registry. Drift

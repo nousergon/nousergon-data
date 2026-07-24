@@ -1,4 +1,4 @@
-# alpha-engine-sf-watch-liveness-probe
+# alpha-engine-sf-watch-reclaim-sweep-handler
 
 The **action** half of the Fleet-SF Watch watchdog: the mid-run spot-reclaim
 checker (config#2270) and the disabled-window dropped-failure sweep (config#2257).

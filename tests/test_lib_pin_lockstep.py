@@ -85,7 +85,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
     "alert-drain-liveness-probe": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742) — mirrors "
-        "sf-watch-liveness-probe's reclaim-checker exactly (config#3173)",
+        "sf-watch-reclaim-sweep-handler's reclaim-checker exactly (config#3173)",
     ),
     "ci-watch-dispatcher": (
         "v0.124.5",
@@ -96,7 +96,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
     "ci-watch-liveness-probe": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742) — mirrors "
-        "sf-watch-liveness-probe's reclaim-checker exactly (config#3173)",
+        "sf-watch-reclaim-sweep-handler's reclaim-checker exactly (config#3173)",
     ),
     "data-spot-dispatcher": (
         "v0.124.5",
@@ -118,7 +118,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742); OPS_HEALTH-only "
         "single-topic consumer, same exemption group as "
-        "saturday-integrity-sentinel/sf-watch-liveness-probe/pipeline-watchdog "
+        "saturday-integrity-sentinel/sf-watch-reclaim-sweep-handler/pipeline-watchdog "
         "(alpha-engine-config#2843)",
     ),
     "freshness-monitor": (
@@ -163,7 +163,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742)",
     ),
-    "sf-watch-liveness-probe": (
+    "sf-watch-reclaim-sweep-handler": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742)",
     ),

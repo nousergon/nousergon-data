@@ -1,7 +1,7 @@
 """Unit tests for ci-watch-liveness-probe/index.handler (config#3173).
 
 Covers the one action path this Lambda serves: the mid-run spot-reclaim
-checker for the ci-watch family, mirroring sf-watch-liveness-probe's
+checker for the ci-watch family, mirroring sf-watch-reclaim-sweep-handler's
 config#2270 reclaim checker — non-watch boxes exit quietly; a completed box
 is a clean exit; a box with no completion marker died mid-run and relaunches
 ONCE (ceiling-bounded, ledger-recorded) by invoking the ci-watch-dispatcher

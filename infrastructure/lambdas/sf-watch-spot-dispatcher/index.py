@@ -152,7 +152,7 @@ SF_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
 # drills and real dispatches: the (cadence, pipeline, run_date) concurrency
 # lock, the completion-marker key sf_watch/_control/completed/
 # {cadence}-{pipeline}-{run_date}.json (what spot-orphan-reaper and the
-# sf-watch-liveness-probe reclaim checker derive from the tags), the
+# sf-watch-reclaim-sweep-handler reclaim checker derive from the tags), the
 # watch-log key consolidated/{cadence}_sf_watch/{run_date}.json, and the
 # saturday dispatcher's config#2269 per-(cadence, pipeline, run_date)
 # mechanical attempt ceiling. A drill therefore can never dedupe-block,
@@ -214,7 +214,7 @@ _WATCH_PREFIXES = {
     # ne-modelzoo-sunday-pipeline (added together 2026-07-14 per I2544/I2545)
     # were retired live (config#2890 re-inlined both back into this Saturday
     # SF) — removed here together with saturday-sf-watch-dispatcher's
-    # PIPELINES entries and sf-watch-liveness-probe's own _WATCH_PREFIXES
+    # PIPELINES entries and sf-watch-reclaim-sweep-handler's own _WATCH_PREFIXES
     # copy, per the lockstep test (config#2937).
     #
     # The transitional alpha-engine-eod-pipeline alias was removed together
@@ -280,7 +280,7 @@ def _resolve_event_fields(event: dict) -> dict:
     failed_state = _optional(event, "failed_state", _FAILED_STATE_RE)
     watch_log_key = _optional(event, "watch_log_key", _WATCH_LOG_KEY_RE)
     is_preflight = _optional(event, "is_preflight", _BOOL_RE, default="false")
-    # force_on_demand (config#2270): set "true" by the sf-watch-liveness-probe
+    # force_on_demand (config#2270): set "true" by the sf-watch-reclaim-sweep-handler
     # reclaim checker's bounded relaunch — a spot reclaim already proved spot
     # unreliable for this run, so the relaunch skips spot entirely (threaded
     # to launch_with_fallback(force_on_demand=...), present in the pinned
@@ -777,7 +777,7 @@ def handler(event: dict, context) -> dict:
     the one-shot EventBridge Scheduler schedule this handler created on a
     concurrency skip) carries the same payload plus `defer_generation` >= 1
     and first re-evaluates the state machine before dispatching. The
-    sf-watch-liveness-probe's mid-run reclaim checker (config#2270) invokes
+    sf-watch-reclaim-sweep-handler's mid-run reclaim checker (config#2270) invokes
     this same handler (async Event) with the payload plus
     `force_on_demand: "true"` — note this Lambda records its dispatch
     decisions ONLY in the returned verdict + CloudWatch logs, never in the

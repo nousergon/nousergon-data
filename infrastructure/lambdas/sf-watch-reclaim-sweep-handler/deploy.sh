@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the alpha-engine-sf-watch-liveness-probe Lambda
+# deploy.sh — Create or update the alpha-engine-sf-watch-reclaim-sweep-handler Lambda
 # and wire its EventBridge Scheduler rules.
 #
 # WHY: Fleet-SF Watch (saturday-sf-watch-dispatcher) is event-driven — it only
@@ -35,19 +35,19 @@
 # live effect until an operator runs this with --bootstrap.
 #
 # Usage:
-#   bash .../sf-watch-liveness-probe/deploy.sh             # update code only
-#   bash .../sf-watch-liveness-probe/deploy.sh --bootstrap # first-time create + wire schedules + EC2 reclaim rules (config#2270)
-#   bash .../sf-watch-liveness-probe/deploy.sh --dry-run   # show actions, do not apply
-#   bash .../sf-watch-liveness-probe/deploy.sh --smoke     # invoke once (read-only check; pings only on a real problem)
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh             # update code only
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --bootstrap # first-time create + wire schedules + EC2 reclaim rules (config#2270)
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --dry-run   # show actions, do not apply
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --smoke     # invoke once (read-only check; pings only on a real problem)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FUNCTION_NAME="alpha-engine-sf-watch-liveness-probe"
-ROLE_NAME="alpha-engine-sf-watch-liveness-probe-role"
-POLICY_NAME="alpha-engine-sf-watch-liveness-probe-policy"
-SCHED_ROLE_NAME="alpha-engine-sf-watch-liveness-probe-scheduler-role"
-SCHED_POLICY_NAME="invoke-sf-watch-liveness-probe"
+FUNCTION_NAME="alpha-engine-sf-watch-reclaim-sweep-handler"
+ROLE_NAME="alpha-engine-sf-watch-reclaim-sweep-handler-role"
+POLICY_NAME="alpha-engine-sf-watch-reclaim-sweep-handler-policy"
+SCHED_ROLE_NAME="alpha-engine-sf-watch-reclaim-sweep-handler-scheduler-role"
+SCHED_POLICY_NAME="invoke-sf-watch-reclaim-sweep-handler"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -55,14 +55,14 @@ FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 
 SCHED_NAMES=(
-  "alpha-engine-sf-watch-liveness-0645-daily"
-  "alpha-engine-sf-watch-liveness-1445-daily"
+  "alpha-engine-sf-watch-reclaim-sweep-0645-daily"
+  "alpha-engine-sf-watch-reclaim-sweep-1445-daily"
 )
 SCHED_CRONS=(
   "cron(45 6 * * ? *)"
   "cron(45 14 * * ? *)"
 )
-SCHED_PREFIX="alpha-engine-sf-watch-liveness-"
+SCHED_PREFIX="alpha-engine-sf-watch-reclaim-sweep-"
 
 # DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
 # flag below, so DRY_RUN=1/true from a caller's shell actually no-ops

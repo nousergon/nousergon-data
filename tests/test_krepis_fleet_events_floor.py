@@ -18,7 +18,7 @@ coverage audit months later.
 
 Scope note: this covers exactly the four Lambdas config#2907 found broken,
 not every fleet Lambda that happens to depend on krepis. Several other
-flow-doctor-extra Lambdas (ci-watch-dispatcher, sf-watch-liveness-probe,
+flow-doctor-extra Lambdas (ci-watch-dispatcher, sf-watch-reclaim-sweep-handler,
 saturday-sf-watch-dispatcher, overseer-liveness-probe, sf-watch-spot-dispatcher)
 were confirmed by config#2907's own deployed-zip audit to already be running
 krepis>=0.15.0 in production despite a lower requirements.txt floor — their

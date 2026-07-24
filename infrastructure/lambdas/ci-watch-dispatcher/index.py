@@ -220,7 +220,7 @@ CI_WATCH_SIGNATURES_PREFIX = os.environ.get(
 # right after a successful launch (mirrors the atomic-with-launch discipline
 # config#2292 already established for the discriminator tags) so a sibling
 # ci-watch-liveness-probe Lambda (EC2 reclaim-event target, mirroring
-# sf-watch-liveness-probe's config#2270 mid-run spot-reclaim checker) can
+# sf-watch-reclaim-sweep-handler's config#2270 mid-run spot-reclaim checker) can
 # reconstruct the original dispatch fields and relaunch once, ceiling-bounded
 # at exactly one relaunch, escalating loud on a second death — closing the
 # "box died with no re-dispatch or escalation" gap config#3173 tracks for the

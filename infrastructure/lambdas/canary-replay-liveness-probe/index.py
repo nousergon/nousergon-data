@@ -10,7 +10,7 @@ external observer of that producer (mirrors the groom/sf-watch liveness
 probes' philosophy — a schedule-driven check external to the thing it's
 watching, since a dead process cannot reliably report its own death).
 
-MUCH SIMPLER than sf-watch-liveness-probe/ci-watch-dispatcher's liveness
+MUCH SIMPLER than sf-watch-reclaim-sweep-handler/ci-watch-dispatcher's liveness
 counterpart: this canary has exactly ONE scheduled trigger (the Thursday
 EventBridge rule) and ONE deterministic completion-marker key per ISO week
 (``_scheduled_run_token`` — duplicated here in lockstep from
@@ -38,7 +38,7 @@ DISABLED-DISPATCHER CARVE-OUT: before treating a missing marker as an
 incident, this probe reads the Thursday EventBridge rule's live State. A
 DISABLED dispatcher rule means no dispatch was ever supposed to fire — a
 deliberate operator disable is state, not an incident (mirrors
-sf-watch-liveness-probe's kill-switch posture). This is also the deploy
+sf-watch-reclaim-sweep-handler's kill-switch posture). This is also the deploy
 SEQUENCING mechanism: this Lambda + its own (harmless, read-only) schedule
 can go live FIRST while the dispatcher's rule is still DISABLED — it will
 no-op cleanly every week instead of paging — and the dispatcher rule is
