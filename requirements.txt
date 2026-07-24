@@ -55,7 +55,13 @@ arcticdb>=6.19.0
 # once that release ships; until then this repo's test suite exercises the
 # wiring against an editable install of the nousergon-lib branch (see this
 # PR's description) rather than a real pip-installable pin.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
+# nousergon/alpha-engine-config#2480 NOTE: tests/test_pipeline_status_registry_source_check.py
+# (added in this PR) asserts every substantive SF Task state has a
+# nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE entry.
+# nousergon-lib#226 registered the 9 states this repo's SF JSONs were
+# missing (2 Saturday + 7 EOD) and shipped in v0.124.8 — bumped to that tag
+# here (was v0.124.6) to unblock the new source-check test.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.9
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
