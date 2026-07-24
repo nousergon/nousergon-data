@@ -97,7 +97,7 @@ def _event(
     severity: float = 0.5,
 ) -> EventFlag:
     return EventFlag(
-        extractor="anthropic_haiku",
+        extractor="rule_based",
         article_fingerprint=fp,
         category=category,
         description=description,

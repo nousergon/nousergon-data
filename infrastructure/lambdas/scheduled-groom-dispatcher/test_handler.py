@@ -317,13 +317,22 @@ def test_deploy_schedule_high_only_carries_pr_budget():
     deploy_sh = (
         Path(__file__).resolve().parent / "deploy.sh"
     ).read_text()
-    assert '"pr_budget":100' in deploy_sh or '"pr_budget": 100' in deploy_sh
-    # Haiku/Sonnet-mid schedules must NOT inherit the high-only override.
-    low_line = next(
+    # groom-primary-deepseek (2026-07-23): every slot now launches all 3 tiers
+    # + sweep, so all SCHED_INPUTS carry pr_budget for the high tier box.
+    sched_inputs_lines = [
         line for line in deploy_sh.splitlines()
-        if "low-only" in line and "SCHED_INPUTS" not in line
+        if "SCHED_INPUTS" in line or line.strip().startswith("'{\"run_mode\"")
+    ]
+    pr_budget_lines = [
+        line for line in sched_inputs_lines
+        if "pr_budget" in line
+    ]
+    # All 3 daily SCHED_INPUTS have pr_budget (every slot launches high tier).
+    # The weekly gated-reverify SCHED_INPUTS does not.
+    assert len(pr_budget_lines) == 3, (
+        f"expected 3 daily SCHED_INPUTS entries with pr_budget (one per slot), "
+        f"got {len(pr_budget_lines)}: {pr_budget_lines}"
     )
-    assert "pr_budget" not in low_line
 
 
 # ── Usage pacing dismantled (Brian ruling 2026-07-14) ───────────────────────
@@ -2057,12 +2066,13 @@ def test_fallback_dispatch_backend_independent_of_primary_tiers_env(monkeypatch)
     assert out["groom"]["backend"] == "deepseek"
 
 
-def test_deploy_sh_arms_primary_deepseek_tiers_low_mid():
+def test_deploy_sh_arms_primary_deepseek_tiers_low_mid_high():
     # Structural pin, INVERTED at arming (2026-07-22, config-I3488 step 3 —
     # Brian's DeepSeek-primary ruling, config-I3479): BOTH `--environment
     # 'Variables={...}'` calls must now carry GROOM_PRIMARY_DEEPSEEK_TIERS
-    # with the value DOUBLE-QUOTED ("low,mid") — a raw comma inside CLI
+    # with the value DOUBLE-QUOTED ("low,mid,high") — a raw comma inside CLI
     # shorthand splits map entries and fails ParamValidation (verified live).
+    # 2026-07-24: high tier added to the armed set.
     # This guards against (a) silent DISARM by a deploy.sh refactor dropping
     # the var from one or both maps, and (b) re-introducing the unquoted form.
     # Disarming is a deliberate reviewed PR that flips this pin back.
@@ -2076,4 +2086,4 @@ def test_deploy_sh_arms_primary_deepseek_tiers_low_mid():
     ]
     assert len(armed_lines) == 2
     for line in armed_lines:
-        assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid"' in line
+        assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"' in line

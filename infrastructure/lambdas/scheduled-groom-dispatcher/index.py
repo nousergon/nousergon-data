@@ -264,11 +264,12 @@ def _primary_backend_for(tiers) -> str | None:
     """PRIMARY-mode DeepSeek selection (alpha-engine-config-I3479): returns
     ``GROOM_BACKEND_DEEPSEEK`` iff ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed
     (non-empty) AND every tier in this launch's bundle is a member of it —
-    else ``None`` (the unchanged Claude path). A bundle containing "high"
-    (e.g. a high+mid attach-upward bundle from ``ge.decide_trigger``'s
-    thin-pool bundling) therefore ALWAYS stays on Claude: high remains on
-    the Max plan by ruling, and "any-high-blocks-the-whole-bundle" means a
-    mixed bundle can never split backends mid-box (one box, one provider).
+    else ``None`` (the unchanged Claude path). A bundle containing a tier
+    NOT in the armed set therefore stays on Claude: the env var controls
+    exactly which tiers use DeepSeek primary, and "any-foreign-tier-blocks-
+    the-whole-bundle" means a mixed bundle can never split backends mid-box
+    (one box, one provider). As of 2026-07-24 all three tiers (low, mid,
+    high) are armed for DeepSeek primary.
 
     Distinct from (and orthogonal to) ``GROOM_BACKEND_DEEPSEEK``'s existing
     quota-FALLBACK use in ``_handle_fallback_dispatch`` — that path is a
@@ -432,6 +433,13 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # the run through DeepSeek instead of Claude — this Lambda passes the flag
     # through verbatim, it does not select the DeepSeek model itself.
     backend_export = f"export GROOM_BACKEND={backend}\n" if backend else ""
+    # Arming the DeepSeek fallback dispatch: when a Claude-backed groom run
+    # hits quota exhaustion, the on-box groom_run.sh checks this flag and —
+    # if enabled — invokes this Lambda again with mode=fallback to launch a
+    # DeepSeek rescue box. Safe to enable unconditionally: DeepSeek-backed
+    # runs never trigger Claude quota signatures, so the flag is harmless
+    # there but critical for high-tier Claude runs (I3483 companion).
+    fallback_enabled_export = "export GROOM_DEEPSEEK_FALLBACK_ENABLED=true\n"
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -454,7 +462,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}{backend_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
