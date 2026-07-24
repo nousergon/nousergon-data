@@ -4,7 +4,7 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator"
   ],
@@ -29,7 +29,7 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity"
   ],
@@ -46,7 +46,7 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator"
   ],
@@ -55,7 +55,7 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator"
   ],
@@ -64,7 +64,7 @@
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator"
   ],
@@ -75,7 +75,7 @@
     "sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
     "cd /home/ec2-user/alpha-engine-predictor",
     "export HOME=/home/ec2-user",
-    "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export ALPHA_ENGINE_EXPERIMENT_ID=reference",
     "export PREDICTOR_DEFER_TRAINING_EMAIL=1",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only"

@@ -40,9 +40,29 @@ _SCRIPTS = [
 # spot scripts above guard against — the .env was also the only thing
 # exporting AWS_REGION / AWS_DEFAULT_REGION, which lib preflight + boto3
 # hard-require in the otherwise-minimal SSM shell.
+#
+# step_function.json (the WEEKLY SF) added 2026-07-10: its predictor-
+# training/model-zoo/backtester command blocks sourced .env the same way the
+# daily/eod trading-box blocks did. Its MorningEnrich/DataPhase1/RAGIngestion
+# states are NOT part of that population — they invoke spot_data_weekly.sh,
+# which self-exports the region via its own ENV_SOURCE heredoc (see
+# test_env_source_exports_region above) and never sourced .env directly. The
+# two dashboard health-check states likewise never sourced .env.
+#
+# Rebased 2026-07-15 onto the config#832/I2515 weekly-SF reshape: of the
+# original 9 sourcing sites, 6 (PredictorTraining, Backtester,
+# PredictorBacktest, PortfolioOptimizerBacktest, Parity, Evaluator) remain in
+# step_function.json; the other 3 (ResolveZooSpecs, TrainSpecDispatch,
+# ModelZooSelect) were lifted into step_function_modelzoo.json then later
+# re-inlined into step_function.json (config#2890). step_function_advisory.json
+# (the other child SF split out the same day) never sourced .env — its lifted
+# states are the eval-judge/ReportCard/Director chain, none of which ran a
+# spot_train.sh/spot_backtest.sh/training.model_zoo shell — so it is
+# intentionally NOT added.
 _STEP_FUNCTIONS = [
     _REPO_ROOT / "infrastructure" / "step_function_daily.json",
     _REPO_ROOT / "infrastructure" / "step_function_eod.json",
+    _REPO_ROOT / "infrastructure" / "step_function.json",
 ]
 
 
@@ -163,12 +183,22 @@ def test_step_function_blocks_export_region(sf: Path):
         joined = "\n".join(block)
         # Scope: only the blocks #890 touched — those that formerly sourced
         # .env to run the data/executor pipeline (weekly_collector.py or
-        # executor/*). Other pipeline blocks (e.g. the lib trading-calendar
-        # check, the dashboard substrate-health check) never sourced .env and
-        # resolve region from the dispatcher EC2's instance metadata, so they
-        # are intentionally NOT covered by this invariant.
-        touched = "source .venv/bin/activate" in joined and (
-            "weekly_collector.py" in joined or "executor/" in joined
+        # executor/*), OR the weekly SF's predictor-training/model-zoo/
+        # backtester blocks (bash infrastructure/spot_train.sh or
+        # spot_backtest.sh, or the model_zoo module invoked directly via
+        # krepis.ssm_log_capture — no `.venv/bin/activate` line in that shape).
+        # Other pipeline blocks (e.g. the lib trading-calendar check, the
+        # dashboard substrate-health check, MorningEnrich/DataPhase1/
+        # RAGIngestion which invoke spot_data_weekly.sh and self-export the
+        # region via their own ENV_SOURCE heredoc) never sourced .env and are
+        # intentionally NOT covered by this invariant.
+        touched = (
+            "source .venv/bin/activate" in joined
+            and ("weekly_collector.py" in joined or "executor/" in joined)
+        ) or (
+            "infrastructure/spot_train.sh" in joined
+            or "infrastructure/spot_backtest.sh" in joined
+            or "training.model_zoo" in joined
         )
         if not touched:
             continue

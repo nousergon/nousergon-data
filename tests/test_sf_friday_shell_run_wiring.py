@@ -376,6 +376,20 @@ def orig_spot_cmds() -> dict:
       reporting SUCCESS. `krepis.ssm_log_capture` is the canonical
       executable path; `test_ssm_log_capture_wrapper_executes.py` now
       proves executability (not just importability) in CI.
+    - **Regenerated 2026-07-10** as part of the weekly-SF `.env` deprecation
+      (alpha-engine-config#890 item 1, mirroring nousergon-data#485's
+      daily/eod migration): the 6 `_SPOT_STATES` entries that formerly did
+      `set -a && source /home/ec2-user/.alpha-engine.env && set +a`
+      (Backtester, Evaluator, Parity, PortfolioOptimizerBacktest,
+      PredictorBacktest, PredictorTraining) now inline-export
+      `AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1` instead — same
+      idiom as the merged daily/eod PR. Secrets still resolve via
+      `get_secret()`/SSM at runtime, unaffected by `.env` removal.
+      `DriftDetection` is left untouched (stale key, no longer a live SF
+      state per config#902 — outside `_SPOT_STATES` and outside this PR's
+      scope). `MorningEnrich`/`DataPhase1`/`RAGIngestion` are unchanged
+      (they invoke `spot_data_weekly.sh`, which self-exports the region via
+      its own `ENV_SOURCE` heredoc and never sourced `.env` directly).
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
