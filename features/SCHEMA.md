@@ -145,6 +145,9 @@ parity.
 | `factor_momentum_ratio` | dimensionless projection | `Σ_f zscore(loading_{i,f,t}) × factor_momentum_{f,t}` (Gupta-Kelly factor momentum) — **second-pass** column materialized over the full universe panel by `factor_momentum.materialize_factor_momentum` (not per-ticker `compute_features`); backward-only | predictor (W2.3, observe) |
 | `vwap_divergence_pct` | decimal pct (`_pct` suffix) | `(Close - VWAP) / VWAP` | predictor (config#939 — VWAP divergence). NaN when VWAP is unavailable (yfinance-fallback rows; the documented 2026-04-17→23 Polygon outage) or when VWAP is 0 (guarded via `.replace(0, nan)`) |
 | `cmf_20_ratio` | dimensionless ratio, bounded ~[-1, 1] (`_ratio` suffix) | Chaikin Money Flow: `rolling_sum(MFM * Volume, 20) / rolling_sum(Volume, 20)` where `MFM = ((Close-Low)-(High-Close))/(High-Low)` | predictor (config#939 — buying/selling pressure). `High == Low` guarded to NaN via `.replace(0, nan)`, mirroring `volume_trend` / `obv_slope_10d` |
+| `sub_sector_vs_benchmark_5d` | decimal return (bare-named convention) | `sub_sector_etf_5d - SPY_5d` | predictor |
+| `sub_sector_vs_benchmark_10d` | decimal return (bare-named convention) | `sub_sector_etf_10d - SPY_10d` | predictor |
+| `sub_sector_vs_benchmark_20d` | decimal return (bare-named convention) | `sub_sector_etf_20d - SPY_20d` | predictor |
 
 ### Macro (one row per date — `per_ticker=False`)
 

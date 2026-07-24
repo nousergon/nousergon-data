@@ -8,3 +8,13 @@ requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", ".venv/*", "venv/*"]
+
+[tool.coverage.report]
+# Ratchet floor — placeholder. Full suite could not be measured on this ARM runner
+# (arcticdb has no ARM Linux wheel). Raise to the actual measured value once CI
+# has run on an x86_64 runner and confirmed the real coverage level.
+fail_under = 0
