@@ -1,0 +1,44 @@
+name: IAM Drift Post-Merge Apply
+
+# Runs AFTER an IAM-codifying PR merges: auto-applies drifted roles via
+# apply.sh, re-checks, fails only on residual (real, unexpected) drift.
+# Replaces the pre-merge comparison that was structurally guaranteed to
+# show drift on every IAM PR (config#3495 → config#3697) — see
+# iam-drift-check.yml's header and infrastructure/iam/check-drift.py's
+# --post-merge docstring.
+#
+# Consumes the reusable workflow from nousergon-lib (config#3495 fleet
+# standard — same consolidation shape as gate-label-guard.yml).
+#
+# gate:dependency on alpha-engine-config#3695: this workflow
+# cannot run successfully until a WRITE-scoped OIDC role
+# (github-actions-iam-drift-apply) exists in AWS — apply.sh needs
+# iam:PutRolePolicy/UpdateAssumeRolePolicy/AttachRolePolicy, which the
+# existing read-only github-actions-iam-drift-check role intentionally
+# does not grant. That role's creation is a manual AWS operator action
+# (out of band from this repo's own apply.sh, which only updates roles
+# that already exist — see apply.sh's own header). Until the role ARN
+# below is real, this workflow will fail at the OIDC step on every merged
+# IAM PR — expected and named in the tracked issue, not silent.
+
+on:
+  pull_request_target:
+    types: [closed]
+    paths:
+      - 'infrastructure/iam/**'
+
+permissions:
+  id-token: write   # required for OIDC; ceiling for the called workflow
+  contents: read
+
+jobs:
+  apply-and-reconcile:
+    if: github.event.pull_request.merged == true
+    permissions:
+      id-token: write
+      contents: read
+    uses: nousergon/nousergon-lib/.github/workflows/iam-drift-post-merge.yml@main
+    with:
+      oidc-role-arn: arn:aws:iam::711398986525:role/github-actions-iam-drift-apply
+      aws-region: us-east-1
+      check-script-path: infrastructure/iam/check-drift.py

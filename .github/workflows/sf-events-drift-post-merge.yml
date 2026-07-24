@@ -1,0 +1,72 @@
+name: SF + EventBridge Drift Post-Merge Apply
+
+# Runs AFTER a PR that changes SF definitions, EventBridge rules, or
+# lambda deploy.sh files merges: auto-applies drifted SF definitions and
+# EventBridge rules, re-checks, fails only on residual (real, unexpected)
+# drift. Replaces the pre-merge comparisons that were structurally
+# guaranteed to show drift on every config-changing PR (config#3495 →
+# config#3697) — see sf-arn-drift-check.yml's header.
+#
+# Covers three drift surfaces in one workflow:
+#   1. SF definition drift (check-definition-drift.py --post-merge):
+#      auto-applies by uploading the codified definition to S3 +
+#      update-state-machine.
+#   2. EventBridge SF-ARN drift (check-drift.py --post-merge):
+#      auto-applies by running the drifted rule's owning lambda deploy.sh.
+#   3. SF LoggingConfiguration + Lambda-existence drift:
+#      read-only — no auto-apply (LoggingConfiguration is CFN-managed;
+#      Lambda existence requires creating a new Lambda, which is out of
+#      scope for an automated sweep).
+#
+# gate:dependency on alpha-engine-config#3695: the SF definition
+# auto-apply step needs states:UpdateStateMachine + s3:PutObject, and the
+# EventBridge auto-apply step needs the Lambda deploy role — both beyond
+# the read-only github-actions-iam-drift-check role this workflow
+# currently uses. Until a write-scoped OIDC role exists, the auto-apply
+# steps will fail at the AWS CLI call, not the OIDC assumption step.
+
+on:
+  pull_request_target:
+    types: [closed]
+    paths:
+      - 'infrastructure/eventbridge/**'
+      - 'infrastructure/step-functions/**'
+      - 'infrastructure/lambdas/**/deploy.sh'
+      - 'infrastructure/cloudformation/alpha-engine-orchestration.yaml'
+      - 'infrastructure/deploy-infrastructure.sh'
+      - 'infrastructure/step_function*.json'
+      - '.github/workflows/sf-arn-drift-check.yml'
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  apply-and-reconcile:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout merge commit (never the PR head — safe under pull_request_target)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Configure AWS credentials via OIDC (read-only — needs write role for auto-apply)
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d  # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
+
+      - name: SF definition drift — auto-apply + re-check
+        run: python3 infrastructure/step-functions/check-definition-drift.py --post-merge
+
+      - name: EventBridge SF-ARN drift — auto-apply + re-check
+        run: python3 infrastructure/eventbridge/check-drift.py --post-merge
+
+      - name: SF LoggingConfiguration drift (read-only — no auto-apply)
+        run: python3 infrastructure/step-functions/check-drift.py
+        continue-on-error: true
+
+      - name: SF lambda:invoke Lambda-existence check (read-only — no auto-apply)
+        run: python3 infrastructure/step-functions/check-lambda-existence.py
+        continue-on-error: true
