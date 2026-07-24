@@ -277,7 +277,6 @@ def ingest_ticker(
         )
         if doc_id:
             ingested += 1
-            logger.info("Ingested %s %s %s: %d chunks", ticker, form_type, filed_date, len(all_chunks))
 
     return ingested
 

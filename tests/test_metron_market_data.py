@@ -198,7 +198,8 @@ class TestHistory:
         assert result["status"] == "ok" and result["close_series"] == 2 and result["fx_series"] == 1
         puts = _puts(s3)
         assert set(puts) == {"market_data/close_history/AAPL.json", "market_data/close_history/1299.HK.json",
-                             "market_data/fx_history/HKD.json"}
+                             "market_data/fx_history/HKD.json",
+                             mmd.CONSOLIDATED_CLOSE_HISTORY_KEY}
         aapl = puts["market_data/close_history/AAPL.json"]
         assert aapl["yf_symbol"] == "AAPL" and aapl["currency"] == "USD"
         assert aapl["closes"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
@@ -246,6 +247,26 @@ class TestHistory:
         mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=lambda c: {})
         aapl = _puts(s3)["market_data/close_history/AAPL.json"]
         assert aapl["adjustment_basis"] == mmd.CLOSE_HISTORY_ADJUSTMENT_BASIS == "dividend_adjusted"
+
+    def test_writes_consolidated_close_history_artifact(self):
+        # metron-ops#233: collect_history writes a single consolidated file containing all
+        # symbols' close series and currency map alongside the per-ticker files.
+        s3 = _universe_s3(_UNIVERSE)
+        close_hist = lambda syms: {"AAPL": [("2026-06-10", 200.0), ("2026-06-11", 201.5)], "1299.HK": [("2026-06-11", 64.2)]}
+        fx_hist = lambda ccys: {"HKD": [("2026-06-10", 0.128), ("2026-06-11", 0.1282)]}
+        result = mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=fx_hist)
+        assert result["status"] == "ok"
+        puts = _puts(s3)
+        # Consolidated artifact must exist alongside per-ticker files.
+        assert mmd.CONSOLIDATED_CLOSE_HISTORY_KEY in puts
+        cons = puts[mmd.CONSOLIDATED_CLOSE_HISTORY_KEY]
+        assert cons["schema_version"] == mmd.CLOSE_HISTORY_SCHEMA_VERSION
+        assert cons["adjustment_basis"] == mmd.CLOSE_HISTORY_ADJUSTMENT_BASIS
+        assert "AAPL" in cons["series"] and "1299.HK" in cons["series"]
+        assert cons["series"]["AAPL"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
+        assert cons["series"]["1299.HK"] == [["2026-06-11", 64.2]]
+        assert cons["currency"]["AAPL"] == "USD"
+        assert cons["currency"]["1299.HK"] == "HKD"
 
 
 class TestCloseHistoryPriceCacheSource:
