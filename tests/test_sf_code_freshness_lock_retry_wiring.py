@@ -96,6 +96,58 @@ def test_self_heal_git_mutations_go_through_git_retry() -> None:
     assert "sudo -u ec2-user git -C $d reset" not in self_heal
 
 
+def test_self_heal_reclaim_is_detect_guarded_and_nonfatal() -> None:
+    """The ownership-reclaim chown must not be a bare, fatal `chown -R`.
+
+    2026-07-20 preopen FailExecution (recurrence of the 2026-07-08 concurrent-
+    writer class, on the one self-heal op left outside the flock protocol): the
+    self-heal's ``chown -R ec2-user:ec2-user $d`` recursed into ``$d/.venv`` and
+    raced boot-pull.service's concurrent ``pip install`` — which runs OUTSIDE the
+    shared git flock, so the flock cannot serialize it. chown -R hit a
+    ``.dist-info`` directory pip had just removed mid-upgrade
+    (``chown: cannot access '.../nousergon_lib-0.116.0.dist-info': No such file
+    or directory``), returned rc=1, and under ``set -eo pipefail`` that aborted
+    the whole gate: COMMAND_FAILED -> HandleFailure -> FailExecution, no orders.
+
+    boot-pull.sh (crucible-executor infrastructure/) already solved this exact
+    race and the gate must mirror it: (a) DETECT foreign ownership first
+    (``find $d -not -user ec2-user -print -quit``) so the clean path chowns
+    nothing and never touches the churning .venv, and (b) chown NON-FATALLY
+    (``|| ...``) so a transient pip-churn ENOENT cannot fail the gate. This is
+    NOT a fail-loud regression: a genuinely unreclaimable root-owned tree still
+    fails LOUD one line later at ``git_retry -C $d reset --hard`` (under
+    pipefail), which is the real gate the 2026-07-06 root-owned-checkout
+    incident exists to catch.
+    """
+    cmds = _gate_commands()
+    self_heal = next((c for c in cmds if "SELF-HEAL" in c), None)
+    assert self_heal is not None, "CodeFreshnessGate self-heal line missing."
+
+    # (a) DETECT-first: the reclaim is guarded by a foreign-ownership scan that
+    # short-circuits the clean path (mirrors boot-pull.sh's reclaim guard).
+    assert "find $d -not -user ec2-user -print -quit" in self_heal, (
+        "self-heal ownership reclaim must DETECT foreign ownership first "
+        "(`find $d -not -user ec2-user -print -quit`) so the common clean path "
+        "never runs chown -R over the concurrently pip-churned $d/.venv "
+        "(2026-07-20 .dist-info ENOENT race with boot-pull.service)."
+    )
+
+    # (b) NON-FATAL: the chown must have a `||` fallback so a transient ENOENT
+    # from boot-pull's concurrent .venv pip churn cannot abort the gate under
+    # `set -eo pipefail`. The bare, fatal `chown -R ...; ` form must be gone.
+    assert "chown -R ec2-user:ec2-user $d ||" in self_heal, (
+        "the ownership-reclaim chown must be NON-FATAL (`chown -R ... $d || ...`) "
+        "so a transient pip-churn ENOENT under $d/.venv can't fail the gate; the "
+        "git_retry reset below stays the fail-loud gate for a genuinely "
+        "unreclaimable root-owned tree."
+    )
+    assert "chown -R ec2-user:ec2-user $d; " not in self_heal, (
+        "the bare, FATAL `chown -R ec2-user:ec2-user $d;` form (fatal under "
+        "`set -eo pipefail`) must not return — it is exactly the 2026-07-20 "
+        "FailExecution root cause."
+    )
+
+
 def test_fetch_loop_goes_through_git_retry() -> None:
     cmds = _gate_commands()
     fetch = next((c for c in cmds if "fetch --quiet origin main" in c), None)
@@ -109,11 +161,19 @@ def test_fetch_loop_goes_through_git_retry() -> None:
 # ── config#1944: shared flock chokepoint across trading-box git writers ──────
 # The lock-signature retry above defends the transition window; the durable
 # class fix is a shared advisory flock that all trading-box git writers
-# (boot-pull.service, CodeFreshnessGate, ChronicGapSelfHeal) acquire on the
-# SAME inode, so no two index-mutating git ops ever run concurrently.
+# (boot-pull.service, CodeFreshnessGate) acquire on the SAME inode, so no two
+# index-mutating git ops ever run concurrently.
+#
+# alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal — formerly the
+# third trading-box git writer this comment used to name — was REMOVED from
+# this SF entirely. Its replacement, the standalone --daily-heal workload, was
+# NOT a candidate for this shared flock in the first place: it runs on its own
+# ephemeral, self-terminating data-spot box (via the existing data-spot-
+# dispatcher bootstrap, which does a fresh shallow CLONE per run, not a `pull`
+# against a persistent checkout) — there is no shared inode to contend over.
 
 # Must match crucible-executor infrastructure/boot-pull.sh's GIT_SYNC_LOCK
-# default and the ChronicGapSelfHeal wrap. A guard test in each repo pins it.
+# default. A guard test in each repo pins it.
 _SHARED_GIT_LOCK = "/home/ec2-user/.ae-git-sync.lock"
 
 
@@ -132,19 +192,15 @@ def test_git_retry_acquires_shared_flock() -> None:
     assert "Another git process seems to be running" in helper
 
 
-def test_chronic_gap_self_heal_git_pulls_flock_wrapped() -> None:
-    """ChronicGapSelfHeal is the third trading-box git writer (its
-    `git -C ... pull --ff-only` runs on $.trading_instance_id). It must take
-    the SAME shared flock so it can't race boot-pull / the gate (config#1944)."""
+def test_chronic_gap_self_heal_removed_not_a_shared_flock_participant() -> None:
+    """alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal — previously
+    pinned here as the third trading-box git writer under the shared flock —
+    is now REMOVED from this SF entirely (moved to the standalone
+    --daily-heal job, on its own ephemeral spot box, which clones fresh rather
+    than pulling a persistent checkout — see the module-level comment above
+    _SHARED_GIT_LOCK). Regression guard: it must not reappear here."""
     doc = json.loads(_SF_PATH.read_text())
-    cmds = doc["States"]["ChronicGapSelfHeal"]["Parameters"]["Parameters"]["commands"]
-    pulls = [c for c in cmds if "pull --ff-only" in c]
-    assert pulls, "ChronicGapSelfHeal must still pull the checkouts."
-    for p in pulls:
-        assert f"flock -w 150 {_SHARED_GIT_LOCK} git" in p, (
-            "each ChronicGapSelfHeal git pull must run under the shared flock "
-            f"({_SHARED_GIT_LOCK})."
-        )
+    assert "ChronicGapSelfHeal" not in doc["States"]
 
 
 def test_shared_git_lock_lives_in_home_not_var_lock() -> None:

@@ -97,21 +97,15 @@ fi
 
 echo "Ensuring IAM role exists: $ROLE_NAME..."
 
-# Trust policy (one-time bootstrap; safe to re-run)
-TRUST_POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"Service": "states.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}'
+# Trust policy (one-time bootstrap; safe to re-run). config#2826: read from
+# the version-tracked snapshot in infrastructure/iam/ rather than keeping an
+# inline copy here, so this script and deploy-infrastructure.sh's own trust
+# assertion can never drift apart from each other or from the codified SoT.
+TRUST_POLICY_FILE="$SCRIPT_DIR/iam/${ROLE_NAME}.trust.json"
 
 aws iam create-role \
   --role-name "$ROLE_NAME" \
-  --assume-role-policy-document "$TRUST_POLICY" \
+  --assume-role-policy-document "file://$TRUST_POLICY_FILE" \
   --region "$REGION" 2>/dev/null || echo "  Role already exists"
 
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -265,26 +259,35 @@ echo "  State machine ARN: $SM_ARN"
 # infrastructure/iam/ directory and applied via that repo's apply.sh —
 # do NOT add inline-policy writes here (per the dual-writer incident
 # 2026-04-21/05-04/05-06 documented above the IAM block historically).
+#
+# Trust principals: this role is assumed by BOTH EventBridge Rules
+# (events.amazonaws.com — the still-live SaturdayTrigger) AND
+# EventBridge Scheduler (scheduler.amazonaws.com — WeekdayTrigger, as
+# of config#2413's AWS::Scheduler::Schedule migration). Both triggers
+# share this one role (see infrastructure/iam/alpha-engine-eventbridge-
+# sfn-role.json's states:StartExecution grant covering both state
+# machines), so the trust policy must list both services rather than
+# splitting into per-trigger roles.
+#
+# config#2826: read from the version-tracked infrastructure/iam/ snapshot
+# rather than an inline literal, so this bootstrap and
+# deploy-infrastructure.sh's own step 3b re-assertion read the exact same
+# document and can never drift apart.
 
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
-EB_TRUST='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"Service": "events.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}'
+EB_TRUST_FILE="$SCRIPT_DIR/iam/${EB_ROLE_NAME}.trust.json"
 
 aws iam create-role \
   --role-name "$EB_ROLE_NAME" \
-  --assume-role-policy-document "$EB_TRUST" \
-  --region "$REGION" 2>/dev/null || true
+  --assume-role-policy-document "file://$EB_TRUST_FILE" \
+  --region "$REGION" 2>/dev/null || \
+aws iam update-assume-role-policy \
+  --role-name "$EB_ROLE_NAME" \
+  --policy-document "file://$EB_TRUST_FILE" \
+  --region "$REGION"
 
 echo "  EventBridge rule + targets: managed by CFN orchestration template"
-echo "  EventBridge IAM role bootstrap: $EB_ROLE_NAME (idempotent)"
+echo "  EventBridge IAM role bootstrap: $EB_ROLE_NAME (idempotent; trusts events.amazonaws.com + scheduler.amazonaws.com)"
 
 # ── 5. Disable old crons (optional) ────────────────────────────────────────
 

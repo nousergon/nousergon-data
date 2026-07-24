@@ -46,6 +46,22 @@ def test_discovers_historically_bitten_rules(cd):
     assert "alpha-engine-saturday-succeeded-groom" not in rule_names  # retired config#2201
 
 
+def test_discovers_sweep_artifact_monitor_rule(cd):
+    """config#2392: the post-SF sweep-artifact validation Lambda's rule must
+    be discovered like every other SF-status-keyed EventBridge rule — no
+    registry to maintain here, so this pins the deploy.sh shape (EVENT_
+    PATTERN heredoc + RULE_NAME literal) staying scannable."""
+    rules = {r["rule_name"]: r for r in cd._discover_codified_rules()}
+    assert "alpha-engine-sweep-artifact-monitor" in rules
+    monitor = rules["alpha-engine-sweep-artifact-monitor"]
+    assert "error" not in monitor
+    arns = cd._extract_state_machine_arns(monitor["expected_pattern"])
+    assert any("alpha-engine-groom-dispatch" in arn for arn in arns)
+    # SUCCEEDED-only — acceptance criterion 3 (never alert on FAILED) is
+    # enforced at the EventBridge rule level, not just in the handler.
+    assert monitor["expected_pattern"]["detail"]["status"] == ["SUCCEEDED"]
+
+
 def test_discovered_rules_have_no_parse_errors(cd):
     """Every discovered rule under today's repo state must parse cleanly —
     a source-error here means a deploy.sh's EVENT_PATTERN heredoc changed

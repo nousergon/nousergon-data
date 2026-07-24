@@ -11,8 +11,15 @@ WorkingDirectory=/home/ec2-user/alpha-engine-data
 ExecStart=/home/ec2-user/alpha-engine-data/scripts/run_daily_news_standalone.sh
 StandardOutput=journal
 StandardError=journal
-# ~20-30 min pull (Polygon 5 req/min over the ~96-ticker holdings∪signals
-# universe); 40 min cap gives headroom.
+# Backstop only — NOT the primary defense. BOTH throttle-prone sources are
+# now hard-capped INSIDE their adapters (GdeltNewsAdapter config#2813 +
+# PolygonNewsAdapter config#2938, each max_fetch_seconds=1200s), and the
+# sources fetch CONCURRENTLY (AsyncNewsAggregator), so a slow/throttled run
+# degrades coverage and still writes a (partial) digest well within this cap
+# instead of being SIGKILLed with zero output. This value is DERIVED — it must
+# equal collectors/news_sources/fetch_budget.py::daily_news_timeout_start_seconds()
+# (one source's 1200s bail budget + 1200s aggregation/write reserve); a test
+# there guards the two in lockstep so universe growth never silently outruns it.
 TimeoutStartSec=2400
 # Shared-box memory guard. Measured peak RSS ~0.17 GB; cap generously.
 MemoryAccounting=yes

@@ -35,14 +35,16 @@
       "Sid": "LambdaUpdate",
       "Effect": "Allow",
       "Action": [
-        "lambda:UpdateFunctionCode",
-        "lambda:UpdateFunctionConfiguration",
+        "lambda:CreateAlias",
+        "lambda:CreateFunction",
         "lambda:GetFunction",
         "lambda:GetFunctionConfiguration",
+        "lambda:GetFunctionEventInvokeConfig",
         "lambda:PublishVersion",
+        "lambda:PutFunctionEventInvokeConfig",
         "lambda:UpdateAlias",
-        "lambda:CreateFunction",
-        "lambda:CreateAlias"
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration"
       ],
       "Resource": [
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
@@ -105,7 +107,10 @@
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["changelog/", "changelog/*"]
+          "s3:prefix": [
+            "changelog/",
+            "changelog/*"
+          ]
         }
       }
     },
@@ -126,6 +131,12 @@
         "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-*-pipeline"
       ]
+    },
+    {
+      "Sid": "InfraDeployValidateSFDefinition",
+      "Effect": "Allow",
+      "Action": "states:ValidateStateMachineDefinition",
+      "Resource": "*"
     },
     {
       "Sid": "InfraDeployResourceCRUD",
@@ -184,6 +195,12 @@
         "arn:aws:iam::711398986525:role/alpha-engine-*",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
       ]
+    },
+    {
+      "Sid": "InfraDeployEventBridgeSchedulerTrust",
+      "Effect": "Allow",
+      "Action": "iam:UpdateAssumeRolePolicy",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-eventbridge-sfn-role"
     },
     {
       "Sid": "InfraDeployResourceRead",
@@ -322,7 +339,9 @@
       ],
       "Resource": [
         "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline",
-        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*"
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/stepfunctions/ne-*-pipeline:*",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/vendedlogs/states/alpha-engine-groom-dispatch",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/vendedlogs/states/alpha-engine-groom-dispatch:*"
       ]
     },
     {

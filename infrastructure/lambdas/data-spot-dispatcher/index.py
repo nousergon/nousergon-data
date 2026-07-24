@@ -55,8 +55,9 @@ import re
 import uuid
 
 import boto3
+from krepis import alerts
 from nousergon_lib import ec2_spot
-from nousergon_lib.ec2_spot import SpotCapacityExhausted
+from nousergon_lib.ec2_spot import SpotCapacityExhausted, SpotQuotaExceededError
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -123,7 +124,7 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("DATA_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("DATA_SPOT_CW_LOG_GROUP", "/alpha-engine/data-spot")
 
-# The four data-phase workloads this dispatcher can run, mapped to the EXACT
+# The five data-phase workloads this dispatcher can run, mapped to the EXACT
 # weekly_collector.py invocation the on-trading SF states ran (unchanged args =
 # unchanged M0 data contract: same paths/schemas). Any other value is rejected.
 _WORKLOADS: dict[str, str] = {
@@ -142,6 +143,13 @@ _WORKLOADS: dict[str, str] = {
     "post-market-arctic-append": (
         "python weekly_collector.py --daily-arctic-append"
     ),
+    # alpha-engine-config-I2717: standalone daily data-heal, EventBridge-triggered
+    # ~09:00 UTC weekdays (alpha-engine-daily-heal rule) — was inline in preopen's
+    # MorningArcticAppend (universe-gap self-heal head) + the weekday SF's own
+    # on-trading ChronicGapSelfHeal state, both REMOVED from
+    # step_function_daily.json entirely. Runs off the preopen critical path with
+    # a much bigger heal timeout budget (see weekly_collector._run_daily_heal).
+    "daily-heal": "python weekly_collector.py --daily-heal",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
@@ -225,8 +233,13 @@ echo "[data-spot] workload {workload} complete"
 
 def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     """Launch the data spot box; spot first, on-demand fallback on capacity
-    exhaustion (a pre-open enrich the predictor reads next must not be starved by
-    a spot-capacity dip). Mirrors _launch_instance in scheduled-groom-dispatcher.
+    exhaustion OR account-wide spot quota exhaustion (config#2698 — e.g.
+    MaxSpotInstanceCountExceeded; a 2026-07-15 incident hard-failed
+    LaunchPostMarketDataSpot instead of falling back, since this launcher calls
+    ec2_spot.launch directly rather than through nousergon_lib.spot_dispatch's
+    launch_with_fallback chokepoint and had no quota-specific branch) — a
+    pre-open enrich the predictor reads next must not be starved by either. Mirrors
+    _launch_instance in scheduled-groom-dispatcher.
 
     force_on_demand=True skips the spot attempt entirely. Set by the EOD SF's
     bounded retry-on-relaunch (2026-07-14 incident: a data-spot box was
@@ -259,6 +272,21 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     except SpotCapacityExhausted:
         logger.warning(
             "spot capacity exhausted across all type x subnet pools — relaunching ON-DEMAND"
+        )
+        iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
+        return iid, "on-demand"
+    except SpotQuotaExceededError as exc:
+        # Account-wide (config#2698) — distinct from ordinary capacity rotation
+        # exhaustion, so this gets its own operator page: capacity exhaustion
+        # self-heals as AWS capacity shifts, but a quota ceiling only clears via
+        # a service-quota increase, which needs a human to notice and request.
+        logger.warning("spot quota exceeded (%s) — relaunching ON-DEMAND", exc)
+        alerts.publish(
+            f"EC2 spot quota exceeded for 'alpha-engine-data-spot' in {REGION} — "
+            f"falling back to on-demand: {exc}",
+            severity="warning",
+            source="data-spot-dispatcher._launch_instance",
+            dedup_key=f"spot-quota-exceeded-{REGION}",
         )
         iid = ec2_spot.launch(INSTANCE_TYPES, SUBNETS, spot=False, **common)
         return iid, "on-demand"
@@ -328,13 +356,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the data spot box for one workload.
 
     `event` carries {"workload": "morning-enrich" | "morning-arctic-append" |
-    "post-market-data" | "post-market-arctic-append", "force_on_demand": bool}.
-    `force_on_demand` (default False) is set by the EOD SF's post-interruption
-    retry (2026-07-14 incident) and the weekday SF's identical retry
-    (config#2542) so the one retry attempt never gambles on spot a second
-    time. Returns, wrapped under a `data_spot` key (mirrors the groom
-    dispatcher's `groom` wrap so the SF's JSONPath is
-    $.<result>.Payload.data_spot.*):
+    "post-market-data" | "post-market-arctic-append" | "daily-heal",
+    "force_on_demand": bool}. `force_on_demand` (default False) is set by the
+    EOD SF's post-interruption retry (2026-07-14 incident) and the weekday
+    SF's identical retry (config#2542) so the one retry attempt never gambles
+    on spot a second time; the "daily-heal" workload (alpha-engine-config-
+    I2717) is invoked directly by its own EventBridge rule (NOT from either
+    SF) and omits `force_on_demand`, so it defaults to False (spot-first, no
+    retry-budget coupling to either pipeline). Returns, wrapped under a
+    `data_spot` key (mirrors the groom dispatcher's `groom` wrap so the SF's
+    JSONPath is $.<result>.Payload.data_spot.*):
 
       {"launched": true, "instance_id", "command_id", "workload", "run_token"}
       or {"launched": false, "reason": "disabled"} under the kill-switch.

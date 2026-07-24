@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""check-drift.py — Diff codified IAM inline policies against live AWS state.
+"""check-drift.py — Diff codified IAM inline + trust policies against live AWS state.
 
 Walks every `infrastructure/iam/<role>.json` in this directory and compares
 against `aws iam get-role-policy --role-name <role> --policy-name <role>-policy`
-(the `{role}-policy` naming convention enforced by apply.sh).
+(the `{role}-policy` naming convention enforced by apply.sh). Also walks every
+`infrastructure/iam/<role>.trust.json` snapshot and compares it against the
+role's live `AssumeRolePolicyDocument` (config#2826) — the trust document a
+role was created with can drift silently since it's normally asserted once at
+bootstrap time in a deploy script, not re-checked on every deploy.
 
 Drift cases (all exit non-zero):
-  * Source JSON differs from AWS document       (content-drift)
-  * AWS role has no inline policy by that name  (missing-in-aws)
+  * Source JSON differs from AWS document              (content-drift)
+  * AWS role has no inline policy by that name          (missing-in-aws)
+  * AWS role's live trust doc differs from the snapshot (trust-drift)
 
 JSON is compared after normalization (sorted keys, no extra whitespace),
 so cosmetic-only differences in indentation or key order don't trip the check.
 
 Usage:
   ./infrastructure/iam/check-drift.py             # check every codified role
-  ./infrastructure/iam/check-drift.py --role X    # check one role
+  ./infrastructure/iam/check-drift.py --role X    # check one role (both .json and .trust.json if present)
 
-Requires AWS creds with iam:ListRolePolicies + iam:GetRolePolicy on the
-target roles. Locally: any admin profile. In CI: the OIDC role
-`github-actions-iam-drift-check` (alpha-engine repo owns it; trust policy
-allows this repo too).
+Requires AWS creds with iam:ListRolePolicies + iam:GetRolePolicy +
+iam:GetRole on the target roles. Locally: any admin profile. In CI: the
+OIDC role `github-actions-iam-drift-check` (alpha-engine repo owns it;
+trust policy allows this repo too).
 """
 
 from __future__ import annotations
@@ -50,9 +55,32 @@ def _aws_iam(*args: str) -> dict | list | str:
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
+def _normalize_unordered_lists(node):
+    """Recursively sort string-lists — IAM treats Action/Resource/
+    Principal.Service (and every other policy-document string array) as
+    UNORDERED sets, and AWS returns them in arbitrary, unstable order.
+    First bitten 2026-07-22: GetRole started returning
+    ["scheduler.amazonaws.com","events.amazonaws.com"] for a trust doc
+    codified in the opposite order — same set, red drift finding, every PR
+    blocked. Only lists that are entirely strings are sorted; mixed/object
+    lists (e.g. Statement arrays) keep their order — Statement order is
+    semantically meaningful for readers even though IAM ORs them, and the
+    codified file controls it."""
+    if isinstance(node, dict):
+        return {k: _normalize_unordered_lists(v) for k, v in node.items()}
+    if isinstance(node, list):
+        if node and all(isinstance(x, str) for x in node):
+            return sorted(node)
+        return [_normalize_unordered_lists(x) for x in node]
+    return node
+
+
 def _canonical_json(doc: dict) -> str:
-    """Canonical JSON for byte-stable comparison: sorted keys, no extra ws."""
-    return json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    """Canonical JSON for byte-stable comparison: sorted keys, sorted
+    string-set arrays (see _normalize_unordered_lists), no extra ws."""
+    return json.dumps(
+        _normalize_unordered_lists(doc), sort_keys=True, separators=(",", ":")
+    )
 
 
 def _check_role(role_file: Path) -> list[str]:
@@ -82,8 +110,41 @@ def _check_role(role_file: Path) -> list[str]:
     if _canonical_json(source_doc) != _canonical_json(aws_doc):
         findings.append(
             f"{role_name}/{policy_name}: source document differs from "
-            f"AWS document (content drift)"
+            f"AWS document (content drift)\n"
+            f"    source: {_canonical_json(source_doc)}\n"
+            f"    aws:    {_canonical_json(aws_doc)}"
         )
+
+    return findings
+
+
+def _check_trust_role(trust_file: Path) -> list[str]:
+    """Return list of trust-drift findings for one role. Empty means clean."""
+    role_name = trust_file.name[: -len(".trust.json")]
+
+    try:
+        source_doc = json.loads(trust_file.read_text())
+    except json.JSONDecodeError as exc:
+        return [f"{role_name}: trust snapshot JSON invalid ({exc})"]
+
+    aws_resp = _aws_iam("get-role", "--role-name", role_name)
+    aws_doc = aws_resp.get("Role", {}).get("AssumeRolePolicyDocument")
+
+    if not aws_doc:
+        return [
+            f"{role_name}: trust snapshot codified in source but role not "
+            f"found on AWS (or has no trust document)"
+        ]
+
+    if _canonical_json(source_doc) != _canonical_json(aws_doc):
+        findings = [
+            f"{role_name}: trust snapshot differs from AWS "
+            f"AssumeRolePolicyDocument (trust-drift — run apply.sh to push)\n"
+            f"    source: {_canonical_json(source_doc)}\n"
+            f"    aws:    {_canonical_json(aws_doc)}"
+        ]
+    else:
+        findings = []
 
     return findings
 
@@ -98,24 +159,34 @@ def main() -> int:
     if args.role:
         role_files = [SCRIPT_DIR / f"{args.role}.json"]
         if not role_files[0].is_file():
-            sys.stderr.write(f"ERROR: {role_files[0]} not found\n")
+            role_files = []
+        trust_files = [SCRIPT_DIR / f"{args.role}.trust.json"]
+        if not trust_files[0].is_file():
+            trust_files = []
+        if not role_files and not trust_files:
+            sys.stderr.write(
+                f"ERROR: neither {args.role}.json nor {args.role}.trust.json "
+                f"found in {SCRIPT_DIR}\n"
+            )
             return 2
     else:
         # *.trust.json are assume-role (trust) policy snapshots, not inline
         # permission documents — they have no `{stem}-policy` inline policy to
-        # diff, so exclude them from the drift sweep (mirrors apply.sh).
+        # diff, so they're checked separately via _check_trust_role below.
         role_files = sorted(
             f for f in SCRIPT_DIR.glob("*.json") if not f.name.endswith(".trust.json")
         )
+        trust_files = sorted(SCRIPT_DIR.glob("*.trust.json"))
 
-    if not role_files:
+    if not role_files and not trust_files:
         print(f"No codified role files found under {SCRIPT_DIR} — nothing to check.")
         return 0
 
     total_findings: list[str] = []
     for role_file in role_files:
-        findings = _check_role(role_file)
-        total_findings.extend(findings)
+        total_findings.extend(_check_role(role_file))
+    for trust_file in trust_files:
+        total_findings.extend(_check_trust_role(trust_file))
 
     if total_findings:
         print(f"IAM drift detected ({len(total_findings)} finding(s)):")
@@ -123,8 +194,10 @@ def main() -> int:
             print(f"  - {f}")
         return 1
 
-    role_names = ", ".join(f.stem for f in role_files)
-    print(f"OK: no IAM drift for {role_names}")
+    checked_names = sorted(
+        {f.stem for f in role_files} | {f.name[: -len(".trust.json")] for f in trust_files}
+    )
+    print(f"OK: no IAM drift for {', '.join(checked_names)}")
     return 0
 
 

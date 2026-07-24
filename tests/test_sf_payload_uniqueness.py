@@ -43,10 +43,6 @@ _SF_SATURDAY = _INFRA / "step_function.json"
 _SF_WEEKDAY = _INFRA / "step_function_daily.json"
 _SF_EOD = _INFRA / "step_function_eod.json"
 # alpha-engine-config-I2544/I2545: the two child SFs split out of the
-# Saturday SF each get their OWN closed payload-key registry (build
-# instruction: "new SFs get their own payload-key registries").
-_SF_ADVISORY = _INFRA / "step_function_advisory.json"
-_SF_MODELZOO = _INFRA / "step_function_modelzoo.json"
 
 _SF_ROLE_POLICY = _INFRA / "iam" / "alpha-engine-step-functions-role.json"
 
@@ -76,6 +72,9 @@ def _flatten_states(sf_doc: dict) -> dict:
 #
 # Saturday SF — alpha-engine-research + alpha-engine-data Lambdas
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
+    # config#2249: fast pre-dispatch substrate health gate, immediately
+    # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
+    "SubstrateHealthGate": frozenset({"instance_id.$"}),
     # L4517: preventive cross-repo lib-pin drift gate (predictor-inference Lambda).
     "LibPinDriftCheck": frozenset({"action"}),
     # config#693 (L4595): pre-spend pipeline-contract preflight gate, wired
@@ -89,17 +88,52 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
     # Research state as the signals.json producer.
-    "SignalsEnvelope": frozenset({"run_date.$", "target"}),
+    # config-I2916: preflight.$=$.research_dry threads the Friday-PM shell-run
+    # signal so the signals-envelope Lambda downgrades its I2880 universe-board
+    # fallback-staleness guard to a WARN (the dry Scanner leaves the dated board
+    # absent every Friday). DISTINCT from dry_run_llm — the read/build/write
+    # path still runs; only the expected-stale-fallback bound is relaxed.
+    "SignalsEnvelope": frozenset({"run_date.$", "target", "preflight.$"}),
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
     "DataPhase2": frozenset({"dry_run.$", "phase"}),
-    # alpha-engine-config-I2544: the eval-judge chain (EvalJudgeSubmit*/
-    # EvalJudgePoll/EvalJudgeProcess/EvalRollingMean/RationaleClustering/
-    # ReplayConcordance/Counterfactual/AggregateCosts) PLUS ReportCard/
-    # Director were LIFTED out of this SF into the async
-    # ne-weekly-advisory-pipeline child SF — see _ADVISORY_PAYLOAD_KEYS
-    # below (step_function_advisory.json has its own closed registry).
+    "EvalJudgeSubmitFirstSaturday": frozenset(
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
+    ),
+    "EvalJudgeSubmitWeekly": frozenset(
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
+    ),
+    "EvalJudgePoll": frozenset(
+        {"batch_id.$", "dry_run_llm.$", "max_wait_seconds", "submit_iso.$"}
+    ),
+    "EvalJudgeProcess": frozenset(
+        {"batch_id.$", "dry_run_llm.$", "plan_s3_key.$"}
+    ),
+    "EvalRollingMean": frozenset({"end_time_iso.$"}),
+    "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
+    "ReplayConcordance": frozenset(
+        {
+            "dry_run_llm.$",
+            "end_time_iso.$",
+            "max_artifacts",
+            "target_models",
+            "window_days",
+        }
+    ),
+    "Counterfactual": frozenset(
+        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days"}
+    ),
+    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$"}),
+    # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
+    # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
+    # dry_run.$=$.research_dry → no-write on the Friday preflight (ROADMAP L4504).
+    "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot"}),
+    # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
+    # advisory task; reads the fresh report card, writes director/{date}/
+    # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
+    # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
+    "Director": frozenset({"date.$", "dry_run.$"}),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload
@@ -117,6 +151,13 @@ _LIVENESS_POLLER_KEYS = frozenset({
 })
 
 # Weekday SF — alpha-engine-predictor Lambdas + the ssm-liveness-poller
+# alpha-engine-config-I2717/I2722 (2026-07-16): PredictorHealthCheck,
+# PredictorDriftCheck, and the WaitForChronicGap liveness-poll entry were
+# REMOVED from this SF entirely (heal -> standalone daily job; health/drift
+# checks -> their own direct EventBridge triggers, see
+# infrastructure/cloudformation/alpha-engine-orchestration.yaml). Removing
+# their registry entries here is the deliberate drift-direction check this
+# registry pattern enforces (test_no_registry_entry_missing_from_sf below).
 _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "DeployDriftCheck": frozenset({"action"}),
     # config#1430: NYSE trading-day gate, moved OFF the box into the
@@ -127,20 +168,15 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "CheckPredictorCoverage": frozenset({"action"}),
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),
     "RecheckCoverage": frozenset({"action"}),
-    "PredictorHealthCheck": frozenset({"action"}),
-    # config#1853: daily prediction-health producer — writes
-    # predictor/metrics/drift_{trading_day}.json every weekday.
-    "PredictorDriftCheck": frozenset({"action", "date.$"}),
     # config#1811: liveness-aware poll loops that stayed on the trading box
-    # (CodeFreshnessGate, ChronicGapSelfHeal, RunMorningPlanner) share the
-    # ssm-liveness-poller payload contract. WaitForMorningEnrich/
-    # WaitForMorningArcticAppend do NOT appear here — config#1767 (Phase 2)
-    # relocated those two onto independent ephemeral spot boxes whose own
-    # PollMorningEnrichSpot/PollMorningArcticAppendSpot poll directly via
-    # ssm:getCommandInvocation (a Task, not a lambda:invoke Payload), so they
-    # are out of scope for this Lambda-Payload registry.
+    # (CodeFreshnessGate, RunMorningPlanner) share the ssm-liveness-poller
+    # payload contract. WaitForMorningEnrich/WaitForMorningArcticAppend do NOT
+    # appear here — config#1767 (Phase 2) relocated those two onto independent
+    # ephemeral spot boxes whose own PollMorningEnrichSpot/
+    # PollMorningArcticAppendSpot poll directly via ssm:getCommandInvocation (a
+    # Task, not a lambda:invoke Payload), so they are out of scope for this
+    # Lambda-Payload registry.
     "WaitForCodeFreshness": _LIVENESS_POLLER_KEYS,
-    "WaitForChronicGap": _LIVENESS_POLLER_KEYS,
     "WaitForMorningPlanner": _LIVENESS_POLLER_KEYS,
     # config#1767 (Phase 2): the data phase (enrich + Arctic append) was relocated
     # onto two independent ephemeral spot boxes via the alpha-engine-data-spot-
@@ -226,136 +262,6 @@ class TestSaturdaySFPayloadFieldSetsClosed:
             "deliberate, update _SATURDAY_PAYLOAD_KEYS in this test file "
             "in the SAME PR."
         )
-
-
-# alpha-engine-config-I2544: the advisory child SF's own closed registry —
-# every Lambda Payload key-set lifted verbatim from the pre-lift
-# _SATURDAY_PAYLOAD_KEYS entries (Payload/Retry/Catch semantics preserved
-# byte-for-byte per the build instruction).
-_ADVISORY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
-    "EvalJudgeSubmitFirstSaturday": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
-    ),
-    "EvalJudgeSubmitWeekly": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
-    ),
-    "EvalJudgePoll": frozenset(
-        {"batch_id.$", "dry_run_llm.$", "max_wait_seconds", "submit_iso.$"}
-    ),
-    "EvalJudgeProcess": frozenset(
-        {"batch_id.$", "dry_run_llm.$", "plan_s3_key.$"}
-    ),
-    "EvalRollingMean": frozenset({"end_time_iso.$"}),
-    "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
-    "ReplayConcordance": frozenset(
-        {
-            "dry_run_llm.$",
-            "end_time_iso.$",
-            "max_artifacts",
-            "target_models",
-            "window_days",
-        }
-    ),
-    "Counterfactual": frozenset(
-        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days"}
-    ),
-    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$"}),
-    # alpha-engine-config-I2556 (2026-07-14, persistent report card with
-    # weekly snapshots): this Saturday-cadence invocation is the WEEKLY
-    # FREEZE — snapshot=true writes the dated historical card. The Sunday
-    # ModelZoo child SF's re-grade tail (_MODELZOO_PAYLOAD_KEYS below)
-    # passes snapshot=false (standing latest.json refresh only).
-    "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot"}),
-    "Director": frozenset({"date.$", "dry_run.$"}),
-}
-
-# alpha-engine-config-I2545: the ModelZoo Sunday child SF's own closed
-# registry — the model-zoo fan-out states carry no static-dict Lambda
-# Payloads (they're all SSM sendCommand Tasks, out of scope for
-# _enumerate_lambda_payloads), so this registry covers only the NEW
-# GradingLambdaReGrade tail (same shape as ReportCard above). I2556:
-# snapshot=false — a Sunday re-grade refreshes latest.json only, never a
-# second same-week dated snapshot (the advisory SF's ReportCard owns that).
-_MODELZOO_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
-    "GradingLambdaReGrade": frozenset({"date.$", "dry_run.$", "snapshot"}),
-}
-
-
-class TestAdvisorySFPayloadFieldSetsClosed:
-    """Same chokepoint as Saturday but for the advisory child SF's Lambda
-    Payloads (alpha-engine-config-I2544)."""
-
-    @pytest.fixture(scope="class")
-    def actual_payloads(self) -> dict[str, frozenset[str]]:
-        return _enumerate_lambda_payloads(json.loads(_SF_ADVISORY.read_text()))
-
-    def test_every_lambda_payload_is_in_registry(self, actual_payloads):
-        extra = set(actual_payloads) - set(_ADVISORY_PAYLOAD_KEYS)
-        assert not extra, (
-            f"Advisory SF has Lambda invoke states with Payloads NOT in "
-            f"_ADVISORY_PAYLOAD_KEYS: {sorted(extra)}."
-        )
-
-    def test_no_registry_entry_missing_from_sf(self, actual_payloads):
-        missing = set(_ADVISORY_PAYLOAD_KEYS) - set(actual_payloads)
-        assert not missing, (
-            f"_ADVISORY_PAYLOAD_KEYS has entries for states no longer in "
-            f"the advisory SF: {sorted(missing)}."
-        )
-
-    @pytest.mark.parametrize("state_name", sorted(_ADVISORY_PAYLOAD_KEYS))
-    def test_payload_keys_match_registry(self, actual_payloads, state_name):
-        if state_name not in actual_payloads:
-            pytest.skip(
-                f"{state_name} not present in SF — covered by "
-                "test_no_registry_entry_missing_from_sf"
-            )
-        expected = _ADVISORY_PAYLOAD_KEYS[state_name]
-        actual = actual_payloads[state_name]
-        assert actual == expected, (
-            f"Advisory SF state {state_name!r} Payload keys drifted from "
-            f"registry. Extras: {sorted(actual - expected)} | "
-            f"Missing: {sorted(expected - actual)}."
-        )
-
-
-class TestModelZooSFPayloadFieldSetsClosed:
-    """Same chokepoint as Saturday but for the ModelZoo Sunday child SF's
-    Lambda Payloads (alpha-engine-config-I2545)."""
-
-    @pytest.fixture(scope="class")
-    def actual_payloads(self) -> dict[str, frozenset[str]]:
-        return _enumerate_lambda_payloads(json.loads(_SF_MODELZOO.read_text()))
-
-    def test_every_lambda_payload_is_in_registry(self, actual_payloads):
-        extra = set(actual_payloads) - set(_MODELZOO_PAYLOAD_KEYS)
-        assert not extra, (
-            f"ModelZoo SF has Lambda invoke states with Payloads NOT in "
-            f"_MODELZOO_PAYLOAD_KEYS: {sorted(extra)}."
-        )
-
-    def test_no_registry_entry_missing_from_sf(self, actual_payloads):
-        missing = set(_MODELZOO_PAYLOAD_KEYS) - set(actual_payloads)
-        assert not missing, (
-            f"_MODELZOO_PAYLOAD_KEYS has entries for states no longer in "
-            f"the modelzoo SF: {sorted(missing)}."
-        )
-
-    @pytest.mark.parametrize("state_name", sorted(_MODELZOO_PAYLOAD_KEYS))
-    def test_payload_keys_match_registry(self, actual_payloads, state_name):
-        if state_name not in actual_payloads:
-            pytest.skip(
-                f"{state_name} not present in SF — covered by "
-                "test_no_registry_entry_missing_from_sf"
-            )
-        expected = _MODELZOO_PAYLOAD_KEYS[state_name]
-        actual = actual_payloads[state_name]
-        assert actual == expected, (
-            f"ModelZoo SF state {state_name!r} Payload keys drifted from "
-            f"registry. Extras: {sorted(actual - expected)} | "
-            f"Missing: {sorted(expected - actual)}."
-        )
-
 
 class TestWeekdaySFPayloadFieldSetsClosed:
     """Same chokepoint as Saturday but for the weekday SF Lambda Payloads."""
@@ -605,9 +511,6 @@ class TestEODSFTopLevelFieldsClosed:
             "snapshot_poll",
             "snapshot_result",
             "stop_result",
-            "substrate_check_error",
-            "substrate_check_poll",
-            "substrate_check_result",
             "trading_instance_id",
             # L274 SF MutualExclusionGuard (2026-05-27) — CheckMutexRole
             # reads $.pipeline_role; AcquireMutex emits $.mutex_result on
@@ -626,7 +529,14 @@ class TestEODSFTopLevelFieldsClosed:
             # state; skip_post_market_data now skips the whole spot data phase.
             "skip_capture_snapshot",
             "skip_eod_reconcile",
-            "skip_daily_substrate_health_check",
+            # alpha-engine-config-I2722 (2026-07-16): skip_daily_substrate_health_check
+            # + the whole DailySubstrateHealthCheck chain (and its dedicated
+            # fail-notify fields, health_check_degraded /
+            # substrate_health_check_degraded_notify[_error] / substrate_check_*)
+            # were REMOVED — the check re-homed to a standalone dashboard-box
+            # systemd timer (crucible-dashboard), genuinely consumer-free
+            # within this SF. Per-row CloudWatch alarms carry the alerting
+            # independently of the SF.
             # StartTradingInstance re-runnability guard (2026-06-30) —
             # ec2:startInstances emits $.ec2_start_result; the SSM-readiness
             # poll emits $.ssm_describe_result (describeInstanceInformation) and
@@ -647,10 +557,45 @@ class TestEODSFTopLevelFieldsClosed:
             "skip_refresh_executor_deploy",
             "refresh_executor_deploy_result",
             "refresh_executor_deploy_poll",
-            # substrate health check (EOD SF) — fail-notify paths
-            "health_check_degraded",
-            "substrate_health_check_degraded_notify",
-            "substrate_health_check_degraded_notify_error",
+            # config-I2702 (2026-07-15): closed-loop self-heal for post-close
+            # data gaps. "run_date" is a PRE-EXISTING top-level input field
+            # (used since day one, embedded inside States.Format() command
+            # strings like EODReconcile's) that only now gets a BARE `"$.
+            # run_date"` reference — the regex above only matches strings that
+            # START with `$.`, and Lambda Payload fields
+            # (ProbeEODReconcilePrecondition, HealReProbe, HealDispatchReplay's
+            # Input) are the first place it's referenced that way.
+            "run_date",
+            # ProbeEODReconcilePrecondition (deliverable #1): fresh verify-by-
+            # artifact read of the macro-freshness sentinel, replacing the old
+            # $.data_spot_error flag test at CheckSkipEODReconcile. Re-emitted
+            # (overwritten) by HealReProbe inside the heal loop below.
+            "precondition_probe",
+            # SetDegradedFlag (deliverable #4): persistent flag read by
+            # CheckDegradedOutcome (after the StopTradingInstance cost-guard
+            # tail) to route to the distinct DegradedSucceeded terminal instead
+            # of NormalSucceeded.
+            "degraded_summary",
+            # The closed self-heal loop (deliverable #3): InitHealLoop /
+            # HealLoopIncrement carry the attempts counter; each heal
+            # iteration's data-spot dispatch + poll emits its own launch/poll/
+            # error ResultPath (mirrors the pre-existing postmarket_launch /
+            # postmarket_poll / data_spot_error naming, prefixed heal_ to keep
+            # the original phase's fields untouched); HealDispatchReplay emits
+            # the auto-replay StartExecution result (or its Catch error); the
+            # three outcome notifications (converged / replay-dispatch-failed /
+            # non-convergent) each emit their own SNS ResultPath.
+            "heal_loop",
+            "heal_postmarket_launch",
+            "heal_postmarket_poll",
+            "heal_arctic_launch",
+            "heal_arctic_poll",
+            "heal_error",
+            "heal_replay_dispatch",
+            "heal_replay_dispatch_error",
+            "heal_replay_dispatch_failed_notify",
+            "heal_converged_notify",
+            "heal_nonconvergent_notify",
         }
     )
 
@@ -706,9 +651,12 @@ class TestEODSFTopLevelFieldsClosed:
 # own spot. DriftDetection dropped out of the flat-level spot set.
 # 10 → 9 on alpha-engine-config-I2545 (2026-07-14): ModelZooSelect (the last
 # remaining flat-level model-zoo spot launcher) moved to the new Sunday-
-# triggered ne-modelzoo-sunday-pipeline child SF (step_function_modelzoo.json)
-# — see TestModelZooSFSpotStateCount below for its own closed count.
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 9
+# triggered ne-modelzoo-sunday-pipeline child SF (step_function_modelzoo.json).
+# 9 → 10 on alpha-engine-config-I2890 (2026-07-17): the I2544/I2545 splits were
+# REVERSED — ModelZooSelect is back inline in Branch B (the Sunday child SF and
+# the advisory child SF are retired; the weekly SF runs the full pre-split
+# pattern again, all-Saturday).
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 10
 
 
 def _spot_states(sf_path: Path) -> list[str]:
@@ -758,21 +706,6 @@ class TestSaturdaySFSpotStateCount:
         )
 
 
-# alpha-engine-config-I2545: the ModelZoo Sunday child SF's own closed spot-
-# state count. ModelZooSelect is the sole flat-level spot launcher moved
-# here from the Saturday SF (TrainSpecDispatch, the per-spec launcher, lives
-# in ModelZooTrainMap's Map ItemProcessor — _flatten_states does not descend
-# into a Map, same exclusion _saturday_spot_states/_spot_states has always
-# applied to the Saturday SF's own ModelZooTrainMap).
-_EXPECTED_MODELZOO_SPOT_STATE_COUNT = 1
-
-
-class TestModelZooSFSpotStateCount:
-    def test_exactly_one_spot_state_in_modelzoo_sf(self):
-        spots = _spot_states(_SF_MODELZOO)
-        assert len(spots) == _EXPECTED_MODELZOO_SPOT_STATE_COUNT, (
-            f"ModelZoo SF should have EXACTLY "
-            f"{_EXPECTED_MODELZOO_SPOT_STATE_COUNT} spot-launching state "
-            f"(ModelZooSelect); found {len(spots)}: {sorted(spots)}."
-        )
-        assert spots == ["ModelZooSelect"]
+# alpha-engine-config-I2890 (2026-07-17): the ModelZoo Sunday child SF was
+# retired (I2544/I2545 splits reversed) — ModelZooSelect is counted in the
+# Saturday census above; no separate child-SF census remains.

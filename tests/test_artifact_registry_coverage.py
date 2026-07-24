@@ -68,7 +68,33 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
     # an ORDINARY S3 ArtifactSpec in ARTIFACT_REGISTRY.yaml, no changes to
     # nousergon_lib.artifact_freshness or its probe machinery).
-    "builders/daily_append.py": 3,
+    "builders/daily_append.py": 5,
+    # 3 -> 4 on alpha-engine-config-I2702 (2026-07-15): a second, separate
+    # freshness sentinel — feature_store/_macro_freshness.json — written
+    # after the macro/SPY readback-verification block succeeds. Deliberately
+    # NOT the same key as the existing feature_store/_freshness.json sentinel
+    # above: the universe writer and the macro writer fire on different code
+    # paths/cadences, and sharing one key would let whichever write lands
+    # last silently mask the other (see MACRO_FRESHNESS_SENTINEL_KEY's module
+    # docstring). Consumed by the new
+    # infrastructure/lambdas/eod-precondition-probe Lambda — the EOD SF's
+    # verify-by-artifact precondition probe, replacing the old
+    # $.data_spot_error launch-phase flag test at CheckSkipEODReconcile.
+    # FOLLOW-UP (tracked, not yet done in this PR — cross-repo, private):
+    # register feature_store/_macro_freshness.json in alpha-engine-config/
+    # private-docs/ARTIFACT_REGISTRY.yaml alongside the existing
+    # feature_store/_freshness.json entry.
+    # 4 -> 5 on config#3237 (2026-07-22): a third freshness sentinel —
+    # feature_store/_universe_close_freshness.json — written after
+    # _scan_universe_and_emit_freshness_receipt's readback confirms each
+    # in-scope symbol's run_date-EXACT row (distinct from the loose
+    # N-trading-day receipt above). Consumed by
+    # infrastructure/lambdas/eod-precondition-probe, ANDed with the macro
+    # sentinel's check (2026-07-21 config#3236: a 100% universe-append
+    # failure alongside a healthy macro sentinel previously produced a false
+    # precondition_met=true). Registered as feature_store_universe_close_
+    # freshness_sentinel in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml alongside feature_store_freshness_sentinel.
     # builders/migrate_universe_crsp_basis_audit/{ts}.json — the per-ticker CRSP
     # reconciliation REPORT (corporate-actions PR7-7a, config#1434). Like the
     # other one-off migration-audit PUTs (feature_order / vwap below), this is an
@@ -78,8 +104,28 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # here only to force operator review of the new PUT site.
     "builders/migrate_universe_crsp_basis.py": 1,
     "builders/migrate_universe_feature_order.py": 1,
+    # overseer/_control/completed/arctic-migration-<head>.json — the migration
+    # runner's per-run completion marker (alpha-engine-config-I3242). Like the
+    # alert-drain/sf-watch completion markers it mirrors (also unregistered),
+    # this is an EVENT-DRIVEN dispatch-control artifact (written once per
+    # merge-triggered migration run), NOT a periodic freshness-SLA artifact —
+    # ARTIFACT_REGISTRY.yaml carries only cadence/SLA rows, so like the
+    # migrate_universe_* audit PUTs above it is grandfathered out of the
+    # registry and pinned here only to force operator review of any new PUT
+    # site in the runner.
+    "scripts/run_arctic_migrations.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
+    # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for
+    # the config#1943 Leg-3 backfill (data#712). Same pattern as prune_delisted_tickers.py's
+    # builders/prune_audit/ write directly above: an EVENT-DRIVEN, operator-triggered audit
+    # of a one-off/occasional manual run, NOT a periodic freshness-SLA artifact — there is no
+    # cadence to monitor (this builder has no scheduled trigger; Brian runs it by hand), so
+    # per that established precedent it is grandfathered out of ARTIFACT_REGISTRY.yaml (no
+    # freshness row, not even in grandfathered_paths — mirrors prune_delisted_tickers.py's own
+    # audit, which also carries no registry row), pinned here only to force operator review of
+    # the new PUT site.
+    "builders/backfill_delisted_history.py": 1,
     "collectors/alternative.py": 3,
     # data/sub_industry_map.json + reference/price_cache/sub_industry_map.json
     # (config#934 narrow slice, 2026-07-09): additive GICS sub-industry capture
@@ -91,7 +137,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # a consumer exists, so grandfathered out of ARTIFACT_REGISTRY.yaml (see
     # alpha-engine-config private-docs/ARTIFACT_REGISTRY.yaml grandfathered_paths)
     # rather than registered with a speculative cadence/SLA.
-    "collectors/constituents.py": 3,
+    #
+    # 4th PUT site (config#934): data/sub_sector_etf_map.json +
+    # reference/price_cache/sub_sector_etf_map.json — ticker → sub-sector
+    # benchmark ETF (defaulting to the sector ETF), consumed by
+    # feature_engineer's sub_sector_vs_benchmark_* features. Same dual-path
+    # loop as the two maps above (1 new put_object call site, textually). The
+    # two new S3 paths still need an ARTIFACT_REGISTRY.yaml grandfather —
+    # companion config PR, same as config#2020 did for sub_industry_map.
+    "collectors/constituents.py": 4,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering
@@ -152,7 +206,29 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # data/crosswalks/cusip_to_ticker.json (CUSIP→ticker cache).
     # ARTIFACT_REGISTRY.yaml row: thinktank_inst_ownership.
     "data/derived/inst_ownership.py": 4,
-    "weekly_collector.py": 5,
+    # 5 -> 6 on alpha-engine-config#2672 (2026-07-16, Brian-ratified binding
+    # design): _data_quality/pending_upgrades.json — the durable
+    # desired-state ledger so a fallback-quality (yfinance-basis) universe
+    # day can't age out unhealed past the sliding-window detectors' lookback.
+    # A single small JSON object touched at most twice/day (mark on EOD
+    # yfinance write, clear on morning polygon-corrected write / gap-heal
+    # success) — control-plane reconciliation state, not a periodic
+    # freshness-SLA data artifact consumers read on a cadence (its absence
+    # is self-evident via the sliding-window detectors that union it, not via
+    # a freshness-monitor staleness check). Grandfathered out of
+    # ARTIFACT_REGISTRY.yaml for that reason, mirroring the
+    # corporate_actions/registry.py and sub_industry_map.json precedents
+    # above — pinned here only to force this operator review of the new PUT
+    # site.
+    # 6 -> 7 on alpha-engine-config-I2717 (2026-07-16): the new standalone
+    # --daily-heal entrypoint (_run_daily_heal) writes a heal-summary artifact
+    # to data/heal/daily/{run_date}.json — the artifact the freshness-monitor
+    # plane watches per the I2722 health-plane ruling (extend the existing
+    # Lambda watch plane, no new bundled health SF). FOLLOW-UP tracked as
+    # alpha-engine-config-I2749 (cross-repo, private): register
+    # data/heal/daily/{run_date}.json in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml.
+    "weekly_collector.py": 7,
 }
 
 

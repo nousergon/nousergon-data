@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from pydantic import ValidationError
 
 from nousergon_lib.sources import NewsArticle, NewsSource
@@ -28,6 +29,7 @@ from collectors.news_sources.bloomberg import BloombergNewsAdapter
 from collectors.news_sources.gdelt import (
     GdeltNewsAdapter,
     _build_query,
+    _looks_like_cusip,
     _retry_after_seconds,
 )
 from collectors.news_sources.polygon import PolygonNewsAdapter
@@ -147,6 +149,64 @@ class TestPolygonNewsAdapter:
         out = adapter.fetch(["AAPL"], hours=24)
         assert len(out) == 1
         assert out[0].vendor_article_id == "good"
+
+    # ── config#2938: Polygon wall-clock time budget ─────────────────────
+
+    def test_time_budget_stops_before_exhausting_all_tickers(self):
+        """config#2938 — the per-ticker loop must bail at ``max_fetch_seconds``
+        and return whatever it collected, so aggregation + digest/RAG write
+        still run within the caller's deadline (mirrors the GDELT guard)."""
+        fake_client = MagicMock()
+        fake_client._get.return_value = {"results": []}
+        clock = {"n": 0}
+
+        def fake_monotonic():
+            clock["n"] += 1
+            # calls: deadline calc (1), then one check per ticker i>0
+            return 0.0 if clock["n"] <= 3 else 1_000_000.0
+
+        adapter = PolygonNewsAdapter(
+            client=fake_client, max_fetch_seconds=100.0, monotonic=fake_monotonic
+        )
+        out = adapter.fetch([f"T{i}" for i in range(10)])
+        assert fake_client._get.call_count < 10
+        assert fake_client._get.call_count >= 1
+        assert out == []
+
+    def test_time_budget_never_checked_before_first_ticker(self):
+        """Even a zero/negative budget must attempt the FIRST ticker — the
+        guard only skips the remainder."""
+        fake_client = MagicMock()
+        fake_client._get.return_value = {"results": []}
+        adapter = PolygonNewsAdapter(
+            client=fake_client, max_fetch_seconds=0.0, monotonic=lambda: 0.0
+        )
+        adapter.fetch(["AAPL", "MSFT", "GOOG"])
+        assert fake_client._get.call_count == 1
+
+    def test_sustained_throttle_bails_at_budget_not_after_all_tickers(self):
+        """config#2938 core regression — a sustained Polygon 429 storm (the
+        2026-07-18 daily + weekly-SF SIGKILL) must NOT run the unbounded loop
+        past the caller's deadline. The adapter bails at its budget and returns
+        (partial), never hanging until the outer timeout kills it with zero
+        output."""
+        fake_client = MagicMock()
+        fake_client._get.side_effect = RuntimeError(
+            "Rate limited after 4 retries"
+        )
+        ticks = {"t": 0.0}
+
+        def fake_monotonic():
+            v = ticks["t"]
+            ticks["t"] += 10.0  # ~10s of wall-clock "elapsed" per 429 wait
+            return v
+
+        adapter = PolygonNewsAdapter(
+            client=fake_client, max_fetch_seconds=45.0, monotonic=fake_monotonic
+        )
+        out = adapter.fetch([f"T{i}" for i in range(1000)])
+        assert fake_client._get.call_count < 1000
+        assert out == []
 
 
 # ── GDELT adapter ──────────────────────────────────────────────────────
@@ -327,6 +387,177 @@ class TestGdeltNewsAdapter:
     def test_retry_after_seconds_parsing(self, header, expected):
         resp = MagicMock(headers=header)
         assert _retry_after_seconds(resp) == expected
+
+    # ── config#2813: time budget ────────────────────────────────────────
+
+    def test_time_budget_stops_early_and_returns_partial_results(self, monkeypatch):
+        """A sustained-throttle day must not run forever: once the wall-clock
+        budget is exhausted, fetch() stops early and returns whatever it
+        already collected, rather than blowing the caller's own timeout."""
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        fake_http = MagicMock()
+        fake_http.get.return_value = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"articles": [{
+                "url": "https://x.com/a",
+                "title": "ok",
+                "seendate": "20260512T143000Z",
+            }]}),
+            raise_for_status=MagicMock(return_value=None),
+        )
+        # Fake clock: still within budget for the first 3 calls (ticker 0's
+        # pre-loop budget check doesn't happen — only i>0 checks it), then
+        # past the deadline from the 4th call onward.
+        clock = {"n": 0}
+
+        def fake_monotonic():
+            clock["n"] += 1
+            # calls: deadline calc (1), then one check per ticker i>0
+            return 0.0 if clock["n"] <= 3 else 1_000_000.0
+
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={},
+            http=fake_http,
+            inter_request_sleep=0.0,
+            max_fetch_seconds=100.0,
+            monotonic=fake_monotonic,
+        )
+        tickers = [f"T{i}" for i in range(10)]
+        out = adapter.fetch(tickers)
+        # Stopped well before exhausting all 10 tickers.
+        assert fake_http.get.call_count < 10
+        assert fake_http.get.call_count >= 1
+        assert len(out) == fake_http.get.call_count
+
+    def test_time_budget_never_checked_before_first_ticker(self, monkeypatch):
+        """Even a zero/negative budget must not prevent the FIRST ticker from
+        being attempted — only skips apply to the remainder."""
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        fake_http = MagicMock()
+        fake_http.get.return_value = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"articles": []}),
+            raise_for_status=MagicMock(return_value=None),
+        )
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={},
+            http=fake_http,
+            inter_request_sleep=0.0,
+            max_fetch_seconds=0.0,
+            monotonic=lambda: 0.0,
+        )
+        adapter.fetch(["AAPL", "MSFT", "GOOG"])
+        assert fake_http.get.call_count == 1
+
+    # ── config#2813: CUSIP skip ─────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "identifier,expected",
+        [
+            ("912810UJ5", True),   # Treasury CUSIP
+            ("40219MBJ2", True),   # corporate bond CUSIP
+            ("AAPL", False),
+            ("MSFT", False),
+            ("SGOV", False),       # short 5-char ETF, not CUSIP-shaped
+            ("BRKB", False),
+            ("ABCDEFGHI", False),  # 9 letters, no digit — not a CUSIP
+        ],
+    )
+    def test_looks_like_cusip(self, identifier, expected):
+        assert _looks_like_cusip(identifier) is expected
+
+    def test_cusip_shaped_tickers_are_skipped_without_any_http_call(self, monkeypatch):
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        fake_http = MagicMock()
+        fake_http.get.return_value = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"articles": []}),
+            raise_for_status=MagicMock(return_value=None),
+        )
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={"AAPL": "Apple"},
+            http=fake_http,
+            inter_request_sleep=0.0,
+        )
+        adapter.fetch(["912810UJ5", "AAPL", "912834PB8"])
+        # Only the one real ticker triggers an HTTP call.
+        assert fake_http.get.call_count == 1
+        called_params = fake_http.get.call_args.kwargs["params"]
+        assert "AAPL" in called_params["query"]
+
+    # ── config#2813: adaptive retry abandonment ─────────────────────────
+
+    def test_retries_abandoned_after_sustained_zero_recovery(self, monkeypatch):
+        """Evidence from the 2026-07-17 outage: under sustained throttling
+        the retry pass recovers nothing but still pays for a second round
+        trip. After a full window of retries with zero recoveries, stop
+        attempting the retry pass — only ONE http call per ticker from then
+        on instead of two."""
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        resp_429 = MagicMock(status_code=429, headers={})
+        resp_429_retry = MagicMock(status_code=429, headers={})
+        resp_429_retry.raise_for_status.side_effect = requests.HTTPError("429")
+
+        fake_http = MagicMock()
+        # Each ticker: first call 429s (triggers retry attempt), retry
+        # ALSO 429s and raises on raise_for_status() — realistic persistent
+        # throttling, unlike the pre-existing fixture's bare MagicMock.
+        fake_http.get.side_effect = [resp_429, resp_429_retry] * 20
+
+        from collectors.news_sources import gdelt as gdelt_module
+        _RETRY_ABANDON_SAMPLE_SIZE = gdelt_module._RETRY_ABANDON_SAMPLE_SIZE
+
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={},
+            http=fake_http,
+            inter_request_sleep=0.0,
+        )
+        tickers = [f"T{i}" for i in range(_RETRY_ABANDON_SAMPLE_SIZE + 2)]
+        adapter.fetch(tickers)
+
+        # First _RETRY_ABANDON_SAMPLE_SIZE tickers: 2 calls each (initial +
+        # retry) while the adapter is still trusting the retry pass.
+        # Remaining tickers: 1 call each, once retries are abandoned.
+        expected_calls = (2 * _RETRY_ABANDON_SAMPLE_SIZE) + (
+            1 * (len(tickers) - _RETRY_ABANDON_SAMPLE_SIZE)
+        )
+        assert fake_http.get.call_count == expected_calls
+        assert adapter._retries_abandoned is True
+
+    def test_retries_not_abandoned_when_they_sometimes_recover(self, monkeypatch):
+        """The occasional-429 regime (config#663) must be unaffected: if
+        retries sometimes DO recover coverage, keep retrying every ticker."""
+        monkeypatch.setattr(
+            "collectors.news_sources.gdelt.time.sleep", lambda s: None
+        )
+        resp_429 = MagicMock(status_code=429, headers={})
+        resp_ok = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"articles": []}),
+            raise_for_status=MagicMock(return_value=None),
+        )
+        fake_http = MagicMock()
+        # Every ticker: initial 429, retry SUCCEEDS — retries stay worthwhile.
+        fake_http.get.side_effect = [resp_429, resp_ok] * 20
+
+        adapter = GdeltNewsAdapter(
+            ticker_name_map={},
+            http=fake_http,
+            inter_request_sleep=0.0,
+        )
+        tickers = [f"T{i}" for i in range(12)]
+        adapter.fetch(tickers)
+
+        assert fake_http.get.call_count == 2 * len(tickers)
+        assert adapter._retries_abandoned is False
 
 
 # ── Yahoo RSS adapter ──────────────────────────────────────────────────

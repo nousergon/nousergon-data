@@ -1,0 +1,156 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-overseer-liveness-probe:*"
+    },
+    {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH"
+      ]
+    },
+    {
+      "Sid": "ReadEventBridgeRules",
+      "Effect": "Allow",
+      "Action": ["events:DescribeRule", "events:ListTargetsByRule"],
+      "Resource": [
+        "arn:aws:events:us-east-1:711398986525:rule/alpha-engine-saturday-sf-watch-failed",
+        "arn:aws:events:us-east-1:711398986525:rule/nousergon-alerts/overseer-intake-alert-events",
+        "arn:aws:events:us-east-1:711398986525:rule/overseer-intake-cw-alarm-state"
+      ]
+    },
+    {
+      "Sid": "ReadRegisteredStateMachines",
+      "Effect": "Allow",
+      "Action": ["states:DescribeStateMachine"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
+    },
+    {
+      "Sid": "ReadWatchPlaneLambdaHealth",
+      "Effect": "Allow",
+      "Action": ["lambda:GetFunctionConfiguration"],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-saturday-sf-watch-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-sf-watch-spot-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ci-watch-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-alert-drain-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-overseer-dispatcher"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchExecutionHistory",
+      "Effect": "Allow",
+      "Action": ["states:ListExecutions"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchExecutionInput",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution"],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
+      ]
+    },
+    {
+      "Sid": "ReadSfWatchLogs",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/consolidated/saturday_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/weekday_sf_watch/*",
+        "arn:aws:s3:::alpha-engine-research/consolidated/eod_sf_watch/*"
+      ]
+    },
+    {
+      "Sid": "ReadRouterSchedulerSchedules",
+      "Effect": "Allow",
+      "Action": ["scheduler:GetSchedule"],
+      "Resource": [
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-0400utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1000utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1600utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-2200utc",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-ci-watch-canary-drill-weekly",
+        "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-sf-watch-canary-drill-weekly"
+      ]
+    },
+    {
+      "Sid": "ReadLaunchConfigEc2DescribeNotResourceScopable",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeImages",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadIntakeQueues",
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueUrl"],
+      "Resource": [
+        "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake",
+        "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake-dlq"
+      ]
+    },
+    {
+      "Sid": "LivenessDedupState",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/overseer_liveness/*"
+    },
+    {
+      "Sid": "RunWindowArtifactsRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/*"
+    },
+    {
+      "Sid": "RunWindowArtifactsList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": { "s3:prefix": "groom/*" }
+      }
+    },
+    {
+      "Sid": "FlowDoctorDedupStore",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
+      ]
+    }
+  ]
+}

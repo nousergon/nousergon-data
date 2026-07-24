@@ -41,6 +41,7 @@ ROLE_NAME="alpha-engine-freshness-monitor-role"
 POLICY_NAME="alpha-engine-freshness-monitor-policy"
 RULE_NAME="alpha-engine-freshness-monitor-cron"
 HISTORICAL_RULE_NAME="alpha-engine-freshness-monitor-historical-cron"
+INTRADAY_RULE_NAME="alpha-engine-freshness-monitor-intraday-cron"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -53,7 +54,15 @@ REGISTRY_VALIDATOR="${CONFIG_REPO}/scripts/validate_artifact_registry.py"
 REGISTRY_BUCKET="alpha-engine-research"
 REGISTRY_S3_KEY="_freshness_monitor/ARTIFACT_REGISTRY.yaml"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 CODE_ONLY=false
@@ -179,12 +188,14 @@ if $BOOTSTRAP; then
     #
     # config#1240 auto-remediation: FRESHNESS_MONITOR_RECOVERY_ENABLED defaults
     # OFF (OBSERVE) — a fresh bootstrap LOGS the would-dispatch but calls no
-    # SF/Lambda and writes no marker. The dispatch path is flipped live ONLY
-    # after the end-to-end drill validates it (delete a recent load-bearing
-    # artifact, confirm the monitor auto-dispatches the correct backfill):
+    # SF/Lambda and writes no marker. Same for config-I3282's
+    # FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED (critical-page → overseer
+    # alert-drain dispatch). Each dispatch path is flipped live ONLY after its
+    # end-to-end drill validates it — and the routine-deploy env update below
+    # MERGES with the live env, so a flipped flag survives redeploys:
     #   aws lambda update-function-configuration \
     #     --function-name alpha-engine-freshness-monitor \
-    #     --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FRESHNESS_MONITOR_RECOVERY_ENABLED=true}'
+    #     --environment 'Variables={...existing...,FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED=true}'
     run aws lambda create-function \
       --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 \
@@ -200,14 +211,19 @@ if $BOOTSTRAP; then
     echo "  Lambda exists, code will be updated in step 3"
   fi
 
-  # EventBridge cron: every 15 minutes. Sub-15min granularity isn't
-  # load-bearing (alerts dedup by cadence window) — this is the floor
-  # for "operator-perceived" probe cadence.
+  # EventBridge cron: daily (config#1297, Brian-directed 2026-06-27 — the
+  # prior 15-min sweep was unnecessary noise once the saturday_sf/run_calendar
+  # staleness models were fixed to be jitter-tolerant). 12:00 UTC gives an
+  # operator-visible check before US market open (13:30 UTC) while landing
+  # comfortably after every prior day's overnight/Saturday-SF producer runs.
+  # The genuinely-intraday artifacts (open_orders_latest,
+  # freshness_monitor_heartbeat) are NOT blinded by this — they're also
+  # covered by the separate 30-min mini-rule below.
   echo "  Creating EventBridge cron: ${RULE_NAME}"
   run aws events put-rule \
     --name "${RULE_NAME}" \
-    --schedule-expression "cron(*/15 * * * ? *)" \
-    --description "Every 15min probe of the artifact freshness registry" \
+    --schedule-expression "cron(0 12 * * ? *)" \
+    --description "Daily 12:00 UTC probe of the artifact freshness registry" \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
@@ -268,6 +284,47 @@ EOF
     --principal events.amazonaws.com \
     --source-arn "${HIST_RULE_ARN}" \
     --region "${REGION}" 2>/dev/null || true
+
+  # Intraday mini-rule (config#1297): 30-min, weekdays 14-21 UTC (covers US
+  # market hours 13:30-20:00 UTC with a buffer either side). Fires the same
+  # Lambda with event={"mode": "intraday"} so it probes ONLY the two
+  # genuinely-intraday artifacts (open_orders_latest,
+  # freshness_monitor_heartbeat) without touching the shared
+  # check_results/heartbeat/cycle_verdict surfaces the daily sweep owns.
+  echo "  Creating EventBridge intraday cron: ${INTRADAY_RULE_NAME}"
+  run aws events put-rule \
+    --name "${INTRADAY_RULE_NAME}" \
+    --schedule-expression "cron(0/30 14-21 ? * MON-FRI *)" \
+    --description "30-min weekday 14-21 UTC intraday probe (mode=intraday)" \
+    --region "${REGION}" \
+    --query 'RuleArn' --output text
+
+  # Same file:// dodge as the historical target above (embedded-quote JSON
+  # doesn't survive the put-targets shorthand form).
+  INTRADAY_TARGET_JSON=$(mktemp)
+  cat > "${INTRADAY_TARGET_JSON}" <<EOF
+[
+  {
+    "Id": "1",
+    "Arn": "${FN_ARN}",
+    "Input": "{\"mode\":\"intraday\"}"
+  }
+]
+EOF
+  run aws events put-targets \
+    --rule "${INTRADAY_RULE_NAME}" \
+    --targets "file://${INTRADAY_TARGET_JSON}" \
+    --region "${REGION}"
+  rm -f "${INTRADAY_TARGET_JSON}"
+
+  INTRADAY_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${INTRADAY_RULE_NAME}"
+  run aws lambda add-permission \
+    --function-name "${FUNCTION_NAME}" \
+    --statement-id "eventbridge-${INTRADAY_RULE_NAME}" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "${INTRADAY_RULE_ARN}" \
+    --region "${REGION}" 2>/dev/null || true
 fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
@@ -287,10 +344,32 @@ fi
 
 echo "✓ Code deployed."
 
-echo "Updating Lambda environment (flow-doctor SSM hydration; preserve alert flags)..."
+# MERGE, don't overwrite (config-I3282; same silent-flag-wipe class as the
+# M2_DISPATCH_TARGET lesson): operator-flipped flags on the live function
+# (FRESHNESS_MONITOR_RECOVERY_ENABLED, FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED,
+# cooldown overrides) must SURVIVE a routine redeploy. The previous hardcoded
+# Variables={...} map silently reverted every non-listed flag to its code
+# default on each deploy. Deploy-owned keys below still win on collision.
+echo "Updating Lambda environment (merge — preserve operator-set flags)..."
+LIVE_ENV=$(aws lambda get-function-configuration \
+  --function-name "${FUNCTION_NAME}" --region "${REGION}" \
+  --query 'Environment.Variables' --output json 2>/dev/null || echo '{}')
+MERGED_ENV=$(python3 - "$LIVE_ENV" <<'PYEOF'
+import json, sys
+live = json.loads(sys.argv[1] or "null") or {}
+deploy_owned = {
+    "LOG_LEVEL": "INFO",
+    "FRESHNESS_MONITOR_ENABLED": "true",
+    "FLOW_DOCTOR_ENABLED": "1",
+    "ALPHA_ENGINE_DEPLOYED": "1",
+}
+live.update(deploy_owned)
+print(json.dumps({"Variables": live}))
+PYEOF
+)
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment "${MERGED_ENV}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

@@ -31,7 +31,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity"
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity"
   ],
   "MorningEnrich": [
     "set -eo pipefail",

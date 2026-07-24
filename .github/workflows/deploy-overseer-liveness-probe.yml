@@ -1,0 +1,89 @@
+name: Deploy overseer-liveness-probe
+
+# Auto-deploy the alpha-engine-overseer-liveness-probe Lambda CODE on merge to
+# main (alpha-engine-config-I2831). Same pattern as the sibling
+# deploy-*-liveness-probe / deploy-*-dispatcher workflows: this script's
+# default/flagless run is code-only (no aws iam/scheduler writes unless
+# --bootstrap is passed), so no new script flag is needed for safety.
+#
+# The playbook registry (infrastructure/overseer/playbooks.yaml) is BUNDLED into
+# the zip at deploy — a registry edit therefore deploys through THIS workflow's
+# code path (the path filter includes the registry). A change to SCHED_NAMES/
+# SCHED_CRONS (the probe's own invocation cadence) still needs an operator to run
+# `deploy.sh --bootstrap` by hand: the github-actions-lambda-deploy OIDC role
+# deliberately lacks iam:CreateRole / scheduler writes (fleet-wide policy).
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-deploy.json).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/overseer-liveness-probe/**'
+      - 'infrastructure/overseer/playbooks.yaml'
+      - '.github/workflows/deploy-overseer-liveness-probe.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-overseer-liveness-probe-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy overseer-liveness-probe Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy overseer-liveness-probe (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/overseer-liveness-probe/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          # Tolerate a not-yet-bootstrapped function: deploy.sh gracefully skips
+          # the code update until an operator runs --bootstrap (the OIDC role
+          # can't create the Lambda), so this report must NOT hard-fail the job
+          # when the function does not exist yet — matching the deploy step's
+          # own guard (alpha-engine-config-I2831 first-merge red-main fix).
+          aws lambda get-function \
+            --function-name alpha-engine-overseer-liveness-probe \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text \
+            || echo "(function not bootstrapped yet — code deploy was skipped)"
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-overseer-liveness-probe.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

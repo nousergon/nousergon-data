@@ -23,10 +23,10 @@
 # prefixes (the reclaim_relaunch record), and lambda:InvokeFunction scoped to
 # alpha-engine-sf-watch-spot-dispatcher.
 #
-# Cadence (UTC): twice daily, offset 15 min from the groom-liveness-probe's own
-# cadence (06:30/14:30) purely to avoid simultaneous invocation, not for any
-# functional reason — this is a config-drift check, not tied to any pipeline's
-# own schedule:
+# Cadence (UTC): the SWEEP runs twice daily (the reclaim checker is event-driven,
+# not scheduled). Offset from the overseer-liveness-probe's cadence (06:50/14:50)
+# purely to avoid simultaneous invocation — the sweep isn't tied to any
+# pipeline's own schedule:
 #   06:45 daily   cron(45 6 * * ? *)
 #   14:45 daily   cron(45 14 * * ? *)
 #
@@ -64,7 +64,15 @@ SCHED_CRONS=(
 )
 SCHED_PREFIX="alpha-engine-sf-watch-liveness-"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
 SMOKE=false
 for arg in "$@"; do

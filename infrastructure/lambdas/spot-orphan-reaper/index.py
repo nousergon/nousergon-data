@@ -103,6 +103,19 @@ WATCH_KINDS: tuple[WatchKind, ...] = (
         label="SF-watch",
         result_key="sf_watch_incomplete_reaps",
     ),
+    # config#3173: alert-drain had ZERO incomplete-reap coverage — a drain box
+    # whose on-box watchdog failed to arm silently ate the fleet-wide age cap
+    # with nobody told (the same class of miss ci-watch/sf-watch already
+    # close here). completion_prefix + the single alert-drain-run-id
+    # discriminator tag match scripts/alert_drain_run.sh's completion_key()
+    # exactly (`overseer/_control/completed/alert-drain-{run_id}.json`).
+    WatchKind(
+        tag_name="alpha-engine-alert-drain-spot",
+        completion_prefix="overseer/_control/completed/alert-drain-",
+        discriminator_tag_keys=("alert-drain-run-id",),
+        label="Alert-drain",
+        result_key="alert_drain_incomplete_reaps",
+    ),
 )
 _WATCH_KIND_BY_TAG_NAME: dict[str, WatchKind] = {wk.tag_name: wk for wk in WATCH_KINDS}
 _ALL_DISCRIMINATOR_TAG_KEYS: tuple[str, ...] = tuple(
@@ -178,14 +191,17 @@ def _completion_marker_exists(s3, kind: WatchKind, watch_tags: dict[str, str]) -
     (recording surface: the logger.warning below)."""
     if not all(watch_tags.get(key) for key in kind.discriminator_tag_keys):
         # Box was reaped before its discriminator tags ever landed — cannot
-        # look up a marker either way. INVARIANT (config#2267 site 2): the
-        # sf-watch/ci-watch dispatchers now TERMINATE a box whose
-        # discriminator tag write fails after bounded retries, so a
-        # long-lived tagless WATCH_KINDS box should no longer exist — hitting
-        # this branch means either the narrow launch→tag race window (the
-        # tags are still post-launch create_tags, not atomic RunInstances
-        # TagSpecifications — that root fix is blocked on krepis.ec2_spot)
-        # or a genuine anomaly worth the alert this False triggers.
+        # look up a marker either way. INVARIANT (config#2267 site 2, root
+        # fix landed config#2292): the sf-watch/ci-watch dispatchers now pass
+        # discriminator tags as ``extra_tags`` into the SAME RunInstances
+        # TagSpecifications call that launches the box (krepis.ec2_spot.launch
+        # >= 0.12.0, via nousergon-lib's spot_dispatch.launch_with_fallback)
+        # — tagging is atomic with launch, not a separate post-launch
+        # create_tags call, so there is no launch→tag race window left at
+        # all. A box that reaches the reaper with any discriminator tag
+        # missing is therefore a genuine anomaly (e.g. an operator-run
+        # instance manually stripped of tags), not the old race — worth the
+        # alert this False triggers.
         return False
     key = _completion_key(kind, watch_tags)
     try:

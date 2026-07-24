@@ -1,7 +1,11 @@
-"""Pins the watch-plane Lambda alarm setup script (config#2266).
+"""Pins the watch-plane Lambda alarm setup script (config#2266; roster
+extended to 8 functions + an intake-queue age alarm by config-I2900/I2910;
+extended to 9 functions by alpha-engine-config-I3242's arctic-migration-
+dispatcher onboarding; extended to 11 functions by config#3173's
+ci-watch-liveness-probe + alert-drain-liveness-probe onboarding).
 
 setup_watch_plane_alarms.sh puts CloudWatch Errors + Throttles alarms on each
-of the four watch-plane Lambdas — the components whose job is to notice fleet
+of the watch-plane Lambdas — the components whose job is to notice fleet
 failures, and whose own failures were previously the one unmonitored failure
 mode (docstrings claimed an "error metric + CW alarm" backstop that did not
 exist). These tests pin the load-bearing shape:
@@ -52,7 +56,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All four watch-plane Lambdas must be alarmed."""
+    """All eleven watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -60,7 +64,26 @@ class TestWatchPlaneCoverage:
             "alpha-engine-saturday-sf-watch-dispatcher",
             "alpha-engine-sf-watch-spot-dispatcher",
             "alpha-engine-ci-watch-dispatcher",
+            # Added config#3173: mid-run spot-reclaim checkers for the
+            # ci-watch and alert-drain families, mirroring
+            # sf-watch-liveness-probe's config#2270 mechanism — onboarded in
+            # the same PR that ships them.
+            "alpha-engine-ci-watch-liveness-probe",
+            "alpha-engine-alert-drain-liveness-probe",
             "alpha-engine-sf-watch-liveness-probe",
+            # The registry-driven unified probe (alpha-engine-config-I2831) — its
+            # own Errors metric is the dead-probe backstop the fail-loud contract
+            # assumes, same as the sibling probes.
+            "alpha-engine-overseer-liveness-probe",
+            "alpha-engine-overseer-dispatcher",
+            # Added config-I2900: both were Active with ZERO alarm coverage
+            # (the same "new Lambda, forgot to onboard it" miss, twice).
+            "alpha-engine-alert-drain-dispatcher",
+            "alpha-engine-substrate-health-gate",
+            # Added alpha-engine-config-I3242: the merge-triggered in-region
+            # ArcticDB migration runner — onboarded in the SAME PR that ships it,
+            # per this file's own header convention.
+            "alpha-engine-arctic-migration-dispatcher",
         ],
     )
     def test_lambda_is_present(self, script_text, fn_name):
@@ -69,13 +92,13 @@ class TestWatchPlaneCoverage:
             "it silently reopens the 'who watches the watcher' gap (config#2266)."
         )
 
-    def test_four_functions_declared(self, script_text):
+    def test_all_functions_declared(self, script_text):
         block = script_text[
             script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(") : script_text.find(
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 4
+        assert block.count('"alpha-engine-') == 11
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
@@ -164,4 +187,62 @@ class TestDocstringsNowTruthful:
             "Both fail-loud docstrings (module header + _write_watch_log) must "
             "name the alarm-provisioning script — the pre-#2266 wording claimed "
             "a CW alarm that did not exist."
+        )
+
+
+class TestOverseerIntakeDlqAlarm:
+    """The intake DLQ depth alarm (alpha-engine-config-I2823) rides this
+    script so its backstop-topic + fail-fast discipline applies to it too."""
+
+    def test_dlq_alarm_present(self, script_text):
+        assert "nousergon-overseer-intake-dlq" in script_text
+        assert "ApproximateNumberOfMessagesVisible" in script_text
+
+    def test_dlq_alarm_routes_to_backstop(self, script_text):
+        dlq_block = script_text[script_text.find("overseer-intake-dlq-depth"):]
+        assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in dlq_block
+
+
+class TestOverseerIntakeAgeAlarm:
+    """The intake queue age-of-oldest-message alarm (alpha-engine-config-I2910)
+    — a dead drain never fails delivery, so it never reaches the DLQ; this is
+    the alarm that catches messages that were never received at all."""
+
+    def _age_block(self, script_text: str) -> str:
+        pos = script_text.find("overseer-intake-age")
+        assert pos != -1, "alpha-engine-watch-plane-overseer-intake-age alarm not found"
+        return script_text[pos:]
+
+    def test_age_alarm_present_and_targets_the_live_queue_not_the_dlq(self, script_text):
+        block = self._age_block(script_text)
+        assert "ApproximateAgeOfOldestMessage" in block
+        # Must target the live intake queue, NOT the DLQ (that's the point —
+        # a dead drain leaves messages on the live queue, never on the DLQ).
+        dims_line = block[block.find("--dimensions"): block.find("--dimensions") + 80]
+        assert "Value=nousergon-overseer-intake" in dims_line
+        assert "Value=nousergon-overseer-intake-dlq" not in dims_line
+
+    def test_age_alarm_routes_to_backstop(self, script_text):
+        block = self._age_block(script_text)
+        assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in block
+        assert '--ok-actions "$BACKSTOP_TOPIC_ARN"' in block
+
+    def test_threshold_within_issue_band_18_to_24h(self, script_text):
+        # alpha-engine-config-I2910: "~18-24h, comfortably above the 12h
+        # drain cadence". Pin the threshold to that band in seconds.
+        block = self._age_block(script_text)
+        assert "--threshold 72000" in block
+        assert 18 * 3600 <= 72000 <= 24 * 3600
+
+    def test_age_alarm_missing_data_not_breaching(self, script_text):
+        block = self._age_block(script_text)
+        threshold_pos = block.find("--threshold 72000")
+        tail = block[threshold_pos:]
+        assert '--treat-missing-data "notBreaching"' in tail
+
+    def test_age_alarm_rides_alongside_dlq_alarm(self, script_text):
+        # I2910 explicitly asks for this alarm "alongside the existing DLQ
+        # alarm" in the same script, not a separate provisioning path.
+        assert script_text.find("overseer-intake-dlq-depth") < script_text.find(
+            "overseer-intake-age"
         )

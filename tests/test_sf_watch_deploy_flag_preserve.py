@@ -17,12 +17,15 @@ HELPER_REL = "_shared/preserve_env_flags.sh"
 SOURCE_LINE = 'source "${SCRIPT_DIR}/../_shared/preserve_env_flags.sh"'
 
 # dispatcher -> list of (flag_name, bootstrap_default, preserved_shell_var)
+# NOTE: saturday-sf-watch-dispatcher's post-escalation flag is deliberately
+# NOT listed here — config#2953 renamed it (EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION
+# -> SF_WATCH_DISPATCH_AFTER_ESCALATION) with a one-release legacy-name
+# fallback, which doesn't fit this generic single-preserve-call pattern; see
+# test_dispatch_after_escalation_flag_rename_preserves_legacy_and_new below.
 OPERATOR_FLAGS = {
     "saturday-sf-watch-dispatcher": [
         ("AGENT_DISPATCH_ENABLED", "false", "CURRENT_DISPATCH"),
         ("FAST_PATH_ENABLED", "false", "CURRENT_FAST_PATH"),
-        # config#2003: post-escalation dispatch override — operator-owned
-        ("EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION", "false", "CURRENT_DISPATCH_AFTER_ESCALATION"),
     ],
     "sf-watch-spot-dispatcher": [
         ("SF_WATCH_DISPATCH_ENABLED", "true", "CURRENT_DISPATCH"),
@@ -92,3 +95,34 @@ def test_deploy_update_path_preserves_operator_dispatch_flag():
             update_pos = src.index("Updating Lambda environment")
             assert src.rindex(hardcoded) < update_pos, \
                 f"{dispatcher}: hardcoded {hardcoded} may only exist pre-update (bootstrap)"
+
+
+def test_dispatch_after_escalation_flag_rename_preserves_legacy_and_new():
+    """config#2953: EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION was renamed to
+    SF_WATCH_DISPATCH_AFTER_ESCALATION (the old name wrongly implied EOD-only
+    scope on a fleet-wide dispatcher) with default false->true (shepherd
+    ruling). The update path must read the LEGACY name's live value (default
+    true) as the fallback default for the NEW name's live read — so an
+    operator override set under the old name before this rename survives —
+    then write BOTH names in lockstep for one release."""
+    src = (LAMBDAS_DIR / "saturday-sf-watch-dispatcher" / "deploy.sh").read_text()
+
+    assert (
+        'CURRENT_DISPATCH_AFTER_ESCALATION_LEGACY=$(preserve_env_flag '
+        '"${FUNCTION_NAME}" "${REGION}" EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION true)'
+    ) in src, "must preserve the legacy flag name's live value, default true"
+    assert (
+        'CURRENT_DISPATCH_AFTER_ESCALATION=$(preserve_env_flag '
+        '"${FUNCTION_NAME}" "${REGION}" SF_WATCH_DISPATCH_AFTER_ESCALATION '
+        '"${CURRENT_DISPATCH_AFTER_ESCALATION_LEGACY}")'
+    ) in src, "must preserve the new flag name, falling back to the legacy value"
+
+    update_pos = src.index("Updating Lambda environment")
+    update_env = src[update_pos:]
+    assert "SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION}" in update_env
+    assert "EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=${CURRENT_DISPATCH_AFTER_ESCALATION}" in update_env
+
+    assert "create-function" in src
+    bootstrap_env = src[src.index("create-function") : update_pos]
+    assert "SF_WATCH_DISPATCH_AFTER_ESCALATION=true" in bootstrap_env
+    assert "EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true" in bootstrap_env

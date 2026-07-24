@@ -10,6 +10,7 @@ mock requests + boto3 + arcticdb to exercise each failure mode.
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -22,6 +23,13 @@ BUCKET = "test-bucket"
 
 def _make(mode: str = "phase1") -> DataPreflight:
     return DataPreflight(bucket=BUCKET, mode=mode)
+
+
+def _host_is(url: str, host: str) -> bool:
+    """Exact-host match (not substring) so 'evil-polygon.io.attacker.com'
+    can't be mistaken for a probe to the real host."""
+    netloc = urlparse(url).netloc
+    return netloc == host or netloc.endswith(f".{host}")
 
 
 # ── Mode validation ──────────────────────────────────────────────────────────
@@ -69,6 +77,19 @@ class TestPolygonReachable:
             with pytest.raises(RuntimeError, match="auth failed"):
                 pf._check_polygon_reachable()
 
+    def test_429_rate_limited_passes(self):
+        # config#2662: a 429 is PROOF of reachability (service answered, auth
+        # not rejected) — the probe must NOT abort the workload; the
+        # collector's client (polygon_client._get) owns Retry-After pacing.
+        # The 2026-07-15 incident: this exact status killed the DataSpot
+        # phase twice for a condition the collector absorbs in seconds.
+        pf = self._setup()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(
+                status_code=429, text='{"error": "max requests per minute"}'
+            )
+            pf._check_polygon_reachable()  # must not raise
+
     def test_500_outage(self):
         pf = self._setup()
         with patch("requests.get") as mock_get:
@@ -99,6 +120,36 @@ class TestPolygonReachable:
         assert mock_get.call_count == 2
 
 
+# ── FMP /stable reachability ─────────────────────────────────────────────────
+
+class TestFmpStableReachable:
+    def _setup(self):
+        env_patch = patch.dict("os.environ", {"FMP_API_KEY": "fake_key"}, clear=False)
+        env_patch.start()
+        self._env_patch = env_patch
+        return _make()
+
+    def teardown_method(self):
+        if hasattr(self, "_env_patch"):
+            self._env_patch.stop()
+
+    def test_200_with_list_body_passes(self):
+        pf = self._setup()
+        resp = MagicMock(status_code=200, text='[{"symbol": "AAPL"}]')
+        resp.json.return_value = [{"symbol": "AAPL"}]
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = resp
+            pf._check_fmp_stable_reachable()
+
+    def test_429_rate_limited_passes(self):
+        # config#2662: same contract as the polygon probe — 429 proves
+        # reachability; quota pressure is the collector's to pace.
+        pf = self._setup()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=429, text="Limit Reach")
+            pf._check_fmp_stable_reachable()  # must not raise
+
+
 # ── FRED reachability ────────────────────────────────────────────────────────
 
 class TestFredReachable:
@@ -126,6 +177,14 @@ class TestFredReachable:
             )
             with pytest.raises(RuntimeError, match="auth failed.*invalid"):
                 pf._check_fred_reachable()
+
+    def test_429_rate_limited_passes(self):
+        # config#2662: same contract as the polygon probe — 429 proves
+        # reachability; _fred_get_with_retry owns pacing at fetch time.
+        pf = self._setup()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=429, text="Too Many Requests")
+            pf._check_fred_reachable()  # must not raise
 
     def test_500_outage(self):
         pf = self._setup()
@@ -369,8 +428,8 @@ class TestMorningEnrichMode:
             mock_http.return_value = MagicMock(status_code=200, text='{"ok": true}')
             pf.run()
         urls = [c.args[0] for c in mock_http.call_args_list]
-        assert any("polygon.io" in u for u in urls), urls
-        assert any("stlouisfed.org" in u for u in urls), urls
+        assert any(_host_is(u, "polygon.io") for u in urls), urls
+        assert any(_host_is(u, "stlouisfed.org") for u in urls), urls
 
     def test_morning_enrich_no_arcticdb_freshness_check(self):
         """morning_enrich must NOT call check_arcticdb_fresh (it is part

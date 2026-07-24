@@ -18,6 +18,7 @@ Usage:
     python weekly_collector.py --daily --dry-run      # validate daily
     python weekly_collector.py --morning-enrich       # morning polygon overwrite (prior trading day)
     python weekly_collector.py --morning-enrich --date 2026-04-23  # backfill specific date
+    python weekly_collector.py --daily-heal           # standalone daily data heal (I2717), off the preopen critical path
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from pathlib import Path
 
 import boto3
 import yaml
+from botocore.exceptions import ClientError
 
 def _load_dotenv() -> None:
     """Load .env file into os.environ (lightweight, no dependency).
@@ -66,7 +68,7 @@ _load_dotenv()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
-from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint, get_flow_doctor
 from nousergon_lib.phase_registry import PhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
 # lift of the five inline _find_config / load_config / config_loader copies into
@@ -168,6 +170,23 @@ def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "Phase
     )
 
 
+def _s3_object_exists(bucket: str, key: str) -> bool:
+    """HEAD-check an S3 object. Any non-404/NoSuchKey ClientError (IAM drift,
+    throttling, etc.) RAISES — fail-loud per feedback_no_silent_fails; a
+    verification check that silently treats "couldn't check" as "doesn't
+    exist" would produce nondeterministic spurious failures, and treating it
+    as "exists" would defeat the whole point of verify-by-artifact."""
+    s3 = boto3.client("s3")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return False
+        raise
+
+
 def _phase_collect(
     reg: "PhaseRegistry | None",
     name: str,
@@ -175,6 +194,8 @@ def _phase_collect(
     *,
     artifact_key: str | None = None,
     supports_auto_skip: bool = True,
+    verify_artifact_exists: bool = False,
+    bucket: str | None = None,
 ) -> dict:
     """Run a collector under the phase registry (markers + L4524 artifact-validated
     auto-skip + watchdog), preserving the module's best-effort-continue posture.
@@ -191,6 +212,18 @@ def _phase_collect(
 
     ``supports_auto_skip=False`` (multi-file / shared-DB / ArcticDB producers with no
     single stable S3 key) → markers + watchdog only, the phase always runs.
+
+    ``verify_artifact_exists=True`` (config-I2702 deliverable #2, "verify-by-artifact
+    workloads"): after a collector reports ``status="ok"``, HEAD-check that
+    ``artifact_key`` actually exists on S3 BEFORE recording success — a collector's own
+    internal ``status="ok"`` reflects "the fetch/write call didn't raise", not "the
+    contracted output is queryable". A missing artifact downgrades the phase to
+    ``error``, which _CollectorError already routes to main()'s existing
+    ``results["status"] not in ("ok", "skipped") -> SystemExit(1)`` contract — no new
+    exit-code plumbing needed, just a stricter success predicate. Skipped for
+    ``status="ok_dry_run"`` (dry-run collectors write nothing real to verify) and for
+    auto-skip cache hits (the L4524 auto-skip check already re-verified the artifact's
+    presence via its own S3 probe before returning the cache hit).
     """
     if reg is None:
         try:
@@ -208,6 +241,19 @@ def _phase_collect(
             result = run_fn() or {}
             if result.get("status") == "error":
                 raise _CollectorError(name, result.get("error"))
+            if verify_artifact_exists and artifact_key and result.get("status") == "ok":
+                if bucket is None:
+                    raise _CollectorError(
+                        name, "verify_artifact_exists=True but bucket was not supplied to _phase_collect"
+                    )
+                if not _s3_object_exists(bucket, artifact_key):
+                    raise _CollectorError(
+                        name,
+                        f"collector reported status=ok but its contracted artifact "
+                        f"s3://{bucket}/{artifact_key} does not exist (verify-by-artifact, "
+                        f"config-I2702 deliverable #2 — rc=0 must mean the artifact exists, "
+                        f"never just 'the process did not crash')",
+                    )
             if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
                 ctx.record_artifact(artifact_key)
             return result
@@ -243,6 +289,9 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
     if getattr(args, "chronic_gap_heal", False):
         return _run_chronic_gap_heal(config, args)
+
+    if getattr(args, "daily_heal", False):
+        return _run_daily_heal(config, args)
 
     if args.daily:
         return _run_daily(config, args)
@@ -364,6 +413,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     staleness_threshold_days=price_cfg.get("staleness_threshold_days", 3),
                     batch_size=price_cfg.get("refresh_batch_size", 50),
                     dry_run=dry_run,
+                    reference_date=run_date,
                 ),
                 supports_auto_skip=False,
             )
@@ -962,11 +1012,23 @@ def _detect_chronic_gap_constituents_drift(
 # state — a spot-per-4-ticker-heal would be wasteful (2026-06-11 decision).
 _CHRONIC_HEAL_HARD_TIMEOUT_S = 600
 
-# Hard bound for the prior-universe-gap self-heal that runs at the head of the
-# MorningArcticAppend state (40-min SSM budget). One interior-day backfill is a
-# full-universe mid-series ArcticDB rewrite (~20 min), so the bound leaves
-# ample headroom for the load-bearing same-day append that follows.
+# Hard bound for the prior-universe-gap self-heal. Historically ran at the
+# head of the MorningArcticAppend state (40-min SSM budget) — REMOVED from that
+# state (alpha-engine-config-I2717, 2026-07-16; the standalone --daily-heal
+# entrypoint below is the sole remaining caller). Retained UNCHANGED at 1500s
+# per the I2717 build instruction in case a future caller ever needs the
+# tighter (critical-path-safe) bound again; the standalone daily heal instead
+# uses the much larger _UNIVERSE_GAP_HEAL_STANDALONE_HARD_TIMEOUT_S below,
+# since it runs off the critical path with no daemon-start deadline pressure.
 _UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S = 1500
+# Hard bound for the universe-gap self-heal when run from the standalone
+# `--daily-heal` EventBridge-triggered job (alpha-engine-config-I2717). Off the
+# preopen critical path entirely (fires ~09:00 UTC, hours before the 12:45 UTC
+# preopen), so this affords a much bigger budget than the 1500s
+# _UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S above ever could — a multi-day backfill or
+# a slow ArcticDB rewrite no longer risks delaying daemon start. Config-
+# overridable via config["universe_gap_heal"]["standalone_hard_timeout_s"].
+_UNIVERSE_GAP_HEAL_STANDALONE_HARD_TIMEOUT_S = 3600
 # How many trading days back to scan for a missing universe append, and how
 # many to heal per run. Default heals only the single most-recent missing day
 # so one run stays comfortably inside the 40-min append budget; a multi-day
@@ -975,6 +1037,122 @@ _UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S = 1500
 # via config["universe_gap_heal"].
 _UNIVERSE_GAP_HEAL_LOOKBACK_TD = 5
 _UNIVERSE_GAP_HEAL_MAX_PER_RUN = 1
+
+# config#2672 (Brian-ratified binding design, 2026-07-15): a durable
+# desired-state ledger so a fallback-quality (yfinance-basis) trading day can
+# NEVER age out unhealed — the bug this issue exists to fix. The sliding
+# -window detectors above (``_detect_missing_universe_days``,
+# ``_detect_fallback_quality_universe_days``) only look back
+# ``lookback_trading_days`` sessions; a day that misses every heal attempt
+# within that window (e.g. repeated Polygon rate-limiting) silently ages out
+# and is never revisited again. This ledger removes that ceiling structurally
+# rather than widening the window (which would just move the ceiling, not
+# remove it): every successful yfinance-basis (fallback-quality) EOD write
+# marks its date here; every successful polygon-corrected write (morning
+# MorningArcticAppend, and the gap-heal path itself) clears it. The reader
+# (``_self_heal_missing_universe_days``) UNIONS this ledger with both
+# existing sliding-window detectors — belt-and-braces: a ledger read/write
+# failure degrades to today's in-window-only behavior, never below it.
+#
+# Single small JSON object keyed by trading_day, touched at most twice/day —
+# plain S3 read-modify-write is adequate (mirrors ARTIFACT_REGISTRY
+# conventions); no DynamoDB needed. Best-effort fail-soft on the trading
+# path: a ledger write failure must NEVER block or crash the daemon-path
+# append (wrapped in try/except, log-and-continue at every call site) — but
+# its absence is self-evident, since the sliding-window detectors above still
+# independently catch in-window days regardless of ledger health.
+_PENDING_UPGRADES_LEDGER_BUCKET = "alpha-engine-research"
+_PENDING_UPGRADES_LEDGER_KEY = "_data_quality/pending_upgrades.json"
+
+
+def _load_pending_upgrades_ledger(
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> dict:
+    """Read the pending-upgrades ledger — ``{trading_day: {reason, detected_at}}``.
+
+    Best-effort: a missing object (first-ever write) or any read/parse
+    failure returns ``{}`` so the reader degrades to sliding-window-only
+    detection rather than raising — this ledger is a belt-and-braces
+    ADDITION to the existing detectors, never a replacement dependency.
+    """
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        doc = json.loads(obj["Body"].read())
+        return doc if isinstance(doc, dict) else {}
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("NoSuchKey", "404"):
+            logger.warning("pending-upgrades ledger read failed (%s) — "
+                           "degrading to sliding-window-only detection.", exc)
+        return {}
+    except Exception as exc:  # noqa: BLE001 — best-effort read, never blocks the reader
+        logger.warning("pending-upgrades ledger read failed (%s) — "
+                       "degrading to sliding-window-only detection.", exc)
+        return {}
+
+
+def _write_pending_upgrades_ledger(
+    doc: dict,
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> None:
+    """Best-effort PUT of the full ledger document. Never raises — a write
+    failure is logged and swallowed (fail-soft on the trading path)."""
+    try:
+        s3 = boto3.client("s3")
+        s3.put_object(
+            Bucket=bucket, Key=key,
+            Body=json.dumps(doc, sort_keys=True, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-soft: never blocks the trading-path append
+        logger.warning("pending-upgrades ledger write failed (%s) — "
+                       "in-window sliding-window detection remains the backstop.", exc)
+
+
+def _mark_pending_upgrade(
+    trading_day: str,
+    reason: str = "fallback_quality",
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> None:
+    """Read-modify-write: mark ``trading_day`` as needing the Polygon-corrected
+    upgrade. Called on every successful yfinance-basis (fallback-quality) EOD
+    write (:func:`_run_daily_arctic_append`). Idempotent (overwrites any
+    existing entry for the same day) and fail-soft — never raises."""
+    try:
+        doc = _load_pending_upgrades_ledger(bucket, key)
+        doc[trading_day] = {
+            "reason": reason,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_pending_upgrades_ledger(doc, bucket, key)
+        logger.info("pending-upgrades ledger: marked %s (%s).", trading_day, reason)
+    except Exception as exc:  # noqa: BLE001 — fail-soft: never blocks the daemon-path append
+        logger.warning("pending-upgrades ledger: failed to mark %s (%s) — non-blocking.",
+                       trading_day, exc)
+
+
+def _clear_pending_upgrade(
+    trading_day: str,
+    bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
+    key: str = _PENDING_UPGRADES_LEDGER_KEY,
+) -> None:
+    """Read-modify-write: clear ``trading_day`` from the ledger on a
+    successful Polygon-corrected write (the morning load-bearing append, or
+    the gap-heal path itself). A day absent from the ledger is a no-op
+    (nothing to clear). Fail-soft — never raises."""
+    try:
+        doc = _load_pending_upgrades_ledger(bucket, key)
+        if trading_day in doc:
+            del doc[trading_day]
+            _write_pending_upgrades_ledger(doc, bucket, key)
+            logger.info("pending-upgrades ledger: cleared %s.", trading_day)
+    except Exception as exc:  # noqa: BLE001 — fail-soft: never blocks the daemon-path append
+        logger.warning("pending-upgrades ledger: failed to clear %s (%s) — non-blocking.",
+                       trading_day, exc)
 
 
 class _HardTimeout(BaseException):
@@ -1354,13 +1532,16 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         results["status"] = "failed"
         return results
 
-    MACRO_DAILY_TICKERS = [
-        "SPY", "GLD", "USO",
-        "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
-        "XLP", "XLRE", "XLU", "XLV", "XLY",
-        "^VIX", "^VIX3M", "^TNX", "^IRX",
-    ]
-    tickers = list(dict.fromkeys(tickers + MACRO_DAILY_TICKERS))
+    # Shared with _load_daily_universe_tickers / _run_daily_arctic_append
+    # (the EOD PostMarketArcticAppend twin of this weekday MorningEnrich
+    # path) — was a SEPARATE inline copy of the same 17-symbol list until
+    # config-I2703 (2026-07-15): two independently-editable literals of
+    # "the macro/benchmark daily tickers" is exactly the duplicate-pin
+    # drift class (one copy gets updated, the other silently doesn't).
+    # Both call sites now derive from the single module-level
+    # _MACRO_DAILY_TICKERS constant so SPY (and any future addition) can't
+    # drift out of one path while staying in the other.
+    tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
     logger.info("=" * 60)
     logger.info("MORNING ENRICH: polygon overwrite for %s (prior trading day)", target_date)
@@ -1673,6 +1854,18 @@ def _self_heal_missing_universe_days(
         limit) — the day is present, so nothing else ever revisits it
         (see :func:`_detect_fallback_quality_universe_days`).
 
+    config#2672: the two detectors above only scan the last
+    ``lookback_trading_days`` sessions — a day that misses healing on every
+    attempt within that sliding window silently ages out and is never
+    revisited again (the bug this issue exists to fix). The durable
+    ``_data_quality/pending_upgrades.json`` ledger (best-effort marked by
+    every yfinance-basis EOD write, cleared by every polygon-corrected write)
+    is UNIONED in here as a third source — belt-and-braces: a ledger read
+    failure degrades to the two window detectors' existing (in-window)
+    coverage, never below it. A ledger day already covered by the window scan
+    is de-duplicated; a ledger day OUTSIDE the window (the actual case this
+    ledger exists for) is still healed.
+
     For each day to heal:
       1. Resolve that day's constituents via ``load_constituents_for_run_date``
          (run_date-direct, #468-correct — never the latest_weekly pointer),
@@ -1696,6 +1889,7 @@ def _self_heal_missing_universe_days(
         "max_per_run": max_heal_days,
         "missing_days": [],
         "fallback_quality_days": [],
+        "ledger_days": [],
         "healed_days": [],
         "deferred_days": [],
         "errors": [],
@@ -1708,14 +1902,29 @@ def _self_heal_missing_universe_days(
     summary["missing_days"] = missing
     summary["fallback_quality_days"] = fallback_quality
 
-    # Mutually exclusive by construction (fallback-quality requires an
-    # existing row; missing requires none) — de-dup is defensive only.
-    # Missing days are the more severe gap, so they get healed first.
-    combined = missing + [d for d in fallback_quality if d not in missing]
+    # config#2672: the durable ledger, newest-first — the third (unbounded
+    # -horizon) source. Best-effort read: a ledger failure returns {} and this
+    # degrades to the two window detectors above, never below their coverage.
+    ledger = _load_pending_upgrades_ledger(bucket)
+    ledger_days = sorted(ledger.keys(), reverse=True)
+    summary["ledger_days"] = ledger_days
+
+    # Mutually exclusive by construction between missing/fallback_quality
+    # (fallback-quality requires an existing row; missing requires none) — de
+    # -dup there is defensive only. The ledger is NOT mutually exclusive with
+    # either (a day already caught by the window scan is also very likely
+    # ledger-marked) — de-dup against both. Missing days are the more severe
+    # gap, so they get healed first; ledger-only days (already outside the
+    # window) come last since the window-scan days are the fresher signal.
+    combined = (
+        missing
+        + [d for d in fallback_quality if d not in missing]
+        + [d for d in ledger_days if d not in missing and d not in fallback_quality]
+    )
     if not combined:
         logger.info(
-            "universe-gap heal: no prior trading-day gaps or fallback-quality "
-            "rows before %s.",
+            "universe-gap heal: no prior trading-day gaps, fallback-quality "
+            "rows, or ledger-pending upgrades before %s.",
             target_date,
         )
         return summary
@@ -1724,14 +1933,14 @@ def _self_heal_missing_universe_days(
     summary["deferred_days"] = combined[max_heal_days:]
     logger.warning(
         "universe-gap heal: %d day(s) need healing before %s — %d missing (%s), "
-        "%d fallback-quality (%s); healing %s this run%s.",
+        "%d fallback-quality (%s), %d ledger-pending (%s); healing %s this run%s.",
         len(combined), target_date, len(missing), missing,
-        len(fallback_quality), fallback_quality, to_heal,
+        len(fallback_quality), fallback_quality, len(ledger_days), ledger_days, to_heal,
         f", deferring {summary['deferred_days']} to subsequent runs" if summary["deferred_days"] else "",
     )
 
     from builders._constituents_loader import load_constituents_for_run_date
-    from builders.daily_append import daily_append
+    from builders.daily_append import UniverseFreshnessViolation, daily_append
     from collectors import daily_closes
 
     daily_cfg = config.get("daily_closes", {})
@@ -1739,7 +1948,12 @@ def _self_heal_missing_universe_days(
     s3 = boto3.client("s3")
 
     for day in to_heal:
-        kind = "missing" if day in missing else "fallback_quality"
+        if day in missing:
+            kind = "missing"
+        elif day in fallback_quality:
+            kind = "fallback_quality"
+        else:
+            kind = "ledger"  # config#2672: aged out of both sliding windows, ledger-only
         try:
             try:
                 tickers_set, weekly_date = load_constituents_for_run_date(
@@ -1779,6 +1993,35 @@ def _self_heal_missing_universe_days(
                 dry_run=dry_run,
                 expected_tickers=tickers,
             )
+        except UniverseFreshnessViolation as exc:
+            # config#2685: this is only ever raised by the post-write
+            # whole-universe freshness scan, which runs after the
+            # per-ticker append loop + error-rate gate have both already
+            # succeeded — so `day`'s own write landed. An unrelated stale
+            # ticker elsewhere in the universe must not misreport this
+            # day's heal as failed; it's a monitored signal, not a heal
+            # error (config-I2684 — the 2026-07-15 backfill's actually-
+            # successful writes were unreadable as `errors` in this exact
+            # summary because of this conflation).
+            summary["healed_days"].append(
+                {
+                    "date": day,
+                    "kind": kind,
+                    "tickers": len(tickers),
+                    "weekly_date": str(weekly_date),
+                }
+            )
+            logger.warning(
+                "universe-gap heal: backfilled %s (%s, %d tickers) — target-date "
+                "write ok, but %d unrelated universe symbol(s) elsewhere are "
+                "stale (monitored separately, not a heal failure): %s",
+                day, kind, len(tickers), len(exc.stale_symbols),
+                [s["symbol"] for s in exc.stale_symbols][:10],
+            )
+        except Exception as exc:
+            logger.warning("universe-gap heal: failed to backfill %s (%s, %s).", day, kind, exc)
+            summary["errors"].append({"date": day, "kind": kind, "reason": str(exc)})
+        else:
             status = append_result.get("status", "unknown")
             if status in ("ok", "ok_dry_run"):
                 summary["healed_days"].append(
@@ -1793,6 +2036,14 @@ def _self_heal_missing_universe_days(
                     "universe-gap heal: backfilled %s (%s, %d tickers, status=%s).",
                     day, kind, len(tickers), status,
                 )
+                # config#2672: this path always writes the polygon-corrected
+                # (auto-source) row (see daily_closes.collect(source="auto")
+                # above) — clear the ledger entry, if any, on every successful
+                # heal regardless of `kind` (a day can be ledger-marked AND
+                # independently caught by the window scan). Fail-soft, never
+                # blocks this already-successful heal.
+                if not dry_run:
+                    _clear_pending_upgrade(day, bucket)
             else:
                 summary["errors"].append(
                     {"date": day, "kind": kind, "reason": f"daily_append status={status}"}
@@ -1801,11 +2052,181 @@ def _self_heal_missing_universe_days(
                     "universe-gap heal: daily_append for %s (%s) returned status=%s.",
                     day, kind, status,
                 )
-        except Exception as exc:
-            logger.warning("universe-gap heal: failed to backfill %s (%s, %s).", day, kind, exc)
-            summary["errors"].append({"date": day, "kind": kind, "reason": str(exc)})
 
     return summary
+
+
+def _run_daily_heal(config: dict, args: argparse.Namespace) -> dict:
+    """Standalone daily data-heal workload (alpha-engine-config-I2717).
+
+    Brian ruling 2026-07-16 (I2717 + the shared I2722 scope note): the
+    universe-gap self-heal (missing/fallback-quality days, config#1228 +
+    config#2664) and the chronic-polygon-gap heal (config#1811's
+    ``ChronicGapSelfHeal``, folded in here per the ruling — "the new daily
+    heal run bundles the ChronicGapSelfHeal logic too") both move OFF the
+    ``ne-preopen-trading-pipeline`` critical path entirely into this single
+    EventBridge-triggered daily spot job (~09:00 UTC, hours before the
+    12:45 UTC preopen so heals still land same-day ahead of inference).
+    Freed from the preopen's tight poll budget, this affords each heal a much
+    larger timeout than either could safely spend inline (1500s for the
+    universe-gap heal at the head of MorningArcticAppend; 300s SSM budget for
+    ChronicGapSelfHeal on the trading box).
+
+    Dispatched via the data-spot-dispatcher Lambda's ``daily-heal`` workload
+    on its own ephemeral spot box — see
+    ``infrastructure/lambdas/data-spot-dispatcher/index.py``.
+
+    Both heals stay fail-soft / best-effort INTERNALLY exactly as before (a
+    single stale ticker or a single bad day must never abort the whole run) —
+    see :func:`_self_heal_missing_universe_days` and
+    :func:`_run_chronic_gap_heal`, both of which are documented to NEVER
+    raise. This function does not additionally swallow their output; if
+    either ever starts raising unexpectedly (a genuine regression, not a
+    per-item failure) that propagates out of this function, out of
+    ``run_weekly()``, and crashes ``main()`` with a nonzero exit — the
+    MODE-level fail-loud posture the build spec requires ("exits nonzero if
+    the heal infrastructure itself blows up"). DataPreflight (wired in
+    ``main()`` for this mode, same surface as ``--daily``) is the first line
+    of defense: a genuinely unreachable S3/ArcticDB fails loud there, before
+    any heal work starts.
+
+    Emits the ``AlphaEngine/Data daily_heal_days_healed`` CloudWatch metric
+    EVERY run (continuous baseline, including 0 — matches the existing
+    chronic-gap drift-alarm convention in this file) and writes a heal-summary
+    artifact to ``data/heal/daily/{run_date}.json`` — the artifact the
+    freshness-monitor plane watches (per the I2722 health-plane ruling: no new
+    bundled health SF, extend the existing Lambda watch plane instead).
+    """
+    bucket = config["bucket"]
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Same PT-aware target-date resolution as MorningEnrich/MorningArcticAppend
+    # (the day being healed is the prior trading day relative to this run).
+    if args.date is None:
+        from zoneinfo import ZoneInfo
+        target_date = _previous_trading_day(
+            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
+        )
+    else:
+        target_date = args.date
+
+    dry_run = args.dry_run
+    results: dict = {
+        "mode": "daily_heal",
+        "date": target_date,
+        "started_at": started_at,
+        "collectors": {},
+    }
+
+    # ── Universe-gap heal (config#1228 + config#2664; formerly the head of
+    # MorningArcticAppend) — bigger, config-overridable hard-timeout budget
+    # now that this runs off the critical path.
+    ugh_cfg = config.get("universe_gap_heal", {})
+    standalone_timeout_s = int(
+        ugh_cfg.get(
+            "standalone_hard_timeout_s", _UNIVERSE_GAP_HEAL_STANDALONE_HARD_TIMEOUT_S
+        )
+    )
+    try:
+        with _hard_timeout(standalone_timeout_s, "standalone universe-gap self-heal"):
+            heal_summary = _self_heal_missing_universe_days(
+                bucket=bucket,
+                target_date=target_date,
+                config=config,
+                dry_run=dry_run,
+                lookback_trading_days=int(
+                    ugh_cfg.get("lookback_trading_days", _UNIVERSE_GAP_HEAL_LOOKBACK_TD)
+                ),
+                max_heal_days=int(
+                    ugh_cfg.get("max_heal_days_per_run", _UNIVERSE_GAP_HEAL_MAX_PER_RUN)
+                ),
+            )
+        results["collectors"]["universe_gap_heal"] = {"status": "ok", **heal_summary}
+    except _HardTimeout as e:
+        logger.warning(
+            "standalone universe-gap self-heal hit the %ds hard timeout for "
+            "%s — skipping (best-effort). %s",
+            standalone_timeout_s, target_date, e,
+        )
+        results["collectors"]["universe_gap_heal"] = {"status": "skipped", "error": str(e)}
+    except Exception as e:
+        logger.exception("standalone universe-gap self-heal failed for %s (non-blocking)", target_date)
+        results["collectors"]["universe_gap_heal"] = {"status": "error", "error": str(e)}
+
+    # ── Chronic-polygon-gap heal (config#1811's ChronicGapSelfHeal logic,
+    # folded in here per the I2717 ruling) — reuses _run_chronic_gap_heal
+    # verbatim (same yfinance-backfill + polygon-recovery/constituents-drift
+    # alarms), just invoked from this standalone entrypoint instead of the
+    # weekday SF's on-trading-box state. Not wrapped in an extra try/except:
+    # _run_chronic_gap_heal's own docstring commits to NEVER raising (its
+    # entire body is a defense-in-depth wrapper already); an unjustified
+    # extra swallow here would only hide a genuine regression from the
+    # MODE-level fail-loud posture this function documents above.
+    chronic_result = _run_chronic_gap_heal(config, args)
+    results["collectors"]["chronic_gap_heal"] = chronic_result
+
+    # ── Metric: continuous baseline of actual heal work performed (Brian's
+    # "loud alert whenever the healer actually does heal-work" ruling). Counts
+    # BOTH the universe-gap days healed and the chronic-gap tickers healed —
+    # either kind firing is a real data-quality event worth seeing. Always
+    # emits (including 0) — best-effort, mirrors the existing chronic-gap
+    # drift-alarm metrics in this file (_detect_chronic_gap_polygon_recovery /
+    # _detect_chronic_gap_constituents_drift).
+    universe_days_healed = len(
+        results["collectors"]["universe_gap_heal"].get("healed_days", [])
+    )
+    chronic_tickers_healed = len(
+        chronic_result.get("collectors", {})
+        .get("chronic_gap_self_heal", {})
+        .get("healed", [])
+    )
+    days_healed = universe_days_healed + chronic_tickers_healed
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "daily_heal_days_healed",
+                "Value": float(days_healed),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "daily_heal_days_healed metric emit failed: %s — the "
+            "days-healed alarm cadence may degrade until next cycle.", exc,
+        )
+
+    results["completed_at"] = datetime.now(timezone.utc).isoformat()
+    results["days_healed"] = days_healed
+    # Best-effort mode overall: neither sub-heal raises (see above), so this
+    # always reports "ok" — matching _run_chronic_gap_heal's own "always ok"
+    # semantics. A genuine infrastructure blowup escapes as an uncaught
+    # exception instead (see the fail-loud note in the docstring above), never
+    # as a status="failed" return.
+    results["status"] = "ok"
+
+    # Heal-summary artifact — the freshness-monitor plane's watch target
+    # (I2722 health-plane ruling). Deliberately NOT wrapped in a try/except:
+    # an inability to write this IS the "cannot reach S3 at all" case the
+    # MODE-level fail-loud posture must catch, so a write failure propagates
+    # and exits nonzero rather than silently leaving the freshness monitor
+    # blind to this run ever having happened.
+    s3 = boto3.client("s3")
+    s3.put_object(
+        Bucket=bucket,
+        Key=f"data/heal/daily/{target_date}.json",
+        Body=json.dumps(results, indent=2, default=str),
+        ContentType="application/json",
+    )
+    logger.info(
+        "Daily heal complete for %s: universe_days_healed=%d "
+        "chronic_tickers_healed=%d (metric daily_heal_days_healed=%d) → "
+        "s3://%s/data/heal/daily/%s.json",
+        target_date, universe_days_healed, chronic_tickers_healed, days_healed,
+        bucket, target_date,
+    )
+    return results
 
 
 def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
@@ -1852,40 +2273,13 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    # Prior-gap self-heal (config#1228): BEFORE today's load-bearing append,
-    # backfill any recent trading day whose universe append was skipped (a
-    # weekday/EOD SF halt), so the series stays gapless and the next EOD
-    # reconcile measures against the true previous trading day rather than a
-    # stale non-adjacent close. Runs here (40-min SSM budget on EC2) because a
-    # full-universe interior-day rewrite is far too slow for the 5-min
-    # best-effort ChronicGapSelfHeal state. Fail-soft + hard-bounded: a heal
-    # failure or hang must NEVER block or delay today's append.
-    ugh_cfg = config.get("universe_gap_heal", {})
-    try:
-        with _hard_timeout(_UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S, "universe-gap self-heal"):
-            heal_summary = _self_heal_missing_universe_days(
-                bucket=bucket,
-                target_date=target_date,
-                config=config,
-                dry_run=dry_run,
-                lookback_trading_days=int(
-                    ugh_cfg.get("lookback_trading_days", _UNIVERSE_GAP_HEAL_LOOKBACK_TD)
-                ),
-                max_heal_days=int(
-                    ugh_cfg.get("max_heal_days_per_run", _UNIVERSE_GAP_HEAL_MAX_PER_RUN)
-                ),
-            )
-        results["collectors"]["prior_gap_heal"] = {"status": "ok", **heal_summary}
-    except _HardTimeout as e:
-        logger.warning(
-            "universe-gap self-heal hit the %ds hard timeout for %s — skipping "
-            "(best-effort); today's append proceeds. %s",
-            _UNIVERSE_GAP_HEAL_HARD_TIMEOUT_S, target_date, e,
-        )
-        results["collectors"]["prior_gap_heal"] = {"status": "skipped", "error": str(e)}
-    except Exception as e:
-        logger.exception("universe-gap self-heal failed for %s (non-blocking)", target_date)
-        results["collectors"]["prior_gap_heal"] = {"status": "error", "error": str(e)}
+    # Prior-gap self-heal (config#1228) REMOVED from this state (alpha-engine-
+    # config-I2717, 2026-07-16): it moved off the preopen critical path entirely
+    # into the standalone `--daily-heal` EventBridge-triggered run (see
+    # `_run_daily_heal` below), which has a much larger (3600s default, config-
+    # overridable) hard-timeout budget than the 1500s this state could spare
+    # without risking today's load-bearing append. MorningArcticAppend is now a
+    # pure append — no heal work runs inline here.
 
     # Load the constituents MorningEnrich just refreshed to S3 (post-prune
     # universe scope for daily_append's expected-ticker check). S3 → Wikipedia
@@ -1977,6 +2371,12 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         # verdict so a write failure halts the pipeline (predictor reads next).
         _status = arctic_result.get("status", "unknown")
         results["status"] = "ok" if _status in ("ok", "ok_dry_run") else "failed"
+        if results["status"] == "ok" and not dry_run:
+            # config#2672: this IS the polygon-corrected write — clear
+            # target_date from the pending-upgrades ledger on success (a
+            # no-op if it was never marked). Fail-soft, never blocks the
+            # already-successful load-bearing append.
+            _clear_pending_upgrade(target_date, bucket)
     except Exception as e:
         logger.exception("ArcticDB daily_append (arctic-append state) failed for %s", target_date)
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
@@ -1991,10 +2391,15 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
     """Best-effort chronic-polygon-gap drift detection + yfinance self-heal.
 
     Split out of :func:`_run_morning_enrich` (2026-06-11) into its own
-    weekday-SF state (``ChronicGapSelfHeal``). Yfinance-backfills any ArcticDB
-    universe row gap for the chronic-gap tickers (BF-B/BRK-B/MOG-A/PSTG by
-    default — see config; polygon does not reliably serve them) and emits the
-    polygon-recovery + constituents-drift alarms.
+    weekday-SF state (``ChronicGapSelfHeal``) — that dedicated SF state was
+    REMOVED entirely (alpha-engine-config-I2717, 2026-07-16); this function
+    itself is unchanged and is now called from two places: inline from
+    :func:`_run_morning_enrich` (the Saturday path, unaffected by I2717) and
+    from the new standalone :func:`_run_daily_heal` (the weekday path's
+    replacement for the old ChronicGapSelfHeal state). Yfinance-backfills any
+    ArcticDB universe row gap for the chronic-gap tickers (BF-B/BRK-B/MOG-A/
+    PSTG by default — see config; polygon does not reliably serve them) and
+    emits the polygon-recovery + constituents-drift alarms.
 
     Runs AFTER MorningEnrich's load-bearing daily_append, as a fail-soft SF
     state, so an unbounded ``yf.download`` hang here (the 2026-06-11 SIGKILL
@@ -2162,6 +2567,13 @@ _MACRO_DAILY_TICKERS = [
     "SPY", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
+    # config#934 — sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX),
+    # the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF.
+    # Their daily closes must land in staging/daily_closes so daily_append can
+    # write their bars to ArcticDB macro for the sub_sector_vs_benchmark_*
+    # features. Additive: unlike the XL* set, a missing bar here is non-fatal
+    # in daily_append (the feature neutral-defaults) — see daily_append.
+    "SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
 ]
 
@@ -2194,11 +2606,15 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
 
 
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
-    """Daily mode: capture today's OHLCV closes for all tracked tickers."""
+    """Daily mode: capture today's OHLCV closes for all tracked tickers, plus
+    (config#2756) refresh reference/price_cache/*.parquet for any ticker that
+    missed a trading session — keeps the cache daily-fresh instead of the
+    prior Saturday-only cadence."""
     bucket = config["bucket"]
     run_date = args.date or default_run_date()
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
+    price_cfg = config.get("price_cache", {})
     reg = _build_registry(config, args, run_date)
 
     results: dict = {
@@ -2245,7 +2661,53 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             skip_if_canonical=skip_if_canonical,
         ),
         artifact_key=f"{_dc_prefix}{run_date}.parquet",
+        # config-I2702 deliverable #2: this collector's artifact is the EOD
+        # post-market-data data-spot workload's whole contracted output — the
+        # PostMarketArcticAppend state (and the reconcile-only replay's
+        # skip_post_market_data=false path) read this exact parquet. A
+        # collector that reports status=ok without the file actually landing
+        # on S3 must not be treated as success.
+        verify_artifact_exists=True,
+        bucket=bucket,
     )
+
+    # ── Price cache refresh (config#2756 — daily cadence) ───────────────────
+    # reference/price_cache/*.parquet previously only refreshed on the
+    # Saturday DataPhase1 run, so metron_market_data.collect_history's
+    # 1-trading-day price_cache staleness gate (data#693) only cleared on
+    # Monday; Tue-Fri the whole universe fell back to an independent
+    # yfinance fetch. Running the same collector here (Mon-Fri EOD) keeps
+    # the cache within `daily_staleness_threshold_days` trading sessions on
+    # every weekday. _find_stale_fast is trading-day-exact (config#2756), so
+    # in steady state only tickers that actually missed a session (new
+    # listings, corporate actions, a prior-day miss) pay the full 10y
+    # yfinance rewrite — most weekdays this list is empty.
+    if bool(price_cfg.get("daily_enabled", True)):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: price cache (daily)")
+        logger.info("=" * 60)
+        results["collectors"]["prices"] = _phase_collect(
+            reg, "prices",
+            lambda: prices.collect(
+                bucket=bucket,
+                tickers=tickers,
+                s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
+                fetch_period=price_cfg.get("fetch_period", "10y"),
+                staleness_threshold_days=price_cfg.get("daily_staleness_threshold_days", 1),
+                batch_size=price_cfg.get("refresh_batch_size", 50),
+                dry_run=dry_run,
+                reference_date=run_date,
+            ),
+            supports_auto_skip=False,
+        )
+        # Same unconditional sentinel the Saturday run writes (config#2350) —
+        # now also written on a successful weekday refresh so the freshness
+        # monitor sees the true (now-daily) cadence.
+        if not dry_run and results["collectors"]["prices"].get("status") == "ok":
+            _write_price_cache_freshness_sentinel(
+                boto3.client("s3"), bucket,
+                writer="nousergon-data:weekly_collector.py:daily",
+            )
 
     # Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
     # `alpha-engine-data` is the single market-data ground truth for the NE system;
@@ -2483,6 +2945,12 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         # verdict so a write failure halts the pipeline (reconcile reads next).
         _status = arctic_result.get("status", "unknown")
         results["status"] = "ok" if _status in ("ok", "ok_dry_run") else "failed"
+        if results["status"] == "ok" and not dry_run:
+            # config#2672: EOD is ALWAYS the yfinance-basis (fallback-quality)
+            # write — mark run_date pending the next morning's polygon
+            # -corrected overwrite. Idempotent (re-marking is harmless) and
+            # fail-soft; never blocks this already-successful append.
+            _mark_pending_upgrade(run_date, "fallback_quality", bucket)
     except Exception as e:
         logger.exception("ArcticDB daily_append (daily-arctic-append state) failed for %s", run_date)
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
@@ -2782,11 +3250,27 @@ def _parse_args() -> argparse.Namespace:
              "MorningEnrich. Never raises — returns a status dict. --date overrides target day.",
     )
     parser.add_argument(
+        "--daily-heal", dest="daily_heal", action="store_true",
+        help="Standalone daily data-heal mode (alpha-engine-config-I2717): bundles "
+             "the universe-gap self-heal (config#1228 + config#2664 fallback-quality "
+             "detection, formerly the head of --morning-arctic-append) and the "
+             "chronic-polygon-gap heal (config#1811's ChronicGapSelfHeal logic) into "
+             "one EventBridge-triggered run, OFF the ne-preopen-trading-pipeline "
+             "critical path entirely (~09:00 UTC, hours before the 12:45 UTC "
+             "preopen). Both heals stay fail-soft internally; emits the "
+             "AlphaEngine/Data daily_heal_days_healed CloudWatch metric every run "
+             "and writes data/heal/daily/{run_date}.json for the freshness-monitor "
+             "plane. --date overrides target day.",
+    )
+    parser.add_argument(
         "--skip-chronic-heal", dest="skip_chronic_heal", action="store_true",
-        help="With --morning-enrich: skip the inline chronic-gap self-heal "
-             "(the weekday SF runs it as a separate fail-soft ChronicGapSelfHeal "
-             "state instead). The Saturday SF omits this flag so the heal still "
-             "runs inline before DataPhase1's postflight.",
+        help="With --morning-enrich: skip the inline chronic-gap self-heal. "
+             "The weekday morning-enrich data-spot workload passes this flag "
+             "because the heal now runs entirely separately, standalone, via "
+             "--daily-heal (alpha-engine-config-I2717, 2026-07-16 — formerly "
+             "a separate fail-soft ChronicGapSelfHeal SF state, now removed). "
+             "The Saturday SF omits this flag so the heal still runs inline "
+             "before DataPhase1's postflight.",
     )
     parser.add_argument(
         "--skip-arctic-append", dest="skip_arctic_append", action="store_true",
@@ -2860,9 +3344,15 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False):
         # --daily-arctic-append reads the daily_closes PostMarketData wrote +
         # the ArcticDB universe libraries — same preflight surface as --daily.
+        # --daily-heal (alpha-engine-config-I2717) reads the same two surfaces
+        # (staging/daily_closes parquet for the chronic-gap drift check +
+        # detect_*_universe_days' ArcticDB reads, and writes both via
+        # daily_append) — no dedicated preflight mode needed, "daily" already
+        # covers S3 + ArcticDB reachability, which is what this mode's
+        # fail-loud posture depends on catching before any heal work starts.
         mode = "daily"
     else:
         mode = f"phase{args.phase or 1}"
@@ -2891,6 +3381,23 @@ def main() -> None:
         raise SystemExit(0)
 
     results = run_weekly(config, args)
+
+    # config#646 (Option A): write the flow's end-of-run status() snapshot to
+    # s3://alpha-engine-research/_flow_doctor/heartbeat/data-collector/{date}.json
+    # so the dashboard System Health consumer can read it. emit_heartbeat soft-
+    # fails (returns None, never raises); fires here — after run_weekly() and
+    # before the exit-code decision — so the heartbeat lands on every completed
+    # run (ok, partial, or failing). config["bucket"] is the research bucket
+    # (RESEARCH_BUCKET default "alpha-engine-research"; see preflight.py:197),
+    # which is where the dashboard reads heartbeats from.
+    # hasattr guard: emit_heartbeat only exists in flow-doctor >=0.6.2. The 5
+    # producing repos deploy independently, so a version-skewed box could hold
+    # an older lib (the #646 arc historically pinned 0.6.0rc3, which lacks it)
+    # — guarding on the method's presence keeps this forward/backward-compatible
+    # during the phased rollout so it can never AttributeError a production run.
+    fd = get_flow_doctor()
+    if fd and hasattr(fd, "emit_heartbeat"):
+        fd.emit_heartbeat(bucket=config["bucket"])
 
     # Hard-fail on any non-ok status — strict form of the no-silent-fails
     # rule applied while the system is unstable. `partial` previously exited

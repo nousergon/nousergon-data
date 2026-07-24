@@ -109,10 +109,20 @@ def make_source_series(values: list[str] | pd.Series, index: pd.Index | None = N
 # and lets each ticker's DataFrame be freed incrementally via pop().
 _FEATURE_WARMUP_ROWS = 280
 
+# Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX,
+# the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF. Like
+# the XL* sector ETFs (excluded via _is_sector_etf) these are benchmark
+# series, NOT stocks: they must NOT get full-universe feature computation and
+# must NOT be flagged as constituents-churn stragglers by the coverage diff.
+# The XL* prefix test can't catch them (SMH/IGV/… don't start with "XL"), so
+# they are enumerated into _SKIP_TICKERS explicitly.
+_SUB_SECTOR_ETFS = frozenset({"SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX"})
+
 # Tickers that are macro/index series, not stocks
 _SKIP_TICKERS = {
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
+    *_SUB_SECTOR_ETFS,
 }
 
 # Macro/index symbols ALSO promoted to full `universe` members (full OHLCV +
@@ -145,6 +155,22 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
         return json.loads(obj["Body"].read())
     except Exception as exc:
         log.warning("Failed to load sector_map.json: %s", exc)
+        return {}
+
+
+def _load_sub_sector_etf_map(s3, bucket: str) -> dict[str, str]:
+    """Load ticker -> sub-sector benchmark ETF mapping from S3 (config#934).
+
+    Best-effort/non-blocking, mirroring _load_sector_map: a missing file
+    (e.g. before the weekly collector has written it, or on an S3 read
+    failure) returns an empty map, which degrades every ticker's
+    sub_sector_vs_benchmark_* to its neutral default rather than raising.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key="data/sub_sector_etf_map.json")
+        return json.loads(obj["Body"].read())
+    except Exception as exc:
+        log.warning("Failed to load sub_sector_etf_map.json: %s", exc)
         return {}
 
 

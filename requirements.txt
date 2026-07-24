@@ -1,9 +1,10 @@
 boto3>=1.34
 pandas>=2.0
-pyarrow>=14.0
-yfinance>=0.2.36
-requests>=2.31
-pyyaml>=6.0
+openpyxl>=3.1
+pyarrow>=25.0.0
+yfinance>=1.5.1
+requests>=2.34.2
+pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
@@ -12,15 +13,15 @@ setuptools>=83.0.0
 # Bitcoin HD-wallet (xpub/ypub/zpub) derivation for the crypto-balances producer
 # (collectors/crypto_balances.py). Pure-Python-capable (ships a prebuilt linux libsecp256k1
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
-embit>=0.7.0
-numpy>=1.24
-feedparser>=6.0
-beautifulsoup4>=4.12
-lxml>=5.0
+embit>=0.8.0
+numpy>=2.4.6
+feedparser>=6.0.12
+beautifulsoup4>=4.15.0
+lxml>=6.1.1
 edgartools>=2.0
-voyageai>=0.3
-jsonschema>=4.20
-arcticdb>=6.11
+voyageai>=0.5.0
+jsonschema>=4.26.0
+arcticdb>=6.19.0
 # flow-doctor is pulled in transitively via nousergon-lib[flow-doctor].
 # NOTE: the extra MUST be hyphenated — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
@@ -41,12 +42,25 @@ arcticdb>=6.11
 # invariant (ROADMAP L286). Gated default-OFF via
 # ``ALPHA_ENGINE_UNIVERSE_WRITER_LOCK_ENABLED``.
 # All additive surface — existing imports unchanged.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.86.0
+#
+# alpha-engine-config#2456 NOTE: builders/daily_append.py's new L2
+# series-contract wiring imports nousergon_lib.series_contract, which ships
+# on nousergon-lib#195 (not yet merged/tagged as of this PR). This repo's
+# nousergon-lib pin MUST stay a tagged ``vX.Y.Z`` release in lockstep across
+# requirements.txt / Dockerfile / requirements-daily-news.txt / Lambda
+# requirements (tests/test_lib_pin_lockstep.py) — a branch ref is not a
+# valid pin here, so this file intentionally still points at v0.86.0. Bump
+# to (and add the ``series-contract`` extra from) the first tagged release
+# that includes nousergon-lib#195 as an immediate same-repo follow-up PR
+# once that release ships; until then this repo's test suite exercises the
+# wiring against an editable install of the nousergon-lib branch (see this
+# PR's description) rather than a real pip-installable pin.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
-# present only in krepis>=0.6.0 — an older krepis rejects the YAML. Pinned
+# present only in krepis>=0.14.0 — an older krepis rejects the YAML. Pinned
 # directly (not via a nousergon-lib bump, which would drag the in-flight,
 # 7/3-cutover SF-rename refs in lib 0.74.0 into this repo). Floor guarantees
 # the upgrade even on a non-fresh venv.
-krepis>=0.6.0
+krepis>=0.14.0

@@ -48,6 +48,25 @@ uncovered — but the degradation is recorded loudly (`dedupe_degraded: true`
 in the returned verdict + an ERROR log naming the probe error). This guard
 is an optimization against duplicate spend, never a correctness gate.
 
+SIGNATURE-REPEAT LAUNCH DEDUP (config#2862): the (repo, sha) lock above is
+blind to a SHA-INDEPENDENT latent infra defect — one that fails EVERY new
+commit's CI regardless of content, so per-SHA dedup can never collapse it
+(2026-07-17: one missing IAM trust relationship, 11 red deploys, 11 spot
+launches, even though every box independently diagnosed the SAME root cause
+and no-op'd as a `REPEAT`). Before the (repo, sha) probe above, this
+dispatcher additionally checks whether ANY signature marker under
+`ci_watch/_control/signatures/{repo}/{today}/` (the S3 control-plane the
+on-box agents themselves populate via
+`alpha-engine-config/scripts/ci_watch_claim_attempt_signature.sh`, STEP 0.6
+of `.github/ci-watch-prompt.md`) already carries a non-null `fix_pr` — see
+`_known_fixed_signature_exists()` for the full rationale (including why the
+"compute the signature before dispatch" layer config#2862 also named is
+infeasible: notify-ci-failure.yml has zero per-repo diagnostic knowledge to
+derive a matching signature with). A hit returns
+`{"launched": false, "reason": "signature_repeat_skip"}`. Same
+coverage-beats-dedup posture as the probe above: no markers, no fix_pr yet,
+or ANY list/read failure all fail OPEN (launch proceeds).
+
 IAM PROFILE — deliberately NOT `alpha-engine-executor-profile` (shared with
 the live trading executor). Uses `alpha-engine-ci-watch-executor-profile`, a
 dedicated instance profile a sibling agent is creating in
@@ -63,14 +82,15 @@ until the new code + IAM are deployed AND a sibling agent's GHA workflow
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timezone
 
 import boto3
+
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import (  # SpotProbeError: nousergon-lib >= 0.106.0
     SpotCapacityExhausted,
@@ -131,6 +151,152 @@ CI_WATCH_SHA_TAG_KEY = "ci-watch-sha"
 # on, not a per-dispatcher variant.
 CI_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
 
+# ── Signature-repeat launch dedup (config#2862) ──────────────────────────────
+# WHY: the (repo, sha) concurrency lock above is deliberately narrow — two
+# DIFFERENT commits failing CI independently must each get their own box
+# (see CONCURRENCY LOCK note). But a SHA-INDEPENDENT latent infra defect
+# (e.g. a missing IAM trust relationship that fails a CFN deploy rollback on
+# every single post-merge commit regardless of content) defeats that lock
+# entirely: each new commit's SHA is novel, so N consecutive broken commits
+# launch N boxes even though every one of them will independently diagnose
+# the SAME root cause, compute the SAME signature via
+# alpha-engine-config/scripts/ci_watch_signature_hash.sh (STEP 0.6 of
+# .github/ci-watch-prompt.md), and no-op as a `REPEAT` (2026-07-17: one
+# missing `scheduler.amazonaws.com` trust, 11 red deploys, 11 spot launches).
+#
+# WHY THIS IS THE FALLBACK, NOT THE "PREFERRED" LAYER: config#2862 named a
+# preferred layer where nousergon-lib's notify-ci-failure.yml computes
+# `signature_hash` BEFORE dispatch and passes it in the client_payload. That
+# is infeasible as scoped: notify-ci-failure.yml is a generic reusable
+# workflow shared by every fleet repo with zero domain knowledge of any
+# repo's canaries/CFN stacks/failure taxonomy — its client_payload is just
+# {repo, sha, run_id, run_url, workflow, branch}. Computing a signature that
+# matches what the on-box agent would independently derive requires the
+# agent's own diagnosis (gh run view --log-failed, canary/CFN/step
+# classification, the canonical-mode registry) — work that only happens
+# AFTER a box is already up. So this dispatcher instead consults the
+# EXISTING signature control-plane THOSE agents already populate
+# (ci_watch_claim_attempt_signature.sh, config#2395) for ANY already-fixed
+# signature recorded for (repo, today) — no new pre-dispatch signal needed
+# from nousergon-lib at all.
+#
+# MECHANISM: before launching, list
+# s3://{CI_WATCH_SIGNATURES_BUCKET}/ci_watch/_control/signatures/{repo_flat}/{utc_date}/
+# (written by every ci-watch box that reaches STEP 0.6 for this repo today)
+# and read each marker. If ANY marker already carries a non-null `fix_pr`,
+# skip the launch — a fix is already known for at least one of today's
+# distinct root causes on this repo, so a fresh box is very likely just
+# going to independently re-derive a REPEAT and no-op (a box that hits a
+# genuinely NEW, still-unfixed signature will still find nothing with
+# fix_pr set for ITS signature — but see the guardrail below).
+#
+# COVERAGE-BEATS-DEDUP GUARDRAIL (binding, config#2862): this is an
+# optimization against duplicate spend, never a correctness gate — mirrors
+# the existing `dedupe_degraded` posture (config#2267 site 1). A brand-new
+# repo-wide signature landscape (no markers yet, or markers present but none
+# carry a fix_pr) MUST launch. ANY probe/list/read failure (throttling,
+# malformed marker JSON, access error) MUST fail OPEN (launch) — never
+# silently treated as "known repeat." This dedup layer is coarser than a
+# true per-signature match (it skips on ANY known-fixed signature for the
+# repo today, not specifically the launching box's own eventual signature) —
+# a deliberate, documented tradeoff: the alternative (compute the real
+# signature pre-dispatch) is the infeasible "preferred" layer above, and a
+# slightly coarser skip that still fails open on anything uncertain is far
+# better than the N-boxes-for-one-defect status quo this issue tracks.
+CI_WATCH_SIGNATURES_BUCKET = os.environ.get("CI_WATCH_SIGNATURES_BUCKET", "alpha-engine-research")
+CI_WATCH_SIGNATURES_PREFIX = os.environ.get(
+    "CI_WATCH_SIGNATURES_PREFIX", "ci_watch/_control/signatures"
+)
+
+# ── Dispatch record for the mid-run reclaim checker (config#3173) ───────────
+# WHY: ci-watch has no equivalent of Fleet-SF Watch's per-run watch-log — a
+# box's own completion marker (ci_watch/_control/completed/{repo}-{sha}.json,
+# written by scripts/ci_watch_run.sh) is the ONLY durable record of a
+# dispatch, and it is written at the END. A box reclaimed by AWS mid-run
+# (before completing, sometimes before even starting the charter) previously
+# left NOTHING for anything to recover from — the completion marker never
+# lands, the (repo, sha) tags on the terminated instance are the only trace,
+# and neither carries run_id/run_url/workflow/branch. This record is written
+# right after a successful launch (mirrors the atomic-with-launch discipline
+# config#2292 already established for the discriminator tags) so a sibling
+# ci-watch-liveness-probe Lambda (EC2 reclaim-event target, mirroring
+# sf-watch-liveness-probe's config#2270 mid-run spot-reclaim checker) can
+# reconstruct the original dispatch fields and relaunch once, ceiling-bounded
+# at exactly one relaunch, escalating loud on a second death — closing the
+# "box died with no re-dispatch or escalation" gap config#3173 tracks for the
+# ci-watch family. Best-effort (never blocks/fails the primary dispatch): a
+# write failure only degrades the reclaim checker to its own "unreconstructable
+# dispatch fields" LOUD escalation path, it never masks the launch itself.
+# Skipped for drills — DRILL_REPO is synthetic and a drill box's reclaim is
+# already covered by its own _canary heartbeat channel (config#2223), never a
+# repair to retry.
+CI_WATCH_DISPATCHED_PREFIX = os.environ.get(
+    "CI_WATCH_DISPATCHED_PREFIX", "ci_watch/_control/dispatched"
+)
+
+
+def _write_dispatch_record(repo: str, sha: str, run_id: str, run_url: str,
+                           workflow: str, branch: str, instance_id: str) -> None:
+    """Best-effort S3 record of this dispatch's full event fields, keyed the
+    same way the completion marker and spot-orphan-reaper's WATCH_KINDS entry
+    key ci-watch (repo/sha, '/' flattened to '-'). Read back by
+    ci-watch-liveness-probe on a mid-run reclaim to reconstruct the fields
+    needed to relaunch. Never raises — see module note above."""
+    key = f"{CI_WATCH_DISPATCHED_PREFIX}/{repo.replace('/', '-')}-{sha}.json"
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=CI_WATCH_SIGNATURES_BUCKET,
+            Key=key,
+            Body=json.dumps({
+                "repo": repo, "sha": sha, "run_id": run_id, "run_url": run_url,
+                "workflow": workflow, "branch": branch, "instance_id": instance_id,
+                "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+        logger.warning(
+            "ci-watch dispatch-record write failed for %s@%s (non-fatal — a "
+            "later mid-run reclaim for this box would escalate loud instead "
+            "of relaunching): %s: %s", repo, sha, type(exc).__name__, exc,
+        )
+
+
+def _known_fixed_signature_exists(repo: str) -> bool:
+    """True iff at least one signature marker for (repo, today) already
+    records a non-null `fix_pr` — i.e. a prior box today already diagnosed
+    and fixed a recurring root cause on this repo. Any list/read failure (or
+    simply no markers / no fix_pr yet) returns False — the caller launches;
+    coverage beats dedup (see module-level guardrail note above)."""
+    now = datetime.now(timezone.utc)
+    repo_flat = repo.replace("/", "-")
+    prefix = f"{CI_WATCH_SIGNATURES_PREFIX}/{repo_flat}/{now:%Y-%m-%d}/"
+    try:
+        s3 = boto3.client("s3", region_name=REGION)
+        resp = s3.list_objects_v2(Bucket=CI_WATCH_SIGNATURES_BUCKET, Prefix=prefix)
+        for obj in resp.get("Contents", []) or []:
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            marker = json.loads(
+                s3.get_object(Bucket=CI_WATCH_SIGNATURES_BUCKET, Key=key)["Body"].read()
+            )
+            if marker.get("fix_pr"):
+                logger.info(
+                    "ci-watch signature-repeat-skip candidate: %s already has "
+                    "fix_pr=%s for repo=%s", key, marker.get("fix_pr"), repo,
+                )
+                return True
+        return False
+    except Exception as exc:  # noqa: BLE001 — fail OPEN, never block a launch
+        logger.error(
+            "ci-watch signature probe FAILED for repo=%s prefix=%s — failing "
+            "OPEN (launching as normal; coverage beats dedup): %s: %s",
+            repo, prefix, type(exc).__name__, exc,
+        )
+        return False
+
+
 # ── Canary drill identity (config#2223) ──────────────────────────────────────
 # DRILL-vs-REAL ISOLATION INVARIANT: a drill's (repo, sha) lock key is ALWAYS
 # synthesized in code — never taken from the payload. DRILL_REPO is not a
@@ -154,15 +320,14 @@ def _drill_sha(now: datetime) -> str:
         f"ci-watch-drill-{now:%Y-%m-%d}".encode("utf-8")
     ).hexdigest()[:40]
 
-# Discriminator tag write (config#2267 site 2, same defect class as
-# sf-watch-spot-dispatcher's): the (repo, sha) tags are LOAD-BEARING —
-# without them the next failure's dedupe guard is blind (duplicate box) and
-# spot-orphan-reaper cannot derive the completion-marker key (guaranteed
-# false "incomplete reap" page for a healthy run). Bounded retry, then
-# terminate-the-box-and-fail-the-dispatch on final failure. Retry delay is
-# env-overridable so tests run at 0.
-TAG_WRITE_ATTEMPTS = int(os.environ.get("CI_WATCH_TAG_WRITE_ATTEMPTS", "3"))
-TAG_WRITE_RETRY_DELAY_SEC = float(os.environ.get("CI_WATCH_TAG_WRITE_RETRY_DELAY_SEC", "2"))
+# Discriminator tags (config#2267 site 2, config#2292 root fix): the (repo,
+# sha) tags are LOAD-BEARING — without them the next failure's dedupe guard
+# is blind (duplicate box) and spot-orphan-reaper cannot derive the
+# completion-marker key. They now ride the RunInstances TagSpecifications
+# call ATOMICALLY (see _launch_instance's extra_tags) instead of a separate
+# post-launch create_tags call — the box is never observably untagged, so
+# the PR758 bounded-retry-then-terminate path this replaced is gone entirely
+# (one mechanism, not two).
 
 # The box reads its own run secrets (PAT) via its instance profile in the
 # common case, but the PRELUDE below (run before the profile-backed bootstrap
@@ -192,6 +357,8 @@ _RUN_ID_RE = re.compile(r"^[0-9]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,200}$")
 _WORKFLOW_RE = re.compile(r"^[A-Za-z0-9 _./:()-]{1,200}$")
 _BOOL_RE = re.compile(r"^(true|false)$")
+# config-I3293 — registry-declared agent model (router-injected); optional.
+_MODEL_RE = re.compile(r"^claude-[a-z0-9.-]{1,60}$")
 
 
 class _InvalidEvent(ValueError):
@@ -214,7 +381,7 @@ def _optional(event: dict, key: str, pattern: "re.Pattern[str]", default: str = 
     return val
 
 
-def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str]:
+def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, str, str]:
     """Validate the GHA payload's CI fields; raises _InvalidEvent on any
     missing/malformed field (caught once, at the handler, and converted to a
     clean launched:false — see module docstring's synchronous contract).
@@ -226,9 +393,13 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
     real (repo, sha) into a drill's lock/marker keys. See the DRILL_REPO
     isolation invariant above."""
     is_drill = _optional(event, "is_drill", _BOOL_RE, default="false")
+    # model (config-I3293): registry-declared agent model injected by the
+    # overseer router; optional — empty means the run script's inline default
+    # applies. Regex-validated so the f-string export cannot inject shell.
+    model = _optional(event, "model", _MODEL_RE)
     if is_drill == "true":
         return (DRILL_REPO, _drill_sha(datetime.now(timezone.utc)), "0",
-                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill)
+                DRILL_RUN_URL, DRILL_WORKFLOW, "main", is_drill, model)
     repo = _require(event, "repo", _REPO_RE)
     sha = _require(event, "sha", _SHA_RE)
     run_id = _require(event, "run_id", _RUN_ID_RE)
@@ -240,12 +411,12 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
         # under `set -u` it could expand as a positional param (same gotcha
         # groom's run_url note documents) and abort the prelude.
         raise _InvalidEvent(f"missing/malformed 'run_url' in event: {run_url!r}")
-    return repo, sha, run_id, run_url, workflow, branch, is_drill
+    return repo, sha, run_id, run_url, workflow, branch, is_drill, model
 
 
 def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
                        workflow: str, branch: str, run_token: str,
-                       is_drill: str = "false") -> str:
+                       is_drill: str = "false", model: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     ci_watch_spot_bootstrap.sh entrypoint (built by a sibling agent in
     alpha-engine-config). Any prelude failure shuts the box down so a botched
@@ -261,6 +432,7 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
     ``_send_bootstrap``, and the handler's returned JSON)."""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
+export CI_WATCH_MODEL="{model}"
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
 export HOME=/root
 fail() {{ echo "[ci-watch-prelude] FATAL: $1"; shutdown -h now; exit 1; }}
@@ -282,11 +454,20 @@ exec bash infrastructure/ci_watch_spot_bootstrap.sh \
 """
 
 
-def _launch_instance() -> tuple[str, str]:
+def _launch_instance(repo: str, sha: str, is_drill: bool = False) -> tuple[str, str]:
     """Launch the CI-watch box; spot first, on-demand fallback on capacity
     exhaustion. Raises SpotLaunchError (or the SpotCapacityExhausted subclass)
     if BOTH the spot attempt and the on-demand fallback are exhausted/fail —
-    caught once by the caller and converted to a clean launched:false."""
+    caught once by the caller and converted to a clean launched:false.
+
+    The load-bearing (repo, sha) discriminator tags (config#2267 site 2) ride
+    the SAME RunInstances call as the launch itself via ``extra_tags``
+    (config#2292 root fix, nousergon-lib >= 0.108.0 / krepis >= 0.12.0) — the
+    box is never observably untagged, so there is no post-launch create_tags
+    step to retry or fail."""
+    extra_tags = {CI_WATCH_REPO_TAG_KEY: repo, CI_WATCH_SHA_TAG_KEY: sha}
+    if is_drill:
+        extra_tags[CI_WATCH_DRILL_TAG_KEY] = "true"
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -295,6 +476,7 @@ def _launch_instance() -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name=CI_WATCH_TAG_NAME,
+        extra_tags=extra_tags,
         region=REGION,
     )
 
@@ -308,12 +490,12 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url: str,
                     workflow: str, branch: str, run_token: str,
-                    is_drill: str = "false") -> str:
+                    is_drill: str = "false", model: str = "") -> str:
     """Fire the async, detached SSM command that runs CI-watch + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token,
-                           is_drill=is_drill),
+                           is_drill=is_drill, model=model),
         comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -345,48 +527,28 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="ci-watch")
 
 
-def _create_discriminator_tags(instance_id: str, repo: str, sha: str,
-                               is_drill: bool = False) -> str | None:
-    """Write the load-bearing (repo, sha) discriminator tags (config#2267
-    site 2) with a bounded retry. Returns None on success, or the final
-    ``"ExcName: msg"`` string after TAG_WRITE_ATTEMPTS failures — the caller
-    terminates the box and fails the dispatch (the tags are what make the
-    box visible to the dedupe guard and the spot-orphan-reaper; an untagged
-    box must not run). A canary drill box (config#2223) additionally carries
-    ``sf-watch-drill=true`` so fleet consumers can tell it apart."""
-    tags = [
-        {"Key": CI_WATCH_REPO_TAG_KEY, "Value": repo},
-        {"Key": CI_WATCH_SHA_TAG_KEY, "Value": sha},
-    ]
-    if is_drill:
-        tags.append({"Key": CI_WATCH_DRILL_TAG_KEY, "Value": "true"})
-    last_error = ""
-    for attempt in range(1, TAG_WRITE_ATTEMPTS + 1):
-        try:
-            boto3.client("ec2", region_name=REGION).create_tags(
-                Resources=[instance_id], Tags=tags
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001 — bounded retry; final failure is FATAL to the dispatch (caller terminates + fails)
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "ci-watch discriminator tag write attempt %d/%d failed for %s: %s",
-                attempt, TAG_WRITE_ATTEMPTS, instance_id, last_error,
-            )
-            if attempt < TAG_WRITE_ATTEMPTS:
-                time.sleep(TAG_WRITE_RETRY_DELAY_SEC)
-    return last_error
-
-
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
-                          is_drill: str = "false") -> dict:
+                          is_drill: str = "false", model: str = "") -> dict:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
     if not DISPATCH_ENABLED:
         logger.warning("CI_WATCH_DISPATCH_ENABLED=false — ci-watch spot NOT launched")
         return {"launched": False, "reason": "disabled"}
+
+    # Signature-repeat launch dedup (config#2862). Skipped entirely for
+    # drills — DRILL_REPO is a synthetic repo with no real signature
+    # markers (so this would always no-op anyway), and the weekly canary's
+    # whole purpose is to exercise the REAL launch pipe unconditionally.
+    if is_drill != "true" and _known_fixed_signature_exists(repo):
+        logger.warning(
+            "ci-watch signature-repeat-skip for %s — a signature already "
+            "recorded a fix_pr for a failure on this repo today; skipping "
+            "launch (coverage beats dedup — see module docstring guardrail)",
+            repo,
+        )
+        return {"launched": False, "reason": "signature_repeat_skip"}
 
     dedupe_degraded = False
     dedupe_probe_error = ""
@@ -418,7 +580,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
 
     run_token = uuid.uuid4().hex
     try:
-        instance_id, market = _launch_instance()
+        instance_id, market = _launch_instance(repo, sha, is_drill=is_drill == "true")
     except SpotLaunchError as exc:
         logger.error("ci-watch spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
@@ -427,25 +589,18 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                 " dedupe_degraded=true" if dedupe_degraded else "")
     # config#1979-style tags so the NEXT trigger's guard check (above) — and
     # the fleet spot-orphan-reaper's completion-marker lookup — can find the
-    # box. LOAD-BEARING, not cosmetic (config#2267 site 2): bounded retry,
-    # then TERMINATE the box and fail the dispatch on final failure — a box
-    # invisible to the dedupe guard and the reaper must not run. (The root
-    # fix — discriminator tags atomic with launch via RunInstances
-    # TagSpecifications — is blocked on krepis.ec2_spot.launch, the fleet's
-    # RunInstances chokepoint, growing an extra-tags parameter; until then
-    # this retry+terminate closes the hole loudly.)
-    tag_error = _create_discriminator_tags(instance_id, repo, sha,
-                                           is_drill=is_drill == "true")
-    if tag_error is not None:
-        _terminate_instance(instance_id)
-        logger.error(
-            "ci-watch discriminator tag write FAILED after %d attempts for %s "
-            "(%s@%s) — box terminated, dispatch failed: %s",
-            TAG_WRITE_ATTEMPTS, instance_id, repo, sha, tag_error,
-        )
-        return {"launched": False, "reason": "tag_write_failed",
-                "instance_id": instance_id, "error": tag_error,
-                "dedupe_degraded": dedupe_degraded}
+    # box. LOAD-BEARING, not cosmetic (config#2267 site 2) — and, as of
+    # config#2292, ATOMIC with launch: _launch_instance already passed them
+    # as extra_tags into the RunInstances TagSpecifications, so the box is
+    # never observably untagged. No post-launch create_tags step remains to
+    # retry or fail here.
+
+    # config#3173: record the dispatch fields NOW (right after launch, before
+    # the SSM round trip) so a mid-run reclaim — possible from this point
+    # forward — has something to reconstruct a relaunch from. Skipped for
+    # drills (see _write_dispatch_record docstring).
+    if is_drill != "true":
+        _write_dispatch_record(repo, sha, run_id, run_url, workflow, branch, instance_id)
 
     # Once the box is up, ANY failure before the bootstrap command is
     # delivered would orphan it (no watchdog/trap yet). Terminate-on-error —
@@ -455,7 +610,8 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     try:
         _wait_ssm_online(instance_id)
         command_id = _send_bootstrap(instance_id, repo, sha, run_id, run_url,
-                                     workflow, branch, run_token, is_drill=is_drill)
+                                     workflow, branch, run_token, is_drill=is_drill,
+                                     model=model)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false
         _terminate_instance(instance_id)
         logger.error("ci-watch post-launch step failed for %s: %s: %s",
@@ -509,7 +665,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     try:
-        repo, sha, run_id, run_url, workflow, branch, is_drill = _resolve_event_fields(event)
+        repo, sha, run_id, run_url, workflow, branch, is_drill, model = _resolve_event_fields(event)
     except _InvalidEvent as exc:
         logger.error("invalid ci-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
@@ -519,4 +675,4 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         repo, sha, run_id, workflow, branch, is_drill,
     )
     return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch,
-                                 is_drill=is_drill)
+                                 is_drill=is_drill, model=model)

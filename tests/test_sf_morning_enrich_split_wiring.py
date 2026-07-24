@@ -103,8 +103,41 @@ class TestChainOrdering:
             "real Saturday run is byte-identical pre-spine."
         )
 
-    def test_skip_morning_enrich_default_runs_morning_enrich(self, states):
-        assert states["CheckSkipMorningEnrich"]["Default"] == "MorningEnrich"
+    def test_skip_morning_enrich_default_runs_substrate_gate_then_morning_enrich(self, states):
+        """config#2249: CheckSkipMorningEnrich.Default now routes through the
+        new fast pre-dispatch SubstrateHealthGate before MorningEnrich —
+        HEALTHY proceeds to MorningEnrich as before; SUBSTRATE_UNHEALTHY
+        short-circuits to a named failure WITHOUT ever entering
+        MorningEnrich's own retry ladder."""
+        assert states["CheckSkipMorningEnrich"]["Default"] == "SubstrateHealthGate"
+        assert states["SubstrateHealthGate"]["Next"] == "CheckSubstrateHealthGate"
+        # config#2275: the HEALTHY rule now IsPresent-guards the verdict path
+        # (a 3-segment Lambda-payload path is never floorable), so the
+        # StringEquals lives inside the rule's And rather than at its top
+        # level. Match either shape so this stays robust to that detail.
+        def _rule_healthy(rule):
+            leaves = rule.get("And", [rule])
+            return any(leaf.get("StringEquals") == "HEALTHY" for leaf in leaves)
+
+        healthy = [
+            c["Next"]
+            for c in states["CheckSubstrateHealthGate"]["Choices"]
+            if _rule_healthy(c)
+        ]
+        assert healthy == ["MorningEnrich"], (
+            "SubstrateHealthGate verdict=HEALTHY must proceed into "
+            "MorningEnrich unchanged"
+        )
+        assert (
+            states["CheckSubstrateHealthGate"]["Default"]
+            == "ExtractSubstrateHealthGateError"
+        ), (
+            "any non-HEALTHY verdict must short-circuit to the named-error "
+            "path, not fall through into MorningEnrich's retry ladder"
+        )
+        assert states["ExtractSubstrateHealthGateError"]["Next"] == (
+            "NormalizeFailureContext"
+        )
 
     def test_skip_morning_enrich_honors_skip_flag(self, states):
         """{"skip_morning_enrich": true} must route to CheckSkipDataPhase1
@@ -174,8 +207,8 @@ class TestChainOrdering:
 
     def test_morning_enrich_is_reachable_before_data_phase1(self, sf, states):
         """Walk the HAPPY path from StartAt (skip-gates take Default = run
-        the action; status checks take the Success choice) and assert
-        MorningEnrich is visited strictly before DataPhase1."""
+        the action; status/verdict checks take the Success/HEALTHY choice)
+        and assert MorningEnrich is visited strictly before DataPhase1."""
         order: list[str] = []
         seen: set[str] = set()
         cur = sf["StartAt"]
@@ -184,13 +217,22 @@ class TestChainOrdering:
             order.append(cur)
             st = states[cur]
             if st.get("Type") == "Choice":
-                # Status checks: follow the Success edge (the real
-                # forward path). Skip-gates have no Success edge → fall
-                # back to Default (= run the action, the no-skip path).
+                # Status/verdict checks: follow the Success/HEALTHY edge
+                # (the real forward path). Skip-gates have no such edge →
+                # fall back to Default (= run the action, the no-skip path).
+                # A rule's forward-edge StringEquals may sit at the rule's top
+                # level OR inside an And that IsPresent-guards the same path
+                # (config#2275: 3-segment Lambda-payload verdict paths must be
+                # guarded, e.g. CheckSubstrateHealthGate's HEALTHY rule).
+                def _forward_edge(rule):
+                    leaves = rule.get("And", [rule])
+                    return any(
+                        leaf.get("StringEquals") in ("Success", "HEALTHY")
+                        for leaf in leaves
+                    )
+
                 success = [
-                    c["Next"]
-                    for c in st.get("Choices", [])
-                    if c.get("StringEquals") == "Success"
+                    c["Next"] for c in st.get("Choices", []) if _forward_edge(c)
                 ]
                 cur = success[0] if success else st.get("Default")
             else:

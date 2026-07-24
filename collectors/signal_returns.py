@@ -15,6 +15,12 @@ Target tables in research.db:
     cutover). New horizon-agnostic columns: actual_log_alpha, horizon_days,
     correct. Legacy columns (actual_5d_return, correct_5d) dual-written
     during the transition window for backtester COALESCE fallback.
+  - score_performance_outcomes: the long-format outcome store (EPIC
+    config#1483). Written at ``_DECAY_CURVE_POLICY``'s horizons — the fleet
+    DEFAULT_POLICY's primary (21d) + diagnostic (5d) plus config#1981's
+    intermediate decay-curve diagnostics (1d/3d/10d/15d) — so the backtester's
+    alpha-decay-curve consumer has enough points between the two canonical
+    horizons to plot a real fade-over-time curve, not just two endpoints.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from datetime import date, datetime, timezone
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
+from nousergon_lib.quant.horizons import DEFAULT_POLICY, HorizonPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +43,34 @@ logger = logging.getLogger(__name__)
 # YAML setting; until then this constant is the source of truth and the
 # `forward_days` parameter on `collect` lets call sites override.
 _DEFAULT_FORWARD_DAYS = 21
+
+# config#1981 — alpha-decay-curve intermediate-horizon ladder (operator
+# ruling "Option A", 2026-07-16): score_performance_outcomes previously only
+# carried the fleet DEFAULT_POLICY's two horizons (5d diagnostic, 21d
+# primary), which is not enough points to plot a genuine decay curve. This
+# is a LOCAL policy override, constructed the same way the producer's own
+# test suite already demonstrates (test_signal_returns_outcome_records.py
+# ``HorizonPolicy(primary_horizon=21, diagnostic_horizons=(5, 10))``) —
+# deliberately NOT a change to nousergon_lib's fleet-wide DEFAULT_POLICY
+# (that constant is consumed by the predictor/evaluator/executor too; a
+# schema/label decision like widening it is out of scope here). Diagnostic
+# horizons are graceful-empty by design (HorizonPolicy contract), so any
+# entry whose universe_returns columns aren't populated yet (or an older
+# row predating this PR) is skipped, not an error — see
+# ``_backfill_outcome_records``'s per-horizon column-existence check.
+#
+# Ladder choice: 1d/3d/5d/10d/15d/21d. 5d and 21d are the pre-existing
+# canonical points; 10d already had raw universe_returns columns (added
+# for the retired legacy 10d horizon, config#1456) but was never wired into
+# the long-format outcome store. 1d/3d/15d are genuinely new
+# universe_returns columns (this PR) chosen to give roughly even coverage
+# of the first three trading weeks post-entry, where alpha decay is
+# expected to be steepest.
+_DECAY_CURVE_DIAGNOSTIC_HORIZONS: tuple[int, ...] = (1, 3, 5, 10, 15)
+_DECAY_CURVE_POLICY = HorizonPolicy(
+    primary_horizon=DEFAULT_POLICY.primary_horizon,
+    diagnostic_horizons=_DECAY_CURVE_DIAGNOSTIC_HORIZONS,
+)
 
 
 def collect(
@@ -49,7 +84,8 @@ def collect(
 
     Steps:
       1. Seed score_performance from S3 signals (entry prices from universe_returns)
-      2. Backfill score_performance returns from universe_returns JOIN
+      2. Primary outcome write: long-format score_performance_outcomes (fail-loud);
+         wide-column bookkeeping echo writes only price_{h}d (outcome columns retired)
       3. Seed predictor_outcomes from S3 predictions
       4. Backfill predictor_outcomes returns from universe_returns JOIN
 
@@ -79,16 +115,41 @@ def collect(
         s3, bucket, db_path, signals_prefix, dry_run,
     )
 
-    # Step 2: Backfill score_performance returns via universe_returns JOIN
-    results["backfill_score_returns"] = _backfill_score_returns(db_path, dry_run)
+    # Step 2 — PRIMARY outcome write (EPIC config#1483 Phase 4, config#1550):
+    # the long-format score_performance_outcomes table is now the canonical
+    # outcome store — one row per (signal, score_date, HorizonPolicy horizon),
+    # sourced from universe_returns decimals + validated against the
+    # nousergon_lib outcome_record contract. Every consumer reads THIS
+    # (analysis.outcome_store & peers; burn-down allowlists {} fleet-wide), so a
+    # write failure must FAIL the whole collector step — the Phase-2 dual-write
+    # soak that let it degrade to status:partial is retired.
+    #
+    # Policy: _DECAY_CURVE_POLICY (config#1981), a LOCAL extension of
+    # DEFAULT_POLICY's diagnostic horizons (adds 1d/3d/10d/15d alongside the
+    # existing 5d) so the long-format store carries enough intermediate
+    # points for a real alpha-decay curve. The primary horizon (21d) is
+    # unchanged — this only adds diagnostic ROWS, no schema change, per the
+    # HorizonPolicy contract (nousergon_lib.quant.horizons).
+    results["backfill_outcome_records"] = _backfill_outcome_records(
+        db_path, dry_run, policy=_DECAY_CURVE_POLICY,
+    )
 
-    # Step 2c: Phase-2 dual-write of the long-format score_performance_outcomes
-    # table (EPIC config#1483). Emits one row per (signal, score_date, horizon)
-    # for the canonical HorizonPolicy horizons, sourced from universe_returns
-    # decimals + validated against the nousergon_lib outcome_record contract.
-    # ADDITIVE + SECONDARY during the >=1-week dual-write soak — the wide
-    # score_performance columns (Step 2) stay primary until the Phase-4 cutover.
-    results["backfill_outcome_records"] = _backfill_outcome_records(db_path, dry_run)
+    # Step 2c' — coverage assertion (config#1860): WARN with counts when a
+    # resolved-age score_performance signal date has zero
+    # score_performance_outcomes rows post-run. Best-effort observability,
+    # not load-bearing — catches a future backfill blind spot (like the
+    # 2026-04-04/04-11/04-12 gap discovered only via months-later forensics)
+    # the SAME cycle it happens.
+    if not dry_run:
+        results["outcome_store_coverage"] = _check_outcome_store_coverage(db_path)
+
+    # Step 2c — wide-column bookkeeping ECHO. The horizon-suffixed OUTCOME
+    # columns (return_/spy_*_return/beat_spy_/log_alpha_21d) are RETIRED: no
+    # longer written now that the long store is primary and consumers are cut
+    # over (config#1550, EPIC config#1483 Phase 4). Only the non-outcome
+    # price_{h}d bookkeeping survives (not part of the outcome contract; kept
+    # until a follow-on decides otherwise).
+    results["backfill_score_returns"] = _backfill_score_returns(db_path, dry_run)
 
     # Step 2b: Drift gate — emit canonical-context coverage as a CW gauge
     # so an alarm fires if the producer ever regresses (e.g. signals.json
@@ -112,6 +173,18 @@ def collect(
     results["backfill_predictor_returns"] = _backfill_predictor_returns(
         db_path, dry_run, forward_days=forward_days,
     )
+
+    # Step 4b: Horizon-grading freshness gate (config#2972) — emit the
+    # trading-day lag between "newest date whose forward_days window has
+    # closed" and "newest date actually graded" for both universe_returns and
+    # predictor_outcomes. A healthy pipeline keeps this at 0; sustained lag
+    # growth (not a one-off 1-2td lag right after a window closes) is the
+    # alarmable signal that the JOIN/backfill has genuinely stalled, as
+    # distinct from the expected wait for a forward-looking window to close.
+    if not dry_run:
+        results["horizon_grading_lag"] = _emit_horizon_grading_lag_metric(
+            db_path, forward_days=forward_days,
+        )
 
     # Upload updated research.db back to S3
     total_written = sum(r.get("rows_written", 0) for r in results.values())
@@ -422,9 +495,19 @@ def _backfill_score_context(
 
 
 def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
-    """Backfill 5d/10d/21d/30d returns in score_performance by JOINing
-    universe_returns, plus the canonical 21d log-domain market-relative
-    alpha (log_alpha_21d) — the same target the predictor trains on.
+    """Backfill the wide ``price_{h}d`` exit-price bookkeeping columns in
+    score_performance by JOINing universe_returns.
+
+    EPIC config#1483 Phase 4 (config#1550): the horizon-suffixed OUTCOME columns
+    (``return_{h}d`` / ``spy_{h}d_return`` / ``beat_spy_{h}d`` / ``log_alpha_21d``)
+    are RETIRED — the canonical outcome store is the long-format
+    ``score_performance_outcomes`` table (Step 2, ``_backfill_outcome_records``),
+    which every consumer now reads. This function keeps only the non-outcome
+    ``price_{h}d`` write (an exit-price convenience, not part of the outcome
+    contract), and the beat_spy-repair + log_alpha-backfill blocks retire WITH
+    the wide writes (the long-store insert already derives beat_spy and carries
+    log_alpha). Physical columns are NOT dropped (SQLite; dead columns are
+    harmless — legacy rows keep their historical values).
     """
     try:
         conn = sqlite3.connect(db_path)
@@ -432,11 +515,10 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
 
         updated = 0
         for horizon in ("5d", "10d", "21d", "30d"):
-            bdays = {"5d": 5, "10d": 10, "21d": 21, "30d": 30}[horizon]
-
-            # Find score_performance rows missing this horizon's return
+            # Pending = rows whose price_{h}d exit bookkeeping isn't computed yet.
+            # (Re-keyed off price_{h}d rather than the now-retired return_{h}d.)
             pending = pd.read_sql_query(
-                f"SELECT symbol, score_date, price_on_date FROM score_performance WHERE return_{horizon} IS NULL",
+                f"SELECT symbol, score_date, price_on_date FROM score_performance WHERE price_{horizon} IS NULL",
                 conn,
             )
             if pending.empty:
@@ -449,9 +531,10 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
                 if entry_price is None:
                     continue
 
-                # Look up forward return from universe_returns
+                # Look up forward return from universe_returns purely to derive
+                # the exit price — the return itself is NOT persisted anymore.
                 ur = conn.execute(
-                    f"SELECT return_{horizon}, spy_return_{horizon}, beat_spy_{horizon} FROM universe_returns WHERE ticker = ? AND eval_date = ?",
+                    f"SELECT return_{horizon} FROM universe_returns WHERE ticker = ? AND eval_date = ?",
                     (ticker, score_date),
                 ).fetchone()
 
@@ -459,83 +542,21 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
                     continue
 
                 stock_return = ur[0]  # already as decimal (e.g., 0.05)
-                spy_return = ur[1]
-                beat_spy = ur[2]
                 exit_price = round(entry_price * (1 + stock_return), 2)
 
                 if not dry_run:
                     conn.execute(
-                        f"UPDATE score_performance SET price_{horizon}=?, return_{horizon}=?, spy_{horizon}_return=?, beat_spy_{horizon}=? WHERE symbol=? AND score_date=? AND return_{horizon} IS NULL",
-                        (
-                            exit_price,
-                            round(stock_return * 100, 2),  # stored as percentage
-                            round(spy_return * 100, 2) if spy_return is not None else None,
-                            beat_spy,
-                            ticker, score_date,
-                        ),
+                        f"UPDATE score_performance SET price_{horizon}=? WHERE symbol=? AND score_date=? AND price_{horizon} IS NULL",
+                        (exit_price, ticker, score_date),
                     )
                 updated += 1
-
-        # Backfill canonical 21d log-domain market-relative alpha
-        # (log_alpha_21d) — the same target the predictor trains on
-        # (actual_log_alpha). Separate block from the arithmetic loop
-        # because it sources the LOG columns, not the arithmetic ones:
-        #   log_alpha = log_return_21d - log_spy_return_21d
-        # Mirrors _backfill_predictor_returns (lines ~629-631) so the
-        # judge outcome-IC correlates against an identically-defined
-        # alpha. No clipping / sector-neutralization — raw log diff, per
-        # the canonical-alpha framework (cutover 2026-05-09).
-        ur_cols = {
-            r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()
-        }
-        if {"log_return_21d", "log_spy_return_21d"} <= ur_cols:
-            pending_alpha = pd.read_sql_query(
-                "SELECT symbol, score_date FROM score_performance WHERE log_alpha_21d IS NULL",
-                conn,
-            )
-            for _, row in pending_alpha.iterrows():
-                ticker = row["symbol"]
-                score_date = row["score_date"]
-                ur = conn.execute(
-                    "SELECT log_return_21d, log_spy_return_21d "
-                    "FROM universe_returns WHERE ticker = ? AND eval_date = ?",
-                    (ticker, score_date),
-                ).fetchone()
-                if ur is None or ur[0] is None:
-                    continue
-                log_alpha = ur[0] - (ur[1] if ur[1] is not None else 0.0)
-                if not dry_run:
-                    conn.execute(
-                        "UPDATE score_performance SET log_alpha_21d=? "
-                        "WHERE symbol=? AND score_date=? AND log_alpha_21d IS NULL",
-                        (round(log_alpha, 6), ticker, score_date),
-                    )
-                updated += 1
-        else:
-            # Carve-out per ~/Development/CLAUDE.md no-silent-fails: (a) failure
-            # mode = legacy universe_returns lacking 21d log columns (pre-#197);
-            # (b) primary deliverable (5/10/21/30d arithmetic returns above)
-            # survives; (c) recording surface = this WARN. Post-#197 DBs always
-            # have these, so a sustained WARN means a migration regressed.
-            logger.warning(
-                "score_performance: universe_returns lacks log_return_21d/"
-                "log_spy_return_21d — skipping canonical log_alpha_21d backfill"
-            )
-
-        # Repair: fix beat_spy columns where return exists but beat_spy is NULL
-        for horizon in ("5d", "10d", "21d", "30d"):
-            repaired = conn.execute(
-                f"UPDATE score_performance SET beat_spy_{horizon} = CASE WHEN return_{horizon} > spy_{horizon}_return THEN 1 ELSE 0 END WHERE return_{horizon} IS NOT NULL AND spy_{horizon}_return IS NOT NULL AND beat_spy_{horizon} IS NULL",
-            ).rowcount
-            if repaired:
-                logger.info("Repaired %d beat_spy_%s values", repaired, horizon)
 
         if not dry_run:
             conn.commit()
         conn.close()
 
         if updated:
-            logger.info("Backfilled %d score_performance returns via universe_returns JOIN", updated)
+            logger.info("Backfilled %d score_performance price_{h}d columns via universe_returns JOIN", updated)
         return {"status": "ok", "rows_written": updated}
 
     except Exception as e:
@@ -732,16 +753,128 @@ def _backfill_outcome_records(
         return {"status": "ok", "rows_written": written}
 
     except Exception as e:
-        # no-silent-fails carve-out (~/Development/CLAUDE.md): (a) failure mode =
-        # the NEW long-format dual-write (schema / contract / JOIN bug); (b) the
-        # primary deliverable — the wide score_performance columns (Step 2,
-        # already committed) — survives, and the live eval system reads THOSE,
-        # not this table, during the soak; (c) recording surface = this ERROR
-        # log + status:error in the returned dict, which bubbles to collect()'s
-        # has_errors → overall status:partial. At the Phase-4 cutover this store
-        # becomes primary and this handler flips to fail-loud (re-raise).
+        # FAIL-LOUD (EPIC config#1483 Phase 4, config#1550). The Phase-2 soak
+        # carve-out that swallowed this into status:partial is retired: the
+        # long-format store is now the PRIMARY outcome write that every consumer
+        # reads, so a schema / contract / JOIN failure here starves the live eval
+        # system and MUST fail the collector step rather than degrade silently.
         logger.error("backfill_outcome_records failed: %s", e)
-        return {"status": "error", "error": str(e), "rows_written": 0}
+        raise
+
+
+# ── Step 2d: Outcome-store coverage assertion (config#1860) ──────────────────
+#
+# config#1860 forensics (crucible-research#389, 2026-07-06): joining 26 weeks
+# of cio_evaluations ADVANCE picks to score_performance_outcomes found 22
+# pre-June picks with ZERO outcome rows at all — three whole score_date
+# cycles (2026-04-04/04-11/04-12) silently missing from the store, discovered
+# only by an offline forensic join months later. _backfill_outcome_records
+# has no visibility into score_performance's OWN date coverage (it only reads
+# whatever rows already made it into score_performance / universe_returns),
+# so a cycle that never got seeded — S3 signals.json missing that week, a
+# universe_returns price-window gap, or any other upstream producer failure —
+# leaves no trace anywhere the collector logs. This closes that blind spot
+# the same way _emit_context_coverage_metric / _emit_horizon_grading_lag_metric
+# close theirs: a cheap, producer-side, best-effort WARN, run every cycle,
+# so a future gap is caught the SAME WEEK it happens instead of months later
+# via manual forensics.
+
+
+def _check_outcome_store_coverage(db_path: str) -> dict:
+    """WARN (with counts) when a ``score_performance`` signal date has ZERO
+    ``score_performance_outcomes`` rows after this run's backfill step.
+
+    For every distinct ``score_date`` present in ``score_performance``,
+    checks whether ``score_performance_outcomes`` has at least one row for
+    that date (any horizon). A date with score_performance rows but no
+    outcome rows at all means the whole cycle silently fell out of the
+    outcome store — as distinct from the ordinary/expected case of a recent
+    date whose forward-return windows haven't closed yet, which the
+    primary-horizon grace cutoff excludes (mirrors the existing
+    ``_newest_window_closed`` reasoning: a date that hasn't had time to
+    resolve is not a coverage gap).
+
+    Best-effort / non-fatal: this is observability, not a load-bearing
+    write path — mirrors ``_emit_context_coverage_metric``'s try/except
+    shape. Always returns a summary dict (even when zero gap dates exist)
+    so callers/tests can assert on ``gap_dates`` deterministically.
+    """
+    from nousergon_lib.trading_calendar import add_trading_days
+
+    summary: dict = {"status": "ok"}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _ensure_score_performance_outcomes_schema(conn)
+
+            signal_dates = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT score_date FROM score_performance ORDER BY score_date"
+                ).fetchall()
+            ]
+            if not signal_dates:
+                summary.update(
+                    signal_dates_checked=0, gap_dates=[], gap_counts={},
+                    note="no score_performance rows — nothing to check",
+                )
+                return summary
+
+            today = date.today()
+            outcome_dates = {
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT score_date FROM score_performance_outcomes"
+                ).fetchall()
+            }
+
+            checked = 0
+            gap_dates: list[str] = []
+            gap_counts: dict[str, int] = {}
+            for sig_date in signal_dates:
+                # Grace window: a date whose primary (21d) horizon hasn't
+                # closed yet is EXPECTED to have no outcome rows — that's
+                # normal forward-window lag, not a gap. Only flag dates old
+                # enough that the primary horizon should have resolved.
+                d = date.fromisoformat(sig_date)
+                if add_trading_days(d, DEFAULT_POLICY.primary_horizon) >= today:
+                    continue
+                checked += 1
+                if sig_date not in outcome_dates:
+                    row_count = conn.execute(
+                        "SELECT COUNT(*) FROM score_performance WHERE score_date = ?",
+                        (sig_date,),
+                    ).fetchone()[0]
+                    gap_dates.append(sig_date)
+                    gap_counts[sig_date] = row_count
+
+            summary.update(
+                signal_dates_checked=checked,
+                gap_dates=gap_dates,
+                gap_counts=gap_counts,
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "outcome_store_coverage: DB read failed — coverage-gap detection "
+            "skipped this cycle. %s", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+        return summary
+
+    if summary["gap_dates"]:
+        logger.warning(
+            "score_performance_outcomes coverage gap: %d signal date(s) with "
+            "score_performance rows but ZERO outcome rows post-run: %s "
+            "(score_performance row counts: %s). A resolved-age cycle with no "
+            "outcome rows at all means it fell out of the backfill entirely — "
+            "investigate whether score_performance seeded correctly for these "
+            "dates and whether universe_returns has their price window "
+            "(config#1860).",
+            len(summary["gap_dates"]), summary["gap_dates"], summary["gap_counts"],
+        )
+
+    return summary
 
 
 # ── Step 3: Seed predictor_outcomes ───────────────────────────────────────────
@@ -1275,6 +1408,178 @@ def _emit_context_coverage_metric(db_path: str) -> dict:
             "investigate _seed_score_performance / signals.json shape.",
             summary["coverage_pct"], summary["rows_fully_populated"],
             summary["rows_post_cutoff"], _DRIFT_EFFECTIVE_DATE,
+        )
+
+    return summary
+
+
+# ── Horizon-grading freshness gate (config#2972) ─────────────────────────────
+#
+# 2026-06/07: a prior investigation pass queried research.db directly and
+# found predictor_outcomes.horizon_days/correct/actual_log_alpha NULL for
+# every prediction_date >= 2026-06-17 (and the same cutoff on
+# universe_returns.log_return_21d), and mistook this for a silently-broken
+# write path. Root-cause re-investigation (config#2972) found NO break: a
+# 21-trading-day-forward metric is *expected* to lag "today" by up to 21
+# trading days before it can be populated at all — add_trading_days(2026-06-17,
+# 21) == 2026-07-20, which had simply not arrived yet as of the date those
+# rows were queried. The apparent "cutoff" was the natural lag boundary, not
+# a stall.
+#
+# The real gap this exposed: NOTHING was distinguishing "expected lag" from
+# "the grading pipeline actually stopped advancing" — a prior groom pass spent
+# real investigation cycles on a false alarm because there was no cheap,
+# producer-side signal for "is the horizon-grading lag inside its expected
+# band, or has it stopped shrinking?". This closes that gap the same way
+# _emit_context_coverage_metric closes the canonical-context gap: a
+# producer-side CloudWatch gauge, best-effort or emit non-fatal, alarmable via
+# infrastructure/setup_horizon_grading_alarms.sh.
+#
+# Metric definition: for each of universe_returns.log_return_{h}d and
+# predictor_outcomes.horizon_days, compute
+#   lag_trading_days = count_trading_days(MAX(date with the column populated),
+#                                          last date whose h-trading-day
+#                                          forward window has already closed)
+# A healthy pipeline keeps this at 0 (every date whose window has closed is
+# graded by the next run). A stalled pipeline (the JOIN/backfill genuinely
+# breaking, e.g. a real regression in universe_returns's 21d computation)
+# makes this grow without bound instead of resetting to 0 each run — that
+# growth, not the raw NULL count, is the alarmable signal.
+def _newest_window_closed(
+    max_candidate: str | None, today: date, h: int,
+) -> str | None:
+    """Newest date <= `max_candidate` whose h-trading-day forward window has
+    already closed as of `today`. None if no row is closed yet (e.g. the
+    table is empty, or every row is still within its forward window).
+
+    `max_candidate` (the newest row present in the table at all) may itself
+    still be inside its own forward window — walk backward a bounded number
+    of trading days (h + margin) to find the newest one that has closed.
+    Bounded at h + 10 steps: a well-formed table has a closed row within
+    that many trading days of the newest row, since _get_existing_dates
+    keeps re-enqueuing any closed-but-ungraded date every run.
+    """
+    if not max_candidate:
+        return None
+    from nousergon_lib.trading_calendar import add_trading_days, previous_trading_day
+
+    d = date.fromisoformat(max_candidate)
+    for _ in range(h + 10):
+        if add_trading_days(d, h) < today:
+            return d.isoformat()
+        d = previous_trading_day(d)
+    return None
+
+
+def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
+    """CloudWatch gauge: trading-day lag between "latest closed h-day window"
+    and "latest date actually graded" for universe_returns + predictor_outcomes.
+
+    Always emits (including 0) so the alarm baseline is continuous. Best
+    effort: read/emit errors log a warning but never raise — this is
+    observability, not a load-bearing path (mirrors
+    _emit_context_coverage_metric).
+    """
+    from nousergon_lib.trading_calendar import count_trading_days
+
+    h = forward_days
+    today = date.today()
+
+    summary: dict = {"status": "ok", "forward_days": h}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            max_eval_date = conn.execute(
+                "SELECT MAX(eval_date) FROM universe_returns"
+            ).fetchone()[0]
+            max_graded_returns = conn.execute(
+                f"SELECT MAX(eval_date) FROM universe_returns "
+                f"WHERE log_return_{h}d IS NOT NULL"
+            ).fetchone()[0]
+            max_prediction_date = conn.execute(
+                "SELECT MAX(prediction_date) FROM predictor_outcomes"
+            ).fetchone()[0]
+            max_graded_outcome = conn.execute(
+                "SELECT MAX(prediction_date) FROM predictor_outcomes "
+                "WHERE horizon_days IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "horizon_grading_lag_metric: DB read failed — drift alarm "
+            "cadence may degrade until next cycle. %s", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+        return summary
+
+    newest_closed_returns = _newest_window_closed(max_eval_date, today, h)
+    newest_closed_outcomes = _newest_window_closed(max_prediction_date, today, h)
+
+    # Lag = trading days between the newest already-graded date and the
+    # newest date whose window has closed (0 if nothing has closed yet, or
+    # the newest closed date is already graded — count_trading_days is a
+    # half-open (start, end] count so it's 0 when start == end and never
+    # negative for a healthy monotonic backfill).
+    lag_returns = (
+        count_trading_days(date.fromisoformat(max_graded_returns), date.fromisoformat(newest_closed_returns))
+        if newest_closed_returns and max_graded_returns
+        else 0
+    )
+    lag_outcomes = (
+        count_trading_days(date.fromisoformat(max_graded_outcome), date.fromisoformat(newest_closed_outcomes))
+        if newest_closed_outcomes and max_graded_outcome
+        else 0
+    )
+
+    summary.update(
+        max_eval_date=max_eval_date,
+        max_graded_returns_eval_date=max_graded_returns,
+        newest_window_closed_eval_date=newest_closed_returns,
+        universe_returns_lag_trading_days=lag_returns,
+        max_prediction_date=max_prediction_date,
+        max_graded_outcome_prediction_date=max_graded_outcome,
+        newest_window_closed_prediction_date=newest_closed_outcomes,
+        predictor_outcomes_lag_trading_days=lag_outcomes,
+    )
+
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[
+                {
+                    "MetricName": "universe_returns_horizon_grading_lag_trading_days",
+                    "Value": float(lag_returns),
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                },
+                {
+                    "MetricName": "predictor_outcomes_grading_lag_trading_days",
+                    "Value": float(lag_outcomes),
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                },
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "horizon_grading_lag metric emit failed: %s — drift alarm "
+            "cadence may degrade until next cycle.", exc,
+        )
+        summary["status"] = "skipped"
+        summary["error"] = str(exc)
+
+    if summary["status"] == "ok" and (lag_returns > 0 or lag_outcomes > 0):
+        logger.warning(
+            "Horizon grading lag: universe_returns=%dtd predictor_outcomes=%dtd "
+            "(forward_days=%d). A healthy pipeline re-grades to lag=0 every run — "
+            "sustained lag > 0 across consecutive runs indicates the grading "
+            "JOIN/backfill has actually stalled (not just normal forward-window "
+            "wait), unlike a single-run lag of 1-2td which is expected right "
+            "after a new window closes.",
+            lag_returns, lag_outcomes, h,
         )
 
     return summary
