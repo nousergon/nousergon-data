@@ -245,7 +245,6 @@ def ingest_ticker(
         )
         if doc_id:
             ingested += 1
-            logger.info("Ingested %s 8-K %s: %d chunks (%s)", ticker, filed_date, len(all_chunks), section_label[:60])
 
     return ingested
 
