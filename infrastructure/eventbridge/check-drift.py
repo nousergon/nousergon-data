@@ -46,6 +46,7 @@ trip the check.
 Usage:
   ./infrastructure/eventbridge/check-drift.py             # check every discovered rule
   ./infrastructure/eventbridge/check-drift.py --rule NAME  # check one rule (by RULE_NAME)
+  ./infrastructure/eventbridge/check-drift.py --post-merge  # auto-apply drifted rules then re-check
 
 Requires AWS creds with events:DescribeRule on the target rules. Locally:
 any admin profile. In CI: intended to reuse the same OIDC role as
@@ -53,6 +54,13 @@ any admin profile. In CI: intended to reuse the same OIDC role as
 need `events:DescribeRule` added to its policy — see this repo's PR for
 config#1464 for the exact IAM diff (that role is codified in
 crucible-executor, not this repo).
+
+--post-merge (config#3495 → config#3697): on EventBridge rule drift,
+run the drifted rule's owning lambda deploy.sh to reconcile the live
+rule, then re-check. A lambda deploy.sh updates both the Lambda function
+AND its EventBridge rule — this is the correct post-merge reconciliation
+for a deploy.sh-codified rule (the same path an operator would take).
+Requires the Lambda deploy role creds in addition to events:DescribeRule.
 """
 
 from __future__ import annotations
@@ -60,6 +68,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -247,10 +256,86 @@ def _check_rule(rule: dict) -> list[str]:
     ]
 
 
+def _apply_eventbridge_rule(deploy_sh_path: Path) -> tuple[bool, str]:
+    """Run the lambda's deploy.sh to reconcile its EventBridge rule.
+
+    The deploy.sh in each infrastructure/lambdas/<name>/ directory maintains
+    the EventBridge rule as part of its normal deploy path. Running it
+    post-merge is the same reconciliation an operator would do manually.
+    Note: deploy.sh also updates the Lambda function itself — this is the
+    correct post-merge behavior for a PR that changed the deploy.sh's
+    codified rule pattern.
+    """
+    bash_bin = shutil.which("bash")
+    if not bash_bin:
+        return False, "bash not found on PATH"
+    deploy_dir = deploy_sh_path.parent
+    try:
+        result = subprocess.run(
+            [bash_bin, str(deploy_sh_path.name)],
+            cwd=str(deploy_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=600,  # 10 min — Lambda deploy can be slow
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"deploy.sh timed out after 600s"
+    except OSError as exc:
+        return False, f"deploy.sh error: {exc}"
+
+    if result.returncode != 0:
+        return False, (
+            f"deploy.sh failed (exit {result.returncode}): "
+            f"{result.stderr.strip()[:500]}"
+        )
+    return True, f"deploy.sh succeeded — {result.stdout.strip()[-200:]}"
+
+
+def _reconcile_events_post_merge(
+    drifted_rules: list[dict],
+) -> list[str]:
+    """Run deploy.sh for each drifted rule, then re-check. Returns residual."""
+    residual: list[str] = []
+    for rule in drifted_rules:
+        rule_name = rule["rule_name"]
+        deploy_sh = rule.get("source_file")
+        if not deploy_sh:
+            residual.append(f"{rule_name}: no source_file — cannot auto-apply")
+            continue
+
+        print(f"Auto-applying {rule_name} via {deploy_sh}...")
+        ok, msg = _apply_eventbridge_rule(deploy_sh)
+        print(f"  {msg}")
+        if not ok:
+            residual.append(f"{rule_name}: auto-apply failed — {msg}")
+            continue
+
+        # Re-check after apply.
+        recheck = _check_rule(rule)
+        if recheck:
+            residual.extend(
+                f"{rule_name}: drift persists after deploy.sh — {f}"
+                for f in recheck
+            )
+        else:
+            print(f"  resolved: {rule_name}")
+    return residual
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--rule", help="Check one rule by RULE_NAME (default: every discovered rule)"
+    )
+    parser.add_argument(
+        "--post-merge",
+        action="store_true",
+        help=(
+            "On drift, run each drifted rule's owning lambda deploy.sh "
+            "to reconcile the live EventBridge rule, then re-check "
+            "(config#3495 → config#3697) — see module docstring"
+        ),
     )
     args = parser.parse_args()
 
@@ -272,11 +357,29 @@ def main() -> int:
         )
         return 0
 
+    drifted_rules: list[dict] = []
     total_findings: list[str] = []
     for rule in rules:
-        total_findings.extend(_check_rule(rule))
+        findings = _check_rule(rule)
+        if findings:
+            drifted_rules.append(rule)
+        total_findings.extend(findings)
 
     if total_findings:
+        if args.post_merge:
+            residual = _reconcile_events_post_merge(drifted_rules)
+            if residual:
+                print(
+                    f"EventBridge drift persists after auto-apply "
+                    f"({len(residual)} finding(s)):"
+                )
+                for f in residual:
+                    print(f"  - {f}")
+                return 1
+            rule_names = ", ".join(r["rule_name"] for r in drifted_rules)
+            print(f"OK: auto-applied and reconciled drift for {rule_names}")
+            return 0
+
         print(f"EventBridge SF-ARN drift detected ({len(total_findings)} finding(s)):")
         for f in total_findings:
             print(f"  - {f}")

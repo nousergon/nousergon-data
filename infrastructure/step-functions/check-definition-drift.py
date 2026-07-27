@@ -58,6 +58,7 @@ Usage:
   ./infrastructure/step-functions/check-definition-drift.py               # every codified SF, alerts on drift
   ./infrastructure/step-functions/check-definition-drift.py --name NAME   # one (by SF name)
   ./infrastructure/step-functions/check-definition-drift.py --no-alert    # diagnostic — no SNS/Telegram
+  ./infrastructure/step-functions/check-definition-drift.py --post-merge  # auto-apply then re-check
 
 Requires AWS creds with states:DescribeStateMachine on the target state
 machines and s3:GetObject on s3://alpha-engine-research/infrastructure/*.
@@ -69,6 +70,13 @@ sns:Publish on `alpha-engine-alerts`. Still standalone-callable from
 liveness sweeps / operator sessions too, same as its check-drift.py sibling.
 Shape-guarded by tests/test_sf_definition_check_drift.py (mocked CLI — no
 real AWS access in CI).
+
+--post-merge (config#3495 → config#3697): on drift, auto-apply the codified
+definition to BOTH the live state machine (update-state-machine) AND the
+S3 staged copy (upload the stamped bytes). Then re-check — residual drift
+after auto-apply is real unexpected drift and still fails. Requires write
+creds (states:UpdateStateMachine + s3:PutObject) in addition to the read
+set above.
 """
 
 from __future__ import annotations
@@ -76,6 +84,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -108,6 +117,100 @@ SF_DEFINITIONS: tuple[dict, ...] = (
 )
 
 _GIT_STAMP_RE = re.compile(r"^\[git:[0-9a-fA-F]{7,40}\]\s*")
+
+
+def _git_sha() -> str:
+    """Return the current HEAD SHA (short), or 'unknown' if git fails."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, FileNotFoundError):
+        pass
+    return "unknown"
+
+
+def _stamp_definition(definition: dict, sha: str) -> dict:
+    """Deep-copy definition with a [git:<sha>] prefix on the Comment."""
+    import copy
+    d = copy.deepcopy(definition)
+    comment = d.get("Comment", "")
+    d["Comment"] = f"[git:{sha}] {comment}"
+    return d
+
+
+def _apply_sf_definition(
+    sf_name: str, definition_file: str, codified: dict, sha: str,
+) -> tuple[bool, str]:
+    """Apply the codified SF definition to live AWS AND S3. Returns (ok, msg)."""
+    stamped = _stamp_definition(codified, sha)
+    stamped_bytes = json.dumps(stamped, indent=2)
+    arn = f"arn:aws:states:{DEFAULT_REGION}:{DEFAULT_ACCOUNT_ID}:stateMachine:{sf_name}"
+    s3_key = f"{S3_PREFIX}{definition_file}"
+
+    errors: list[str] = []
+
+    # 1. Upload to S3 (fix staged copy drift).
+    try:
+        upload = subprocess.run(
+            ["aws", "s3", "cp", "-", f"s3://{S3_BUCKET}/{s3_key}"],
+            input=stamped_bytes, capture_output=True, text=True, check=False,
+        )
+        if upload.returncode != 0:
+            errors.append(f"S3 upload failed: {upload.stderr.strip()}")
+    except OSError as exc:
+        errors.append(f"S3 upload error: {exc}")
+
+    # 2. Update live state machine.
+    try:
+        update = subprocess.run(
+            [
+                "aws", "stepfunctions", "update-state-machine",
+                "--state-machine-arn", arn,
+                "--definition", stamped_bytes,
+                "--output", "json",
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        if update.returncode != 0:
+            errors.append(f"update-state-machine failed: {update.stderr.strip()}")
+    except OSError as exc:
+        errors.append(f"update-state-machine error: {exc}")
+
+    if errors:
+        return False, "; ".join(errors)
+    return True, f"applied {sf_name} → S3 + live"
+
+
+def _reconcile_sf_post_merge(
+    drifted: list[tuple[dict, dict, list[str]]],
+) -> list[str]:
+    """Apply each drifted SF definition and re-check. Returns residual findings."""
+    sha = _git_sha()
+    residual: list[str] = []
+    for entry, codified, findings in drifted:
+        sf_name = entry["sf_name"]
+        def_file = entry["definition_file"]
+        print(f"Auto-applying {sf_name} ({len(findings)} finding(s))...")
+        ok, msg = _apply_sf_definition(sf_name, def_file, codified, sha)
+        print(f"  {msg}")
+        if not ok:
+            residual.append(f"{sf_name}: auto-apply failed — {msg}")
+            continue
+
+        # Re-check after apply.
+        recheck = _check_sf(entry)
+        if recheck:
+            residual.extend(
+                f"{sf_name}: drift persists after auto-apply — {f}"
+                for f in recheck
+            )
+        else:
+            print(f"  resolved: {sf_name}")
+    return residual
 
 
 def _normalized_dict(definition: dict) -> dict:
@@ -311,6 +414,15 @@ def main() -> int:
         action="store_true",
         help="diagnostic mode — no SNS/Telegram alert on drift",
     )
+    parser.add_argument(
+        "--post-merge",
+        action="store_true",
+        help=(
+            "On drift, auto-apply the codified definition to both live "
+            "AWS and the S3 staged copy, then re-check "
+            "(config#3495 → config#3697) — see module docstring"
+        ),
+    )
     args = parser.parse_args()
 
     entries = list(SF_DEFINITIONS)
@@ -324,11 +436,35 @@ def main() -> int:
             )
             return 2
 
+    drifted: list[tuple[dict, dict, list[str]]] = []
     total_findings: list[str] = []
     for entry in entries:
-        total_findings.extend(_check_sf(entry))
+        findings = _check_sf(entry)
+        if findings:
+            # Re-read the codified definition for auto-apply.
+            definition_path = INFRA_DIR / entry["definition_file"]
+            try:
+                codified = json.loads(definition_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                codified = {}
+            drifted.append((entry, codified, findings))
+        total_findings.extend(findings)
 
     if total_findings:
+        if args.post_merge:
+            residual = _reconcile_sf_post_merge(drifted)
+            if residual:
+                print(
+                    f"SF definition drift persists after auto-apply "
+                    f"({len(residual)} finding(s)):"
+                )
+                for f in residual:
+                    print(f"  - {f}")
+                return 1
+            sf_names = ", ".join(e["sf_name"] for e, _, _ in drifted)
+            print(f"OK: auto-applied and reconciled drift for {sf_names}")
+            return 0
+
         print(f"SF definition drift detected ({len(total_findings)} finding(s)):")
         for f in total_findings:
             print(f"  - {f}")
