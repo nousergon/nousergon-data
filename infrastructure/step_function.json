@@ -403,6 +403,80 @@
       ],
       "Next": "EvaluatorDeployDriftCheck"
     },
+    "WeeklyPreflight": {
+      "Type": "Task",
+      "Comment": "I4494: pre-spend gate — runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError → NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-preflight:live"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A Lambda-side crash means we cannot determine pass/fail. Fail-closed: a preflight that cannot check must NOT silently proceed (contrast the advisory gates that fail-open). Route through the normalizer so the failure names the error.",
+          "ResultPath": "$.weekly_preflight_error",
+          "Next": "ExtractWeeklyPreflightError"
+        }
+      ],
+      "ResultPath": "$.weekly_preflight_result",
+      "Next": "WeeklyPreflightGate"
+    },
+    "WeeklyPreflightGate": {
+      "Type": "Choice",
+      "Comment": "I4494: hard-fail when the preflight reports any failing check. Stops the pipeline before any spot spend, naming the failing assertion. Routes via ExtractWeeklyPreflightError (NOT straight to HandleFailure), mirroring the other pre-spend gate conventions: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime, swallowing the violation list behind an opaque meta-error. config#1819: ExtractWeeklyPreflightError hands off to NormalizeFailureContext, not HandleFailure directly.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_preflight_result.Payload.has_violation",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.weekly_preflight_result.Payload.has_violation",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "Preflight found one or more failing checks — stop before spend. The Payload carries the violation list for the SNS alert.",
+          "Next": "ExtractWeeklyPreflightError"
+        },
+        {
+          "Not": {
+            "Variable": "$.weekly_preflight_result.Payload.has_violation",
+            "IsPresent": true
+          },
+          "Comment": "Preflight returned a payload WITHOUT has_violation (partial/malformed result). Fail-closed: a preflight that cannot produce a verdict must not proceed, unlike the advisory gates (LibPinDriftCheck/PipelineContractCheck) which fail-open. The preflight is the last check before spend — failing open here defeats its purpose.",
+          "Next": "ExtractWeeklyPreflightError"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "ExtractWeeklyPreflightError": {
+      "Type": "Pass",
+      "Comment": "Normalize a confirmed preflight failure (WeeklyPreflightGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the preflight failure details. Carries the whole preflight Payload (failures/warnings) so the FAILED SNS alert names the exact check that must pass before redrive. References only $.weekly_preflight_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here. Mirrors ExtractPipelineContractError's convention.",
+      "Parameters": {
+        "phase": "WeeklyPreflightGate",
+        "source": "WeeklyPreflightGate.has_violation",
+        "violation.$": "$.weekly_preflight_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
     "CheckMutexRole": {
       "Type": "Choice",
       "Comment": "L274 SF MutualExclusionGuard \u2014 gate at SF entry point. Allowlist all unattended cadence-roles (currently: daily / weekly / eod / shell-run / exercise) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations \u2014 that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell. Trigger of record: 2026-05-26 duplicate-EventBridge-target incident (PR #322 closed the SPECIFIC dup-target shape via CI; this mutex closes the broader class).",
@@ -4885,7 +4959,7 @@
     },
     "EvaluatorDirectorDeployDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the director Lambda's probe reports has_drift=true. Mirrors EvaluatorDeployDriftGate exactly; on a clean pass this is the last of the three pre-spend gates, proceeding to CheckMutexRole.",
+      "Comment": "Hard-fail when the director Lambda's probe reports has_drift=true. Mirrors EvaluatorDeployDriftGate exactly; on a clean pass this is the last of the three deploy-drift pre-spend gates, proceeding to WeeklyPreflight (I4494) -- the last pre-spend probe of all, composing all four before any spot spend.",
       "Choices": [
         {
           "And": [
@@ -4910,7 +4984,7 @@
           "Next": "EvaluatorDirectorGateDegraded"
         }
       ],
-      "Default": "CheckMutexRole"
+      "Default": "WeeklyPreflight"
     },
     "ExtractEvaluatorDirectorDeployDriftError": {
       "Type": "Pass",
@@ -4932,7 +5006,7 @@
     },
     "PublishEvaluatorDirectorGateDegraded": {
       "Type": "Task",
-      "Comment": "Fail-open + alert, mirrors PublishEvaluatorGateDegraded.",
+      "Comment": "Fail-open + alert, mirrors PublishEvaluatorGateDegraded. Proceeds to WeeklyPreflight (NOT straight to CheckMutexRole) -- mirrors PublishPipelineContractGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
@@ -4947,10 +5021,10 @@
           ],
           "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
           "ResultPath": "$.evaluator_director_gate_degraded_notify_error",
-          "Next": "CheckMutexRole"
+          "Next": "WeeklyPreflight"
         }
       ],
-      "Next": "CheckMutexRole"
+      "Next": "WeeklyPreflight"
     },
     "SubstrateHealthGate": {
       "Type": "Task",

@@ -1,0 +1,6 @@
+# Lambda deps for weekly-preflight — minimal set.
+# boto3 and jmespath are available in the Lambda runtime.
+# sf_preflight.py is copied from the repo root during deploy.
+# ArcticDB/polygon/secrets deps are NOT needed: checks that require
+# them gracefully skip/fail with an explanatory message.
+aws-assume-role-lib
