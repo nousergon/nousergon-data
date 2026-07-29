@@ -115,13 +115,38 @@ class TestVerdicts:
 
 
 class TestBootstrapCommand:
-    def test_command_targets_alert_drain_bootstrap_with_run_id(self, index_mod):
+    def test_command_targets_the_unified_artifact_with_the_playbook_name(self, index_mod):
         index, sd = index_mod
         index.handler({"is_drill": "false"}, None)
         cmd = sd.send_async_command.call_args.args[1]
-        assert "infrastructure/alert_drain_spot_bootstrap.sh" in cmd
-        assert "--run-id" in cmd and "--is-drill" in cmd
+        assert "infrastructure/overseer_spot_bootstrap.sh" in cmd
+        assert "--playbook alert-drain" in cmd
         assert index.DRAIN_GH_PAT_SSM in cmd
+        # The legacy path must be gone, not merely unreferenced — a command
+        # that execs both, or the old one, is the cutover silently not
+        # happening.
+        assert "alert_drain_spot_bootstrap.sh" not in cmd
+
+    def test_run_identity_is_exported_not_passed_as_flags(self, index_mod):
+        """The unified bootstrap reads DRAIN_RUN_ID / DRAIN_IS_DRILL from the
+        ENVIRONMENT and forwards unrecognised argv to the run script. Passing
+        them as flags leaves both unset: the run script invents a `<ts>-adhoc`
+        run id (breaking dispatch-ledger correlation) and reads the drill flag
+        as false — so a drill would drain the real queue."""
+        index, sd = index_mod
+        index.handler({"is_drill": "true"}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        assert 'export DRAIN_IS_DRILL="true"' in cmd
+        assert "export DRAIN_RUN_ID=" in cmd
+        assert "--run-id" not in cmd and "--is-drill" not in cmd
+
+    def test_drill_run_id_keeps_its_prefix_through_the_export(self, index_mod):
+        """Drill isolation rides on the run id prefix (completion-marker and
+        ledger keys derive from it), so it must survive the argv -> env move."""
+        index, sd = index_mod
+        index.handler({"is_drill": "true"}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        assert 'export DRAIN_RUN_ID="drill-' in cmd
 
 
 def test_model_threaded_into_bootstrap_export():

@@ -11,8 +11,18 @@ that triggers the autonomous resilience agent (diagnose→fix→merge→rerun) i
 **Per-pipeline registry.** ``PIPELINES`` maps each SF name → its watch-log
 prefix + repository_dispatch event type, so the GHA workflow + dashboard filter
 by cadence and each pipeline carries its OWN kill-switch (in the agent charter).
-weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped on,
-independently of Saturday. Fan-out is additive: register a pipeline here, add its
+**All three cadences run autonomous-merge=true** (since 2026-07-07, config#1616).
+PROPOSE-ONLY is now only reachable by an operator re-flipping the per-cadence
+`/alpha-engine/<slug>_sf_watch/autonomous_merge_enabled` kill-switch; it is not
+a default and there is no soak in progress. (This paragraph previously said
+"weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped
+on" — that was written before #1616 and was three weeks stale by 2026-07-29,
+when it caused a session to report a nonexistent operator soak and to treat
+widening weekday/EOD autonomy as a decision still owed. The charter
+`alpha-engine-config/.github/sf-watch-prompt.md` is authoritative for autonomy
+and budget; this docstring is a pointer, not a second source.)
+
+Fan-out is additive: register a pipeline here, add its
 ARN to the single EventBridge rule (deploy.sh), widen the IAM ARNs.
 
 **Why this is NOT a second notifier.** The fleet already has
@@ -408,9 +418,43 @@ def _prior_dispatch_count(existing_events: list[dict]) -> int:
     return sum(1 for ev in existing_events if ev.get("action") in _BUDGET_CONSUMING_ACTIONS)
 
 
-def _max_dispatches(cadence_slug: str) -> int:
+def _pipeline_role(describe_resp: dict | None) -> str:
+    """``pipeline_role`` from the failed execution's input, or "".
+
+    Mirrors :func:`_is_preflight`'s parsing exactly — same field, same
+    fail-soft posture. An unreadable input yields "", which routes to the
+    CONSERVATIVE ceiling below rather than the permissive one.
+    """
+    if not describe_resp:
+        return ""
+    try:
+        payload = json.loads(describe_resp.get("input") or "{}")
+    except (ValueError, TypeError):
+        return ""
+    role = payload.get("pipeline_role")
+    return role.strip().lower() if isinstance(role, str) else ""
+
+
+def _max_dispatches(cadence_slug: str, pipeline_role: str = "") -> int:
     """Per-cadence dispatch ceiling (config#2269) — 8 for saturday, 2 for
-    weekday/eod, conservative 2 for any unruled future cadence."""
+    weekday/eod, conservative 2 for any unruled future cadence.
+
+    alpha-engine-config-I5502: ``cadence_slug`` is a FROZEN PER-PIPELINE
+    label, not a day derivation, so every run of ne-weekly-freshness-pipeline
+    resolves to "saturday" — including the weekday EXERCISE runs that
+    alpha-engine-config-I5489 chains off postclose. Because the budget is
+    keyed on (cadence, pipeline, run_date) and each trading day brings a new
+    run_date, the Saturday ceiling of 8 would REFILL DAILY: up to 40 agent
+    dispatches a week where 8 was ruled, each one a spot box plus a frontier
+    model run, against a pipeline that currently fails ~4 runs in 5.
+
+    An exercise run is a debugging cycle, not the week's belief refresh, so
+    it takes the conservative ceiling. The real Saturday run
+    (``pipeline_role="weekly"``, or absent on manual/recovery invocations)
+    is unchanged.
+    """
+    if pipeline_role == "exercise":
+        return _DEFAULT_MAX_DISPATCHES
     return SF_WATCH_MAX_DISPATCHES.get(cadence_slug, _DEFAULT_MAX_DISPATCHES)
 
 
@@ -763,7 +807,8 @@ def _build_event_record(
     is_preflight = _is_preflight(describe_resp)
     already_escalated = bool(existing_events) and _already_escalated_today(existing_events)
     prior_dispatches = _prior_dispatch_count(existing_events or [])
-    dispatch_ceiling = _max_dispatches(str(cfg.get("cadence_slug", "")))
+    pipeline_role = _pipeline_role(describe_resp)
+    dispatch_ceiling = _max_dispatches(str(cfg.get("cadence_slug", "")), pipeline_role)
     budget_exhausted = prior_dispatches >= dispatch_ceiling
     if operator_abort:
         dispatch_suppressed = "operator_abort"
@@ -810,6 +855,11 @@ def _build_event_record(
         # (additive fields — S3 schema contract allows ADD only).
         record["prior_dispatch_count"] = prior_dispatches
         record["dispatch_ceiling"] = dispatch_ceiling
+        # I5502: WHY the ceiling is what it is. Without this, an exercise run
+        # capped at 2 and a Saturday run capped at 8 are indistinguishable in
+        # the watch-log, and "why did this only get 2 attempts" costs an
+        # execution-history dig to answer.
+        record["pipeline_role"] = pipeline_role or None
     return record
 
 

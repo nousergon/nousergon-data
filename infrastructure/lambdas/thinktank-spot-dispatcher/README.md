@@ -68,12 +68,22 @@ Lambda until step 3.
 Roll back by re-running `put-targets` against the Lambda alias; the Lambda
 itself is left deployed and functional throughout.
 
-## Alarm follow-up (not yet done)
+## Alarm rotation (handled by `--cutover`)
 
-`alpha-engine-thinktank-daily-run-failed` currently watches the **Lambda's**
-`Errors` metric (`infrastructure/setup-thinktank-schedule.sh` in
-crucible-research). After step 4 that Lambda stops being invoked on a schedule,
-so the alarm goes **blind** — a green alarm would then mean "nothing ran", which
-is the same silence class this whole arc is about. The alarm has to move onto
-this dispatcher's `Errors` plus the freshness registry's
-`thinktank_challenger_selection` row before the cutover is complete.
+`alpha-engine-thinktank-daily-run-failed` and its `-timeout` sibling watch the
+**old Lambda's** metrics. The instant the rule stops targeting that function
+they stop seeing invocations — and because both were created with
+`--treat-missing-data notBreaching`, zero invocations evaluates to **OK**. They
+would go green *because nothing ran*, which is precisely the silence class
+config-I5208 is about.
+
+So `--cutover` rotates them atomically with the repoint:
+
+| Signal | Covers | Where |
+|---|---|---|
+| `alpha-engine-thinktank-spot-dispatch-failed` | **launch** — Errors >= 3/day means the invoke plus both async retries all raised, so no box exists | armed by `--cutover` |
+| `thinktank_challenger_selection` | **end-to-end** — the artifact itself going stale, i.e. a box that booted and produced nothing | ARTIFACT_REGISTRY, already live |
+
+Both are required. The dispatcher alarm cannot see a box that boots and then
+fails its run; the freshness row cannot distinguish "never launched" from
+"launched and failed". The two old alarms are deleted, not left green.

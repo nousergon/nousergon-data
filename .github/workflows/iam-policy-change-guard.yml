@@ -15,6 +15,29 @@ name: IAM Policy Change Guard
 # gated the change on a tracked operator issue. See infrastructure/iam/
 # README.md "Single-writer rule" and _shared/apply_iam_policy.sh.
 #
+# ── Third accepted branch: ALREADY LIVE (alpha-engine-config-I5309) ──────────
+#
+# The two original branches deadlocked against `gate-label-guard`, which fails
+# any PR carrying a `gate:*` label and was ALSO a required check on this repo.
+# Satisfying this guard via `gate:operator` therefore guaranteed the other guard
+# went red, so an IAM-only PR could not merge by any route. Hit live 2026-07-29
+# on nousergon-data-PR1132.
+#
+# The deeper problem is that both original branches accept an INTENTION — "an
+# operator will run --apply-iam later" — rather than a fact. The alpha-engine
+# standing rule actually PREFERS applying the policy in-session BEFORE opening
+# the PR, and that path had no way to satisfy this guard at all: the strictly
+# safer workflow was the one the guard rejected.
+#
+# So the third branch verifies the OUTCOME the other two only promise: read the
+# live inline policy and compare it to the PR's file. If they already match, the
+# change is not inert — it is deployed — and there is nothing left to gate on.
+# This is a fact about the account, not a label anyone can apply by hand.
+#
+# Read-only: the `github-actions-iam-drift-check` role holds iam:GetRolePolicy
+# and NOT iam:PutRolePolicy, so this guard cannot become the fourth IAM-clobber
+# incident. Verification stays strictly weaker than mutation.
+#
 # Usage: required status check on main branch protection.
 
 on:
@@ -26,6 +49,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  id-token: write   # OIDC -> github-actions-iam-drift-check (read-only IAM)
 
 jobs:
   # Job id is the branch-protection CONTEXT. Deliberately specific rather
@@ -40,6 +64,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+
+      # Read-only IAM identity — iam:GetRolePolicy without iam:PutRolePolicy.
+      # continue-on-error so an OIDC/STS hiccup degrades the ALREADY-LIVE branch
+      # to unavailable rather than failing the guard outright: the two original
+      # branches still work, so a credentials blip must not block a PR that
+      # satisfies them.
+      - name: Configure AWS credentials (read-only IAM drift-check role)
+        id: aws
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
 
       - name: Check iam-policy.json changes have deploy.sh or gate:operator
         shell: bash
@@ -92,13 +129,52 @@ jobs:
               continue
             fi
 
-            echo "FAIL: ${POLICY} changed but ${DEPLOY_SCRIPT} was not touched"
-            echo "      and no gate:operator label is set on this PR."
+            # ── Branch 3: ALREADY LIVE (alpha-engine-config-I5309) ──────────
+            # Verify the OUTCOME the other two branches only promise. If the
+            # deployed inline policy already equals this PR's file, the change
+            # is not inert and there is nothing to gate on.
+            #
+            # Both documents are normalised through `jq -S` (recursively
+            # key-sorted, canonical whitespace) before comparison — IAM returns
+            # its own key order and URL-decodes the document, so a raw string
+            # compare would report drift on every PR and make this branch dead
+            # code that always falls through.
+            if [ "${{ steps.aws.outcome }}" = "success" ]; then
+              ROLE_NAME=$(grep -m1 '^ROLE_NAME=' "$DEPLOY_SCRIPT" 2>/dev/null | cut -d'"' -f2)
+              POLICY_NAME=$(grep -m1 '^POLICY_NAME=' "$DEPLOY_SCRIPT" 2>/dev/null | cut -d'"' -f2)
+              if [ -n "$ROLE_NAME" ] && [ -n "$POLICY_NAME" ]; then
+                if aws iam get-role-policy --role-name "$ROLE_NAME" \
+                     --policy-name "$POLICY_NAME" --query PolicyDocument \
+                     --output json > /tmp/live_policy.json 2>/dev/null; then
+                  if jq -S . /tmp/live_policy.json > /tmp/live_norm.json 2>/dev/null \
+                     && jq -S . "$POLICY" > /tmp/repo_norm.json 2>/dev/null \
+                     && diff -q /tmp/live_norm.json /tmp/repo_norm.json >/dev/null 2>&1; then
+                    echo "✓ ${POLICY}: ALREADY LIVE on ${ROLE_NAME}/${POLICY_NAME}"
+                    echo "  (applied in-session before merge — verified against the account,"
+                    echo "   not asserted by a label; nothing left to gate on)"
+                    continue
+                  fi
+                  echo "  ${POLICY}: live policy on ${ROLE_NAME}/${POLICY_NAME} DIFFERS from this PR"
+                else
+                  echo "  ${POLICY}: could not read live policy for ${ROLE_NAME}/${POLICY_NAME}"
+                fi
+              else
+                echo "  ${POLICY}: could not parse ROLE_NAME/POLICY_NAME from ${DEPLOY_SCRIPT}"
+              fi
+            else
+              echo "  ${POLICY}: AWS credentials unavailable — already-live check skipped"
+            fi
+
+            echo "FAIL: ${POLICY} changed but ${DEPLOY_SCRIPT} was not touched,"
+            echo "      no gate:operator label is set, and the policy is not already live."
             echo ""
             echo "      A changed iam-policy.json has NO LIVE EFFECT until an operator"
-            echo "      runs 'deploy.sh --apply-iam' or 'deploy.sh --bootstrap'. Either:"
-            echo "        1) Also modify ${DEPLOY_SCRIPT} (so the operator knows to apply IAM)"
-            echo "        2) Add the 'gate:operator' label with a tracked operator issue"
+            echo "      runs 'deploy.sh --apply-iam' or 'deploy.sh --bootstrap'. Any of:"
+            echo "        1) Apply it now, BEFORE merging (preferred — the standing rule's"
+            echo "           own preference, and this guard then passes on its own):"
+            echo "             bash ${DEPLOY_SCRIPT} --apply-iam"
+            echo "        2) Also modify ${DEPLOY_SCRIPT} (so the operator knows to apply IAM)"
+            echo "        3) Add the 'gate:operator' label with a tracked operator issue"
             FAILED="true"
           done
 
