@@ -207,9 +207,14 @@ _RESEARCH_BUCKET = "alpha-engine-research"
 # Savings Plan (instance-family-agnostic) already covers it — cost-I2864. CRITICAL:
 # every type here MUST be arm64 to match the arm64 AMI below — an arm64 AMI will
 # not boot on an x86 instance type (and vice-versa).
+#
+# config#4989: widened to span multiple arm64 families (t4g, c7g, c6g, m7g, m6g)
+# so the per-lane anti-affinity rotation (see _lane_rotation_offset) has at least
+# 6 distinct types × 6 subnets = 36 pool combinations to distribute across.
 INSTANCE_TYPES = [
     t.strip()
-    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t4g.medium,t4g.large").split(",")
+    for t in os.environ.get("GROOM_INSTANCE_TYPES",
+        "t4g.medium,t4g.large,c7g.medium,c6g.medium,m7g.medium,m6g.large").split(",")
     if t.strip()
 ]
 SUBNETS = [
@@ -535,13 +540,50 @@ export GROOM_RUN_TOKEN={run_token}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+# ── Per-lane anti-affinity rotation (config#4989) ────────────────────────
+# The dispatch SF's Map state launches 0-3 lanes in the same instant. Without
+# per-lane rotation every lane starts at the same type × subnet pair, so a
+# single-pool capacity event claims all concurrent lanes (2026-07-28: all 3
+# lanes reclaimed instance-terminated-no-capacity within 2m20s of launch).
+# Map issue_filter values to distinct offsets so concurrent lanes diverge.
+_LANE_ROTATION_INDEX = {"mid-only": 0, "low": 1, "high": 2, "sweep": 3}
+
+
+def _lane_rotation_offset(issue_filter: str) -> int:
+    """Deterministic per-lane rotation offset so co-launched lanes start at
+    different type × subnet combinations (config#4989).
+
+    Returns an index into ``INSTANCE_TYPES`` and ``SUBNETS`` (used to rotate
+    both lists before the first launch attempt). With 6 types and 6 subnets,
+    lanes 0/1/2 start at three distinct pools on their first attempt. A single
+    pool's capacity event then claims at most one lane — the other two are on
+    different pairs and succeed or fail independently.
+    """
+    return _LANE_ROTATION_INDEX.get(issue_filter, 0)
+
+
+def _launch_instance(force_on_demand: bool = False,
+                     rotation_offset: int = 0) -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``rotation_offset`` (config#4989): rotates the instance types and subnet
+    lists so co-launched lanes diverge on their first type × subnet attempt.
+    Applied BEFORE the list is passed to the launch chokepoint — the krepis
+    lib still rotates on capacity errors within the per-lane rotated subset."""
+    types = list(INSTANCE_TYPES)
+    subnets = list(SUBNETS)
+    if rotation_offset:
+        offset = rotation_offset % len(types) if types else 0
+        if offset:
+            types = types[offset:] + types[:offset]
+        offset = rotation_offset % len(subnets) if subnets else 0
+        if offset:
+            subnets = subnets[offset:] + subnets[:offset]
     return spot_dispatch.launch_with_fallback(
-        INSTANCE_TYPES, SUBNETS,
+        types, subnets,
         image_id=AMI_ID,
         key_name=KEY_NAME,
         security_group_ids=[SECURITY_GROUP],
@@ -1026,7 +1068,9 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # sf-watch watch-log timing) so a launch that itself fails/raises still
     # consumes ceiling budget — see _write_dispatch_ledger_entry.
     _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+    rotation_offset = _lane_rotation_offset(issue_filter)
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand,
+                                           rotation_offset=rotation_offset)
     logger.info("launched groom box %s (%s)", instance_id, market)
     # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
     # so the NEXT trigger's guard check (above) can find it. Best-effort — a
