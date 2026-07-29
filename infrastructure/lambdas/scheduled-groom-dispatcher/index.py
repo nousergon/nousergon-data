@@ -535,11 +535,21 @@ export GROOM_RUN_TOKEN={run_token}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False,
+                     tier_tag: str = "") -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``tier_tag`` (config#5303 root fix): the load-bearing ``groom-issue-filter``
+    discriminator tag now rides the SAME RunInstances call via ``extra_tags``
+    (config#2292 root fix, already adopted by sf-watch/ci-watch dispatchers) —
+    the box is NEVER observably untagged after launch, so a spot-reclaim CloudTrail
+    record (which only sees ``TagSpecifications``, not post-launch ``CreateTags``)
+    retains lane attribution for the full 90-day CloudTrail retention window.
+    """
+    extra_tags = {GROOM_TIER_TAG_KEY: tier_tag} if tier_tag else None
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -548,6 +558,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-groom-spot",
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -598,6 +609,101 @@ def _tier_tag(run_mode: str, issue_filter: str) -> str:
     groom boxes guard per issue_filter tier; sweep boxes guard as one
     distinct 'sweep' lane regardless of the (inert) issue_filter they carry."""
     return _SWEEP_TIER_TAG if run_mode == "sweep" else issue_filter
+
+
+class ConcurrentCycleError(RuntimeError):
+    """The cycle-singleton probe could not reach a verdict (alpha-engine-config-I5371).
+
+    Distinct from "a sibling cycle IS running": this means we do not KNOW.
+    Raised so the decide phase fails CLOSED rather than launching blind — see
+    ``_concurrent_cycle_blockers`` for why that asymmetry is the correct default.
+    """
+
+
+def _dispatch_state_machine_arn(execution_arn: str) -> str:
+    """The state-machine ARN owning ``execution_arn``.
+
+    ``arn:aws:states:R:A:execution:<SM_NAME>:<EXEC_NAME>``
+      -> ``arn:aws:states:R:A:stateMachine:<SM_NAME>``
+
+    Fail-loud on any other shape: a silently-wrong ARN here would make
+    ``list_executions`` return an empty set, which reads exactly like
+    "no sibling cycles" — the §2.4 absence-as-benign failure this whole
+    guard exists to prevent.
+    """
+    parts = execution_arn.split(":")
+    if len(parts) != 8 or parts[:3] != ["arn", "aws", "states"] or parts[5] != "execution":
+        raise ConcurrentCycleError(
+            f"unparseable execution ARN for cycle-singleton check: {execution_arn!r}")
+    return ":".join(parts[:5] + ["stateMachine", parts[6]])
+
+
+def _concurrent_cycle_blockers(execution_arn: str) -> list[dict]:
+    """RUNNING sibling executions of this dispatch SF that started BEFORE us.
+
+    **Why this guard exists (alpha-engine-config-I5371).** The dispatch SF
+    carried ``TimeoutSeconds: 72000`` (20h) against an 8h trigger cadence and
+    no singleton state, so up to three cycles could be alive at once *by
+    construction* — no failure required. Measured live 2026-07-29: two
+    executions RUNNING simultaneously (started 7/28 21:00 PT and 7/29 05:00
+    PT, both hung on their task-token callback), plus a third that ran 18h
+    before failing. Each independently enumerated the backlog and dispatched
+    an agent at the same issue, producing 19 duplicate PRs across 16 clusters
+    — e.g. crucible-dashboard#588/#589/#590, three PRs against config#4790
+    opened three minutes apart under three different branch conventions.
+
+    **Oldest-wins, not newest-wins.** The comparison key is
+    ``(startDate, executionArn)`` — a total order, so exactly one live cycle
+    survives even when two start in the same millisecond. Newest-wins would
+    let a fresh trigger repeatedly preempt a cycle that is doing real work.
+
+    **Fail CLOSED, unlike the sibling lane guard.** ``_running_tier_instance_ids``
+    deliberately fails open ("an optimization, not a correctness gate") because
+    a missed lane-skip costs one redundant box. This guard fails closed because
+    the costs are asymmetric: a wrongly-skipped cycle self-heals on the next 8h
+    trigger at zero cost, while a wrongly-launched concurrent cycle leaves
+    duplicate PRs that need a human to disentangle. Callers surface the skip by
+    name (never silently — §2.4).
+    """
+    if not execution_arn:
+        # Direct/legacy invoke with no SF context (manual `aws lambda invoke`,
+        # the DeepSeek fallback path). There is no cycle to be a sibling OF, so
+        # there is nothing to guard — this is a real absence, not an unknown.
+        return []
+
+    sm_arn = _dispatch_state_machine_arn(execution_arn)
+    try:
+        sfn = boto3.client("stepfunctions", region_name=REGION)
+        running: list[dict] = []
+        kwargs = {"stateMachineArn": sm_arn, "statusFilter": "RUNNING", "maxResults": 100}
+        while True:
+            page = sfn.list_executions(**kwargs)
+            running.extend(page.get("executions", []))
+            token = page.get("nextToken")
+            if not token:
+                break
+            kwargs["nextToken"] = token
+    except Exception as exc:  # noqa: BLE001 — converted to a NAMED closed failure
+        raise ConcurrentCycleError(
+            f"could not list RUNNING executions of {sm_arn}: {exc}") from exc
+
+    mine = next((e for e in running if e.get("executionArn") == execution_arn), None)
+    if mine is None:
+        # We are executing, so we MUST appear in our own RUNNING set. Absence
+        # means the listing is not describing reality (wrong SM, truncated
+        # page, IAM-filtered result) — refuse to conclude "no siblings".
+        raise ConcurrentCycleError(
+            f"this execution ({execution_arn}) absent from its own RUNNING set "
+            f"({len(running)} listed) — cannot establish singleton")
+
+    def _key(ex: dict) -> tuple:
+        return (ex.get("startDate"), ex.get("executionArn") or "")
+
+    return sorted(
+        (e for e in running
+         if e.get("executionArn") != execution_arn and _key(e) < _key(mine)),
+        key=_key,
+    )
 
 
 def _running_tier_instance_ids(tier_tag: str) -> list[str]:
@@ -851,6 +957,37 @@ def _handle_cycle_complete(event: dict) -> dict:
         return {"cycleNotify": {"notified": False, "error": str(exc)}}
 
 
+def _notify_concurrent_cycle_skip(blockers: list[dict], schedule_label: str,
+                                  execution_arn: str) -> None:
+    """Loud ping for a whole-cycle singleton skip — never raises.
+
+    Deliberately NOT silent: unlike the per-lane skip (a routine, expected
+    outcome of a long-running lane), a cycle-level skip means the PREVIOUS
+    cycle is still alive after a full trigger interval, which is either a
+    genuinely long run or a hang. Both warrant a look.
+    """
+    names = ", ".join(str(b.get("name") or b.get("executionArn") or "?") for b in blockers)
+    text = (
+        "⚪ Backlog groom CYCLE SKIPPED — an earlier dispatch cycle is still "
+        f"RUNNING (alpha-engine-config-I5371). still-running: {names}. "
+        f"schedule={schedule_label}. Zero enumeration, zero spot/WET spend; "
+        "this cycle's queue rides the next trigger. A repeat of this skip "
+        "means the earlier cycle is hung, not slow — check its task-token "
+        "callback state."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="warning",
+            dedup_key=f"{_FLOW_NAME}:concurrent_cycle_skip:{_utc_today()}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "execution_arn": execution_arn,
+                     "blocking_executions": names},
+        )
+    except Exception as exc:  # noqa: BLE001 — notification must never block the skip
+        logger.warning("concurrent-cycle skip notification failed (non-fatal): %s", exc)
+
+
 def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
     """Best-effort loud ping for a concurrent-same-lane skip — never raises."""
     text = (
@@ -1026,18 +1163,14 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # sf-watch watch-log timing) so a launch that itself fails/raises still
     # consumes ceiling budget — see _write_dispatch_ledger_entry.
     _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand,
+                                           tier_tag=tier_tag)
     logger.info("launched groom box %s (%s)", instance_id, market)
-    # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
-    # so the NEXT trigger's guard check (above) can find it. Best-effort — a
-    # tag-write failure must not abort an already-launched box (mirrors the
-    # fail-safe posture of the check itself).
-    try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": tier_tag}])
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
-        logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
+    # config#5303: the load-bearing groom-issue-filter tag is now passed as
+    # extra_tags on the RunInstances call itself (see _launch_instance), not
+    # applied via a post-launch create_tags — so the tag is ATOMIC with launch
+    # and visible in CloudTrail RunInstances events for the full 90-day
+    # retention window. No post-launch tagging step remains to retry or fail.
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
@@ -1821,6 +1954,39 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     queue_manifest_key = str(event.get("queue_manifest_key") or "")
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
+
+    # ── Cycle singleton (alpha-engine-config-I5371) ───────────────────────────
+    # Checked on the DECIDE phase only, and BEFORE enumeration: a skipped cycle
+    # must cost zero GitHub calls, not a full backlog walk we then discard.
+    #
+    # Deliberately NOT applied to `launch_decided`: that shape is a per-lane
+    # launch *within* an already-decided cycle (including the SF's bounded
+    # relaunch retries and the unconditional end-of-SF sweep). Blocking it here
+    # would let the singleton guard cancel the surviving cycle's own lanes —
+    # the opposite of what it is for. Lane-level concurrency stays owned by the
+    # config#1979 tag guard in `_launch_groom_spot`.
+    if event.get("decide_only"):
+        execution_arn = str(event.get("executionArn") or "")
+        try:
+            blockers = _concurrent_cycle_blockers(execution_arn)
+        except ConcurrentCycleError as exc:
+            # Fail CLOSED with a NAMED reason (§2.4: never a silent residual).
+            logger.error("cycle-singleton probe INDETERMINATE — skipping this "
+                         "cycle rather than risking a concurrent one: %s", exc)
+            _notify_concurrent_cycle_skip(
+                [{"name": f"<probe failed: {exc}>"}], schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_probe_failed",
+                 "detail": str(exc)}, schedule_label)
+        if blockers:
+            names = [str(b.get("name") or b.get("executionArn")) for b in blockers]
+            logger.warning(
+                "cycle singleton: %d earlier dispatch cycle(s) still RUNNING (%s) "
+                "— skipping this cycle's enumeration entirely", len(blockers), names)
+            _notify_concurrent_cycle_skip(blockers, schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_skip",
+                 "blocking_executions": names}, schedule_label)
 
     if event.get("launch_decided"):
         # config#2129: a decide_only call (or the SF's bounded-relaunch loop

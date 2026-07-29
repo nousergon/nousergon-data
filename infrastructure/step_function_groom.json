@@ -4,11 +4,12 @@
   "States": {
     "InitRunState": {
       "Type": "Pass",
-      "Comment": "Seed schedInput (the raw EventBridge Scheduler input, e.g. {run_mode, trigger, pr_budget, schedule} \u2014 unchanged contract) and a literal decide_only marker merged into DecideLaunches's Payload below (States.JsonMerge arguments must be real JSONPaths, so the literal lives here rather than inline in the merge call).",
+      "Comment": "Seed schedInput (the raw EventBridge Scheduler input, e.g. {run_mode, trigger, pr_budget, schedule} \u2014 unchanged contract) and a literal decide_only marker merged into DecideLaunches's Payload below (States.JsonMerge arguments must be real JSONPaths, so the literal lives here rather than inline in the merge call). alpha-engine-config-I5371: also seeds executionArn from the SF context object so the decide phase can enforce a CYCLE SINGLETON (skip when an earlier dispatch execution is still RUNNING). The context object is not reachable from inside States.JsonMerge, so it is seeded here like decide_only itself.",
       "Parameters": {
         "schedInput.$": "$",
         "decideMarker": {
-          "decide_only": true
+          "decide_only": true,
+          "executionArn.$": "$$.Execution.Id"
         }
       },
       "Next": "DecideLaunches"
@@ -357,7 +358,7 @@
     },
     "CheckMapLaneOutcomes": {
       "Type": "Choice",
-      "Comment": "config#4803: inspect every iteration's output for a laneOutcome.laneFailed marker. Because the per-lane FailExecution was replaced with RecordLaneFailure (a Pass, not a Fail), every iteration 'succeeds' from the Map's perspective — no sibling abort. Each index is guarded by IsPresent (fewer than 3 iterations is a valid path) and BooleanEquals on laneFailed — if any lane recorded a failure, SetMapFailureFromLanes shapes the same $.mapFailure marker that RecordMapLaunchFailure (the Map's Catch) produces, so CheckMapLaunchOutcome routes to GroomMapLaunchFailed without changes and the execution still terminates FAILED for Fleet-SF Watch.",
+      "Comment": "config#4803: inspect every iteration's output for a laneOutcome.laneFailed marker. Because the per-lane FailExecution was replaced with RecordLaneFailure (a Pass, not a Fail), every iteration 'succeeds' from the Map's perspective \u2014 no sibling abort. Each index is guarded by IsPresent (fewer than 3 iterations is a valid path) and BooleanEquals on laneFailed \u2014 if any lane recorded a failure, SetMapFailureFromLanes shapes the same $.mapFailure marker that RecordMapLaunchFailure (the Map's Catch) produces, so CheckMapLaunchOutcome routes to GroomMapLaunchFailed without changes and the execution still terminates FAILED for Fleet-SF Watch.",
       "Choices": [
         {
           "And": [
@@ -403,7 +404,7 @@
     },
     "SetMapFailureFromLanes": {
       "Type": "Pass",
-      "Comment": "config#4803: at least one lane recorded laneFailed → shape the same $.mapFailure marker that RecordMapLaunchFailure (the Map Catch) produces. CheckMapLaunchOutcome's existing Choice (IsPresent on $.mapFailure) routes to GroomMapLaunchFailed unchanged — the execution still terminates FAILED for Fleet-SF Watch after the sweep dispatch completes.",
+      "Comment": "config#4803: at least one lane recorded laneFailed \u2192 shape the same $.mapFailure marker that RecordMapLaunchFailure (the Map Catch) produces. CheckMapLaunchOutcome's existing Choice (IsPresent on $.mapFailure) routes to GroomMapLaunchFailed unchanged \u2014 the execution still terminates FAILED for Fleet-SF Watch after the sweep dispatch completes.",
       "Parameters": {
         "failed": true,
         "reason": "one_or_more_lanes_failed",
@@ -499,7 +500,7 @@
     },
     "NotifyCycleComplete": {
       "Type": "Task",
-      "Comment": "2026-07-28 operator ruling: emit ONE buzzing cycle-level COMPLETE roll-up naming every lane's terminal state and the sweep's dispatch outcome. Sits on the single convergence point ahead of CheckMapLaunchOutcome so it fires on BOTH terminal routings — a cycle that ends FAILED is the one whose roll-up matters most. Before this, GroomDispatchComplete was a bare Succeed and cycle completion had no notifier on ANY rail, so the three lanes reclaimed at bootstrap on the 12:00Z cycle (config-I4987/I4989) produced total Telegram silence. Payload passes the state ROOT (\"cycle.$\": \"$\") rather than named fields because $.mapFailure is ABSENT on the two healthy paths, and a Parameters reference to an absent field raises States.Runtime, which no Catch can intercept (groom-sweep-policy §2.2).",
+      "Comment": "2026-07-28 operator ruling: emit ONE buzzing cycle-level COMPLETE roll-up naming every lane's terminal state and the sweep's dispatch outcome. Sits on the single convergence point ahead of CheckMapLaunchOutcome so it fires on BOTH terminal routings \u2014 a cycle that ends FAILED is the one whose roll-up matters most. Before this, GroomDispatchComplete was a bare Succeed and cycle completion had no notifier on ANY rail, so the three lanes reclaimed at bootstrap on the 12:00Z cycle (config-I4987/I4989) produced total Telegram silence. Payload passes the state ROOT (\"cycle.$\": \"$\") rather than named fields because $.mapFailure is ABSENT on the two healthy paths, and a Parameters reference to an absent field raises States.Runtime, which no Catch can intercept (groom-sweep-policy \u00a72.2).",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -525,7 +526,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort per groom-sweep-policy §8 — a notify hiccup must never change this execution's terminal state. The Lambda handler is itself total (it catches and returns an in-band error record rather than raising), so reaching this Catch means the invoke itself failed.",
+          "Comment": "Best-effort per groom-sweep-policy \u00a78 \u2014 a notify hiccup must never change this execution's terminal state. The Lambda handler is itself total (it catches and returns an in-band error record rather than raising), so reaching this Catch means the invoke itself failed.",
           "Next": "CheckMapLaunchOutcome",
           "ResultPath": "$.cycleNotifyError"
         }

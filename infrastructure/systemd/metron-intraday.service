@@ -6,8 +6,32 @@
 # append --require-heartbeat below to stop fetching when no Metron app is open
 # (multi-tenant cost control; left OFF on this single-tenant owner build so the strip
 # stays warm and never freezes at the morning quote after the app has been idle).
-# Installed on the trading box by infrastructure/install-metron-intraday.sh;
-# S3 write rides the instance role (executor-role already has market_data/*).
+# Installed by infrastructure/install-metron-intraday.sh.
+#
+# INTERPRETER: `.venv-intraday`, NOT `.venv`. The shared `.venv` on the dashboard
+# box is Python 3.9 and was provisioned for daily-news — it has boto3 and
+# feedparser but no pandas and no yfinance. Pointing here at `.venv` produced a
+# timer that ran every 5 minutes for hours with zero successful runs: every
+# `_yfinance_*` helper took its `except ImportError -> return {}` branch and the
+# collector wrote an EMPTY artifact over a good one while reporting ok
+# (2026-07-29). requirements.txt pins numpy>=2.4.6, which needs Python 3.11+, so
+# that venv cannot be repaired by installing wheels into it — and rebuilding it
+# would change the interpreter daily-news runs on. A dedicated venv is the fix
+# with no blast radius: `python3.12 -m venv .venv-intraday` +
+# `pip install -r requirements.txt`, created by the installer.
+#
+# MEMORY: measured, not guessed — shared-application-host-policy.md §4.3 requires
+# a footprint measured BEFORE install. Three real in-session runs on 2026-07-29:
+# peak RSS 184 MB, wall clock 3.2-3.7s, 7 quotes + 4 indices + 2 fund proxies.
+# MemoryHigh=260M is ~1.4x that peak (reclaim window); MemoryMax=350M is ~1.9x
+# (hard stop). Against 1884 MB MemAvailable this is ~10% of the box's headroom,
+# which is why §4's stricter batch-job rule ("a peak larger than the box's
+# steady-state headroom does not belong here at all") does not send it to a spot
+# instance or Lambda. Re-measure before widening the universe it fetches.
+#
+# S3 write rides the instance role: alpha-engine-dashboard-role carries
+# market_data/intraday/* via alpha-engine-dashboard-metron-intraday-putobject
+# (nous-ergon-ops-PR185).
 [Unit]
 Description=Metron intraday quotes producer (alpha-engine-data)
 After=network-online.target
@@ -17,5 +41,7 @@ Wants=network-online.target
 Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine-data
-ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python -m collectors.metron_market_data --only-intraday
+ExecStart=/home/ec2-user/alpha-engine-data/.venv-intraday/bin/python -m collectors.metron_market_data --only-intraday
 TimeoutStartSec=300
+MemoryHigh=260M
+MemoryMax=350M

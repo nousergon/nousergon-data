@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from nousergon_lib.sources import AnalystSnapshot
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,8 @@ class YfinanceAnalystAdapter:
 
     def fetch(self, ticker: str) -> AnalystSnapshot | None:
         try:
-            info = self._get_yf().Ticker(ticker).info
+            with quiet_yfinance():
+                info = self._get_yf().Ticker(ticker).info
         except Exception as e:
             logger.warning(
                 "[yfinance_analyst] fetch failed for %s: %s", ticker, e,

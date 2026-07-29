@@ -1178,7 +1178,7 @@
     },
     "SetDegradedFlag": {
       "Type": "Pass",
-      "Comment": "config-I2702 deliverable #4: an execution that skips ANY load-bearing state (here: EODReconcile) must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary flag, checked once by CheckDegradedOutcome AFTER the cost-guard tail (StopTradingInstance) always completes, to route to the distinct DegradedSucceeded terminal instead of NormalSucceeded. The DISTINCT NOTIFICATION half of deliverable #4 already fired above (SkipEODReconcileDataGap) and will fire again from HealConvergedNotify or HealNonConvergent below — this flag only controls the terminal state's shape/output, mirroring how SubstrateHealthCheckDegraded already threads $.health_check_degraded through this same file for an analogous (lower-severity) condition.",
+      "Comment": "config-I2702 deliverable #4: an execution that skips ANY load-bearing state (here: EODReconcile) must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary flag, checked once by CheckDegradedOutcome AFTER the cost-guard tail (StopTradingInstance) always completes, to route to the distinct DegradedRun terminal (Type: Fail) instead of NormalSucceeded. The DISTINCT NOTIFICATION half of deliverable #4 already fired above (SkipEODReconcileDataGap) and will fire again from HealConvergedNotify or HealNonConvergent below — this flag only controls the terminal state's shape/output, mirroring how SubstrateHealthCheckDegraded already threads $.health_check_degraded through this same file for an analogous (lower-severity) condition.",
       "Parameters": {
         "degraded": true,
         "reason": "eod_reconcile_skipped_data_gap",
@@ -1677,7 +1677,7 @@
     },
     "StopTradingInstance": {
       "Type": "Task",
-      "Comment": "Stop trading EC2 instance after EOD completes EXTENDED config-I2702 deliverable #4: no longer a bare execution terminal (End:true) — routes to CheckDegradedOutcome so a run that skipped EODReconcile ends in the distinct DegradedSucceeded terminal instead of the same plain ExecutionSucceeded a fully-green day gets.",
+      "Comment": "Stop trading EC2 instance after EOD completes EXTENDED config-I2702 deliverable #4: no longer a bare execution terminal (End:true) — routes to CheckDegradedOutcome so a run that skipped EODReconcile ends in the distinct DegradedRun terminal (Type: Fail) — not a Succeed state — so status-keyed watchers engage (Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699).",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1702,6 +1702,61 @@
         }
       ],
       "ResultPath": "$.stop_result",
+      "Next": "LaunchWeeklyExerciseRun"
+    },
+    "LaunchWeeklyExerciseRun": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I5489 (Brian ruling 2026-07-29): kick the FULL weekly pipeline after every trading day's postclose, so its components get 5 iteration cycles a week instead of 1. Measured justification: over the last 60 weekly executions only 11 reached a successful terminal state (41 FAILED, 5 ABORTED) — iteration rate, not compute cost, is what is blocking that pipeline from working. | WHY CHAINED HERE rather than a cron: postclose is triggered by daemon shutdown, which only happens on an actual trading day, so chaining inherits 'every trading day' for free with no NYSE-calendar logic to get wrong — and by this point PostMarketData + EODReconcile have settled the day's data, which is exactly what the weekly pipeline's data stages want. | pipeline_role='exercise' (NOT 'weekly') is load-bearing: step_function.json's CheckWeeklyRunDayGate applies the run-day gate ONLY when pipeline_role=='weekly', so a non-weekly role bypasses it automatically. No gate change was needed. Saturday's own cron (rule alpha-engine-saturday, pipeline_role='weekly') is untouched. | FIRE-AND-FORGET on purpose: states:startExecution WITHOUT .sync, so postclose does not wait on a ~4h pipeline and a weekly-SF failure can never fail the postclose execution or leave the trading box running.",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "Input": {
+          "sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+          "pipeline_role": "exercise",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "WeeklyExerciseLaunchFailed",
+          "ResultPath": "$.weekly_exercise_launch_error"
+        }
+      ],
+      "ResultPath": "$.weekly_exercise_run",
+      "Next": "CheckDegradedOutcome"
+    },
+    "WeeklyExerciseLaunchFailed": {
+      "Type": "Task",
+      "Comment": "The exercise run failed to LAUNCH. Alert loudly, then continue to the normal terminal — postclose's own deliverable is complete by this point and must not be failed by a downstream pipeline's launch. This is the honest-degradation route required by weekly-sf-policy.md §2.3: a silent non-launch is indistinguishable from a day nobody looked at, which is the fleet's most-recorded bug class. The most likely cause is the states:StartExecution grant on alpha-engine-step-functions-role not yet covering ne-weekly-freshness-pipeline (alpha-engine-config-I5490) — until that lands, this state is the expected path and its alert is the signal.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine — weekly EXERCISE run failed to launch",
+        "Message.$": "States.Format('postclose completed but could not start the weekly exercise run. The weekly pipeline will NOT be exercised today. Error: {}', States.JsonToString($.weekly_exercise_launch_error))"
+      },
+      "ResultPath": "$.weekly_exercise_launch_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CheckDegradedOutcome",
+          "ResultPath": "$.weekly_exercise_launch_notify_error"
+        }
+      ],
       "Next": "CheckDegradedOutcome"
     },
     "CheckDegradedOutcome": {
@@ -1720,7 +1775,7 @@
             }
           ],
           "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on the degraded path (SetDegradedFlag) — on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
-          "Next": "DegradedSucceeded"
+          "Next": "DegradedRun"
         }
       ],
       "Default": "NormalSucceeded"
@@ -1729,9 +1784,11 @@
       "Type": "Succeed",
       "Comment": "The ordinary, fully-green terminal — EODReconcile ran (or was validly skipped via an operator-replay skip_eod_reconcile flag), nothing degraded."
     },
-    "DegradedSucceeded": {
-      "Type": "Succeed",
-      "Comment": "config-I2702 deliverable #4: distinct terminal for a run that skipped EODReconcile. Still reports AWS execution status SUCCEEDED (a Step Functions Succeed state cannot do otherwise) — the 'never report plain green' guarantee is carried by (a) this being a DIFFERENT named state than NormalSucceeded, visible in the SF console/execution history and in $.degraded_summary on the execution output, and (b) the distinctly-labeled SNS/Telegram notifications that already fired earlier in this execution (SkipEODReconcileDataGap, and HealConvergedNotify or HealNonConvergent) — mirroring this file's OWN established pattern for exactly this kind of signal (PublishDataSpotFailureImmediate, SubstrateHealthCheckDegraded + PublishSubstrateHealthCheckDegradedAlert) rather than relying on sf-telegram-notifier's generic execution-status rendering, which does not special-case Succeed-state names."
+    "DegradedRun": {
+      "Type": "Fail",
+      "Error": "DegradedRun",
+      "Cause": "EOD pipeline skipped EODReconcile (data gap) — load-bearing state not executed. Check $.degraded_summary in execution input and SkipEODReconcileDataGap/Heal* notifications in execution history. Per Brian's 2026-07-28 Option-A ruling: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, notifier) engage with zero new plumbing.",
+      "Comment": "config-I2702 deliverable #4 FOLLOW-UP (Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699): the original DegradedSucceeded (Type: Succeed) left every status-keyed consumer (sf-watch, EventBridge, sf-telegram-notifier) seeing green — repeating the exact failure mode of the 2026-07-15 incident. Replaced with Type: Fail so FAILED execution status engages all watchers with zero new plumbing. StopTradingInstance remains unconditionally reachable BEFORE this terminal (SetDegradedFlag -> HealLoop -> CheckHealLoopEligible -> StopTradingInstance -> CheckDegradedOutcome)."
     },
     "HandleFailure": {
       "Type": "Task",

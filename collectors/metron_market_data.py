@@ -2217,6 +2217,40 @@ def collect_intraday(
         "indices": dict(sorted(indices.items())),
         "fund_proxies": dict(sorted(fund_proxies.items())),
     }
+    # An EMPTY fetch is a failed run, and writing it destroys the last good one.
+    #
+    # `indices` and `fund_proxies` come from fixed non-empty constants and are
+    # fetched unconditionally, so zero of them is never a legitimate state --
+    # unlike `quotes`, which is legitimately empty for an account holding
+    # nothing. That asymmetry is what makes this a precise assertion rather than
+    # a heuristic on volume.
+    #
+    # Observed live 2026-07-29: `yfinance` was absent from the box's venv, so
+    # every `_yfinance_*` helper took its `except ImportError -> return {}`
+    # branch, logged a warning, and the run reported
+    # `{'status': 'ok', 'quotes': 0, 'indices': 0, 'fund_proxies': 0}` while
+    # OVERWRITING latest.json with a 126-byte artifact containing no quotes at
+    # all. The producer replaced good data with nothing and called it success.
+    # Every ImportError branch is marked `# pragma: no cover - yfinance/pandas
+    # are prod deps`, which is exactly the assumption that broke; this is the
+    # assertion the pragma was standing in for.
+    #
+    # Refuse before the write, not after: a consumer reading a stale as_of_utc
+    # can tell the feed is old, but one reading a fresh timestamp over an empty
+    # body cannot tell anything is wrong.
+    if not indices or not fund_proxies:
+        missing = [n for n, v in (("indices", indices), ("fund_proxies", fund_proxies)) if not v]
+        logger.error(
+            "[metron_market_data] intraday fetch returned NOTHING for %s -- these come "
+            "from fixed symbol lists and can never be legitimately empty. Refusing to "
+            "overwrite %slatest.json with an empty artifact. Check that yfinance and "
+            "pandas are importable in this interpreter.",
+            " and ".join(missing), INTRADAY_PREFIX,
+        )
+        return {"status": "error", "error": f"empty intraday fetch for {','.join(missing)}",
+                "quotes": len(quotes), "indices": len(indices),
+                "fund_proxies": len(fund_proxies)}
+
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN intraday: %d quotes, %d indices, %d fund-proxies (not written)",
                     len(quotes), len(indices), len(fund_proxies))

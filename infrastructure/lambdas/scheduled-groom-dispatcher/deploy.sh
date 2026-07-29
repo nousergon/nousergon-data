@@ -23,6 +23,21 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
+# alpha-engine-config-I5371 adds one further grant: states:ListExecutions,
+# scoped to the alpha-engine-groom-dispatch state machine ONLY. The decide phase
+# uses it to enforce a CYCLE SINGLETON — it lists RUNNING siblings of its own
+# execution and skips when an earlier cycle is still alive. Read-only, and the
+# narrowest resource scope the API allows.
+#
+# That grant is LOAD-BEARING FOR AVAILABILITY, not just correctness:
+# _concurrent_cycle_blockers() fails CLOSED, so an AccessDenied is treated as
+# "cannot establish singleton" and skips the cycle. A deploy that ships the code
+# without the policy therefore stops ALL grooming, silently, until the grant
+# lands. Run `deploy.sh --apply-iam` BEFORE (or with) any deploy that first
+# introduces it — the GHA auto-deploy OIDC role deliberately lacks
+# iam:PutRolePolicy (fleet single-writer rule), so a code-only deploy cannot
+# apply it for you.
+#
 # Cadence (UTC). Three symmetric demand-all triggers per day + Sunday extra slot.
 # Each trigger evaluates the FULL backlog and launches 0..3 tier boxes via
 # decide_trigger / _primary_backend_for. All tiers route through DeepSeek primary.

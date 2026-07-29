@@ -85,6 +85,36 @@ def _install_stubs(launch_impl, boto_clients):
     sys.modules["nousergon_lib.github_app"] = ga_mod
 
 
+class _FakeSfn:
+    """Minimal ``stepfunctions`` client for the cycle-singleton guard
+    (alpha-engine-config-I5371). ``executions`` is the RUNNING set the fake
+    reports; ``error`` (when set) makes ``list_executions`` raise, exercising
+    the fail-CLOSED path."""
+
+    def __init__(self, executions=None, error=None):
+        self.executions = list(executions or [])
+        self.error = error
+        self.calls = []
+
+    def list_executions(self, **kw):  # noqa: D102 — boto3 shape
+        self.calls.append(kw)
+        if self.error is not None:
+            raise self.error
+        return {"executions": self.executions}
+
+
+def _exec(arn, started, name=None):
+    """RUNNING-execution record shaped like boto3's ``list_executions``."""
+    return {"executionArn": arn, "name": name or arn.rsplit(":", 1)[-1],
+            "status": "RUNNING",
+            "startDate": datetime(2026, 7, 29, 0, 0, tzinfo=timezone.utc)
+                         .replace(hour=started)}
+
+
+_SM = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch"
+_EXEC_PREFIX = "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-groom-dispatch"
+
+
 class _FakeWaiter:
     def wait(self, **kw):
         return None
@@ -93,7 +123,6 @@ class _FakeWaiter:
 class _FakeEc2:
     def __init__(self, running_tier_instances=None):
         self.terminated = []
-        self.tags_created = []
         # config#1979: (issue_filter -> [instance_ids]) already "live" for the
         # concurrent-tier guard's describe_instances check to find.
         self._running_tier_instances = dict(running_tier_instances or {})
@@ -104,10 +133,6 @@ class _FakeEc2:
     def terminate_instances(self, InstanceIds):  # noqa: N803 — boto3 kwarg name
         self.terminated.extend(InstanceIds)
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
-
-    def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
-        self.tags_created.append((Resources, Tags))
-        return {}
 
     def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
         by_name = {f["Name"]: f["Values"] for f in Filters}
@@ -182,13 +207,14 @@ class _FakeS3:
 
 
 def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None,
-         running_tier_instances=None):
+         running_tier_instances=None, sfn_executions=None, sfn_error=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm(ssm_parameters)
     ec2 = _FakeEc2(running_tier_instances=running_tier_instances)
     s3 = _FakeS3(s3_objects)
-    clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
+    sfn = _FakeSfn(sfn_executions, sfn_error)
+    clients = {"ec2": ec2, "ssm": ssm, "s3": s3, "stepfunctions": sfn}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
@@ -218,6 +244,7 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_param
     index._test_ssm = ssm  # expose for assertions
     index._test_ec2 = ec2
     index._test_s3 = s3
+    index._test_sfn = sfn
     return index
 
 
@@ -631,14 +658,20 @@ def test_different_tier_running_does_not_block_launch(monkeypatch):
 
 
 def test_launched_instance_gets_tagged_with_its_tier(monkeypatch):
+    extra_tags_captured = {}
+
+    def _launch(types_, subnets, **kw):
+        extra_tags_captured["value"] = kw.get("extra_tags")
+        return "i-new"
+
     idx = _load(
-        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        monkeypatch, launch_impl=_launch,  # noqa: E731
         env={"GROOM_DISPATCH_ENABLED": "true"},
     )
     idx.handler({"run_mode": "full", "issue_filter": "high-only", "schedule": "x"}, None)
-    assert idx._test_ec2.tags_created == [
-        (["i-new"], [{"Key": "groom-issue-filter", "Value": "high-only"}])
-    ]
+    # config#5303: the groom-issue-filter tag now rides the RunInstances call
+    # as extra_tags (atomic with launch), not a separate post-launch create_tags.
+    assert extra_tags_captured["value"] == {"groom-issue-filter": "high-only"}
 
 
 def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
@@ -1001,13 +1034,20 @@ def test_sweep_box_tagged_with_distinct_sweep_lane(monkeypatch):
     # with its (inert) issue_filter verbatim would collide with the mid-only
     # GROOM box's tag. Sweep boxes get the distinct 'sweep' tag value instead;
     # the event's issue_filter still passes the lib filter validation.
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    extra_tags_captured = {}
+
+    def _launch(types_, subnets, **kw):
+        extra_tags_captured["value"] = kw.get("extra_tags")
+        return "i-stub"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
     out = idx.handler(dict(_SWEEP_SF_EVENT), None)
     assert out["groom"]["tier_tag"] == "sweep"
     assert out["groom"]["issue_filter"] == "mid-only"
-    assert idx._test_ec2.tags_created == [
-        (["i-stub"], [{"Key": "groom-issue-filter", "Value": "sweep"}])
-    ]
+    # config#5303: sweep lane tag rides the RunInstances call as extra_tags.
+    assert extra_tags_captured["value"] == {"groom-issue-filter": "sweep"}
 
 
 def test_sweep_launch_skipped_when_sweep_box_already_live(monkeypatch):
@@ -2127,3 +2167,138 @@ def test_task_token_is_read_from_the_event_not_the_context(monkeypatch):
         pass
 
     assert not hasattr(_Ctx(), "task")
+
+
+# ── Cycle singleton (alpha-engine-config-I5371) ──────────────────────────────
+#
+# The dispatch SF ran TimeoutSeconds=72000 (20h) against an 8h trigger cadence
+# with no singleton state, so up to three cycles could be alive at once BY
+# CONSTRUCTION. Measured live 2026-07-29: two executions RUNNING at the same
+# time (both hung on their task-token callback) plus a third that ran 18h
+# before failing; each enumerated the backlog independently and dispatched an
+# agent at the same issue, producing 19 duplicate PRs across 16 clusters.
+
+
+def _decide_evt(arn_suffix="c", **extra):
+    return {"run_mode": "full", "model": "deepseek-v4-flash",
+            "issue_filter": "gated-reverify", "decide_only": True,
+            "executionArn": f"{_EXEC_PREFIX}:{arn_suffix}", **extra}
+
+
+def test_cycle_singleton_proceeds_when_only_self_is_running(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                sfn_executions=[_exec(f"{_EXEC_PREFIX}:c", 5)])
+    out = idx.handler(_decide_evt("c"), None)
+    assert out["decide"]["launches"] == [{"model": "deepseek-v4-flash",
+                                          "issue_filter": "gated-reverify"}]
+    # It queried the right state machine, derived from our own execution ARN.
+    assert idx._test_sfn.calls[0]["stateMachineArn"] == _SM
+    assert idx._test_sfn.calls[0]["statusFilter"] == "RUNNING"
+
+
+def test_cycle_singleton_skips_when_an_earlier_cycle_is_running(monkeypatch):
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                sfn_executions=[_exec(f"{_EXEC_PREFIX}:older", 1),
+                                _exec(f"{_EXEC_PREFIX}:c", 5)])
+
+    def _launch(types_, subnets, **kw):
+        raise AssertionError("a skipped cycle must never launch a box")
+    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
+
+    d = idx.handler(_decide_evt("c"), None)["decide"]
+    assert d["launches"] == []
+    # §2.4: the exit is NAMED, never a silent empty result.
+    assert d["reason"] == "concurrent_cycle_skip"
+    assert d["blocking_executions"] == ["older"]
+
+
+def test_cycle_singleton_oldest_wins_so_the_running_cycle_is_not_preempted(monkeypatch):
+    """We are the OLDEST live cycle — a newer sibling must not block us."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                sfn_executions=[_exec(f"{_EXEC_PREFIX}:c", 1),
+                                _exec(f"{_EXEC_PREFIX}:newer", 9)])
+    d = idx.handler(_decide_evt("c"), None)["decide"]
+    assert d["launches"], "the oldest live cycle must proceed"
+    assert "reason" not in d or d.get("reason") != "concurrent_cycle_skip"
+
+
+def test_cycle_singleton_breaks_a_startdate_tie_by_arn_so_exactly_one_survives(monkeypatch):
+    """Two cycles at the identical startDate: the (startDate, arn) total order
+    must let exactly one through, never both and never neither."""
+    same = [_exec(f"{_EXEC_PREFIX}:aaa", 3), _exec(f"{_EXEC_PREFIX}:bbb", 3)]
+    survivors = []
+    for me in ("aaa", "bbb"):
+        idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                    sfn_executions=same)
+        d = idx.handler(_decide_evt(me), None)["decide"]
+        if d["launches"]:
+            survivors.append(me)
+    assert survivors == ["aaa"], f"exactly one cycle must survive, got {survivors}"
+
+
+def test_cycle_singleton_fails_closed_when_the_probe_errors(monkeypatch):
+    """A probe failure means we do not KNOW. A wrongly-skipped cycle self-heals
+    on the next 8h trigger; a wrongly-launched concurrent cycle leaves duplicate
+    PRs a human must disentangle. Asymmetric — so skip."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                sfn_error=RuntimeError("AccessDeniedException"))
+
+    def _launch(types_, subnets, **kw):
+        raise AssertionError("an indeterminate probe must never launch")
+    monkeypatch.setattr(idx.spot_dispatch, "launch_with_fallback", _launch)
+
+    d = idx.handler(_decide_evt("c"), None)["decide"]
+    assert d["launches"] == []
+    assert d["reason"] == "concurrent_cycle_probe_failed"
+    assert "AccessDeniedException" in d["detail"]
+
+
+def test_cycle_singleton_fails_closed_when_self_absent_from_running_set(monkeypatch):
+    """We are executing, so we MUST be in our own RUNNING set. Absence means the
+    listing is not describing reality — refuse to conclude 'no siblings'."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+                sfn_executions=[_exec(f"{_EXEC_PREFIX}:someone-else", 4)])
+    d = idx.handler(_decide_evt("c"), None)["decide"]
+    assert d["launches"] == []
+    assert d["reason"] == "concurrent_cycle_probe_failed"
+
+
+def test_cycle_singleton_rejects_a_malformed_execution_arn(monkeypatch):
+    """A silently-wrong ARN would make list_executions return an empty set,
+    which reads exactly like 'no sibling cycles' — the §2.4 absence-as-benign
+    failure this guard exists to prevent."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    d = idx.handler(_decide_evt("c", executionArn="not-an-arn"), None)["decide"]
+    assert d["launches"] == []
+    assert d["reason"] == "concurrent_cycle_probe_failed"
+
+
+def test_cycle_singleton_is_inert_without_an_execution_arn(monkeypatch):
+    """A direct/legacy `aws lambda invoke` has no SF context, so there is no
+    cycle to be a sibling OF — a real absence, not an unknown. It must not
+    consult Step Functions at all."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
+                       "issue_filter": "gated-reverify", "decide_only": True}, None)
+    assert out["decide"]["launches"]
+    assert idx._test_sfn.calls == []
+
+
+def test_cycle_singleton_does_not_block_launch_decided(monkeypatch):
+    """`launch_decided` is a per-lane launch WITHIN an already-decided cycle
+    (including the SF's relaunch retries and the unconditional end-of-SF sweep).
+    Blocking it would let the guard cancel the surviving cycle's own lanes."""
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(kw)
+        return "i-lane"
+    idx = _load(monkeypatch, launch_impl=_launch,
+                env={"GROOM_DISPATCH_ENABLED": "true"},
+                sfn_executions=[_exec(f"{_EXEC_PREFIX}:older", 1),
+                                _exec(f"{_EXEC_PREFIX}:c", 5)])
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
+                       "issue_filter": "mid-only", "launch_decided": True,
+                       "executionArn": f"{_EXEC_PREFIX}:c"}, None)
+    assert out["groom"]["launched"] is True
+    assert idx._test_sfn.calls == [], "launch_decided must not consult the singleton"

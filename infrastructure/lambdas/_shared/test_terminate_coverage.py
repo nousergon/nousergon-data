@@ -35,6 +35,12 @@ _EXPECTED_LAUNCHERS = frozenset(
         # terminate-on-failure coverage plus a 13h InstanceInitiatedShutdown
         # watchdog sized past the SF's own 12h TimeoutSeconds.
         "weekly-freshness-spot-dispatcher",
+        # alpha-engine-config-I5208 / ARCHITECTURE §47 — daily Think Tank off
+        # the 900s Lambda ceiling onto spot. Terminates on failure in the
+        # launch→bootstrap window (the box has no watchdog or trap until the
+        # bootstrap command lands), plus a 2.5h watchdog sized above the SSM
+        # execution timeout.
+        "thinktank-spot-dispatcher",
     }
 )
 

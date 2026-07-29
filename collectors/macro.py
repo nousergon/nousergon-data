@@ -28,6 +28,7 @@ import requests
 import yfinance as yf
 
 from nousergon_lib.arcticdb import load_universe_ohlcv
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 
 logger = logging.getLogger(__name__)
 
@@ -567,15 +568,16 @@ def _fetch_market_prices() -> dict:
 
     result: dict = {}
     try:
-        df = yf.download(
-            all_tickers,
-            period="35d",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
+        with quiet_yfinance():
+            df = yf.download(
+                all_tickers,
+                period="35d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+            )
 
         def _last_close(ticker: str) -> Optional[float]:
             try:

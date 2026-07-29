@@ -567,6 +567,16 @@ class TestEODSFTopLevelFieldsClosed:
             "heal_replay_dispatch_failed_notify",
             "heal_converged_notify",
             "heal_nonconvergent_notify",
+            # config-I5489: postclose chains the weekly pipeline as an
+            # "exercise" run on every trading day. LaunchWeeklyExerciseRun
+            # emits the fire-and-forget StartExecution result (or its Catch
+            # error); WeeklyExerciseLaunchFailed emits the alert's SNS
+            # ResultPath (and its own Catch error, so a failure to alert
+            # about a failure to launch still cannot strand the execution).
+            "weekly_exercise_run",
+            "weekly_exercise_launch_error",
+            "weekly_exercise_launch_notify",
+            "weekly_exercise_launch_notify_error",
         }
     )
 

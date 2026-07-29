@@ -814,7 +814,8 @@ class TestIntraday:
         quotes = {"AAPL": {"last": 350.0, "open": 200.5, "prev_close": 201.5,
                            "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes, self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
+            now=self._RTH,
         )
         assert result["status"] == "ok"
         art = _puts(s3)["market_data/intraday/latest.json"]
@@ -836,7 +837,8 @@ class TestIntraday:
         quotes = {"AAPL": {"last": 202.1, "open": 200.5, "prev_close": 196.4,
                            "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes, self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
+            now=self._RTH,
         )
         assert result["status"] == "ok"
         q = _puts(s3)["market_data/intraday/latest.json"]["quotes"]["AAPL"]
@@ -856,7 +858,8 @@ class TestIntraday:
                         "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
         }
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes, self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
+            now=self._RTH,
         )
         assert result["status"] == "ok"
         art_quotes = _puts(s3)["market_data/intraday/latest.json"]["quotes"]
@@ -870,7 +873,8 @@ class TestIntraday:
         quotes = {"AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
                            "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}}
         result = mmd.collect_intraday(
-            bucket="b", s3_client=s3, intraday_source=self._stub(quotes), now=self._RTH
+            bucket="b", s3_client=s3, intraday_source=self._stub(quotes, self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
+            now=self._RTH,
         )
         assert result["status"] == "ok"
         assert "suspect" not in _puts(s3)["market_data/intraday/latest.json"]["quotes"]["AAPL"]
@@ -965,6 +969,58 @@ class TestIntraday:
         )
         assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 4
         assert not s3.put_object.called
+
+    def test_empty_fetch_refuses_to_overwrite_latest(self):
+        """The 2026-07-29 live defect: an empty run reported ok and wiped latest.json.
+
+        `yfinance` was absent from the box's venv, so every `_yfinance_*` helper
+        took its `except ImportError -> return {}` branch. The run reported
+        `{'status': 'ok', 'quotes': 0, 'indices': 0, 'fund_proxies': 0}` and
+        PUT a 126-byte artifact with no quotes over the previous good one.
+
+        `indices` comes from a fixed non-empty constant fetched unconditionally,
+        so zero of them can only mean the fetch failed.
+        """
+        s3 = self._s3()
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=lambda syms: {}, now=self._RTH,
+        )
+        assert result["status"] == "error", "an empty fetch must not report ok"
+        assert not s3.put_object.called, (
+            "the empty artifact must never be written -- a fresh as_of_utc over an "
+            "empty body is undetectable downstream, unlike a stale one"
+        )
+
+    def test_the_guard_names_which_fixed_set_came_back_empty(self):
+        """The message has to say what failed, not that something did.
+
+        Both fixed sets are asserted rather than just `indices`, though SPY is in
+        BOTH lists — so a fund-proxy fetch returning nothing implies the index
+        fetch lost SPY too. The second assertion is defence in depth against
+        FUND_PROXY_ETFS diverging from INDEX_PROXY_SYMBOLS later, not a case
+        reachable through a symbol-keyed source today.
+        """
+        s3 = self._s3()
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=lambda syms: {}, now=self._RTH,
+        )
+        assert "indices" in result["error"] and "fund_proxies" in result["error"]
+
+    def test_empty_held_universe_is_still_a_normal_run(self):
+        """`quotes` IS legitimately empty — a new account holds nothing.
+
+        The guard must not fire here, or it converts a supported state into a
+        permanent failure. This is the line between the assertion and a
+        heuristic on volume.
+        """
+        s3 = self._s3(universe={"holdings": []})
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3,
+            intraday_source=self._stub(self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
+            now=self._RTH,
+        )
+        assert result["status"] == "ok" and result["quotes"] == 0
+        assert s3.put_object.called
 
 
 class TestEafeUniverse:

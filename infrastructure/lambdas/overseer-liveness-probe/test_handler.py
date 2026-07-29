@@ -441,6 +441,13 @@ class _Body:
         return self._data
 
 
+def _details(findings):
+    """Findings carry a scannable headline AND the full prose; assertions about
+    what was FOUND read `detail`, so a wording change to the page can never
+    quietly turn a coverage test green."""
+    return [f["detail"] for f in findings]
+
+
 def test_run_window_trigger_with_artifact_in_window_clean():
     # With NOW=07-17 20:00 + lookback 30h, the one mature in-window trigger is
     # 07-17 01:00; give it a covering artifact (run_start inside [T, T+405min]).
@@ -454,7 +461,7 @@ def test_run_window_trigger_without_artifact_is_missed():
     s3 = _FakeRunWindowS3({})  # no artifacts at all
     with patch("index._s3_client", return_value=s3):
         problems, _ = index._check_run_window(_RW_SPEC, NOW)
-    assert problems and all("filed NO" in p for p in problems)
+    assert problems and all("filed NO" in p["detail"] for p in problems)
 
 
 def test_run_window_fail_loud_on_primary_s3_error():
@@ -473,8 +480,8 @@ def test_run_window_single_silent_death_not_masked_by_later_success():
     with patch("index._s3_client", return_value=s3):
         problems, _ = index._check_run_window(spec, NOW)
     # 2026-07-16 01:00 missed (no artifact); 2026-07-17 01:00 covered.
-    assert any("2026-07-16 01:00" in p for p in problems)
-    assert not any("2026-07-17 01:00" in p for p in problems)
+    assert any("2026-07-16 01:00" in p["detail"] for p in problems)
+    assert not any("2026-07-17 01:00" in p["detail"] for p in problems)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -583,7 +590,8 @@ def test_sf_watch_invocation_success_missing_event_is_a_finding():
     s3.get_object.return_value = {"Body": _Body(json.dumps({"events": []}).encode())}
     with patch("index._sfn_client", return_value=sfn), patch("index._s3_client", return_value=s3):
         problems, _ = index._check_sf_watch_invocation_success(_SFI_SPEC, NOW)
-    assert len(problems) == 1 and "NO" in problems[0] and "matching watch-log event" in problems[0]
+    assert len(problems) == 1
+    assert "NO" in problems[0]["detail"] and "matching watch-log event" in problems[0]["detail"]
 
 
 def test_sf_watch_invocation_success_no_watch_log_at_all_is_a_finding():
@@ -718,8 +726,9 @@ def test_run_checks_aggregates_problems_and_kill_switches():
     with patch("index._registry", return_value=reg), \
          patch("index.boto3.client", side_effect=_client_factory(**{"lambda": lam, "sqs": sqs})):
         problems, ks, run, failed = index._run_checks(NOW)
-    assert any("not Active" in p for p in problems)
-    assert any("does NOT EXIST" in p for p in problems)
+    details = _details(problems)
+    assert any("not Active" in p for p in details)
+    assert any("does NOT EXIST" in p for p in details)
     assert ks == {"SF_WATCH_DISPATCH_ENABLED": "true"}
     assert (run, failed) == (2, 0)
 
@@ -759,14 +768,15 @@ def test_run_checks_isolates_a_raising_check_and_still_runs_the_others():
              **{"lambda": lam, "scheduler": sched, "sqs": sqs})):
         problems, ks, run, failed = index._run_checks(NOW)
 
+    details = _details(problems)
     # the raising check became its own problem line...
-    assert any("FAILED TO RUN" in p and "scheduler_schedule_exists" in p for p in problems)
+    assert any("FAILED TO RUN" in p and "scheduler_schedule_exists" in p for p in details)
     # ...and BOTH other checks still reported their real findings
-    assert any("not Active" in p for p in problems)
-    assert any("does NOT EXIST" in p for p in problems)
+    assert any("not Active" in p for p in details)
+    assert any("does NOT EXIST" in p for p in details)
     assert ks == {"SF_WATCH_DISPATCH_ENABLED": "true"}
     assert (run, failed) == (3, 1)
-    assert not any("PROBE BLIND" in p for p in problems)
+    assert not any("PROBE BLIND" in p for p in details)
 
 
 def test_run_checks_unknown_type_still_raises_not_isolated():
@@ -789,8 +799,8 @@ def test_run_checks_all_failing_reports_probe_blind_first():
          patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
         problems, _ks, run, failed = index._run_checks(NOW)
     assert run == failed == 2
-    assert problems[0].startswith("PROBE BLIND")
-    assert "all 2 liveness checks failed to run" in problems[0]
+    assert problems[0]["detail"].startswith("PROBE BLIND")
+    assert "all 2 liveness checks failed to run" in problems[0]["detail"]
 
 
 def test_run_checks_partial_failure_is_not_probe_blind():
@@ -808,7 +818,7 @@ def test_run_checks_partial_failure_is_not_probe_blind():
          patch("index.boto3.client", side_effect=_client_factory(scheduler=sched, sqs=sqs)):
         problems, _ks, run, failed = index._run_checks(NOW)
     assert (run, failed) == (2, 1)
-    assert not any("PROBE BLIND" in p for p in problems)
+    assert not any("PROBE BLIND" in p for p in _details(problems))
 
 
 def test_registry_malformed_raises():
@@ -819,14 +829,23 @@ def test_registry_malformed_raises():
     index._REGISTRY_CACHE = None
 
 
-def _handler_with(problems, kill_switches=None, state_fingerprint=None,
+def _handler_with(problems, kill_switches=None, state_per_problem=None,
                   checks_run=None, checks_failed=0):
-    """Drive handler with _run_checks + S3 dedup state stubbed."""
+    """Drive handler with _run_checks + S3 dedup state stubbed.
+
+    ``state_per_problem`` is the prior ``per_problem`` dict (maps stable-key
+    to problem-text). ``None`` means the state object never existed (first
+    run); ``{}`` means the state was cleared (previously healthy).
+
+    Plain strings are wrapped as findings (headline == detail) so these tests
+    stay about handler behaviour rather than message shape."""
+    problems = [p if isinstance(p, dict) else index._finding("test", p) for p in problems]
     s3 = MagicMock()
-    if state_fingerprint is None:
+    if state_per_problem is None:
         s3.get_object.side_effect = FakeClientError("NoSuchKey")
     else:
-        s3.get_object.return_value = {"Body": _Body(json.dumps({"fingerprint": state_fingerprint}).encode())}
+        s3.get_object.return_value = {"Body": _Body(json.dumps(
+            {"per_problem": state_per_problem}).encode())}
     notify = MagicMock(return_value=True)
     if checks_run is None:
         checks_run = max(len(problems), 1)
@@ -866,27 +885,146 @@ def test_handler_clean_no_alert():
     notify.assert_not_called()
 
 
-def test_handler_new_problem_alerts_and_persists_fingerprint():
-    result, s3, notify = _handler_with(["EventBridge rule 'r' does NOT EXIST"])
+def test_handler_clears_dedup_state_when_healthy_again():
+    """After a problem clears, the dedup state is written as {} (not None)
+    so the next clean-fast-path does not re-trigger."""
+    result, s3, notify = _handler_with([], state_per_problem={"fp-old": "previous problem"})
+    assert result["clean"] is True
+    s3.put_object.assert_called_once()
+    body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert body["per_problem"] == {}
+
+
+def test_handler_first_ever_run_alerts_everything():
+    """First run (state_per_problem=None) — every problem is 'new'."""
+    problems = ["Lambda 'x' does NOT EXIST", "rule 'y' is DISABLED"]
+    result, s3, notify = _handler_with(problems, state_per_problem=None)
     assert result["alerted"] is True
+    assert result["new"] == 2
+    assert result["continuing"] == 0
     notify.assert_called_once()
-    s3.put_object.assert_called_once()  # fingerprint persisted
+    # two writes: the detail report the page points at, then the dedup state
+    written = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+    assert any(k.startswith(index.REPORT_PREFIX) for k in written)
+    assert index.STATE_KEY in written
+    text = notify.call_args[0][0]
+    assert "2 new" in text
+    assert "\u2022 *test*: Lambda 'x' does NOT EXIST" in text
+    assert "\u2022 *test*: rule 'y' is DISABLED" in text
 
 
-def test_handler_unchanged_problem_suppressed():
-    fp = index._problem_fingerprint(["EventBridge rule 'r' does NOT EXIST"])
-    result, s3, notify = _handler_with(["EventBridge rule 'r' does NOT EXIST"], state_fingerprint=fp)
+def test_handler_new_problem_added_pages_only_new():
+    """Two problems persist; ONE new one appears — only the new one pages."""
+    p1 = "Lambda 'x' does NOT EXIST"
+    p2 = "rule 'y' is DISABLED"
+    p3 = "sqs queue 'q' does NOT EXIST"
+    state = {index._stable_problem_key(p): p for p in [p1, p2]}
+    problems = [p1, p2, p3]
+    result, s3, notify = _handler_with(problems, state_per_problem=state)
+    assert result["alerted"] is True
+    assert result["new"] == 1
+    assert result["continuing"] == 2
+    text = notify.call_args[0][0]
+    assert "\u2022 *test*: sqs queue 'q' does NOT EXIST" in text
+    assert "Lambda 'x' does NOT EXIST" not in text  # continuing, not re-listed
+    assert "rule 'y' is DISABLED" not in text
+    assert "continuing" in text
+
+
+def test_handler_problem_set_unchanged_suppressed():
+    """Exactly the same problem set as last time -> no alert."""
+    p1 = "Lambda 'x' does NOT EXIST"
+    state = {index._stable_problem_key(p): p for p in [p1]}
+    result, s3, notify = _handler_with([p1], state_per_problem=state)
     assert result["alerted"] is False
     notify.assert_not_called()
 
 
-def test_handler_clears_dedup_state_when_healthy_again():
-    result, s3, notify = _handler_with([], state_fingerprint="stale-fp")
+def test_handler_problem_resolved_without_new_is_suppressed():
+    """One problem was alerted; now it's gone — no alert (the count just
+    decreased to zero silently)."""
+    p1 = "Lambda 'x' does NOT EXIST"
+    state = {index._stable_problem_key(p): p for p in [p1]}
+    result, s3, notify = _handler_with([], state_per_problem=state)
+    assert result["alerted"] is False
     assert result["clean"] is True
-    # cleared: put_object called with fingerprint None
-    s3.put_object.assert_called_once()
+    notify.assert_not_called()
+    # state cleared
     body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    assert body["fingerprint"] is None
+    assert body["per_problem"] == {}
+
+
+def test_handler_problem_changed_replaces_old():
+    """Problem text changed → the old fingerprint resolves, new one alerts."""
+    old_p = "run '01:00' @ 2026-07-28 01:00Z filed NO report"
+    new_p = "run '01:00' @ 2026-07-29 01:00Z filed NO report"
+    state = {index._stable_problem_key(old_p): old_p}
+    result, s3, notify = _handler_with([new_p], state_per_problem=state)
+    assert result["alerted"] is True
+    assert result["new"] == 1
+    assert result["continuing"] == 0
+    assert result["resolved"] == 1
+    text = notify.call_args[0][0]
+    assert "\u2022 *test*:" in text and "2026-07-29" in text
+
+
+def test_handler_problem_reappears_after_resolution_pages_again():
+    """A problem that was seen, aged out, then returns should page again."""
+    p = "Lambda 'x' does NOT EXIST"
+    # First run: pages
+    result1, s3, _notify = _handler_with([p], state_per_problem=None)
+    assert result1["alerted"] is True
+
+    # Problem resolves
+    result2, _s3, _notify2 = _handler_with([], state_per_problem={index._stable_problem_key(p): p})
+    assert result2["clean"] is True
+
+    # Problem returns → should page again (state was cleared)
+    result3, _s3, notify3 = _handler_with([p], state_per_problem=None)
+    assert result3["alerted"] is True
+    assert result3["new"] == 1
+
+
+def test_handler_new_problem_count_capped_at_five():
+    """More than 5 new problems lists 5 then says '...and N more'."""
+    problems = [f"problem #{i}" for i in range(10)]
+    result, s3, notify = _handler_with(problems, state_per_problem=None)
+    assert result["alerted"] is True
+    assert result["new"] == 10
+    text = notify.call_args[0][0]
+    # First 5 with the 🆕 prefix
+    assert text.count("\u2022 *test*:") == index._MAX_HEADLINES
+    assert f"\u2026and {10 - index._MAX_HEADLINES} more new" in text
+
+
+def test_handler_return_includes_diff_counts():
+    """Handler return dict includes new/continuing/resolved breakdown."""
+    p_old = "Lambda 'x' does NOT EXIST"
+    p_new = "rule 'y' is DISABLED"
+    state = {index._stable_problem_key(p_old): p_old}
+    result, _s3, _notify = _handler_with([p_old, p_new], state_per_problem=state)
+    assert result["new"] == 1
+    assert result["continuing"] == 1
+    assert result["resolved"] == 0
+
+
+def test_handler_old_format_state_treated_as_first_run():
+    """Old single-fingerprint format → treated as None (first run)."""
+    s3 = MagicMock()
+    # Old state format: {"fingerprint": "...", "updated_at": "..."}
+    s3.get_object.return_value = {"Body": _Body(json.dumps(
+        {"fingerprint": "abc123", "updated_at": "2026-07-01T00:00:00+00:00"}).encode())}
+    notify = MagicMock(return_value=True)
+    # _run_checks is the sole producer of findings and always normalises to
+    # dicts, so the stub must too — a raw string here would test a shape
+    # production cannot produce.
+    with patch("index._run_checks",
+               return_value=([index._finding("test", "rule 'r' does NOT EXIST")], {}, 1, 0)), \
+         patch("index._s3_client", return_value=s3), \
+         patch("index.notify_via_flow_doctor", notify):
+        result = index.handler({}, None)
+    assert result["alerted"] is True
+    assert result["new"] == 1
 
 
 # ── Real-registry integration (the whole point: the shipped registry drives it)
@@ -964,9 +1102,9 @@ def test_crash_cascaded_run_is_flagged_despite_writing_an_artifact():
     with patch("index._s3_client", return_value=s3):
         problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
     assert len(problems) == 1, problems
-    assert "RAN BUT DID NO WORK" in problems[0]
-    assert "engaged=0" in problems[0] and "total_issues=21" in problems[0]
-    assert "chunk-agent crashes" in problems[0]
+    assert "RAN BUT DID NO WORK" in problems[0]["detail"]
+    assert "engaged=0" in problems[0]["detail"] and "total_issues=21" in problems[0]["detail"]
+    assert "chunk-agent crashes" in problems[0]["detail"]
     # ...and it must NOT also be reported as a missing artifact: the trigger IS
     # covered. Two different findings; only the productivity one applies.
     assert "filed NO" not in problems[0]
@@ -1005,7 +1143,7 @@ def test_one_dead_lane_is_visible_even_when_a_sibling_lane_covered_the_trigger()
     s3 = _FakeRunWindowS3({"2026-07-17": [good, _REAL_CRASH_CASCADE_ARTIFACT]})
     with patch("index._s3_client", return_value=s3):
         problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
-    assert len(problems) == 1 and "RAN BUT DID NO WORK" in problems[0]
+    assert len(problems) == 1 and "RAN BUT DID NO WORK" in problems[0]["detail"]
 
 
 def test_unknown_operator_raises_rather_than_silently_passing():
@@ -1045,3 +1183,137 @@ def test_registry_declares_productive_when_for_groom():
             "the groom run_window check must declare productive_when — without it "
             "a crash-cascaded run that writes an artifact reads as full coverage"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# run_start_field — the fleet's run artifacts do not share one schema
+# (the 2026-07-29 false-page regression)
+# ══════════════════════════════════════════════════════════════════════════
+
+# The alert-drain ledger's real shape: `started_at`, never `run_start`.
+_DRAIN_SPEC = dict(
+    _RW_SPEC,
+    label="alert-drain",
+    artifact_prefix="groom/",       # _FakeRunWindowS3 keys off the prefix shape only
+    run_start_field="started_at",
+)
+
+
+def test_run_window_reads_the_registry_declared_start_field():
+    """A drain-ledger-shaped artifact covers its trigger. Before run_start_field
+    the reader asked every ledger for `run_start`, got None, skipped it, and
+    reported the trigger as a silent death — four consecutive false pages on
+    2026-07-29 while the drain was running normally."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [{"started_at": "2026-07-17T01:05:00+00:00"}]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_DRAIN_SPEC, NOW)
+    assert problems == []
+
+
+def test_run_window_artifact_missing_declared_start_field_raises():
+    """The regression guard proper: a skip here is indistinguishable from a
+    genuinely missing run, which is the ONE distinction this check exists to
+    make. It must fail loud, not degrade into a false page."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [{"run_start": "2026-07-17T01:05:00+00:00"}]})
+    with patch("index._s3_client", return_value=s3):
+        with pytest.raises(index._RegistryError) as exc:
+            index._check_run_window(_DRAIN_SPEC, NOW)
+    assert "started_at" in str(exc.value)
+
+
+def test_run_window_default_start_field_is_unchanged_for_groom():
+    """Specs without the key keep reading `run_start` — additive per entry."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [{"run_start": "2026-07-17T01:05:00+00:00"}]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC, NOW)
+    assert problems == []
+
+
+def test_registry_declares_started_at_for_the_alert_drain_ledger():
+    """The live registry must name the drain ledger's real field. Without this
+    the check above is inert and the drain leg pages on every mature trigger."""
+    import yaml
+    reg = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "overseer" / "playbooks.yaml").read_text()
+    )
+    checks = [
+        c
+        for pb in reg["playbooks"].values()
+        for c in ((pb.get("liveness") or {}).get("checks") or [])
+        if c.get("type") == "run_window" and c.get("artifact_prefix", "").startswith("overseer/drain_ledger")
+    ]
+    assert checks, "no run_window check over the alert-drain ledger in the registry"
+    for c in checks:
+        assert c.get("run_start_field") == "started_at", (
+            "the drain ledger keys its start timestamp 'started_at'; reading the "
+            "groom artifact's 'run_start' name against it reports 100% of mature "
+            "triggers as silent deaths"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Page shape — a summons, not a report
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_many_missed_runs_render_as_one_headline_not_one_line_each():
+    """Five missed triggers used to render as five near-identical paragraphs,
+    burying the one finding that differed. They collapse to a single line."""
+    s3 = _FakeRunWindowS3({})
+    spec = dict(_RW_SPEC, lookback_hours=120)
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(spec, NOW)
+    assert len(problems) == 1
+    headline = problems[0]["headline"]
+    assert "scheduled runs filed no report" in headline
+    assert headline.count("\n") == 0
+    # every missed trigger is still fully accounted for, in the detail
+    assert problems[0]["detail"].count("filed NO") >= 5
+
+
+def test_page_carries_headlines_and_a_detail_pointer_not_full_prose():
+    long_detail = "x" * 400
+    finding = index._finding("alert-drain", "1 of 4 scheduled runs filed no report", long_detail)
+    _result, s3, notify = _handler_with([finding], checks_run=25, checks_failed=0)
+    text = notify.call_args[0][0]
+    assert "*alert-drain*: 1 of 4 scheduled runs filed no report" in text
+    assert long_detail not in text            # prose stays out of the page
+    assert index.REPORT_PREFIX in text        # ...and the page says where it is
+    assert any(
+        c.kwargs["Key"].startswith(index.REPORT_PREFIX) for c in s3.put_object.call_args_list
+    )
+
+
+def test_page_inlines_detail_when_the_report_write_fails():
+    """Honest degradation: a failed report write must never silently drop the
+    findings it was carrying."""
+    finding = index._finding("groom", "short headline", "the full prose that matters")
+    s3 = MagicMock()
+    s3.get_object.side_effect = FakeClientError("NoSuchKey")
+    s3.put_object.side_effect = [FakeClientError("AccessDenied"), None]
+    notify = MagicMock(return_value=True)
+    with patch("index._run_checks", return_value=([finding], {}, 25, 0)), \
+         patch("index._s3_client", return_value=s3), \
+         patch("index.notify_via_flow_doctor", notify):
+        index.handler({}, None)
+    text = notify.call_args[0][0]
+    assert "Detail report unavailable" in text
+    assert "the full prose that matters" in text
+
+
+def test_page_caps_headlines_and_says_how_many_it_dropped():
+    many = 12
+    findings = [index._finding(f"c{i}", f"headline {i}") for i in range(many)]
+    _result, _s3, notify = _handler_with(findings, checks_run=25, checks_failed=0)
+    text = notify.call_args[0][0]
+    assert "headline 0" in text and f"headline {index._MAX_HEADLINES - 1}" in text
+    assert f"headline {index._MAX_HEADLINES}" not in text
+    assert f"…and {many - index._MAX_HEADLINES} more" in text
+
+
+def test_dedup_key_ignores_headline_wording():
+    """Dedup keys on DETAIL, so re-wording the page cannot re-page Brian."""
+    a = index._finding("groom", "one phrasing", "the finding")
+    b = index._finding("groom", "a completely different phrasing", "the finding")
+    assert (index._stable_problem_key(a["detail"])
+            == index._stable_problem_key(b["detail"]))

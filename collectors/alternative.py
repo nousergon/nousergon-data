@@ -63,6 +63,7 @@ from validators.price_validator import (
     DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES,
     validate_feature_record,
 )
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 
 logger = logging.getLogger(__name__)
 
@@ -983,7 +984,8 @@ def _fetch_analyst(ticker: str) -> dict:
         last_exc: Exception | None = None
         for attempt in range(_YF_INFO_MAX_ATTEMPTS):
             try:
-                info = yf.Ticker(ticker).info
+                with quiet_yfinance():
+                    info = yf.Ticker(ticker).info
                 break
             except Exception as e:  # noqa: BLE001 — yfinance raises opaque types
                 last_exc = e

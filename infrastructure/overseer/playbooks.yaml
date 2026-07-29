@@ -32,6 +32,7 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
+    execution_surface: spot
     # config-I3293 — model/wake/cadence are REGISTRY-DECLARED (this file is
     # the one place that answers "what model runs this agent, what wakes it,
     # on what cadence"). `model` is LIVE config, not documentation: the
@@ -210,9 +211,19 @@ playbooks:
         # MAX_RUNTIME_SECONDS=10800 (180m) + boot/report margin = 210m ceiling;
         # margin beyond the ceiling is 30m. The 4x-daily schedule mirrors the
         # four EventBridge Scheduler names in watch_plane_liveness.
+        #
+        # run_start_field: the drain ledger keys its start timestamp
+        # `started_at`; the groom artifact this check was ported from uses
+        # `run_start`. Reading groom's name against the drain's schema found
+        # nothing, and the reader skipped past every ledger silently, so all
+        # four daily triggers were reported as silent deaths while the drain
+        # was running normally (false pages 2026-07-29). The reader now RAISES
+        # on a missing declared field. Retire this key when G16
+        # (alpha-engine-config-I5284) gives every playbook one artifact schema.
         - type: run_window
           label: alert-drain
           artifact_prefix: overseer/drain_ledger/
+          run_start_field: started_at
           ceiling_min: 210
           margin_min: 30
           lookback_hours: 30

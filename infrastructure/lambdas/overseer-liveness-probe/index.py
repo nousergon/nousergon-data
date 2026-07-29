@@ -39,9 +39,11 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
 
 Conventions preserved from both source probes:
   * silent-unless-broken: a clean pass logs + returns, no Telegram noise.
-  * content-hash dedup: ONE sha256 fingerprint over the aggregated problem set
-    (subsumes groom's per-trigger dedup) — a standing problem doesn't re-ping,
-    and the alert state clears automatically the moment everything is clean.
+  * per-problem dedup: each problem gets its own signature; only NEW problems
+    trigger an alert, continuing ones are summarized as a count, and resolved
+    ones age out so a genuine recurrence later pages again (alpha-engine-config-I5207).
+    The flow-doctor dedup key still covers the full new+continuing set so
+    an entire run with zero new problems is fully suppressed.
   * fail-loud (CLAUDE.md no-silent-fails): every AWS describe/list is a PRIMARY
     input — an UNEXPECTED API error RAISES so a broken probe surfaces via the
     Lambda Errors metric, alarmed by the watch-plane backstop alarms in
@@ -82,6 +84,32 @@ WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
 STATE_KEY = os.environ.get(
     "OVERSEER_LIVENESS_STATE_KEY", "consolidated/overseer_liveness/alerted.json"
 )
+# Full per-finding prose lands here; the page carries headlines and this key.
+# Same prefix as STATE_KEY so the existing LivenessDedupState IAM statement
+# already grants it — this deploys on merge with no operator step (the rule
+# alpha-engine-config-I4472 exists to enforce).
+REPORT_PREFIX = os.environ.get(
+    "OVERSEER_LIVENESS_REPORT_PREFIX", "consolidated/overseer_liveness/reports/"
+)
+
+# Message shape. A page is a summons, not a report: it must answer "what is
+# broken, how bad, where do I look" in one screen. Findings beyond the cap and
+# every finding's full prose live in the S3 detail report.
+_MAX_HEADLINES = 8       # headline lines rendered before "…and N more"
+_HEADLINE_ITEMS = 3      # per-finding items (timestamps, runs) named inline
+
+
+def _finding(component: str, headline: str, detail: str | None = None) -> dict:
+    """One liveness finding, in the two registers a page needs.
+
+    ``headline`` is scannable and one line; ``detail`` is the full prose that
+    used to BE the message. Checks that are already one short sentence pass
+    only a headline and the two are identical."""
+    return {
+        "component": component,
+        "headline": headline,
+        "detail": detail if detail is not None else headline,
+    }
 
 # The playbook registry — bundled into the zip at deploy from the repo SSoT
 # (infrastructure/overseer/playbooks.yaml), same pattern as overseer-dispatcher.
@@ -528,8 +556,24 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
     """Recent S3 run artifacts (``{artifact_prefix}{date}/{run_id}.json``) as
     (run_start, key, artifact). PRIMARY input — RAISES on error (fail-loud); a
     malformed individual artifact also raises (skipping it silently would let a
-    genuinely-missed trigger hide behind a corrupt one)."""
+    genuinely-missed trigger hide behind a corrupt one).
+
+    The start-timestamp field is REGISTRY-DECLARED (``run_start_field``,
+    default ``run_start``) because the fleet's run artifacts do not share one
+    schema: the groom artifact carries ``run_start``, the alert-drain ledger
+    carries ``started_at``. Until G16 (alpha-engine-config-I5284) collapses
+    them into one execution artifact, the reader must be told which field to
+    read rather than assuming groom's.
+
+    An artifact WITHOUT the declared field raises — this is the exact defect
+    this parameter fixes. From 2026-07-25 the drain leg read `art.get("run_start")`
+    on ledgers that never carry it, `continue`d past every one, and reported
+    100% of mature alert-drain triggers as silent deaths while the drain was
+    running normally: four consecutive false pages on 2026-07-29. A silent skip
+    here cannot be told apart from a genuinely missing run, which is the one
+    distinction the whole check exists to make."""
     artifact_prefix = spec["artifact_prefix"]
+    start_field = spec.get("run_start_field", "run_start")
     found: list[tuple[datetime, str, dict]] = []
     for date in _rw_lookback_dates(spec, now):
         prefix = f"{artifact_prefix}{date}/"
@@ -545,9 +589,14 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
                     continue
                 body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
                 art = json.loads(body)
-                run_start = art.get("run_start")
+                run_start = art.get(start_field)
                 if not run_start:
-                    continue
+                    raise _RegistryError(
+                        f"run_window[{spec.get('label')}]: artifact s3://{WATCH_BUCKET}/{key} "
+                        f"has no {start_field!r} field (registry run_start_field). Every run "
+                        "under this prefix would read as a missed run — fix the registry "
+                        "field name or the producer, do not skip the artifact."
+                    )
                 found.append(
                     (datetime.fromisoformat(run_start.replace("Z", "+00:00")), key, art)
                 )
@@ -558,8 +607,8 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
 
 
 def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list[dict]:
-    """A trigger is a MISS iff no run artifact's run_start fell inside its run
-    window [T, T + ceiling + margin]."""
+    """A trigger is a MISS iff no run artifact's start timestamp fell inside its
+    run window [T, T + ceiling + margin]."""
     window = timedelta(minutes=spec["ceiling_min"] + spec["margin_min"])
     return [trig for trig in triggers if not any(trig["at"] <= s <= trig["at"] + window for s in stamps)]
 
@@ -594,7 +643,7 @@ def _rw_clause_holds(clause: dict, art: dict) -> bool:
     return True
 
 
-def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> list[str]:
+def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> list[tuple[str, str]]:
     """Run artifacts that prove a box BOOTED but not that the run did anything.
 
     A pure existence check answers "was an artifact written?", which is not the
@@ -608,12 +657,15 @@ def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> li
     ``productive_when`` is an OR of declarative clauses; an artifact matching
     NONE of them is a dead run. Specs without the key keep the old
     existence-only semantics, so this is additive per registry entry.
+
+    Returns (headline_fragment, detail) per dead run — the caller collapses
+    them into ONE finding so a bad day reads as one line, not N paragraphs.
     """
     clauses = spec.get("productive_when")
     if not clauses:
         return []
     label = spec["label"]
-    problems: list[str] = []
+    out: list[tuple[str, str]] = []
     for run_start, key, art in sorted(artifacts, key=lambda t: t[0]):
         if any(_rw_clause_holds(c, art) for c in clauses):
             continue
@@ -624,20 +676,33 @@ def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> li
             if f in art
         )
         stop = str(art.get("stop_reason") or "").strip()
-        problems.append(
+        stamp = run_start.strftime("%m-%d %H:%M")
+        engaged, total = art.get("engaged"), art.get("total_issues")
+        short = (
+            f"{stamp}Z engaged {engaged} of {total}"
+            if engaged is not None and total is not None
+            else f"{stamp}Z did no work"
+        )
+        out.append((
+            short,
             f"scheduled {label} run @ {run_start.strftime('%Y-%m-%d %H:%M')}Z RAN BUT "
             f"DID NO WORK — the artifact exists, so run-window coverage looks green, "
             f"but the run engaged nothing it was dispatched to engage ({detail}). "
             f"artifact=s3://{WATCH_BUCKET}/{key}"
-            + (f" stop_reason={stop[:200]!r}" if stop else "")
-        )
-    return problems
+            + (f" stop_reason={stop[:200]!r}" if stop else ""),
+        ))
+    return out
 
 
-def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_run_window(spec: dict, now: datetime) -> tuple[list[dict], dict]:
     """Per-trigger run-window accounting — a mature scheduled run with no
     covering S3 artifact = a silent death (ported from groom-liveness-probe,
-    minus its per-trigger dedup which the unified fingerprint subsumes)."""
+    minus its per-trigger dedup which the unified fingerprint subsumes).
+
+    Emits at most TWO findings — one per failure mode — each collapsing every
+    affected run into a single headline with the per-run prose in ``detail``.
+    Per-run lines were the dominant term in an unreadable page: five missed
+    drain triggers rendered as five near-identical paragraphs saying one thing."""
     s3 = _s3_client()
     label = spec["label"]
     triggers = _rw_all_expected_triggers(spec, s3, now)
@@ -646,17 +711,35 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
         return [], {}
     artifacts = _rw_fetch_run_artifacts(spec, s3, now)  # PRIMARY — fail-loud
     misses = _rw_missed(spec, triggers, [a[0] for a in artifacts])
-    problems = [
-        f"scheduled {label} run '{m['label']}' @ {m['at'].strftime('%Y-%m-%d %H:%M')}Z filed NO "
-        f"terminal report (no S3 run artifact under '{spec['artifact_prefix']}' in-window) — box "
-        "likely died silently (spot reclaim / OOM / pre-trap crash) or was never dispatched"
-        for m in misses
-    ]
+    findings: list[dict] = []
+    if misses:
+        when = ", ".join(m["at"].strftime("%m-%d %H:%M") + "Z" for m in misses[:_HEADLINE_ITEMS])
+        if len(misses) > _HEADLINE_ITEMS:
+            when += f", +{len(misses) - _HEADLINE_ITEMS} more"
+        findings.append(_finding(
+            label,
+            f"{len(misses)} of {len(triggers)} scheduled runs filed no report ({when})",
+            "\n".join(
+                f"scheduled {label} run '{m['label']}' @ {m['at'].strftime('%Y-%m-%d %H:%M')}Z filed NO "
+                f"terminal report (no S3 run artifact under '{spec['artifact_prefix']}' in-window) — box "
+                "likely died silently (spot reclaim / OOM / pre-trap crash) or was never dispatched"
+                for m in misses
+            ),
+        ))
     # Second failure mode, same check: the artifact EXISTS but the run did
-    # nothing. Reported per-artifact rather than per-trigger, so one dead lane
+    # nothing. Assessed per-artifact rather than per-trigger, so one dead lane
     # is visible even when its sibling lanes covered the same trigger.
-    problems += _rw_dead_runs(spec, artifacts)
-    return problems, {}
+    dead = _rw_dead_runs(spec, artifacts)
+    if dead:
+        shorts = "; ".join(s for s, _ in dead[:_HEADLINE_ITEMS])
+        if len(dead) > _HEADLINE_ITEMS:
+            shorts += f"; +{len(dead) - _HEADLINE_ITEMS} more"
+        findings.append(_finding(
+            label,
+            f"{len(dead)} run(s) wrote an artifact but did no work ({shorts})",
+            "\n".join(d for _, d in dead),
+        ))
+    return findings, {}
 
 
 # ── Check: sf_watch_invocation_success ───────────────────────────────────────
@@ -753,14 +836,19 @@ def _watch_log_events(s3, key: str) -> list[dict] | None:
     return events if isinstance(events, list) else []
 
 
-def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[dict], dict]:
     """Per registered pipeline, every MATURE (older than
     ``response_window_min``) terminal-failure execution within
     ``lookback_hours`` must have produced a matching watch-log event. A miss
     means the dispatcher was invoked (EventBridge fired — wiring is fine) but
     never completed its PRIMARY fail-loud watch-log write, i.e. it crashed on
-    invocation."""
+    invocation.
+
+    One finding regardless of how many executions missed: N unrecorded
+    dispatches are one broken dispatcher, and rendering them as N paragraphs
+    makes the page longer without making it more actionable."""
     problems: list[str] = []
+    missed_names: list[str] = []
     sfn = _sfn_client()
     s3 = _s3_client()
     horizon = now - timedelta(hours=spec["lookback_hours"])
@@ -781,6 +869,7 @@ def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[
                 e.get("execution_arn") == execu.get("executionArn") for e in events
             )
             if not recorded:
+                missed_names.append(sm_name)
                 problems.append(
                     f"sf-watch: {sm_name} execution '{execu.get('name')}' terminal-failed "
                     f"({execu.get('status')}) @ {stop.strftime('%Y-%m-%d %H:%M')}Z with NO "
@@ -788,7 +877,18 @@ def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[
                     "later — the dispatcher was invoked but crashed before its fail-loud "
                     "watch-log write (wiring OK, function broken)"
                 )
-    return problems, {}
+    if not problems:
+        return [], {}
+    pipelines = sorted(set(missed_names))
+    named = ", ".join(pipelines[:_HEADLINE_ITEMS])
+    if len(pipelines) > _HEADLINE_ITEMS:
+        named += f", +{len(pipelines) - _HEADLINE_ITEMS} more"
+    return [_finding(
+        "sf-watch",
+        f"{len(problems)} pipeline failure(s) got no watch-log event — dispatcher "
+        f"invoked but crashing ({named})",
+        "\n".join(problems),
+    )], {}
 
 
 # ── Check dispatch table + aggregation ───────────────────────────────────────
@@ -817,9 +917,20 @@ def _iter_check_specs(registry: dict) -> list[tuple[str, dict]]:
     return specs
 
 
-def _run_checks(now: datetime) -> tuple[list[str], dict[str, str], int, int]:
-    """Run every registry-declared liveness check, aggregating problems +
+def _component_name(label: str) -> str:
+    """Registry source label → the name a human uses for it. ``playbook:groom``
+    is a lookup path; ``groom`` is what the page should say."""
+    return label.split(":", 1)[1] if label.startswith("playbook:") else label.replace("_", "-")
+
+
+def _run_checks(now: datetime) -> tuple[list[dict], dict[str, str], int, int]:
+    """Run every registry-declared liveness check, aggregating findings +
     reported kill-switches.
+
+    Checkers may return either a plain string (already one short sentence — it
+    becomes both headline and detail) or a ``_finding`` dict. Normalisation
+    happens HERE, once, so a check that has nothing to summarise stays a
+    one-liner and only the checks that fan out carry the extra structure.
 
     An unknown check type RAISES (_RegistryError, fail-loud) — a registry that
     outran the probe's checker table is a packaging bug that makes the WHOLE
@@ -835,9 +946,9 @@ def _run_checks(now: datetime) -> tuple[list[str], dict[str, str], int, int]:
     check's coverage to one check's failure is not, because a probe's whole
     job is to report N independent findings.
 
-    Returns (problems, kill_switches, checks_run, checks_failed)."""
+    Returns (findings, kill_switches, checks_run, checks_failed)."""
     registry = _registry()
-    problems: list[str] = []
+    findings: list[dict] = []
     kill_switches: dict[str, str] = {}
     checks_run = 0
     checks_failed = 0
@@ -847,21 +958,25 @@ def _run_checks(now: datetime) -> tuple[list[str], dict[str, str], int, int]:
         if checker is None:
             raise _RegistryError(f"{label}: unknown liveness check type {ctype!r}")
         checks_run += 1
+        component = _component_name(label)
         try:
             p, ks = checker(spec, now)
-        except Exception as exc:  # noqa: BLE001 — isolated per I4473; recorded as a problem line below, never swallowed
+        except Exception as exc:  # noqa: BLE001 — isolated per I4473; recorded as a finding below, never swallowed
             checks_failed += 1
             logger.error(
                 "liveness check FAILED to run: %s type=%s: %s: %s",
                 label, ctype, type(exc).__name__, exc,
             )
-            problems.append(
+            findings.append(_finding(
+                component,
+                f"check '{ctype}' FAILED TO RUN ({type(exc).__name__}) — coverage ABSENT",
                 f"{label}: liveness check '{ctype}' FAILED TO RUN "
                 f"({type(exc).__name__}: {exc}) — this check's coverage is ABSENT; "
-                "the component it watches is unverified, not healthy"
-            )
+                "the component it watches is unverified, not healthy",
+            ))
             continue
-        problems.extend(p)
+        for item in p:
+            findings.append(item if isinstance(item, dict) else _finding(component, item))
         kill_switches.update(ks)
 
     if checks_run and checks_failed == checks_run:
@@ -869,87 +984,243 @@ def _run_checks(now: datetime) -> tuple[list[str], dict[str, str], int, int]:
         # anything (blanket IAM/credential/network failure). Reporting this
         # identically to N individual check failures would understate it —
         # the plane is not degraded, it is BLIND.
-        problems.insert(
-            0,
+        findings.insert(0, _finding(
+            "PROBE",
+            f"BLIND — all {checks_run} checks failed to run; the plane is unobserved",
             f"PROBE BLIND: all {checks_run} liveness checks failed to run — "
             "the watch plane is unobserved, not healthy. Check the probe role's "
             "IAM against infrastructure/lambdas/overseer-liveness-probe/iam-policy.json.",
-        )
-    return problems, kill_switches, checks_run, checks_failed
+        ))
+    return findings, kill_switches, checks_run, checks_failed
 
 
-# ── Dedup + alert (content-fingerprint, ported from sf-watch-reclaim-sweep-handler) ──
+# ── Dedup + alert (per-problem signature, alpha-engine-config-I5207) ─────────
 
 
-def _problem_fingerprint(problems: list[str]) -> str:
-    return hashlib.sha256("\n".join(sorted(problems)).encode()).hexdigest()[:16]
+def _stable_problem_key(problem: str) -> str:
+    """SHA256 hex digest (first 16 hexits) of the problem text — used as a
+    per-problem dedup identity.
+
+    Each problem's FULL text is the key (including timestamps), because a
+    run-window finding for a different trigger window IS a different problem.
+    This is the correct semantic for age-out: if a problem text changes (e.g.
+    the trigger timestamp advances for a still-missing run), it becomes a NEW
+    per-problem entry — the old one resolves and the new one alerts once.
+    """
+    return hashlib.sha256(problem.encode()).hexdigest()[:16]
 
 
-def _load_alerted_fingerprint(s3) -> str | None:
-    """None means 'no state yet' OR 'currently healthy' — both mean nothing to
-    suppress against."""
+def _load_alerted_state(s3) -> dict[str, str] | None:
+    """Previously-alerted per-problem state: ``{fingerprint: problem_text}``.
+
+    Returns ``None`` when there is no prior state at all (first-ever run, or
+    the state object has never been written) — distinct from ``{}``, which
+    means \"same as healthy\" (the state was cleared after a clean pass).
+
+    A missing/403 key (the common first-run or healthy-cleared case) skips
+    the warning log — these are expected, not anomalous."""
     try:
         obj = s3.get_object(Bucket=WATCH_BUCKET, Key=STATE_KEY)
-        return json.loads(obj["Body"].read()).get("fingerprint")
+        raw = json.loads(obj["Body"].read())
+        if isinstance(raw, dict):
+            # Backward compat (I5207): old format stored a single
+            # ``fingerprint`` key — treat it as "no per-problem state"
+            # so the first run with new code treats everything as new
+            # (safe one-time re-alert, after which the new format is
+            # persisted).
+            if "fingerprint" in raw and "per_problem" not in raw:
+                return None
+            return raw.get("per_problem") or {}
+        return {}
     except Exception as exc:  # noqa: BLE001 — absence expected; bad blob recoverable
         if _error_code(exc) not in {"NoSuchKey", "404", "403", ""}:
             logger.warning("could not read overseer liveness state %s: %s", STATE_KEY, exc)
         return None
 
 
-def _save_alerted_fingerprint(s3, fingerprint: str | None) -> None:
-    """Best-effort: a write failure only risks a duplicate/missed-clear ping
+def _save_alerted_state(s3, state: dict[str, str] | None) -> None:
+    """Persist (or clear) the per-problem dedup state.
+
+    ``state is None`` (or ``{}``) clears the state — written as ``{}`` so
+    the next load sees an empty set rather than ``None``, enabling the
+    \"problems resolved\" branch without retriggering on a subsequent clean
+    pass.
+
+    Best-effort: a write failure only risks a duplicate/missed-clear ping
     next run (logged), never a missed finding — so it does NOT raise."""
+    payload = {"per_problem": state or {}, "updated_at": datetime.now(timezone.utc).isoformat()}
     try:
         s3.put_object(
             Bucket=WATCH_BUCKET,
             Key=STATE_KEY,
-            Body=json.dumps(
-                {"fingerprint": fingerprint, "updated_at": datetime.now(timezone.utc).isoformat()},
-                indent=2,
-            ).encode("utf-8"),
+            Body=json.dumps(payload, indent=2).encode("utf-8"),
             ContentType="application/json",
         )
     except Exception as exc:  # noqa: BLE001 — dedup state; failure only risks a dup ping
         logger.warning("could not persist overseer liveness state %s: %s", STATE_KEY, exc)
 
 
+def _write_detail_report(s3, findings: list[dict], now: datetime,
+                         checks_run: int, checks_failed: int) -> str | None:
+    """Persist the full per-finding prose and return its s3:// URI, or None if
+    the write failed.
+
+    Best-effort BY DESIGN, and the one swallow in this module that is not a
+    defect: the report is a delivery convenience for a page that must go out
+    regardless. Raising here would trade a readable page for no page at all.
+    Failure is recorded two ways — a logged warning, and the caller falling
+    back to inlining every detail in the message, so the information is never
+    lost, only rendered less pleasantly."""
+    key = f"{REPORT_PREFIX}{now.strftime('%Y-%m-%dT%H%M%SZ')}.json"
+    try:
+        s3.put_object(
+            Bucket=WATCH_BUCKET,
+            Key=key,
+            Body=json.dumps(
+                {
+                    "generated_at": now.isoformat(),
+                    "checks_run": checks_run,
+                    "checks_failed": checks_failed,
+                    "findings": findings,
+                },
+                indent=2,
+            ).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — delivery aid; caller inlines detail instead
+        logger.warning("could not write liveness detail report %s: %s — "
+                       "falling back to inline detail in the page", key, exc)
+        return None
+    return f"s3://{WATCH_BUCKET}/{key}"
+
+
+def _alert_diff(
+    current_problems: list[str],
+    previous_state: dict[str, str] | None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Diff the CURRENT problem set against the PREVIOUSLY-ALERTED per-problem
+    state.
+
+    Returns ``(new_problems, continuing_problems, resolved_keys)``:
+
+    * ``new_problems`` — problems that exist now but were NOT in the previous
+      state (ordered by the stable key for determinism). Never empty.
+    * ``continuing_problems`` — problems whose fingerprint matches one in the
+      previous state. Empty when ``previous_state is None``.
+    * ``resolved_keys`` — keys present in the previous state but NOT in the
+      current set. These should be aged out of the persisted state.
+
+    ``previous_state is None`` (no prior state at all) means every current
+    problem is treated as \"new\" — the probe has never alerted before, so
+    there is nothing to compare against."""
+    current_map: dict[str, str] = {}
+    for p in current_problems:
+        current_map[_stable_problem_key(p)] = p
+
+    if previous_state is None:
+        return list(current_map.values()), [], []
+
+    prev_keys = set(previous_state.keys())
+    cur_keys = set(current_map.keys())
+
+    new_keys = cur_keys - prev_keys
+    continuing_keys = cur_keys & prev_keys
+    resolved = list(prev_keys - cur_keys)
+
+    new_problems = [current_map[k] for k in sorted(new_keys)]
+    continuing_problems = [current_map[k] for k in sorted(continuing_keys)]
+    return new_problems, continuing_problems, resolved
+
+
 def _alert(
-    problems: list[str],
+    new_findings: list[dict],
+    continuing_count: int,
+    resolved_count: int,
+    total_findings: int,
     kill_switches: dict[str, str] | None = None,
     checks_run: int = 0,
     checks_failed: int = 0,
+    now: datetime | None = None,
 ) -> bool:
+    """Page Brian with a summons he can act on from one screen.
+
+    Carries: the new/continuing/resolved accounting (alpha-engine-config-I5207),
+    ONE headline per new finding, the coverage caveat, and a pointer. Full prose
+    goes to an S3 detail report.
+
+    The prior format inlined every finding's full paragraph, so a bad morning
+    produced a wall of near-identical text in which the one line that mattered —
+    a groom run that engaged 0 of 21 issues — sat below five paragraphs of the
+    same sentence about missed drain runs. It also pointed the reader at
+    CloudWatch logs for anything past the cap; the report is a better answer to
+    the same problem."""
+    now = now or datetime.now(timezone.utc)
+    report_uri = _write_detail_report(
+        _s3_client(), new_findings, now, checks_run, checks_failed
+    )
+
+    parts = [f"{total_findings} finding(s)"]
+    if new_findings:
+        parts.append(f"{len(new_findings)} new")
+    if continuing_count:
+        parts.append(f"{continuing_count} continuing")
+    if resolved_count:
+        parts.append(f"{resolved_count} resolved")
+
     lines = [
-        "\U0001f6f0️ *Overseer Liveness Probe — WATCH-PLANE PROBLEM*",
-        f"{len(problems)} wiring/liveness issue(s) found across the fleet watch plane "
-        "(the WATCHERS' own wiring, NOT a pipeline failure):",
+        "\U0001f6f0️ *Overseer Liveness — watch plane*",
+        f"{' · '.join(parts)} · {checks_run - checks_failed}/{checks_run} checks ran "
+        "(the WATCHERS' own wiring, not a pipeline failure)",
+        "",
     ]
-    lines.extend(f"• {p}" for p in problems)
+    lines.extend(
+        f"• *{f['component']}*: {f['headline']}" for f in new_findings[:_MAX_HEADLINES]
+    )
+    if len(new_findings) > _MAX_HEADLINES:
+        lines.append(f"…and {len(new_findings) - _MAX_HEADLINES} more new")
     if checks_failed:
-        # I4473: coverage caveat, stated BEFORE the closing advice — a reader
+        # I4473: coverage caveat, stated BEFORE the closing pointer — a reader
         # must not read this report as a complete picture when part of the
         # plane went unobserved.
         lines.append(
             f"⚠️ *Coverage incomplete:* {checks_failed} of {checks_run} checks could not "
             "run — the components they watch are UNVERIFIED, not confirmed healthy."
         )
-    lines.append(
-        "_A watcher may not catch (or repair) a real failure right now. Check the "
-        "named rules / Step Functions / dispatcher Lambdas / intake queue._"
-    )
+    lines.append("")
+    if report_uri:
+        lines.append(f"Detail: `{report_uri}`")
+    else:
+        # Degraded, and SAID so: the report write failed, so the full prose is
+        # inlined here rather than dropped.
+        lines.append("_Detail report unavailable (S3 write failed) — full findings inline:_")
+        lines.extend(f"— {f['detail']}" for f in new_findings)
     text = "\n".join(lines)
+
+    # Flow-doctor dedup key: hash the new-problem keys + continuing count so
+    # a run that only adds new problems gets through, but a run whose
+    # continuing set is unchanged does not re-page if flow-doctor called us
+    # with the same set twice (belt-and-braces — the handler never calls
+    # _alert when new_problems is empty).
+    dedup_fingerprint = hashlib.sha256(
+        "\n".join(sorted(_stable_problem_key(f["detail"]) for f in new_findings)
+                   + [f"c:{continuing_count}", f"r:{resolved_count}"]).encode()
+    ).hexdigest()[:16]
+
     try:
         return notify_via_flow_doctor(
             text,
             silent=False,
             severity="error",
-            dedup_key=f"{_FLOW_NAME}:wiring:{_problem_fingerprint(problems)}",
+            dedup_key=f"{_FLOW_NAME}:wiring:{dedup_fingerprint}",
             flow_name=_FLOW_NAME,
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
             context={
-                "problems": len(problems),
+                "problems": total_findings,
+                "new": len(new_findings),
+                "continuing": continuing_count,
+                "resolved": resolved_count,
+                "detail_report": report_uri,
                 "kill_switches": kill_switches or {},
                 "checks_run": checks_run,
                 "checks_failed": checks_failed,
@@ -970,49 +1241,85 @@ def _alert(
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Iterates the playbook registry,
-    runs every declared liveness check read-only, dedups by problem-set content,
-    and LOUD-alerts only on a NEW/changed problem set.
+    runs every declared liveness check read-only, dedups PER PROBLEM
+    (alpha-engine-config-I5207), and LOUD-alerts only when NEW problems appear.
 
-    A runtime AWS failure in ONE check is isolated into its own problem line so
-    the rest of the plane is still observed (alpha-engine-config-I4473); an
-    unknown registry check type still RAISES, so the probe can never silently
-    no-op on a registry that outran its checker table."""
+    Per-problem dedup replaces the old aggregate-fingerprint approach: each
+    problem gets its own signature tracked in S3 state. On each run the
+    current problem set is diffed against the saved set:
+      * NEW problems page individually (capped at 5).
+      * CONTINUING problems (same signature as before) are summarized as a
+        count — the list was already delivered, the reader has seen it.
+      * RESOLVED problems (key absent from current set) age out of the state
+        so a genuine recurrence later pages again.
+
+    A runtime AWS failure in ONE check is isolated into its own problem line
+    so the rest of the plane is still observed (alpha-engine-config-I4473);
+    the per-problem dedup means a single new check failure does not re-page
+    every other standing check's problem."""
     now = datetime.now(timezone.utc)
-    problems, kill_switches, checks_run, checks_failed = _run_checks(now)
-    fingerprint = _problem_fingerprint(problems) if problems else None
+    findings, kill_switches, checks_run, checks_failed = _run_checks(now)
 
     # Always surfaced (record + log), never alerted: a deliberate operator
     # disable is state, not an incident.
     logger.info("overseer liveness: dispatch kill-switches: %s", kill_switches)
 
     s3 = _s3_client()
-    already = _load_alerted_fingerprint(s3)
+    previous_state = _load_alerted_state(s3)
 
+    new_count = continuing_count = resolved_count = 0
     alerted = False
-    if problems and fingerprint != already:
-        logger.warning("overseer liveness: %d NEW problem(s): %s", len(problems), problems)
-        alerted = _alert(problems, kill_switches, checks_run, checks_failed)
-        if alerted:
-            _save_alerted_fingerprint(s3, fingerprint)
-    elif problems:
-        logger.info(
-            "overseer liveness: %d problem(s), unchanged since last alert — suppressed",
-            len(problems),
+
+    if findings:
+        # Dedup identity stays the finding's full DETAIL text (I5207 semantics
+        # unchanged): the headline is presentation, and a re-worded page must
+        # never be able to re-page on its own.
+        by_detail = {f["detail"]: f for f in findings}
+        new_details, continuing_details, resolved_keys = _alert_diff(
+            list(by_detail), previous_state
         )
+        new_findings = [by_detail[d] for d in new_details]
+        new_count = len(new_findings)
+        continuing_count = len(continuing_details)
+        resolved_count = len(resolved_keys)
+
+        if new_findings:
+            logger.warning(
+                "overseer liveness: %d new, %d continuing, %d resolved: %s",
+                new_count, continuing_count, resolved_count, new_details,
+            )
+            alerted = _alert(
+                new_findings, continuing_count, resolved_count,
+                len(findings), kill_switches, checks_run, checks_failed, now,
+            )
+            if alerted:
+                # Persist the FULL current set so the next run can diff against it.
+                _save_alerted_state(s3, {_stable_problem_key(d): d for d in by_detail})
+        else:
+            logger.info(
+                "overseer liveness: %d problem(s), unchanged since last alert — suppressed",
+                len(findings),
+            )
     else:
         logger.info("overseer liveness: all checks clean")
-        if already is not None:
-            _save_alerted_fingerprint(s3, None)  # clear dedup state now that it's healthy again
+        if previous_state is not None:
+            _save_alerted_state(s3, None)  # clear dedup state now that it's healthy again
 
     return {
-        "problems": problems,
+        # `problems` stays the full prose list — the payload is a record, not a
+        # page, and nothing that reads it benefits from the shortening.
+        "problems": [f["detail"] for f in findings],
+        "findings": findings,
         "alerted": alerted,
-        "clean": not problems,
+        "clean": not findings,
         "kill_switches": kill_switches,
+        "new": new_count,
+        "continuing": continuing_count,
+        "resolved": resolved_count,
         # I4473: coverage accounting. `clean: true` with checks_failed > 0 is
-        # impossible by construction (a failed check IS a problem line), but
-        # these make "how much did we actually observe" answerable from the
-        # return payload alone, without reading logs.
+        # impossible by construction (a failed check IS a finding), but these
+        # make "how much did we actually observe" answerable from the return
+        # payload alone, without reading logs.
         "checks_run": checks_run,
         "checks_failed": checks_failed,
     }
