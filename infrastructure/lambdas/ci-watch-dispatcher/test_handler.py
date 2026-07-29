@@ -224,13 +224,16 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     assert idx._test_ec2.terminated == []
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
-    # ci_watch_spot_bootstrap.sh (alpha-engine-config) takes its CI fields as
-    # CLI FLAGS, not env vars — assert the actual invocation shape, not an
-    # `export CI_WATCH_*` form the bootstrap script never reads.
-    assert "exec bash infrastructure/ci_watch_spot_bootstrap.sh" in cmd
-    assert '--ci-repo "nousergon/alpha-engine-config"' in cmd
-    assert '--ci-sha "abc1234def5678900000000000000000000abcd"' in cmd
-    assert '--ci-run-url "https://github.com' in cmd
+    # Cut over to the unified artifact (EPIC config-I4992 step 3): the CI
+    # fields cross as ENV, because that is what the unified bootstrap reads.
+    # Passed as flags they would every one arrive unset and the agent would
+    # diagnose nothing, silently.
+    assert "exec bash infrastructure/overseer_spot_bootstrap.sh --playbook ci-watch" in cmd
+    assert "ci_watch_spot_bootstrap.sh" not in cmd
+    assert 'export CI_REPO="nousergon/alpha-engine-config"' in cmd
+    assert 'export CI_SHA="abc1234def5678900000000000000000000abcd"' in cmd
+    assert 'export CI_RUN_URL="https://github.com' in cmd
+    assert "--ci-repo" not in cmd and "--ci-sha" not in cmd
     assert "export HOME=/root" in cmd
     # run_token is NOT threaded into the box (no in-box consumer — the
     # completion marker keys directly on repo+sha) — only a Lambda-side
@@ -529,9 +532,9 @@ def test_drill_synthesizes_isolated_identity_and_launches(monkeypatch):
         "sf-watch-drill": "true",
     }
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--is-drill "true"' in cmd
-    assert f'--ci-repo "{idx.DRILL_REPO}"' in cmd
-    assert f'--ci-sha "{expected_sha}"' in cmd
+    assert 'export CI_IS_DRILL="true"' in cmd
+    assert f'export CI_REPO="{idx.DRILL_REPO}"' in cmd
+    assert f'export CI_SHA="{expected_sha}"' in cmd
 
 
 def test_drill_identity_can_never_collide_with_a_real_dispatch(monkeypatch):
@@ -609,7 +612,7 @@ def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch)
     assert out["is_drill"] is False
     assert "sf-watch-drill" not in calls["extra_tags"]
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--is-drill "false"' in cmd
+    assert 'export CI_IS_DRILL="false"' in cmd
 
 
 # ── config#2862: signature-repeat launch dedup ───────────────────────────────

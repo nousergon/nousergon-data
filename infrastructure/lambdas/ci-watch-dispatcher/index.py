@@ -429,9 +429,17 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
     alpha-engine-config). Any prelude failure shuts the box down so a botched
     launch never idles (mirrors groom's prelude fail() trap exactly).
 
-    ``ci_watch_spot_bootstrap.sh`` takes its CI fields as CLI FLAGS
-    (``--ci-repo``/``--ci-sha``/...), not environment variables — invoke it
-    that way, not via `export`. ``run_token`` is deliberately NOT threaded
+    Cut over to the UNIFIED ``overseer_spot_bootstrap.sh --playbook ci-watch``
+    (alpha-engine-config-I5284 / EPIC I4992 step 3). The unified artifact reads
+    per-playbook identity from the ENVIRONMENT — per-playbook identity is
+    registry data, not argv — and forwards unrecognised argv to the run script,
+    so the CI fields that were CLI flags on the legacy bootstrap are now
+    exports. Passing them as flags would leave every one unset and the agent
+    would diagnose nothing, silently.
+
+    Revert lever: restore the flags and
+    ``exec bash infrastructure/ci_watch_spot_bootstrap.sh``. The legacy
+    bootstrap stays on disk until a real dispatch proves the unified one. ``run_token`` is deliberately NOT threaded
     into the box: the bootstrap/run-script side keys its S3 completion
     marker directly on repo+sha (no per-attempt dispatch token, unlike
     groom's ``GROOM_RUN_TOKEN``), so there is no in-box consumer for it — it
@@ -454,10 +462,14 @@ git clone --depth 1 --branch {CI_WATCH_CONFIG_BRANCH} \
   "https://x-access-token:${{PAT}}@github.com/{CI_WATCH_CONFIG_REPO}.git" \
   /home/ec2-user/alpha-engine-config || fail "clone failed"
 cd /home/ec2-user/alpha-engine-config
-exec bash infrastructure/ci_watch_spot_bootstrap.sh \
-  --ci-repo "{repo}" --ci-sha "{sha}" --ci-run-id "{run_id}" \
-  --ci-run-url "{run_url}" --ci-workflow "{workflow}" --ci-branch "{branch}" \
-  --is-drill "{is_drill}"
+export CI_REPO="{repo}"
+export CI_SHA="{sha}"
+export CI_RUN_ID="{run_id}"
+export CI_RUN_URL="{run_url}"
+export CI_WORKFLOW="{workflow}"
+export CI_BRANCH="{branch}"
+export CI_IS_DRILL="{is_drill}"
+exec bash infrastructure/overseer_spot_bootstrap.sh --playbook ci-watch
 """
 
 

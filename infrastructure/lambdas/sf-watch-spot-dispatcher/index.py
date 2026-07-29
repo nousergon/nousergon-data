@@ -323,9 +323,20 @@ def _bootstrap_command(fields: dict, run_token: str) -> str:
     failure shuts the box down so a botched launch never idles (mirrors
     ci-watch-dispatcher's prelude fail() trap exactly).
 
-    ``sf_watch_spot_bootstrap.sh`` takes its SF fields as CLI FLAGS
-    (``--pipeline``/``--cadence-slug``/...), not environment variables —
-    invoke it that way, not via `export`. ``run_token`` is deliberately NOT
+    Cut over to the UNIFIED ``overseer_spot_bootstrap.sh --playbook sf-watch``
+    (alpha-engine-config-I5284 / EPIC I4992 step 4). The unified artifact reads
+    per-playbook identity from the ENVIRONMENT, so the SF fields that were CLI
+    flags are now exports.
+
+    ``cause`` stays BASE64 across the boundary. It is arbitrary Step Functions
+    failure text and this command is built by an f-string, so the raw value
+    must never be interpolated. The unified bootstrap decodes any
+    ``<NAME>_B64`` passthrough into ``<NAME>`` (alpha-engine-config-PR5563),
+    which is the same protection the legacy ``--cause-b64`` flag provided.
+
+    Revert lever: restore the flags and
+    ``exec bash infrastructure/sf_watch_spot_bootstrap.sh``. The legacy
+    bootstrap stays on disk until a real dispatch proves the unified one. ``run_token`` is deliberately NOT
     threaded into the box: the bootstrap/run-script side keys its S3
     completion marker directly on (cadence_slug, pipeline_name, run_date) —
     it stays a Lambda-side-only correlation id (see the SSM Comment field in
@@ -347,13 +358,18 @@ git clone --depth 1 --branch {SF_WATCH_CONFIG_BRANCH} \
   "https://x-access-token:${{PAT}}@github.com/{SF_WATCH_CONFIG_REPO}.git" \
   /home/ec2-user/alpha-engine-config || fail "clone failed"
 cd /home/ec2-user/alpha-engine-config
-exec bash infrastructure/sf_watch_spot_bootstrap.sh \
-  --pipeline "{fields['pipeline_name']}" --cadence-slug "{fields['cadence_slug']}" \
-  --state-machine-arn "{fields['state_machine_arn']}" --execution-arn "{fields['execution_arn']}" \
-  --run-date "{fields['run_date']}" --failed-state "{fields['failed_state']}" \
-  --cause-b64 "{cause_b64}" --watch-log-key "{fields['watch_log_key']}" \
-  --is-preflight "{fields['is_preflight']}" --is-drill "{fields['is_drill']}" \
-  --model "{fields.get('model', '')}"
+export SF_PIPELINE="{fields['pipeline_name']}"
+export SF_CADENCE_SLUG="{fields['cadence_slug']}"
+export SF_STATE_MACHINE_ARN="{fields['state_machine_arn']}"
+export SF_EXECUTION_ARN="{fields['execution_arn']}"
+export SF_RUN_DATE="{fields['run_date']}"
+export SF_FAILED_STATE="{fields['failed_state']}"
+export SF_CAUSE_B64="{cause_b64}"
+export SF_WATCH_LOG_KEY="{fields['watch_log_key']}"
+export SF_IS_PREFLIGHT="{fields['is_preflight']}"
+export SF_IS_DRILL="{fields['is_drill']}"
+export SF_WATCH_MODEL="{fields.get('model', '')}"
+exec bash infrastructure/overseer_spot_bootstrap.sh --playbook sf-watch
 """
 
 
