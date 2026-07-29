@@ -459,6 +459,32 @@ watch_plane_liveness:
       schedule_name: alpha-engine-ci-watch-canary-drill-weekly
     - type: scheduler_schedule_exists
       schedule_name: alpha-engine-sf-watch-canary-drill-weekly
+    # alpha-engine-config-I4482: watch-plane backstop CloudWatch alarms must
+    # exist and be wired to the independent backstop topic (rather than the
+    # primary alpha-engine-alerts topic) — a blackout of the primary alert
+    # channel must not also silence the alarm that watches the watchers.
+    # The `alarm_action_pattern` expects the backstop topic name. TODO: verify
+    # each per-Lambda Errors + Throttles alarm name against the exact labels
+    # in infrastructure/setup_watch_plane_alarms.sh WATCH_PLANE_FUNCTIONS.
+    - type: alarm_coverage
+      alarms:
+        # Per-Lambda watch-plane Errors + Throttles (setup_watch_plane_alarms.sh)
+        - name_pattern: alpha-engine-watch-plane-overseer-dispatcher
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        - name_pattern: alpha-engine-watch-plane-alert-drain-dispatcher
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        - name_pattern: alpha-engine-watch-plane-overseer-intake
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        # Intake DLQ depth + age-of-oldest-message
+        - name_pattern: alpha-engine-watch-plane-overseer-intake-dlq-depth
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        - name_pattern: alpha-engine-watch-plane-overseer-intake-age
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
 
 # ── Alert-class registry (config-I3211; Brian directive 2026-07-22) ──────────
 # One row per DISTINCT notification class the fleet emits. This answers, in

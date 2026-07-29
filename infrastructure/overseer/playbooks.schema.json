@@ -415,6 +415,36 @@
             "response_window_min": { "type": "integer", "minimum": 1 },
             "lookback_hours": { "type": "integer", "minimum": 1 }
           }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "alarms"],
+          "properties": {
+            "type": { "const": "alarm_coverage" },
+            "alarms": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name_pattern", "alarm_action_pattern"],
+                "properties": {
+                  "name_pattern": { "type": "string", "minLength": 1 },
+                  "alarm_action_pattern": { "type": "string", "minLength": 1 },
+                  "max_insufficient_data_hours": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 168
+                  },
+                  "expect_state": {
+                    "type": "string",
+                    "enum": ["OK", "ALARM", "INSUFFICIENT_DATA"],
+                    "default": "ALARM"
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     }
