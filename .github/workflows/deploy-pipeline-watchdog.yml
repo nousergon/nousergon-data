@@ -1,0 +1,96 @@
+name: Deploy pipeline-watchdog
+
+# Auto-deploy the alpha-engine-pipeline-watchdog Lambda CODE on merge to main.
+#
+# Why this exists (alpha-engine-config#5606): nousergon-data#1148 fixed a
+# DISARMED watchdog — its Saturday check counted executions on
+# ne-weekly-freshness-pipeline with no pipeline_role filter, so the ~5 daily
+# exercise runs (alpha-engine-config#5489) satisfied its 7-day window
+# unconditionally and it could never alert again. That fix merged and did NOT
+# go live: this Lambda had no deploy workflow, `deploy.yml` covers only the
+# Phase-2 image paths, and its own deploy.sh header says "operator-deployed
+# only". A merged fix to a detector that never reaches production leaves the
+# detector broken while the tracker says it is fixed — the exact shape
+# deploy-freshness-monitor.yml was created to close on 2026-06-26 ("a
+# registry/lib fix sat inert").
+#
+# Mirrors deploy-freshness-monitor.yml deliberately rather than inventing a
+# second shape. Code only: deploy.sh with no flags is its update-code path.
+# --bootstrap (SNS topic, EventBridge rule, IAM) stays operator-run, so this
+# workflow cannot create or rewire infrastructure — only ship code to a
+# function that already exists.
+#
+# IAM: no change needed. github-actions-lambda-deploy's LambdaUpdate statement
+# already grants GetFunction / GetFunctionConfiguration / UpdateFunctionCode /
+# UpdateFunctionConfiguration on arn:aws:lambda:us-east-1:711398986525:
+# function:alpha-engine-*, which covers alpha-engine-pipeline-watchdog. Those
+# four are every AWS call the no-flag deploy.sh path makes (verified against
+# nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/ on
+# 2026-07-29).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/pipeline-watchdog/**'
+      - '.github/workflows/deploy-pipeline-watchdog.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-pipeline-watchdog-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy pipeline-watchdog Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy pipeline-watchdog (code-only)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/pipeline-watchdog/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-pipeline-watchdog \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-pipeline-watchdog.yml
+
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
