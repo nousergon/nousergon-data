@@ -218,7 +218,7 @@ def test_launch_groom_spot_uses_wait_for_task_token(states):
     """
     lg = states["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
     assert lg["Resource"] == "arn:aws:states:::lambda:invoke.waitForTaskToken"
-    assert lg["TimeoutSeconds"] == 21600
+    assert lg["TimeoutSeconds"] == 10800
     assert "TaskToken.$" not in lg["Parameters"]
     assert "TaskToken" not in lg["Parameters"]
     assert "$$.Task" in lg["Parameters"]["Payload.$"]

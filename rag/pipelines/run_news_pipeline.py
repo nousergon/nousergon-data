@@ -39,6 +39,37 @@ from datetime import date, datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+# Watermark identity for this pipeline. One store per source (config-I5701),
+# so no two pipelines contend on a write.
+NEWS_SOURCE = "news"
+NEWS_DOC_TYPE = "news_article"
+
+
+def _log_run_stats(
+    *,
+    scope: int,
+    fetched: int,
+    skipped_at_watermark: int,
+    gaps_outstanding: int,
+    articles: int,
+    window_hours: int,
+) -> None:
+    """Emit the five ``rag-corpus-policy.md`` §5 observability fields.
+
+    ``skipped_at_watermark`` is the load-bearing one: it is how §2.2 is
+    verified from OUTSIDE the code. A run whose skipped count never rises as
+    the corpus warms is a run that is not gap-filling, whatever its comments
+    claim. ``gaps_outstanding`` non-zero means coverage was dropped and must be
+    attributable to a named cause, never to an unexplained exception.
+    """
+    logger.info(
+        "[run_news_pipeline] RUN STATS scope=%d fetched=%d "
+        "skipped_at_watermark=%d gaps_outstanding=%d articles=%d "
+        "window_hours=%d",
+        scope, fetched, skipped_at_watermark, gaps_outstanding,
+        articles, window_hours,
+    )
+
 
 def main() -> int:
     logging.basicConfig(
@@ -53,8 +84,7 @@ def main() -> int:
     )
     grp.add_argument(
         "--from-signals", action="store_true",
-        help="Load tickers from the latest signals.json on S3 "
-             "(canonical Saturday SF posture).",
+        help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)",
     )
     parser.add_argument(
         "--hours", type=int, default=168,
@@ -87,8 +117,8 @@ def main() -> int:
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket)
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers(bucket=args.bucket)
     if not tickers:
         logger.error("[run_news_pipeline] no tickers — aborting")
         return 1
@@ -99,32 +129,90 @@ def main() -> int:
     else:
         agg_date = datetime.now(timezone.utc).date()
 
-    # ── Step 1: build aggregator + fetch ─────────────────────────
+    # ── Step 1: resolve gaps, then fetch ONLY those ──────────────
+    #
+    # config-I5701 / rag-corpus-policy.md §2.2. This block used to fetch every
+    # ticker in scope for a flat 168h, every run, and dedup afterwards in
+    # ingest_news — which saves the embedding call and nothing else, because
+    # the vendor request is already paid for and vendor requests are the
+    # binding constraint (Polygon 5 req/min account-wide, ~12.5s/ticker).
+    #
+    # A ticker already at watermark now contributes ZERO requests, which is
+    # what makes §4's health check honest: the marginal cost of a
+    # no-new-documents cycle is ~zero rather than the full cycle cost.
+    from rag.pipelines._watermarks import WatermarkStore, resolve_outstanding
+
+    wm = WatermarkStore(NEWS_SOURCE, bucket=args.bucket)
+    scope_size = len(tickers)
+    tickers, fetch_hours = resolve_outstanding(
+        tickers, wm, doc_type=NEWS_DOC_TYPE, max_hours=args.hours,
+    )
+    logger.info(
+        "[run_news_pipeline] gap resolution — %d/%d ticker(s) outstanding, "
+        "window %dh (scope %d, at-watermark %d contribute zero requests)",
+        len(tickers), scope_size, fetch_hours, scope_size, scope_size - len(tickers),
+    )
+    if not tickers:
+        # The corpus is current. Issue NO request at all — not a request for
+        # zero hours. This is the intended steady state, not a degradation.
+        logger.info(
+            "[run_news_pipeline] corpus current for all %d scoped ticker(s) — "
+            "zero vendor requests issued", scope_size,
+        )
+        _log_run_stats(
+            scope=scope_size, fetched=0, skipped_at_watermark=scope_size,
+            gaps_outstanding=0, articles=0, window_hours=0,
+        )
+        return 0
+
     logger.info("[run_news_pipeline] step 1/4 — fetch via multi-source aggregator")
-    from collectors.news_aggregator import NewsAggregator
+    from collectors.news_aggregator_async import AsyncNewsAggregator
     from collectors.news_sources.gdelt import GdeltNewsAdapter
     from collectors.news_sources.polygon import PolygonNewsAdapter
     from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
 
     # config#2938 ruling 1 — the WEEKLY corpus gets FULL coverage: size the
-    # Polygon budget from the LIVE universe so the ~5-req/min sweep COMPLETES
-    # (the adapter guard is only a SIGKILL backstop). GDELT keeps its own tight
-    # default (its throttle-degrades-this-adapter posture, config#2813). The
-    # budget is kept below the RAGIngestion SSM executionTimeout so the rest of
-    # the step (NLP + RAG ingest) always runs — see fetch_budget for the
-    # derivation and its lockstep with nousergon-data's step_function.json.
+    # Polygon budget from the OUTSTANDING set so the ~5-req/min sweep
+    # COMPLETES (the adapter guard is only a SIGKILL backstop). GDELT keeps its
+    # own tight default (its throttle-degrades-this-adapter posture,
+    # config#2813). The budget is kept below the RAGIngestion SSM
+    # executionTimeout so the rest of the step (NLP + RAG ingest) always runs —
+    # see fetch_budget for the derivation and its lockstep with
+    # nousergon-data's step_function.json.
+    #
+    # config-I5701: sized from OUTSTANDING work, not scope — rag-corpus-policy
+    # §2.4. A budget sized to the universe grows silently with the universe; a
+    # budget sized to gaps shrinks as the corpus warms, which is the correct
+    # direction and is itself the health signal.
     from collectors.news_sources.fetch_budget import weekly_news_max_fetch_seconds
     poly_budget = weekly_news_max_fetch_seconds(len(tickers))
     logger.info(
-        "[run_news_pipeline] weekly Polygon news budget = %ds for %d tickers",
+        "[run_news_pipeline] weekly Polygon news budget = %ds for %d "
+        "outstanding ticker(s)",
         poly_budget, len(tickers),
     )
-    aggregator = NewsAggregator(sources=[
+    # config-I5703: ASYNC aggregator, matching collectors/daily_news.py. The
+    # sync NewsAggregator sums its sources sequentially — its own docstring
+    # says "Sequential per-source today; PR D adds async parallel fan-in" — and
+    # PR D landed as AsyncNewsAggregator wired into the DAILY path only
+    # (2026-06-09, after the sync version TimedOut every weekday producing
+    # nothing, ROADMAP L4573). The weekly path, which is the one on a decision
+    # pipeline's critical path, never got the fix. Polygon is the long pole
+    # either way; this recovers the GDELT + Yahoo wall-clock that was being
+    # added to it rather than overlapped.
+    aggregator = AsyncNewsAggregator(sources=[
         PolygonNewsAdapter(max_fetch_seconds=poly_budget),
         GdeltNewsAdapter(ticker_name_map=_load_ticker_name_map()),
         YahooRssNewsAdapter(),
     ])
-    articles = aggregator.fetch(tickers, hours=args.hours)
+    # AsyncNewsAggregator.fetch is a coroutine — drive it from this sync entry
+    # point, same shape as collectors/daily_news.py.
+    import functools
+
+    import anyio
+    articles = anyio.run(
+        functools.partial(aggregator.fetch, tickers, hours=fetch_hours)
+    )
     logger.info(
         "[run_news_pipeline] step 1 — %d aggregated articles "
         "(across %d source-variants)",
@@ -175,21 +263,50 @@ def main() -> int:
         )
 
     # ── Step 4: RAG ingest ───────────────────────────────────────
+    ingest_stats: dict[str, int] = {}
     if args.skip_rag or args.dry_run:
         logger.info(
             "[run_news_pipeline] step 4/4 — SKIPPED (--skip-rag or --dry-run)",
         )
+        # Watermarks are NOT advanced here. --dry-run and --skip-rag mean
+        # nothing was stored, and advancing on anything but a confirmed store
+        # turns a skipped ingest into a permanent silent hole (config-I5701).
     else:
         logger.info("[run_news_pipeline] step 4/4 — RAG corpus ingest")
         from rag.pipelines.ingest_news import ingest_articles
         ticker_to_sector = _load_ticker_sector_map(tickers)
-        stats = ingest_articles(
+        ingest_stats = ingest_articles(
             articles=articles,
             filed_date=agg_date,
             ticker_to_sector=ticker_to_sector,
         )
-        logger.info("[run_news_pipeline] step 4 — RAG ingest stats: %s", stats)
+        logger.info("[run_news_pipeline] step 4 — RAG ingest stats: %s", ingest_stats)
 
+        # Advance watermarks ONLY for tickers whose documents actually landed,
+        # and only after ingest_articles returned. A ticker we fetched but
+        # failed to store stays outstanding and is retried next run.
+        if not ingest_stats.get("n_failures"):
+            for t in tickers:
+                wm.advance(t, NEWS_DOC_TYPE)
+            wm.flush()
+        else:
+            logger.warning(
+                "[run_news_pipeline] %d ingest failure(s) — watermarks NOT "
+                "advanced; every fetched ticker stays outstanding and is "
+                "retried next run rather than becoming a silent hole",
+                ingest_stats["n_failures"],
+            )
+
+    _log_run_stats(
+        scope=scope_size,
+        fetched=len(tickers),
+        skipped_at_watermark=scope_size - len(tickers),
+        gaps_outstanding=(
+            len(tickers) if ingest_stats.get("n_failures") else 0
+        ),
+        articles=len(articles),
+        window_hours=fetch_hours,
+    )
     logger.info("[run_news_pipeline] complete")
     return 0
 
@@ -251,26 +368,26 @@ def _load_ticker_name_map() -> dict[str, str]:
 def _load_ticker_sector_map(tickers: list[str]) -> dict[str, str]:
     """Build a {ticker: sector} map for RAG ingest's sector tagging.
 
-    Reads from the latest signals.json's universe — same source the
-    research module uses. Missing entries leave sector=None for that
-    ticker (acceptable per the RAG ingest contract).
+    Reads sectors from ``signals/latest.json``. This is a legitimate use of
+    the wide ``universe`` array — it is a per-name ATTRIBUTE lookup, not a
+    scope decision (config-I5700 changed only the latter), and the sizing
+    envelope covering the whole board is exactly what makes it a good sector
+    source. Missing entries leave sector=None for that ticker (acceptable per
+    the RAG ingest contract).
+
+    config-I5703: reads the ``latest.json`` POINTER rather than listing and
+    sorting prefixes. ``list_objects_v2`` caps ``CommonPrefixes`` at 1000, so
+    the old scan silently returns the 1000th-oldest date once the partition
+    count crosses a page — a stale sector map with no error.
     """
     try:
-        from rag.pipelines._signals_universe import DEFAULT_BUCKET
+        from rag.pipelines._rag_scope import DEFAULT_BUCKET
         import boto3
         import json
         s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(
-            Bucket=DEFAULT_BUCKET, Prefix="signals/", Delimiter="/",
-        )
-        prefixes = sorted(
-            [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
-        )
-        if not prefixes:
-            return {}
         obj = s3.get_object(
             Bucket=DEFAULT_BUCKET,
-            Key=f"{prefixes[-1]}signals.json",
+            Key="signals/latest.json",
         )
         data = json.loads(obj["Body"].read())
         out: dict[str, str] = {}

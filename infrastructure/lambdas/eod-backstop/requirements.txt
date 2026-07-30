@@ -5,4 +5,4 @@
 # pin coherent across sibling Lambdas avoids divergence on lib-side helpers.
 # (The package imports as ``nousergon_lib`` at this pin — the rename from
 # ``alpha_engine_lib`` landed at 0.60.0 and siblings are now on v0.83.0.)
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.22
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.24

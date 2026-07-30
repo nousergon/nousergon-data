@@ -12,90 +12,144 @@ from __future__ import annotations
 import json
 import sys
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
-# ── _signals_universe ─────────────────────────────────────────────────
+# ── _rag_scope ────────────────────────────────────────────────────────
+#
+# config-I5700: the corpus fetch set is the scanner DECISION SET, resolved
+# from universe_membership/{date}/membership.json::cuts.scanner_candidates —
+# NOT signals.json::universe, which is a 903-row sizing envelope. The old
+# TestLoadSignalsTickers class pinned the defective behaviour (including that
+# `sorted(prefixes)[-1]` list_objects_v2 scan, which silently returns the
+# 1000th-oldest date once the partition count crosses a page) and is replaced
+# wholesale rather than adapted.
 
 
-class TestLoadSignalsTickers:
-    def _mock_s3_with_signals(self, universe):
+class TestLoadRagScope:
+    def _s3(self, *, cuts=None, holdings=("HELD",), membership=True):
         s3 = MagicMock()
-        s3.list_objects_v2.return_value = {
-            "CommonPrefixes": [{"Prefix": "signals/2026-05-13/"}],
-        }
-        s3.get_object.return_value = {
-            "Body": BytesIO(json.dumps({"universe": universe}).encode()),
-        }
+        payloads = {}
+        if membership:
+            payloads["universe_membership/latest.json"] = {
+                "run_date": "2026-07-29",
+                "cuts": cuts if cuts is not None else {
+                    "scanner_candidates": {
+                        "basis": "scanner_gate", "size": 2,
+                        "tickers": ["msft", "AAPL"],
+                        "source": "candidates/2026-07-29/candidates.json::scanner_tickers",
+                    },
+                    # A wider cut is present and must NOT be picked up.
+                    "attractiveness_top_60": {"size": 3, "tickers": ["A", "B", "C"]},
+                },
+            }
+        if holdings is not None:
+            payloads["metron/holdings_universe.json"] = {
+                "as_of": "2026-07-29", "tickers": list(holdings),
+            }
+
+        def _get(Bucket, Key):
+            if Key not in payloads:
+                raise RuntimeError(f"NoSuchKey {Key}")
+            return {"Body": BytesIO(json.dumps(payloads[Key]).encode())}
+
+        s3.get_object.side_effect = _get
         return s3
 
-    def test_loads_universe_dict_shape(self):
-        from rag.pipelines._signals_universe import load_signals_tickers
+    def test_resolves_scanner_cut_union_holdings_uppercased_and_sorted(self):
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
 
-        s3 = self._mock_s3_with_signals([
-            {"ticker": "AAPL", "sector": "Technology"},
-            {"ticker": "MSFT", "sector": "Technology"},
-        ])
-        tickers = load_signals_tickers(s3_client=s3)
-        assert tickers == ["AAPL", "MSFT"]
+        assert load_rag_scope_tickers(s3_client=self._s3()) == ["AAPL", "HELD", "MSFT"]
 
-    def test_loads_universe_flat_shape_backward_compat(self):
-        from rag.pipelines._signals_universe import load_signals_tickers
+    def test_reads_the_pointer_not_a_prefix_listing(self):
+        # The pagination bomb: list_objects_v2 caps CommonPrefixes at 1000, so
+        # a scan-and-sort silently goes STALE rather than failing. The resolver
+        # must never list.
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
 
-        s3 = self._mock_s3_with_signals(["AAPL", "MSFT"])
-        tickers = load_signals_tickers(s3_client=s3)
-        assert tickers == ["AAPL", "MSFT"]
-
-    def test_uppercases_tickers(self):
-        from rag.pipelines._signals_universe import load_signals_tickers
-
-        s3 = self._mock_s3_with_signals([{"ticker": "aapl"}])
-        assert load_signals_tickers(s3_client=s3) == ["AAPL"]
-
-    def test_picks_most_recent_prefix(self):
-        from rag.pipelines._signals_universe import load_signals_tickers
-
-        s3 = MagicMock()
-        s3.list_objects_v2.return_value = {
-            "CommonPrefixes": [
-                {"Prefix": "signals/2026-05-06/"},
-                {"Prefix": "signals/2026-05-13/"},
-                {"Prefix": "signals/2026-04-29/"},
-            ],
-        }
-        s3.get_object.return_value = {
-            "Body": BytesIO(json.dumps({"universe": [{"ticker": "X"}]}).encode()),
-        }
-        load_signals_tickers(s3_client=s3)
-        # Sorted prefixes pick the lexicographically-last (most recent)
-        s3.get_object.assert_called_with(
-            Bucket="alpha-engine-research",
-            Key="signals/2026-05-13/signals.json",
+        s3 = self._s3()
+        load_rag_scope_tickers(s3_client=s3)
+        s3.list_objects_v2.assert_not_called()
+        assert any(
+            c.kwargs.get("Key") == "universe_membership/latest.json"
+            for c in s3.get_object.call_args_list
         )
 
-    def test_no_signals_returns_empty_with_error_log(self, caplog):
-        from rag.pipelines._signals_universe import load_signals_tickers
+    def test_run_date_pins_the_dated_artifact(self):
+        from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
 
-        s3 = MagicMock()
-        s3.list_objects_v2.return_value = {"CommonPrefixes": []}
-        with caplog.at_level("ERROR"):
-            tickers = load_signals_tickers(s3_client=s3)
-        assert tickers == []
-        assert any("no signals/ prefix" in r.message for r in caplog.records)
+        s3 = self._s3(membership=False)
+        with pytest.raises(RagScopeUnavailable):
+            load_rag_scope_tickers(s3_client=s3, run_date="2026-07-29")
+        assert any(
+            c.kwargs.get("Key") == "universe_membership/2026-07-29/membership.json"
+            for c in s3.get_object.call_args_list
+        )
 
-    def test_s3_read_failure_returns_empty(self, caplog):
-        from rag.pipelines._signals_universe import load_signals_tickers
+    def test_takes_only_the_scanner_cut_not_a_wider_one(self):
+        from rag.pipelines._rag_scope import load_rag_scope
 
-        s3 = MagicMock()
-        s3.list_objects_v2.return_value = {
-            "CommonPrefixes": [{"Prefix": "signals/2026-05-13/"}],
-        }
-        s3.get_object.side_effect = RuntimeError("net down")
-        with caplog.at_level("ERROR"):
-            tickers = load_signals_tickers(s3_client=s3)
-        assert tickers == []
+        scope = load_rag_scope(s3_client=self._s3())
+        assert scope["counts"]["scanner_candidates"] == 2
+        assert "B" not in scope["tickers"]
+
+    def test_missing_membership_raises_never_widens(self):
+        from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
+
+        with pytest.raises(RagScopeUnavailable, match="903-ticker"):
+            load_rag_scope_tickers(s3_client=self._s3(membership=False))
+
+    def test_empty_scanner_cut_raises_and_names_the_available_cuts(self):
+        from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
+
+        s3 = self._s3(cuts={"attractiveness_top_20": {"tickers": ["X"]}})
+        with pytest.raises(RagScopeUnavailable, match="attractiveness_top_20"):
+            load_rag_scope_tickers(s3_client=s3)
+
+    def test_missing_holdings_degrades_loudly_but_does_not_fail(self, caplog):
+        # Held names losing fresh evidence narrows coverage; it cannot corrupt
+        # it. Blocking the whole corpus fill on a cross-product artifact is the
+        # worse failure — but the gap must be stated, not swallowed.
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+
+        with caplog.at_level("WARNING"):
+            tickers = load_rag_scope_tickers(s3_client=self._s3(holdings=None))
+        assert tickers == ["AAPL", "MSFT"]
+        assert any("HELD NAMES WILL NOT BE COVERED" in r.message for r in caplog.records)
+
+    def test_non_equity_identifiers_are_dropped_loudly(self, caplog):
+        # Measured live 2026-07-30: the held set carried 912828YK0, a US
+        # Treasury CUSIP. Every ingestion source here is equity-only, so it is
+        # a wasted request per source per run, forever — and a permanent
+        # corpus gap no watermark can close. Dropped, but NAMED.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        s3 = self._s3(holdings=("912828YK0", "HELD"))
+        with caplog.at_level("WARNING"):
+            scope = load_rag_scope(s3_client=s3)
+        assert "912828YK0" not in scope["tickers"]
+        assert scope["counts"]["rejected_non_equity"] == 1
+        assert any("912828YK0" in r.message for r in caplog.records)
+
+    def test_share_class_tickers_survive_the_filter(self):
+        # BRK.B / BF-B are real, resolvable tickers — the filter must not be
+        # so strict that it silently drops legitimate holdings.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        scope = load_rag_scope(s3_client=self._s3(holdings=("BRK.B", "BF-B")))
+        assert {"BRK.B", "BF-B"} <= set(scope["tickers"])
+        assert scope["counts"]["rejected_non_equity"] == 0
+
+    def test_scope_is_far_narrower_than_the_sizing_envelope(self):
+        # The regression guard. 903 -> ~68 is the whole point; a resolver that
+        # silently returns board-scale output is the defect returning.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        board_scale = 903
+        scope = load_rag_scope(s3_client=self._s3())
+        assert scope["counts"]["total"] < board_scale / 5
 
 
 # ── run_news_pipeline CLI ──────────────────────────────────────────────
@@ -116,7 +170,10 @@ class TestRunNewsPipelineCli:
             "rag.pipelines.run_news_pipeline._load_ticker_name_map",
             return_value={},
         ), patch(
-            "collectors.news_aggregator.NewsAggregator"
+            # config-I5703: the weekly path uses the ASYNC aggregator now.
+            # Patching the sync class here left the REAL aggregator running and
+            # reaching the network — which is why this test took ~90s.
+            "collectors.news_aggregator_async.AsyncNewsAggregator"
         ) as mock_agg_cls, patch(
             "data.derived.news_aggregates.aggregate_and_write"
         ) as mock_aaw, patch(
@@ -125,7 +182,9 @@ class TestRunNewsPipelineCli:
             "boto3.client"
         ) as mock_boto:
             # Configure: aggregator returns empty list (no articles)
-            mock_agg_cls.return_value.fetch.return_value = []
+            # .fetch is a coroutine driven by anyio.run — an AsyncMock,
+            # not a plain return_value, or main() awaits a MagicMock.
+            mock_agg_cls.return_value.fetch = AsyncMock(return_value=[])
             mock_aaw.return_value = (
                 "data/news_aggregates/2026-05-17.parquet",
                 _empty_df(),
@@ -163,13 +222,13 @@ class TestRunNewsPipelineCli:
             "rag.pipelines.run_news_pipeline._load_ticker_name_map",
             return_value={},
         ), patch(
-            "collectors.news_aggregator.NewsAggregator"
+            "collectors.news_aggregator_async.AsyncNewsAggregator"
         ) as mock_agg_cls, patch(
             "data.derived.news_aggregates.aggregate_and_write"
         ) as mock_aaw, patch(
             "rag.pipelines.ingest_news.ingest_articles"
         ) as mock_rag_ingest:
-            mock_agg_cls.return_value.fetch.return_value = []
+            mock_agg_cls.return_value.fetch = AsyncMock(return_value=[])
             monkeypatch.setattr(
                 sys, "argv",
                 ["run_news_pipeline", "--tickers", "AAPL", "--dry-run"],
@@ -189,13 +248,13 @@ class TestRunNewsPipelineCli:
             "rag.pipelines.run_news_pipeline._load_ticker_name_map",
             return_value={},
         ), patch(
-            "collectors.news_aggregator.NewsAggregator"
+            "collectors.news_aggregator_async.AsyncNewsAggregator"
         ) as mock_agg_cls, patch(
             "data.derived.news_aggregates.aggregate_and_write"
         ) as mock_aaw, patch(
             "rag.pipelines.ingest_news.ingest_articles"
         ) as mock_rag_ingest, patch("boto3.client"):
-            mock_agg_cls.return_value.fetch.return_value = []
+            mock_agg_cls.return_value.fetch = AsyncMock(return_value=[])
             mock_aaw.return_value = (
                 "data/news_aggregates/x.parquet", _empty_df(),
             )
@@ -211,7 +270,7 @@ class TestRunNewsPipelineCli:
         from rag.pipelines import run_news_pipeline
 
         with patch(
-            "rag.pipelines._signals_universe.load_signals_tickers",
+            "rag.pipelines._rag_scope.load_rag_scope_tickers",
             return_value=[],
         ):
             monkeypatch.setattr(
@@ -314,7 +373,7 @@ class TestRunAnalystPipelineCli:
         from rag.pipelines import run_analyst_pipeline
 
         with patch(
-            "rag.pipelines._signals_universe.load_signals_tickers",
+            "rag.pipelines._rag_scope.load_rag_scope_tickers",
             return_value=[],
         ):
             monkeypatch.setattr(
@@ -336,7 +395,7 @@ class TestIngestForm4FromSignals:
         from rag.pipelines import ingest_form4
 
         with patch(
-            "rag.pipelines._signals_universe.load_signals_tickers",
+            "rag.pipelines._rag_scope.load_rag_scope_tickers",
             return_value=["AAPL", "MSFT"],
         ), patch.object(
             ingest_form4, "ingest_for_tickers",

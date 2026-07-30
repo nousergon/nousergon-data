@@ -42,9 +42,18 @@ def _mock_s3(holdings=None, signals_universe=None):
                 "tickers": holdings,
             }
             return {"Body": BytesIO(json.dumps(payload).encode())}
-        if Key.endswith("signals.json"):
-            uni = [{"ticker": t} for t in (signals_universe or [])]
-            return {"Body": BytesIO(json.dumps({"universe": uni}).encode())}
+        # config-I5700: the AE slice is now the scanner DECISION SET from the
+        # universe-membership artifact, not signals.json::universe (a 903-row
+        # sizing envelope). Same fixture arg, new source of truth.
+        if Key == "universe_membership/latest.json":
+            return {"Body": BytesIO(json.dumps({
+                "run_date": "2026-07-29",
+                "cuts": {"scanner_candidates": {
+                    "basis": "scanner_gate",
+                    "size": len(signals_universe or []),
+                    "tickers": list(signals_universe or []),
+                }},
+            }).encode())}
         raise RuntimeError(f"unexpected key {Key}")
 
     s3.get_object.side_effect = _get_object

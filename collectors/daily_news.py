@@ -94,22 +94,31 @@ def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
 
 
 def assemble_universe(bucket: str, s3_client: Any) -> list[str]:
-    """Union Metron held tickers ∪ AE signals universe (tracked + recs).
+    """Union Metron held tickers ∪ the AE decision set.
 
-    Each slice is fail-soft: a missing holdings file or signals.json degrades
-    to whatever is available rather than aborting the pull.
+    config-I5700: the AE slice now resolves through ``_rag_scope`` (the
+    scanner's ``cuts.scanner_candidates``) rather than ``signals.json``'s
+    ``universe`` array — a 903-row SIZING envelope that was never a scope.
+    The daily and weekly paths therefore resolve ONE identical set, which is
+    what ``rag-corpus-policy.md`` §2.3's one-fetch-one-corpus corollary needs
+    before the daily fetch can serve the corpus.
+
+    Each slice stays fail-soft HERE specifically: this is the morning digest,
+    and a degraded universe is better than no brief. The weekly corpus path
+    calls the same resolver WITHOUT this catch, so an unresolvable scope fails
+    the ingestion loudly instead of quietly filling for the wrong names.
     """
-    from rag.pipelines._signals_universe import load_signals_tickers
+    from rag.pipelines._rag_scope import load_rag_scope_tickers
 
     holdings = _load_holdings_universe(bucket, s3_client)
     try:
-        ae = load_signals_tickers(bucket=bucket, s3_client=s3_client)
+        ae = load_rag_scope_tickers(bucket=bucket, s3_client=s3_client)
     except Exception as e:
-        logger.warning("[daily_news] signals universe unavailable (%s)", e)
+        logger.warning("[daily_news] AE decision set unavailable (%s)", e)
         ae = []
     universe = sorted(set(holdings) | set(ae))
     logger.info(
-        "[daily_news] universe = %d holdings ∪ %d AE-signals = %d unique",
+        "[daily_news] universe = %d holdings ∪ %d AE-decision-set = %d unique",
         len(holdings),
         len(ae),
         len(universe),

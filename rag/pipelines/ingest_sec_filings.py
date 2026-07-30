@@ -288,7 +288,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest SEC filings into RAG store")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from latest signals.json on S3")
+    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
     parser.add_argument("--lookback-years", type=int, default=2, help="Years of filings to backfill")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be ingested without writing")
     args = parser.parse_args()
@@ -296,17 +296,11 @@ def main():
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
     elif args.from_signals:
-        import boto3
-        s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(Bucket="alpha-engine-research", Prefix="signals/", Delimiter="/")
-        prefixes = sorted([p["Prefix"] for p in resp.get("CommonPrefixes", [])])
-        if not prefixes:
-            logger.error("No signals found on S3")
-            return
-        obj = s3.get_object(Bucket="alpha-engine-research", Key=f"{prefixes[-1]}signals.json")
-        data = json.loads(obj["Body"].read())
-        tickers = [s["ticker"] for s in data.get("universe", []) if s.get("ticker")]
-        logger.info("Loaded %d tickers from signals", len(tickers))
+        # config-I5700: the corpus scope is the scanner decision set, not
+        # signals.json::universe (a 903-row SIZING envelope). One resolver
+        # for every pipeline — this used to be an inline copy.
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers()
     else:
         parser.error("Provide --tickers or --from-signals")
         return
