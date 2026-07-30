@@ -40,10 +40,19 @@ independence preserved per plan doc §3.5.
   - **Saturday SF** (``ne-weekly-freshness-pipeline``)
       Watch-day: TODAY is Sunday (weekday 6) — Saturday SF fires at 09:00
       UTC Saturday; by Sunday 14:00 UTC any missed firing is 24+h overdue.
-      Alert if 0 executions started in the last 7 days. (One CW alarm with
-      a 7-day window would suffice for Saturday too, but bundling all 3
-      checks into one Lambda eliminates a moving part and unifies the
-      operator-facing message format.)
+      Alert if 0 CADENCE-ROLE executions started in the last 7 days. (One
+      CW alarm with a 7-day window would suffice for Saturday too, but
+      bundling all 3 checks into one Lambda eliminates a moving part and
+      unifies the operator-facing message format.)
+
+      The role filter is load-bearing, not a refinement. Since
+      2026-07-29 this same state machine also runs a post-close-chained
+      daily EXERCISE run (alpha-engine-config#5489, ``pipeline_role=
+      "exercise"``), so ~5 executions a week land here that say nothing
+      about the Saturday cron. An unfiltered count is satisfied by them
+      unconditionally: the check would report healthy forever with the
+      cron completely dead (alpha-engine-config#5597 / #5590). See
+      ``WEEKLY_CADENCE_ROLES``.
 
 **Fail-loud semantics** (per ``feedback_no_silent_fails`` + the
 ``feedback_wire_orphaned_producer_must_fail_loud`` discipline):
@@ -76,6 +85,7 @@ non-overlapping second channel.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -204,6 +214,23 @@ def _eod_window_seconds(now_utc: datetime) -> int:
 # email — that's a different concern.
 _STARTED_STATUSES = ("RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED")
 
+# Roles that count as "the Saturday cadence fired" on the weekly SF. The
+# cadence role itself plus the recovery overlays that legitimately stand in
+# for it (a watch-rerun IS the cadence run, resubmitted). Deliberately
+# EXCLUDES "exercise" (the daily debugging cadence, alpha-engine-config#5489)
+# and every ad-hoc role — none of them is evidence the Saturday cron fired.
+#
+# This set is the local mirror of nousergon_lib.pipeline_status.roles
+# .cadence_filter("weekly"); it is declared here rather than imported so
+# this fix ships without waiting on a lib release. alpha-engine-config#5592
+# replaces it with the import (nousergon-lib-PR270).
+WEEKLY_CADENCE_ROLES = frozenset({"weekly", "watch-rerun", "recovery"})
+
+# Ceiling on DescribeExecution calls per role-filtered walk. The weekly SF
+# sees ~5 exercise runs + reruns per 7-day window, so this is ~5x headroom;
+# exceeding it raises rather than returning a truncated count.
+_MAX_ROLE_DESCRIBES = 200
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -252,11 +279,51 @@ def _is_trading_day_now(now_utc: datetime) -> bool:
     return post_close_trading_day == synthetic_post_close.date()
 
 
+def _role_clause(role_filter: Optional[frozenset]) -> str:
+    """Names the role filter in the alert body, so an operator reading
+    "has not executed" knows a same-SF exercise run does not contradict it."""
+    if not role_filter:
+        return ""
+    return (
+        f" counting only executions with pipeline_role in "
+        f"{sorted(role_filter)} (other roles on this state machine — e.g. the "
+        f"daily exercise run — are NOT evidence the cadence fired)"
+    )
+
+
+def _pipeline_role(client: object, execution_arn: str) -> Optional[str]:
+    """``input.pipeline_role`` for one execution, or None when absent.
+
+    ``ListExecutions`` does not return the execution input, so reading the
+    role costs one ``DescribeExecution`` per candidate. A malformed input
+    JSON yields None (the execution then does not count toward a
+    role-filtered check) — never a swallow: the caller's alert path is what
+    surfaces it, and a cadence run that lost its role IS the outage this
+    watchdog exists to catch.
+    """
+    resp = client.describe_execution(executionArn=execution_arn)
+    raw = resp.get("input")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "watchdog: unparseable execution input, role=None: %s", execution_arn
+        )
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    role = parsed.get("pipeline_role")
+    return role if isinstance(role, str) and role else None
+
+
 def _count_executions_in_window(
     sf_arn: str,
     window_seconds: int,
     *,
     client: Optional[object] = None,
+    role_filter: Optional[frozenset] = None,
 ) -> int:
     """Return the number of executions that STARTED for ``sf_arn`` in the
     last ``window_seconds``. Counts ALL terminal statuses + RUNNING; what
@@ -267,12 +334,27 @@ def _count_executions_in_window(
     so we page through statusFilter results and apply the time cutoff in
     Python. maxResults=100 per page; we stop at the first page whose
     oldest entry is older than the window (lex-sortable by startDate desc).
+
+    ``role_filter`` — count ONLY executions whose ``input.pipeline_role``
+    is in the set. Required wherever a state machine carries more than one
+    cadence: from 2026-07-29 the weekly SF also runs a post-close-chained
+    daily EXERCISE run (alpha-engine-config#5489), so "did the Saturday
+    cron fire" became unanswerable by an unfiltered count — 5 exercise runs
+    a week satisfy a 7-day window on their own and the check could never
+    alert again, no matter how dead the cron was (alpha-engine-config#5597 / #5590).
+
+    An execution with NO role does not count toward a filtered check. The
+    Saturday cron's EventBridge input sets ``pipeline_role="weekly"``
+    explicitly, so an untagged execution is a manual/ad-hoc run — and a
+    cadence run that somehow lost its role is itself an outage this
+    watchdog should report, not paper over.
     """
     if client is None:  # pragma: no cover — production path
         client = boto3.client("stepfunctions", region_name=REGION)
 
     cutoff_utc = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
     seen = 0
+    described = 0
 
     for status_filter in _STARTED_STATUSES:
         next_token: Optional[str] = None
@@ -304,7 +386,25 @@ def _count_executions_in_window(
                     else start.replace(tzinfo=timezone.utc)
                 )
                 if start_utc >= cutoff_utc:
-                    seen += 1
+                    if role_filter is None:
+                        seen += 1
+                        continue
+                    described += 1
+                    if described > _MAX_ROLE_DESCRIBES:
+                        # Never silently truncate a coverage check: a
+                        # truncated walk that found nothing is
+                        # indistinguishable from a dead cron.
+                        raise RuntimeError(
+                            f"pipeline-watchdog: role-filtered walk for {sf_arn} "
+                            f"exceeded {_MAX_ROLE_DESCRIBES} DescribeExecution "
+                            f"calls in a {window_seconds}s window — the count "
+                            f"cannot be trusted; widen the cap or narrow the "
+                            f"window before this check is believed"
+                        )
+                    if _pipeline_role(client, exec_row.get("executionArn")) in (
+                        role_filter
+                    ):
+                        seen += 1
                 else:
                     # Executions are returned newest-first; once we see one
                     # older than the cutoff we can stop paging this status.
@@ -328,6 +428,7 @@ def _check_sf(
     skip_reason_if_not_watching: str,
     window_seconds: int,
     client: Optional[object] = None,
+    role_filter: Optional[frozenset] = None,
 ) -> CheckResult:
     if not is_watch_day:
         logger.info(
@@ -340,7 +441,9 @@ def _check_sf(
             skip_reason=skip_reason_if_not_watching,
         )
 
-    seen = _count_executions_in_window(sf_arn, window_seconds, client=client)
+    seen = _count_executions_in_window(
+        sf_arn, window_seconds, client=client, role_filter=role_filter
+    )
     if seen > 0:
         logger.info(
             "watchdog clear: sf=%s executions_in_window=%d", sf_label, seen
@@ -355,7 +458,8 @@ def _check_sf(
     # 0 executions in window on a watch-day → alert.
     window_hours = window_seconds // 3600
     message = (
-        f"{sf_label} has not executed in the last {window_hours}h on a trading-day window. "
+        f"{sf_label} has not executed in the last {window_hours}h on a trading-day window"
+        f"{_role_clause(role_filter)}. "
         f"Expected at least 1 execution since "
         f"{(datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()}. "
         f"Either the EventBridge schedule did not fire, the SF control plane is wedged, "
@@ -459,6 +563,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             "watch-day is Sunday so missed firings are 24+h overdue"
         ),
         window_seconds=WINDOW_SECONDS_WEEKLY,
+        role_filter=WEEKLY_CADENCE_ROLES,
     )
 
     summary = {

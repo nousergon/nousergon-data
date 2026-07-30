@@ -178,6 +178,174 @@ def test_count_executions_handles_missing_start_date():
     assert seen == 0
 
 
+# ── role-filtered counting (alpha-engine-config#5597 / #5590) ────────────────────
+
+
+def _make_role_sfn_client(executions: list) -> MagicMock:
+    """SFN mock whose executions carry a pipeline_role.
+
+    ``executions`` is a list of ``(startDate, role_or_None)``. Only the
+    FIRST status filter returns rows so the count isn't inflated 5x by the
+    status-filter loop — these tests assert exact numbers.
+    """
+    client = MagicMock()
+    seen_status = {"n": 0}
+    inputs = {}
+    rows = []
+    for i, (start, role) in enumerate(executions):
+        arn = f"arn:aws:states:us-east-1:1:execution:sf:e{i}"
+        rows.append({"startDate": start, "executionArn": arn})
+        inputs[arn] = (
+            '{"pipeline_role": "%s"}' % role if role is not None else "{}"
+        )
+
+    def _list_executions(**kwargs):
+        seen_status["n"] += 1
+        if seen_status["n"] > 1:
+            return {"executions": [], "nextToken": None}
+        return {"executions": rows, "nextToken": None}
+
+    def _describe(**kwargs):
+        return {"input": inputs.get(kwargs.get("executionArn"), "{}")}
+
+    client.list_executions.side_effect = _list_executions
+    client.describe_execution.side_effect = _describe
+    return client
+
+
+def test_exercise_runs_do_not_satisfy_the_saturday_cadence_check():
+    """THE regression (alpha-engine-config#5597 / #5590).
+
+    From 2026-07-29 the weekly SF also runs a post-close-chained daily
+    EXERCISE run. Five of those in a 7-day window used to satisfy the
+    unfiltered "did the Saturday cron fire" count unconditionally — the
+    check could never alert again with the cron completely dead.
+    """
+    now = datetime.now(timezone.utc)
+    client = _make_role_sfn_client(
+        [(now - timedelta(days=d), "exercise") for d in range(1, 6)]
+    )
+    seen = index._count_executions_in_window(
+        SAT_ARN, index.WINDOW_SECONDS_WEEKLY, client=client,
+        role_filter=index.WEEKLY_CADENCE_ROLES,
+    )
+    assert seen == 0
+
+
+def test_cadence_and_recovery_roles_do_satisfy_the_check():
+    now = datetime.now(timezone.utc)
+    for role in sorted(index.WEEKLY_CADENCE_ROLES):
+        client = _make_role_sfn_client([(now - timedelta(days=1), role)])
+        seen = index._count_executions_in_window(
+            SAT_ARN, index.WINDOW_SECONDS_WEEKLY, client=client,
+            role_filter=index.WEEKLY_CADENCE_ROLES,
+        )
+        assert seen == 1, f"{role} should count as the cadence having fired"
+
+
+def test_untagged_execution_does_not_count_toward_a_filtered_check():
+    # The Saturday cron sets pipeline_role="weekly" explicitly, so an
+    # untagged execution is a manual run — and a cadence run that lost its
+    # role is itself the outage this watchdog should report.
+    now = datetime.now(timezone.utc)
+    client = _make_role_sfn_client([(now - timedelta(days=1), None)])
+    seen = index._count_executions_in_window(
+        SAT_ARN, index.WINDOW_SECONDS_WEEKLY, client=client,
+        role_filter=index.WEEKLY_CADENCE_ROLES,
+    )
+    assert seen == 0
+
+
+def test_exercise_role_is_excluded_from_the_cadence_role_set():
+    assert "exercise" not in index.WEEKLY_CADENCE_ROLES
+    assert "smoke" not in index.WEEKLY_CADENCE_ROLES
+    assert "shell-run" not in index.WEEKLY_CADENCE_ROLES
+    assert index.WEEKLY_CADENCE_ROLES == frozenset(
+        {"weekly", "watch-rerun", "recovery"}
+    )
+
+
+def test_unfiltered_count_is_unchanged_for_the_other_two_sfs():
+    # Weekday/EOD state machines carry one cadence each — no role filter,
+    # and therefore no DescribeExecution cost.
+    now = datetime.now(timezone.utc)
+    client = _make_role_sfn_client([(now - timedelta(hours=1), "exercise")])
+    seen = index._count_executions_in_window(WKD_ARN, 24 * 3600, client=client)
+    assert seen == 1
+    client.describe_execution.assert_not_called()
+
+
+def test_role_walk_raises_rather_than_returning_a_truncated_count():
+    # A truncated walk that found nothing is indistinguishable from a dead
+    # cron — it must never be reported as a clean count.
+    now = datetime.now(timezone.utc)
+    client = _make_role_sfn_client(
+        [(now - timedelta(hours=1), "exercise")]
+        * (index._MAX_ROLE_DESCRIBES + 1)
+    )
+    with pytest.raises(RuntimeError, match="DescribeExecution"):
+        index._count_executions_in_window(
+            SAT_ARN, index.WINDOW_SECONDS_WEEKLY, client=client,
+            role_filter=index.WEEKLY_CADENCE_ROLES,
+        )
+
+
+def test_unparseable_input_does_not_raise_and_does_not_count():
+    now = datetime.now(timezone.utc)
+    client = MagicMock()
+    client.list_executions.side_effect = [
+        {"executions": [{"startDate": now, "executionArn": "arn:e"}],
+         "nextToken": None},
+    ] + [{"executions": [], "nextToken": None}] * 8
+    client.describe_execution.return_value = {"input": "{not json"}
+    seen = index._count_executions_in_window(
+        SAT_ARN, index.WINDOW_SECONDS_WEEKLY, client=client,
+        role_filter=index.WEEKLY_CADENCE_ROLES,
+    )
+    assert seen == 0
+
+
+def test_alert_body_names_the_role_filter():
+    # An operator reading "Saturday SF has not executed" while the console
+    # shows a same-SF exercise run needs the message to explain both.
+    clause = index._role_clause(index.WEEKLY_CADENCE_ROLES)
+    assert "pipeline_role" in clause
+    assert "exercise" in clause
+    assert index._role_clause(None) == ""
+
+
+def test_handler_passes_the_cadence_role_filter_for_the_saturday_check():
+    """Sunday 2026-05-31 — the Saturday check MUST carry the role filter;
+    the two single-cadence SFs must not (no DescribeExecution cost)."""
+    _tc_mod.last_closed_trading_day.side_effect = [
+        date(2026, 5, 29),
+        date(2026, 5, 29),
+    ]
+    # _eod_window_seconds runs even on a skipped EOD check (the window is an
+    # argument), and the autouse fixture resets side_effect but not
+    # return_value — so pin it rather than inherit whatever ran before.
+    _tc_mod.previous_trading_day.return_value = date(2026, 5, 29)
+    now = _frozen_now(2026, 5, 31, 14, 0)
+    captured = {}
+    real_check_sf = index._check_sf
+
+    def _fake_check_sf(**kwargs):
+        captured[kwargs["sf_label"]] = kwargs.get("role_filter")
+        return real_check_sf(**{**kwargs, "is_watch_day": False})
+
+    with patch("index.datetime") as mock_dt, patch("index.boto3") as mock_boto3, \
+            patch.object(index, "_check_sf", side_effect=_fake_check_sf):
+        mock_dt.now.return_value = now
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        mock_boto3.client.return_value = _make_sfn_client({})
+        index.handler({}, None)
+
+    assert captured["Saturday SF"] == index.WEEKLY_CADENCE_ROLES
+    assert captured["Weekday SF"] is None
+    assert captured["EOD SF"] is None
+
+
 # ── _check_sf: skip-when-not-watch-day ──────────────────────────────────
 
 
