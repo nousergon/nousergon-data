@@ -371,6 +371,57 @@ EOF
     fi
   done
 
+  # --- 2e-bis. The lane-death reconciler rule (alpha-engine-config-I5229).
+  #
+  # Deliberately NOT in SCHED_NAMES: every rule there targets the STEP FUNCTION
+  # and starts a dispatch cycle. This one targets the LAMBDA directly with
+  # {"mode":"reconcile"} and must never start a cycle. It also sits outside
+  # SCHED_PREFIX so step 2f's prune reconciliation does not delete it.
+  #
+  # Why it must exist at all: groom-sweep-policy §2.7 makes the reconciler the
+  # property the others depend on, and §2.2 holds that a recovery path which has
+  # never executed is presumed broken. A reconciler with no trigger is exactly
+  # that — the code merges, the tests pass, and nothing ever runs it. Every
+  # 5 minutes is well inside the ~6h lane budget it is watching and costs one
+  # short Lambda invocation.
+  RECON_SCHED_NAME="alpha-engine-groom-lane-reconciler-5min"
+  RECON_SCHED_CRON="rate(5 minutes)"
+  recon_target=$(cat <<EOF
+{"Arn":"${FN_ARN}","RoleArn":"${SCHED_ROLE_ARN}","Input":"{\\\"mode\\\":\\\"reconcile\\\"}"}
+EOF
+)
+  echo "  Applying Scheduler invoke-Lambda policy for the reconciler"
+  run aws iam put-role-policy \
+    --role-name "${SCHED_ROLE_NAME}" \
+    --policy-name "${SCHED_POLICY_NAME}-recon-invoke" \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lambda:InvokeFunction\"],\"Resource\":\"${FN_ARN}\"}]}"
+
+  if aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
+      --query 'Name' --output text >/dev/null 2>&1; then
+    echo "  Updating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
+    run aws scheduler update-schedule \
+      --name "${RECON_SCHED_NAME}" \
+      --schedule-expression "${RECON_SCHED_CRON}" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --target "${recon_target}" \
+      --region "${REGION}" \
+      --query 'ScheduleArn' --output text
+  else
+    echo "  Creating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
+    run aws scheduler create-schedule \
+      --name "${RECON_SCHED_NAME}" \
+      --schedule-expression "${RECON_SCHED_CRON}" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --target "${recon_target}" \
+      --region "${REGION}" \
+      --query 'ScheduleArn' --output text
+  fi
+  if ! $DRY_RUN; then
+    aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
+      --query 'Name' --output text >/dev/null \
+      || { echo "ERROR: reconciler rule ${RECON_SCHED_NAME} not found after create/update" >&2; exit 1; }
+  fi
+
   # --- 2f. Prune reconciliation: delete any live rule under SCHED_PREFIX that is
   # no longer in SCHED_NAMES (so dropping a cadence above removes it live too,
   # rather than silently orphaning a still-firing schedule). Added 2026-06-29

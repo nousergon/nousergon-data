@@ -167,7 +167,7 @@ def test_lane_timeout_is_the_sole_bound_no_unemitted_heartbeat(states):
     heartbeat sat beside a 21600s timeout with no emitter anywhere in the fleet,
     and every lane died at 3606s."""
     launch = states["LaunchGroomSpot"]
-    assert launch["TimeoutSeconds"] == 21600
+    assert launch["TimeoutSeconds"] == 10800
     assert "HeartbeatSeconds" not in launch, (
         "no SendTaskHeartbeat emitter exists on the groom box — a heartbeat here "
         "would become the real lane timeout"

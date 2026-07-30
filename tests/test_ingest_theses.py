@@ -37,6 +37,28 @@ class _InMemoryS3:
     def list_objects_v2(self, *, Bucket, Prefix, Delimiter=None):
         return {"CommonPrefixes": [{"Prefix": f"signals/{d}/"} for d in self._data]}
 
+    def get_paginator(self, operation_name):
+        """config-I5703: the date walk paginates now (a bare list_objects_v2
+        silently truncates at 1000 CommonPrefixes). Stub yields ONE page, and
+        deliberately splits across TWO so a consumer that only reads page 0
+        fails here rather than in production years from now."""
+        assert operation_name == "list_objects_v2"
+        outer = self
+
+        class _Paginator:
+            def paginate(self, *, Bucket, Prefix, Delimiter=None):
+                dates = list(outer._data)
+                mid = max(1, len(dates) // 2) if len(dates) > 1 else len(dates)
+                for chunk in (dates[:mid], dates[mid:]):
+                    if chunk:
+                        yield {
+                            "CommonPrefixes": [
+                                {"Prefix": f"signals/{d}/"} for d in chunk
+                            ]
+                        }
+
+        return _Paginator()
+
     def get_object(self, *, Bucket, Key):
         date_str = Key.split("/")[1]  # signals/{date}/signals.json
         return {"Body": BytesIO(json.dumps(self._data[date_str]).encode())}

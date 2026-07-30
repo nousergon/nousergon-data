@@ -372,3 +372,166 @@ def test_groom_sf_failures_reach_telegram():
     assert set(pattern["detail"]["status"]) == {"FAILED", "TIMED_OUT", "ABORTED"}
     assert "SUCCEEDED" not in pattern["detail"]["status"]
     assert "RUNNING" not in pattern["detail"]["status"]
+
+
+# ── Zero-launch cycles are classified, not assumed healthy (I5689) ────────────
+#
+# CheckAnyLaunches routes EVERY empty-launches decide to AllSkipped. Measured
+# 2026-07-30: the 07-29 21:00 and 07-30 05:00 triggers both skipped on
+# concurrency behind an 18h-running cycle and both reported
+# `{"degraded": false, "lanes": 0}` under a "✅ COMPLETE" headline — two
+# starved cycles rendered identically to a healthy light-backlog one.
+
+
+def test_concurrency_skip_is_degraded_not_a_clean_complete(dispatcher):
+    """The exact shape of the 2026-07-30 05:00 execution."""
+    out = dispatcher._notify_cycle_complete({
+        "schedInput": {"schedule": "0 12 * * *"},
+        "decideResult": {"Payload": {"decide": {
+            "launches": [],
+            "reason": "concurrent_cycle_skip",
+            "blocking_executions": ["476a6a5b-c098-4cfb-8a61-2a240576c2e7"],
+        }}},
+        "allSkipped": {"all_skipped": True},
+        "sweep": {"groom": {"launched": True}},
+    })
+    assert out["degraded"] is True, "a starved cycle must not report healthy"
+    assert out["skip_reason"] == "concurrent_cycle_skip"
+    assert out["skip_healthy"] is False
+    assert out["lanes"] == 0
+
+
+def test_blocking_execution_is_named_in_the_rollup(dispatcher):
+    """§2.4: a failure notification carries the real cause, not a pointer."""
+    captured = {}
+    dispatcher._notify_cycle = lambda text, **kw: captured.update(
+        {"text": text, **kw})
+    dispatcher._notify_cycle_complete({
+        "schedInput": {"schedule": "0 4 * * *"},
+        "decideResult": {"Payload": {"decide": {
+            "launches": [], "reason": "concurrent_cycle_skip",
+            "blocking_executions": ["exec-abc123"],
+        }}},
+        "sweep": {"groom": {"launched": True}},
+    })
+    assert "exec-abc123" in captured["text"], "the blocker must be nameable from the ping alone"
+    assert captured["severity"] == "warning"
+    assert captured["context"]["skip_reason"] == "concurrent_cycle_skip"
+
+
+def test_light_backlog_skip_stays_healthy(dispatcher):
+    """The skip that SHOULD be quiet: nothing to groom, nothing spent.
+
+    Guards the over-correction — making every zero-launch cycle degraded would
+    page on the system working correctly, which is the failure mode recorded in
+    bugclass 'a time budget on a state OTHERS cause'.
+    """
+    for reason in (None, "demand_gate_skip"):
+        out = dispatcher._notify_cycle_complete({
+            "schedInput": {"schedule": "0 20 * * *"},
+            "decideResult": {"Payload": {"decide": {
+                **({"reason": reason} if reason else {}), "launches": []}}},
+            "sweep": {"groom": {"launched": True}},
+        })
+        assert out["degraded"] is False, f"{reason!r} is a healthy skip"
+        assert out["skip_healthy"] is True
+
+
+def test_unknown_skip_reason_is_never_silently_healthy(dispatcher):
+    """§2.4 applied to the skip vocabulary, mirroring _lane_glyph's ❔ rule."""
+    glyph, healthy, blurb = dispatcher._skip_verdict("a_reason_invented_next_month")
+    assert healthy is False, "an unrecognized skip must not inherit the benign default"
+    assert glyph == "❔"
+    assert "a_reason_invented_next_month" in blurb, "render the reason verbatim"
+
+
+def test_skip_table_is_total_over_the_dispatchers_own_reasons(dispatcher):
+    """Meta-test (§2.4: "enforcement is a meta-test, not review discipline").
+
+    Every zero-launch `reason` literal the dispatcher emits must be classified.
+    A new skip route added without a row here fails this test rather than
+    silently rendering as ✅.
+    """
+    import ast
+
+    source = (DISPATCHER_DIR / "index.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # `_decide_result` is the SINGLE chokepoint for every decide_only response
+    # (its own docstring says so), which makes its call sites the authoritative
+    # enumeration of cycle-level decide payloads. Walking the AST rather than
+    # grepping literals is deliberate: the payloads are built in three different
+    # syntactic shapes (inline dict, `{"launches": [], **err}` spread, and a
+    # multi-key dict), and a regex that matched only some of them would report
+    # green while leaving a reason unclassified — the exact silent-coverage
+    # failure this test exists to prevent.
+    emitted, spread_sites = set(), 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_decide_result"
+                and node.args):
+            continue
+        payload = node.args[0]
+        if not isinstance(payload, ast.Dict):
+            continue
+        keys = [k.value for k in payload.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        # A zero-launch payload is one whose `launches` is a literal empty list.
+        zero_launch = any(
+            isinstance(k, ast.Constant) and k.value == "launches"
+            and isinstance(v, ast.List) and not v.elts
+            for k, v in zip(payload.keys, payload.values)
+        )
+        if not zero_launch:
+            continue
+        for k, v in zip(payload.keys, payload.values):
+            if (isinstance(k, ast.Constant) and k.value == "reason"
+                    and isinstance(v, ast.Constant)):
+                emitted.add(v.value)
+        # `**skip` / `**err` spreads carry their reason in a nearby local. Count
+        # them so a payload whose reason this test CANNOT see is never silently
+        # treated as full coverage.
+        if any(k is None for k in payload.keys) and "reason" not in keys:
+            spread_sites += 1
+
+    assert emitted, "no zero-launch decide payloads found — the AST walk has rotted"
+
+    classified = set(dispatcher._SKIP_REASONS)
+    missing = emitted - classified
+    assert not missing, (
+        f"zero-launch reason(s) {sorted(missing)} are emitted by the dispatcher "
+        "but absent from _SKIP_REASONS — they would render as an unknown skip"
+    )
+    # Reverse direction: a row for a reason nothing emits is dead weight that
+    # outlives the mechanism it describes (§9 — `pace_gate_skip` was dismantled
+    # 2026-07-14 and a row for it would never fire again). Spread call sites are
+    # the known blind spot, so only assert this when there are none.
+    spread_reasons = {"demand_gate_skip", "demand_all_failed"}
+    assert spread_sites == len(spread_reasons), (
+        f"{spread_sites} spread-payload decide site(s) but {len(spread_reasons)} "
+        "known — a new one was added; name its reason here or this test's "
+        "reverse-direction check silently loosens"
+    )
+    stale = classified - emitted - spread_reasons
+    assert not stale, (
+        f"_SKIP_REASONS classifies {sorted(stale)} which the dispatcher never "
+        "emits — remove the row rather than leaving a guard for a retired path"
+    )
+
+
+def test_lanes_that_launched_are_unaffected_by_the_skip_classifier(dispatcher):
+    """Regression guard: the skip row must not appear on the launched path."""
+    out = dispatcher._notify_cycle_complete({
+        "schedInput": {"schedule": "0 12 * * *"},
+        "mapOutcome": [
+            {"issue_filter": "low-only", "groomLaunch": {"completion": "success"}},
+            {"issue_filter": "mid-only", "groomLaunch": {"completion": "success"}},
+        ],
+        "decideResult": {"Payload": {"decide": {"launches": [{"tier": "low"}]}}},
+        "sweep": {"groom": {"launched": True}},
+    })
+    assert out["degraded"] is False
+    assert out["lanes"] == 2
+    assert out["skip_reason"] is None
+    assert out["skip_healthy"] is None, "skip_healthy is meaningless when lanes ran"

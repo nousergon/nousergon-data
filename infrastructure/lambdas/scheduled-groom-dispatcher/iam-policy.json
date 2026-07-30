@@ -123,6 +123,12 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/queues/*"
     },
     {
+      "Sid": "WriteGroomControlLedger",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/*"
+    },
+    {
       "Sid": "FlowDoctorDedupStore",
       "Effect": "Allow",
       "Action": [
@@ -136,6 +142,12 @@
         "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
         "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
       ]
+    },
+    {
+      "Sid": "SendTaskFailureOnLaneDeath",
+      "Effect": "Allow",
+      "Action": "states:SendTaskFailure",
+      "Resource": "*"
     }
   ]
 }

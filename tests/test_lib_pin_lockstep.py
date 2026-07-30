@@ -121,94 +121,32 @@ class _Exemption:
 # A floor is not an exemption: root >= floor already satisfies it.
 # scheduled-groom-dispatcher: see test_groom_dispatcher_is_not_exempted
 _LAMBDA_PIN_EXEMPTIONS: dict[str, _Exemption] = {
-    # ── Spot-dispatch lockstep group (alpha-engine-config-I3242) ────────
-    # These Lambdas share a common spot-dispatch chokepoint and must move
-    # together.  Re-evaluated against root quarterly.
-    "arctic-migration-dispatcher": _Exemption(
-        kind="group",
-        version="v0.124.5",
-        re_exam="2026-10-27",
-        reason=(
-            "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I3242): "
-            "same spot-launch/concurrency-lock primitives as the other spot-dispatch "
-            "Lambdas — stays in lockstep with them, not with root"
-        ),
-        members=(
-            "arctic-migration-dispatcher",
-            "canary-replay-dispatcher",
-            "alert-drain-dispatcher",
-            "ci-watch-dispatcher",
-            "sf-watch-spot-dispatcher",
-        ),
-    ),
-    "canary-replay-dispatcher": _Exemption(
-        kind="group",
-        version="v0.124.5",
-        re_exam="2026-10-27",
-        reason=(
-            "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config#2246): "
-            "same SpotProbeError handling as ci-watch-dispatcher; bumped for config#2698 "
-            "SpotQuotaExceededError on-demand fallback"
-        ),
-        members=(
-            "arctic-migration-dispatcher",
-            "canary-replay-dispatcher",
-            "alert-drain-dispatcher",
-            "ci-watch-dispatcher",
-            "sf-watch-spot-dispatcher",
-        ),
-    ),
-    "alert-drain-dispatcher": _Exemption(
-        kind="group",
-        version="v0.124.5",
-        re_exam="2026-10-27",
-        reason=(
-            "nousergon_lib.spot_dispatch chokepoint (alpha-engine-config-I2824): "
-            "same extra_tags atomic-launch-tagging floor as ci-watch-dispatcher; "
-            "bumped for config#2698 SpotQuotaExceededError on-demand fallback"
-        ),
-        members=(
-            "arctic-migration-dispatcher",
-            "canary-replay-dispatcher",
-            "alert-drain-dispatcher",
-            "ci-watch-dispatcher",
-            "sf-watch-spot-dispatcher",
-        ),
-    ),
-    "ci-watch-dispatcher": _Exemption(
-        kind="group",
-        version="v0.124.5",
-        re_exam="2026-10-27",
-        reason=(
-            "nousergon_lib.spot_dispatch chokepoint (config#2267): SpotProbeError handling; "
-            "bumped for extra_tags atomic-launch-tagging (config#2292) and config#2698 "
-            "SpotQuotaExceededError on-demand fallback"
-        ),
-        members=(
-            "arctic-migration-dispatcher",
-            "canary-replay-dispatcher",
-            "alert-drain-dispatcher",
-            "ci-watch-dispatcher",
-            "sf-watch-spot-dispatcher",
-        ),
-    ),
-    "sf-watch-spot-dispatcher": _Exemption(
-        kind="group",
-        version="v0.124.5",
-        re_exam="2026-10-27",
-        reason=(
-            "nousergon_lib.spot_dispatch chokepoint (config#2267): SpotProbeError handling; "
-            "bumped for extra_tags atomic-launch-tagging (config#2292) and config#2698 "
-            "SpotQuotaExceededError on-demand fallback"
-        ),
-        members=(
-            "arctic-migration-dispatcher",
-            "canary-replay-dispatcher",
-            "alert-drain-dispatcher",
-            "ci-watch-dispatcher",
-            "sf-watch-spot-dispatcher",
-        ),
-    ),
+    # EMPTY, and that is the target state (alpha-engine-config-I5751).
+    #
+    # The "Spot-dispatch lockstep group" that lived here — arctic-migration,
+    # canary-replay, alert-drain, ci-watch and sf-watch-spot — was removed
+    # 2026-07-30 after being frozen at v0.124.5 for nineteen lib versions.
+    #
+    # Its stated reason was that the five share the nousergon_lib.spot_dispatch
+    # chokepoint and so "stay in lockstep with them, not with root". That reason
+    # argues for bumping them AS A UNIT. It was enforced as not bumping them at
+    # all, and the difference cost something measurable: nousergon-lib#274 added
+    # launch-provenance tags to spot_dispatch itself, and the five Lambdas
+    # grouped around that module were the only five that would not have received
+    # it (alpha-engine-config-I5727).
+    #
+    # Measured before removing it, rather than assumed: across v0.124.5..v0.124.24
+    # the ONLY commit touching spot_dispatch.py or ec2_spot.py is #274, and all
+    # five Lambdas import spot_dispatch and nothing else from the library. The
+    # exemption therefore protected them from no change at all — the nineteen
+    # versions of drift were entirely in modules they do not import — while
+    # withholding the one change that was for them.
+    #
+    # A `group` kind still exists in _Exemption and is still legitimate: it means
+    # "these move together". If a future cluster genuinely cannot track root, it
+    # goes here WITH a contract reason naming what breaks — not "shares a
+    # chokepoint", which is an argument for coupling their bumps, not for
+    # freezing them.
 }
 
 

@@ -217,10 +217,14 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     # config#2292 root fix: the repo+sha discriminator tags ride the SAME
     # RunInstances call as the launch itself (extra_tags), not a separate
     # post-launch create_tags call.
-    assert calls["extra_tags"] == {
-        "ci-watch-repo": "nousergon/alpha-engine-config",
-        "ci-watch-sha": "abc1234def5678900000000000000000000abcd",
-    }
+    # I5751/I5727: launch_with_fallback tags every launch with
+    # LaunchMarket/LaunchReason, so assert the caller's own tags by key
+    # rather than exact-dict equality — the contract is "these tags ride
+    # RunInstances", never "nothing else may".
+    assert calls["extra_tags"]["ci-watch-repo"] == "nousergon/alpha-engine-config"
+    assert calls["extra_tags"]["ci-watch-sha"] == "abc1234def5678900000000000000000000abcd"
+    assert calls["extra_tags"]["LaunchMarket"] == "spot"
+    assert calls["extra_tags"]["LaunchReason"] == "spot_ok"
     assert idx._test_ec2.terminated == []
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
@@ -526,11 +530,15 @@ def test_drill_synthesizes_isolated_identity_and_launches(monkeypatch):
     assert out["is_drill"] is True
     assert out["repo"] == idx.DRILL_REPO == "nousergon/ci-watch-drill"
     assert out["sha"] == expected_sha
-    assert calls["extra_tags"] == {
-        "ci-watch-repo": idx.DRILL_REPO,
-        "ci-watch-sha": expected_sha,
-        "sf-watch-drill": "true",
-    }
+    # I5751/I5727: launch_with_fallback tags every launch with
+    # LaunchMarket/LaunchReason, so assert the caller's own tags by key
+    # rather than exact-dict equality — the contract is "these tags ride
+    # RunInstances", never "nothing else may".
+    assert calls["extra_tags"]["ci-watch-repo"] == idx.DRILL_REPO
+    assert calls["extra_tags"]["ci-watch-sha"] == expected_sha
+    assert calls["extra_tags"]["sf-watch-drill"] == "true"
+    assert calls["extra_tags"]["LaunchMarket"] == "spot"
+    assert calls["extra_tags"]["LaunchReason"] == "spot_ok"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert 'export CI_IS_DRILL="true"' in cmd
     assert f'export CI_REPO="{idx.DRILL_REPO}"' in cmd

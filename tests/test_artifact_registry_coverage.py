@@ -114,6 +114,18 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # registry and pinned here only to force operator review of any new PUT
     # site in the runner.
     "scripts/run_arctic_migrations.py": 1,
+    # rag/watermarks/v1/{source}.json — per-source ingestion watermarks
+    # (alpha-engine-config-I5701): last CONFIRMED ingest per
+    # (ticker, doc_type), so the news fetch pays the vendor for the GAP
+    # instead of the whole 168h window (rag-corpus-policy.md §2.2).
+    # OPERATIONAL STATE, not a freshness-SLA artifact — grandfathered in
+    # ARTIFACT_REGISTRY.yaml under prefix "rag/watermarks/" because the
+    # staleness direction is SAFE: the resolver treats an unreadable or absent
+    # store as "everything outstanding" and OVER-fetches, so a stale store
+    # costs one redundant sweep and can never open a silent coverage hole.
+    # Health for this mechanism is skipped_at_watermark in
+    # run_news_pipeline's RUN STATS line (policy §5), not artifact age.
+    "rag/pipelines/_watermarks.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for

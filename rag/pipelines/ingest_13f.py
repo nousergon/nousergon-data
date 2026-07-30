@@ -356,8 +356,8 @@ def main():
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     elif args.from_signals:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket, s3_client=s3)
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers(bucket=args.bucket, s3_client=s3)
         if not tickers:
             logger.error("[ingest_13f] --from-signals requested but no tickers found — aborting")
             return

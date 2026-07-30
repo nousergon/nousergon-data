@@ -264,9 +264,20 @@ def ingest_signals_theses(
     s3 = boto3.client("s3")
     results = {"signals_theses": 0, "skipped_dedup": 0, "chunks_total": 0}
 
-    # List signal dates
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix="signals/", Delimiter="/")
-    prefixes = sorted([p["Prefix"] for p in resp.get("CommonPrefixes", [])])
+    # List signal dates. PAGINATED (config-I5703): this walk needs a RANGE of
+    # dates, not just the newest, so a `latest.json` pointer does not serve it
+    # — but a bare `list_objects_v2` caps CommonPrefixes at 1000 and sets
+    # IsTruncated, so an unpaginated walk silently stops covering the tail once
+    # the partition count crosses a page. 48 partitions as of 2026-07-30, so
+    # this is latent rather than live; the paginator closes it regardless.
+    paginator = s3.get_paginator("list_objects_v2")
+    prefixes = sorted(
+        p["Prefix"]
+        for page in paginator.paginate(
+            Bucket=bucket, Prefix="signals/", Delimiter="/",
+        )
+        for p in page.get("CommonPrefixes", [])
+    )
 
     for prefix in prefixes:
         date_str = prefix.strip("/").split("/")[-1]

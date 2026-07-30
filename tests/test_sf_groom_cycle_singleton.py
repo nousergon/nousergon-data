@@ -48,35 +48,62 @@ def sf() -> dict:
         return json.load(fh)
 
 
+def test_ceiling_is_strictly_less_than_the_trigger_interval(sf):
+    """alpha-engine-config-I5372 (Brian's Option-1 ruling, 2026-07-29): the
+    global ceiling must be strictly less than the 8h trigger interval so the
+    schedule itself is the outermost bound and overlap is impossible without a
+    mutex. The cycle singleton (alpha-engine-config-I5371) remains as defence
+    in depth — but the ceiling is now the PRIMARY mechanism, and this assertion
+    must never silently regress.
+
+    Before this ruling the ceiling was 72000 (20h) against an 8h interval, so
+    overlap was possible by construction — the disjunction in the old
+    test_overlapping_cycles_are_prevented_by_at_least_one_mechanism was only
+    correct while the ceiling could not bound overlap.
+    """
+    ceiling = sf.get("TimeoutSeconds")
+    assert ceiling is not None, (
+        "the dispatch SF must declare a top-level TimeoutSeconds")
+    assert ceiling < TRIGGER_INTERVAL_SECONDS, (
+        f"ceiling {ceiling}s must be strictly less than the {TRIGGER_INTERVAL_SECONDS}s "
+        f"trigger interval — a ceiling >= interval reintroduces the I5372 defect: "
+        f"overlap is possible by construction regardless of the singleton guard")
+
+
 def test_overlapping_cycles_are_prevented_by_at_least_one_mechanism(sf):
-    """The safety property, stated as the disjunction it actually is.
+    """The safety property, tightened per alpha-engine-config-I5372 (Brian's
+    Option-1 ruling, 2026-07-29).
 
-    Overlap is impossible if EITHER a cycle cannot outlive its trigger interval
-    (ceiling < interval) OR a singleton guard rejects a cycle whose predecessor
-    is still alive. Asserting only the ceiling would be wrong here: the lane
-    budget is deliberately larger than the interval (6h lane x 3 attempts = 18h,
-    see `test_sf_groom_relaunch_wiring.py`), so the ceiling CANNOT be the
-    mechanism without redesigning the relaunch budget — tracked separately as
-    alpha-engine-config-I5372.
+    The ceiling (25200s / 7h) is now strictly less than the trigger interval
+    (28800s / 8h), so the schedule itself is the outermost bound and overlap is
+    impossible without a mutex. The cycle singleton (I5371) is defence in depth
+    — not the only guard, and the disjunction is no longer sufficient: a future
+    ceiling regression must fail THIS test even if the singleton still holds.
 
-    What must never hold is *neither*. That was the live configuration on
-    2026-07-29 and it produced 19 duplicate PRs across 16 clusters.
+    Lane budget is now 3h × 2 attempts = 6h worst-case, composes to strictly
+    less than the 7h ceiling, which in turn is strictly less than the 8h
+    interval. `test_ceiling_is_strictly_less_than_the_trigger_interval` above
+    asserts the outer bound independently.
     """
     ceiling = sf.get("TimeoutSeconds")
     assert ceiling is not None, (
         "the dispatch SF must declare a top-level TimeoutSeconds — without one "
         "a hung cycle runs until the account's 1-year service ceiling")
 
-    ceiling_bounds_overlap = ceiling < TRIGGER_INTERVAL_SECONDS
+    # The ceiling MUST bound overlap (the primary mechanism post-I5372).
+    assert ceiling < TRIGGER_INTERVAL_SECONDS, (
+        f"ceiling={ceiling}s >= trigger interval {TRIGGER_INTERVAL_SECONDS}s — "
+        f"overlap is possible by construction regardless of the singleton guard")
+
+    # Singleton is defence in depth — still required.
     singleton_wired = (
         sf["States"]["InitRunState"]["Parameters"]["decideMarker"].get("executionArn.$")
         == "$$.Execution.Id"
     )
-    assert ceiling_bounds_overlap or singleton_wired, (
-        f"neither mechanism prevents overlapping groom cycles: ceiling={ceiling}s "
-        f">= trigger interval {TRIGGER_INTERVAL_SECONDS}s AND no executionArn is "
-        f"seeded for the cycle-singleton guard. Concurrent cycles each enumerate "
-        f"the backlog independently and open duplicate PRs for the same issue.")
+    assert singleton_wired, (
+        "the cycle-singleton guard must remain wired as defence in depth even "
+        "when the ceiling bounds overlap — a ceiling-only defence has no second "
+        "layer against a misconfigured redeploy")
 
 
 def test_decide_phase_receives_the_execution_arn(sf):

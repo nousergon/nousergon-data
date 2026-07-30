@@ -241,11 +241,15 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     # ride the SAME RunInstances call as the launch itself (extra_tags), not
     # a separate post-launch create_tags call — used by both the concurrency
     # guard AND the fleet spot-orphan-reaper's completion check.
-    assert calls["extra_tags"] == {
-        "sf-watch-cadence": "saturday",
-        "sf-watch-pipeline": "ne-weekly-freshness-pipeline",
-        "sf-watch-run-date": "2026-07-11",
-    }
+    # I5751/I5727: launch_with_fallback tags every launch with
+    # LaunchMarket/LaunchReason, so assert the caller's own tags by key
+    # rather than exact-dict equality — the contract is "these tags ride
+    # RunInstances", never "nothing else may".
+    assert calls["extra_tags"]["sf-watch-cadence"] == "saturday"
+    assert calls["extra_tags"]["sf-watch-pipeline"] == "ne-weekly-freshness-pipeline"
+    assert calls["extra_tags"]["sf-watch-run-date"] == "2026-07-11"
+    assert calls["extra_tags"]["LaunchMarket"] == "spot"
+    assert calls["extra_tags"]["LaunchReason"] == "spot_ok"
     assert idx._test_ec2.terminated == []
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
@@ -934,12 +938,16 @@ def test_drill_event_launches_with_drill_scoped_run_date_and_drill_tag(monkeypat
     # Tags: the normal discriminator triple (run_date drill-scoped) PLUS the
     # drill marker tag fleet consumers filter on — all riding the SAME
     # RunInstances call as the launch (config#2292 root fix).
-    assert calls["extra_tags"] == {
-        "sf-watch-cadence": "saturday",
-        "sf-watch-pipeline": "ne-weekly-freshness-pipeline",
-        "sf-watch-run-date": drill_date,
-        "sf-watch-drill": "true",
-    }
+    # I5751/I5727: launch_with_fallback tags every launch with
+    # LaunchMarket/LaunchReason, so assert the caller's own tags by key
+    # rather than exact-dict equality — the contract is "these tags ride
+    # RunInstances", never "nothing else may".
+    assert calls["extra_tags"]["sf-watch-cadence"] == "saturday"
+    assert calls["extra_tags"]["sf-watch-pipeline"] == "ne-weekly-freshness-pipeline"
+    assert calls["extra_tags"]["sf-watch-run-date"] == drill_date
+    assert calls["extra_tags"]["sf-watch-drill"] == "true"
+    assert calls["extra_tags"]["LaunchMarket"] == "spot"
+    assert calls["extra_tags"]["LaunchReason"] == "spot_ok"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert 'export SF_IS_DRILL="true"' in cmd
     assert f'export SF_RUN_DATE="{drill_date}"' in cmd

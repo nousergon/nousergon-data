@@ -47,7 +47,7 @@ def main() -> int:
     )
     grp.add_argument(
         "--from-signals", action="store_true",
-        help="Load tickers from latest signals.json on S3.",
+        help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates).",
     )
     parser.add_argument(
         "--snapshot-date", type=str, default=None,
@@ -71,8 +71,8 @@ def main() -> int:
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket)
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers(bucket=args.bucket)
     if not tickers:
         logger.error("[run_analyst_pipeline] no tickers — aborting")
         return 1
