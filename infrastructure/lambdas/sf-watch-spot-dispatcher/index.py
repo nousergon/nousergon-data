@@ -144,6 +144,11 @@ SF_WATCH_RUN_DATE_TAG_KEY = "sf-watch-run-date"
 # synthetic drill box from a real repair box with one tag read. The SAME tag
 # key is used by ci-watch-dispatcher — one fleet-wide drill marker.
 SF_WATCH_DRILL_TAG_KEY = "sf-watch-drill"
+# Per-run execution identity for EC2 cost attribution (config#5504): the SF
+# execution ID of the pipeline that owns this dispatch — the key that lets
+# per-instance cost rows join to the run they belong to. Rides the same
+# RunInstances call atomically via extra_tags.
+SF_WATCH_EXECUTION_ID_TAG_KEY = "execution-id"
 
 # DRILL RUN_DATE PREFIX (config#2223). DRILL-vs-REAL ISOLATION INVARIANT: a
 # drill's effective run_date is ALWAYS synthesized as f"drill-{utc-date}" —
@@ -301,6 +306,12 @@ def _resolve_event_fields(event: dict) -> dict:
     # cause: deliberately unvalidated — arbitrary AWS text, base64-encoded
     # before it ever reaches a shell command (see _bootstrap_command).
     cause = str(event.get("cause") or "")
+    # sf_execution_id (config#5504): the Step Functions execution ID of the
+    # pipeline that owns this dispatch — the per-run identity key for EC2 cost
+    # attribution. Optional: not all invocation paths carry it (operator
+    # re-drives, preflight canaries). When present, it rides the RunInstances
+    # call atomically as an EC2 tag.
+    sf_execution_id = str(event.get("sf_execution_id") or "").strip() or None
     return {
         "pipeline_name": pipeline_name,
         "cadence_slug": cadence_slug,
@@ -314,6 +325,7 @@ def _resolve_event_fields(event: dict) -> dict:
         "force_on_demand": force_on_demand,
         "model": model,
         "cause": cause,
+        "sf_execution_id": sf_execution_id,
     }
 
 
@@ -376,6 +388,7 @@ exec bash infrastructure/overseer_spot_bootstrap.sh --playbook sf-watch
 def _launch_instance(
     cadence_slug: str, pipeline_name: str, run_date: str,
     is_drill: bool = False, force_on_demand: bool = False,
+    sf_execution_id: str | None = None,
 ) -> tuple[str, str]:
     """Launch the SF-watch box; spot first, on-demand fallback on capacity
     exhaustion — or straight to on-demand when ``force_on_demand`` (the
@@ -389,7 +402,12 @@ def _launch_instance(
     (config#2267 site 2) ride the SAME RunInstances call as the launch
     itself via ``extra_tags`` (config#2292 root fix, nousergon-lib >= 0.108.0
     / krepis >= 0.12.0) — the box is never observably untagged, so there is
-    no post-launch create_tags step to retry or fail."""
+    no post-launch create_tags step to retry or fail.
+
+    sf_execution_id (config#5504): the owning pipeline's SF execution ID, for
+    per-run EC2 cost attribution. Rides the same RunInstances call atomically.
+    None for operator re-drives and preflight canaries where no SF execution
+    context exists."""
     extra_tags = {
         SF_WATCH_CADENCE_TAG_KEY: cadence_slug,
         SF_WATCH_PIPELINE_TAG_KEY: pipeline_name,
@@ -397,6 +415,8 @@ def _launch_instance(
     }
     if is_drill:
         extra_tags[SF_WATCH_DRILL_TAG_KEY] = "true"
+    if sf_execution_id:
+        extra_tags[SF_WATCH_EXECUTION_ID_TAG_KEY] = sf_execution_id
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -736,6 +756,7 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
         instance_id, market = _launch_instance(
             cadence_slug, pipeline_name, run_date,
             is_drill=is_drill, force_on_demand=force_on_demand,
+            sf_execution_id=fields.get("sf_execution_id"),
         )
     except SpotLaunchError as exc:
         logger.error("sf-watch spot launch failed: %s: %s", type(exc).__name__, exc)

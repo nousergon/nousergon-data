@@ -4498,7 +4498,9 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-weekly-freshness-spot-dispatcher",
-        "Payload": {}
+        "Payload": {
+          "execution_id.$": "$$.Execution.Id"
+        }
       },
       "TimeoutSeconds": 600,
       "Retry": [

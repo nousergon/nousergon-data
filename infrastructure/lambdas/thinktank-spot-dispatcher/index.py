@@ -172,7 +172,9 @@ exec bash infrastructure/thinktank_spot_bootstrap.sh
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = None) -> tuple[str, str]:
+    """Launch the Think Tank spot box. extra_tags (config#5504): per-run
+    identity tags ride the SAME RunInstances call atomically."""
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES,
         SUBNETS,
@@ -182,6 +184,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name=INSTANCE_TAG_NAME,
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -214,6 +217,21 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     force_on_demand = bool(event.get("force_on_demand", False))
+
+    # Per-run identity tags (config#5504): attribute the Think Tank box for EC2
+    # cost measurement. This dispatcher is EventBridge-triggered (not SF), so
+    # execution_id may be absent; when present from a chained upstream SF it
+    # rides the RunInstances call atomically, otherwise the box has only its
+    # Name tag.
+    extra_tags = {}
+    for key, tag_name in (
+        ("execution_id", "execution-id"),
+        ("run_date", "run-date"),
+        ("pipeline_role", "pipeline-role"),
+    ):
+        val = str(event.get(key, "")).strip()
+        if val:
+            extra_tags[tag_name] = val
 
     if not DISPATCH_ENABLED:
         raise RuntimeError(
@@ -254,7 +272,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     run_token = uuid.uuid4().hex
     try:
-        instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+        instance_id, market = _launch_instance(force_on_demand=force_on_demand, extra_tags=extra_tags or None)
     except SpotLaunchError:
         logger.error("thinktank-spot launch failed (spot + on-demand exhausted)")
         raise

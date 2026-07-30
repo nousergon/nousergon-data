@@ -536,7 +536,8 @@ export GROOM_RUN_TOKEN={run_token}
 
 
 def _launch_instance(force_on_demand: bool = False,
-                     tier_tag: str = "") -> tuple[str, str]:
+                     tier_tag: str = "",
+                     extra_identity_tags: dict | None = None) -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
@@ -548,8 +549,16 @@ def _launch_instance(force_on_demand: bool = False,
     the box is NEVER observably untagged after launch, so a spot-reclaim CloudTrail
     record (which only sees ``TagSpecifications``, not post-launch ``CreateTags``)
     retains lane attribution for the full 90-day CloudTrail retention window.
-    """
-    extra_tags = {GROOM_TIER_TAG_KEY: tier_tag} if tier_tag else None
+
+    ``extra_identity_tags`` (config#5504): per-run identity tags (execution_id,
+    run_date, pipeline_role) for EC2 cost attribution — merged into the same
+    RunInstances call so the box is attributable to its owning SF execution from
+    the moment of launch."""
+    extra_tags = {}
+    if tier_tag:
+        extra_tags[GROOM_TIER_TAG_KEY] = tier_tag
+    if extra_identity_tags:
+        extra_tags.update(extra_identity_tags)
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -558,7 +567,7 @@ def _launch_instance(force_on_demand: bool = False,
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-groom-spot",
-        extra_tags=extra_tags,
+        extra_tags=extra_tags or None,
         region=REGION,
         force_on_demand=force_on_demand,
     )
