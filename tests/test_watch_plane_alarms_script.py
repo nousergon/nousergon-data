@@ -151,8 +151,11 @@ class TestAlarmSemantics:
         # Opposite of the deadman alarms: these alarm on PRESENCE of errors,
         # and AWS/Lambda emits no Errors datapoint when idle — "breaching"
         # would page continuously on every quiet 5-minute window.
-        assert '--treat-missing-data "notBreaching"' in script_text
-        assert '--treat-missing-data "breaching"' not in script_text
+        # Must check only the Errors/Throttles section (the new
+        # Invocations-floor alarms use breaching intentionally).
+        errors_block = script_text[:script_text.find("invocations-floor")] if "invocations-floor" in script_text else script_text
+        assert '--treat-missing-data "notBreaching"' in errors_block
+        assert '--treat-missing-data "breaching"' not in errors_block
 
     def test_five_minute_single_period_window(self, script_text):
         assert "--period 300" in script_text
@@ -195,6 +198,85 @@ class TestDocstringsNowTruthful:
             "name the alarm-provisioning script — the pre-#2266 wording claimed "
             "a CW alarm that did not exist."
         )
+
+
+class TestLivenessInvocationsFloorAlarms:
+    """Invocations-floor alarms for liveness probes (alpha-engine-config-I5567):
+    fires when a probe that should run on a schedule stops being invoked
+    entirely — the exact blind spot the Errors/Throttles NotBreaching alarms
+    have."""
+
+    def _invocations_block(self, script_text: str) -> str:
+        pos = script_text.find("Per-liveness-probe Invocations-floor alarms")
+        assert pos != -1, "Invocations-floor alarm block not found"
+        # Block ends at the next section header (--- N.) or EOF.
+        next_section = script_text.find("\n# ---", pos + 10)
+        return script_text[pos:next_section] if next_section != -1 else script_text[pos:]
+
+    def test_invocations_metric_used(self, script_text):
+        block = self._invocations_block(script_text)
+        assert '--metric-name "Invocations"' in block
+
+    def test_threshold_zero_lte(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "--threshold 0" in block
+        assert '--comparison-operator "LessThanOrEqualToThreshold"' in block
+
+    def test_treat_missing_data_is_breaching(self, script_text):
+        block = self._invocations_block(script_text)
+        # Opposite of the Errors/Throttles alarms: INVOCATIONS absence IS the
+        # condition being detected — breaching, not notBreaching.
+        assert '--treat-missing-data "breaching"' in block
+        assert '--treat-missing-data "notBreaching"' not in block
+
+    def test_twenty_four_hour_window(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "--period 86400" in block
+
+    def test_sum_statistic(self, script_text):
+        block = self._invocations_block(script_text)
+        assert '--statistic "Sum"' in block
+
+    def test_single_period_datum(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "--evaluation-periods 1" in block
+        assert "--datapoints-to-alarm 1" in block
+
+    def test_gated_on_liveness_label(self, script_text):
+        block = self._invocations_block(script_text)
+        assert 'case "$label" in' in block
+        assert "*liveness*" in block
+
+    def test_routes_to_backstop_topic(self, script_text):
+        block = self._invocations_block(script_text)
+        assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in block
+        assert '--ok-actions "$BACKSTOP_TOPIC_ARN"' in block
+
+    def test_alarm_name_convention(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "invocations-floor" in block
+        assert 'alpha-engine-watch-plane-${label}' in block
+
+    def test_all_liveness_labels_have_invocation_floor(self, script_text):
+        """Every WATCH_PLANE_FUNCTIONS entry whose label contains 'liveness'
+        is iterated by the Invocations-floor for loop — verified by counting
+        liveness labels in the declaration block and checking the for-loop
+        guard pattern matches *liveness* (which catches all of them at runtime,
+        even though the static text only has one put-metric-alarm call inside
+        the case body)."""
+        # Count liveness labels in the declaration block.
+        dec_start = script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
+        dec_end = script_text.find(")", dec_start)
+        dec_block = script_text[dec_start:dec_end]
+        liveness_labels = [line for line in dec_block.split("\n") if "liveness" in line]
+        assert len(liveness_labels) >= 4, f"Expected >=4 liveness labels, found {len(liveness_labels)}"
+        # Verify the for loop exists with *liveness* pattern (catches all at runtime).
+        invoc_block = script_text[script_text.find("Per-liveness-probe Invocations-floor"):]
+        assert "for label in \"${!WATCH_PLANE_FUNCTIONS[@]}\"" in invoc_block
+        assert "*liveness*)" in invoc_block
+        assert "put-metric-alarm" in invoc_block
+        # Verify uniqueness: the alarm name uses ${label} so each iteration creates a distinct name.
+        assert 'alpha-engine-watch-plane-${label}-invocations-floor' in invoc_block
 
 
 class TestOverseerIntakeDlqAlarm:
