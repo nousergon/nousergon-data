@@ -5,7 +5,8 @@ Phase 1 (before research): constituents, prices, macro, universe returns.
 Phase 2 (after research): alternative data for promoted tickers.
 
 Phase 1 runs on EC2 via SSM RunCommand (price refresh takes 15-25 min).
-Phase 2 runs as Lambda (< 10 min for ~30 tickers).
+Phase 2 runs as Lambda (concurrent ThreadPoolExecutor, ~3-5 min for
+900+ tickers; timeout=900s).
 
 Usage:
     python weekly_collector.py --phase 1              # Phase 1 only

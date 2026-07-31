@@ -14,13 +14,13 @@
 # Keep in lockstep with the lib pin in requirements.txt. If a future change
 # adds an import to the daily-news chain, add the dep here too (the standalone
 # run will fail loud on a missing import).
-boto3>=1.43.58
+boto3>=1.43.59
 pandas>=2.0
 pyarrow>=25.0.0
 numpy>=2.4.6
 requests>=2.34.2
-feedparser>=6.0.12
+feedparser>=6.0.14
 anyio>=4.14.2
 tenacity>=9.1.4
 pyyaml>=6.0.3
-nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.24
+nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.25

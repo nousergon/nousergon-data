@@ -1,10 +1,10 @@
 {
-  "Comment": "Backlog groom dispatch (config#1472, restructured config#2129, end-of-SF sweep config#2201) \u2014 wraps the EventBridge Scheduler -> Lambda -> EC2-spot-via-SSM dispatch chain in a Step Function so the fleet's existing Fleet-SF Watch resilience/observability agent covers groom runs the SAME way it covers the Saturday/weekday/EOD pipelines. config#2129 TWO-PHASE REDESIGN: the OLD version invoked the scheduled-groom-dispatcher Lambda ONCE per trigger and tried to poll a SINGLE CommandId/InstanceId \u2014 that worked for a single-tier launch, but config#1933's 'demand-all' symmetric triggers made ALL 3 tiers co-launch on every recorded trigger (2026-07-08..10), and the Lambda's demand-all response is a `launches: [...]` ARRAY with no top-level launched/instance_id/command_id. CheckLaunched/PollGroomCommand's Choice/Task Parameters referenced that missing singular shape and failed with States.Runtime on ~83% of real triggers (5 of the last 6 executions checked 2026-07-10) \u2014 the SF reported FAILED (or never even reached PollGroomCommand) on runs where the real EC2 boxes launched and worked FINE; Fleet-SF-Watch had zero real visibility into them. This is now: DecideLaunches (Lambda op=decide_only \u2014 enumerate + decide WITHOUT launching, returns 0..3 launch decisions) -> CheckAnyLaunches -> a Map state, ONE ITERATION PER DECISION, each independently launching (Lambda op=launch_decided) and polling via the SAME per-box states the old single-launch design already had (LaunchGroomSpot/PollGroomCommand/CheckGroomStatus/.../GroomSucceeded/GroomSkipped/FailExecution, now scoped inside the Map's ItemProcessor instead of the top level). A Standard Map state's default semantics (ToleratedFailurePercentage=0) mean ANY iteration reaching its own FailExecution fails the whole Map \u2014 and hence the whole SF execution \u2014 which is the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes. config#1645's bounded auto-relaunch (spot-interruption recovery via the S3 completion-marker check) is UNCHANGED, just now per-iteration instead of per-execution \u2014 each co-launched tier can independently die mid-run and independently relaunch up to max_retries times without affecting its siblings. config#2201 END-OF-SF SWEEP (Brian design 2026-07-10): after the Map fully winds down \u2014 and equally on the zero-launches path \u2014 a final DispatchEndOfSfSweep state launches ONE Haiku run_mode=sweep spot box covering the full org PR set. This replaces the config#2129 per-box partitioned sweeps (the partition machinery is retired in the dispatcher + config driver): sweeps now run unconditionally every trigger cycle (the drain-the-backlog end state can never starve them) and AFTER all groomers finish (catching the PRs they just opened). The sweep dispatch is fire-and-forget (no polling loop \u2014 Brian removed the wait): a sweep-launch failure is RECORDED in the execution output + SNS-notified but never fails the SF (the groom boxes are the primary deliverable; the next trigger's sweep covers the tail).",
+  "Comment": "Backlog groom dispatch (config#1472, restructured config#2129, end-of-SF sweep config#2201) — wraps the EventBridge Scheduler -> Lambda -> EC2-spot-via-SSM dispatch chain in a Step Function so the fleet's existing Fleet-SF Watch resilience/observability agent covers groom runs the SAME way it covers the Saturday/weekday/EOD pipelines. config#2129 TWO-PHASE REDESIGN: the OLD version invoked the scheduled-groom-dispatcher Lambda ONCE per trigger and tried to poll a SINGLE CommandId/InstanceId — that worked for a single-tier launch, but config#1933's 'demand-all' symmetric triggers made ALL 3 tiers co-launch on every recorded trigger (2026-07-08..10), and the Lambda's demand-all response is a `launches: [...]` ARRAY with no top-level launched/instance_id/command_id. CheckLaunched/PollGroomCommand's Choice/Task Parameters referenced that missing singular shape and failed with States.Runtime on ~83% of real triggers (5 of the last 6 executions checked 2026-07-10) — the SF reported FAILED (or never even reached PollGroomCommand) on runs where the real EC2 boxes launched and worked FINE; Fleet-SF-Watch had zero real visibility into them. This is now: DecideLaunches (Lambda op=decide_only — enumerate + decide WITHOUT launching, returns 0..3 launch decisions) -> CheckAnyLaunches -> a Map state, ONE ITERATION PER DECISION, each independently launching (Lambda op=launch_decided) and polling via the SAME per-box states the old single-launch design already had (LaunchGroomSpot/PollGroomCommand/CheckGroomStatus/.../GroomSucceeded/GroomSkipped/FailExecution, now scoped inside the Map's ItemProcessor instead of the top level). A Standard Map state's default semantics (ToleratedFailurePercentage=0) mean ANY iteration reaching its own FailExecution fails the whole Map — and hence the whole SF execution — which is the correct 'fail loud' extension of the old single-box behavior to N co-launched boxes. config#1645's bounded auto-relaunch (spot-interruption recovery via the S3 completion-marker check) is UNCHANGED, just now per-iteration instead of per-execution — each co-launched tier can independently die mid-run and independently relaunch up to max_retries times without affecting its siblings. config#2201 END-OF-SF SWEEP (Brian design 2026-07-10): after the Map fully winds down — and equally on the zero-launches path — a final DispatchEndOfSfSweep state launches ONE Haiku run_mode=sweep spot box covering the full org PR set. This replaces the config#2129 per-box partitioned sweeps (the partition machinery is retired in the dispatcher + config driver): sweeps now run unconditionally every trigger cycle (the drain-the-backlog end state can never starve them) and AFTER all groomers finish (catching the PRs they just opened). The sweep dispatch is fire-and-forget (no polling loop — Brian removed the wait): a sweep-launch failure is RECORDED in the execution output + SNS-notified but never fails the SF (the groom boxes are the primary deliverable; the next trigger's sweep covers the tail).",
   "StartAt": "InitRunState",
   "States": {
     "InitRunState": {
       "Type": "Pass",
-      "Comment": "Seed schedInput (the raw EventBridge Scheduler input, e.g. {run_mode, trigger, pr_budget, schedule} \u2014 unchanged contract) and a literal decide_only marker merged into DecideLaunches's Payload below (States.JsonMerge arguments must be real JSONPaths, so the literal lives here rather than inline in the merge call). alpha-engine-config-I5371: also seeds executionArn from the SF context object so the decide phase can enforce a CYCLE SINGLETON (skip when an earlier dispatch execution is still RUNNING). The context object is not reachable from inside States.JsonMerge, so it is seeded here like decide_only itself.",
+      "Comment": "Seed schedInput (the raw EventBridge Scheduler input, e.g. {run_mode, trigger, pr_budget, schedule} — unchanged contract) and a literal decide_only marker merged into DecideLaunches's Payload below (States.JsonMerge arguments must be real JSONPaths, so the literal lives here rather than inline in the merge call). alpha-engine-config-I5371: also seeds executionArn from the SF context object so the decide phase can enforce a CYCLE SINGLETON (skip when an earlier dispatch execution is still RUNNING). The context object is not reachable from inside States.JsonMerge, so it is seeded here like decide_only itself.",
       "Parameters": {
         "schedInput.$": "$",
         "decideMarker": {
@@ -16,7 +16,7 @@
     },
     "DecideLaunches": {
       "Type": "Task",
-      "Comment": "config#2129: invoke the Lambda's NEW decide_only operation \u2014 enumerates the backlog (or applies the pre-boot pace gate) and returns 0..3 launch DECISIONS without launching anything. Each decision carries model/issue_filter(+pr_budget when applicable) \u2014 the config#2129 per-decision sweep-partition fields are retired (config#2201: one end-of-SF sweep box replaces per-box partitioned sweeps). Payload is schedInput merged with the decide_only marker \u2014 same pass-through-wrapper contract the old LaunchGroomSpot had, just decide instead of decide-and-launch.",
+      "Comment": "config#2129: invoke the Lambda's NEW decide_only operation — enumerates the backlog (or applies the pre-boot pace gate) and returns 0..3 launch DECISIONS without launching anything. Each decision carries model/issue_filter(+pr_budget when applicable) — the config#2129 per-decision sweep-partition fields are retired (config#2201: one end-of-SF sweep box replaces per-box partitioned sweeps). Payload is schedInput merged with the decide_only marker — same pass-through-wrapper contract the old LaunchGroomSpot had, just decide instead of decide-and-launch.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -39,7 +39,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "A genuine invoke-level failure (throttle, IAM, unhandled exception) \u2014 distinct from a clean 'nothing to launch' decide response (pace-gate skip / demand-gate skip / fail-safe enumeration-error skip), which CheckAnyLaunches below routes to AllSkipped, not here.",
+          "Comment": "A genuine invoke-level failure (throttle, IAM, unhandled exception) — distinct from a clean 'nothing to launch' decide response (pace-gate skip / demand-gate skip / fail-safe enumeration-error skip), which CheckAnyLaunches below routes to AllSkipped, not here.",
           "Next": "HandleDecideFailure",
           "ResultPath": "$.error"
         }
@@ -49,7 +49,7 @@
     },
     "CheckAnyLaunches": {
       "Type": "Choice",
-      "Comment": "IsPresent on launches[0] is the standard ASL idiom for 'array non-empty' (no native length operator). Empty covers: pace-gate skip, demand-gate skip (light queue), and the fail-safe enumeration-error skip \u2014 all clean, zero-spend, non-failure outcomes.",
+      "Comment": "IsPresent on launches[0] is the standard ASL idiom for 'array non-empty' (no native length operator). Empty covers: pace-gate skip, demand-gate skip (light queue), and the fail-safe enumeration-error skip — all clean, zero-spend, non-failure outcomes.",
       "Choices": [
         {
           "Variable": "$.decideResult.Payload.decide.launches[0]",
@@ -61,7 +61,7 @@
     },
     "AllSkipped": {
       "Type": "Pass",
-      "Comment": "Zero groom spot/WET spend \u2014 but NOT automatically healthy. This state is reached by several distinct routes and only some are benign: a demand-gate skip (light backlog) is the system correctly declining to spend, while a concurrent_cycle_skip is a cycle the backlog needed and did not get. The route travels in $.decideResult.Payload.decide.reason and is CLASSIFIED by _SKIP_REASONS in the dispatcher Lambda (alpha-engine-config-I5689) \u2014 before that table both rendered as a clean '\u2705 COMPLETE'. Deliberately NOT branched on here via JSONPath: a plain light-backlog decide carries launches:[] with no reason field at all, and a Parameters reference to an absent field raises States.Runtime that no Catch can intercept (groom-sweep-policy \u00a72.2). The pre-boot pace gate named in the previous version of this comment was DISMANTLED by Brian's 2026-07-14 ruling and is no longer a route to this state. config#2201: no longer a terminal Succeed \u2014 the zero-launches path MUST still reach DispatchEndOfSfSweep (unconditional sweep coverage is the whole point of the end-of-SF design: the drain-the-backlog end state can never starve the PR sweep).",
+      "Comment": "Zero groom spot/WET spend — but NOT automatically healthy. This state is reached by several distinct routes and only some are benign: a demand-gate skip (light backlog) is the system correctly declining to spend, while a concurrent_cycle_skip is a cycle the backlog needed and did not get. The route travels in $.decideResult.Payload.decide.reason and is CLASSIFIED by _SKIP_REASONS in the dispatcher Lambda (alpha-engine-config-I5689) — before that table both rendered as a clean '✅ COMPLETE'. Deliberately NOT branched on here via JSONPath: a plain light-backlog decide carries launches:[] with no reason field at all, and a Parameters reference to an absent field raises States.Runtime that no Catch can intercept (groom-sweep-policy §2.2). The pre-boot pace gate named in the previous version of this comment was DISMANTLED by Brian's 2026-07-14 ruling and is no longer a route to this state. config#2201: no longer a terminal Succeed — the zero-launches path MUST still reach DispatchEndOfSfSweep (unconditional sweep coverage is the whole point of the end-of-SF design: the drain-the-backlog end state can never starve the PR sweep).",
       "Result": {
         "all_skipped": true
       },
@@ -70,7 +70,7 @@
     },
     "MapLaunches": {
       "Type": "Map",
-      "Comment": "config#2129: one iteration per launch decision \u2014 up to 3 (low/mid/high co-launch is the observed steady state). Each iteration independently launches (op=launch_decided, .waitForTaskToken) and waits for the box to call send-task-success on completion. Timeout (6h) routes to the existing CheckCompletionMarker / bounded-retry relaunch loop. config-I4333: replaces the old SSM poll loop (15s intervals x hours) with a sub-second task-token callback \u2014 the sweep dispatches immediately after the last tier completes. config#4803: per-lane FailExecution replaced with RecordLaneFailure (a recording Pass) \u2014 every iteration succeeds from the Map's perspective, so a single lane failure no longer aborts its siblings mid-work. Post-Map aggregation (CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes) inspects $.mapOutcome[*].laneOutcome.laneFailed and routes to GroomMapLaunchFailed if any lane recorded a failure, preserving fail-loud at the execution level without sibling collateral.",
+      "Comment": "config#2129: one iteration per launch decision — up to 3 (low/mid/high co-launch is the observed steady state). Each iteration independently launches (op=launch_decided, .waitForTaskToken) and waits for the box to call send-task-success on completion. Timeout (6h) routes to the existing CheckCompletionMarker / bounded-retry relaunch loop. config-I4333: replaces the old SSM poll loop (15s intervals x hours) with a sub-second task-token callback — the sweep dispatches immediately after the last tier completes. config#4803: per-lane FailExecution replaced with RecordLaneFailure (a recording Pass) — every iteration succeeds from the Map's perspective, so a single lane failure no longer aborts its siblings mid-work. Post-Map aggregation (CheckMapLaneOutcomes → SetMapFailureFromLanes) inspects $.mapOutcome[*].laneOutcome.laneFailed and routes to GroomMapLaunchFailed if any lane recorded a failure, preserving fail-loud at the execution level without sibling collateral.",
       "ItemsPath": "$.decideResult.Payload.decide.launches",
       "MaxConcurrency": 3,
       "ItemSelector": {
@@ -88,7 +88,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#2311 + config#4803: a Map-level Catch here now catches only genuine Map-level failures (States.Runtime from a malformed definition, etc.) \u2014 per-lane failures no longer fail the Map (RecordLaneFailure is a Pass, not a Fail). On a Map-level failure, route through RecordMapLaunchFailure so the sweep still fires, then re-assert FAILED via CheckMapLaunchOutcome/GroomMapLaunchFailed after the sweep dispatch completes. The healthy path (Map succeeds, all iterations complete, possibly with laneOutcome.laneFailed markers) goes through CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes or DispatchEndOfSfSweep.",
+          "Comment": "config#2311 + config#4803: a Map-level Catch here now catches only genuine Map-level failures (States.Runtime from a malformed definition, etc.) — per-lane failures no longer fail the Map (RecordLaneFailure is a Pass, not a Fail). On a Map-level failure, route through RecordMapLaunchFailure so the sweep still fires, then re-assert FAILED via CheckMapLaunchOutcome/GroomMapLaunchFailed after the sweep dispatch completes. The healthy path (Map succeeds, all iterations complete, possibly with laneOutcome.laneFailed markers) goes through CheckMapLaneOutcomes → SetMapFailureFromLanes or DispatchEndOfSfSweep.",
           "Next": "RecordMapLaunchFailure",
           "ResultPath": "$.mapLaunchError"
         }
@@ -101,7 +101,7 @@
         "States": {
           "LaunchGroomSpot": {
             "Type": "Task",
-            "Comment": "config#2129 + alpha-engine-config-I4333 (task-token callback): invoke the Lambda's launch_decided operation with .waitForTaskToken so the SF pauses here until the box calls send-task-success (sub-second) instead of polling SSM every 15s for hours. The token is carried INSIDE the Payload by merging the context object's $$.Task ({Token: ...}) into the same wholesale merge \u2014 `TaskToken` is NOT a field of the Lambda Invoke API, and declaring it as a sibling of Payload is rejected at RUNTIME (not by validate-state-machine-definition), which is how the 2026-07-27 20:00 UTC run died 11s in. String-building the key with States.Format does not work either: Format cannot emit a literal brace. The Lambda reads event['Token']. The Lambda launches the box, embeds the token in the SSM command, and returns immediately \u2014 the SF ignores the return value; the callback payload IS the state output. TimeoutSeconds (6h, matching the box's own watchdog) is the SOLE authoritative bound on a lane \u2014 groom-sweep-policy \u00a72.1. A HeartbeatSeconds was declared here until 2026-07-27 with NO SendTaskHeartbeat emitter on the box, which silently made 3600s the real lane timeout and killed every run longer than an hour; do not re-add a liveness interval without a proven emitter and its states:SendTaskHeartbeat grant. Timeout routes to CheckCompletionMarkerTaskToken / the bounded relaunch loop.",
+            "Comment": "config#2129 + alpha-engine-config-I4333 (task-token callback): invoke the Lambda's launch_decided operation with .waitForTaskToken so the SF pauses here until the box calls send-task-success (sub-second) instead of polling SSM every 15s for hours. The token is carried INSIDE the Payload by merging the context object's $$.Task ({Token: ...}) into the same wholesale merge — `TaskToken` is NOT a field of the Lambda Invoke API, and declaring it as a sibling of Payload is rejected at RUNTIME (not by validate-state-machine-definition), which is how the 2026-07-27 20:00 UTC run died 11s in. String-building the key with States.Format does not work either: Format cannot emit a literal brace. The Lambda reads event['Token']. The Lambda launches the box, embeds the token in the SSM command, and returns immediately — the SF ignores the return value; the callback payload IS the state output. TimeoutSeconds (6h, matching the box's own watchdog) is the SOLE authoritative bound on a lane — groom-sweep-policy §2.1. A HeartbeatSeconds was declared here until 2026-07-27 with NO SendTaskHeartbeat emitter on the box, which silently made 3600s the real lane timeout and killed every run longer than an hour; do not re-add a liveness interval without a proven emitter and its states:SendTaskHeartbeat grant. Timeout routes to CheckCompletionMarkerTaskToken / the bounded relaunch loop.",
             "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
             "Parameters": {
               "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -130,9 +130,17 @@
               },
               {
                 "ErrorEquals": [
+                  "LaneDeath"
+                ],
+                "Comment": "alpha-engine-config-I5229/I5512. The lane reconciler sends send-task-failure(error=LaneDeath) within ~5 minutes of a box dying, instead of the SF waiting out the 6h TimeoutSeconds. Without this entry that failure fell to States.ALL -> HandleFailure, which is TERMINAL — so fast detection REPLACED recovery instead of accelerating it. Measured live on the 2026-07-30 20:00 UTC cycle: all three lanes were reclaimed for spot capacity, each launched exactly once, and none relaunched. Before the reconciler existed the same reclaim recovered via States.Timeout -> relaunch (up to 3 attempts, the last forced to on-demand). Routing LaneDeath to the SAME state as a timeout restores that recovery and keeps the 6-hour saving. ResultPath is deliberately $.timeoutError — the SAME field the States.Timeout catch writes — because GroomRetriesExhausted downstream references it. Writing a differently-named field here would leave $.timeoutError absent on this path and raise an uncatchable States.Runtime (groom-sweep-policy §2.2). Caught by test_sf_groom_field_reachability on the first run of this change. The name is the pre-existing contract, not a description of the cause; the cause is in the value.",
+                "Next": "CheckCompletionMarkerTaskToken",
+                "ResultPath": "$.timeoutError"
+              },
+              {
+                "ErrorEquals": [
                   "States.ALL"
                 ],
-                "Comment": "Launch failure (spot+on-demand exhaustion, SSM send failure, etc.) \u2014 the Lambda already terminates any partially-launched box before re-raising.",
+                "Comment": "Launch failure (spot+on-demand exhaustion, SSM send failure, etc.) — the Lambda already terminates any partially-launched box before re-raising.",
                 "Next": "HandleFailure",
                 "ResultPath": "$.error"
               }
@@ -142,7 +150,7 @@
           },
           "RelaunchNotifyGate": {
             "Type": "Choice",
-            "Comment": "Relaunch-first, notify-second (2026-07-06): only ping SNS after a successful re-launch (retry_count>0). First launch (retry_count==0) skips straight to polling. NotifyRelaunch failures must not block polling \u2014 its Catch routes to CheckLaunched.",
+            "Comment": "Relaunch-first, notify-second (2026-07-06): only ping SNS after a successful re-launch (retry_count>0). First launch (retry_count==0) skips straight to polling. NotifyRelaunch failures must not block polling — its Catch routes to CheckLaunched.",
             "Choices": [
               {
                 "Variable": "$.retry_count",
@@ -154,7 +162,7 @@
           },
           "CheckLaunchedCallback": {
             "Type": "Choice",
-            "Comment": "config-I4333: the callback output carries {groomLaunch} with the same shape the old Lambda return did. Route launched=true \u2192 GroomSucceeded (box already ran cleanly \u2014 the callback IS the completion signal), launched=false \u2192 GroomSkipped.",
+            "Comment": "config-I4333: the callback output carries {groomLaunch} with the same shape the old Lambda return did. Route launched=true → GroomSucceeded (box already ran cleanly — the callback IS the completion signal), launched=false → GroomSkipped.",
             "Choices": [
               {
                 "And": [
@@ -208,7 +216,7 @@
           },
           "CheckRetryBudget": {
             "Type": "Choice",
-            "Comment": "config#1645: marker is absent (box died mid-run) \u2014 relaunch if attempts remain, else give up and alert. Bounded to max_retries (1, i.e. up to 2 total launch attempts per iteration) so a genuinely bad AWS day can't spot-cycle indefinitely.",
+            "Comment": "config#1645: marker is absent (box died mid-run) — relaunch if attempts remain, else give up and alert. Bounded to max_retries (1, i.e. up to 2 total launch attempts per iteration) so a genuinely bad AWS day can't spot-cycle indefinitely.",
             "Choices": [
               {
                 "Variable": "$.retry_count",
@@ -220,7 +228,7 @@
           },
           "PrepRelaunch": {
             "Type": "Pass",
-            "Comment": "config#1645: bump the counter for the next attempt (each relaunch calls the Lambda fresh, which mints its own new run_token \u2014 the old attempt's absent marker is never confused with the new attempt's). Emits EXACTLY the shape LaunchGroomSpot needs (schedInput/launchDecision/fod for its Payload merge, retry_count for RelaunchNotifyGate, max_retries for CheckRetryBudget) and nothing else. Until 2026-07-27 this also carried groomPoll/groomLaunch, retired with the SSM poll loop by I4333 \u2014 the dangling reference raised an UNCATCHABLE States.Runtime here and killed the entire bounded-relaunch loop (groom-sweep-policy \u00a72.2). Every field referenced below must be produced by a predecessor on the path that reaches this state.",
+            "Comment": "config#1645: bump the counter for the next attempt (each relaunch calls the Lambda fresh, which mints its own new run_token — the old attempt's absent marker is never confused with the new attempt's). Emits EXACTLY the shape LaunchGroomSpot needs (schedInput/launchDecision/fod for its Payload merge, retry_count for RelaunchNotifyGate, max_retries for CheckRetryBudget) and nothing else. Until 2026-07-27 this also carried groomPoll/groomLaunch, retired with the SSM poll loop by I4333 — the dangling reference raised an UNCATCHABLE States.Runtime here and killed the entire bounded-relaunch loop (groom-sweep-policy §2.2). Every field referenced below must be produced by a predecessor on the path that reaches this state.",
             "Parameters": {
               "schedInput.$": "$.schedInput",
               "launchDecision.$": "$.launchDecision",
@@ -244,7 +252,7 @@
           },
           "SetForceOnDemand": {
             "Type": "Pass",
-            "Comment": "Final relaunch attempt \u2014 escalate to on-demand so a bad spot-capacity window still guarantees completion. Same field discipline as PrepRelaunch: emits only what LaunchGroomSpot and its downstream Choices actually read.",
+            "Comment": "Final relaunch attempt — escalate to on-demand so a bad spot-capacity window still guarantees completion. Same field discipline as PrepRelaunch: emits only what LaunchGroomSpot and its downstream Choices actually read.",
             "Parameters": {
               "schedInput.$": "$.schedInput",
               "launchDecision.$": "$.launchDecision",
@@ -259,11 +267,11 @@
           },
           "NotifyRelaunch": {
             "Type": "Task",
-            "Comment": "config#1645: best-effort WARNING-level ping AFTER the relaunch box is already launching (LaunchGroomSpot -> RelaunchNotifyGate -> here). A States.Format intrinsic error in Parameters is NOT catchable (States.Runtime), so this message may reference ONLY fields PrepRelaunch/SetForceOnDemand emit \u2014 it referenced the retired $.groomPoll.Status until 2026-07-27. SNS publish failures ARE catchable and route to CheckLaunchedCallback so a notify hiccup never blocks the new run.",
+            "Comment": "config#1645: best-effort WARNING-level ping AFTER the relaunch box is already launching (LaunchGroomSpot -> RelaunchNotifyGate -> here). A States.Format intrinsic error in Parameters is NOT catchable (States.Runtime), so this message may reference ONLY fields PrepRelaunch/SetForceOnDemand emit — it referenced the retired $.groomPoll.Status until 2026-07-27. SNS publish failures ARE catchable and route to CheckLaunchedCallback so a notify hiccup never blocks the new run.",
             "Resource": "arn:aws:states:::sns:publish",
             "Parameters": {
               "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-              "Subject": "Alpha Engine Backlog Groom \u2014 spot interrupted, auto-relaunching",
+              "Subject": "Alpha Engine Backlog Groom — spot interrupted, auto-relaunching",
               "Message.$": "States.Format('Backlog groom box died mid-run (task token never fired; no completion marker). Tier: {}. Relaunched automatically: attempt {} of {} (force_on_demand={}).', $.launchDecision.issue_filter, $.retry_count, $.max_retries, States.JsonToString($.fod.force_on_demand))"
             },
             "ResultPath": "$.relaunch_notify",
@@ -284,11 +292,11 @@
           },
           "GroomSkipped": {
             "Type": "Succeed",
-            "Comment": "GROOM_DISPATCH_ENABLED=false kill-switch, or config#1979's concurrent-same-tier skip \u2014 intentional no-op, not a failure."
+            "Comment": "GROOM_DISPATCH_ENABLED=false kill-switch, or config#1979's concurrent-same-tier skip — intentional no-op, not a failure."
           },
           "RecordLaneFailure": {
             "Type": "Pass",
-            "Comment": "config#4803: record lane failure in the iteration output instead of failing the Map. A Map iteration FailExecution aborts every sibling iteration mid-work (ToleratedFailurePercentage=0) \u2014 the per-lane terminal is now a recording Pass, so every iteration 'succeeds' from the Map's perspective. Post-Map aggregation (CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes) inspects $.mapOutcome[*].laneOutcome.laneFailed and routes to GroomMapLaunchFailed if any lane recorded a failure, preserving fail-loud at the execution level without sibling collateral.",
+            "Comment": "config#4803: record lane failure in the iteration output instead of failing the Map. A Map iteration FailExecution aborts every sibling iteration mid-work (ToleratedFailurePercentage=0) — the per-lane terminal is now a recording Pass, so every iteration 'succeeds' from the Map's perspective. Post-Map aggregation (CheckMapLaneOutcomes → SetMapFailureFromLanes) inspects $.mapOutcome[*].laneOutcome.laneFailed and routes to GroomMapLaunchFailed if any lane recorded a failure, preserving fail-loud at the execution level without sibling collateral.",
             "Parameters": {
               "laneFailed": true,
               "reason": "groom_lane_failure",
@@ -299,11 +307,11 @@
           },
           "LaneCompleted": {
             "Type": "Succeed",
-            "Comment": "Lane completed with failure recorded \u2014 this is a Map-iteration success, NOT a terminal lane failure. The post-Map aggregation (CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes) determines the execution outcome from $.mapOutcome[*].laneOutcome.laneFailed."
+            "Comment": "Lane completed with failure recorded — this is a Map-iteration success, NOT a terminal lane failure. The post-Map aggregation (CheckMapLaneOutcomes → SetMapFailureFromLanes) determines the execution outcome from $.mapOutcome[*].laneOutcome.laneFailed."
           },
           "GroomRetriesExhausted": {
             "Type": "Pass",
-            "Comment": "config#1645: the task token never fired on any attempt (box died mid-run each time) and the bounded relaunch budget \u2014 including the forced-on-demand final attempt \u2014 is spent. A genuine escalation, not a routine spot hiccup. Reached ONLY from CheckRetryBudget, so $.timeoutError is always present; the CheckLaunchedCallback path has its own terminal (GroomLaunchStateUnknown) because its input shape is disjoint from this one.",
+            "Comment": "config#1645: the task token never fired on any attempt (box died mid-run each time) and the bounded relaunch budget — including the forced-on-demand final attempt — is spent. A genuine escalation, not a routine spot hiccup. Reached ONLY from CheckRetryBudget, so $.timeoutError is always present; the CheckLaunchedCallback path has its own terminal (GroomLaunchStateUnknown) because its input shape is disjoint from this one.",
             "Parameters": {
               "source": "groom_status",
               "reason": "spot_interruption_retries_exhausted",
@@ -317,11 +325,11 @@
           },
           "HandleFailure": {
             "Type": "Task",
-            "Comment": "Failure alert via SNS (same topic the fleet SFs already use). No force-stop step is needed here \u2014 unlike the persistent trading instance the EOD SF guards, the groom spot box tears itself down via groom_spot_bootstrap.sh's own EXIT trap regardless of what this SF observes; there is no idle-cost risk to guard against.",
+            "Comment": "Failure alert via SNS (same topic the fleet SFs already use). No force-stop step is needed here — unlike the persistent trading instance the EOD SF guards, the groom spot box tears itself down via groom_spot_bootstrap.sh's own EXIT trap regardless of what this SF observes; there is no idle-cost risk to guard against.",
             "Resource": "arn:aws:states:::sns:publish",
             "Parameters": {
               "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-              "Subject": "Alpha Engine Backlog Groom \u2014 FAILED",
+              "Subject": "Alpha Engine Backlog Groom — FAILED",
               "Message.$": "States.Format('Backlog groom dispatch failed. Error: {}', States.JsonToString($.error))"
             },
             "ResultPath": "$.failure_notify",
@@ -340,7 +348,7 @@
           },
           "GroomLaunchStateUnknown": {
             "Type": "Pass",
-            "Comment": "config-I4333: the task-token callback returned but its payload carries no groom.launched flag \u2014 the box called send-task-success with an unrecognised shape. Distinct from the retries-exhausted path above: this one has $.callbackOutput and no $.timeoutError, so it needs its own terminal rather than sharing one whose Parameters cannot resolve here (groom-sweep-policy \u00a72.2).",
+            "Comment": "config-I4333: the task-token callback returned but its payload carries no groom.launched flag — the box called send-task-success with an unrecognised shape. Distinct from the retries-exhausted path above: this one has $.callbackOutput and no $.timeoutError, so it needs its own terminal rather than sharing one whose Parameters cannot resolve here (groom-sweep-policy §2.2).",
             "Parameters": {
               "source": "groom_status",
               "reason": "callback_payload_missing_launch_flag",
@@ -358,12 +366,16 @@
     },
     "CheckMapLaneOutcomes": {
       "Type": "Choice",
-      "Comment": "config#4803: inspect every iteration's output for a laneOutcome.laneFailed marker. Because the per-lane FailExecution was replaced with RecordLaneFailure (a Pass, not a Fail), every iteration 'succeeds' from the Map's perspective \u2014 no sibling abort. Each index is guarded by IsPresent (fewer than 3 iterations is a valid path) and BooleanEquals on laneFailed \u2014 if any lane recorded a failure, SetMapFailureFromLanes shapes the same $.mapFailure marker that RecordMapLaunchFailure (the Map's Catch) produces, so CheckMapLaunchOutcome routes to GroomMapLaunchFailed without changes and the execution still terminates FAILED for Fleet-SF Watch.",
+      "Comment": "config#4803: inspect every iteration's output for a laneOutcome.laneFailed marker. Because the per-lane FailExecution was replaced with RecordLaneFailure (a Pass, not a Fail), every iteration 'succeeds' from the Map's perspective — no sibling abort. Each index is guarded by IsPresent (fewer than 3 iterations is a valid path) and BooleanEquals on laneFailed — if any lane recorded a failure, SetMapFailureFromLanes shapes the same $.mapFailure marker that RecordMapLaunchFailure (the Map's Catch) produces, so CheckMapLaunchOutcome routes to GroomMapLaunchFailed without changes and the execution still terminates FAILED for Fleet-SF Watch.",
       "Choices": [
         {
           "And": [
             {
               "Variable": "$.mapOutcome[0]",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[0].laneOutcome.laneFailed",
               "IsPresent": true
             },
             {
@@ -381,6 +393,10 @@
             },
             {
               "Variable": "$.mapOutcome[1].laneOutcome.laneFailed",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[1].laneOutcome.laneFailed",
               "BooleanEquals": true
             }
           ],
@@ -390,6 +406,10 @@
           "And": [
             {
               "Variable": "$.mapOutcome[2]",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[2].laneOutcome.laneFailed",
               "IsPresent": true
             },
             {
@@ -404,7 +424,7 @@
     },
     "SetMapFailureFromLanes": {
       "Type": "Pass",
-      "Comment": "config#4803: at least one lane recorded laneFailed \u2192 shape the same $.mapFailure marker that RecordMapLaunchFailure (the Map Catch) produces. CheckMapLaunchOutcome's existing Choice (IsPresent on $.mapFailure) routes to GroomMapLaunchFailed unchanged \u2014 the execution still terminates FAILED for Fleet-SF Watch after the sweep dispatch completes.",
+      "Comment": "config#4803: at least one lane recorded laneFailed → shape the same $.mapFailure marker that RecordMapLaunchFailure (the Map Catch) produces. CheckMapLaunchOutcome's existing Choice (IsPresent on $.mapFailure) routes to GroomMapLaunchFailed unchanged — the execution still terminates FAILED for Fleet-SF Watch after the sweep dispatch completes.",
       "Parameters": {
         "failed": true,
         "reason": "one_or_more_lanes_failed",
@@ -417,7 +437,7 @@
     },
     "RecordMapLaunchFailure": {
       "Type": "Pass",
-      "Comment": "config#2311 no-silent-caps: shape an explicit failed:true record into $.mapFailure (mirrors RecordSweepDispatchFailure's $.sweep shape) so a Map-iteration failure is visible in the execution output. The raw error stays alongside in $.mapLaunchError. Falls through to the SAME DispatchEndOfSfSweep the healthy paths use \u2014 the sweep is unconditional regardless of how this state was reached \u2014 then CheckMapLaunchOutcome re-asserts FAILED once the sweep dispatch is done.",
+      "Comment": "config#2311 no-silent-caps: shape an explicit failed:true record into $.mapFailure (mirrors RecordSweepDispatchFailure's $.sweep shape) so a Map-iteration failure is visible in the execution output. The raw error stays alongside in $.mapLaunchError. Falls through to the SAME DispatchEndOfSfSweep the healthy paths use — the sweep is unconditional regardless of how this state was reached — then CheckMapLaunchOutcome re-asserts FAILED once the sweep dispatch is done.",
       "Parameters": {
         "failed": true,
         "reason": "map_iteration_failed",
@@ -428,7 +448,7 @@
     },
     "DispatchEndOfSfSweep": {
       "Type": "Task",
-      "Comment": "config#2201: ONE Haiku run_mode=sweep spot box per trigger cycle, launched AFTER every groom box has fully wound down (this state is reached when every Map iteration hit its own GroomSucceeded/GroomSkipped/LaneCompleted \u2014 per-lane failures now record into $.mapOutcome[*].laneOutcome rather than failing the Map, so the Map always completes) \u2014 and equally via AllSkipped when zero groom boxes launched, or SetMapFailureFromLanes when lanes failed. Payload is a LITERAL launch_decided event (no pace/demand re-check \u2014 the sweep is unconditional by design; issue_filter is inert for run_mode=sweep but the launch path validates it, so the mid-only default is passed explicitly). The dispatcher tags sweep boxes groom-issue-filter=sweep \u2014 distinct from every groom tier tag \u2014 so its config#1979 concurrent guard skips ONLY when a prior cycle's sweep box is still live (launched:false, reason=concurrent_tier_skip, recorded in $.sweep), never colliding with a live mid-only groom box. Fire-and-forget: the Lambda returns as soon as the async SSM command is delivered; no polling loop here (Brian removed the wait \u2014 the sweep box self-terminates and writes its own S3 run artifact + completion marker). NON-FATAL: a sweep-launch failure must never fail the groom SF execution \u2014 Catch records it in the execution output (no-silent-caps) + SNS-notifies, then the SF still succeeds.",
+      "Comment": "config#2201: ONE Haiku run_mode=sweep spot box per trigger cycle, launched AFTER every groom box has fully wound down (this state is reached when every Map iteration hit its own GroomSucceeded/GroomSkipped/LaneCompleted — per-lane failures now record into $.mapOutcome[*].laneOutcome rather than failing the Map, so the Map always completes) — and equally via AllSkipped when zero groom boxes launched, or SetMapFailureFromLanes when lanes failed. Payload is a LITERAL launch_decided event (no pace/demand re-check — the sweep is unconditional by design; issue_filter is inert for run_mode=sweep but the launch path validates it, so the mid-only default is passed explicitly). The dispatcher tags sweep boxes groom-issue-filter=sweep — distinct from every groom tier tag — so its config#1979 concurrent guard skips ONLY when a prior cycle's sweep box is still live (launched:false, reason=concurrent_tier_skip, recorded in $.sweep), never colliding with a live mid-only groom box. Fire-and-forget: the Lambda returns as soon as the async SSM command is delivered; no polling loop here (Brian removed the wait — the sweep box self-terminates and writes its own S3 run artifact + completion marker). NON-FATAL: a sweep-launch failure must never fail the groom SF execution — Catch records it in the execution output (no-silent-caps) + SNS-notifies, then the SF still succeeds.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -457,7 +477,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Sweep-launch failure (spot+on-demand exhaustion, SSM send failure, Lambda error) \u2014 recorded + notified below, NEVER fatal to the groom SF: the groom boxes already ran/skipped cleanly by the time this state executes, and the next trigger cycle's sweep covers the tail. The Lambda itself already terminates any partially-launched box before re-raising.",
+          "Comment": "Sweep-launch failure (spot+on-demand exhaustion, SSM send failure, Lambda error) — recorded + notified below, NEVER fatal to the groom SF: the groom boxes already ran/skipped cleanly by the time this state executes, and the next trigger cycle's sweep covers the tail. The Lambda itself already terminates any partially-launched box before re-raising.",
           "Next": "RecordSweepDispatchFailure",
           "ResultPath": "$.sweepDispatchError"
         }
@@ -478,12 +498,12 @@
     },
     "NotifySweepDispatchFailure": {
       "Type": "Task",
-      "Comment": "Best-effort WARNING ping \u2014 the sweep miss must page (no-silent-caps) but must not fail the SF; an SNS publish failure routes straight to the terminal Succeed (the $.sweep record above already persisted into the execution output).",
+      "Comment": "Best-effort WARNING ping — the sweep miss must page (no-silent-caps) but must not fail the SF; an SNS publish failure routes straight to the terminal Succeed (the $.sweep record above already persisted into the execution output).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine Backlog Groom \u2014 end-of-SF PR sweep NOT dispatched",
-        "Message.$": "States.Format('End-of-SF PR-sweep box failed to launch (config#2201) \u2014 the groom boxes themselves completed/skipped cleanly and this execution still SUCCEEDS, but this cycle has NO PR merge-readiness sweep. Next trigger cycle covers the tail. Error: {}', States.JsonToString($.sweepDispatchError))"
+        "Subject": "Alpha Engine Backlog Groom — end-of-SF PR sweep NOT dispatched",
+        "Message.$": "States.Format('End-of-SF PR-sweep box failed to launch (config#2201) — the groom boxes themselves completed/skipped cleanly and this execution still SUCCEEDS, but this cycle has NO PR merge-readiness sweep. Next trigger cycle covers the tail. Error: {}', States.JsonToString($.sweepDispatchError))"
       },
       "ResultPath": "$.sweep_notify",
       "Catch": [
@@ -500,7 +520,7 @@
     },
     "NotifyCycleComplete": {
       "Type": "Task",
-      "Comment": "2026-07-28 operator ruling: emit ONE buzzing cycle-level COMPLETE roll-up naming every lane's terminal state and the sweep's dispatch outcome. Sits on the single convergence point ahead of CheckMapLaunchOutcome so it fires on BOTH terminal routings \u2014 a cycle that ends FAILED is the one whose roll-up matters most. Before this, GroomDispatchComplete was a bare Succeed and cycle completion had no notifier on ANY rail, so the three lanes reclaimed at bootstrap on the 12:00Z cycle (config-I4987/I4989) produced total Telegram silence. Payload passes the state ROOT (\"cycle.$\": \"$\") rather than named fields because $.mapFailure is ABSENT on the two healthy paths, and a Parameters reference to an absent field raises States.Runtime, which no Catch can intercept (groom-sweep-policy \u00a72.2).",
+      "Comment": "2026-07-28 operator ruling: emit ONE buzzing cycle-level COMPLETE roll-up naming every lane's terminal state and the sweep's dispatch outcome. Sits on the single convergence point ahead of CheckMapLaunchOutcome so it fires on BOTH terminal routings — a cycle that ends FAILED is the one whose roll-up matters most. Before this, GroomDispatchComplete was a bare Succeed and cycle completion had no notifier on ANY rail, so the three lanes reclaimed at bootstrap on the 12:00Z cycle (config-I4987/I4989) produced total Telegram silence. Payload passes the state ROOT (\"cycle.$\": \"$\") rather than named fields because $.mapFailure is ABSENT on the two healthy paths, and a Parameters reference to an absent field raises States.Runtime, which no Catch can intercept (groom-sweep-policy §2.2).",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -526,7 +546,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort per groom-sweep-policy \u00a78 \u2014 a notify hiccup must never change this execution's terminal state. The Lambda handler is itself total (it catches and returns an in-band error record rather than raising), so reaching this Catch means the invoke itself failed.",
+          "Comment": "Best-effort per groom-sweep-policy §8 — a notify hiccup must never change this execution's terminal state. The Lambda handler is itself total (it catches and returns an in-band error record rather than raising), so reaching this Catch means the invoke itself failed.",
           "Next": "CheckMapLaunchOutcome",
           "ResultPath": "$.cycleNotifyError"
         }
@@ -536,7 +556,7 @@
     },
     "CheckMapLaunchOutcome": {
       "Type": "Choice",
-      "Comment": "config#2311: every path (MapLaunches success, AllSkipped, RecordMapLaunchFailure) converges here AFTER the end-of-SF sweep has already been attempted, so the sweep's unconditional-coverage guarantee holds regardless of which branch set this. IsPresent (not BooleanEquals \u2014 the field is absent on the two healthy paths, and referencing an absent path in a non-IsPresent rule is a States.Runtime error) routes a genuine Map-iteration failure to GroomMapLaunchFailed so the execution still terminates FAILED for Fleet-SF Watch, instead of the pre-fix behavior where reaching this point meant the failure was silently absorbed.",
+      "Comment": "config#2311: every path (MapLaunches success, AllSkipped, RecordMapLaunchFailure) converges here AFTER the end-of-SF sweep has already been attempted, so the sweep's unconditional-coverage guarantee holds regardless of which branch set this. IsPresent (not BooleanEquals — the field is absent on the two healthy paths, and referencing an absent path in a non-IsPresent rule is a States.Runtime error) routes a genuine Map-iteration failure to GroomMapLaunchFailed so the execution still terminates FAILED for Fleet-SF Watch, instead of the pre-fix behavior where reaching this point meant the failure was silently absorbed.",
       "Choices": [
         {
           "Variable": "$.mapFailure",
@@ -549,19 +569,19 @@
     "GroomMapLaunchFailed": {
       "Type": "Fail",
       "Error": "GroomMapLaunchFailure",
-      "Cause": "One or more groom launch lanes failed (see $.mapFailure / the per-lane SNS alert). The end-of-SF PR sweep was still dispatched unconditionally (see $.sweep) \u2014 this execution is marked FAILED so Fleet-SF Watch alerts on the underlying lane failure."
+      "Cause": "One or more groom launch lanes failed (see $.mapFailure / the per-lane SNS alert). The end-of-SF PR sweep was still dispatched unconditionally (see $.sweep) — this execution is marked FAILED so Fleet-SF Watch alerts on the underlying lane failure."
     },
     "GroomDispatchComplete": {
       "Type": "Succeed",
-      "Comment": "Terminal success (config#2201/config#2311): every co-launched iteration reached its own GroomSucceeded/GroomSkipped, OR the zero-launches AllSkipped path \u2014 and in EITHER case the end-of-SF sweep dispatch was attempted, with its outcome recorded in $.sweep (launched box, concurrent-sweep skip, kill-switch skip, or dispatched:false failure record). A genuine Map-iteration failure never reaches here \u2014 CheckMapLaunchOutcome routes it to GroomMapLaunchFailed instead, after the sweep still fires."
+      "Comment": "Terminal success (config#2201/config#2311): every co-launched iteration reached its own GroomSucceeded/GroomSkipped, OR the zero-launches AllSkipped path — and in EITHER case the end-of-SF sweep dispatch was attempted, with its outcome recorded in $.sweep (launched box, concurrent-sweep skip, kill-switch skip, or dispatched:false failure record). A genuine Map-iteration failure never reaches here — CheckMapLaunchOutcome routes it to GroomMapLaunchFailed instead, after the sweep still fires."
     },
     "HandleDecideFailure": {
       "Type": "Task",
-      "Comment": "Top-level failure alert \u2014 reached ONLY by DecideLaunches's Catch (a genuine invoke-level failure computing the decision itself, before any box exists). Per-iteration launch/poll/relaunch failures use their OWN copy of HandleFailure/RecordLaneFailure inside MapLaunches's ItemProcessor, scoped to that one tier \u2014 ASL requires globally-unique state names even across a Map's nested ItemProcessor, hence the distinct Decide-prefixed names here.",
+      "Comment": "Top-level failure alert — reached ONLY by DecideLaunches's Catch (a genuine invoke-level failure computing the decision itself, before any box exists). Per-iteration launch/poll/relaunch failures use their OWN copy of HandleFailure/RecordLaneFailure inside MapLaunches's ItemProcessor, scoped to that one tier — ASL requires globally-unique state names even across a Map's nested ItemProcessor, hence the distinct Decide-prefixed names here.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine Backlog Groom \u2014 FAILED",
+        "Subject": "Alpha Engine Backlog Groom — FAILED",
         "Message.$": "States.Format('Backlog groom dispatch decide-phase failed. Error: {}', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
@@ -581,7 +601,7 @@
     "DecideFailExecution": {
       "Type": "Fail",
       "Error": "GroomDispatchFailure",
-      "Cause": "Backlog groom dispatch failed during the decide phase \u2014 see the SNS alert / Lambda logs for detail."
+      "Cause": "Backlog groom dispatch failed during the decide phase — see the SNS alert / Lambda logs for detail."
     }
   },
   "TimeoutSeconds": 25200

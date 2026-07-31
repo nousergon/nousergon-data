@@ -116,6 +116,30 @@ WATCH_KINDS: tuple[WatchKind, ...] = (
         label="Alert-drain",
         result_key="alert_drain_incomplete_reaps",
     ),
+    # alpha-engine-config-I5752: Think Tank was the fourth box class and the
+    # only one still missing a row here — the same miss ci-watch, sf-watch and
+    # alert-drain each closed before it. Its box runs the daily challenger arm
+    # (config-I5208 §47 cutover), and a box that overruns its 2.5h watchdog and
+    # reaches this reaper's 6.5h age cap was terminated with nobody told.
+    #
+    # This row covers the HANG end specifically. The fast-fail end is covered
+    # on the box itself: crucible-research#558 made
+    # thinktank_spot_bootstrap.sh's on_exit publish to alpha-engine-alerts on a
+    # non-zero rc, which is the window flow-doctor cannot see (a failure before
+    # the Python run configures it). Neither is a substitute for the other.
+    #
+    # completion_prefix + the two discriminator tags match that script's
+    # COMPLETION_KEY exactly:
+    # thinktank/_control/completed/{trading_day}-{run_token}.json — and the
+    # marker is written on the SUCCESS PATH ONLY (principles.md §2.7), so a
+    # failed run leaves no marker and this row fires rather than reading green.
+    WatchKind(
+        tag_name="alpha-engine-thinktank-spot",
+        completion_prefix="thinktank/_control/completed/",
+        discriminator_tag_keys=("thinktank-trading-day", "thinktank-run-token"),
+        label="Think-Tank",
+        result_key="thinktank_incomplete_reaps",
+    ),
 )
 _WATCH_KIND_BY_TAG_NAME: dict[str, WatchKind] = {wk.tag_name: wk for wk in WATCH_KINDS}
 _ALL_DISCRIMINATOR_TAG_KEYS: tuple[str, ...] = tuple(

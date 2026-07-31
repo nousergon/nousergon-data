@@ -232,3 +232,113 @@ def test_task_token_travels_inside_the_lambda_payload(states):
 def test_wait_for_task_token_resource_still_declared(states):
     """The token plumbing above is only meaningful with the callback integration."""
     assert states["LaunchGroomSpot"]["Resource"].endswith(".waitForTaskToken")
+
+
+# ── I5229 regression: fast detection must ACCELERATE recovery, not replace it ──
+
+
+def _lane_state():
+    import json
+    from pathlib import Path
+    d = json.loads((Path(__file__).resolve().parents[1]
+                    / "infrastructure" / "step_function_groom.json").read_text())
+    m = [v for v in d["States"].values() if v.get("Type") == "Map"][0]
+    return ((m.get("ItemProcessor") or m.get("Iterator"))["States"]
+            ["LaunchGroomSpot"])
+
+
+def test_lane_death_routes_to_the_relaunch_path_not_the_terminal_one():
+    """The reconciler must not convert a recoverable death into a dead lane.
+
+    The lane reconciler sends send-task-failure(error="LaneDeath") within ~5
+    minutes of a box dying. Before this Catch entry existed that failure fell
+    through to States.ALL -> HandleFailure, which is TERMINAL — so shipping the
+    reconciler made recovery strictly WORSE: a spot reclaim used to recover via
+    States.Timeout -> CheckCompletionMarkerTaskToken -> relaunch (3 attempts,
+    the last forced to on-demand), and instead failed permanently.
+
+    Measured live, 2026-07-30 20:00 UTC: all three lanes reclaimed for spot
+    capacity, `LaunchGroomSpot` visited exactly 3 times (once per lane), zero
+    visits to CheckCompletionMarkerTaskToken or PrepRelaunch.
+    """
+    catches = _lane_state()["Catch"]
+    routes = {tuple(c["ErrorEquals"]): c["Next"] for c in catches}
+    assert ("LaneDeath",) in routes, (
+        "no Catch for the reconciler's LaneDeath error — a detected lane death "
+        "falls to States.ALL and the lane never relaunches"
+    )
+    timeout_target = routes[("States.Timeout",)]
+    assert routes[("LaneDeath",)] == timeout_target, (
+        "LaneDeath must route to the SAME state as States.Timeout "
+        f"({timeout_target}) — fast detection should accelerate the existing "
+        "recovery, never bypass it"
+    )
+
+
+def test_lane_death_catch_precedes_the_catch_all():
+    """Order matters: States.ALL first would make the LaneDeath entry dead."""
+    catches = _lane_state()["Catch"]
+    order = [tuple(c["ErrorEquals"]) for c in catches]
+    assert order.index(("LaneDeath",)) < order.index(("States.ALL",)), (
+        "the LaneDeath Catch sits after States.ALL and is therefore unreachable"
+    )
+
+
+# ── §2.1: ONE authoritative runtime bound for a lane ─────────────────────────
+
+
+def _dispatcher_max_runtime() -> int:
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+           / "scheduled-groom-dispatcher" / "index.py").read_text()
+    m = re.search(r'GROOM_MAX_RUNTIME_SECONDS",\s*"(\d+)"', src)
+    assert m, "could not read MAX_RUNTIME_SECONDS from the dispatcher"
+    return int(m.group(1))
+
+
+def test_runtime_bound_is_single_and_authoritative():
+    """The box must never outlive the lane the SF is waiting on.
+
+    groom-sweep-policy §2.1: "where two mechanisms bound the same thing, the
+    TIGHTER one is the real budget regardless of intent."
+
+    Measured 2026-07-30 — three copies that did not agree:
+
+        SF LaunchGroomSpot TimeoutSeconds   10800s (180 min)  <- real budget
+        dispatcher MAX_RUNTIME_SECONDS      21600s (360 min)
+        bootstrap watchdog default          21600s (360 min)
+
+    The failure is not cosmetic. The SF abandons the lane at 180 min and fires
+    a relaunch while the ORIGINAL box works on for another three hours; the
+    relaunch's concurrent-tier guard then refuses because that box is alive —
+    the alpha-engine-config-I4987 no-op relaunch, manufactured on a timer. The
+    reconciler was mis-armed identically: deadline_utc was now + 360 min, so a
+    lane the SF had already given up on stayed 'not overdue' for three hours.
+    """
+    lane_timeout = _lane_state()["TimeoutSeconds"]
+    box_bound = _dispatcher_max_runtime()
+    assert box_bound <= lane_timeout, (
+        f"the box may run {box_bound}s but the SF abandons the lane at "
+        f"{lane_timeout}s — every timeout leaves an orphan box that blocks its "
+        "own relaunch"
+    )
+
+
+def test_the_runtime_bound_reaches_the_box():
+    """A constant the box never receives is not a bound.
+
+    groom_spot_bootstrap.sh reads `${MAX_RUNTIME_SECONDS:-<default>}`. If the
+    dispatcher does not export it, the box silently uses its own default and
+    the value tested above governs nothing on the machine it is about.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+           / "scheduled-groom-dispatcher" / "index.py").read_text()
+    assert "export MAX_RUNTIME_SECONDS=" in src, (
+        "the dispatcher never exports MAX_RUNTIME_SECONDS, so the box falls "
+        "back to its own default and the two can diverge freely"
+    )
+    assert "{runtime_bound_export}" in src, (
+        "the export is built but never interpolated into the bootstrap command"
+    )

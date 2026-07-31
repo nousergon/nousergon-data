@@ -535,3 +535,73 @@ def test_lanes_that_launched_are_unaffected_by_the_skip_classifier(dispatcher):
     assert out["lanes"] == 2
     assert out["skip_reason"] is None
     assert out["skip_healthy"] is None, "skip_healthy is meaningless when lanes ran"
+
+
+# ── Independent sweep schedules (Brian's ruling 2026-07-30) ──────────────────
+
+
+def _deploy_sh() -> str:
+    from pathlib import Path
+    return (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+            / "scheduled-groom-dispatcher" / "deploy.sh").read_text(encoding="utf-8")
+
+
+def test_sweep_has_its_own_schedules_not_only_the_groom_tail():
+    """The sweep must not be hostage to groom health.
+
+    It ran only as DispatchEndOfSfSweep — the last state of the groom cycle —
+    so when two of three cycles ended in `concurrent_cycle_skip` on 2026-07-30,
+    the sweep did not run on either. It has no dependency on groom OUTPUT, so
+    the coupling bought nothing.
+    """
+    sh = _deploy_sh()
+    assert "SWEEP_SCHED_NAMES=(" in sh, "no independent sweep schedules defined"
+    for hhmm in ("0000", "0800", "1600"):
+        assert f"alpha-engine-groom-sweep-{hhmm}-daily" in sh, (
+            f"missing the {hhmm} UTC sweep rule")
+
+
+def test_sweep_rules_sit_outside_the_pruned_prefix():
+    """Step 2f deletes any rule under SCHED_PREFIX absent from SCHED_NAMES.
+
+    SCHED_NAMES entries target the STEP FUNCTION (a full groom cycle); the
+    sweep rules target the LAMBDA with run_mode=sweep. Sharing the prefix would
+    have them silently deleted on the very next deploy.
+    """
+    import re
+    sh = _deploy_sh()
+    prefix = re.search(r'SCHED_PREFIX="([^"]+)"', sh).group(1)
+    block = sh.split("SWEEP_SCHED_NAMES=(", 1)[1].split(")", 1)[0]
+    for name in re.findall(r'"([^"]+)"', block):
+        assert not name.startswith(prefix), (
+            f"sweep rule {name!r} starts with the pruned prefix {prefix!r} — "
+            "it would be deleted on the next deploy"
+        )
+
+
+def test_sweep_schedule_interleaves_with_the_groom():
+    """Each sweep must land between grooms, not on top of one.
+
+    groom 04/12/20 UTC daily, sweep 00/08/16 UTC — every daily groom is swept
+    4h later. The Sun 09:00 UTC weekly slot is an extra and is excluded: it is
+    not part of the daily interleave.
+    """
+    import re
+    sh = _deploy_sh()
+
+    def hours(block_name: str) -> list[int]:
+        block = sh.split(block_name, 1)[1].split(")\n", 1)[0]
+        # Daily rules only: `cron(0 H * * ? *)`. The weekly is `? * SUN *`.
+        return sorted(int(h) for h in
+                      re.findall(r'cron\(0 (\d+) \* \* \? \*\)', block))
+
+    groom = hours("SCHED_CRONS=(")
+    sweep = hours("SWEEP_SCHED_CRONS=(")
+    assert groom and sweep, f"could not parse schedules: groom={groom} sweep={sweep}"
+    assert not (set(groom) & set(sweep)), (
+        f"a sweep fires at the same hour as a groom: {sorted(set(groom) & set(sweep))}"
+    )
+    for g in groom:
+        assert any((s - g) % 24 == 4 for s in sweep), (
+            f"groom at {g:02d}:00 UTC has no sweep 4h later; sweeps={sweep}"
+        )

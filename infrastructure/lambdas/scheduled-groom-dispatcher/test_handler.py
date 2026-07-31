@@ -2619,3 +2619,59 @@ def test_reconciler_fixtures_are_not_date_pinned():
         f"date-pinned ledger partition(s) in test fixtures: {sorted(set(pinned))} — "
         "derive the partition from the clock via _ledger_key() instead"
     )
+
+
+def test_reconciler_pages_a_death_only_once(monkeypatch):
+    """An actioned expectation is a CLOSED expectation.
+
+    Brian, 2026-07-30: "why are the groom lane death error messages repeating?
+    they should be sent one time only." The reconciler paged and sent
+    send-task-failure but recorded nothing, so every 5-minute tick re-detected
+    the same dead lane and paged again. The per-run_token dedup key on the
+    notification did not hold across invocations.
+    """
+    ledger = {
+        _ledger_key("tok-dead"): json.dumps({
+            "run_token": "tok-dead", "tier_tag": "mid-only",
+            "schedule": "0 20 * * *", "instance_id": "i-dead",
+            "deadline_utc": _future_deadline(),
+        }).encode(),
+    }
+    idx = _load(monkeypatch, s3_objects=dict(ledger))
+
+    first = idx.handler({"mode": "reconcile"}, None)
+    assert first["deaths"] == 1, "the first tick must detect and page the death"
+
+    # The second tick runs against the SAME bucket the first one wrote to.
+    second = idx.handler({"mode": "reconcile"}, None)
+    assert second["deaths"] == 0, (
+        "the reconciler re-detected an already-actioned lane death — this is "
+        "the repeating-alert defect: it pages every 5 minutes until the ledger "
+        "entry ages out of the scan window"
+    )
+    assert second["open_expectations"] == 0
+
+
+def test_actioned_marker_is_not_written_to_the_completed_prefix(monkeypatch):
+    """A death must not be indistinguishable from a clean completion.
+
+    `completed/` means "the box finished its work and said so". Writing a
+    reclaimed lane into it would corrupt that meaning for every other consumer,
+    so the reconciler uses its own prefix.
+    """
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok-dead"): json.dumps({
+            "run_token": "tok-dead", "tier_tag": "mid-only",
+            "schedule": "0 20 * * *", "instance_id": "i-dead",
+            "deadline_utc": _future_deadline(),
+        }).encode(),
+    })
+    idx.handler({"mode": "reconcile"}, None)
+    written = getattr(idx._test_s3, "_objects", {})
+    completed = [k for k in written if "_control/completed/" in k]
+    actioned = [k for k in written if "_control/reconciled/" in k]
+    assert not completed, (
+        f"reconciler wrote into the completed/ prefix: {completed} — a dead "
+        "lane would read as a successful one"
+    )
+    assert actioned, "no reconciled/ marker written; the expectation stays open"

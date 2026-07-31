@@ -386,10 +386,13 @@ EOF
   # short Lambda invocation.
   RECON_SCHED_NAME="alpha-engine-groom-lane-reconciler-5min"
   RECON_SCHED_CRON="rate(5 minutes)"
-  recon_target=$(cat <<EOF
-{"Arn":"${FN_ARN}","RoleArn":"${SCHED_ROLE_ARN}","Input":"{\\\"mode\\\":\\\"reconcile\\\"}"}
-EOF
-)
+  # Built with python3, NOT a heredoc. In an unquoted heredoc bash unescapes
+  # only \$, \`, \\ and \<newline> — a backslash before a double quote is
+  # PRESERVED. So `\\\"` emitted `\\"` rather than `\"`, and every
+  # create-schedule call died on `Invalid JSON: Expecting ',' delimiter`.
+  # Counting backslashes through two layers of quoting is not a thing to get
+  # right by inspection; json.dumps cannot get it wrong.
+  recon_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"mode": "reconcile"})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}")
   echo "  Applying Scheduler invoke-Lambda policy for the reconciler"
   run aws iam put-role-policy \
     --role-name "${SCHED_ROLE_NAME}" \
@@ -421,6 +424,74 @@ EOF
       --query 'Name' --output text >/dev/null \
       || { echo "ERROR: reconciler rule ${RECON_SCHED_NAME} not found after create/update" >&2; exit 1; }
   fi
+
+  # --- 2e-ter. INDEPENDENT sweep schedules (Brian's ruling 2026-07-30).
+  #
+  # Until now the PR sweep ran only as DispatchEndOfSfSweep, the last state of
+  # the groom cycle — so sweep frequency was hostage to groom health. That is
+  # not theoretical: on 2026-07-30 two of three cycles ended in
+  # `concurrent_cycle_skip`, and the sweep did not run on either. The sweep has
+  # no dependency on groom OUTPUT (it classifies open PRs), so the coupling
+  # bought nothing.
+  #
+  # These rules give it its own trigger, interleaved 4h after each groom:
+  #
+  #   groom  04:00 12:00 20:00 UTC   (9pm / 5am / 1pm PT — unchanged)
+  #   sweep  00:00 08:00 16:00 UTC   (5pm / 1am / 9am PT)
+  #
+  # DispatchEndOfSfSweep is deliberately KEPT. groom-sweep-policy §2.5 makes it
+  # the unconditional tail-catcher — "making it conditional on groom success
+  # starves it exactly when it is most needed" — and removing it is an
+  # orchestration change requiring a policy amendment, not a schedule tweak.
+  # Keeping both yields a sweep roughly every 4h at one cheap box per run.
+  #
+  # Collisions are already handled: the dispatcher tags sweep boxes
+  # `groom-issue-filter=sweep`, distinct from every groom tier tag, so the
+  # config#1979 concurrent guard skips when a prior sweep box is still live.
+  #
+  # NAMED OUTSIDE SCHED_PREFIX on purpose. Step 2f prunes any live rule under
+  # `alpha-engine-scheduled-groom-` that is absent from SCHED_NAMES, and
+  # SCHED_NAMES entries target the STEP FUNCTION (a full groom cycle). These
+  # target the LAMBDA with run_mode=sweep, so a shared prefix would have them
+  # deleted on the next deploy.
+  SWEEP_SCHED_NAMES=(
+    "alpha-engine-groom-sweep-0000-daily"
+    "alpha-engine-groom-sweep-0800-daily"
+    "alpha-engine-groom-sweep-1600-daily"
+  )
+  SWEEP_SCHED_CRONS=(
+    "cron(0 0 * * ? *)"
+    "cron(0 8 * * ? *)"
+    "cron(0 16 * * ? *)"
+  )
+  # Mirrors the DispatchEndOfSfSweep payload in step_function_groom.json:
+  # a literal launch_decided sweep event. `issue_filter` is inert for
+  # run_mode=sweep but the launch path validates it, so it is passed
+  # explicitly rather than defaulted.
+  for i in "${!SWEEP_SCHED_NAMES[@]}"; do
+    sname="${SWEEP_SCHED_NAMES[$i]}"
+    scron="${SWEEP_SCHED_CRONS[$i]}"
+    sweep_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"run_mode": "sweep", "launch_decided": True, "model": "deepseek-v4-flash", "issue_filter": "mid-only", "schedule": sys.argv[3]})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}" "${sname}")
+    if aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
+        --query 'Name' --output text >/dev/null 2>&1; then
+      echo "  Updating sweep rule: ${sname} → ${scron}"
+      run aws scheduler update-schedule --name "${sname}" \
+        --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
+        --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
+        --region "${REGION}" --query 'ScheduleArn' --output text
+    else
+      echo "  Creating sweep rule: ${sname} → ${scron}"
+      run aws scheduler create-schedule --name "${sname}" \
+        --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
+        --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
+        --region "${REGION}" --query 'ScheduleArn' --output text
+    fi
+    if ! $DRY_RUN; then
+      aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
+        --query 'Name' --output text >/dev/null \
+        || { echo "ERROR: sweep rule ${sname} not found after create/update" >&2; exit 1; }
+    fi
+  done
 
   # --- 2f. Prune reconciliation: delete any live rule under SCHED_PREFIX that is
   # no longer in SCHED_NAMES (so dropping a cadence above removes it live too,

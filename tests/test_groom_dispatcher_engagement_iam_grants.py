@@ -211,3 +211,79 @@ def test_send_task_failure_is_unscoped_because_iam_permits_nothing_narrower():
         "scoping evaluates implicitDeny and disables the reconciler's only "
         "means of reporting a dead lane."
     )
+
+
+# ── I4989 / I5512: capacity diversification and deploy-trigger coverage ──────
+
+
+def _dispatcher_source() -> str:
+    return (POLICY_FILE.parent / "index.py").read_text(encoding="utf-8")
+
+
+def test_instance_pool_spans_more_than_one_family():
+    """Two types in one family is one capacity pool, not a diversified one.
+
+    Measured 2026-07-30 20:00 UTC: the pool was t4g.medium + t4g.large and all
+    three lanes were reclaimed (`instance-terminated-no-capacity`) at the same
+    second, 6.5 minutes in, taking out the entire cycle.
+    """
+    import re
+    src = _dispatcher_source()
+    m = re.search(r'"GROOM_INSTANCE_TYPES",\s*\n?\s*"([^"]+)"', src)
+    assert m, "could not read the GROOM_INSTANCE_TYPES default"
+    types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    families = {t.split(".")[0] for t in types}
+    assert len(families) >= 3, (
+        f"instance pool spans only {sorted(families)} — spot capacity is pooled "
+        "per family, so a single-family list gives no real diversification"
+    )
+
+
+def test_instance_pool_is_all_arm64_families():
+    """One AMI serves one architecture; an x86 type here fails at launch.
+
+    GROOM_AMI_ID is Amazon Linux 2023 arm64/Graviton. Adding an x86 type would
+    not diversify anything — it would produce launch failures.
+    """
+    import re
+    src = _dispatcher_source()
+    m = re.search(r'"GROOM_INSTANCE_TYPES",\s*\n?\s*"([^"]+)"', src)
+    types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    # arm64 families in use are Graviton: t4g / c6g / c7g / m6g / m7g / r6g...
+    for t in types:
+        fam = t.split(".")[0]
+        assert fam.endswith("g"), (
+            f"{t!r} is not an arm64/Graviton type but GROOM_AMI_ID is arm64 — "
+            "this launch would fail the AMI architecture check"
+        )
+
+
+def test_launch_records_the_instance_type_it_actually_got():
+    """A diversified pool is only manageable if usage-by-type is countable."""
+    src = _dispatcher_source()
+    assert "_describe_instance_type" in src, (
+        "nothing records which instance type won the capacity race — reclaim "
+        "rate by type is then unanswerable, which is the question a "
+        "diversified pool creates"
+    )
+    assert '"instance_type"' in src and '"market"' in src, (
+        "the dispatch ledger does not carry instance_type/market — terminated "
+        "instances age out of describe-instances in ~1h, so the ledger is the "
+        "only durable record"
+    )
+
+
+def test_state_machine_definition_is_in_the_deploy_trigger():
+    """A merged definition change that never deploys is the I5512 class.
+
+    deploy.sh deploys the state machine as well as the Lambda, but the trigger
+    only watched the Lambda directory — so definition-only changes reached
+    production by luck. Two did so on 2026-07-30.
+    """
+    from pathlib import Path
+    wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+          / "deploy-scheduled-groom-dispatcher.yml").read_text(encoding="utf-8")
+    assert "infrastructure/step_function_groom.json" in wf, (
+        "the deploy workflow does not trigger on the state-machine definition "
+        "— a definition-only merge will not reach production"
+    )

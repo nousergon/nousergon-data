@@ -1,0 +1,91 @@
+name: Deploy thinktank-spot-dispatcher
+
+# Auto-deploy the alpha-engine-thinktank-spot-dispatcher Lambda CODE on merge to main.
+# Mirrors deploy-alert-drain-dispatcher.yml -- same gap, same fix: a merged
+# code fix must not sit inert until someone remembers to run deploy.sh by hand.
+#
+# Added alongside alpha-engine-config-I5752 (2026-07-30), which is the concrete
+# case: that change is inert without a deploy, and pull-request-policy.md §4.2
+# admits exactly three forms of post-merge step -- automated on merge, applied
+# in-session before the PR, or operator-gated as a SECURITY boundary with a
+# detector that stays red until it runs. A Lambda code deploy is none of the
+# last two, and "file an issue to deploy later" is the alpha-engine-config-I1906
+# anti-pattern (an issue closed as fixed on a PR whose command was never run).
+# So: form 1.
+#
+# Separation of concerns: CODE ONLY. deploy.sh's flagless run is already
+# code-only; --bootstrap is what ADDS IAM-role and Lambda-function creation on
+# top, and --apply-iam re-applies the policy. The github-actions-lambda-deploy
+# OIDC role deliberately holds no iam:CreateRole / iam:PutRolePolicy (fleet-wide
+# after 4 IAM-clobber incidents in 2 months; see
+# nous-ergon-ops/infrastructure/iam/README.md), so an IAM or EventBridge change
+# still requires an operator to run --bootstrap by hand. That is the boundary,
+# and it is deliberate.
+#
+# IAM: no new grant needed -- LambdaUpdate already covers
+# arn:...:function:alpha-engine-* , which includes alpha-engine-thinktank-spot-dispatcher.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/thinktank-spot-dispatcher/**'
+      - '.github/workflows/deploy-thinktank-spot-dispatcher.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-thinktank-spot-dispatcher-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy thinktank-spot-dispatcher Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy thinktank-spot-dispatcher (code-only -- no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/thinktank-spot-dispatcher/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-thinktank-spot-dispatcher \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-thinktank-spot-dispatcher.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

@@ -32,6 +32,16 @@ on:
     paths:
       - 'infrastructure/lambdas/scheduled-groom-dispatcher/**'
       - '.github/workflows/deploy-scheduled-groom-dispatcher.yml'
+      # alpha-engine-config-I5512. deploy.sh deploys the STATE MACHINE as well
+      # as the Lambda, but this trigger only watched the Lambda directory — so
+      # a definition-only change reached production purely by luck, whenever a
+      # Lambda change happened to ride along in the same merge. Two changes hit
+      # that on 2026-07-30: the I5689 AllSkipped comment, and the I5229
+      # LaneDeath Catch, which merged and stayed un-deployed until it was
+      # pushed by hand. groom-sweep-policy §2.3: "config-only changes must
+      # reach production — either the trigger covers the path, or the file does
+      # not live outside it."
+      - 'infrastructure/step_function_groom.json'
   workflow_dispatch:
 
 concurrency:

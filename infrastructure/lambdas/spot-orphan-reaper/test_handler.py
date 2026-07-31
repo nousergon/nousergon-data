@@ -75,7 +75,8 @@ def index_module(monkeypatch):
 def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c5.large",
          ci_watch_repo: str | None = None, ci_watch_sha: str | None = None,
          sf_watch_cadence: str | None = None, sf_watch_pipeline: str | None = None,
-         sf_watch_run_date: str | None = None, alert_drain_run_id: str | None = None):
+         sf_watch_run_date: str | None = None, alert_drain_run_id: str | None = None,
+         thinktank_trading_day: str | None = None, thinktank_run_token: str | None = None):
     """Build a mock describe-instances entry."""
     tags = [{"Key": "Name", "Value": name}]
     if ci_watch_repo is not None:
@@ -90,6 +91,10 @@ def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c
         tags.append({"Key": "sf-watch-run-date", "Value": sf_watch_run_date})
     if alert_drain_run_id is not None:
         tags.append({"Key": "alert-drain-run-id", "Value": alert_drain_run_id})
+    if thinktank_trading_day is not None:
+        tags.append({"Key": "thinktank-trading-day", "Value": thinktank_trading_day})
+    if thinktank_run_token is not None:
+        tags.append({"Key": "thinktank-run-token", "Value": thinktank_run_token})
     return {
         "InstanceId": instance_id,
         "InstanceType": instance_type,
@@ -410,3 +415,89 @@ class TestAlertDrainIncompleteReapAlert:
         assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
         assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
         assert len(index_module._test_send_message.calls) == 3
+
+
+class TestThinkTankIncompleteReapAlert:
+    """alpha-engine-config-I5752 — Think Tank was the fourth box class and the
+    only one still missing a WATCH_KINDS row, so a box that overran its 2.5h
+    watchdog and reached the 6.5h age cap was terminated with nobody told.
+
+    This row covers the HANG end. The fast-fail end is covered on the box
+    (crucible-research#558: `on_exit` publishes to alpha-engine-alerts on a
+    non-zero rc, the window flow-doctor cannot see). Neither substitutes for
+    the other, which is why both exist.
+    """
+
+    def test_reaped_without_marker_fires_alert(self, index_module):
+        spots = [_spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                       thinktank_trading_day="2026-07-30", thinktank_run_token="tok123")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert out["terminated"] == ["i-tt"]
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        s3.head_object.assert_called_once_with(
+            Bucket="alpha-engine-research",
+            Key="thinktank/_control/completed/2026-07-30-tok123.json",
+        )
+        assert len(index_module._test_send_message.calls) == 1
+        (text,), kwargs = index_module._test_send_message.calls[0]
+        assert "reaped WITHOUT completing" in text
+        assert "tok123" in text
+        assert kwargs["disable_notification"] is False
+
+    def test_reaped_with_marker_present_does_not_alert(self, index_module):
+        spots = [_spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                       thinktank_trading_day="2026-07-30", thinktank_run_token="tok123")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["terminated"] == ["i-tt"]
+        assert out["thinktank_incomplete_reaps"] == []
+        assert index_module._test_send_message.calls == []
+
+    def test_missing_discriminator_tags_treated_as_incomplete(self, index_module):
+        """A box reaped with either tag absent cannot be looked up either way;
+        since config#2292 tagging is atomic with RunInstances, so this is a
+        genuine anomaly worth the alert rather than the old launch->tag race."""
+        spots = [_spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                       thinktank_trading_day="2026-07-30")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        s3.head_object.assert_not_called()
+        assert len(index_module._test_send_message.calls) == 1
+
+    def test_the_key_matches_what_the_box_actually_writes(self, index_module):
+        """The contract between two repos, asserted rather than assumed.
+
+        `thinktank_spot_bootstrap.sh` writes
+        thinktank/_control/completed/${TRADING_DAY}-${RUN_TOKEN}.json. If the
+        tuple order in WATCH_KINDS or the prefix ever drifts from that, the
+        reaper looks up a key nothing writes and EVERY reap alerts — noisy
+        rather than silent, but wrong either way.
+        """
+        kind = next(
+            wk for wk in index_module.WATCH_KINDS
+            if wk.tag_name == "alpha-engine-thinktank-spot"
+        )
+        key = index_module._completion_key(
+            kind,
+            {"thinktank-trading-day": "2026-07-30", "thinktank-run-token": "deadbeef"},
+        )
+        assert key == "thinktank/_control/completed/2026-07-30-deadbeef.json"
+
+    def test_all_four_watch_kinds_independently_tracked(self, index_module):
+        spots = [
+            _spot("i-ciwatch", "alpha-engine-ci-watch-spot", age_seconds=THRESHOLD + 600,
+                 ci_watch_repo="nousergon/alpha-engine-config", ci_watch_sha="abc123"),
+            _spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600,
+                 sf_watch_cadence="saturday", sf_watch_pipeline="ne-weekly-freshness-pipeline",
+                 sf_watch_run_date="2026-07-11"),
+            _spot("i-drain", "alpha-engine-alert-drain-spot", age_seconds=THRESHOLD + 600,
+                 alert_drain_run_id="drain-2026-07-22T1200Z"),
+            _spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                 thinktank_trading_day="2026-07-30", thinktank_run_token="tok123"),
+        ]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert set(out["terminated"]) == {"i-ciwatch", "i-sfwatch", "i-drain", "i-tt"}
+        assert out["ci_watch_incomplete_reaps"] == ["i-ciwatch"]
+        assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
+        assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        assert len(index_module._test_send_message.calls) == 4

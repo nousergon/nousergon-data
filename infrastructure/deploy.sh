@@ -3,7 +3,8 @@
 #
 # Container image deployment (ECR) — same pattern as research + predictor.
 # Function: alpha-engine-data-collector
-#   - Timeout: 600s (10 min, ~30 tickers of alternative data)
+#   - Timeout: 900s (15 min, Lambda max standard — was 600s for ~30 tickers;
+#     now servicing 900+ tickers via concurrent ThreadPoolExecutor)
 #   - Memory: 1024 MB (see LAMBDA_MEMORY_MB below)
 #   - Triggered by Step Functions (Saturday pipeline)
 #
@@ -52,7 +53,7 @@ BUCKET="alpha-engine-research"
 # because the OOM'd invocations were also running ~460s of a 600s timeout, and
 # Lambda scales CPU with memory — the headroom buys margin on both axes.
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-1024}"
-LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-600}"
+LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-900}"
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION" 2>/dev/null || echo "ACCOUNT_ID")
 ROLE_ARN="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-data-role}"

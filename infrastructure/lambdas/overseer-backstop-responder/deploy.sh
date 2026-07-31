@@ -73,14 +73,13 @@ LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${LAMBDAS_DIR}/../.." && pwd)"
 REGISTRY_SRC="${REPO_ROOT}/infrastructure/overseer/playbooks.yaml"
 
-# ----- 0b. Run unit tests ---------------------------------------------------
-
-echo "Running unit tests..."
-python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -v --tb=short 2>&1 || {
-  echo "TESTS FAILED — aborting deploy"
-  exit 1
-}
-echo "Tests passed."
+# ----- 0b. Preflight handler unit tests (shared gate — config#2381) ----------
+# Delegates to the one _shared/run_handler_tests.sh so this gate can never
+# re-drift into the naive no-install `python3 -m pytest` form (config#2295).
+# Handler imports boto3 (Lambda runtime built-in) at module scope, and tests
+# stub it via unittest.mock — boto3 must be installed for the import to work.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3
 
 # ----- 1. Package: zip handler + playbooks registry -------------------------
 

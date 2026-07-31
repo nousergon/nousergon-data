@@ -71,6 +71,44 @@ SCHEMA_VERSION = 1
 # must not leave a hole.
 DEFAULT_LOOKBACK_MIN = int(os.environ.get("RECONCILE_LOOKBACK_MIN", "90"))
 
+# ── Fallback series (alpha-engine-config-I5727) ──────────────────────────────
+# A spot->on-demand ESCALATION is a different event from a reclaim and none of
+# this Lambda's eviction paths can see one: nothing was interrupted, no instance
+# state changed, and there is no BidEvictedEvent, because there was no eviction.
+# It is a decision taken at launch because spot capacity was refused.
+#
+# nousergon-lib v0.124.23 records that decision ON the box, as LaunchMarket /
+# LaunchReason tags riding the same RunInstances call. Those tags are in the
+# CloudTrail RunInstances record this Lambda ALREADY fetches and indexes for
+# reclaim attribution — so the sweep below costs no additional API calls, only
+# a second read of an index that is already in memory.
+# Deliberately a SUB-prefix of the interruption series, not a sibling
+# `overseer/fallbacks`. The sibling reads better and costs an operator step: this
+# Lambda's role is granted s3:PutObject on `overseer/interruptions/*` only, and
+# widening it would make the PR undeployable by the merge button alone
+# (pull-request-policy.md §4.2 — and iam-policy-change-guard enforces exactly
+# that, correctly). An S3 prefix name is not a security boundary, so paying a
+# standing human step for a naming preference is the wrong trade. `_fallbacks`
+# cannot collide with the date-partitioned record keys beside it.
+FALLBACK_PREFIX = os.environ.get("FALLBACK_PREFIX", "overseer/interruptions/_fallbacks")
+FALLBACK_SCHEMA_VERSION = 1
+
+LAUNCH_MARKET_TAG = "LaunchMarket"
+LAUNCH_REASON_TAG = "LaunchReason"
+REASON_SPOT_OK = "spot_ok"
+#: Reasons that mean an escalation off spot happened. Mirrors
+#: nousergon_lib.spot_dispatch.FALLBACK_REASONS. Kept as a literal rather than
+#: imported because this Lambda's requirements.txt does not pull the library,
+#: and a lockstep on a four-string vocabulary is worse than a duplicated
+#: constant that a test pins (see test_fallback_reason_vocabulary_matches_lib).
+FALLBACK_REASONS = ("capacity_exhausted", "quota_exceeded", "force_on_demand")
+#: A launch whose provenance tags are absent. NOT folded into spot_ok: the box
+#: may predate v0.124.23, or have been launched by a path that bypasses
+#: launch_with_fallback. Either way it is un-classified, and reporting it as a
+#: successful spot launch would be the absence-reads-as-health defect this
+#: series exists to close.
+REASON_MISSING = "provenance_missing"
+
 # Tag keys that name the unit of work, most specific first. These are keys the
 # fleet's launchers already set; a new launcher adds its key here rather than
 # inventing a parallel tagging scheme.
@@ -350,6 +388,9 @@ def _unattributable_record(event_id: str, occurred: datetime) -> dict:
 # ── Modes ────────────────────────────────────────────────────────────────────
 
 
+_LAST_WINDOW: dict = {}
+
+
 def _reconcile(lookback_min: int, until: datetime | None = None) -> dict:
     """Sweep CloudTrail evictions and record any not already recorded."""
     end = until or _now()
@@ -360,6 +401,10 @@ def _reconcile(lookback_min: int, until: datetime | None = None) -> dict:
     # built exactly once however many evictions the window holds. Per-eviction
     # windows would each miss the cache and re-scan.
     launch_since = start - timedelta(days=_launch_lookback_days())
+
+    # Published so the fallback sweep runs over the identical window and the
+    # identical RunInstances index rather than recomputing either.
+    _LAST_WINDOW.update({"start": start, "end": end, "launch_since": launch_since})
 
     written, skipped, gaps = [], 0, 0
     for ev in events:
@@ -414,6 +459,116 @@ def _from_event(event: dict) -> dict:
     return {"mode": "event", "instance_id": iid, "written": key or "already-recorded"}
 
 
+def _fallback_key(launched_at: datetime, event_id: str) -> str:
+    return f"{FALLBACK_PREFIX}/{launched_at.strftime('%Y-%m-%d')}/{event_id}.json"
+
+
+def _daily_key(day: str) -> str:
+    return f"{FALLBACK_PREFIX}/_daily/{day}.json"
+
+
+def _classify(tags: dict) -> str:
+    """Total classifier. An unrecognised LaunchReason is returned verbatim
+    rather than bucketed, so a value added to the library and not here shows up
+    as itself instead of silently joining spot_ok."""
+    reason = tags.get(LAUNCH_REASON_TAG)
+    return reason if reason else REASON_MISSING
+
+
+def _build_fallback_record(*, event_id: str, instance_id: str, item: dict,
+                           ev: dict, tags: dict, reason: str) -> dict:
+    rp = ev.get("requestParameters") or {}
+    return {
+        "schema_version": FALLBACK_SCHEMA_VERSION,
+        "event_id": event_id,
+        "instance_id": instance_id,
+        "launched_at": ev.get("eventTime"),
+        "recorded_at": _iso(_now()),
+        "reason": reason,
+        "market": tags.get(LAUNCH_MARKET_TAG),
+        "instance_type": item.get("instanceType") or rp.get("instanceType"),
+        "availability_zone": (item.get("placement") or {}).get("availabilityZone"),
+        "workload": _workload_from_tags(tags),
+        "tags": tags,
+        # Mirrors the interruption series: a launch nothing can attribute to a
+        # lane is recorded WITH the gap flagged, never dropped.
+        "attribution_gap": _workload_from_tags(tags) is None,
+    }
+
+
+def _sweep_fallbacks(start: datetime, end: datetime, launch_since: datetime) -> dict:
+    """Classify every launch in [start, end) by its provenance tags.
+
+    Reads the RunInstances index built by the reclaim reconciler in the same
+    invocation — see the module note on FALLBACK_PREFIX. ``launch_since`` is the
+    index's own window and is passed explicitly rather than recomputed, so a
+    future change to one cannot silently desynchronise the other.
+
+    Returns per-lane counts INCLUDING the denominator. A fallback count with no
+    launch count is not a rate, and a rate is the thing the spot-vs-on-demand
+    ruling's revisit condition is written against.
+    """
+    lanes: dict[str, dict[str, int]] = {}
+    written: list[str] = []
+    for iid, rec in _run_instances_index(launch_since).items():
+        ev, item = rec["event"], rec["item"]
+        launched_raw = ev.get("eventTime")
+        if not launched_raw:
+            continue
+        try:
+            launched = _parse_iso(launched_raw)
+        except ValueError:
+            continue
+        if not (start <= launched < end):
+            continue
+
+        tags = {}
+        for spec in ((ev.get("requestParameters") or {}).get("tagSpecificationSet")
+                     or {}).get("items", []):
+            tags.update(_tags_to_dict(spec.get("tags")))
+        reason = _classify(tags)
+        lane = _workload_from_tags(tags) or "_unattributed"
+        counts = lanes.setdefault(lane, {"launches": 0})
+        counts["launches"] += 1
+        counts[reason] = counts.get(reason, 0) + 1
+
+        if reason in FALLBACK_REASONS:
+            event_id = ev.get("eventID", "") or f"{iid}-{launched_raw}"
+            key = _fallback_key(launched, event_id)
+            if not _exists(key):
+                _s3().put_object(
+                    Bucket=BUCKET, Key=key,
+                    Body=json.dumps(_build_fallback_record(
+                        event_id=event_id, instance_id=iid, item=item, ev=ev,
+                        tags=tags, reason=reason), indent=2).encode(),
+                    ContentType="application/json",
+                )
+                written.append(key)
+
+    summary = {
+        "schema_version": FALLBACK_SCHEMA_VERSION,
+        "window_start": _iso(start),
+        "window_end": _iso(end),
+        "recorded_at": _iso(_now()),
+        "lanes": lanes,
+        "launches": sum(c["launches"] for c in lanes.values()),
+        "fallbacks": sum(c.get(r, 0) for c in lanes.values() for r in FALLBACK_REASONS),
+        "provenance_missing": sum(c.get(REASON_MISSING, 0) for c in lanes.values()),
+        "written": written,
+    }
+    # The rollup is overwritten every sweep for the day it ends in — idempotent, and
+    # the freshest window wins. Its absence is what a consumer must render as
+    # stale; an empty `lanes` means "swept, saw nothing", which is different.
+    _s3().put_object(
+        Bucket=BUCKET, Key=_daily_key(end.strftime("%Y-%m-%d")),
+        Body=json.dumps(summary, indent=2).encode(),
+        ContentType="application/json",
+    )
+    logger.info("fallback sweep: %d launch(es), %d fallback(s), %d without provenance",
+                summary["launches"], summary["fallbacks"], summary["provenance_missing"])
+    return summary
+
+
 def handler(event, context):  # noqa: ANN001, ARG001
     """Modes:
       EC2 EventBridge notification      low-latency single-instance record
@@ -433,5 +588,17 @@ def handler(event, context):  # noqa: ANN001, ARG001
             raise _RecorderError(f"backfill days={days} exceeds CloudTrail's 90-day retention")
         return _reconcile(lookback_min=days * 24 * 60)
     if mode == "reconcile":
-        return _reconcile(lookback_min=int(event.get("lookback_min", DEFAULT_LOOKBACK_MIN)))
+        out = _reconcile(lookback_min=int(event.get("lookback_min", DEFAULT_LOOKBACK_MIN)))
+        # Same invocation, same window, same already-built RunInstances index —
+        # the fallback sweep adds no CloudTrail calls (I5727). Failing it must
+        # not lose the reclaim result that already succeeded, so it is reported
+        # rather than raised: the reclaim series is the higher-value artifact
+        # and the error lands in the return value AND the log, never silently.
+        try:
+            out["fallbacks"] = _sweep_fallbacks(
+                _LAST_WINDOW["start"], _LAST_WINDOW["end"], _LAST_WINDOW["launch_since"])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("fallback sweep failed")
+            out["fallbacks"] = {"error": repr(exc)}
+        return out
     raise _RecorderError(f"unknown mode {mode!r}")

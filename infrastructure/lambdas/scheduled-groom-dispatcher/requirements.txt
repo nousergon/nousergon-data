@@ -55,4 +55,4 @@ boto3>=1.34.0
 # The exemption is removed and the tier-model floor is asserted explicitly in
 # tests/test_lib_pin_lockstep.py::test_groom_dispatcher_pin_can_express_the_policy_tier_table.
 # Bump this in lockstep with the root pin.
-nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.24
+nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.25
