@@ -15,7 +15,7 @@ setuptools>=83.0.0
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
 embit>=0.8.0
 numpy>=2.4.6
-feedparser>=6.0.12
+feedparser>=6.0.14
 beautifulsoup4>=4.15.0
 lxml>=6.1.1
 edgartools>=5.44.0
