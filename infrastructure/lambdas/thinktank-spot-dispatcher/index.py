@@ -51,6 +51,7 @@ one is validated by a REAL run).
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import uuid
@@ -172,7 +173,41 @@ exec bash infrastructure/thinktank_spot_bootstrap.sh
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _trading_day() -> str:
+    """The UTC date the box will also compute at exit.
+
+    The box derives its completion-marker key from ``date -u +%Y-%m-%d`` in
+    ``thinktank_spot_bootstrap.sh``'s ``on_exit``; the reaper derives the key it
+    looks up from these tags. Both must agree, and they agree because a Think
+    Tank box cannot span UTC midnight: dispatch is 14:30 UTC and
+    ``RUN_TIMEOUT_SECONDS`` is 2h, leaving ~7h of margin.
+
+    That is an invariant, not a coincidence, so
+    ``test_handler.py::test_the_box_cannot_span_utc_midnight`` fails if anyone
+    moves the schedule or raises the timeout into the boundary rather than
+    discovering the mismatch as a silently-missing marker.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _discriminator_tags(run_token: str) -> dict[str, str]:
+    """Tags spot-orphan-reaper reconstructs the completion-marker key from.
+
+    Joined with '-' and suffixed '.json' onto the WatchKind's
+    ``completion_prefix``, these must reproduce exactly the key the box writes:
+    ``thinktank/_control/completed/{trading_day}-{run_token}.json``. Key order
+    here is the tuple order in ``WATCH_KINDS`` — the reaper joins by that
+    tuple, not by dict order.
+    """
+    return {
+        "thinktank-trading-day": _trading_day(),
+        "thinktank-run-token": run_token,
+    }
+
+
+def _launch_instance(
+    run_token: str, force_on_demand: bool = False
+) -> tuple[str, str]:
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES,
         SUBNETS,
@@ -184,6 +219,10 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         tag_name=INSTANCE_TAG_NAME,
         region=REGION,
         force_on_demand=force_on_demand,
+        # Atomic with RunInstances, never a post-launch create_tags: a box
+        # reaped inside the tagging window would be unlookupable either way
+        # (config#2292, the root fix for config#2267 site 2).
+        extra_tags=_discriminator_tags(run_token),
     )
 
 
@@ -254,7 +293,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     run_token = uuid.uuid4().hex
     try:
-        instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+        instance_id, market = _launch_instance(run_token, force_on_demand=force_on_demand)
     except SpotLaunchError:
         logger.error("thinktank-spot launch failed (spot + on-demand exhausted)")
         raise

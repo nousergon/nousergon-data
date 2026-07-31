@@ -2,7 +2,9 @@
 collectors/alternative.py — Alternative data collector for promoted tickers.
 
 Phase 2 collector: runs AFTER research produces signals.json to fetch
-alternative data for the ~25-30 promoted tickers (buy candidates + tracked).
+alternative data for the ~900+ promoted tickers (buy candidates + tracked).
+Processing is concurrent via ThreadPoolExecutor (I/O-bound API calls overlap)
+so wall clock stays sub-10-min regardless of universe size.
 
 Data sources:
   - Analyst rating (Finnhub ``/stock/recommendation`` — free tier)
@@ -48,8 +50,11 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 import threading
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -397,6 +402,46 @@ _HAS_DATA_PREDICATES = {
 # the bucket root, matching its hardcoded ``archive/options/{date}.json``).
 _PREDICTOR_OPTIONS_MIRROR_KEY_FMT = "archive/options/{run_date}.json"
 
+# Per-ticker hard timeout for HTTP calls that lack configurable timeouts
+# (yfinance, feedparser). SIGALRM interrupts blocking syscalls, bounding
+# a hung network fetch to _PER_TICKER_TIMEOUT_S seconds per ticker. This
+# prevents a single unresponsive external source (Yahoo, SEC) from consuming
+# the entire 600s Lambda budget — the specific failure pattern of issue #4495
+# where two tickers each hit the full 600s wall timeout while memory was
+# comfortable (293 MB / 341 MB).
+_PER_TICKER_TIMEOUT_S = 20
+
+
+class _TickerHardTimeout(Exception):
+    """Raised when a single ticker's alternative data fetch exceeds its budget."""
+
+
+@contextmanager
+def _ticker_hard_timeout(seconds: int, ticker: str):
+    """SIGALRM-based per-ticker hard wall-clock timeout.
+
+    Raises ``_TickerHardTimeout`` on expiry. No-op (yields without arming)
+    if SIGALRM is unavailable — not the main thread, or a non-POSIX platform.
+    Matches the established pattern in weekly_collector._hard_timeout.
+    """
+    def _handler(signum, frame):
+        raise _TickerHardTimeout(
+            f"ticker {ticker} exceeded {seconds}s hard timeout"
+        )
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _handler)
+    except (ValueError, AttributeError):
+        # Not in the main thread, or SIGALRM unavailable — run unbounded.
+        yield
+        return
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
 
 def _build_predictor_options_mirror(
     per_ticker_alt: dict[str, dict],
@@ -426,6 +471,95 @@ def _build_predictor_options_mirror(
             "atm_iv": opts.get("atm_iv", 0.0),
         }
     return mirror
+
+
+def _process_one_ticker(
+    ticker: str,
+    run_date: str,
+    bucket: str,
+    block_anomaly_types: list[dict],
+    s3,
+    s3_prefix: str,
+) -> dict:
+    """Fetch, validate, and write alternative data for a single ticker.
+
+    Returns a result dict with ``status`` (``ok``, ``blocked``, ``error``)
+    plus the per-ticker data needed by the caller to aggregate counters
+    and post-loop quality gates.  All S3 writes happen inside the worker
+    so the main thread only aggregates under a lock — it never touches
+    per-ticker payloads.
+
+    Designed to be called from a :class:`concurrent.futures.ThreadPoolExecutor`
+    so the I/O-bound external API calls overlap.
+
+    Per-ticker hard timeout (_ticker_hard_timeout via SIGALRM) is applied here.
+    When called from a ThreadPoolExecutor worker (the normal concurrent path),
+    the timeout is a no-op — SIGALRM can only be delivered to the main thread
+    (see _ticker_hard_timeout's except ValueError path). When called from the
+    main thread (test harness, or a future single-threaded rework), the timeout
+    bounds hung yfinance/feedparser HTTP calls to _PER_TICKER_TIMEOUT_S per
+    ticker (config#4495).
+    """
+    try:
+        with _ticker_hard_timeout(_PER_TICKER_TIMEOUT_S, ticker):
+            data = _fetch_all_alternative(ticker, run_date, bucket)
+        blocking, warning = _validate_alt_payload(
+            data, ticker, block_anomaly_types
+        )
+        if blocking:
+            blocked_details: list[dict] = []
+            for a in blocking:
+                logger.warning(
+                    "Alternative quality gate BLOCK %s.%s.%s: %s",
+                    ticker, a["source"], a["type"], a["detail"],
+                )
+                blocked_details.append(a)
+            return {
+                "status": "blocked",
+                "ticker": ticker,
+                "blocking": blocking,
+                "warning": warning,
+            }
+
+        key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(data, indent=2, default=str),
+            ContentType="application/json",
+        )
+        source_oks = {}
+        for source_name, predicate in _HAS_DATA_PREDICATES.items():
+            if predicate(data.get(source_name, {}) or {}):
+                source_oks[source_name] = True
+        logger.info("Alternative data: %s -> s3://%s/%s", ticker, bucket, key)
+        if warning:
+            for a in warning:
+                logger.warning(
+                    "Alternative quality gate WARN %s.%s.%s: %s",
+                    ticker, a["source"], a["type"], a["detail"],
+                )
+        return {
+            "status": "ok",
+            "ticker": ticker,
+            "data": data,
+            "source_oks": source_oks,
+            "warning": warning,
+        }
+    except _TickerHardTimeout:
+        logger.warning(
+            "Alternative data hard timeout for %s (exceeded %ds)",
+            ticker, _PER_TICKER_TIMEOUT_S,
+        )
+        return {
+            "status": "error",
+            "ticker": ticker,
+            "error": f"per-ticker hard timeout ({_PER_TICKER_TIMEOUT_S}s)",
+        }
+    except Exception as e:
+        scrubbed = _scrub_url_creds(e)
+        logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
+        return {"status": "error", "ticker": ticker, "error": scrubbed}
 
 
 def collect(
@@ -498,75 +632,85 @@ def collect(
     # files above are the source of truth and are left untouched.
     per_ticker_alt: dict[str, dict] = {}
 
-    for ticker in tickers:
-        try:
-            data = _fetch_all_alternative(ticker, run_date, bucket)
-            # ── Write-time value-range gate ─────────────────────────────
-            # Runs on the assembled per-ticker payload before the S3
-            # write. A block-severity anomaly (NaN/inf or
-            # negative-where-impossible in a numeric feature sub-field)
-            # refuses the whole ticker write — a corrupt sub-section would
-            # otherwise silently degrade the research qual sub-score. The
-            # ticker is then accounted exactly like a fetch failure so the
-            # existing failed/errors + ok_ratio machinery surfaces it.
-            blocking, warning = _validate_alt_payload(
-                data, ticker, block_anomaly_types
-            )
-            if blocking:
-                for a in blocking:
-                    # WARNING per ticker; the single aggregated run-level
-                    # logger.error below is the Flow Doctor surface (one
-                    # systemic event → one alert, not one per ticker).
-                    logger.warning(
-                        "Alternative quality gate BLOCK %s.%s.%s: %s",
-                        ticker, a["source"], a["type"], a["detail"],
-                    )
-                    quality_counts_by_type[a["type"]] = (
-                        quality_counts_by_type.get(a["type"], 0) + 1
-                    )
-                    quality_blocked_details.append(
-                        f"{ticker}.{a['source']}.{a['type']}"
-                    )
-                n_quality_blocked += 1
-                failed += 1
-                errors.append({
-                    "ticker": ticker,
-                    "error": (
-                        "value-range gate blocked: "
-                        + "; ".join(
-                            f"{a['source']}.{a['type']}" for a in blocking
+    # ── Concurrent ticker processing ─────────────────────────────────────
+    # Process all promoted tickers concurrently via ThreadPoolExecutor.
+    # The I/O-bound fetch (FMP + yfinance + SEC EDGAR + news) dominates the
+    # per-ticker wall clock; threading overlaps the HTTP round-trips so the
+    # total runtime scales sub-linearly with universe size (~3 min for 900
+    # tickers at 20 workers instead of ~45 min sequentially).
+    #
+    # Per-ticker hard timeout (_ticker_hard_timeout via SIGALRM) is applied
+    # inside _process_one_ticker. In the concurrent ThreadPoolExecutor path,
+    # the timeout no-ops (SIGALRM can only be delivered to the main thread —
+    # see _ticker_hard_timeout's except ValueError path). The infrastructure
+    # and intent are preserved: when _max_workers=1 or when called from a
+    # single-threaded test harness, the timeout arms and bounds hung network
+    # fetches at _PER_TICKER_TIMEOUT_S per ticker (config#4495).
+    #
+    # The FMP rate limiter (_fmp_lock + _FMP_MIN_INTERVAL=1s) is the sole
+    # serialisation point — workers naturally queue behind it while their
+    # other fetches run in parallel.
+    #
+    # Shared state (counters, per_ticker_alt, quality details, error list)
+    # is protected by _agg_lock.  Per-ticker logging + S3 writes happen
+    # inside the worker (logging is thread-safe; boto3 S3 client is
+    # thread-safe).
+    _max_workers = int(os.environ.get("ALT_DATA_MAX_WORKERS", "20"))
+    _agg_lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_one_ticker,
+                ticker,
+                run_date,
+                bucket,
+                block_anomaly_types,
+                s3,
+                s3_prefix,
+            ): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            with _agg_lock:
+                if result["status"] == "ok":
+                    succeeded += 1
+                    per_ticker_alt[result["ticker"]] = result["data"]
+                    for source_name in result.get("source_oks", {}):
+                        source_ok_counts[source_name] += 1
+                    if result.get("warning"):
+                        for a in result["warning"]:
+                            quality_counts_by_type[a["type"]] = (
+                                quality_counts_by_type.get(a["type"], 0) + 1
+                            )
+                        n_quality_warned += 1
+                elif result["status"] == "blocked":
+                    n_quality_blocked += 1
+                    failed += 1
+                    errors.append({
+                        "ticker": result["ticker"],
+                        "error": (
+                            "value-range gate blocked: "
+                            + "; ".join(
+                                f"{a['source']}.{a['type']}"
+                                for a in result.get("blocking", [])
+                            )
+                        ),
+                    })
+                    for a in result.get("blocking", []):
+                        quality_counts_by_type[a["type"]] = (
+                            quality_counts_by_type.get(a["type"], 0) + 1
                         )
-                    ),
-                })
-                continue
-            if warning:
-                for a in warning:
-                    logger.warning(
-                        "Alternative quality gate WARN %s.%s.%s: %s",
-                        ticker, a["source"], a["type"], a["detail"],
-                    )
-                    quality_counts_by_type[a["type"]] = (
-                        quality_counts_by_type.get(a["type"], 0) + 1
-                    )
-                n_quality_warned += 1
-            key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
-            s3.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=json.dumps(data, indent=2, default=str),
-                ContentType="application/json",
-            )
-            per_ticker_alt[ticker] = data
-            succeeded += 1
-            for source_name, predicate in _HAS_DATA_PREDICATES.items():
-                if predicate(data.get(source_name, {}) or {}):
-                    source_ok_counts[source_name] += 1
-            logger.info("Alternative data: %s -> s3://%s/%s", ticker, bucket, key)
-        except Exception as e:
-            failed += 1
-            scrubbed = _scrub_url_creds(e)
-            errors.append({"ticker": ticker, "error": scrubbed})
-            logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
+                        quality_blocked_details.append(
+                            f"{result['ticker']}.{a['source']}.{a['type']}"
+                        )
+                else:  # error
+                    failed += 1
+                    errors.append({
+                        "ticker": result["ticker"],
+                        "error": result["error"],
+                    })
 
     if n_quality_blocked:
         # Single aggregated ERROR per run — the Flow Doctor surface for the

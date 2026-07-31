@@ -320,6 +320,69 @@ def collect(
             type(e).__name__, e,
         )
 
+    # ── RAG corpus ingest — ONE FETCH, TWO WRITE TARGETS ─────────────────────
+    #
+    # config-I5702 / rag-corpus-policy.md §2.3. These are the SAME articles the
+    # weekly RAGIngestion step used to re-fetch: this job already pulls them
+    # every weekday for the same decision set, and used to write them only to
+    # the analytics prefix above. The weekly sweep then paid Polygon a second
+    # time for an overlapping window.
+    #
+    # That split was by WRITE TARGET, not by fetch — "waste dressed as
+    # separation of concerns" (§2.3). Splitting the writes is right; splitting
+    # the fetch was not. Ingesting here is what makes the corpus WARM, which is
+    # what lets Saturday read instead of fetch.
+    #
+    # FAIL-SOFT, same acceptable category as the two writes above: (a) failure
+    # mode swallowed — the corpus ingest fails (pgvector down, Voyage
+    # throttled); (b) the primary deliverable, the daily aggregate, already
+    # landed and the morning brief is unaffected; (c) recording surface — a
+    # WARN here, ``rag_status`` on the returned dict, and — load-bearing — the
+    # watermarks are NOT advanced, so the gap stays outstanding and the next
+    # run (daily or weekly) picks it up rather than it becoming a silent hole.
+    rag_status = "ok"
+    rag_stats: dict[str, int] = {}
+    if dry_run:
+        rag_status = "skipped_dry_run"
+        logger.info("[daily_news] dry-run — skipping RAG corpus ingest")
+    else:
+        try:
+            from rag.pipelines._watermarks import WatermarkStore
+            from rag.pipelines.ingest_news import ingest_articles
+            from rag.pipelines.run_news_pipeline import (
+                NEWS_DOC_TYPE,
+                NEWS_SOURCE,
+                _load_ticker_sector_map,
+            )
+
+            rag_stats = ingest_articles(
+                articles=articles,
+                filed_date=agg_date,
+                ticker_to_sector=_load_ticker_sector_map(universe),
+            )
+            logger.info("[daily_news] RAG corpus ingest: %s", rag_stats)
+
+            if rag_stats.get("n_failures"):
+                rag_status = "partial"
+                logger.warning(
+                    "[daily_news] %d RAG ingest failure(s) — watermarks NOT "
+                    "advanced; the gap stays outstanding for the next run",
+                    rag_stats["n_failures"],
+                )
+            else:
+                wm = WatermarkStore(NEWS_SOURCE, bucket=bucket, s3_client=s3_client)
+                for t in universe:
+                    wm.advance(t, NEWS_DOC_TYPE)
+                wm.flush()
+        except Exception as e:  # noqa: BLE001 — fail-soft secondary (see above)
+            rag_status = "error"
+            logger.warning(
+                "[daily_news] RAG corpus ingest FAILED (%s: %s) — daily "
+                "aggregate already landed; watermarks NOT advanced so the "
+                "weekly path still sees the gap",
+                type(e).__name__, e,
+            )
+
     # ── Podcast-ready combined digest (portfolio + macro + tech) ─────────────
     # Combines the per-ticker article records ALREADY in memory (portfolio
     # section) with curated macro/tech RSS headlines (topic_news) into a single
@@ -418,6 +481,15 @@ def collect(
         "digest_key": digest_key,
         "digest_total": digest_total,
         "topic_status": topic_status,
+        # config-I5702: corpus-ingest outcome. `rag_status != "ok"` means the
+        # corpus did NOT warm this run, so Saturday's freshness assertion will
+        # see the gap — which is the intended, visible degradation rather than
+        # a silent one.
+        "rag_status": rag_status,
+        "rag_documents_ingested": int(rag_stats.get("n_documents_ingested", 0)),
+        "rag_documents_skipped_exists": int(
+            rag_stats.get("n_documents_skipped_exists", 0)
+        ),
     }
 
 

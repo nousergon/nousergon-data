@@ -71,9 +71,42 @@ def aws(monkeypatch):
     return types.SimpleNamespace(s3=s3, ec2=ec2, ct=ct)
 
 
+def _puts(aws, prefix):
+    """Every object written under a prefix, as (key, body) pairs.
+
+    A reconcile tick now writes to TWO series — the interruption records and
+    the I5727 fallback rollup — so reading `call_args` (the LAST write) picks
+    whichever ran last rather than the one under test.
+    """
+    return [(c.kwargs["Key"], json.loads(c.kwargs["Body"].decode()))
+            for c in aws.s3.put_object.call_args_list
+            if c.kwargs["Key"].startswith(prefix)]
+
+
+FALLBACK_PREFIX = "overseer/interruptions/_fallbacks/"
+
+
+def _interruptions(aws):
+    """Reclaim records only. The I5727 fallback series is a SUB-prefix of this
+    one (it rides the same S3 grant), so a plain prefix match catches both."""
+    return [(k, b) for k, b in _puts(aws, "overseer/interruptions/")
+            if not k.startswith(FALLBACK_PREFIX)]
+
+
 def _written(aws):
-    assert aws.s3.put_object.called, "no record was written"
-    return json.loads(aws.s3.put_object.call_args.kwargs["Body"].decode())
+    got = _interruptions(aws)
+    assert got, "no interruption record was written"
+    return got[-1][1]
+
+
+def _fallback_daily(aws):
+    got = _puts(aws, "overseer/interruptions/_fallbacks/_daily/")
+    assert got, "no fallback rollup was written"
+    return got[-1][1]
+
+
+def _fallback_records(aws):
+    return [b for k, b in _puts(aws, FALLBACK_PREFIX) if "/_daily/" not in k]
 
 
 # ── reconcile ────────────────────────────────────────────────────────────────
@@ -96,7 +129,7 @@ def test_reconcile_records_a_real_eviction_with_full_attribution(aws):
 def test_record_key_is_partitioned_by_the_event_date_not_today(aws):
     """A backfill run must not file historical events under the run date."""
     index.handler({"mode": "reconcile"}, None)
-    key = aws.s3.put_object.call_args.kwargs["Key"]
+    key = _interruptions(aws)[-1][0]
     assert key.startswith("overseer/interruptions/2026-07-28/")
     assert REAL_EVICTION["eventID"] in key
 
@@ -106,7 +139,9 @@ def test_already_recorded_is_skipped_not_rewritten(aws):
     aws.s3.head_object.return_value = {}
     out = index.handler({"mode": "reconcile"}, None)
     assert out["records_written"] == 0 and out["already_recorded"] == 1
-    aws.s3.put_object.assert_not_called()
+    # The fallback rollup still writes every tick by design (its absence is
+    # what a consumer renders as stale), so assert on the SERIES under test.
+    assert not _interruptions(aws)
 
 
 def test_multi_instance_eviction_yields_distinct_records(aws):
@@ -115,7 +150,7 @@ def test_multi_instance_eviction_yields_distinct_records(aws):
     aws.ct.lookup_events.return_value = {"Events": [{"CloudTrailEvent": json.dumps(ev)}]}
     out = index.handler({"mode": "reconcile"}, None)
     assert out["records_written"] == 2
-    keys = [c.kwargs["Key"] for c in aws.s3.put_object.call_args_list]
+    keys = [k for k, _ in _interruptions(aws)]
     assert len(set(keys)) == 2, f"event_ids collided: {keys}"
 
 
@@ -223,7 +258,9 @@ def test_on_demand_termination_is_not_a_reclaim(aws):
         "detail": {"instance-id": "i-07d70f8f1ca48020c", "state": "terminated"},
     }, None)
     assert "skipped" in out
-    aws.s3.put_object.assert_not_called()
+    # The fallback rollup still writes every tick by design (its absence is
+    # what a consumer renders as stale), so assert on the SERIES under test.
+    assert not _interruptions(aws)
 
 
 def test_running_state_change_is_ignored(aws):
@@ -232,7 +269,9 @@ def test_running_state_change_is_ignored(aws):
         "detail": {"instance-id": "i-x", "state": "running"},
     }, None)
     assert out["skipped"] == "state=running"
-    aws.s3.put_object.assert_not_called()
+    # The fallback rollup still writes every tick by design (its absence is
+    # what a consumer renders as stale), so assert on the SERIES under test.
+    assert not _interruptions(aws)
 
 
 def test_event_without_instance_id_raises(aws):
@@ -319,3 +358,140 @@ def test_index_is_built_once_within_a_single_run(aws):
         f"expected 2 CloudTrail lookups, got {aws.ct.lookup_events.call_count} "
         f"— the index is being rebuilt per instance"
     )
+
+
+# ── fallback series (alpha-engine-config-I5727) ──────────────────────────────
+#
+# The reclaim paths above cannot see a spot->on-demand ESCALATION: nothing was
+# interrupted, so there is no BidEvictedEvent. The sweep reads the provenance
+# tags nousergon-lib v0.124.23 writes onto every launch, out of the SAME
+# RunInstances index the reclaim reconciler already builds.
+
+def _run_instances_event(*, iid, tags, at="2026-07-28T22:29:39Z", itype="t4g.medium"):
+    return {
+        "eventTime": at,
+        "eventName": "RunInstances",
+        "eventID": f"run-{iid}",
+        "requestParameters": {
+            "instanceType": itype,
+            "tagSpecificationSet": {
+                "items": [{"resourceType": "instance",
+                           "tags": [{"key": k, "value": v} for k, v in tags.items()]}]
+            },
+        },
+        "responseElements": {"instancesSet": {"items": [
+            {"instanceId": iid, "instanceType": itype,
+             "placement": {"availabilityZone": "us-east-1c"}}
+        ]}},
+    }
+
+
+def _route_lookups(aws, launches):
+    """CloudTrail returns evictions for one EventName and launches for the other."""
+    def _lookup(**kwargs):
+        name = kwargs["LookupAttributes"][0]["AttributeValue"]
+        events = launches if name == "RunInstances" else [REAL_EVICTION]
+        return {"Events": [{"CloudTrailEvent": json.dumps(e)} for e in events]}
+    aws.ct.lookup_events.side_effect = _lookup
+
+
+def test_capacity_fallback_is_recorded_with_its_discriminator(aws):
+    _route_lookups(aws, [_run_instances_event(
+        iid="i-fell", tags={"Name": "alpha-engine-groom-spot",
+                            "LaunchMarket": "on-demand",
+                            "LaunchReason": "capacity_exhausted"})])
+    index.handler({"mode": "reconcile"}, None)
+
+    recs = _fallback_records(aws)
+    assert len(recs) == 1
+    assert recs[0]["reason"] == "capacity_exhausted"
+    assert recs[0]["market"] == "on-demand"
+    assert recs[0]["workload"] == "alpha-engine-groom-spot"
+
+
+def test_a_successful_spot_launch_is_counted_but_not_recorded(aws):
+    """The denominator. A fallback COUNT with no launch count is not a rate, and
+    a rate is what the spot-vs-on-demand ruling's revisit condition needs."""
+    _route_lookups(aws, [_run_instances_event(
+        iid="i-ok", tags={"Name": "alpha-engine-groom-spot",
+                          "LaunchMarket": "spot", "LaunchReason": "spot_ok"})])
+    index.handler({"mode": "reconcile"}, None)
+
+    assert _fallback_records(aws) == []
+    daily = _fallback_daily(aws)
+    assert daily["launches"] == 1 and daily["fallbacks"] == 0
+    assert daily["lanes"]["alpha-engine-groom-spot"]["spot_ok"] == 1
+
+
+def test_a_launch_without_provenance_is_not_counted_as_a_spot_success(aws):
+    """A box predating v0.124.23, or launched by a path that bypasses
+    launch_with_fallback, is UNCLASSIFIED. Folding it into spot_ok would be the
+    absence-reads-as-health defect this series exists to close."""
+    _route_lookups(aws, [_run_instances_event(
+        iid="i-old", tags={"Name": "alpha-engine-groom-spot"})])
+    index.handler({"mode": "reconcile"}, None)
+
+    daily = _fallback_daily(aws)
+    assert daily["provenance_missing"] == 1
+    assert daily["lanes"]["alpha-engine-groom-spot"].get("spot_ok", 0) == 0
+    assert _fallback_records(aws) == []
+
+
+def test_forced_and_capacity_fallbacks_stay_distinct_in_the_rollup(aws):
+    """Both cost the on-demand premium; they have different fixes."""
+    _route_lookups(aws, [
+        _run_instances_event(iid="i-a", tags={"Name": "lane-a",
+                                              "LaunchMarket": "on-demand",
+                                              "LaunchReason": "capacity_exhausted"}),
+        _run_instances_event(iid="i-b", tags={"Name": "lane-a",
+                                              "LaunchMarket": "on-demand",
+                                              "LaunchReason": "force_on_demand"}),
+    ])
+    index.handler({"mode": "reconcile"}, None)
+
+    lane = _fallback_daily(aws)["lanes"]["lane-a"]
+    assert lane["capacity_exhausted"] == 1
+    assert lane["force_on_demand"] == 1
+    assert lane["launches"] == 2
+
+
+def test_an_unknown_reason_is_reported_verbatim_not_bucketed(aws):
+    """A value added to the library and not mirrored here must surface as
+    itself, never silently join spot_ok."""
+    _route_lookups(aws, [_run_instances_event(
+        iid="i-new", tags={"Name": "lane-a", "LaunchReason": "some_future_reason"})])
+    index.handler({"mode": "reconcile"}, None)
+
+    assert _fallback_daily(aws)["lanes"]["lane-a"]["some_future_reason"] == 1
+
+
+def test_the_rollup_is_written_even_when_the_window_held_no_launches(aws):
+    """'Swept, saw nothing' must be distinguishable from 'did not sweep'. The
+    consumer renders an ABSENT rollup as stale; an empty one is a real zero."""
+    _route_lookups(aws, [])
+    index.handler({"mode": "reconcile"}, None)
+
+    daily = _fallback_daily(aws)
+    assert daily["launches"] == 0 and daily["lanes"] == {}
+
+
+def test_a_failing_fallback_sweep_does_not_lose_the_reclaim_result(aws, monkeypatch):
+    """The reclaim series is the higher-value artifact and already succeeded.
+    The error is reported in the return value AND logged — never swallowed."""
+    monkeypatch.setattr(index, "_sweep_fallbacks",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = index.handler({"mode": "reconcile"}, None)
+
+    assert out["records_written"] == 1
+    assert "boom" in out["fallbacks"]["error"]
+
+
+def test_fallback_reason_vocabulary_matches_lib():
+    """This Lambda duplicates the four-string vocabulary rather than importing
+    nousergon_lib (its requirements.txt does not pull the library). The
+    duplication is pinned here so a library rename cannot drift silently."""
+    assert set(index.FALLBACK_REASONS) == {
+        "capacity_exhausted", "quota_exceeded", "force_on_demand"}
+    assert index.REASON_SPOT_OK == "spot_ok"
+    assert index.LAUNCH_MARKET_TAG == "LaunchMarket"
+    assert index.LAUNCH_REASON_TAG == "LaunchReason"

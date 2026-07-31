@@ -62,6 +62,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # rag/pipelines/ ingest-side scripts are scope-exempt — they write
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
+    # alpha-engine-config-I5718 — the §10.2 fault-injection verdict surface,
+    # s3://alpha-engine-research/groom/_control/fault-injection/{date}.json.
+    # One PUT per programme run (weekly, plus on any change to the dispatch
+    # definition or the harness).
+    #
+    # This artifact IS freshness-relevant and belongs in ARTIFACT_REGISTRY.yaml
+    # rather than grandfathered_paths: a stale verdict means
+    # the standing gate stopped running, and §10.2 holds that a failure mode
+    # not exercised in the current programme is UNVERIFIED, never passing. A
+    # gate that silently stops is the one failure this artifact exists to make
+    # visible. The registry lives in alpha-engine-config, so the entry rides a
+    # separate PR there — pinned here first so this repo's guard is honest
+    # about the new PUT site either way.
+    "scripts/fault_injection_run.py": 1,
     "builders/_price_cache_writeboth.py": 2,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
@@ -126,6 +140,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # Health for this mechanism is skipped_at_watermark in
     # run_news_pipeline's RUN STATS line (policy §5), not artifact age.
     "rag/pipelines/_watermarks.py": 1,
+    # rag/corpus_freshness/latest.json — the freshness verdict published by
+    # the assertion that REPLACED the inline weekly news fetch
+    # (alpha-engine-config-I5702). Registered with a real SLA row in
+    # ARTIFACT_REGISTRY.yaml (artifact_id: rag_corpus_freshness), NOT
+    # grandfathered like its sibling rag/watermarks/ prefix: a stale verdict
+    # means the assertion itself stopped running — nobody is checking whether
+    # the corpus is warm — and nothing else surfaces that.
+    "rag/pipelines/assert_corpus_freshness.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for

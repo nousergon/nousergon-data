@@ -1324,35 +1324,26 @@
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage top-up (alpha-engine-config-I2467). config-I2515 Phase B: MOVED to run AFTER the RAG ingestion chain (was between Scanner and RAG) so Think Tank's theses read the FRESH corpus instead of the week-old one — this also resolves alpha-engine-config-I2511. The daily EventBridge cadence (alpha-research-thinktank-daily) is the primary coverage-growth mechanism (5/day toward the full rank_ceiling=150 universe, handling staleness refresh gradually) and stays unchanged. This state's job is a narrower, reactive top-up — mode=gap_fill shores up whatever of the CURRENT top-60 the daily cadence hasn't caught up to yet by the time the fresh weekly scan lands, sized to the EXACT measured coverage_gap.uncovered_count (never a fixed constant, never padded with stale-refill — see crucible-research thinktank/run.py's gap_fill_only). Small and bounded by construction, so no sf_cover_target/sf_cover_ceiling numbers to keep in sync across repos. Observe-only: writes to thinktank/ S3 prefix for validation tracking; does NOT gate the Predictor. Non-blocking Catch routes forward on any failure so the pipeline continues exactly as it would without this step. The Retry below (States.Timeout/Lambda.Unknown) stays as cheap defense-in-depth even though the gap-fill workload is small.",
+              "Comment": "Think Tank observe-mode coverage top-up, dispatched to EC2 SPOT (alpha-engine-config-I5758). PREVIOUSLY a direct lambda:invoke against alpha-engine-research-thinktank with TimeoutSeconds 900 — the AWS Lambda MAXIMUM, which this workload cannot fit in: measured 2026-07-30 on watch-rerun-2026-07-29-1, both attempts hit States.Timeout at 900s (11:24:47 and 11:40:48) for 30 min of wall-clock and zero output. alpha-engine-config-I5208 established the same failure on the DAILY cadence and ARCHITECTURE §47 ruled the fix: a long-running agent loop runs on owned compute behind a dispatcher. That fix shipped for the daily path (crucible-research infrastructure/thinktank_box_runner.py + thinktank_spot_bootstrap.sh + this dispatcher) and THIS state was never repointed — the weekly SF kept re-entering the failure the migration already fixed, on the one path inside a decision pipeline. The dispatcher fires an ASYNC detached SSM command and returns immediately, so this state only LAUNCHES; the poll quartet below waits for the box, mirroring the RAGIngestion / WaitForRAGIngestion / CheckRAGIngestionStatus / RAGIngestionWait shape. Budget chain (load-bearing, asserted by the dispatcher's own handler and test_handler.py): THINKTANK_RUN_BUDGET_SECONDS (5400) < THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) < this state's poll bound. If the budget ever meets the SSM timeout, SSM guillotines the run mid-loop and every terminal write is lost — the exact I5208 failure, reintroduced by config drift. config-I2515 Phase B ordering is preserved: this runs AFTER the RAG chain so Think Tank's theses read the FRESH corpus. The daily EventBridge cadence stays the primary coverage-growth mechanism; this state remains the reactive gap_fill top-up.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "alpha-engine-research-thinktank:live",
+                "FunctionName": "alpha-engine-thinktank-spot-dispatcher",
                 "Payload": {
                   "mode": "gap_fill",
                   "run_date.$": "$.run_date"
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 330,
               "Retry": [
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException",
-                    "States.TaskFailed"
+                    "Lambda.SdkClientException"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
-                },
-                {
-                  "ErrorEquals": [
-                    "States.Timeout",
-                    "Lambda.Unknown"
-                  ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0
                 }
               ],
               "Catch": [
@@ -1360,12 +1351,146 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Observe-mode non-blocking: think tank failure must NOT halt the pipeline. Routes forward to CheckSkipRegimeRetrospectiveEval (ThinkTankCoverage's new post-RAG successor, config-I2515 Phase B).",
-                  "Next": "CheckSkipRegimeRetrospectiveEval",
+                  "Comment": "Observe-mode non-blocking: a Think Tank failure must NOT halt the pipeline (config-I2515 Phase B). Routes to ThinkTankDegraded, which SETS A VISIBLE FLAG before converging — weekly-sf-policy.md §2.3 permits fail-open ONLY with a flag that propagates to the terminal notification, and champion-challenger-policy.md §3 requires a cycle with no arm output to be recorded as a MISS, never omitted. The flagless fail-open this replaces is why 13 days of silent Lambda timeouts went unnoticed.",
+                  "Next": "ThinkTankDegraded",
                   "ResultPath": "$.thinktank_error"
                 }
               ],
-              "ResultPath": "$.thinktank_result",
+              "ResultSelector": {
+                "launched.$": "$.Payload.launched",
+                "instance_id.$": "$.Payload.instance_id",
+                "command_id.$": "$.Payload.command_id"
+              },
+              "ResultPath": "$.thinktank_dispatch",
+              "Next": "CheckThinkTankLaunched"
+            },
+            "CheckThinkTankLaunched": {
+              "Type": "Choice",
+              "Comment": "The dispatcher returns launched=false with reason=already_running when a Think Tank box is already up — normally the DAILY cadence's box. That box writes the same terminal artifacts this state wants, so waiting for a command_id we do not have would be wrong; converge with a degraded flag naming the reason instead. Skipping silently would render identically to a genuine zero, which champion-challenger-policy.md §3 forbids.",
+              "Choices": [
+                {
+                  "Variable": "$.thinktank_dispatch.launched",
+                  "BooleanEquals": true,
+                  "Next": "InitThinkTankPollCount"
+                }
+              ],
+              "Default": "ThinkTankDegraded"
+            },
+            "InitThinkTankPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Every other poll loop in this pipeline is unbounded and instance-liveness-blind, which cost 5h11m of blind polling on 2026-07-29; this new loop ships bounded rather than adding a 16th instance of that defect. Bound is derived: THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) / Wait 60s = 120 polls, +20% slack = 144.",
+              "Result": 0,
+              "ResultPath": "$.thinktank_polls",
+              "Next": "WaitForThinkTank"
+            },
+            "WaitForThinkTank": {
+              "Type": "Task",
+              "Comment": "Poll the detached SSM command until it reaches a terminal status.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.thinktank_dispatch.command_id",
+                "InstanceId.$": "$.thinktank_dispatch.instance_id"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "The dispatcher sends the command asynchronously, so the invocation can lag the returned command_id by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ThinkTankDegraded",
+                  "ResultPath": "$.thinktank_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.thinktank_poll",
+              "Next": "CheckThinkTankStatus"
+            },
+            "CheckThinkTankStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.thinktank_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "CheckSkipRegimeRetrospectiveEval"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.thinktank_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.thinktank_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.thinktank_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.thinktank_polls",
+                      "NumericLessThan": 144
+                    }
+                  ],
+                  "Next": "ThinkTankWait"
+                }
+              ],
+              "Default": "ThinkTankDegraded"
+            },
+            "ThinkTankWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckThinkTankStatus actually advances — a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.thinktank_polls, 1)"
+              },
+              "ResultPath": "$.thinktank_poll_count",
+              "Next": "ThinkTankPollWait"
+            },
+            "ThinkTankPollWait": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "MergeThinkTankPollCount"
+            },
+            "MergeThinkTankPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.thinktank_poll_count.polls",
+              "ResultPath": "$.thinktank_polls",
+              "Next": "WaitForThinkTank"
+            },
+            "ThinkTankDegraded": {
+              "Type": "Pass",
+              "Comment": "THE VISIBLE DEGRADED FLAG (alpha-engine-config-I5758). Every non-Success path converges here — dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md §2.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md §3: a cycle where an arm produces no output is recorded as a MISS, not omitted — silent absence and a genuine zero must never render identically. The predecessor of this state had no flag at all, which is exactly why 13 consecutive days of 900s Lambda timeouts (2026-07-17 onward) passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop.",
+              "Result": true,
+              "ResultPath": "$.thinktank_degraded",
               "Next": "CheckSkipRegimeRetrospectiveEval"
             },
             "CheckSkipRegimeRetrospectiveEval": {
@@ -1444,7 +1569,7 @@
             },
             "DataPhase2": {
               "Type": "Task",
-              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) — judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email.",
+              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) — judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email. TimeoutSeconds 900 (2026-07-30, was 600): the concurrent ThreadPoolExecutor in collectors/alternative.py overlaps I/O-bound API calls so the Lambda completes in ~3-5 min for 900+ tickers (was ~30 at original design), but 600 s left zero headroom for a provider degradation. 900 s is the Lambda max standard timeout — the Lambda's own timeout (deploy.sh LAMBDA_TIMEOUT) must move in lockstep.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-data-collector:live",
@@ -1453,7 +1578,7 @@
                   "dry_run.$": "$.data_phase2_dry"
                 }
               },
-              "TimeoutSeconds": 600,
+              "TimeoutSeconds": 900,
               "Retry": [
                 {
                   "ErrorEquals": [

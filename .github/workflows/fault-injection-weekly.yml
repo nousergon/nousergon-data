@@ -1,0 +1,91 @@
+name: Fault Injection (weekly)
+
+# groom-sweep-policy §10.2 — fault injection is a STANDING GATE, not a one-off.
+# §2.2 holds that "a recovery path that has never executed is presumed broken",
+# and this workflow is the thing that MAKES them execute. Before it existed the
+# only exerciser was production breakage, which is why every recovery path in
+# the 2026-07-27 arc was found broken at the moment it was first needed — and
+# why the first successful run of this harness immediately surfaced a
+# States.Runtime that made a fully-successful groom cycle impossible
+# (alpha-engine-config-I5718).
+#
+# Runs against the STAGING dispatch only: the Lambda is a scripted mock with no
+# EC2/SSM/GitHub grants, and the SNS target is a staging topic. An injection run
+# cannot launch a spot box, touch the backlog, or page the operator.
+#
+# Sunday 06:00 UTC — deliberately AFTER the Sun 09:00 UTC weekly groom slot's
+# preceding week and before the new week's Monday cycles, so a regression is
+# known before the week's grooming depends on it.
+
+on:
+  schedule:
+    - cron: "0 6 * * SUN"
+  workflow_dispatch: {}
+  # Also on any change to the definition under test or the harness itself —
+  # a topology change is exactly when the recovery paths need re-proving.
+  pull_request:
+    paths:
+      - "infrastructure/step_function_groom.json"
+      - "infrastructure/lambdas/groom-inject-mock/**"
+      - "scripts/fault_injection_run.py"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inject:
+    name: fault-injection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install --quiet boto3
+
+      # The pure derivation tests run WITHOUT credentials, so a PR from a fork
+      # or a credential outage still catches the dangerous-swap regressions
+      # rather than silently skipping the whole gate.
+      - name: Guard the staging derivation (no credentials needed)
+        run: pip install --quiet pytest && python -m pytest tests/test_fault_injection_staging.py -q
+
+      # The full programme needs AWS and therefore only runs on the SCHEDULE
+      # (and on demand) — not on pull_request. Two reasons, and the second is
+      # the load-bearing one:
+      #
+      #   1. A PR from a fork cannot hold OIDC credentials, so a credentialed
+      #      step there is unrunnable by construction.
+      #   2. §10.2's gate is the WEEKLY programme. Making every PR block on it
+      #      would mean the first missing role or expired credential turns a
+      #      standing gate into a thing people disable — which is precisely how
+      #      an exercise programme dies.
+      #
+      # The derivation tests above DO run on every PR without credentials, so
+      # the two dangerous swaps (production Lambda, production SNS topic) stay
+      # guarded on the path that actually changes them.
+      - name: Configure AWS credentials
+        id: creds
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-fault-injection
+          aws-region: us-east-1
+
+      # §2.4 no-silent-caps: on the scheduled run, unavailable credentials mean
+      # every failure mode is UNVERIFIED, and the gate FAILS rather than passing
+      # on an exercise that did not happen.
+      - name: Run the injection programme
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ "${{ steps.creds.outcome }}" != "success" ]; then
+            echo "::error::AWS credentials unavailable — the injection programme did NOT run."
+            echo "::error::Every failure mode is therefore UNVERIFIED. This gate fails rather"
+            echo "::error::than passing on an exercise that did not occur (groom-sweep-policy §10.2)."
+            exit 1
+          fi
+          python scripts/fault_injection_run.py

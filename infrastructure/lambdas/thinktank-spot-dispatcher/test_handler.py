@@ -199,7 +199,7 @@ class TestDispatchPosture:
         monkeypatch.setattr(
             mod, "_already_running", lambda: (_ for _ in ()).throw(mod.SpotProbeError("boom"))
         )
-        monkeypatch.setattr(mod, "_launch_instance", lambda force_on_demand=False: ("i-abc", "spot"))
+        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False: ("i-abc", "spot"))
         monkeypatch.setattr(mod.spot_dispatch, "wait_ssm_online", lambda *a, **k: None)
         monkeypatch.setattr(mod.spot_dispatch, "send_async_command", lambda *a, **k: "cmd-1")
         out = mod.handler({}, None)
@@ -219,7 +219,7 @@ class TestDispatchPosture:
         mod = _load()
         terminated: list[str] = []
         monkeypatch.setattr(mod, "_already_running", lambda: [])
-        monkeypatch.setattr(mod, "_launch_instance", lambda force_on_demand=False: ("i-xyz", "spot"))
+        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False: ("i-xyz", "spot"))
         monkeypatch.setattr(
             mod.spot_dispatch,
             "wait_ssm_online",
@@ -233,3 +233,47 @@ class TestDispatchPosture:
         with pytest.raises(RuntimeError, match="ssm never came online"):
             mod.handler({}, None)
         assert terminated == ["i-xyz"]
+
+
+class TestDiscriminatorTags:
+    """alpha-engine-config-I5752 — the tags spot-orphan-reaper rebuilds the
+    completion-marker key from. Without them a reaped box is unlookupable and
+    every reap alerts."""
+
+    def test_tags_are_passed_atomically_with_launch(self, monkeypatch):
+        mod = _load()
+        captured = {}
+
+        def _fake_launch(*args, **kwargs):
+            captured.update(kwargs)
+            return ("i-abc", "spot")
+
+        monkeypatch.setattr(mod.spot_dispatch, "launch_with_fallback", _fake_launch)
+        mod._launch_instance("tok123")
+        assert captured["extra_tags"] == {
+            "thinktank-trading-day": mod._trading_day(),
+            "thinktank-run-token": "tok123",
+        }
+
+    def test_tag_order_reproduces_the_key_the_box_writes(self):
+        mod = _load()
+        """The reaper joins discriminator values by its WATCH_KINDS tuple order
+        and appends '.json' to the prefix. The box writes
+        ${TRADING_DAY}-${RUN_TOKEN}.json, so trading-day must come first."""
+        tags = mod._discriminator_tags("tok123")
+        joined = "-".join(
+            [tags["thinktank-trading-day"], tags["thinktank-run-token"]]
+        )
+        assert joined == f"{mod._trading_day()}-tok123"
+
+    def test_the_box_cannot_span_utc_midnight(self):
+        """Why the dispatcher may compute the trading day independently of the
+        box: both use the UTC date, and the box cannot outlive the day it
+        started. Dispatch is 14:30 UTC; this asserts the margin rather than
+        trusting it, so moving the schedule or raising the timeout fails here
+        instead of surfacing as a silently-missing marker."""
+        mod = _load()
+        dispatch_hour_utc = 14.5  # cron(30 14 * * ? *), alpha-research-thinktank-daily
+        hours_to_midnight = 24 - dispatch_hour_utc
+        assert mod.RUN_TIMEOUT_SECONDS / 3600 < hours_to_midnight
+        assert mod.WATCHDOG_SECONDS / 3600 < hours_to_midnight

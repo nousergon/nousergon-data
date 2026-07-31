@@ -7,8 +7,9 @@
 #   2.  8-K material events — from signals universe, 1y lookback
 #   3.  Earnings transcripts (Finnhub) — from signals universe, latest 8
 #   4.  Thesis history — from research.db (incremental)
-#   5.  News pipeline (Wave 1 Gate A) — fetch via aggregator → NLP →
-#       news_aggregates parquet + RAG corpus ingest
+#   5.  News corpus freshness ASSERTION (config-I5702) — verifies the
+#       corpus is warm; NEVER fetches. The daily job ingests news at fetch
+#       time now, so Saturday reads instead of fetching.
 #   6.  Form 4 insider transactions (Wave 1 Gate A) — EDGAR → parquet
 #   7.  13F institutional ownership (config#2428) — reads the
 #       inst_ownership derived table (produced separately by
@@ -145,13 +146,28 @@ else
     echo "==> LM dict bootstrap: $LM_DICT_PATH already present, skipping download"
 fi
 
-# ── Step 5: News pipeline (Wave 1 Gate A) ────────────────────────────────────
-# Fetch news via NewsAggregator (Polygon + GDELT + Yahoo RSS) → NLP pipeline
-# (Loughran-McDonald sentiment + Anthropic-Haiku event extraction) → write
-# structured aggregates parquet → ingest article narrative to RAG corpus.
+# ── Step 5: News corpus freshness ASSERTION (config-I5702) ───────────────────
+# This step used to run the full news fetch inline — the ~3.1h Polygon sweep
+# that dominated RAGIngestion's 6h budget and was the stage in flight when the
+# 2026-07-29 weekly pipeline died (alpha-engine-config-I5695).
+#
+# collectors/daily_news.py now ingests the SAME articles into the corpus at the
+# point it already fetches them every weekday, so by Saturday the corpus is
+# warm and this step only VERIFIES it. rag-corpus-policy.md §2.3: a decision
+# pipeline may verify corpus freshness; it may never fill the corpus.
+#
+# NEVER FETCHES, ALWAYS EXITS 0. A stale corpus sets a visible degraded flag
+# and the run proceeds on what is held — an assertion that blocked or
+# backfilled inline would reintroduce the exact coupling this removes. Failing
+# the weekly pipeline over stale news would degrade the belief set the whole
+# trading week depends on, which is strictly worse than one stale answer.
+#
+# The verdict is derived from the WATERMARK store (config-I5701) — what
+# actually landed — not from an artifact's mtime, which a run that ingested
+# nothing can still refresh.
 echo ""
-echo "==> Step 5/10: News pipeline..."
-$PYTHON_BIN -m rag.pipelines.run_news_pipeline --from-signals --hours 168 $DRY_RUN
+echo "==> Step 5/10: News corpus freshness assertion (no fetch)..."
+$PYTHON_BIN -m rag.pipelines.assert_corpus_freshness ${DRY_RUN:+--no-write}
 
 # ── Step 6: Form 4 insider transactions (Wave 1 Gate A) ──────────────────────
 # EDGAR Form 4 → structured per-(filed_date) parquet at
