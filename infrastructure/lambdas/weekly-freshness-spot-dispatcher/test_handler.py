@@ -12,6 +12,7 @@ four repo clones + the dashboard venv build + the long-lived watchdog.
 
 from __future__ import annotations
 
+import datetime
 import importlib
 import sys
 import types
@@ -73,6 +74,25 @@ class TestHappyPath:
         kwargs = sd.launch_with_fallback.call_args.kwargs
         assert kwargs["iam_instance_profile"] == "alpha-engine-executor-profile"
         assert kwargs["tag_name"] == "alpha-engine-weekly-freshness-spot"
+
+    def test_launch_includes_watchdog_deadline_tag(self, index_mod):
+        """config#5695: the launcher stamps watchdog-deadline so the orphan
+        reaper honours the box's own deadline rather than the global cap."""
+        index, sd = index_mod
+        index.handler({}, None)
+        kwargs = sd.launch_with_fallback.call_args.kwargs
+        extra = kwargs.get("extra_tags", {})
+        assert "watchdog-deadline" in extra
+        # The deadline value should be a parseable ISO8601 UTC string in the
+        # future (watchdog budget = WATCHDOG_SECONDS from now).
+        dl = extra["watchdog-deadline"]
+        assert dl.endswith("+00:00")
+        parsed = datetime.datetime.fromisoformat(dl.replace("Z", "+00:00"))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # Deadline should be roughly WATCHDOG_SECONDS in the future (allow
+        # a few seconds for test execution time)
+        delta = (parsed - now).total_seconds()
+        assert 0 < delta < index.WATCHDOG_SECONDS + 10
 
     def test_force_on_demand_passthrough(self, index_mod):
         index, sd = index_mod

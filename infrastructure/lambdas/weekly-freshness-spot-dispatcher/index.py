@@ -101,6 +101,7 @@ new states — see this dispatcher's README for the exact rollout order.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import uuid
@@ -292,11 +293,20 @@ echo "[weekly-freshness-spot-bootstrap] complete — launcher box ready"
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(
+    extra_tags: dict[str, str] | None = None,
+    force_on_demand: bool = False,
+) -> tuple[str, str]:
     """Launch the launcher box; spot first, on-demand fallback on capacity/
     quota exhaustion via the shared spot_dispatch chokepoint (same posture as
     every other fleet dispatcher — the weekly run must not be starved by a
-    capacity dip)."""
+    capacity dip).
+
+    ``extra_tags`` (config#5695): additional instance tags threaded through
+    to the SAME RunInstances TagSpecifications as the Name tag (atomic with
+    launch — no post-launch create_tags race). Used to stamp
+    ``watchdog-deadline`` so the orphan reaper uses the box's own deadline
+    rather than the fleet-wide global cap."""
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -305,6 +315,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-weekly-freshness-spot",
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -372,8 +383,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         )
 
     run_token = uuid.uuid4().hex
+    # ── Watchdog-deadline tag (config#5695) ──────────────────────────────────
+    # The orphan reaper uses this per-box deadline when present (instead of the
+    # fleet-wide global cap), so the box is never reaped before its own watchdog
+    # fires. Sized to WATCHDOG_SECONDS (13h by default, comfortably above the
+    # SF's 12h top-level TimeoutSeconds) with GRACE_SECONDS added by the reaper.
+    deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=WATCHDOG_SECONDS)
+    deadline_tag = {"watchdog-deadline": deadline.strftime("%Y-%m-%dT%H:%M:%S+00:00")}
     try:
-        instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+        instance_id, market = _launch_instance(extra_tags=deadline_tag, force_on_demand=force_on_demand)
     except SpotLaunchError:
         logger.error("weekly-freshness-spot launch failed (spot + on-demand exhausted)")
         raise

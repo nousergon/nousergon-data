@@ -59,27 +59,38 @@
 # deliberately lacks iam:CreateRole/iam:PutRolePolicy, a fleet-wide policy
 # after 4 IAM-clobber incidents in 2 months — see infrastructure/iam/README.md).
 #
-# CODE auto-deploys on merge to main via
-# `.github/workflows/deploy-scheduled-groom-dispatcher.yml` (path-filtered to
-# `infrastructure/lambdas/scheduled-groom-dispatcher/**`), which runs this
-# script with NO flags (this script's default/flagless run is already
-# code-only — --bootstrap is what ADDS IAM-role-creation + EventBridge
-# Scheduler wiring on top, not the reverse) under the github-actions-lambda-
-# deploy OIDC role (LambdaUpdate grant on `alpha-engine-*`, no IAM-role-create).
-# A SCHED_NAMES/SCHED_CRONS/SCHED_INPUTS change (a schedule/cadence change,
-# e.g. this file's own 2026-07-02 Sat-skip removal) still needs an operator to
-# run `--bootstrap` by hand — merging alone has ZERO effect on the live
-# EventBridge Scheduler rule. CUTOVER (config#1432, historical): after a
-# manual --smoke spot run validates end-to-end, deploy this AND disable the
-# GHA `schedule:` crons in backlog-groom.yml together (so there is no
-# double-groom and no gap). NOTE: --smoke fires a REAL groom on a REAL spot box.
+# CODE, SF DEFINITION and SCHEDULES all auto-deploy on merge to main via
+# `.github/workflows/deploy-scheduled-groom-dispatcher.yml`, which runs this
+# script twice: flagless (Lambda code + SF definition) and then
+# `--reconcile-schedules` (EventBridge Scheduler upsert + prune), both under
+# the github-actions-lambda-deploy OIDC role.
+#
+# alpha-engine-config-I5805 is why the schedule half is here at all. It used to
+# sit inside --bootstrap next to the IAM-role creation, so the OIDC role — which
+# deliberately lacks iam:CreateRole/iam:PutRolePolicy (fleet single-writer rule
+# after 4 IAM-clobber incidents in 2 months) — could not run it, and a merged
+# cadence change did nothing until an operator ran a command by hand. It was not
+# run: nousergon-data#1179 added three independent sweep schedules on 2026-07-30
+# and none of them was ever created. Splitting on the IAM boundary rather than
+# on "first time vs not" is what makes the schedule half CI-runnable.
+#
+# What still needs an operator: --bootstrap-iam, i.e. creating the three IAM
+# roles and their inline policies, plus first-ever creation of the Lambda and
+# the Step Function. That is genuinely first-time-only.
+#
+# CUTOVER (config#1432, historical): after a manual --smoke spot run validates
+# end-to-end, deploy this AND disable the GHA `schedule:` crons in
+# backlog-groom.yml together (so there is no double-groom and no gap).
+# NOTE: --smoke fires a REAL groom on a REAL spot box.
 #
 # Usage:
-#   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
-#   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # operator-only: create/update IAM roles + wire EventBridge Scheduler
-#   bash .../scheduled-groom-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
-#   bash .../scheduled-groom-dispatcher/deploy.sh --dry-run   # show actions, do not apply
-#   bash .../scheduled-groom-dispatcher/deploy.sh --smoke     # invoke once with a synthetic schedule event (⚠ fires a REAL groom)
+#   bash .../deploy.sh                        # code + SF definition (the CI path, step 1)
+#   bash .../deploy.sh --reconcile-schedules  # + upsert/prune Scheduler rules (the CI path, step 2)
+#   bash .../deploy.sh --bootstrap-iam        # operator-only: create IAM roles, Lambda, SF
+#   bash .../deploy.sh --bootstrap            # both of the above (unchanged meaning)
+#   bash .../deploy.sh --apply-iam            # re-apply iam-policy.json only (config#2825)
+#   bash .../deploy.sh --dry-run              # show actions, do not apply
+#   bash .../deploy.sh --smoke                # synthetic schedule event (⚠ fires a REAL groom)
 
 set -euo pipefail
 
@@ -141,18 +152,48 @@ case "${DRY_RUN:-false}" in
   true|1|yes|TRUE|YES) DRY_RUN=true ;;
   *) DRY_RUN=false ;;
 esac
-BOOTSTRAP=false
+# alpha-engine-config-I5805 splits the old monolithic --bootstrap in two, along
+# the line that actually matters: which grants the caller needs.
+#
+#   BOOTSTRAP_IAM       creates IAM roles and puts inline policies. Needs
+#                       iam:CreateRole + iam:PutRolePolicy, which the GHA OIDC
+#                       role deliberately does NOT have (fleet single-writer
+#                       rule after 4 IAM-clobber incidents). Operator-only, and
+#                       first-time-only in practice.
+#   RECONCILE_SCHEDULES upserts + prunes the EventBridge Scheduler rules. Needs
+#                       ONLY scheduler:{Get,List,Create,Update,Delete}Schedule
+#                       and a scoped iam:PassRole — all of which
+#                       github-actions-lambda-deploy already holds. Safe to run
+#                       on every merge, and now does.
+#
+# --bootstrap keeps its old meaning (both) so every runbook, every comment and
+# every operator habit that predates the split still does what it says.
+BOOTSTRAP_IAM=false
+RECONCILE_SCHEDULES=false
 APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
-    --bootstrap) BOOTSTRAP=true ;;
+    --bootstrap) BOOTSTRAP_IAM=true; RECONCILE_SCHEDULES=true ;;
+    --bootstrap-iam) BOOTSTRAP_IAM=true ;;
+    --reconcile-schedules) RECONCILE_SCHEDULES=true ;;
     --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
 done
+
+# `--reconcile-schedules` ALONE is a schedules-only run: it skips packaging
+# (docker pip + handler tests), the code push and the SF definition push. The
+# CI deploy therefore invokes this script twice without paying for the ~2min
+# package build twice, and an operator repairing live schedule drift does not
+# have to redeploy code to do it. Combined with --bootstrap or run flagless,
+# everything happens as before.
+CODE_DEPLOY=true
+if $RECONCILE_SCHEDULES && ! $BOOTSTRAP_IAM && ! $APPLY_IAM && ! $SMOKE; then
+  CODE_DEPLOY=false
+fi
 
 run() {
   if $DRY_RUN; then
@@ -168,6 +209,8 @@ run() {
 
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
+
+if $CODE_DEPLOY; then
 
 python3 -c "
 import ast
@@ -201,7 +244,11 @@ ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
-# ----- 2. Bootstrap (first-time only) ---------------------------------------
+else
+  echo "Schedules-only run (--reconcile-schedules): skipping handler tests + packaging."
+fi
+
+# ----- 2. IAM + resource bootstrap (operator-only, first-time only) ---------
 
 # ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
 if $APPLY_IAM; then
@@ -211,8 +258,8 @@ if $APPLY_IAM; then
   echo "  ✓ IAM applied."
 fi
 
-if $BOOTSTRAP; then
-  echo "Bootstrapping ${FUNCTION_NAME}..."
+if $BOOTSTRAP_IAM; then
+  echo "Bootstrapping IAM + resources for ${FUNCTION_NAME}..."
 
   # --- 2a. Lambda execution role + inline policy ---
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
@@ -284,6 +331,8 @@ if $BOOTSTRAP; then
     sleep 10
   fi
 
+  # CREATE only. The UPDATE half moved to step 3b, which runs unconditionally
+  # (alpha-engine-config-I5805) — see the comment there for why.
   if ! aws stepfunctions describe-state-machine --state-machine-arn "${SF_ARN}" \
       --query 'name' --output text >/dev/null 2>&1; then
     echo "  Creating Step Function: ${SF_NAME}"
@@ -296,13 +345,7 @@ if $BOOTSTRAP; then
       --region "${REGION}" \
       --query 'stateMachineArn' --output text
   else
-    echo "  Step Function exists, updating definition: ${SF_NAME}"
-    run aws stepfunctions update-state-machine \
-      --state-machine-arn "${SF_ARN}" \
-      --definition "file://${SF_DEFINITION_FILE}" \
-      --role-arn "${SF_ROLE_ARN}" \
-      --region "${REGION}" \
-      --query 'updateDate' --output text
+    echo "  Step Function exists — definition update happens in step 3b"
   fi
 
   # --- 2d. EventBridge Scheduler execution role (start THIS SF only) ---
@@ -327,10 +370,40 @@ EOF
     --policy-name "${SCHED_POLICY_NAME}" \
     --policy-document "${SCHED_INVOKE_POLICY}"
 
+  # The reconciler and the sweep rules both target the LAMBDA directly rather
+  # than the SF, so the Scheduler role needs lambda:InvokeFunction on top of
+  # states:StartExecution. This grant used to live inside block 2e-bis, next to
+  # the rule it serves — which meant the whole schedule section required
+  # iam:PutRolePolicy and could therefore never run in CI. Grants live here;
+  # rules live below (alpha-engine-config-I5805).
+  echo "  Applying Scheduler invoke-Lambda policy (reconciler + sweep rules)"
+  run aws iam put-role-policy \
+    --role-name "${SCHED_ROLE_NAME}" \
+    --policy-name "${SCHED_POLICY_NAME}-recon-invoke" \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lambda:InvokeFunction\"],\"Resource\":\"${FN_ARN}\"}]}"
+
   if ! $DRY_RUN; then
     echo "  Waiting 10s for Scheduler role propagation..."
     sleep 10
   fi
+fi
+
+# ----- 2bis. Schedule reconciliation (IAM-free — runs on every merge) --------
+#
+# alpha-engine-config-I5805. Everything below upserts or prunes EventBridge
+# Scheduler rules and nothing below writes IAM, so github-actions-lambda-deploy
+# can run it. Before the split these blocks sat inside --bootstrap alongside the
+# role creation, so a merged cadence change was inert until an operator
+# remembered a manual command. It was not remembered: nousergon-data#1179 gave
+# the PR sweep its own three daily schedules on 2026-07-30 and they were never
+# created — the sweep stayed coupled to groom health, which is the exact defect
+# that PR was written to remove.
+#
+# Note this block does NOT gate on the rules already existing. It is a
+# reconciler: source is the truth, live is made to match, every run.
+
+if $RECONCILE_SCHEDULES; then
+  echo "Reconciling EventBridge Scheduler rules against source..."
 
   # --- 2e. The EventBridge Scheduler rules (target = SF, not the Lambda) ---
   for i in "${!SCHED_NAMES[@]}"; do
@@ -392,12 +465,9 @@ EOF
   # create-schedule call died on `Invalid JSON: Expecting ',' delimiter`.
   # Counting backslashes through two layers of quoting is not a thing to get
   # right by inspection; json.dumps cannot get it wrong.
+  # The lambda:InvokeFunction grant this rule depends on is applied in block 2d
+  # (--bootstrap-iam), not here — see the note there.
   recon_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"mode": "reconcile"})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}")
-  echo "  Applying Scheduler invoke-Lambda policy for the reconciler"
-  run aws iam put-role-policy \
-    --role-name "${SCHED_ROLE_NAME}" \
-    --policy-name "${SCHED_POLICY_NAME}-recon-invoke" \
-    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lambda:InvokeFunction\"],\"Resource\":\"${FN_ARN}\"}]}"
 
   if aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
       --query 'Name' --output text >/dev/null 2>&1; then
@@ -519,6 +589,8 @@ fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
 
+if $CODE_DEPLOY; then
+
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
 run aws lambda update-function-code \
   --function-name "${FUNCTION_NAME}" \
@@ -534,6 +606,42 @@ fi
 
 echo "✓ Code deployed."
 
+# ----- 3b. Update the Step Function definition (always, idempotent) ----------
+#
+# alpha-engine-config-I5805. This used to live in block 2c, behind --bootstrap,
+# which made a definition-only change inert on merge. That is not theoretical
+# and it is already documented as fixed when it was not: I5512 added
+# `infrastructure/step_function_groom.json` to the deploy workflow's path
+# filter, so the workflow FIRED on a definition change — and then ran the
+# flagless, code-only path, which never touched the state machine. The trigger
+# was correct and the deploy was a no-op, which is worse than not firing: the
+# green check reads as "deployed".
+#
+# The definition is code. It deploys on every run, exactly like index.py above.
+# github-actions-lambda-deploy already holds states:UpdateStateMachine on
+# `alpha-engine-groom-dispatch` (InfraDeploySFDefinition) and a scoped
+# iam:PassRole on `alpha-engine-*` (InfraDeployPassRole) — no new grant.
+#
+# Fail-loud if the state machine is absent: that means a first-time deploy that
+# skipped --bootstrap-iam, and silently continuing would leave the schedules
+# below pointing at an ARN that does not resolve.
+echo "Updating Step Function definition: ${SF_NAME}"
+if aws stepfunctions describe-state-machine --state-machine-arn "${SF_ARN}" \
+    --query 'name' --output text >/dev/null 2>&1; then
+  run aws stepfunctions update-state-machine \
+    --state-machine-arn "${SF_ARN}" \
+    --definition "file://${SF_DEFINITION_FILE}" \
+    --role-arn "${SF_ROLE_ARN}" \
+    --region "${REGION}" \
+    --query 'updateDate' --output text
+  echo "  ✓ Definition deployed."
+elif $DRY_RUN; then
+  echo "DRY: state machine ${SF_NAME} absent — would require --bootstrap-iam"
+else
+  echo "ERROR: state machine ${SF_NAME} does not exist. Run with --bootstrap-iam first." >&2
+  exit 1
+fi
+
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
@@ -545,6 +653,8 @@ if ! $DRY_RUN; then
     --function-name "${FUNCTION_NAME}" \
     --region "${REGION}"
 fi
+
+fi  # end CODE_DEPLOY (steps 3, 3b and the env update)
 
 # ----- 4. Smoke (synthetic schedule event, via the SF — the real live path) --
 

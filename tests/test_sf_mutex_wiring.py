@@ -9,7 +9,7 @@ chokepoint misses) by gating each SF at its entry point on a DynamoDB
 conditional-PUT mutex.
 
 Design:
-- Allowlist cadence roles (``daily`` / ``weekly`` / ``eod`` / ``shell-run``)
+- Allowlist all unattended cadence roles (``daily`` / ``weekly`` / ``eod`` / ``shell-run`` / ``exercise``)
   acquire the mutex via ``DynamoDB.PutItem`` with
   ``ConditionExpression: attribute_not_exists(mutex_key)``.
 - Operator-initiated runs (any other ``pipeline_role`` value, including
@@ -87,7 +87,7 @@ MUTEX_TABLE_NAME = "alpha-engine-sf-execution-mutex"
 MUTEX_TABLE_ARN = (
     "arn:aws:dynamodb:us-east-1:711398986525:table/alpha-engine-sf-execution-mutex"
 )
-CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run"}
+CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run", "exercise"}
 
 # Per SF, the state that the mutex chain (CheckMutexRole.Default and
 # AcquireMutex.Next) routes into — i.e., the state that USED TO BE first
@@ -264,9 +264,15 @@ class TestMutexWiring:
         # config#693: the pipeline-contract preflight gate now sits between
         # LibPinDriftGate and CheckMutexRole (see
         # test_sf_pipeline_contract_wiring.py); its own pass-through Default
-        # still lands on CheckMutexRole, one gate further down.
+        # used to land on CheckMutexRole directly.
         assert saturday_sf["States"]["LibPinDriftGate"]["Default"] == "PipelineContractCheck"
-        assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "CheckMutexRole"
+        # config#2348: the evaluator Lambda-SHA drift gate pair now sits
+        # between PipelineContractGate and CheckMutexRole — the mutex is
+        # still the entry point's next gate-free state, two gates further
+        # down (see test_sf_prespend_gate_alerting.py for the full quartet).
+        assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "EvaluatorDeployDriftCheck"
+        assert saturday_sf["States"]["EvaluatorDeployDriftGate"]["Default"] == "EvaluatorDirectorDeployDriftCheck"
+        assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"
@@ -315,11 +321,12 @@ class TestMutexWiring:
 # ---------------------------------------------------------------------------
 
 class TestCheckMutexRoleAllowlist:
-    """CheckMutexRole's Choices block must allowlist exactly the four
-    cadence roles. Adding a fifth role (e.g., a new cron cadence) MUST
-    be a deliberate edit here AND in the cadence-role-set across other
-    tests; promoting an operator role to a cadence role without
-    updating both surfaces silently un-protects the SF."""
+    """CheckMutexRole's Choices block must allowlist exactly the
+    cadence roles (all unattended cadence roles acquire the mutex).
+    Adding a new role MUST be a deliberate edit here AND in the
+    cadence-role-set across other tests; promoting an operator role to
+    a cadence role without updating both surfaces silently un-protects
+    the SF."""
 
     @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))
     def test_allowlist_matches_cadence_set(self, sf_name, all_sfs):

@@ -97,7 +97,7 @@ MUTEX_TABLE = "alpha-engine-sf-execution-mutex"
 EMITTED_ROLE = "watch-rerun"
 # Roles that acquire the run-slot mutex (CheckMutexRole allowlist — kept in
 # lockstep by tests/test_weekly_sf_rerun.py against the SF definition).
-CADENCE_ROLES = frozenset({"daily", "weekly", "eod", "shell-run"})
+CADENCE_ROLES = frozenset({"daily", "weekly", "eod", "shell-run", "exercise"})
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
 RERUNNABLE_SOURCE_STATUSES = frozenset({"FAILED", "TIMED_OUT", "ABORTED"})
 

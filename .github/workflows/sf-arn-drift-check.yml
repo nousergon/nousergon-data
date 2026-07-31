@@ -31,6 +31,7 @@ on:
       - 'infrastructure/cloudformation/alpha-engine-orchestration.yaml'
       - 'infrastructure/deploy-infrastructure.sh'
       - 'infrastructure/step_function*.json'
+      - 'infrastructure/scheduler/**'
       - '.github/workflows/sf-arn-drift-check.yml'
   schedule:
     - cron: '30 9 * * *'   # daily, alongside the IAM sweep
@@ -60,3 +61,11 @@ jobs:
 
       - name: SF lambda:invoke Lambda-existence check (codified vs live)
         run: python3 infrastructure/step-functions/check-lambda-existence.py
+
+      # alpha-engine-config-I5805. The out-of-band half of schedule coverage.
+      # deploy-scheduled-groom-dispatcher.yml reconciles + asserts on every
+      # merge, which closes drift caused by a merge; this catches what no merge
+      # can see — a rule disabled or retimed in the console, or one belonging to
+      # a dispatcher whose repo has no deploy workflow at all.
+      - name: EventBridge Scheduler rule drift (codified vs live)
+        run: python3 infrastructure/scheduler/check-schedule-drift.py

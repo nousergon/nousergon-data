@@ -2,4 +2,4 @@
 # trading_day fallback when an execution name lacks the friday-shell-{date}
 # prefix). Pinned to match the sibling eod-success-friday-shell-trigger Lambda
 # so the two Friday-shell-run Lambdas share one lib-date substrate.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.25
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.26

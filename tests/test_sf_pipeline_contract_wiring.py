@@ -88,9 +88,12 @@ def test_gate_halts_only_on_confirmed_violation(states):
     # FIRST (not straight to HandleFailure) — see
     # test_violation_halt_normalizes_error.
     assert c["Next"] == "ExtractPipelineContractError"
-    # No violation -> proceed into the pipeline, same target LibPinDriftGate
-    # used before this gate was inserted.
-    assert gate["Default"] == "CheckMutexRole"
+    # No violation -> proceed into the evaluator Lambda-SHA drift gate
+    # (config#2348), the third pre-spend sibling gate composed after this
+    # one. Was CheckMutexRole before config#2348 inserted
+    # EvaluatorDeployDriftCheck here — same insertion pattern this gate
+    # itself used against LibPinDriftGate.
+    assert gate["Default"] == "EvaluatorDeployDriftCheck"
 
 
 def test_violation_halt_normalizes_error_before_handle_failure(states):

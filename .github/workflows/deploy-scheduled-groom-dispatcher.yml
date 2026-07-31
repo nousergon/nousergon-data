@@ -7,24 +7,35 @@ name: Deploy scheduled-groom-dispatcher
 # until someone remembered to run deploy.sh by hand. This closes that gap for
 # the CODE path only.
 #
-# Separation of concerns: this deploys CODE only (deploy.sh with NO flag —
-# unlike freshness-monitor, this script's default/flagless run IS already
-# code-only; --bootstrap is what ADDS the IAM-role-creation + EventBridge
-# Scheduler wiring, not the reverse, so no new script flag was needed here).
-# A change to SCHED_NAMES/SCHED_CRONS/SCHED_INPUTS (a schedule/cadence change)
-# still requires an operator to run `deploy.sh --bootstrap` by hand — the
-# github-actions-lambda-deploy OIDC role deliberately has no iam:CreateRole /
-# iam:PutRolePolicy (fleet-wide policy after 4 IAM-clobber incidents in 2
-# months traced to auto-applied IAM writes; see nous-ergon-ops/infrastructure/iam/README.md).
-# It DOES already have scheduler:Create/Update/DeleteSchedule + a scoped
-# iam:PassRole — a future refinement could split deploy.sh's --bootstrap into
-# an IAM-role-creation step (still operator-only) and a schedule-rules-only
-# step (auto-deployable), but that needs a deliberate script redesign +
-# live-AWS validation, not bundled into this workflow-only change.
+# alpha-engine-config-I5805 closes the rest of that gap. The refinement this
+# header used to describe as future work — "split deploy.sh's --bootstrap into
+# an IAM-role-creation step (still operator-only) and a schedule-rules-only step
+# (auto-deployable)" — is done, so this workflow now deploys all three moving
+# parts on merge:
 #
-# IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
-# deploy.json), which already includes this function.
+#   1. Lambda code           flagless deploy.sh, step 3   (LambdaUpdate)
+#   2. SF definition         flagless deploy.sh, step 3b  (InfraDeploySFDefinition)
+#   3. Scheduler rules       --reconcile-schedules        (InfraDeployResourceCRUD)
+#
+# Why it mattered: nousergon-data#1179 gave the PR sweep three independent daily
+# schedules on 2026-07-30. This workflow ran green on that merge and created
+# none of them, because the schedule block was behind --bootstrap. The sweep
+# stayed hostage to groom health — the exact condition #1179 removed in source
+# and never removed in production.
+#
+# What remains operator-only: `deploy.sh --bootstrap-iam`, which creates the
+# three IAM roles and puts their inline policies. The OIDC role deliberately has
+# no iam:CreateRole / iam:PutRolePolicy (fleet-wide policy after 4 IAM-clobber
+# incidents in 2 months traced to auto-applied IAM writes; see
+# nous-ergon-ops/infrastructure/iam/README.md). That step is genuinely
+# first-time-only — it does not gate any cadence or definition change.
+#
+# IAM: the only new grant this needed is scheduler:ListSchedules, for the prune
+# loop in block 2f (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
+# deploy/github-actions-lambda-deploy-policy.json, InfraDeployResourceRead).
+# Everything else was already held: scheduler:{Create,Update,Delete}Schedule and
+# scheduler:GetSchedule, states:UpdateStateMachine on alpha-engine-groom-dispatch,
+# and iam:PassRole on alpha-engine-*.
 
 on:
   push:
@@ -54,7 +65,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy scheduled-groom-dispatcher Lambda (code-only)
+    name: Deploy scheduled-groom-dispatcher (code + SF definition + schedules)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -75,9 +86,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy scheduled-groom-dispatcher (code-only — no --bootstrap)
+      - name: Deploy code + Step Function definition
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh
+
+      # Separate step, not a flag on the one above, so the log makes it obvious
+      # which half failed. Both run under the same OIDC role; neither writes IAM.
+      - name: Reconcile EventBridge Scheduler rules (upsert + prune)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh --reconcile-schedules
 
       - name: Report deployed version
         working-directory: alpha-engine-data
@@ -87,6 +104,15 @@ jobs:
             --function-name alpha-engine-scheduled-groom-dispatcher \
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text
+
+      # Assert the OUTCOME, not the exit status of the step that should have
+      # produced it. Every rule the source declares must exist live, in state
+      # ENABLED, after this workflow runs — a deploy that reports success while
+      # a schedule is missing is the failure mode this whole change exists to
+      # remove, and it is exactly what a green run looked like on 2026-07-30.
+      - name: Assert every declared schedule exists live
+        working-directory: alpha-engine-data
+        run: python3 infrastructure/scheduler/check-schedule-drift.py
 
       - name: Append to system-wide deploy changelog
         if: always()

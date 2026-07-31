@@ -6,56 +6,52 @@ Backstop for the spot-side watchdog every spot launcher installs (`systemd-run
 case where the watchdog itself never installed — dispatcher SSM cancelled before
 reaching the `systemd-run` step, package manager interrupted bootstrap, etc.
 
-DESIGN — one number, zero per-workload config (2026-07-01, config#1492).
-Every alpha-engine spot box self-terminates via its own on-box watchdog; this
-reaper is ONLY a backstop for the box whose watchdog failed to arm. A backstop
-does not need per-workload precision — it needs a single invariant:
+DESIGN — per-box watchdog-deadline tag, global cap fallback (2026-07-30,
+config#5695).
 
-    no alpha-engine spot box should ever outlive the LONGEST watchdog in the
-    fleet (plus a grace window).
+Every launcher that knows its own watchdog budget stamps a ``watchdog-deadline``
+tag (ISO8601 UTC) on the box at launch time, atomically with RunInstances via
+the shared ``spot_dispatch.launch_with_fallback(extra_tags=...)`` chokepoint.
+The reaper reads this tag on every running instance:
 
-So there is deliberately NO per-tag budget table. The previous table
-(`TAG_BUDGETS`) had to be kept in lockstep with each launcher's MAX_RUNTIME_SECONDS
-in a DIFFERENT repo; on 2026-07-01 the groom-on-spot migration (config#1432) added
-`alpha-engine-groom-spot` (6h watchdog) without a table row, so the reaper's 2h
-default killed a live groom mid-run at 2.5h (config#1492). A single global cap
-above the longest watchdog cannot drift out of lockstep with anything:
+  - **Tag present + valid**: reap if ``now > watchdog-deadline + GRACE_SECONDS``
+    (the per-box deadline, sized to the launcher's own known budget).
+  - **Tag absent or malformed**: reap if ``age > MAX_SPOT_BUDGET_SECONDS +
+    GRACE_SECONDS`` (the global cap fallback — unchanged behaviour for legacy
+    workloads that predate this feature, or boxes whose watchdog never armed).
 
-  - Adding a new spot workload touches ONLY its own launcher. The reaper needs no
-    change as long as the workload's watchdog <= MAX_SPOT_BUDGET_SECONDS.
-  - The only time this constant moves is when a workload legitimately needs a
-    LONGER watchdog than any today — a rare, deliberate act, and the failure mode
-    if forgotten is LOUD (the box is reaped at the cap and logged), never a silent
-    mis-kill at a wrong per-workload guess.
+This replaces the previous single-global-cap design (config#1492, 2026-07-01),
+which had no enforcement mechanism: the invariant "every workload's watchdog <=
+MAX_SPOT_BUDGET_SECONDS" was documented-only and silently violated when the
+weekly SF launcher's 13h watchdog exceeded the 6.5h reaper cap (config#5695).
+The per-box tag is self-enforcing — each launcher declares its own deadline,
+and the reaper honours it.
 
-Cap sizing: MAX_SPOT_BUDGET_SECONDS defaults to 21600 (6h) — the longest fleet
-watchdog (backlog groom, groom_spot_bootstrap.sh). GRACE_SECONDS (default 1800)
-covers the gap between that watchdog firing and the reaper's hourly cadence, so
-the effective reap threshold is 6.5h. Both are env-overridable.
+Cap sizing (fallback): MAX_SPOT_BUDGET_SECONDS defaults to 21600 (6h) — the
+longest legacy fleet watchdog (backlog groom). GRACE_SECONDS (default 1800)
+covers the gap between that watchdog firing and the reaper's hourly cadence.
+Every new workload should emit ``watchdog-deadline`` rather than fitting under
+the fallback cap.
 
-Hourly EventBridge cron scans running `alpha-engine-*` spot instances and
-terminates any older than the threshold. Emits CloudWatch custom metric
-`AlphaEngine/Infra/spot_orphans_terminated` (sum) with a `name` dimension (the
-box's Name tag) purely for observability — it does NOT feed the reap decision.
+Hourly EventBridge cron scans running ``alpha-engine-*`` spot instances and
+terminates any older than its effective threshold. Emits CloudWatch custom
+metric ``AlphaEngine/Infra/spot_orphans_terminated`` (sum) with a ``name``
+dimension (the box's Name tag) — purely for observability, NOT feeding the reap
+decision.
 
 WATCH-KIND INCOMPLETE-REAP ALERT (additive, generalized config#2106): for a
-small, explicit set of "watch" workloads (Fleet CI Watch, Fleet-SF Watch), a box
-reaped by the fleet-wide age cap — rather than its own on-box completion path —
-can mean the diagnose+fix agent never finished, leaving something unrepaired
-with nobody told. `WATCH_KINDS` below is a table of these workloads (tag name,
-S3 completion-marker prefix, and the discriminator tag keys the marker key is
-built from); one shared check/notify path serves all of them instead of a
-parallel `_ci_watch_*`/`_sf_watch_*` function pair per kind — the second entry
-(`sf-watch`, finishing config#2001) was the trigger to generalize rather than
-duplicate the first (`ci-watch`, config#2001/#2004) a second time. Before
-terminating a `WATCH_KINDS`-tagged box, check for its sibling run script's S3
-completion marker; if absent, fire one best-effort Telegram ping via
-`krepis.telegram.send_message` (through the `nousergon_lib.telegram` re-export —
-the same base primitive `flow_doctor_telegram.py` itself falls back to, reused
-directly here since this Lambda sends exactly one alert shape per kind and
-doesn't need the full forum-topic/dedup machinery). This check is purely
-additive to every OTHER (non-`WATCH_KINDS`) spot workload's reap path, which is
-untouched.
+small, explicit set of "watch" workloads (Fleet CI Watch, Fleet-SF Watch,
+Alert-Drain, Think-Tank), a box reaped by the fleet-wide age cap — rather than
+its own on-box completion path — can mean the diagnose+fix agent never
+finished, leaving something unrepaired with nobody told. ``WATCH_KINDS`` below
+is a table of these workloads (tag name, S3 completion-marker prefix, and the
+discriminator tag keys the marker key is built from); one shared check/notify
+path serves all of them instead of a parallel ``_ci_watch_*``/``_sf_watch_*``
+function pair per kind. Before terminating a ``WATCH_KINDS``-tagged box, check
+for its sibling run script's S3 completion marker; if absent, fire one best-
+effort Telegram ping via ``krepis.telegram.send_message``. This check is purely
+additive to every OTHER (non-``WATCH_KINDS``) spot workload's reap path, which
+is untouched.
 """
 
 from __future__ import annotations
@@ -187,6 +183,12 @@ def _scan_spot_instances(ec2) -> list[dict]:
                     # Only meaningful for a WATCH_KINDS-tagged box; empty
                     # (harmless no-op) for every other workload's instances.
                     "watch_tags": {k: tags.get(k, "") for k in _ALL_DISCRIMINATOR_TAG_KEYS},
+                    # Optional per-box watchdog deadline (ISO8601 UTC, set
+                    # atomically with RunInstances by the launcher via
+                    # spot_dispatch.launch_with_fallback(extra_tags=...)).
+                    # When present and parseable, the reap decision uses this
+                    # deadline + GRACE_SECONDS instead of the global cap.
+                    "watchdog_deadline": tags.get("watchdog-deadline", ""),
                 })
     return out
 
@@ -307,20 +309,42 @@ def handler(event: dict, context) -> dict:
 
     for inst in instances:
         age = now - inst["launch_time"]
-        if age <= threshold:
+        # ── Effective per-instance reap threshold ─────────────────────────────
+        # If the launcher stamped a watchdog-deadline tag (ISO8601 UTC), use that
+        # as the per-box deadline + GRACE. Otherwise fall back to the global cap
+        # (MAX_SPOT_BUDGET_SECONDS + GRACE_SECONDS). A malformed tag value drops
+        # to the global cap fallback (logged, not silently accepted or rejected).
+        watchdog_deadline_str = inst.get("watchdog_deadline", "")
+        if watchdog_deadline_str:
+            try:
+                deadline = datetime.fromisoformat(watchdog_deadline_str.replace("Z", "+00:00"))
+                effective_threshold = timedelta(seconds=max(
+                    0, (deadline - inst["launch_time"]).total_seconds() + GRACE_SECONDS
+                ))
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Malformed watchdog-deadline tag on %s (%s): %r — falling back to global cap",
+                    inst["instance_id"], inst["name"], watchdog_deadline_str,
+                )
+                effective_threshold = threshold
+        else:
+            effective_threshold = threshold
+
+        if age <= effective_threshold:
             continue
         orphans.append({
             "instance_id": inst["instance_id"],
             "name": inst["name"],
             "age_seconds": int(age.total_seconds()),
-            "reap_after_seconds": REAP_AFTER_SECONDS,
+            "reap_after_seconds": int(effective_threshold.total_seconds()),
             "instance_type": inst["instance_type"],
+            "watchdog_deadline": watchdog_deadline_str or None,
         })
         if DRY_RUN:
             logger.warning(
                 "DRY_RUN orphan %s (%s, age=%ds, reap_after=%ds): would terminate",
                 inst["instance_id"], inst["name"], int(age.total_seconds()),
-                REAP_AFTER_SECONDS,
+                int(effective_threshold.total_seconds()),
             )
             continue
         try:
@@ -330,7 +354,7 @@ def handler(event: dict, context) -> dict:
             logger.warning(
                 "Terminated orphan %s (%s, age=%ds, reap_after=%ds, type=%s)",
                 inst["instance_id"], inst["name"], int(age.total_seconds()),
-                REAP_AFTER_SECONDS, inst["instance_type"],
+                int(effective_threshold.total_seconds()), inst["instance_type"],
             )
             # WATCH_KINDS migration (additive — every other tag's reap path
             # above is unchanged): a WATCH_KINDS box reaped by the fleet-wide

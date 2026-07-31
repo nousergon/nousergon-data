@@ -76,9 +76,12 @@ def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c
          ci_watch_repo: str | None = None, ci_watch_sha: str | None = None,
          sf_watch_cadence: str | None = None, sf_watch_pipeline: str | None = None,
          sf_watch_run_date: str | None = None, alert_drain_run_id: str | None = None,
-         thinktank_trading_day: str | None = None, thinktank_run_token: str | None = None):
+         thinktank_trading_day: str | None = None, thinktank_run_token: str | None = None,
+         watchdog_deadline: str | None = None):
     """Build a mock describe-instances entry."""
     tags = [{"Key": "Name", "Value": name}]
+    if watchdog_deadline is not None:
+        tags.append({"Key": "watchdog-deadline", "Value": watchdog_deadline})
     if ci_watch_repo is not None:
         tags.append({"Key": "ci-watch-repo", "Value": ci_watch_repo})
     if ci_watch_sha is not None:
@@ -143,6 +146,100 @@ class TestThresholdConfig:
             del sys.modules["index"]
         mod = importlib.import_module("index")
         assert mod.REAP_AFTER_SECONDS == 30600
+
+
+class TestWatchdogDeadlineTag:
+    """config#5695: per-box watchdog-deadline tag takes precedence over the
+    global cap when present and parseable. Legacy boxes without the tag are
+    still reaped at the global cap (unchanged behavior)."""
+
+    def _deadline_str(self, age_seconds: int) -> str:
+        """Build an ISO8601 UTC deadline string that fired ``age_seconds`` ago
+        (deadline was set ``age_seconds`` in the past from now)."""
+        return (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    def _future_deadline_str(self, offset_seconds: int) -> str:
+        """Build an ISO8601 UTC deadline string in the future."""
+        return (datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    def test_watchdog_deadline_tag_lifts_threshold_above_global_cap(self, index_module):
+        """A box with a past deadline but still within the delta from the
+        deadline to the global cap would have been reaped by the global cap.
+        With a deadline tag that has NOT yet been reached, the box survives."""
+        # Deadline 12h from now; the global cap (6.5h) would have reaped the
+        # box at age 7h, but the deadline tag protects it until 12h + grace.
+        deadline = self._future_deadline_str(12 * 3600)
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=7 * 3600, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_watchdog_deadline_expired_triggers_reap(self, index_module):
+        """A box whose watchdog-deadline + grace has passed IS reaped."""
+        # Deadline was set to 6h after launch, which is 2h ago (age=8h),
+        # and grace (0.5h) has also passed.
+        deadline = self._deadline_str(2 * 3600)  # deadline 2h in the past
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=8 * 3600, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-weekly"]
+
+    def test_watchdog_deadline_barely_within_grace_not_reaped(self, index_module):
+        """A box within GRACE_SECONDS of its watchdog deadline is NOT reaped."""
+        # deadline 25min ago (1500s). Launch 7000s ago → deadline set at
+        # 5500s after launch. effective_threshold = 5500 + 1800 (grace) = 7300s.
+        # age = 7000s ≤ 7300s → safe.
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=7000, watchdog_deadline=self._deadline_str(1500))]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_watchdog_deadline_just_beyond_grace_is_reaped(self, index_module):
+        deadline = self._deadline_str(2000)  # deadline 33 min ago (>1800 grace)
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=7500, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-weekly"]
+
+    def test_box_without_tag_still_at_global_cap(self, index_module):
+        """A box WITHOUT a watchdog-deadline tag uses the global cap unchanged."""
+        spots = [_spot("i-groom", "alpha-engine-groom-spot", age_seconds=THRESHOLD + 600)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-groom"]
+
+    def test_box_without_tag_below_global_cap_is_safe(self, index_module):
+        spots = [_spot("i-groom", "alpha-engine-groom-spot", age_seconds=THRESHOLD - 60)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_malformed_deadline_falls_back_to_global_cap(self, index_module):
+        """A malformed (non-ISO8601) watchdog-deadline tag drops to global cap."""
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=THRESHOLD + 600,
+                       watchdog_deadline="not-a-valid-date")]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-weekly"]
+
+    def test_orphan_detail_includes_effective_reap_threshold_and_deadline(self, index_module):
+        deadline = self._future_deadline_str(12 * 3600)
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=THRESHOLD + 600, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+
+    def test_return_summary_includes_global_fallback_when_no_tag(self, index_module):
+        spots = [_spot("i-groom", "alpha-engine-groom-spot", age_seconds=THRESHOLD + 600)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["reap_after_seconds"] == THRESHOLD
+        # Each orphan detail shows the global cap as its reap_after
+        assert out["orphan_detail"][0]["reap_after_seconds"] == THRESHOLD
 
 
 class TestHandler:
