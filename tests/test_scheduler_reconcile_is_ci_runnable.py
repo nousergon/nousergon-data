@@ -209,3 +209,86 @@ class TestDriftCheckerSeesEveryDeclaredRule:
         assert errors and errors[0]["kind"] == "source-error", (
             f"unbalanced arrays should produce a source-error, got {errors}"
         )
+
+
+class TestDeployAssertionIsScopedToItsOwnDispatcher:
+    """The scoping in #1188 shipped without tests. These are them.
+
+    A deploy may only assert rules it can itself create — the groom deploy went
+    red on three schedules belonging to `expense-collector` and
+    `sf-watch-reclaim-sweep-handler` (real defects, tracked as
+    alpha-engine-config-I5815, but not ones this workflow can fix). A gate that
+    the deploy has no power to turn green goes permanently red and then gets
+    ignored, which costs more than the missing rules do.
+
+    The load-bearing one is `test_daily_sweep_stays_unscoped`. Scoping the deploy
+    is only correct because SOMETHING still looks at the whole fleet. If a later
+    change scopes both callers, no surface reports a sibling dispatcher's missing
+    schedule and an I5815-class finding becomes permanently invisible — the exact
+    absence-of-signal failure this arc existed to close, reintroduced by a
+    plausible-looking cleanup.
+    """
+
+    GROOM_DEPLOY_SH = "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh"
+    SWEEP_WORKFLOW = "sf-arn-drift-check.yml"
+
+    def test_deploy_workflow_scopes_the_assertion(self):
+        wf = WORKFLOW.read_text(encoding="utf-8")
+        assert "--source-file" in wf, (
+            "the post-deploy assertion must pass --source-file naming this "
+            "dispatcher's deploy.sh (nousergon-data#1188); unscoped belongs to "
+            "the daily sweep only"
+        )
+        assert self.GROOM_DEPLOY_SH in wf
+
+    def test_daily_sweep_stays_unscoped(self):
+        """Fleet-wide coverage has to live somewhere, and this is the only place."""
+        sweep = (REPO_ROOT / ".github" / "workflows" / self.SWEEP_WORKFLOW).read_text(
+            encoding="utf-8"
+        )
+        assert "check-schedule-drift.py" in sweep, (
+            f"{self.SWEEP_WORKFLOW} must run the fleet-wide schedule drift check"
+        )
+        after = sweep.split("check-schedule-drift.py", 1)[1][:200]
+        assert "--source-file" not in after and "--source " not in after, (
+            f"{self.SWEEP_WORKFLOW} must run the checker UNSCOPED. It owns no "
+            "deploy, so it is the ONLY surface on which a sibling dispatcher's "
+            "missing schedule can appear. Scoping it too would make findings "
+            "like alpha-engine-config-I5815 permanently invisible."
+        )
+
+    def test_scoping_selects_a_strict_subset(self):
+        checker = _load_checker()
+        rules, _, _ = checker.discover_codified_rules()
+        scoped = [r for r in rules if r["source_file"] == self.GROOM_DEPLOY_SH]
+        assert scoped, "no rules discovered for the groom dispatcher"
+        assert len(scoped) < len(rules), (
+            "the groom dispatcher must own a STRICT subset of fleet rules — if "
+            "it owned all of them, scoping would be a no-op and this test would "
+            "prove nothing"
+        )
+        # 4 groom cadences + 3 sweep cadences + 1 lane reconciler.
+        assert len(scoped) == 8, (
+            f"expected 8 rules for the groom dispatcher, found {len(scoped)}: "
+            f"{sorted(r['name'] for r in scoped)}"
+        )
+
+    def test_scoped_run_ignores_other_dispatchers_rules(self):
+        """The behaviour, not just the flag: I5815's three must not appear."""
+        checker = _load_checker()
+        rules, _, _ = checker.discover_codified_rules()
+        scoped_names = {
+            r["name"] for r in rules if r["source_file"] == self.GROOM_DEPLOY_SH
+        }
+        for foreign in (
+            "alpha-engine-expense-collector-reconcile-monthly",
+            "alpha-engine-sf-watch-reclaim-sweep-0645-daily",
+            "alpha-engine-sf-watch-reclaim-sweep-1445-daily",
+        ):
+            assert foreign in {r["name"] for r in rules}, (
+                f"{foreign} should still be discovered fleet-wide"
+            )
+            assert foreign not in scoped_names, (
+                f"{foreign} belongs to another dispatcher and must not be in "
+                "the groom deploy's scope"
+            )
