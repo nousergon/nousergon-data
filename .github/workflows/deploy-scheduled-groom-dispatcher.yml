@@ -112,7 +112,8 @@ jobs:
       # remove, and it is exactly what a green run looked like on 2026-07-30.
       - name: Assert every declared schedule exists live
         working-directory: alpha-engine-data
-        run: python3 infrastructure/scheduler/check-schedule-drift.py
+        run: python3 infrastructure/scheduler/check-schedule-drift.py \
+               --source-file infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh
 
       - name: Append to system-wide deploy changelog
         if: always()

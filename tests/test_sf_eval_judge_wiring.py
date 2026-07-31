@@ -801,7 +801,18 @@ class TestJudgeChainBeforePredictor:
         predictor training. This is the load-bearing invariant — if
         someone ever rewires DataPhase2.Next to CheckSkipPredictorTraining
         (the pre-reorder target), the judge chain bypass is silent."""
-        assert states["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
+        # alpha-engine-config-I5759 moved DataPhase2 from a lambda:invoke to
+        # the spot dispatch->poll quartet, so the success edge is no longer
+        # DataPhase2.Next — it is the Success arm of CheckDataPhase2Status.
+        # The invariant is unchanged and still load-bearing: whatever the
+        # stage's success edge IS, it must enter the judge chain.
+        assert states["DataPhase2"]["Next"] == "InitDataPhase2PollCount"
+        success_arm = [
+            c for c in states["CheckDataPhase2Status"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        ]
+        assert len(success_arm) == 1, "CheckDataPhase2Status lost its Success arm"
+        assert success_arm[0]["Next"] == "CheckSkipEvalJudge"
         assert (
             states["CheckSkipDataPhase2"]["Choices"][0]["Next"]
             == "CheckSkipEvalJudge"

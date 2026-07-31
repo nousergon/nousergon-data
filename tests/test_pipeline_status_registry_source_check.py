@@ -96,7 +96,8 @@ def test_every_substantive_state_has_registry_entry(label, json_path):
     fails here instead of days/weeks later as a dashboard "Registry drift"
     cell. Fix: add the new state name + ArchivePageRef or ArtifactReason to
     ``nousergon_lib.pipeline_status.registry`` (companion nousergon-lib PR),
-    bump the lib version, then bump this repo's pin in requirements.txt."""
+    let the lib's merge-time auto-bump tag the new version, then bump this
+    repo's pin in requirements.txt to that tag."""
     assert json_path.exists(), f"{label} SF JSON not found at {json_path}"
 
     substantive = _all_substantive_states(json_path)
@@ -112,7 +113,9 @@ def test_every_substantive_state_has_registry_entry(label, json_path):
         f"{sorted(missing)}. This is the config#1115/#1120/#2372/#2430 drift "
         f"class recurring again. Add each state to the registry in "
         f"nousergon-lib with an ArchivePageRef deep-link or an explicit "
-        f"ArtifactReason string, bump the lib version, then bump this "
+        f"ArtifactReason string, merge that lib PR (auto-version-bump.yml is "
+        f"the single version writer — config-I2716 — and version-bump-check.yml "
+        f"FORBIDS version edits inside a lib PR), then bump this "
         f"repo's requirements.txt pin in the SAME PR that adds the state — "
         f"do not merge the SF JSON change ahead of the registry entry."
     )

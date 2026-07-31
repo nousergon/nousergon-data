@@ -5,4 +5,4 @@ boto3>=1.34.0
 # CI-watch incomplete-reap alert. No [flow-doctor] extra needed: this Lambda
 # sends exactly one alert shape, not the full multi-topic forum substrate
 # other Lambdas route through. Same pin as scheduled-groom-dispatcher.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.26
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.27

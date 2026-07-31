@@ -159,6 +159,18 @@ _SPOT_STATES = {
         "bash infrastructure/spot_data_weekly.sh --rag-only",
         "/var/log/rag-ingestion.log",
     ),
+    # alpha-engine-config-I5759: DataPhase2 moved OFF lambda:invoke onto spot,
+    # so its Friday dry path moved with it — out of _DRY_LAMBDA_STATES (where
+    # it was ("dry_run.$", "$.data_phase2_dry")) and into this table, routed
+    # dry by the same States.Format($.preflight_args) suffix every other spot
+    # stage uses. That is a STRONGER dry guarantee than the Payload flag it
+    # replaces: --preflight-only exits weekly_collector.py immediately after
+    # DataPreflight("phase2") and strictly BEFORE run_weekly(), the sole
+    # function in that module performing any collector fetch or S3 write.
+    "DataPhase2": (
+        "bash infrastructure/spot_data_weekly.sh --phase2-only",
+        "/var/log/data-phase2.log",
+    ),
     "PredictorTraining": (
         "bash infrastructure/spot_train.sh --full-only",
         "/var/log/predictor-training.log",
@@ -194,6 +206,12 @@ _SPOT_STATES = {
 # skipped) via an input-var ref so the absent path is behaviourally
 # identical. DataPhase2/Regime* were dry from the keystone; the
 # skip-exception rewire ADDED the eval-judge chain + rationale-clustering
+# NOTE (alpha-engine-config-I5759): DataPhase2 LEFT this map when it moved
+# to spot — it is now in _SPOT_STATES above, routed dry via
+# --preflight-only. $.data_phase2_dry survives in InitializeInput's
+# defaults floor as an unread control var; removing it is a separate
+# change because ApplyShellRunDefaults and the offcycle presets also set
+# it, and a half-removed control var is worse than an unread one.
 # (research #202 added dry_run_llm) + replay-concordance + counterfactual
 # (backtester #225 added dry_run_llm) — all reusing the canonical
 # $.research_dry shell-run-dry signal (already true under shell_run / false
@@ -210,7 +228,6 @@ _SPOT_STATES = {
 # test_signals_envelope_preflight_signal below, not by the dry-flag map.
 # state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
-    "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
     "RegimeSubstrate": ("action.$", "$.regime_action"),
     "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),
     # Skip-exception rewire — eval-judge chain + agent-justification triple.
@@ -402,6 +419,14 @@ def orig_spot_cmds() -> dict:
       scope). `MorningEnrich`/`DataPhase1`/`RAGIngestion` are unchanged
       (they invoke `spot_data_weekly.sh`, which self-exports the region via
       its own `ENV_SOURCE` heredoc and never sourced `.env` directly).
+
+    - **Extended 2026-07-31** (alpha-engine-config-I5759) with a `DataPhase2`
+      entry. That state was a `lambda:invoke` pre-keystone, so unlike every
+      other key here it has NO pre-keystone form to be byte-identical to —
+      its entry was captured at the commit that moved it to spot. The
+      guarantee it carries is therefore "this command has not drifted since
+      the spot migration", not "identical to the pre-keystone Saturday path".
+      A future spot state added here inherits the same weaker-but-real pin.
 
     - **Regenerated 2026-07-27** as part of the krepis `--correlation-id`
       fix. krepis 0.18.8 made the correlation id mandatory (`run` exits 2

@@ -139,6 +139,29 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=21_600,  # config#2938 ruling 2: hard 6h cap
         pipeline_segment="branch_a",
     ),
+    "DataPhase2": StageBudget(
+        name="DataPhase2",
+        current_timeout_seconds=5_400,
+        # MEASURED, not estimated — the only entry in this table that is.
+        # alpha-engine-config-I5759, execution 1e856026 (2026-07-30): 402 of
+        # 903 tickers in 900s of steady state, 2.16-2.24 s/ticker, FLAT for
+        # the whole run. The number is not a throughput estimate, it is a
+        # provider-imposed serial FLOOR: _fetch_all_alternative makes two
+        # _finnhub_get calls per ticker and collectors/finnhub_client.py
+        # sleeps _FINNHUB_MIN_INTERVAL (1.1s) while HOLDING _finnhub_lock,
+        # so 2 x 1.1 = 2.2 s/ticker no matter how many workers
+        # collectors/alternative.py's ThreadPoolExecutor runs. Concurrency
+        # cannot move it; only fewer calls per ticker or a faster provider
+        # tier can. That is why this stage left Lambda rather than being
+        # parallelised harder.
+        per_ticker_cost_seconds=2.2,
+        # Spot launch + AL2023 bootstrap (python/git/clone/config) measured at
+        # ~7 min across the sibling stages, plus margin for the ArcticDB and
+        # S3 preflight legs.
+        fixed_overhead_seconds=900,
+        max_budget_seconds=10_800,
+        pipeline_segment="branch_a",
+    ),
     # ── Model/training stages (NOT universe-scaling — scale with
     #    model count and strategy complexity, not ticker count) ──────────
     "PredictorTraining": StageBudget(

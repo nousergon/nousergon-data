@@ -728,8 +728,69 @@ def _load_cached_fundamentals(s3, bucket: str, date_str: str) -> dict[str, dict]
     return {}
 
 
+class AlternativeCoverageError(RuntimeError):
+    """DataPhase2 published alternative data that this reader could not read.
+
+    Raised only for the unambiguous case: the manifest states N>0 tickers were
+    written and we loaded ZERO. Every alternative feature would silently become
+    0.0 for the whole universe, which is indistinguishable from a genuine zero
+    (see ``compute_and_write``'s ``val ... else 0.0``) — a red run is the honest
+    outcome. A PARTIAL shortfall is logged at ERROR rather than raised, so the
+    daily append still lands on a provider hiccup.
+    """
+
+
+def _alt_entry_from_payload(ticker_data: dict) -> dict:
+    """Project one raw per-ticker alt payload onto the feature-store shape.
+
+    ``or {}`` rather than ``.get(k, {})`` throughout: a sub-section that is
+    present-but-null (a provider returning ``null`` for a section it could not
+    fill) would otherwise raise ``AttributeError`` on the nested ``.get`` and,
+    before this was extracted, be swallowed by a bare ``except Exception: pass``
+    — dropping that ticker's alternative data entirely and invisibly.
+    """
+    eps = ticker_data.get("eps_revision") or {}
+    consensus = ticker_data.get("analyst_consensus") or {}
+    options = ticker_data.get("options_flow") or {}
+    surprise = eps.get("surprise_pct")
+    if surprise is None:
+        surprise = consensus.get("surprise_pct", 0.0)
+    return {
+        "earnings": {
+            "surprise_pct": surprise,
+            "days_since_earnings": eps.get("days_since_earnings", 0.0),
+        },
+        "revisions": {
+            "eps_revision_4w": eps.get("revision_4w", 0.0),
+            "revision_streak": eps.get("streak", 0),
+        },
+        "options": {
+            "put_call_ratio": options.get("put_call_ratio"),
+            "iv_rank": options.get("iv_rank"),
+            "atm_iv": options.get("expected_move_pct"),
+        },
+    }
+
+
 def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
-    """Load cached alternative data from the most recent DataPhase2 output."""
+    """Load cached alternative data from the most recent DataPhase2 output.
+
+    Reads EVERY object under the partition, and reconciles what it loaded
+    against the count DataPhase2 recorded in ``manifest.json``.
+
+    Why the reconciliation exists (alpha-engine-config-I5811): this function
+    used to call ``list_objects_v2`` ONCE with ``MaxKeys=200`` and no
+    pagination, so it silently returned at most the alphabetically-first 200
+    tickers of a partition holding up to 903. Every ticker past the cap got
+    ``alt_data.get(ticker, {})`` -> ``{}`` -> ``0.0`` for all seven registered
+    ``alternative``-family features (``earnings_surprise_pct``,
+    ``days_since_earnings``, ``eps_revision_4w``, ``revision_streak``,
+    ``put_call_ratio``, ``iv_rank``, ``iv_vs_rv`` — see ``features/registry.py``
+    ``CATALOG``), for every one of the five feature-store writers that call
+    this. A ceiling with no counterpart on the write side reports success at
+    any universe size, so nothing failed and nothing said so; the population
+    that kept real values was decided by the alphabet.
+    """
     try:
         # Find latest weekly date
         obj = s3.get_object(Bucket=bucket, Key="market_data/latest_weekly.json")
@@ -737,44 +798,92 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
         latest_date = latest.get("date", "")
         prefix = f"market_data/weekly/{latest_date}/alternative/"
 
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=200)
-        contents = resp.get("Contents", [])
+        # Paginate. The producer writes one object per ticker; a single
+        # list_objects_v2 page is 1000 keys and the universe is ~903 today,
+        # so an unpaginated read is latently wrong even without the MaxKeys
+        # cap that made it actively wrong.
+        keys: list[str] = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for item in page.get("Contents", []):
+                key = item["Key"]
+                if key.endswith("manifest.json") or not key.endswith(".json"):
+                    continue
+                keys.append(key)
 
         alt_data: dict[str, dict] = {}
-        for item in contents:
-            key = item["Key"]
-            if key.endswith("manifest.json") or not key.endswith(".json"):
-                continue
+        unreadable: list[str] = []
+        for key in keys:
             ticker = key.split("/")[-1].replace(".json", "")
             try:
                 obj = s3.get_object(Bucket=bucket, Key=key)
-                ticker_data = json.loads(obj["Body"].read())
-                alt_data[ticker] = {
-                    "earnings": {
-                        "surprise_pct": ticker_data.get("eps_revision", {}).get("surprise_pct",
-                                        ticker_data.get("analyst_consensus", {}).get("surprise_pct", 0.0)),
-                        "days_since_earnings": ticker_data.get("eps_revision", {}).get("days_since_earnings", 0.0),
-                    },
-                    "revisions": {
-                        "eps_revision_4w": ticker_data.get("eps_revision", {}).get("revision_4w", 0.0),
-                        "revision_streak": ticker_data.get("eps_revision", {}).get("streak", 0),
-                    },
-                    "options": {
-                        "put_call_ratio": ticker_data.get("options_flow", {}).get("put_call_ratio"),
-                        "iv_rank": ticker_data.get("options_flow", {}).get("iv_rank"),
-                        "atm_iv": ticker_data.get("options_flow", {}).get("expected_move_pct"),
-                    },
-                }
-            except Exception:
-                pass
+                alt_data[ticker] = _alt_entry_from_payload(json.loads(obj["Body"].read()))
+            except Exception as exc:  # noqa: BLE001 — recorded, then reported below
+                unreadable.append(f"{ticker}: {type(exc).__name__}")
 
-        if alt_data:
-            log.info("Loaded cached alternative data for %d tickers from %s", len(alt_data), latest_date)
+        if unreadable:
+            # Was a bare `except Exception: pass`. A per-ticker read failure is
+            # a silently-zeroed feature row, so it is named rather than dropped.
+            log.error(
+                "Alternative data: %d of %d objects unreadable under %s — those "
+                "tickers get 0.0 for every alternative feature. First 10: %s",
+                len(unreadable), len(keys), prefix, unreadable[:10],
+            )
+
+        expected = _expected_alternative_count(s3, bucket, prefix)
+        if expected is None:
+            log.warning(
+                "Alternative data: no readable manifest at %smanifest.json — "
+                "loaded %d tickers with no producer count to reconcile against, "
+                "so an under-read cannot be detected this run.",
+                prefix, len(alt_data),
+            )
+        elif len(alt_data) < expected:
+            if not alt_data:
+                raise AlternativeCoverageError(
+                    f"Alternative data: manifest at {prefix}manifest.json reports "
+                    f"{expected} tickers written for {latest_date}, loaded ZERO. "
+                    "Every alternative feature would be 0.0 for the whole universe "
+                    "and indistinguishable from a genuine zero."
+                )
+            log.error(
+                "Alternative data coverage SHORTFALL for %s: loaded %d of %d "
+                "tickers the producer recorded (%.1f%%). The %d missing tickers "
+                "get 0.0 for every alternative feature, which is not "
+                "distinguishable downstream from a real zero.",
+                latest_date, len(alt_data), expected,
+                100.0 * len(alt_data) / expected, expected - len(alt_data),
+            )
+        else:
+            log.info(
+                "Loaded cached alternative data for %d tickers from %s "
+                "(manifest recorded %d — full coverage)",
+                len(alt_data), latest_date, expected,
+            )
         return alt_data
 
+    except AlternativeCoverageError:
+        raise
     except Exception as exc:
         log.warning("No cached alternative data loaded — alternative features will use defaults: %s", exc)
         return {}
+
+
+def _expected_alternative_count(s3, bucket: str, prefix: str) -> int | None:
+    """``tickers_succeeded`` from DataPhase2's manifest, or None if unreadable.
+
+    The producer writes the manifest BEFORE its own quality gate can raise, so
+    it is present even on a degraded Phase 2 — which is exactly the run where a
+    reader most needs to know how many rows it should have seen.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"{prefix}manifest.json")
+        manifest = json.loads(obj["Body"].read())
+    except Exception as exc:  # noqa: BLE001 — absence is reported by the caller
+        log.debug("Alternative manifest unreadable at %smanifest.json: %s", prefix, exc)
+        return None
+    value = manifest.get("tickers_succeeded")
+    return int(value) if isinstance(value, (int, float)) else None
 
 
 # ── Main computation ─────────────────────────────────────────────────────────

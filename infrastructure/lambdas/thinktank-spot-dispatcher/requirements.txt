@@ -6,4 +6,4 @@ boto3>=1.34.0
 # running_instance_ids / terminate_on_failure) plus SpotProbeError, all of
 # which have been present since v0.106.0 — so there is no feature floor above
 # root here and no reason to carve an exemption. Bump in lockstep with root.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.26
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.27

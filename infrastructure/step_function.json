@@ -1573,26 +1573,42 @@
             },
             "DataPhase2": {
               "Type": "Task",
-              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) — judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email. TimeoutSeconds 900 (2026-07-30, was 600): the concurrent ThreadPoolExecutor in collectors/alternative.py overlaps I/O-bound API calls so the Lambda completes in ~3-5 min for 900+ tickers (was ~30 at original design), but 600 s left zero headroom for a provider degradation. 900 s is the Lambda max standard timeout — the Lambda's own timeout (deploy.sh LAMBDA_TIMEOUT) must move in lockstep.",
-              "Resource": "arn:aws:states:::lambda:invoke",
+              "Comment": "Phase 2: alternative data for the tracked universe, dispatched to EC2 SPOT (alpha-engine-config-I5759). PREVIOUSLY a direct lambda:invoke against alpha-engine-data-collector:live — TimeoutSeconds 600, raised to 900 by alpha-engine-data#1171, which is the Lambda MAXIMUM and still not enough. Measured live 2026-07-30 on execution 1e856026: the Lambda was killed at exactly 900,000 ms having completed 402 of 903 tickers (alphabetically through HON). The rate was 2.16-2.24 s/ticker and FLAT for the whole run — not a degradation curve, a floor. _fetch_all_alternative makes two _finnhub_get calls per ticker and collectors/finnhub_client.py serialises every one of them behind _finnhub_lock with a 1.1s sleep held INSIDE the lock, so 2 x 1.1 = 2.2 s/ticker regardless of how many workers collectors/alternative.py's ThreadPoolExecutor has. 903 x 2.2s = ~2000s, 2.2x a ceiling that cannot be raised. This is the same class as alpha-engine-config-I5208 (daily Think Tank) and alpha-engine-config-I5758 (weekly ThinkTankCoverage): long-running work parked on Lambda, where the ceiling is a hard wall rather than a tunable. UNLIKE the RAG scope fix (alpha-engine-config-I5700), narrowing is NOT the answer here: this stage's per-ticker output feeds seven registered feature-store columns in the `alternative` family (features/registry.py CATALOG, all consumers='predictor') for the WHOLE ArcticDB universe, and a ticker with no alt data gets 0.0 — indistinguishable from a real zero. It legitimately needs the universe; it needed different compute. The dispatcher fires an SSM command that returns as soon as it is accepted, so this state only LAUNCHES; the bounded poll quartet below waits for the box, mirroring DataPhase1 / WaitForDataPhase1 / CheckDataPhase1Status / DataPhase1Wait. Budget chain (load-bearing, asserted by tests/test_data_phase2_spot_budget_wiring.py): the workload run_ssm timeout (3600s) < the spot watchdog MAX_RUNTIME_SECONDS (4200s) < this state's executionTimeout (5400s) < this state's TimeoutSeconds (5460s). If the workload budget ever meets the watchdog, systemd shuts the box down mid-loop and the manifest is never written.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
-                "FunctionName": "alpha-engine-data-collector:live",
-                "Payload": {
-                  "phase": 2,
-                  "dry_run.$": "$.data_phase2_dry"
-                }
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only{}',$$.Execution.Name,$.preflight_args))",
+                  "executionTimeout": [
+                    "5400"
+                  ]
+                },
+                "TimeoutSeconds": 5400
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 5460,
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException",
-                    "States.TaskFailed"
+                    "States.TaskFailed",
+                    "States.Timeout"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
+                  "Comment": "config#2279 gold 4+2 ladder, same as every other spot-stage sendCommand. Re-issue is idempotent here for the declared reason: this state fails only on pre-execution API failures (the launcher never ran); once the command is delivered, WaitForDataPhase2 owns the outcome.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
                 }
               ],
               "Catch": [
@@ -1605,7 +1621,144 @@
                 }
               ],
               "ResultPath": "$.data_phase2_result",
-              "Next": "CheckSkipEvalJudge"
+              "Next": "InitDataPhase2PollCount"
+            },
+            "InitDataPhase2PollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed. alpha-engine-config-I5687 recorded that all 15 existing SSM poll loops in this pipeline are unbounded and instance-liveness-blind, which cost 5h11m of blind polling on 2026-07-29. This loop ships bounded rather than adding a 16th instance of that defect. Bound is derived: the SF executionTimeout (5400s) / the DataPhase2Wait interval (30s) = 180 polls, +20% slack = 216.",
+              "Result": 0,
+              "ResultPath": "$.data_phase2_polls",
+              "Next": "WaitForDataPhase2"
+            },
+            "WaitForDataPhase2": {
+              "Type": "Task",
+              "Comment": "Poll the DataPhase2 SSM command until it reaches a terminal status.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.data_phase2_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "BranchAFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.data_phase2_poll",
+              "Next": "CheckDataPhase2Status"
+            },
+            "CheckDataPhase2Status": {
+              "Type": "Choice",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success — a bound whose exhaustion converges on the happy path is not a bound.",
+              "Choices": [
+                {
+                  "Variable": "$.data_phase2_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "CheckSkipEvalJudge"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.data_phase2_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.data_phase2_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.data_phase2_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.data_phase2_polls",
+                      "NumericLessThan": 216
+                    }
+                  ],
+                  "Next": "DataPhase2Wait"
+                }
+              ],
+              "Default": "DataPhase2RetryGate"
+            },
+            "DataPhase2Wait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase2Status actually advances — a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.data_phase2_polls, 1)"
+              },
+              "ResultPath": "$.data_phase2_poll_count",
+              "Next": "DataPhase2PollWait"
+            },
+            "DataPhase2PollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeDataPhase2PollCount"
+            },
+            "MergeDataPhase2PollCount": {
+              "Type": "Pass",
+              "InputPath": "$.data_phase2_poll_count.polls",
+              "ResultPath": "$.data_phase2_polls",
+              "Next": "WaitForDataPhase2"
+            },
+            "DataPhase2RetryGate": {
+              "Type": "Choice",
+              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate. A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.data_phase2_attempts",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.data_phase2_attempts",
+                      "NumericGreaterThanEquals": 1
+                    }
+                  ],
+                  "Next": "PublishResearchFailureImmediate"
+                }
+              ],
+              "Default": "DataPhase2Reissue"
+            },
+            "DataPhase2Reissue": {
+              "Type": "Pass",
+              "Result": 1,
+              "ResultPath": "$.data_phase2_attempts",
+              "Next": "DataPhase2"
             },
             "CheckSkipEvalJudge": {
               "Type": "Choice",

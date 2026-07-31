@@ -41,6 +41,7 @@ Drift cases (all exit non-zero):
 Usage:
   ./infrastructure/scheduler/check-schedule-drift.py             # every discovered rule
   ./infrastructure/scheduler/check-schedule-drift.py --rule NAME # one rule
+  ./infrastructure/scheduler/check-schedule-drift.py --source-file PATH  # rules from PATH only
   ./infrastructure/scheduler/check-schedule-drift.py --json      # machine-readable
 
 Requires AWS creds with ``scheduler:GetSchedule`` and ``scheduler:ListSchedules``.
@@ -203,8 +204,19 @@ def _live_names_under(prefix: str) -> list[str]:
     return out.split() if out else []
 
 
-def check(rule_filter: str | None = None) -> tuple[list[dict], int]:
+def check(rule_filter: str | None = None, source_file: str | None = None) -> tuple[list[dict], int]:
     rules, findings, prefixes = discover_codified_rules()
+    if source_file:
+        rules = [r for r in rules if r["source_file"] == source_file]
+        # Only the prefixes declared by the same source file participate.
+        prefixes = {
+            prefix
+            for prefix in prefixes
+            if any(
+                r["source_file"] == source_file and r["name"].startswith(prefix)
+                for r in rules
+            )
+        }
     if rule_filter:
         rules = [r for r in rules if r["name"] == rule_filter]
         if not rules:
@@ -256,11 +268,15 @@ def check(rule_filter: str | None = None) -> tuple[list[dict], int]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="EventBridge Scheduler drift check")
     ap.add_argument("--rule", help="check a single rule by name")
+    ap.add_argument(
+        "--source-file",
+        help="scope the check to rules declared in this deploy.sh (repo-relative path)",
+    )
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
 
     try:
-        findings, checked = check(args.rule)
+        findings, checked = check(args.rule, source_file=args.source_file)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

@@ -601,6 +601,7 @@ def collect(
         return {"status": "skipped", "reason": "no tickers"}
 
     logger.info("Collecting alternative data for %d tickers", len(tickers))
+    _assert_scope_stable(s3, bucket, s3_prefix, run_date, len(tickers))
 
     if dry_run:
         return {
@@ -875,10 +876,99 @@ def load_from_s3(
 
 # -- Ticker resolution -------------------------------------------------------
 
+class ScopeChangedUnexpectedly(RuntimeError):
+    """The resolved ticker count moved by more than the allowed factor.
+
+    alpha-engine-config-I5814. On 2026-07-21 this collector's input went from
+    27 to 902 tickers overnight because an unrelated producer swap changed the
+    file it resolved its scope from. Nothing failed, nothing warned; the only
+    symptom was a 33x wall-clock increase that broke through the Lambda ceiling
+    on the next weekly run and was diagnosed nine days later.
+
+    A scope change is legitimate — the universe does grow — but it is a
+    DECISION, and a decision that arrives as a silent 33x is not one. Raising
+    here converts it into a one-line, same-run answer.
+    """
+
+
+# Widest run-over-run change treated as ordinary universe churn. S&P 500+400
+# reconstitution moves a handful of names quarterly; anything past +-30% is a
+# scope change, not churn.
+_SCOPE_CHANGE_TOLERANCE = 0.30
+
+
+def _assert_scope_stable(
+    s3, bucket: str, s3_prefix: str, run_date: str, n_tickers: int
+) -> None:
+    """Compare this run's ticker count against the most recent prior manifest.
+
+    Fail-open on a MISSING baseline (first run ever, or a new partition
+    scheme) — there is nothing to compare against and refusing to collect
+    would be worse than collecting. Fail-CLOSED on a baseline that exists and
+    disagrees, which is the case this guard is for.
+    """
+    prior_key = None
+    prior_n = None
+    for days_back in range(1, 15):
+        dt = date.fromisoformat(run_date) - timedelta(days=days_back)
+        key = f"{s3_prefix}weekly/{dt}/alternative/manifest.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            manifest = json.loads(obj["Body"].read())
+        except Exception:  # noqa: BLE001 — absence is the fail-open case
+            continue
+        value = manifest.get("tickers_requested")
+        if isinstance(value, (int, float)) and value > 0:
+            prior_key, prior_n = key, int(value)
+            break
+
+    if prior_n is None:
+        logger.warning(
+            "Alternative scope: no prior manifest within 14 days of %s — "
+            "collecting %d tickers with no baseline to compare against, so a "
+            "scope change cannot be detected this run.",
+            run_date, n_tickers,
+        )
+        return
+
+    ratio = n_tickers / prior_n
+    # round() before comparing: 1300/1000 gives 0.30000000000000004, so a
+    # bare `>` would reject a ratio that is exactly at the declared bound.
+    if round(abs(ratio - 1.0), 6) > _SCOPE_CHANGE_TOLERANCE:
+        raise ScopeChangedUnexpectedly(
+            f"alternative: resolved {n_tickers} tickers, prior run "
+            f"({prior_key}) requested {prior_n} — a {ratio:.2f}x change, past "
+            f"the {_SCOPE_CHANGE_TOLERANCE:.0%} churn tolerance. Either the "
+            "constituent universe genuinely moved this much (record why and "
+            "widen the tolerance deliberately) or something upstream changed "
+            "this collector's scope without meaning to — which is exactly "
+            "what happened on 2026-07-21 when 27 became 902 "
+            "(alpha-engine-config-I5814)."
+        )
+    logger.info(
+        "Alternative scope: %d tickers, %.2fx the prior run's %d — within the "
+        "%.0f%% churn tolerance.",
+        n_tickers, ratio, prior_n, _SCOPE_CHANGE_TOLERANCE * 100,
+    )
+
+
 def _load_promoted_tickers(
     s3, bucket: str, signals_key: str | None, run_date: str
 ) -> list[str]:
-    """Extract promoted tickers from the latest signals.json."""
+    """Extract promoted tickers from the latest signals.json.
+
+    DEPRECATED as the production scope resolver (alpha-engine-config-I5814).
+    ``weekly_collector._run_phase2`` now passes the constituent universe
+    explicitly, from the same ``constituents.json`` phase 1 hands to
+    ``fundamentals.collect``. This remains only for direct/ad-hoc calls that
+    pass a ``signals_key``.
+
+    Do NOT restore this as the default. ``signals.json``'s ``universe`` array
+    is a sizing envelope for the executor (alpha-engine-config-I5809), so
+    resolving scope from it makes this collector's cost and coverage a
+    function of whichever signals producer is champion — measured on
+    2026-07-21 as a silent 27 -> 902 step.
+    """
     if not signals_key:
         signals_key = f"signals/{run_date}/signals.json"
 

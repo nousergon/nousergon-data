@@ -38,6 +38,11 @@ _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_functi
 SPOT_STAGE_SEND_STATES = {
     "MorningEnrich",
     "DataPhase1",
+    # alpha-engine-config-I5759: repointed from lambda:invoke to the spot
+    # dispatch->poll quartet; it carries the same gold 4+2 ladder as its
+    # siblings because re-issue is idempotent for the same reason (the send
+    # state fails only pre-execution; the WaitFor* loop owns delivered runs).
+    "DataPhase2",
     "RAGIngestion",
     "PredictorTraining",
     "ResolveZooSpecs",

@@ -101,7 +101,6 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
-    "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
@@ -643,7 +642,13 @@ class TestEODSFTopLevelFieldsClosed:
 # REVERSED — ModelZooSelect is back inline in Branch B (the Sunday child SF and
 # the advisory child SF are retired; the weekly SF runs the full pre-split
 # pattern again, all-Saturday).
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 10
+# 10 → 11 on alpha-engine-config-I5759 (2026-07-31): DataPhase2 was
+# repointed from a lambda:invoke to the spot dispatch->poll quartet. Its
+# wall clock is a provider-imposed serial floor (2 Finnhub calls/ticker x
+# a 1.1s sleep held inside a module-global lock = 2.2 s/ticker, measured
+# flat at 903 tickers), so ~33 min against Lambda's 900s HARD maximum —
+# a ceiling no further bump can raise.
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
 
 
 def _spot_states(sf_path: Path) -> list[str]:
@@ -675,14 +680,14 @@ def _spot_states(sf_path: Path) -> list[str]:
 
 
 class TestSaturdaySFSpotStateCount:
-    """Closes the spot-state set as exactly 9 (see the count-history
+    """Closes the spot-state set at the declared count (see the count-history
     changelog comment above `_EXPECTED_SATURDAY_SPOT_STATE_COUNT`).
     Pre-rewire test_sf_friday_shell_run_wiring.py parametrizes over the
     expected names but doesn't assert an EXACT count — an orphaned legacy
     spot state from an incomplete refactor would slip through.
     """
 
-    def test_exactly_nine_spot_states_in_saturday_sf(self):
+    def test_spot_state_count_is_exactly_the_declared_count(self):
         spots = _spot_states(_SF_SATURDAY)
         assert len(spots) == _EXPECTED_SATURDAY_SPOT_STATE_COUNT, (
             f"Saturday SF should have EXACTLY "

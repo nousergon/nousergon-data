@@ -656,7 +656,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
 
 
 def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
-    """Phase 2: alternative data for promoted tickers (after research)."""
+    """Phase 2: alternative data for the constituent universe (after research)."""
     bucket = config["bucket"]
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
     run_date = args.date or default_run_date()
@@ -670,13 +670,50 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
+    # Scope resolution (alpha-engine-config-I5814, Brian ruling 2026-07-31).
+    #
+    # Phase 2 resolves its ticker list from constituents.json — the SAME source
+    # phase 1 passes to fundamentals.collect — rather than from
+    # signals/{date}/signals.json's `universe` array.
+    #
+    # Why: the seven `alternative`-family columns in features/registry.py are
+    # written for every ticker in the ArcticDB universe, so this collector's
+    # scope IS the constituent universe. Resolving it from signals.json made
+    # that scope a function of whichever producer happens to be champion:
+    # measured 2026-07-21, the retirement of the multi-agent Research stage
+    # (config-I2515 / config#1580) swapped a 27-name promoted list for a
+    # 902-row board, so this collector's input grew 33x overnight with no
+    # change to its own code. Its Lambda duration went 126-215s -> ~2000s and
+    # it broke through the 600s ceiling on the next weekly run.
+    #
+    # signals.json's `universe` is a SIZING ENVELOPE for the executor, not a
+    # scope (alpha-engine-config-I5809). constituents.json is the universe
+    # definition, and it is what every other universe-wide collector reads.
+    universe_tickers: list[str] = []
+    existing = constituents.load_from_s3(bucket, market_prefix)
+    if existing:
+        universe_tickers = list(existing.get("tickers") or [])
+    if not universe_tickers:
+        # No silent narrowing. A missing constituents artifact used to fall
+        # through to signals.json, which is exactly how the scope moved
+        # without anyone deciding it.
+        raise _CollectorError(
+            "alternative",
+            "constituents.json unreadable or empty at "
+            f"{market_prefix}weekly/<latest>/constituents.json — refusing to "
+            "collect alternative data against an implicit ticker list. Fix the "
+            "constituents artifact rather than falling back to "
+            "signals.json::universe (alpha-engine-config-I5814).",
+        )
+
     logger.info("=" * 60)
     logger.info("COLLECTING: alternative data (Phase 2)")
     logger.info("=" * 60)
     results["collectors"]["alternative"] = _phase_collect(
         reg, "alternative",
         lambda: alternative.collect(
-            bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
+            bucket=bucket, s3_prefix=market_prefix, run_date=run_date,
+            tickers=universe_tickers, dry_run=dry_run,
         ),
         artifact_key=f"{market_prefix}weekly/{run_date}/alternative/manifest.json",
     )

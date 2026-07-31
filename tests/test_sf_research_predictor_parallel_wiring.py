@@ -274,8 +274,46 @@ class TestBranchAContents:
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
 
     def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
-        assert branch_a["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
+        # alpha-engine-config-I5759: DataPhase2 dispatches to spot, so its
+        # success edge is the Success arm of CheckDataPhase2Status rather
+        # than DataPhase2.Next. Same shape as RAGIngestion above it.
+        assert branch_a["DataPhase2"]["Next"] == "InitDataPhase2PollCount"
+        success_arm = [
+            c for c in branch_a["CheckDataPhase2Status"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        ]
+        assert len(success_arm) == 1
+        assert success_arm[0]["Next"] == "CheckSkipEvalJudge"
         assert branch_a["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
+
+    def test_data_phase2_poll_loop_is_bounded(self, branch_a):
+        """alpha-engine-config-I5687: a poll loop added AFTER that finding
+        ships with its budget, and budget exhaustion must not converge on the
+        success path — an exhausted bound that reaches CheckSkipEvalJudge
+        would render a timed-out collection as a completed one."""
+        assert branch_a["InitDataPhase2PollCount"]["Result"] == 0
+        assert branch_a["InitDataPhase2PollCount"]["ResultPath"] == "$.data_phase2_polls"
+        bound = [
+            c for c in branch_a["CheckDataPhase2Status"]["Choices"]
+            if "And" in c
+        ]
+        assert len(bound) == 1, "the bounded in-progress arm is missing"
+        caps = [
+            cond["NumericLessThan"] for cond in bound[0]["And"]
+            if "NumericLessThan" in cond
+        ]
+        assert caps == [216], f"poll bound changed to {caps} without updating this test"
+        # The counter must actually advance, or the bound is decorative.
+        assert (
+            branch_a["DataPhase2Wait"]["Parameters"]["polls.$"]
+            == "States.MathAdd($.data_phase2_polls, 1)"
+        )
+        assert branch_a["MergeDataPhase2PollCount"]["ResultPath"] == "$.data_phase2_polls"
+        # Exhaustion falls to the retry gate, never to the judge chain.
+        assert branch_a["CheckDataPhase2Status"]["Default"] == "DataPhase2RetryGate"
+        assert branch_a["DataPhase2RetryGate"]["Choices"][0]["Next"] == (
+            "PublishResearchFailureImmediate"
+        )
 
     def test_eval_judge_quartet_preserved(self, branch_a):
         assert branch_a["EvalJudgePollChoice"]["Type"] == "Choice"

@@ -14,6 +14,10 @@
 #       (full price-cache refresh: weekly_collector.py --phase 1)
 #   SF state RAGIngestion  → --rag-only
 #       (rag/pipelines/run_weekly_ingestion.sh)
+#   SF state DataPhase2    → --phase2-only
+#       (alt-data refresh: weekly_collector.py --phase 2 — moved off a
+#        lambda:invoke by alpha-engine-config-I5759; its ~33-min serial floor
+#        does not fit Lambda's 900s maximum at the current universe size)
 #
 # Each SF state polls its own spot's completion independently (Wait /
 # CheckStatus / RetryGate / Reissue loop in step_function.json), so a
@@ -49,6 +53,7 @@
 #   ./infrastructure/spot_data_weekly.sh --morning-enrich-only  # one spot: morning enrich (SF: MorningEnrich)
 #   ./infrastructure/spot_data_weekly.sh --phase1-only          # one spot: DataPhase1 (SF: DataPhase1)
 #   ./infrastructure/spot_data_weekly.sh --rag-only             # one spot: RAG ingestion (SF: RAGIngestion)
+#   ./infrastructure/spot_data_weekly.sh --phase2-only          # one spot: alt data (SF: DataPhase2)
 #   ./infrastructure/spot_data_weekly.sh --data-only            # manual rerun: morning-enrich + phase1
 #   ./infrastructure/spot_data_weekly.sh                        # manual full bundle: enrich + phase1 + rag
 #   ./infrastructure/spot_data_weekly.sh --smoke-only      # quick validation, then terminate
@@ -233,6 +238,7 @@ while [[ $# -gt 0 ]]; do
         --data-only) RUN_MODE="data-only"; shift ;;
         --morning-enrich-only) RUN_MODE="morning-enrich-only"; shift ;;
         --phase1-only) RUN_MODE="phase1-only"; shift ;;
+        --phase2-only) RUN_MODE="phase2-only"; shift ;;
         --launch-only) RUN_MODE="launch-only"; shift ;;
         --id-artifact-key) ID_ARTIFACT_KEY="$2"; shift 2 ;;
         --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; MAX_RUNTIME_EXPLICIT=1; shift 2 ;;
@@ -263,6 +269,38 @@ if [ "$RUN_MODE" = "rag-only" ] && [ "$MAX_RUNTIME_EXPLICIT" != "1" ]; then
     # +300s so the box's own shutdown watchdog is a BACKSTOP that fires after
     # the outer SF executionTimeout/cleanup, never before the sweep completes.
     MAX_RUNTIME_SECONDS=21900
+fi
+
+# ── alpha-engine-config-I5759: phase2-only alt-data budget ───────────────────
+# DataPhase2 (collectors/alternative.py) cannot fit in Lambda and never could
+# at the current universe size. Its wall clock is set by two module-global
+# rate limiters that sleep while holding a lock, so it is SERIAL regardless of
+# how many workers the ThreadPoolExecutor has:
+#
+#   collectors/finnhub_client.py  _finnhub_lock + _FINNHUB_MIN_INTERVAL 1.1s
+#   collectors/alternative.py     _fmp_lock     + _FMP_MIN_INTERVAL     1.0s
+#
+# _fetch_all_alternative makes TWO _finnhub_get calls per ticker
+# (stock/recommendation, stock/earnings), so the floor is 2 x 1.1 = 2.2s per
+# ticker. Measured live 2026-07-30 on execution 1e856026: 2.16-2.24 s/ticker,
+# FLAT across the whole run, 402 of 903 tickers done when the 900s Lambda
+# MAXIMUM killed it. 903 x 2.2s = ~2000s, i.e. 2.2x a ceiling that cannot be
+# raised. Adding workers cannot move a provider-imposed serial floor; the only
+# correct fix is compute that can run for 33 minutes.
+#
+# Budget chain (load-bearing — each strictly less than the next, asserted by
+# tests/test_data_phase2_spot_budget_wiring.py):
+#   3600  workload run_ssm timeout      (~1.8x the measured 2000s need)
+#   4200  MAX_RUNTIME_SECONDS watchdog  (spot-side shutdown BACKSTOP)
+#   5400  SF executionTimeout           (covers launch + bootstrap + workload)
+#   5460  SF DataPhase2 TimeoutSeconds
+# If the workload budget ever meets the watchdog, systemd shuts the box down
+# mid-loop and the manifest is never written — the alpha-engine-config-I5208
+# failure mode, reintroduced by config drift.
+PHASE2_ONLY_EXECUTION_TIMEOUT_SECONDS=5400        # = SF DataPhase2 executionTimeout
+PHASE2_ONLY_WORKLOAD_TIMEOUT_SECONDS=3600
+if [ "$RUN_MODE" = "phase2-only" ] && [ "$MAX_RUNTIME_EXPLICIT" != "1" ]; then
+    MAX_RUNTIME_SECONDS=4200
 fi
 
 # launch-only contract: the id artifact is how the weekday SF finds the
@@ -865,6 +903,102 @@ RAG_ONLY
         --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
         && echo "Heartbeat emitted: rag-ingestion" \
         || echo "WARNING: Failed to emit heartbeat for rag-ingestion (non-fatal)"
+    exit 0
+fi
+
+# ── Phase2-only run (SF state DataPhase2) ───────────────────────────────────
+# alpha-engine-config-I5759. Mirrors the rag-only block above: a self-contained
+# workload that runs on its own spot, emits its own heartbeat, and exits — so a
+# DataPhase2 failure costs nothing already spent by DataPhase1 or RAGIngestion.
+#
+# No secret pre-fetch block (unlike rag-only): every provider key this phase
+# touches is resolved at call time through nousergon_lib.secrets.get_secret,
+# which reads SSM directly under the box's instance role. rag-only pre-fetches
+# only because rag.preflight's check_env_vars asserts on os.environ.
+#
+# NOT given a spot-orphan-reaper WATCH_KINDS row, deliberately: this box is the
+# same class as DataPhase1's and RAGIngestion's — bounded by the systemd
+# watchdog armed in the bootstrap step and by the dispatcher's cleanup trap —
+# and neither sibling carries one. The reaper's watch-kind rows cover the four
+# box classes with no dispatcher holding them (ci-watch, sf-watch, alert-drain,
+# thinktank). Adding a fifth here would introduce a mechanism this stage's
+# siblings do not use rather than mirroring them.
+if [ "$RUN_MODE" = "phase2-only" ]; then
+    # Friday shell-run dry path. The pre-spot DataPhase2 was a lambda:invoke
+    # whose Payload carried dry_run.$ = $.data_phase2_dry; the spot states
+    # express the same intent through $.preflight_args, which
+    # ApplyShellRunDefaults sets to --preflight-only. Forwarding it to
+    # weekly_collector.py is a STRONGER guarantee than the old dry_run flag:
+    # --preflight-only exits 0 immediately after DataPreflight("phase2") and
+    # strictly BEFORE run_weekly(), the sole function in that module that
+    # performs any collector fetch or any S3 write, so every fetch/write path
+    # is statically unreachable rather than branch-suppressed.
+    PHASE2_COLLECTOR_ARGS=""
+    if [ "$PREFLIGHT_ONLY" = "1" ]; then
+        PHASE2_COLLECTOR_ARGS="--preflight-only"
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "  PHASE2-ONLY PREFLIGHT-ONLY (boot + phase2 preflight, NO fetch/write)"
+        echo "═══════════════════════════════════════════════════════════════"
+    fi
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  PHASE2-ONLY RUN: alternative data (MorningEnrich/DataPhase1/RAG separate)"
+    echo "═══════════════════════════════════════════════════════════════"
+    # Printed, not just declared: when this stage times out the first question
+    # is which link of the chain fired, and the answer should be in the log
+    # rather than reconstructed from three files.
+    echo "  Budget chain  : workload ${PHASE2_ONLY_WORKLOAD_TIMEOUT_SECONDS}s"\
+         "< watchdog ${MAX_RUNTIME_SECONDS}s"\
+         "< SF executionTimeout ${PHASE2_ONLY_EXECUTION_TIMEOUT_SECONDS}s"
+    run_ssm "phase2-only" "$PHASE2_ONLY_WORKLOAD_TIMEOUT_SECONDS" <<PHASE2_ONLY
+set -eo pipefail
+${ENV_SOURCE}
+cd /home/ec2-user/alpha-engine-data
+
+# Spot-side log capture — same rationale as the rag-only block: SSM caps
+# StandardOutputContent at 24KB and this phase logs one line per ticker for
+# ~900 tickers, so the inline capture is guaranteed to truncate. The tee'd
+# copy lands in S3 on EVERY exit path, including the SIGKILL-free timeout.
+LOG_FILE=/tmp/data-phase2.log
+exec > >(tee -a "\$LOG_FILE") 2>&1
+upload_log() {
+    local exit_code=\$?
+    local s3_key="health/data_phase2_log/\$(date +%Y-%m-%d)/\$(date +%Y%m%dT%H%M%SZ -u)-exit\${exit_code}.log"
+    aws s3 cp "\$LOG_FILE" "s3://${S3_BUCKET}/\$s3_key" --region "\${AWS_REGION:-us-east-1}" 2>/dev/null \\
+        && echo "[log-upload] s3://${S3_BUCKET}/\$s3_key" \\
+        || echo "[log-upload] WARNING: failed to upload \$LOG_FILE to S3"
+}
+trap upload_log EXIT
+
+echo "──────────────────────────────────────────────────────────────"
+echo "Starting weekly_collector.py --phase 2 at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+if ! \$PYTHON_BIN weekly_collector.py --phase 2 ${PHASE2_COLLECTOR_ARGS} 2>&1; then
+    echo "ERROR: weekly_collector.py --phase 2 ${PHASE2_COLLECTOR_ARGS} failed." >&2
+    exit 1
+fi
+echo "DataPhase2 complete at \$(date)"
+PHASE2_ONLY
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Phase2-only run complete. Instance will be terminated."
+    echo "═══════════════════════════════════════════════════════════════"
+
+    if [ "$PREFLIGHT_ONLY" = "1" ]; then
+        echo "Preflight-only run — heartbeat deliberately NOT emitted (a preflight is not a completed collection)."
+        exit 0
+    fi
+
+    aws cloudwatch put-metric-data \
+        --namespace "AlphaEngine" \
+        --metric-name "Heartbeat" \
+        --dimensions "Process=data-phase2" \
+        --value 1 --unit "Count" \
+        --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+        && echo "Heartbeat emitted: data-phase2" \
+        || echo "WARNING: Failed to emit heartbeat for data-phase2 (non-fatal)"
     exit 0
 fi
 
