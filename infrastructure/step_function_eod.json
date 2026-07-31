@@ -686,6 +686,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
+          "execution_id.$": "$$.Execution.Id",
           "workload": "post-market-data",
           "force_on_demand.$": "$.data_spot_retry.force_on_demand"
         }
@@ -861,6 +862,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
+          "execution_id.$": "$$.Execution.Id",
           "workload": "post-market-arctic-append",
           "force_on_demand.$": "$.data_spot_arctic_retry.force_on_demand"
         }
@@ -1253,6 +1255,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
+          "execution_id.$": "$$.Execution.Id",
           "workload": "post-market-data",
           "force_on_demand": true
         }
@@ -1388,6 +1391,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
+          "execution_id.$": "$$.Execution.Id",
           "workload": "post-market-arctic-append",
           "force_on_demand": true
         }

@@ -231,7 +231,7 @@ echo "[data-spot] workload {workload} complete"
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = None) -> tuple[str, str]:
     """Launch the data spot box; spot first, on-demand fallback on capacity
     exhaustion OR account-wide spot quota exhaustion (config#2698 — e.g.
     MaxSpotInstanceCountExceeded; a 2026-07-15 incident hard-failed
@@ -249,7 +249,12 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
     retry-on-relaunch. A workload that already lost one box to a spot
     interruption should not gamble on spot again for its one retry attempt —
     the cost delta is a few cents for a sub-hour c5.large-class box,
-    negligible against the reconcile-reliability this buys."""
+    negligible against the reconcile-reliability this buys.
+
+    extra_tags (config#5504): per-run identity tags (execution_id, run_date,
+    pipeline_role) ride the SAME RunInstances call atomically via krepis.ec2_spot's
+    extra_tags kwarg — never a separate post-launch create_tags call subject to a
+    race. When omitted, the box is launched with only the Name tag."""
     common = dict(
         image_id=AMI_ID,
         key_name=KEY_NAME,
@@ -258,6 +263,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         volume_size_gb=VOLUME_SIZE_GB,
         shutdown_behavior="terminate",
         tag_name="alpha-engine-data-spot",
+        extra_tags=extra_tags,
         region=REGION,
     )
     if force_on_demand:
@@ -357,15 +363,25 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     `event` carries {"workload": "morning-enrich" | "morning-arctic-append" |
     "post-market-data" | "post-market-arctic-append" | "daily-heal",
-    "force_on_demand": bool}. `force_on_demand` (default False) is set by the
+    "force_on_demand": bool, "execution_id": str, "run_date": str,
+    "pipeline_role": str}. `force_on_demand` (default False) is set by the
     EOD SF's post-interruption retry (2026-07-14 incident) and the weekday
     SF's identical retry (config#2542) so the one retry attempt never gambles
     on spot a second time; the "daily-heal" workload (alpha-engine-config-
     I2717) is invoked directly by its own EventBridge rule (NOT from either
     SF) and omits `force_on_demand`, so it defaults to False (spot-first, no
-    retry-budget coupling to either pipeline). Returns, wrapped under a
-    `data_spot` key (mirrors the groom dispatcher's `groom` wrap so the SF's
-    JSONPath is $.<result>.Payload.data_spot.*):
+    retry-budget coupling to either pipeline).
+
+    execution_id / run_date / pipeline_role (config#5504): per-run identity
+    fields threaded from the SF execution context ($$.Execution.Id,
+    $$.Execution.StartTime, $.pipeline_role). They ride the RunInstances call
+    atomically as EC2 tags so every launched instance is attributable to the
+    SF execution that launched it — the prerequisite for per-run cost
+    measurement. Any field omitted (e.g. daily-heal EventBridge invoke, which
+    has no SF execution context) is simply not tagged.
+
+    Returns, wrapped under a `data_spot` key (mirrors the groom dispatcher's
+    `groom` wrap so the SF's JSONPath is $.<result>.Payload.data_spot.*):
 
       {"launched": true, "instance_id", "command_id", "workload", "run_token"}
       or {"launched": false, "reason": "disabled"} under the kill-switch.
@@ -378,12 +394,26 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     workload, collector_cmd = _resolve_workload(event)
     force_on_demand = bool(event.get("force_on_demand", False))
 
+    # Per-run identity tags (config#5504): attribute every launched instance
+    # to the SF execution so per-run EC2 cost is measurable. Gracefully
+    # absent for invocations without SF execution context (daily-heal
+    # EventBridge, operator re-drives).
+    extra_tags = {}
+    for key, tag_name in (
+        ("execution_id", "execution-id"),
+        ("run_date", "run-date"),
+        ("pipeline_role", "pipeline-role"),
+    ):
+        val = str(event.get(key, "")).strip()
+        if val:
+            extra_tags[tag_name] = val
+
     if not DISPATCH_ENABLED:
         logger.warning("DATA_SPOT_DISPATCH_ENABLED=false — data spot NOT launched")
         return {"data_spot": {"launched": False, "reason": "disabled", "workload": workload}}
 
     run_token = uuid.uuid4().hex
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand, extra_tags=extra_tags or None)
     logger.info("launched data-spot box %s (%s) for %s", instance_id, market, workload)
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow

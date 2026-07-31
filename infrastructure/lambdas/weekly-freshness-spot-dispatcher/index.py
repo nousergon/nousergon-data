@@ -292,11 +292,15 @@ echo "[weekly-freshness-spot-bootstrap] complete — launcher box ready"
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = None) -> tuple[str, str]:
     """Launch the launcher box; spot first, on-demand fallback on capacity/
     quota exhaustion via the shared spot_dispatch chokepoint (same posture as
     every other fleet dispatcher — the weekly run must not be starved by a
-    capacity dip)."""
+    capacity dip).
+
+    extra_tags (config#5504): per-run identity tags (execution_id, run_date,
+    pipeline_role) ride the SAME RunInstances call atomically — never a
+    separate post-launch create_tags call."""
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -305,6 +309,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-weekly-freshness-spot",
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -356,6 +361,19 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     event = event or {}
     force_on_demand = bool(event.get("force_on_demand", False))
 
+    # Per-run identity tags (config#5504): attribute the launcher box to the SF
+    # execution so per-run EC2 cost is measurable. Gracefully absent for
+    # operator off-cycle reruns that bypass the SF.
+    extra_tags = {}
+    for key, tag_name in (
+        ("execution_id", "execution-id"),
+        ("run_date", "run-date"),
+        ("pipeline_role", "pipeline-role"),
+    ):
+        val = str(event.get(key, "")).strip()
+        if val:
+            extra_tags[tag_name] = val
+
     if not DISPATCH_ENABLED:
         # No fail-open skip on the SF side for this flag — flipping it off is
         # an explicit "I will pass ec2_instance_id myself" operator action.
@@ -373,7 +391,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     run_token = uuid.uuid4().hex
     try:
-        instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+        instance_id, market = _launch_instance(force_on_demand=force_on_demand, extra_tags=extra_tags or None)
     except SpotLaunchError:
         logger.error("weekly-freshness-spot launch failed (spot + on-demand exhausted)")
         raise
