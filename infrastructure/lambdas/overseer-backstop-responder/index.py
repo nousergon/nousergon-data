@@ -1,842 +1,507 @@
-"""alpha-engine-overseer-backstop-responder — bounded, deterministic, non-agentic
-recovery responder between the dumb SNS backstop and the human page.
+"""alpha-engine-overseer-backstop-responder — the dumb backstop's bounded
+recovery attempt (alpha-engine-config-I4480, epic I2821).
 
-Subscribes DIRECTLY to the SNS backstop topic (``alpha-engine-alarm-backstop``),
-gathers fleet state, attempts ONE bounded recovery per alarm per cooldown window,
-and forwards an enhanced page to Telegram. Designed per alpha-engine-config-I4480
-(G9 of the 2026-07-27 conformance audit).
+overseer-policy.md §1 ("no failure class terminates in a notification"),
+§4 inv. 1/3/16, §5 layer D, O3.
 
-INVARIANT (overseer-policy §4.3): the backstop must stay dumb — no agent, no
-queue, no bus dependency, nothing that can fail non-obviously. This Lambda:
-  - Has NO LLM call, NO queue read/write, NO EventBridge dependency.
-  - Invokes other Lambdas synchronously (Lambda→Lambda is a deterministic,
-    auditable call, not a bus/queue dependency).
-  - Uses urllib only for Telegram (zero pip deps, same as backstop-telegram-notifier).
-  - Cooldown state in S3 (no DynamoDB — S3 is the simplest possible persistence).
+WHY. Degradation of the Overseer plane is the one class the Overseer cannot
+cover for itself: its own response path is the thing that is down. Until now
+the terminal state of that class was an SNS email. The 2026-07-27 audit found
+`alpha-engine-watch-plane-overseer-intake-age` had been in ALARM for three
+days with the alert-drain dead behind it and no autonomous response of any
+kind; by 2026-07-28 that was five days. Detection worked perfectly throughout.
+Nothing acted.
 
-AUTHORITY: T1 (named deterministic remediation, per overseer-policy §6). The
-recovery actions are a HARDCODED, REVIEWED list — never improvised at run time:
-  1. Re-invoke the liveness probe (read-only, always safe).
-  2. Re-dispatch a failed playbook once via the router (for intake-age alarm).
+This Lambda sits between the backstop topic and the human, and does three
+bounded things:
 
-COOLDOWN: one recovery attempt per alarm per window (default 60 min). Second
-occurrence within the window escalates — no retry, human needed now.
+  1. **Reports state, always** — kill-switch values, intake depth AND age,
+     last ledger per routed playbook, last probe invocation. The page becomes
+     decision-shaped instead of an alarm name. Even when it takes no action,
+     this alone converts a bare page into something answerable from a phone.
+  2. **Attempts ONE recovery**, once per alarm per cooldown window, from a
+     hardcoded reviewed allowlist: re-invoke the liveness probe, or re-dispatch
+     one playbook through the router. Nothing else exists in the map, and an
+     unmapped alarm reports without acting.
+  3. **Escalates on the second firing** inside the window — the attempt did not
+     work, a human is needed now, and retrying would be a loop.
 
-Design:
-  - urllib only — zero pip dependencies, zero 3rd-party packages
-  - Bot token read from SSM at EVERY invoke (no cached credentials)
-  - SNS → Lambda direct subscription (no EventBridge, no DLQ)
-  - All external calls are caught and reported — never crash the handler
-  - The email leg (SNS→email subscription) is unaffected — this is an ADDITIONAL
-    independent channel
+WHAT IT DELIBERATELY IS NOT
+---------------------------
+**Not an agent.** No LLM, no charter, no reasoning. The action set is a dict
+literal reviewed in this file. §4 inv. 3 makes the backstop's dumbness
+permanent, and an agent here would reintroduce exactly the silent-failure mode
+the backstop exists to survive.
+
+**Not dependent on the plane it rescues.** No bus, no intake queue, no S3
+fallback prefix, no krepis, no flow-doctor, no nousergon-lib. Its only imports
+are boto3 (present in the runtime) and the standard library — a third-party
+dependency is one more thing that can fail non-obviously in the one component
+that must not (§4 inv. 1, inv. 3). It MAY invoke the router as a recovery
+action, but it never requires the router to be healthy in order to run or to
+page: a failed invoke is a reported verdict, not an exception.
+
+**Not a queue consumer.** It reads SQS *attributes* (depth, age of oldest) and
+never receives or deletes a message. Nothing it does can lose an incident.
+
+**Its paging path is independent of everything above.** Direct HTTPS to the
+Telegram API. The SNS email subscription on the same topic still fires
+independently, so the human has two paths that share no component — which is
+the whole content of §5 layer D.
+
+FAILURE POSTURE. Every gathering step and every action is individually
+try/except'd, and its failure becomes a *line in the report* rather than an
+exception. That is deliberate and is the documented deviation the
+no-silent-fails rule requires: (a) swallowed = any AWS call failing during
+evidence-gathering, (b) the primary deliverable — the page — must survive
+partial blindness, because a backstop that crashes while reporting that the
+plane is down is worse than one that reports "could not read X", (c) recording
+surface = the page itself, which names every failed probe explicitly, plus
+CloudWatch logs.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import logging
 import os
-import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import boto3
 
-logger = logging.getLogger()
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
-
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
+ACCOUNT = os.environ.get("AWS_ACCOUNT_ID", "711398986525")
 
-# ── SSM paths ─────────────────────────────────────────────────────────────────
-SSM_BOT_TOKEN_PATH = os.environ.get(
-    "SSM_BOT_TOKEN_PATH", "/alpha-engine/TELEGRAM_BOT_TOKEN"
-)
-SSM_CHAT_ID_PATH = os.environ.get(
-    "SSM_CHAT_ID_PATH", "/alpha-engine/TELEGRAM_CHAT_ID"
-)
-SSM_THREAD_ID_PATH = os.environ.get(
-    "SSM_THREAD_ID_PATH",
-    "/alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
-)
+# Kill switch. Set to "false" to make this responder report-and-page only,
+# without ever attempting a recovery action.
+RECOVERY_ENABLED = os.environ.get("BACKSTOP_RECOVERY_ENABLED", "true").lower() == "true"
 
-TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+COOLDOWN_HOURS = int(os.environ.get("BACKSTOP_COOLDOWN_HOURS", "6"))
+STATE_BUCKET = os.environ.get("BACKSTOP_STATE_BUCKET", "alpha-engine-research")
+STATE_PREFIX = os.environ.get("BACKSTOP_STATE_PREFIX", "overseer/_backstop/attempts")
 
-# ── Cooldown ───────────────────────────────────────────────────────────────────
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
-COOLDOWN_BUCKET = os.environ.get("COOLDOWN_BUCKET", "alpha-engine-research")
-COOLDOWN_PREFIX = os.environ.get(
-    "COOLDOWN_PREFIX", "consolidated/overseer_backstop/cooldown"
+ROUTER_FUNCTION = os.environ.get(
+    "OVERSEER_ROUTER_FUNCTION", "alpha-engine-overseer-dispatcher"
 )
+PROBE_FUNCTION = os.environ.get(
+    "OVERSEER_PROBE_FUNCTION", "alpha-engine-overseer-liveness-probe"
+)
+INTAKE_QUEUE = os.environ.get("OVERSEER_INTAKE_QUEUE", "nousergon-overseer-intake")
+INTAKE_DLQ = os.environ.get("OVERSEER_INTAKE_DLQ", "nousergon-overseer-intake-dlq")
 
-# ── Recovery targets ──────────────────────────────────────────────────────────
-LIVENESS_PROBE_FUNCTION = os.environ.get(
-    "LIVENESS_PROBE_FUNCTION", "alpha-engine-overseer-liveness-probe"
+TELEGRAM_TOKEN_PARAM = os.environ.get(
+    "TELEGRAM_TOKEN_PARAM", "/alpha-engine/TELEGRAM_BOT_TOKEN"
 )
-OVERSEER_DISPATCHER_FUNCTION = os.environ.get(
-    "OVERSEER_DISPATCHER_FUNCTION", "alpha-engine-overseer-dispatcher"
+TELEGRAM_CHAT_PARAM = os.environ.get(
+    "TELEGRAM_CHAT_PARAM", "/alpha-engine/TELEGRAM_CHAT_ID"
 )
 
-# ── Queue names for state reporting ───────────────────────────────────────────
-INTAKE_QUEUE_NAME = os.environ.get(
-    "INTAKE_QUEUE_NAME", "nousergon-overseer-intake"
-)
-INTAKE_DLQ_NAME = os.environ.get(
-    "INTAKE_DLQ_NAME", "nousergon-overseer-intake-dlq"
-)
-
-# ── S3 paths for ledger/liveness state ────────────────────────────────────────
-WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
-DISPATCH_LEDGER_PREFIX = os.environ.get(
-    "DISPATCH_LEDGER_PREFIX", "overseer/dispatch_ledger"
-)
-DRAIN_LEDGER_PREFIX = os.environ.get(
-    "DRAIN_LEDGER_PREFIX", "overseer/drain_ledger"
-)
-LIVENESS_STATE_KEY = os.environ.get(
-    "LIVENESS_STATE_KEY", "consolidated/overseer_liveness/alerted.json"
-)
-
-# ── Alarm→recovery mapping ────────────────────────────────────────────────────
-# Hardcoded, reviewed action list. Keys are alarm-name substrings; values are
-# lists of recovery actions to attempt. Order matters — actions run sequentially,
-# each on failure of the prior. An empty list means "report state only."
-ALARM_RECOVERY_MAP = {
-    "overseer-intake-age": ["invoke_liveness_probe", "redispatch_alert_drain"],
-    "overseer-liveness-probe": ["invoke_liveness_probe"],
-    "overseer-intake-dlq": ["invoke_liveness_probe", "redispatch_alert_drain"],
+# ── The action allowlist ─────────────────────────────────────────────────────
+# THE ENTIRE AUTHORITY OF THIS LAMBDA. Adding a row is a reviewed change, never
+# a runtime decision. An alarm absent from this map is reported, not acted on —
+# report-only is the safe default, and a missing row must never mean "improvise".
+#
+# `redispatch` payloads mirror what the scheduler sends, minus the run id (the
+# executor mints its own). `is_drill` is always false: a drill would prove the
+# pipe works while leaving the real backlog untouched.
+ALARM_ACTIONS: dict[str, dict] = {
+    "alpha-engine-watch-plane-overseer-intake-age": {
+        "action": "redispatch",
+        "playbook": "alert-drain",
+        "payload": {"trigger": "backstop-recovery", "is_drill": "false"},
+        "rationale": "queue ageing means the drain is not draining — one dispatch",
+    },
+    "alpha-engine-watch-plane-overseer-intake-depth": {
+        "action": "redispatch",
+        "playbook": "alert-drain",
+        "payload": {"trigger": "backstop-recovery", "is_drill": "false"},
+        "rationale": "queue depth means the drain is not draining — one dispatch",
+    },
+    "alpha-engine-watch-plane-overseer-liveness-probe-errors": {
+        "action": "invoke_probe",
+        "rationale": "a probe erroring every invocation blinds the whole plane",
+    },
 }
-# Default recovery for any backstop alarm not explicitly mapped:
-DEFAULT_RECOVERY_ACTIONS = ["invoke_liveness_probe"]
+
+# Kill switches to report. Component -> (function name, env var).
+KILL_SWITCHES = [
+    ("router", ROUTER_FUNCTION, "OVERSEER_DISPATCH_ENABLED"),
+    ("alert-drain", "alpha-engine-alert-drain-dispatcher", "ALERT_DRAIN_DISPATCH_ENABLED"),
+    ("ci-watch", "alpha-engine-ci-watch-dispatcher", "CI_WATCH_DISPATCH_ENABLED"),
+    ("sf-watch", "alpha-engine-sf-watch-spot-dispatcher", "SF_WATCH_DISPATCH_ENABLED"),
+]
+
+# Playbook -> S3 prefix whose newest object proves the playbook last completed.
+LEDGER_PREFIXES = {
+    "alert-drain": "overseer/drain_ledger/",
+    "dispatch-router": "overseer/dispatch_ledger/",
+}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SSM helpers (mirrors backstop-telegram-notifier)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _ssm_parameter(path: str) -> str:
-    """Read a plaintext SSM parameter. Raises on any error (fail-loud)."""
-    ssm = boto3.client("ssm", region_name=REGION)
-    resp = ssm.get_parameter(Name=path, WithDecryption=True)
-    return resp["Parameter"]["Value"]
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Telegram (mirrors backstop-telegram-notifier — urllib only, zero pip deps)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Evidence gathering — every step degrades to a string, never raises ───────
 
-def _send_telegram(
-    bot_token: str,
-    chat_id: str,
-    text: str,
-    thread_id: str | None = None,
-) -> dict | None:
-    """Send ``text`` to the given Telegram chat/thread via the Bot API.
 
-    Returns the JSON response on success, or None on any non-fatal error.
-    Uses raw urllib — zero pip dependencies.
-    """
-    payload: dict[str, object] = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "MarkdownV2",
-        "disable_web_page_preview": True,
-    }
-    if thread_id:
-        payload["message_thread_id"] = int(thread_id)
-
-    data = json.dumps(payload).encode("utf-8")
-    url = f"{TELEGRAM_API_BASE}{bot_token}/sendMessage"
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read()
-            if isinstance(body, bytes):
-                body = body.decode("utf-8")
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        body = ""
+def _kill_switch_state() -> dict[str, str]:
+    out: dict[str, str] = {}
+    lam = boto3.client("lambda", region_name=REGION)
+    for label, function, var in KILL_SWITCHES:
         try:
-            body = exc.read()
-            if isinstance(body, bytes):
-                body = body.decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            body = str(exc)
-        logger.warning("Telegram API HTTP %s: %s", exc.code, body)
-        return None
-    except urllib.error.URLError as exc:
-        logger.warning("Telegram API connection failed: %s", exc.reason)
-        return None
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("Telegram send unexpected error: %s", exc)
-        return None
+            cfg = lam.get_function_configuration(FunctionName=function)
+            out[label] = cfg.get("Environment", {}).get("Variables", {}).get(
+                var, "(unset — defaults to enabled)"
+            )
+        except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+            out[label] = f"UNREADABLE: {type(exc).__name__}"
+    return out
 
 
-def _escape_markdown(text: str) -> str:
-    """Escape Telegram MarkdownV2 special characters."""
-    special = r"_*[]()~`>#+-=|{}.!"
-    for ch in special:
-        text = text.replace(ch, f"\\{ch}")
-    return text
+def _queue_age_seconds(queue_name: str) -> int | None:
+    """Age of the oldest message, from CloudWatch.
+
+    `ApproximateAgeOfOldestMessage` is an AWS/SQS **metric**, NOT a
+    GetQueueAttributes attribute — asking SQS for it returns
+    `InvalidAttributeName` and, because attribute names are validated as a set,
+    it takes the depth read down with it. Found by live-invoking the deployed
+    function (overseer-policy §4 inv. 14); the unit fakes had happily returned
+    a value for it.
+
+    Age is the load-bearing half: a queue being drained and refilled looks
+    identical to one that is not being drained until you look at age (§5 C).
+    """
+    cw = boto3.client("cloudwatch", region_name=REGION)
+    now = _utcnow()
+    resp = cw.get_metric_statistics(
+        Namespace="AWS/SQS",
+        MetricName="ApproximateAgeOfOldestMessage",
+        Dimensions=[{"Name": "QueueName", "Value": queue_name}],
+        StartTime=now - timedelta(minutes=30),
+        EndTime=now,
+        Period=300,
+        Statistics=["Maximum"],
+    )
+    pts = sorted(resp.get("Datapoints") or [], key=lambda p: p["Timestamp"])
+    return int(pts[-1]["Maximum"]) if pts else None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Cooldown (S3-based — no DynamoDB dependency)
-# ═══════════════════════════════════════════════════════════════════════════════
+def _queue_state() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for label, name in (("intake", INTAKE_QUEUE), ("dlq", INTAKE_DLQ)):
+        depth = "?"
+        try:
+            sqs = boto3.client("sqs", region_name=REGION)
+            url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+            attrs = sqs.get_queue_attributes(
+                QueueUrl=url,
+                AttributeNames=[
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                ],
+            )["Attributes"]
+            depth = (
+                f"{attrs.get('ApproximateNumberOfMessages', '?')} visible / "
+                f"{attrs.get('ApproximateNumberOfMessagesNotVisible', '?')} in flight"
+            )
+        except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+            out[label] = f"UNREADABLE: {type(exc).__name__}"
+            continue
+        # Age is gathered separately so a CloudWatch failure cannot cost us the
+        # depth reading, and vice versa. Two facts, two failure domains.
+        try:
+            age = _queue_age_seconds(name)
+            age_str = "n/a" if age is None else f"{age // 3600}h{(age % 3600) // 60:02d}m"
+        except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+            age_str = f"UNREADABLE ({type(exc).__name__})"
+        out[label] = f"{depth} / oldest {age_str}"
+    return out
 
-def _alarm_slug(alarm_name: str) -> str:
-    """Deterministic S3-safe slug from an alarm name."""
-    return hashlib.sha256(alarm_name.encode()).hexdigest()[:16]
+
+def _last_ledger_ages() -> dict[str, str]:
+    """Newest object under each ledger prefix, as an age.
+
+    Deliberately an AGE, not a timestamp: 'last drain ledger 4h ago' is
+    actionable on a phone; an ISO timestamp requires arithmetic at 3am.
+    """
+    out: dict[str, str] = {}
+    s3 = boto3.client("s3", region_name=REGION)
+    now = _utcnow()
+    for playbook, prefix in LEDGER_PREFIXES.items():
+        try:
+            newest = None
+            # Date-partitioned prefixes: walk at most three day-partitions, so
+            # this stays bounded regardless of how much history accumulates —
+            # a backstop must not get slower as the fleet gets older.
+            for delta in (0, 1, 2):
+                day = (now - timedelta(days=delta)).strftime("%Y-%m-%d")
+                resp = s3.list_objects_v2(
+                    Bucket=STATE_BUCKET, Prefix=f"{prefix}{day}/"
+                )
+                for obj in resp.get("Contents") or []:
+                    if newest is None or obj["LastModified"] > newest:
+                        newest = obj["LastModified"]
+                if newest is not None:
+                    break
+            if newest is None:
+                out[playbook] = "NONE in the last 3 days"
+            else:
+                mins = int((now - newest).total_seconds() // 60)
+                out[playbook] = f"{mins // 60}h{mins % 60:02d}m ago"
+        except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+            out[playbook] = f"UNREADABLE: {type(exc).__name__}"
+    return out
 
 
-def _cooldown_key(alarm_name: str) -> str:
-    return f"{COOLDOWN_PREFIX}/{_alarm_slug(alarm_name)}.json"
-
-
-def _load_cooldown(s3, alarm_name: str) -> dict | None:
-    """Load the cooldown state for ``alarm_name``, or None if no prior firing."""
-    key = _cooldown_key(alarm_name)
+def _probe_health() -> str:
     try:
-        obj = s3.get_object(Bucket=COOLDOWN_BUCKET, Key=key)
-        return json.loads(obj["Body"].read())
-    except Exception as exc:  # noqa: BLE001
-        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
-        if code not in {"NoSuchKey", "404", ""}:
-            logger.warning("Cooldown read error for %s: %s", alarm_name, exc)
-        return None
+        cw = boto3.client("cloudwatch", region_name=REGION)
+        now = _utcnow()
+        stats = {}
+        for metric in ("Invocations", "Errors"):
+            resp = cw.get_metric_statistics(
+                Namespace="AWS/Lambda",
+                MetricName=metric,
+                Dimensions=[{"Name": "FunctionName", "Value": PROBE_FUNCTION}],
+                StartTime=now - timedelta(hours=24),
+                EndTime=now,
+                Period=86400,
+                Statistics=["Sum"],
+            )
+            pts = resp.get("Datapoints") or []
+            stats[metric] = int(sum(p["Sum"] for p in pts))
+        inv, err = stats.get("Invocations", 0), stats.get("Errors", 0)
+        if inv == 0:
+            return "NOT INVOKED in 24h — the probe is not running at all"
+        if err >= inv:
+            return f"{inv} invocations, {err} errors in 24h — failing EVERY run"
+        return f"{inv} invocations, {err} errors in 24h"
+    except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+        return f"UNREADABLE: {type(exc).__name__}"
 
 
-def _save_cooldown(s3, alarm_name: str, state: dict) -> None:
-    """Persist cooldown state. Best-effort — failure only risks a duplicate
-    recovery next firing, never a missed alarm."""
-    key = _cooldown_key(alarm_name)
+# ── Cooldown ────────────────────────────────────────────────────────────────
+
+
+def _window_start(now: datetime) -> str:
+    """Floor `now` to the cooldown window. Deterministic and stateless — two
+    firings in the same window map to the same key without any clock state."""
+    hours = (now.hour // COOLDOWN_HOURS) * COOLDOWN_HOURS
+    return now.replace(hour=hours, minute=0, second=0, microsecond=0).strftime(
+        "%Y-%m-%dT%H%MZ"
+    )
+
+
+def _attempt_key(alarm: str, now: datetime) -> str:
+    safe = urllib.parse.quote(alarm, safe="")
+    return f"{STATE_PREFIX}/{safe}/{_window_start(now)}.json"
+
+
+def _is_missing_key(exc: Exception) -> bool:
+    """True when `exc` means "that S3 key does not exist" — matched by name and
+    error code rather than by exception class (see _claim_attempt)."""
+    if type(exc).__name__ in ("NoSuchKey", "404"):
+        return True
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+    return code in ("NoSuchKey", "404", "NotFound")
+
+
+def _claim_attempt(alarm: str, now: datetime) -> tuple[bool, dict | None]:
+    """Return (is_first_in_window, prior_record).
+
+    Fails OPEN on a state-store error — if S3 is unreadable we would rather
+    make one extra bounded recovery attempt than make none. Both branches are
+    named in the page, so the human sees which happened.
+    """
+    key = _attempt_key(alarm, now)
+    try:
+        s3 = boto3.client("s3", region_name=REGION)
+    except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE / fail-open
+        print(f"WARN: no s3 client ({type(exc).__name__}) — treating as first "
+              f"attempt in window")
+        return True, None
+    try:
+        obj = s3.get_object(Bucket=STATE_BUCKET, Key=key)
+        return False, json.loads(obj["Body"].read())
+    except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE / fail-open
+        # Detect "absent" by error IDENTITY, not by class: referencing
+        # `s3.exceptions.NoSuchKey` requires the client to be healthy enough to
+        # expose its exception factory, which is exactly what is not guaranteed
+        # in the one component that must survive a degraded account. Caught by
+        # test_page_still_sent_when_every_evidence_call_fails.
+        if not _is_missing_key(exc):
+            print(f"WARN: cooldown state unreadable ({type(exc).__name__}) — "
+                  f"treating as first attempt in window")
+        # Fall THROUGH to the claim write in both cases. Returning early on an
+        # unreadable read would skip the claim, so every subsequent firing would
+        # also read-fail and also act — an unbounded retry loop in the component
+        # whose entire contract is "one bounded attempt". Caught by
+        # test_second_firing_in_window_escalates_instead_of_retrying.
     try:
         s3.put_object(
-            Bucket=COOLDOWN_BUCKET,
-            Key=key,
-            Body=json.dumps(state, indent=2, default=str).encode("utf-8"),
+            Bucket=STATE_BUCKET, Key=key,
+            Body=json.dumps({"alarm": alarm, "claimed_at": now.isoformat()}).encode(),
             ContentType="application/json",
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Cooldown write failed for %s: %s", alarm_name, exc)
+    except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+        print(f"WARN: cooldown claim write failed ({type(exc).__name__}) — a "
+              f"second firing this window may retry")
+    return True, None
 
 
-def _within_cooldown(last_fired_at_str: str | None, now: datetime) -> bool:
-    """True iff the last firing was within the cooldown window."""
-    if not last_fired_at_str:
-        return False
-    try:
-        last = datetime.fromisoformat(last_fired_at_str.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return False
-    return (now - last) < timedelta(minutes=COOLDOWN_MINUTES)
+# ── The two permitted actions ───────────────────────────────────────────────
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Recovery actions (hardcoded, reviewed list — T1 authority)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _invoke_liveness_probe() -> dict:
-    """Synchronously invoke the liveness probe. Read-only, always safe.
-    Returns the probe's verdict: problems list, kill_switches, checks_run,
-    checks_failed, clean, alerted."""
-    try:
-        lam = boto3.client("lambda", region_name=REGION)
-        resp = lam.invoke(
-            FunctionName=LIVENESS_PROBE_FUNCTION,
-            InvocationType="RequestResponse",
-            Payload=b"{}",
-        )
-        body = json.loads(resp["Payload"].read())
-        if resp.get("FunctionError"):
-            return {
-                "action": "invoke_liveness_probe",
-                "ok": False,
-                "error": f"probe function error: {str(body)[:500]}",
-            }
-        return {
-            "action": "invoke_liveness_probe",
-            "ok": True,
-            "verdict": body,
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Liveness probe invoke failed: %s", exc)
-        return {
-            "action": "invoke_liveness_probe",
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-def _redispatch_alert_drain() -> dict:
-    """Re-dispatch the alert-drain playbook via the overseer-dispatcher router.
-    Synchronous — waits for the router's verdict. The router handles its own
-    escalation on failure."""
-    try:
-        lam = boto3.client("lambda", region_name=REGION)
-        resp = lam.invoke(
-            FunctionName=OVERSEER_DISPATCHER_FUNCTION,
-            InvocationType="RequestResponse",
-            Payload=json.dumps({
-                "playbook": "alert-drain",
-                "payload": {
-                    "trigger": "backstop-responder",
-                    "run_mode": "backstop_recovery",
-                },
-            }).encode("utf-8"),
-        )
-        body = json.loads(resp["Payload"].read())
-        if resp.get("FunctionError"):
-            return {
-                "action": "redispatch_alert_drain",
-                "ok": False,
-                "error": f"dispatcher function error: {str(body)[:500]}",
-            }
-        return {
-            "action": "redispatch_alert_drain",
-            "ok": True,
-            "verdict": body,
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Alert-drain redispatch failed: %s", exc)
-        return {
-            "action": "redispatch_alert_drain",
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-RECOVERY_ACTIONS = {
-    "invoke_liveness_probe": _invoke_liveness_probe,
-    "redispatch_alert_drain": _redispatch_alert_drain,
-}
-
-
-def _recovery_actions_for_alarm(alarm_name: str) -> list[str]:
-    """Determine which recovery actions apply to this alarm."""
-    for pattern, actions in ALARM_RECOVERY_MAP.items():
-        if pattern in alarm_name:
-            return actions
-    return DEFAULT_RECOVERY_ACTIONS
-
-
-def _attempt_recovery(alarm_name: str) -> list[dict]:
-    """Run the hardcoded recovery actions for ``alarm_name``. Each action is
-    attempted once; the result (ok + verdict/error) is recorded. Actions are
-    independent — one failure does not block the next."""
-    action_names = _recovery_actions_for_alarm(alarm_name)
-    results: list[dict] = []
-    for name in action_names:
-        fn = RECOVERY_ACTIONS.get(name)
-        if fn is None:
-            logger.warning("Unknown recovery action %r for alarm %s", name, alarm_name)
-            results.append({"action": name, "ok": False, "error": "unknown_action"})
-            continue
-        logger.info("Backstop recovery: attempting %s for alarm %s", name, alarm_name)
-        result = fn()
-        results.append(result)
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# State gathering (decision-shaped reporting)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _queue_metrics(queue_name: str) -> dict:
-    """Read ApproximateNumberOfMessages + ApproximateAgeOfOldestMessage for a
-    queue. Best-effort — a failure returns an error dict, never raises."""
-    try:
-        sqs = boto3.client("sqs", region_name=REGION)
-        url_resp = sqs.get_queue_url(QueueName=queue_name)
-        queue_url = url_resp["QueueUrl"]
-        attrs = sqs.get_queue_attributes(
-            QueueUrl=queue_url,
-            AttributeNames=[
-                "ApproximateNumberOfMessages",
-                "ApproximateNumberOfMessagesNotVisible",
-                "ApproximateAgeOfOldestMessage",
-            ],
-        ).get("Attributes", {})
-        age_sec = int(attrs.get("ApproximateAgeOfOldestMessage", 0))
-        depth = int(attrs.get("ApproximateNumberOfMessages", 0))
-        in_flight = int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
-        age_min = age_sec // 60
-        return {
-            "queue": queue_name,
-            "depth": depth,
-            "in_flight": in_flight,
-            "oldest_message_age_minutes": age_min,
-            "ok": True,
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Queue metrics failed for %s: %s", queue_name, exc)
-        return {
-            "queue": queue_name,
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-def _last_ledger_entry(prefix: str) -> dict:
-    """Find the most recent ledger object under ``prefix`` in the watch bucket.
-    Returns the key, last_modified, and a parsed timestamp if available.
-    Best-effort — a failure returns an error dict, never raises."""
-    try:
-        s3 = boto3.client("s3", region_name=REGION)
-        # List today's prefix first, then fall back to yesterday
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-        for date_str in (today, yesterday):
-            date_prefix = f"{prefix}/{date_str}/"
-            resp = s3.list_objects_v2(
-                Bucket=WATCH_BUCKET, Prefix=date_prefix, MaxKeys=5
-            )
-            objects = sorted(
-                (obj for obj in resp.get("Contents", []) if obj["Key"].endswith(".json")),
-                key=lambda o: o["LastModified"],
-                reverse=True,
-            )
-            if objects:
-                newest = objects[0]
-                # Try to read run_start from the ledger entry
-                run_start = None
-                try:
-                    body = s3.get_object(Bucket=WATCH_BUCKET, Key=newest["Key"])["Body"].read()
-                    record = json.loads(body)
-                    run_start = record.get("run_start") or record.get("started_at")
-                except Exception:  # noqa: BLE001
-                    pass
-                return {
-                    "prefix": prefix,
-                    "key": newest["Key"],
-                    "last_modified": newest["LastModified"].isoformat(),
-                    "run_start": run_start,
-                    "ok": True,
-                }
-        return {"prefix": prefix, "key": None, "ok": True, "note": "no ledger entries found"}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ledger read failed for %s: %s", prefix, exc)
-        return {"prefix": prefix, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
-def _last_probe_state() -> dict:
-    """Read the liveness probe's own state object (last fingerprint + timestamp).
-    Best-effort — a failure returns an error dict, never raises."""
-    try:
-        s3 = boto3.client("s3", region_name=REGION)
-        obj = s3.get_object(Bucket=WATCH_BUCKET, Key=LIVENESS_STATE_KEY)
-        state = json.loads(obj["Body"].read())
-        return {
-            "ok": True,
-            "fingerprint": state.get("fingerprint"),
-            "updated_at": state.get("updated_at"),
-            "healthy": state.get("fingerprint") is None,
-        }
-    except Exception as exc:  # noqa: BLE001
-        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
-        if code in {"NoSuchKey", "404"}:
-            return {"ok": True, "healthy": True, "note": "no prior probe state (never alerted)"}
-        logger.warning("Probe state read failed: %s", exc)
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
-def _gather_state() -> dict:
-    """Gather fleet state for the enhanced page. Every sub-call is best-effort
-    — one failure does not block the rest. Returns a dict of state sections."""
-    state: dict = {}
-
-    # Queue metrics
-    state["intake_queue"] = _queue_metrics(INTAKE_QUEUE_NAME)
-    state["intake_dlq"] = _queue_metrics(INTAKE_DLQ_NAME)
-
-    # Last ledger entries per routed playbook
-    state["dispatch_ledger"] = _last_ledger_entry(DISPATCH_LEDGER_PREFIX)
-    state["drain_ledger"] = _last_ledger_entry(DRAIN_LEDGER_PREFIX)
-
-    # Last probe state
-    state["probe_state"] = _last_probe_state()
-
-    return state
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Message formatting
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _format_duration_minutes(total_minutes: int) -> str:
-    """Human-readable duration from minutes."""
-    if total_minutes < 60:
-        return f"{total_minutes}m"
-    hours = total_minutes // 60
-    mins = total_minutes % 60
-    if mins == 0:
-        return f"{hours}h"
-    return f"{hours}h{mins}m"
-
-
-def _format_recovery_section(results: list[dict]) -> str:
-    """Format recovery action results for Telegram."""
-    if not results:
-        return ""
-    lines = ["", "*Recovery attempt:*"]
-    for r in results:
-        action = r.get("action", "unknown")
-        ok = r.get("ok", False)
-        if ok:
-            verdict = r.get("verdict", {})
-            if action == "invoke_liveness_probe":
-                problems = verdict.get("problems", [])
-                clean = verdict.get("clean", False)
-                ks = verdict.get("kill_switches", {})
-                checks_run = verdict.get("checks_run", 0)
-                checks_failed = verdict.get("checks_failed", 0)
-                if clean:
-                    lines.append(f"  ✅ Liveness probe: all {checks_run} checks clean")
-                else:
-                    lines.append(f"  ⚠️ Liveness probe: {len(problems)} problem(s), "
-                                 f"{checks_run} checks ({checks_failed} failed to run)")
-                if ks:
-                    ks_str = ", ".join(f"{k}={v}" for k, v in sorted(ks.items()))
-                    lines.append(f"  🔘 Kill-switches: {_escape_markdown(ks_str)}")
-            elif action == "redispatch_alert_drain":
-                v = verdict
-                routed = v.get("routed", False)
-                launched = v.get("verdict", {}).get("launched", False)
-                reason = v.get("verdict", {}).get("reason", v.get("reason", "?"))
-                if routed and launched:
-                    lines.append(f"  ✅ Alert-drain re-dispatched: launched (reason: {_escape_markdown(str(reason))})")
-                elif routed:
-                    lines.append(f"  ⚠️ Alert-drain re-dispatched: NOT launched (reason: {_escape_markdown(str(reason))})")
-                else:
-                    lines.append(f"  ❌ Alert-drain dispatch failed: {_escape_markdown(str(reason))}")
-            else:
-                lines.append(f"  ✅ {_escape_markdown(action)}: ok")
-        else:
-            error = r.get("error", "unknown error")
-            lines.append(f"  ❌ {_escape_markdown(action)}: {_escape_markdown(str(error)[:200])}")
-    return "\n".join(lines)
-
-
-def _format_state_section(state: dict) -> str:
-    """Format gathered fleet state for Telegram."""
-    lines: list[str] = []
-
-    # Intake queue
-    iq = state.get("intake_queue", {})
-    if iq.get("ok"):
-        depth = iq.get("depth", 0)
-        in_flight = iq.get("in_flight", 0)
-        age = iq.get("oldest_message_age_minutes", 0)
-        lines.append(f"📥 *Intake queue:* {depth} visible, {in_flight} in-flight, "
-                     f"oldest {_format_duration_minutes(age)}")
-    else:
-        lines.append(f"📥 *Intake queue:* UNREADABLE ({iq.get('error', '?')})")
-
-    # DLQ
-    dlq = state.get("intake_dlq", {})
-    if dlq.get("ok"):
-        dlq_depth = dlq.get("depth", 0)
-        if dlq_depth > 0:
-            lines.append(f"🗑 *DLQ:* {dlq_depth} messages")
-    elif not dlq.get("ok"):
-        pass  # DLQ error is non-critical; don't clutter the page
-
-    # Dispatch ledger
-    dl = state.get("dispatch_ledger", {})
-    if dl.get("ok") and dl.get("key"):
-        ts = dl.get("run_start") or dl.get("last_modified", "?")
-        lines.append(f"📒 *Last dispatch:* {_escape_markdown(str(ts)[:19])}")
-    elif dl.get("ok"):
-        lines.append("📒 *Last dispatch:* none found")
-
-    # Drain ledger
-    dr = state.get("drain_ledger", {})
-    if dr.get("ok") and dr.get("key"):
-        ts = dr.get("run_start") or dr.get("last_modified", "?")
-        lines.append(f"📒 *Last drain:* {_escape_markdown(str(ts)[:19])}")
-    elif dr.get("ok"):
-        lines.append("📒 *Last drain:* none found")
-
-    # Probe state
-    ps = state.get("probe_state", {})
-    if ps.get("ok"):
-        if ps.get("healthy"):
-            lines.append("🟢 *Probe state:* healthy (no standing problems)")
-        else:
-            updated = ps.get("updated_at", "?")
-            lines.append(f"🔴 *Probe state:* PROBLEMS since {_escape_markdown(str(updated)[:19])}")
-    else:
-        lines.append(f"⚠️ *Probe state:* UNREADABLE ({ps.get('error', '?')})")
-
-    return "\n".join(lines)
-
-
-def _format_escalation_note(is_escalation: bool) -> str:
-    """The escalation note for a second-occurrence page."""
-    if is_escalation:
-        return (
-            "\n⚠️ *ESCALATED:* second firing within the cooldown window — "
-            "recovery already attempted, human needed now\\."
-        )
-    return ""
-
-
-def _format_alarm_header(alarm: dict, is_escalation: bool) -> str:
-    """Build the alarm header line."""
-    alarm_name = alarm.get("AlarmName", "unknown")
-    new_state = alarm.get("NewStateValue", "?")
-    old_state = alarm.get("OldStateValue", "?")
-
-    emoji = {"ALARM": "🔴", "OK": "🟢", "INSUFFICIENT_DATA": "⚪"}
-    e = emoji.get(new_state, "🔔")
-
-    if is_escalation:
-        return f"🚨 {e} *BACKSTOP ESCALATION: {_escape_markdown(alarm_name)}*"
-    if new_state == "ALARM":
-        return f"{e} *BACKSTOP: {_escape_markdown(alarm_name)}*"
-    return f"{e} *BACKSTOP RESOLVED: {_escape_markdown(alarm_name)}*"
-
-
-def _format_page(
-    alarm: dict,
-    state: dict,
-    recovery_results: list[dict],
-    is_escalation: bool,
-    cooldown_info: str,
-) -> str:
-    """Build the full enhanced Telegram page."""
-    alarm_name = alarm.get("AlarmName", "unknown")
-    reason = alarm.get("NewStateReason", "")
-    region_alarm = alarm.get("Region", REGION)
-
-    lines = [
-        _format_alarm_header(alarm, is_escalation),
-        f"State: {alarm.get('OldStateValue', '?')} → *{alarm.get('NewStateValue', '?')}*",
-    ]
-
-    if reason:
-        escaped = _escape_markdown(reason)
-        if len(escaped) > 400:
-            escaped = escaped[:397] + "..."
-        lines.append(f"Reason: {escaped}")
-
-    # Trigger metric
-    trigger = alarm.get("Trigger", {})
-    metric = trigger.get("MetricName", "")
-    if metric:
-        dims = trigger.get("Dimensions", [])
-        dim_str = " ".join(
-            f"`{d['value']}`" for d in dims
-            if isinstance(d, dict) and d.get("value")
-        )
-        namespace = trigger.get("Namespace", "")
-        lines.append(f"Metric: {_escape_markdown(namespace)}/{_escape_markdown(metric)} {dim_str}")
-
-    # Fleet state
-    lines.append("")
-    lines.append("*Fleet state:*")
-    lines.append(_format_state_section(state))
-
-    # Recovery
-    recovery_text = _format_recovery_section(recovery_results)
-    if recovery_text:
-        lines.append(recovery_text)
-    else:
-        lines.append("")
-        lines.append("_No recovery actions configured for this alarm\\._")
-
-    # Escalation note
-    esc = _format_escalation_note(is_escalation)
-    if esc:
-        lines.append(esc)
-
-    # Cooldown info
-    lines.append(cooldown_info)
-
-    # Console link
-    encoded_name = alarm_name.replace(" ", "+")
-    console_url = (
-        f"https://{region_alarm}.console.aws.amazon.com/cloudwatch/home"
-        f"?region={region_alarm}#alarmsV2:alarm/{encoded_name}"
+def _do_invoke_probe() -> dict:
+    lam = boto3.client("lambda", region_name=REGION)
+    resp = lam.invoke(
+        FunctionName=PROBE_FUNCTION, InvocationType="RequestResponse",
+        Payload=b"{}",
     )
-    lines.append(f"[AWS Console]({console_url})")
+    body = resp["Payload"].read()[:500].decode("utf-8", "replace")
+    return {
+        "ok": not resp.get("FunctionError"),
+        "function_error": resp.get("FunctionError"),
+        "response": body,
+    }
 
+
+def _do_redispatch(playbook: str, payload: dict) -> dict:
+    lam = boto3.client("lambda", region_name=REGION)
+    resp = lam.invoke(
+        FunctionName=ROUTER_FUNCTION, InvocationType="RequestResponse",
+        Payload=json.dumps({"playbook": playbook, "payload": payload}).encode(),
+    )
+    body = resp["Payload"].read()[:800].decode("utf-8", "replace")
+    try:
+        verdict = json.loads(body)
+    except json.JSONDecodeError:
+        verdict = {"unparseable": body}
+    return {
+        "ok": not resp.get("FunctionError") and verdict.get("routed") is True,
+        "function_error": resp.get("FunctionError"),
+        "verdict": verdict,
+    }
+
+
+def _attempt(spec: dict) -> dict:
+    """Dispatch one allowlisted action. Never raises — a failed recovery is a
+    reported verdict, because the page must go out either way."""
+    try:
+        if spec["action"] == "invoke_probe":
+            return {"attempted": "invoke_probe", **_do_invoke_probe()}
+        if spec["action"] == "redispatch":
+            return {
+                "attempted": f"redispatch:{spec['playbook']}",
+                **_do_redispatch(spec["playbook"], spec["payload"]),
+            }
+        return {"attempted": None, "ok": False,
+                "error": f"unknown action {spec['action']!r} in the allowlist"}
+    except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+        return {"attempted": spec.get("action"), "ok": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ── Paging — independent of every component above ───────────────────────────
+
+
+def _telegram(text: str) -> bool:
+    try:
+        ssm = boto3.client("ssm", region_name=REGION)
+        token = ssm.get_parameter(Name=TELEGRAM_TOKEN_PARAM, WithDecryption=True)[
+            "Parameter"]["Value"]
+        chat = ssm.get_parameter(Name=TELEGRAM_CHAT_PARAM, WithDecryption=True)[
+            "Parameter"]["Value"]
+        data = urllib.parse.urlencode({
+            "chat_id": chat, "text": text[:4000], "disable_notification": "false",
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception as exc:  # noqa: BLE001 — SNS email on the same topic is the other path
+        print(f"ERROR: BACKSTOP_PAGE_FAILED {type(exc).__name__}: {exc} — the SNS "
+              f"email subscription on the same topic is the surviving path")
+        return False
+
+
+def _render(alarm: str, reason: str, evidence: dict, outcome: dict) -> str:
+    lines = [
+        f"🚨 OVERSEER BACKSTOP — {alarm}",
+        "",
+        f"Alarm reason: {reason or '(none given)'}",
+        "",
+        "PLANE STATE",
+        f"  intake: {evidence['queues'].get('intake')}",
+        f"  dlq:    {evidence['queues'].get('dlq')}",
+        f"  probe:  {evidence['probe']}",
+    ]
+    lines.append("  last ledger:")
+    for k, v in evidence["ledgers"].items():
+        lines.append(f"    {k}: {v}")
+    lines.append("  kill switches:")
+    for k, v in evidence["kill_switches"].items():
+        lines.append(f"    {k}: {v}")
+    lines += ["", "RECOVERY"]
+    if outcome.get("escalated"):
+        lines += [
+            "  ⚠️ SECOND firing inside the cooldown window — the earlier",
+            "     recovery attempt did NOT fix this. Not retrying.",
+            "     A human is needed now.",
+            f"  earlier attempt: {json.dumps(outcome.get('prior') or {})[:300]}",
+        ]
+    elif outcome.get("skipped"):
+        lines.append(f"  no action: {outcome['skipped']}")
+    else:
+        res = outcome.get("result") or {}
+        lines += [
+            f"  attempted: {res.get('attempted')}",
+            f"  result:    {'OK' if res.get('ok') else 'FAILED'}",
+            f"  detail:    {json.dumps({k: v for k, v in res.items() if k not in ('attempted', 'ok')})[:600]}",
+        ]
     return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Handler
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def handler(event: dict, context) -> dict:  # noqa: ARG001
-    """SNS-triggered handler: for every backstop alarm, gather state, attempt
-    ONE bounded recovery (if within cooldown rules), and forward an enhanced
-    page to Telegram.
-
-    Accepts the SNS event shape (``Records[].Sns``). Processes each alarm
-    independently with its own cooldown tracking.
-
-    Returns a summary dict with per-record outcomes. Errors are logged and
-    returned — never raised — so a transient failure does not cause SNS redrive.
-    """
-    records = event.get("Records", [])
-    if not records:
-        records = [{"Sns": {"Message": json.dumps(event)}}]
-
-    # Read Telegram secrets at invoke time (no cached credentials).
+def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+    now = _utcnow()
+    alarm, reason = "(unknown)", ""
     try:
-        bot_token = _ssm_parameter(SSM_BOT_TOKEN_PATH)
-        chat_id = _ssm_parameter(SSM_CHAT_ID_PATH)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to read SSM parameters: %s", exc)
-        return {"status": "error", "reason": f"SSM read failed: {exc}", "sent": 0}
+        record = (event.get("Records") or [{}])[0]
+        msg = json.loads(record.get("Sns", {}).get("Message") or "{}")
+        alarm = msg.get("AlarmName") or "(unknown)"
+        reason = msg.get("NewStateReason") or ""
+    except Exception as exc:  # noqa: BLE001 — page anyway; a malformed event is itself news
+        reason = f"(could not parse SNS message: {type(exc).__name__})"
 
-    thread_id: str | None = None
-    try:
-        thread_id = _ssm_parameter(SSM_THREAD_ID_PATH)
-    except Exception:  # noqa: S110, BLE001
-        pass
+    evidence = {
+        "kill_switches": _kill_switch_state(),
+        "queues": _queue_state(),
+        "ledgers": _last_ledger_ages(),
+        "probe": _probe_health(),
+    }
 
-    now = datetime.now(timezone.utc)
-    s3 = boto3.client("s3", region_name=REGION)
-    results: list[dict] = []
-    sent_count = 0
-
-    for record in records:
-        sns_info = record.get("Sns", {})
-        message_str = str(sns_info.get("Message", "{}"))
-        message_id = str(sns_info.get("MessageId", "?"))
-
-        try:
-            alarm = json.loads(message_str)
-        except (ValueError, TypeError) as exc:
-            logger.warning("Non-JSON SNS message %s: %s", message_id, exc)
-            results.append({
-                "message_id": message_id, "status": "skipped", "reason": "non-json"
-            })
-            continue
-
-        if "AlarmName" not in alarm:
-            logger.info("SNS message %s is not a CloudWatch alarm — skipping", message_id)
-            results.append({
-                "message_id": message_id, "status": "skipped", "reason": "not-an-alarm"
-            })
-            continue
-
-        alarm_name = alarm["AlarmName"]
-        new_state = alarm.get("NewStateValue", "")
-
-        # Only act on ALARM state. OK/INSUFFICIENT_DATA are informational —
-        # we forward them but skip recovery.
-        is_alarm = new_state == "ALARM"
-
-        # ── Cooldown check ──
-        prior = _load_cooldown(s3, alarm_name)
-        in_window = _within_cooldown(
-            prior.get("last_fired_at") if prior else None, now
-        )
-        already_attempted = prior.get("recovery_attempted", False) if prior else False
-        is_escalation = is_alarm and in_window and already_attempted
-        should_recover = is_alarm and not (in_window and already_attempted)
-
-        # ── State gathering (always for ALARM; skip for OK to keep it fast) ──
-        recovery_results: list[dict] = []
-        state: dict = {}
-        if is_alarm:
-            state = _gather_state()
-
-        # ── Recovery attempt ──
-        if should_recover:
-            recovery_results = _attempt_recovery(alarm_name)
-            any_ok = any(r.get("ok") for r in recovery_results)
-            _save_cooldown(s3, alarm_name, {
-                "alarm_name": alarm_name,
-                "last_fired_at": now.isoformat(),
-                "recovery_attempted": True,
-                "recovery_results": recovery_results,
-                "occurrence": (prior.get("occurrence", 0) + 1) if prior else 1,
-                "any_recovery_ok": any_ok,
-            })
-        elif is_alarm and is_escalation:
-            # Second occurrence — escalate, no retry
-            _save_cooldown(s3, alarm_name, {
-                "alarm_name": alarm_name,
-                "last_fired_at": now.isoformat(),
-                "recovery_attempted": True,
-                "recovery_results": prior.get("recovery_results", []) if prior else [],
-                "occurrence": (prior.get("occurrence", 0) + 1) if prior else 1,
-                "escalated": True,
-            })
-        elif is_alarm:
-            # In cooldown but no prior recovery? Defensive: attempt recovery.
-            logger.warning(
-                "Alarm %s in cooldown with no prior recovery — attempting recovery now",
-                alarm_name,
-            )
-            recovery_results = _attempt_recovery(alarm_name)
-            _save_cooldown(s3, alarm_name, {
-                "alarm_name": alarm_name,
-                "last_fired_at": now.isoformat(),
-                "recovery_attempted": True,
-                "recovery_results": recovery_results,
-                "occurrence": (prior.get("occurrence", 0) + 1) if prior else 1,
-            })
-        elif not is_alarm:
-            # OK/INSUFFICIENT_DATA — clear cooldown so next ALARM is a fresh start
-            _save_cooldown(s3, alarm_name, {
-                "alarm_name": alarm_name,
-                "last_fired_at": now.isoformat(),
-                "last_state": new_state,
-                "recovery_attempted": False,
-                "occurrence": 0,
-                "resolved": True,
-            })
-
-        # ── Cooldown info line ──
-        if is_escalation:
-            cooldown_info = (
-                f"\\⏱ _Escalation: {COOLDOWN_MINUTES}m cooldown, "
-                f"occurrence #{prior.get('occurrence', 0) + 1 if prior else 1}_"
-            )
-        elif should_recover and recovery_results:
-            cooldown_info = (
-                f"\\⏱ _Recovery attempted \\(cooldown: {COOLDOWN_MINUTES}m, "
-                f"occurrence #{(prior.get('occurrence', 0) + 1) if prior else 1}\\)_"
-            )
-        elif not is_alarm:
-            cooldown_info = "\\✅ _Alarm resolved, cooldown reset_"
+    spec = ALARM_ACTIONS.get(alarm)
+    if spec is None:
+        outcome = {"skipped": "alarm has no entry in the reviewed action "
+                              "allowlist — reporting only"}
+    elif not RECOVERY_ENABLED:
+        outcome = {"skipped": "BACKSTOP_RECOVERY_ENABLED=false (operator "
+                              "kill switch) — reporting only"}
+    else:
+        first, prior = _claim_attempt(alarm, now)
+        if not first:
+            outcome = {"escalated": True, "prior": prior}
         else:
-            cooldown_info = f"\\⏱ _Within {COOLDOWN_MINUTES}m cooldown \\(recovery already attempted\\)_"
+            outcome = {"result": _attempt(spec), "rationale": spec["rationale"]}
 
-        # ── Build and send page ──
-        text = _format_page(alarm, state, recovery_results, is_escalation, cooldown_info)
-        resp = _send_telegram(bot_token, chat_id, text, thread_id)
-        if resp and resp.get("ok"):
-            sent_count += 1
-            results.append({
-                "message_id": message_id,
-                "alarm_name": alarm_name,
-                "status": "sent",
-                "recovery_attempted": bool(recovery_results),
-                "escalated": is_escalation,
-            })
-        else:
-            err_desc = (resp or {}).get("description", "send failed")
-            logger.warning("Telegram send failed for %s: %s", message_id, err_desc)
-            results.append({
-                "message_id": message_id,
-                "alarm_name": alarm_name,
-                "status": "failed",
-                "error": err_desc,
-            })
-
-    logger.info("backstop-responder: %d/%d sent", sent_count, len(results))
+    text = _render(alarm, reason, evidence, outcome)
+    print(text)
+    paged = _telegram(text)
     return {
-        "status": "ok",
-        "sent": sent_count,
-        "total": len(results),
-        "results": results,
+        "alarm": alarm, "paged": paged, "evidence": evidence, "outcome": outcome,
+        "window": _window_start(now),
     }

@@ -709,6 +709,36 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     logger.info("COLLECTING: alternative data (Phase 2)")
     logger.info("=" * 60)
+
+    # ── Record resolved scope BEFORE collection ───────────────────────────
+    # The scope guard (_assert_scope_stable) needs a truthful baseline for the
+    # NEXT run.  If this run fails mid-collection (spot termination, provider
+    # outage), the manifest is never written and the prior-run lookup deadlocks:
+    # the only run that can advance the baseline is a run the guard permits,
+    # and the guard permits none (the prior manifest is pre-change).  Writing
+    # scope.json at resolution time — before the first API call — means even a
+    # partial run leaves a truthful baseline.  Read preference is scope.json
+    # first, manifest second (see collectors/alternative.py).
+    scope_key = f"{market_prefix}weekly/{run_date}/alternative/scope.json"
+    try:
+        s3 = boto3.client("s3")
+        s3.put_object(
+            Bucket=bucket,
+            Key=scope_key,
+            Body=json.dumps({
+                "tickers_requested": len(universe_tickers),
+                "resolved_from": "constituents.json",
+                "run_date": run_date,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }),
+            ContentType="application/json",
+        )
+        logger.info("Wrote scope baseline: s3://%s/%s (%d tickers)",
+                     bucket, scope_key, len(universe_tickers))
+    except Exception:
+        logger.warning("Failed to write scope baseline %s — non-fatal; "
+                        "scope guard will fall back to prior manifest", scope_key)
+
     results["collectors"]["alternative"] = _phase_collect(
         reg, "alternative",
         lambda: alternative.collect(

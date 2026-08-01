@@ -134,32 +134,100 @@ if ! $DRY_RUN && ! aws sns get-topic-attributes --topic-arn "$BACKSTOP_TOPIC_ARN
   exit 1
 fi
 
-# --- 2. Per-Lambda Errors + Throttles alarms ---------------------------------
+# --- 2. Per-Lambda alarm shape overrides ---------------------------------------
+# Most watch-plane Lambdas are event-driven (fire on demand, no fixed cadence) —
+# their default Period=300 (5 min), EvaluationPeriods=1, TreatMissingData=notBreaching
+# is correct: missing data IS the healthy steady state, and a single error in any
+# 5-minute window should page immediately.
+#
+# SLOW-CADENCE PROBES (config#4477 — alpha-engine-config-I4477, 2026-07-29):
+# Lambdas that run on a fixed SCHEDULE slower than the default 5-minute period
+# need customized alarm shapes. Without this, a probe that is failing EVERY
+# invocation still shows OK because the datapoint-sparse windows between invocations
+# are treated as not-breaching — the alarm self-clears faster than the watched
+# cadence (exactly the §2.1 overseer-policy violation the issue found).
+#
+# The override sets Period equal to the Lambda's invocation cadence, uses a single
+# evaluation period, and sets TreatMissingData=breaching so a completely silent
+# Lambda (not running at all) also pages — not just one that runs and errors.
+# Keyed by the LABEL (not the function name) so the caller can read which function
+# each override applies to.
+
+declare -A _LAMBDA_CADENCE_SECONDS=(
+  # alpha-engine-overseer-liveness-probe: runs 06:50 / 14:50 UTC (twice daily,
+  # ~8h cadence). Period=28800 (8h) means each evaluation window covers one
+  # expected invocation. TreatMissingData=breaching: a probe that never runs
+  # (dead EventBridge schedule, deleted Lambda, IAM blackout) pages as ALARM
+  # within 8h instead of reading OK indefinitely while failing every invocation.
+  ["overseer-liveness-probe"]=28800
+)
+
+DEFAULT_ALARM_PERIOD=300
+DEFAULT_ALARM_EVALS=1
+DEFAULT_ALARM_TREAT_MISSING="notBreaching"
+
+_effective_period() {
+  local label="$1"
+  local cadence="${_LAMBDA_CADENCE_SECONDS[$label]:-}"
+  if [ -n "$cadence" ]; then
+    echo "$cadence"
+  else
+    echo "$DEFAULT_ALARM_PERIOD"
+  fi
+}
+
+_effective_evals() {
+  local label="$1"
+  # Slow-cadence probes use a single evaluation period covering one invocation
+  # window. Event-driven Lambdas keep the default single evaluation period.
+  if [ -n "${_LAMBDA_CADENCE_SECONDS[$label]:-}" ]; then
+    echo "1"
+  else
+    echo "$DEFAULT_ALARM_EVALS"
+  fi
+}
+
+_effective_treat_missing() {
+  local label="$1"
+  # For slow-cadence probes: a completely silent period means the probe never
+  # ran — which IS a failure (the "not running" failure mode). For event-driven
+  # Lambdas, missing data is the healthy steady state.
+  if [ -n "${_LAMBDA_CADENCE_SECONDS[$label]:-}" ]; then
+    echo "breaching"
+  else
+    echo "$DEFAULT_ALARM_TREAT_MISSING"
+  fi
+}
 
 echo ""
 echo "==> Creating per-Lambda watch-plane alarms..."
 for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
   fn_name="${WATCH_PLANE_FUNCTIONS[$label]}"
+  period="$(_effective_period "$label")"
+  evals="$(_effective_evals "$label")"
+  treat="$(_effective_treat_missing "$label")"
+  window_desc="$(( period / 60 ))m"
+  [ "$period" -ne "$DEFAULT_ALARM_PERIOD" ] && window_desc="${window_desc} (matched to cadence)"
 
   for metric in Errors Throttles; do
     metric_lc=$(echo "$metric" | tr '[:upper:]' '[:lower:]')
     alarm_name="alpha-engine-watch-plane-${label}-${metric_lc}"
 
-    echo "  -> $alarm_name (FunctionName=$fn_name, metric=$metric)"
+    echo "  -> $alarm_name (FunctionName=$fn_name, metric=$metric, period=${period}s, evals=${evals}, missing=${treat})"
     run aws cloudwatch put-metric-alarm \
       --region "$REGION" \
       --alarm-name "$alarm_name" \
-      --alarm-description "Watch-plane backstop: fires when ${fn_name} records any ${metric} in a 5-minute window. This Lambda is part of the fleet's failure-detection plane — its own unhandled failure (e.g. the fail-loud raise in _write_watch_log) is otherwise exactly the unmonitored failure mode (config#2266). Routes to the INDEPENDENT ${BACKSTOP_TOPIC_NAME} topic (not alpha-engine-alerts) so a blackout of the primary alert channel cannot also silence the alarm that watches the watchers. Provisioned by infrastructure/setup_watch_plane_alarms.sh." \
+      --alarm-description "Watch-plane backstop: fires when ${fn_name} records any ${metric} in a ${window_desc} window. This Lambda is part of the fleet's failure-detection plane — its own unhandled failure (e.g. the fail-loud raise in _write_watch_log) is otherwise exactly the unmonitored failure mode (config#2266). Routes to the INDEPENDENT ${BACKSTOP_TOPIC_NAME} topic (not alpha-engine-alerts) so a blackout of the primary alert channel cannot also silence the alarm that watches the watchers. Provisioned by infrastructure/setup_watch_plane_alarms.sh." \
       --namespace "AWS/Lambda" \
       --metric-name "$metric" \
       --dimensions "Name=FunctionName,Value=${fn_name}" \
       --statistic "Sum" \
-      --period 300 \
-      --evaluation-periods 1 \
+      --period "$period" \
+      --evaluation-periods "$evals" \
       --datapoints-to-alarm 1 \
       --threshold 1 \
       --comparison-operator "GreaterThanOrEqualToThreshold" \
-      --treat-missing-data "notBreaching" \
+      --treat-missing-data "$treat" \
       --alarm-actions "$BACKSTOP_TOPIC_ARN" \
       --ok-actions "$BACKSTOP_TOPIC_ARN" >/dev/null
   done

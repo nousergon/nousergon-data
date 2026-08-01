@@ -111,7 +111,9 @@ class TestSSMReadyChoiceFailLoud:
         assert len(budget) == 1, "no bounded-attempts branch on the readiness poll"
         # Exhausted budget must route to the fail-loud handler, NOT to the work
         # chain (that would run EOD against a possibly-down box, or skip it).
-        assert budget[0]["Next"] == "HandleFailure"
+        assert budget[0]["Next"] == "SetSSMReadyExhaustedError"
+        assert states["SetSSMReadyExhaustedError"]["Next"] == "HandleFailure"
+        assert states["SetSSMReadyExhaustedError"]["ResultPath"] == "$.error"
         assert budget[0].get("NumericGreaterThanEquals", 0) >= 1
         # And the default keeps looping (waits), it does not fall through to work.
         assert ch["Default"] == "WaitSSMPoll"

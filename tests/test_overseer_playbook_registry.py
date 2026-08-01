@@ -263,7 +263,13 @@ def test_watch_plane_covers_all_four_router_scheduler_schedules():
     DIFFERENT AWS resource from the classic `events` rules the
     eventbridge_rule check type covers). Name+state only, deliberately no
     target-ARN assertion (a concurrent workstream, alpha-engine-config-I2832,
-    re-points two of these schedules' targets)."""
+    re-points two of these schedules' targets).
+
+    alpha-engine-config-I4988 (2026-07-31): the four groom dispatch schedules
+    joined the same set when the run_window groom check was retired — a rule
+    that never fires produces no dispatch execution, so the reconciler's
+    trigger-health leg (which screens fires) cannot see it; existence+state
+    here is the only wiring signal for it."""
     checks = REGISTRY["watch_plane_liveness"]["checks"]
     names = {c["schedule_name"] for c in checks if c["type"] == "scheduler_schedule_exists"}
     assert names == {
@@ -273,6 +279,10 @@ def test_watch_plane_covers_all_four_router_scheduler_schedules():
         "alpha-engine-alert-drain-2200utc",
         "alpha-engine-ci-watch-canary-drill-weekly",
         "alpha-engine-sf-watch-canary-drill-weekly",
+        "alpha-engine-scheduled-groom-0400-daily",
+        "alpha-engine-scheduled-groom-1200-daily",
+        "alpha-engine-scheduled-groom-2000-daily",
+        "alpha-engine-scheduled-groom-sun0900-weekly",
     }
 
 

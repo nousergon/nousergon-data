@@ -21,9 +21,15 @@ Providers collected per run (adapter registry, one row each):
                        (``expenses/baselines/{YYYY-MM}.json``).
   - **deepseek**       ``/user/balance`` prepaid balance, diffed the same way
                        (top-ups make the diff conservative; noted on the row).
-  - **neon**           ``/api/v2/consumption_history/account`` — data-transfer
-                       GB vs the ``/alpha-engine/NEON_DATA_TRANSFER_QUOTA_GB``
-                       quota (free plan ⇒ $0 unless budgets say otherwise).
+  - **neon**           ``/api/v2/consumption_history/v2/projects`` — the
+                       invoice-aligned metrics Neon bills from
+                       (``compute_unit_seconds``, the four ``*_bytes_month``
+                       storage metrics, ``public_network_transfer_bytes``,
+                       ``extra_branches_month``), priced per project and
+                       summed: a real bill, not an estimate. Falls back to the
+                       per-project detail counters on plans where the v2
+                       endpoint is unreachable (Free), where the bill is $0 and
+                       the transfer quota is the binding constraint.
   - **github (org+user)** enhanced billing usage endpoint per account
                        (nousergon org + cipher813 user): billed $ across all
                        products + Actions minutes vs included quota (legacy
@@ -93,6 +99,7 @@ import json
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -551,132 +558,266 @@ def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
 
 NEON_TRANSFER_FREE_GB = 500.0
 NEON_TRANSFER_OVERAGE_USD_PER_GB = 0.10
-# Neon Launch plan pricing (neon.com/pricing, verified live 2026-07-17): no
-# flat monthly fee ("pay for what you use, no monthly minimum"). Compute
-# $0.106/CU-hour and storage $0.35/GB-month are BOTH left unknown below — the
-# per-project detail object (the only endpoint this free/Launch-plan API key
-# can reach; ``consumption_history`` is Scale-plan-only, 403/404 confirmed
-# live) exposes ``compute_time_seconds`` (wall-clock active-compute seconds,
-# NOT CU-scaled — no CU-size/vCPU field is returned anywhere in this response
-# to convert it into CU-hours) and ``written_data_bytes`` (a cumulative WRITE
-# counter, not a point-in-time storage size — no ``logical_size_bytes`` or
-# equivalent current-size field is present either). Fabricating a $ figure
-# from either would be a guess dressed up as a bill; both render `None` with
-# the gap named in ``detail.cost_components_unavailable`` instead.
-NEON_COMPUTE_USD_PER_CU_HOUR = 0.106  # documented for when a CU-size field
-NEON_STORAGE_USD_PER_GB_MONTH = 0.35  # ever becomes available; unused today.
+# Neon Launch plan pricing (neon.com/pricing, verified live 2026-07-17 and
+# re-verified 2026-07-31): no flat monthly fee ("pay for what you use, no
+# monthly minimum").
+NEON_COMPUTE_USD_PER_CU_HOUR = 0.106
+NEON_STORAGE_USD_PER_GB_MONTH = 0.35
+NEON_EXTRA_BRANCH_USD_PER_MONTH = 1.50
+
+# The consumption-history **v2** endpoints ARE available on Launch (verified
+# live 2026-07-31 against both fleet projects) — only the v1
+# ``/consumption_history/account`` family is Scale-plan-only, which is what
+# this adapter previously probed before concluding compute and storage were
+# unpriceable (config#2913's residue). v2 returns the metrics Neon states
+# "align with usage-based billing and match your invoice"
+# (neon.com/docs/guides/consumption-metrics), so every line item on the row
+# below is a real charge, not an estimate.
+NEON_CONSUMPTION_V2_URL = "https://console.neon.tech/api/v2/consumption_history/v2/projects"
+NEON_COMPUTE_METRIC = "compute_unit_seconds"
+NEON_TRANSFER_METRIC = "public_network_transfer_bytes"
+NEON_BRANCHES_METRIC = "extra_branches_month"
+# Storage is billed as the SUM of four separate metrics; a project missing one
+# (no snapshots, no child branches) simply omits it from the response.
+NEON_STORAGE_METRICS = ("root_branch_bytes_month", "child_branch_bytes_month",
+                        "instant_restore_bytes_month", "snapshot_storage_bytes_month")
+NEON_V2_METRICS = (NEON_COMPUTE_METRIC, NEON_TRANSFER_METRIC, NEON_BRANCHES_METRIC,
+                   *NEON_STORAGE_METRICS)
+# Unit conversions, both magnitude-verified against live values 2026-07-31:
+#   compute_unit_seconds → CU-hours: / 3600 (CPU time already weighted by
+#     compute size — it is NOT wall-clock ``active_time_seconds``; the two
+#     differ by the average CU size, measured 43277 vs 128088 on the RAG
+#     project, i.e. ~0.34 CU).
+#   *_bytes_month → GB-months: / 1e9. Cross-checked on metron-prod, which
+#     existed for 5 of the period's 30 days at ~36 MB: root_branch_bytes_month
+#     6_264_182 / 1e9 = 0.0063 GB-month ≈ 0.036 GB × (5/30). A byte-HOURS
+#     reading (the wording used elsewhere in Neon's docs) would be off by 744x
+#     and is ruled out by that check.
+NEON_CU_SECONDS_PER_HOUR = 3600.0
+NEON_BYTES_MONTH_PER_GB_MONTH = 1e9
+_NEON_PRICING_NOTE = {
+    "consumption_history_v2":
+        "compute + storage + egress + branches priced from Neon's "
+        "invoice-aligned consumption metrics (a bill, not an estimate)",
+    "projects_api_fallback":
+        "consumption-history v2 unreachable on this plan — $ covers "
+        "data-transfer overage only; see detail.consumption_v2_error",
+}
+
+
+def _neon_rfc3339(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def neon_consumption_v2(headers: dict, org_id: str, start: datetime,
+                        end: datetime) -> dict[str, dict[str, float]]:
+    """``{project_id: {metric_name: total}}`` over ``[start, end)`` from the
+    invoice-aligned v2 endpoint. Every period bucket in the window is summed,
+    so a plan change mid-window (which opens a new ``period_id``) is included
+    rather than silently dropping one side of it."""
+    url = NEON_CONSUMPTION_V2_URL + "?" + urllib.parse.urlencode({
+        "from": _neon_rfc3339(start), "to": _neon_rfc3339(end),
+        "granularity": "monthly", "org_id": org_id,
+        "metrics": ",".join(NEON_V2_METRICS)})
+    doc = _http_json(url, headers)
+    out: dict[str, dict[str, float]] = {}
+    for proj in doc.get("projects", []):
+        bucket = out.setdefault(proj.get("project_id") or "unknown", {})
+        for period in proj.get("periods", []):
+            for frame in period.get("consumption", []):
+                for metric in frame.get("metrics", []):
+                    value = metric.get("value")
+                    if isinstance(value, (int, float)):
+                        name = metric.get("metric_name")
+                        bucket[name] = bucket.get(name, 0.0) + float(value)
+    return out
+
+
+def price_neon_project(metrics: dict[str, float]) -> dict:
+    """Price ONE project's invoice-aligned metric bundle (pure — unit-tested).
+
+    The 500 GB public-egress allowance is per PROJECT (neon.com/pricing):
+    applying it to a fleet-wide sum would hide one project's overage behind
+    another's headroom, which is the same shape as the 2026-07-16 lockout
+    (one workload's burst invisible inside a shared counter)."""
+    compute_cu_hours = metrics.get(NEON_COMPUTE_METRIC, 0.0) / NEON_CU_SECONDS_PER_HOUR
+    storage_gb_month = sum(metrics.get(m, 0.0) for m in NEON_STORAGE_METRICS
+                           ) / NEON_BYTES_MONTH_PER_GB_MONTH
+    transfer_gb = metrics.get(NEON_TRANSFER_METRIC, 0.0) / 1e9
+    extra_branch_months = metrics.get(NEON_BRANCHES_METRIC, 0.0)
+    compute_usd = compute_cu_hours * NEON_COMPUTE_USD_PER_CU_HOUR
+    storage_usd = storage_gb_month * NEON_STORAGE_USD_PER_GB_MONTH
+    transfer_usd = (max(0.0, transfer_gb - NEON_TRANSFER_FREE_GB)
+                    * NEON_TRANSFER_OVERAGE_USD_PER_GB)
+    branches_usd = extra_branch_months * NEON_EXTRA_BRANCH_USD_PER_MONTH
+    return {
+        "compute_cu_hours": round(compute_cu_hours, 3),
+        "compute_cost_usd": round(compute_usd, 4),
+        "storage_gb_month": round(storage_gb_month, 4),
+        "storage_cost_usd": round(storage_usd, 4),
+        "data_transfer_gb": round(transfer_gb, 3),
+        "data_transfer_cost_usd": round(transfer_usd, 4),
+        "extra_branch_months": round(extra_branch_months, 3),
+        "extra_branches_cost_usd": round(branches_usd, 4),
+        "total_cost_usd": round(compute_usd + storage_usd + transfer_usd + branches_usd, 4),
+    }
 
 
 def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
-    """Free-tier-compatible consumption read: the ``consumption_history``
-    endpoints are Scale-plan-only (verified 403/404 live, 2026-07-17), but the
-    per-project detail object carries current-consumption-period counters
-    (``data_transfer_bytes``, ``compute_time_seconds``, …) plus the period
-    bounds on every plan — sum across projects and pace against the period.
-    Only the data-transfer line is actually computable in $ from those
-    counters (see ``NEON_COMPUTE_USD_PER_CU_HOUR`` docstring above for why
-    compute + storage are NOT): a real partial bill, not a fabricated flat
-    fee, unless the operator sets an explicit ``fixed_monthly_usd`` override
-    (e.g. a manually-confirmed paid-plan invoice) in the budgets SSoT."""
-    row = _row("neon", "Neon Postgres", source="projects_api")
+    """Real Neon bill from the invoice-aligned consumption-history v2 metrics.
+
+    Every billed component — compute (CU-hours), storage (the four
+    ``*_bytes_month`` metrics), public egress above the per-project 500 GB
+    allowance, extra branches — is priced from the metrics Neon states match
+    the invoice, per project, and summed. This supersedes the transfer-only
+    estimate that preceded it: the v1 ``consumption_history`` endpoints ARE
+    Scale-plan-only (that part of config#2913 held), but the **v2** endpoints
+    are available on Launch, which is where compute and storage were hiding.
+
+    The project-detail counters are still read for project names, the
+    consumption-period bounds (Neon's period is NOT calendar-aligned — a plan
+    change opens a fresh one) and the free-plan-fit transfer quota signal, and
+    they are the fallback pricing source on plans where v2 is unreachable
+    (Free), where the bill is $0 by construction and the quota — not $ — is
+    the binding constraint.
+
+    ``fixed_monthly_usd`` is deliberately NOT honored for this provider: the
+    override exists for providers with no usable cost API, and a hardcoded
+    figure silently outranking a real measurement is exactly the defect
+    config#2913 was filed for (it shipped as $19/mo against a real ~$4/mo).
+    A configured value is reported in ``detail.fixed_monthly_usd_ignored`` so
+    the stale config is visible on the page rather than merely inert."""
+    row = _row("neon", "Neon Postgres", source="consumption_history_v2")
     if SSM_NEON not in secrets:
         row.update(status="not_configured", error=f"SSM {SSM_NEON} missing")
         return row
     headers = {"Authorization": f"Bearer {secrets[SSM_NEON]}", "Accept": "application/json"}
     listing = _http_json("https://console.neon.tech/api/v2/projects", headers)
-    sums: dict[str, float] = {}
+
+    projects: list[dict] = []
+    org_ids: list[str] = []
     period_start = period_end = None
-    project_names = []
     for proj in listing.get("projects", []):
         detail = _http_json(
             f"https://console.neon.tech/api/v2/projects/{proj['id']}", headers)
         p = detail.get("project", {})
-        project_names.append(p.get("name", proj["id"]))
-        for k in ("data_transfer_bytes", "compute_time_seconds",
-                  "active_time_seconds", "written_data_bytes"):
-            if isinstance(p.get(k), (int, float)):
-                sums[k] = sums.get(k, 0.0) + float(p[k])
+        org_id = p.get("org_id") or proj.get("org_id")
+        if org_id and org_id not in org_ids:
+            org_ids.append(org_id)
+        transfer_bytes = (float(p["data_transfer_bytes"])
+                          if isinstance(p.get("data_transfer_bytes"), (int, float)) else 0.0)
+        projects.append({"id": proj["id"], "name": p.get("name", proj["id"]),
+                         "org_id": org_id, "transfer_bytes": transfer_bytes})
         period_start = period_start or p.get("consumption_period_start")
         period_end = period_end or p.get("consumption_period_end")
-    transfer_gb = sums.get("data_transfer_bytes", 0.0) / 1e9
+
+    # Bill window = the WHOLE calendar month, not month-to-date: at monthly
+    # granularity Neon truncates both bounds to month boundaries, so a `to` of
+    # "now" collapses onto `from` and the request 400s with "'from' must be
+    # before 'to'" (hit live 2026-07-31). The response only ever contains
+    # consumption that has actually happened, so asking for the full month
+    # returns MTD.
+    window_end = mw["start"] + timedelta(seconds=mw["total_seconds"])
+    metrics_by_project: dict[str, dict[str, float]] = {}
+    pricing_source = "consumption_history_v2"
+    v2_error = None
+    for org_id in org_ids:
+        try:
+            metrics_by_project.update(
+                neon_consumption_v2(headers, org_id, mw["start"], window_end))
+        except RuntimeError as exc:
+            # Free plan (or a future entitlement change) — the endpoint is
+            # plan-gated. Named on the row, never silently treated as $0 spend.
+            v2_error = str(exc)[:200]
+            pricing_source = "projects_api_fallback"
+            logger.warning("Neon consumption v2 unavailable for org %s: %s", org_id, exc)
+
+    per_project = []
+    priced_bundles: list[dict[str, float]] = []
+    totals = {"compute_cu_hours": 0.0, "compute_cost_usd": 0.0,
+              "storage_gb_month": 0.0, "storage_cost_usd": 0.0,
+              "data_transfer_gb": 0.0, "data_transfer_cost_usd": 0.0,
+              "extra_branch_months": 0.0, "extra_branches_cost_usd": 0.0,
+              "total_cost_usd": 0.0}
+    for proj in projects:
+        # Fallback bundle carries transfer only: on the plans where v2 is
+        # gated (Free) there IS no compute/storage charge, so a $0 line for
+        # each is the true bill, not a silently-dropped component.
+        bundle = metrics_by_project.get(
+            proj["id"], {} if metrics_by_project
+            else {NEON_TRANSFER_METRIC: proj["transfer_bytes"]})
+        priced = price_neon_project(bundle)
+        priced_bundles.append(bundle)
+        per_project.append({"project": proj["name"], **priced})
+        for k in totals:
+            totals[k] = round(totals[k] + priced[k], 4)
+
+    # Transfer GB for the quota signal: the v2 public-transfer metric when we
+    # have it, else the project-detail counter (which is what the free plan
+    # meters against anyway) — both already folded into the totals above.
+    transfer_gb = totals["data_transfer_gb"]
     quota_gb = float(secrets.get(SSM_NEON_QUOTA_GB, 0) or 0) or None
-    # Pace against Neon's OWN consumption period when reported (it can start
-    # mid-calendar-month, e.g. after a plan change), else the calendar month.
-    observed_frac = mw["elapsed_frac"]
+
+    # Two different denominators, deliberately:
+    #   quota_frac — fraction of NEON's consumption period elapsed, for the
+    #     GB-vs-quota projection (the free-plan-fit signal, config-I2790).
+    #   cost_frac  — fraction of the CALENDAR month the measurement covers,
+    #     for the $ projection, since a plan-change period start means the
+    #     month's early days carry no billable data at all.
+    quota_frac = mw["elapsed_frac"]
+    cost_frac = mw["elapsed_frac"]
     if period_start and period_end:
         try:
             ps = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
             pe = datetime.fromisoformat(period_end.replace("Z", "+00:00"))
             total = (pe - ps).total_seconds()
             if total > 0:
-                observed_frac = max((_now_utc() - ps).total_seconds() / total, 0.0)
+                quota_frac = max((_now_utc() - ps).total_seconds() / total, 0.0)
+            covered = (_now_utc() - max(ps, mw["start"])).total_seconds()
+            cost_frac = min(max(covered / mw["total_seconds"], 0.0), mw["elapsed_frac"])
         except ValueError:
             logger.warning("unparseable Neon consumption period: %s → %s",
                            period_start, period_end)
-    projected_gb = None
-    if observed_frac >= MIN_PROJECTION_FRAC:
-        projected_gb = transfer_gb / observed_frac
+    projected_gb = transfer_gb / quota_frac if quota_frac >= MIN_PROJECTION_FRAC else None
 
-    # Data transfer overage is the ONE line item this endpoint can actually
-    # price: 500 GB/mo free egress, then $0.10/GB (neon.com/pricing, verified
-    # live 2026-07-17). Compute and storage are genuinely uncomputable from
-    # the fields this API key can reach — see the module-level constants'
-    # docstring — and MUST surface as unknown, not silently dropped or
-    # counted as $0.
-    transfer_mtd_usd = max(0.0, transfer_gb - NEON_TRANSFER_FREE_GB) * NEON_TRANSFER_OVERAGE_USD_PER_GB
-    transfer_projected_usd = None
-    if observed_frac >= MIN_PROJECTION_FRAC:
-        transfer_projected_usd = (max(0.0, (transfer_gb / observed_frac) - NEON_TRANSFER_FREE_GB)
-                                   * NEON_TRANSFER_OVERAGE_USD_PER_GB)
-    cost_components_unavailable = [
-        {"component": "compute", "unit": "CU-hour", "reason":
-         "compute_time_seconds is wall-clock active-compute time, not "
-         "CU-scaled — the project detail API returns no CU-size/vCPU field "
-         "to convert it into billable CU-hours"},
-        {"component": "storage", "unit": "GB-month", "reason":
-         "written_data_bytes is a cumulative write counter, not a "
-         "point-in-time storage size — the project detail API returns no "
-         "logical_size_bytes (or equivalent current-size) field"},
-    ]
+    # Month-end $ is projected on USAGE and then priced, never by scaling the
+    # dollars: the egress line is a hinge (free below 500 GB/project, $0.10/GB
+    # above), so doubling a $10 overage gives $20 where the real month-end
+    # charge is $70. Compute/storage/branches are linear, so this is exact for
+    # them and correct for transfer.
+    projected_month_end_usd = None
+    if cost_frac >= MIN_PROJECTION_FRAC:
+        scale = 1.0 + (1.0 - mw["elapsed_frac"]) / cost_frac
+        projected_month_end_usd = round(sum(
+            price_neon_project({k: v * scale for k, v in bundle.items()})["total_cost_usd"]
+            for bundle in priced_bundles), 4)
 
     fixed_override = _fixed_usd(budgets, "neon")
-    if fixed_override is not None:
-        # Explicit operator override (e.g. a manually-confirmed paid-plan
-        # invoice) — takes precedence over the computed estimate below, same
-        # as every other provider's fixed_monthly_usd escape hatch.
-        mtd_cost_usd = float(fixed_override)
-        projected_month_end_usd = float(fixed_override)
-    else:
-        mtd_cost_usd = round(transfer_mtd_usd, 4)
-        projected_month_end_usd = (round(transfer_projected_usd, 4)
-                                    if transfer_projected_usd is not None else None)
-
     row.update(
-        mtd_cost_usd=mtd_cost_usd,
+        source=pricing_source,
+        mtd_cost_usd=totals["total_cost_usd"],
         projected_month_end_usd=projected_month_end_usd,
         quota={"unit": "GB data transfer", "used": round(transfer_gb, 3),
                "limit": quota_gb,
                "projected": round(projected_gb, 3) if projected_gb is not None else None},
-        pace=_pace(projected_gb, quota_gb),
-        detail={"projects": project_names,
-                "compute_hours": round(sums.get("compute_time_seconds", 0.0) / 3600, 2),
-                "compute_cost_usd": None,
-                "written_gb": round(sums.get("written_data_bytes", 0.0) / 1e9, 3),
-                "storage_cost_usd": None,
-                "data_transfer_cost_usd": round(transfer_mtd_usd, 4),
+        detail={"projects": [p["name"] for p in projects],
+                "by_project": per_project,
+                **totals,
                 "consumption_period": f"{period_start} → {period_end}",
-                "cost_components_unavailable": (None if fixed_override is not None
-                                                 else cost_components_unavailable)},
-        # Prefer an operator note from the budgets SSoT (e.g. a temporary
-        # paid-plan explanation) so what the operator recorded reaches the page;
-        # fall back to a note that names the estimate's gaps when no override
-        # is configured, so the console never implies this is a full bill.
-        note=_cfg_note(budgets, "neon")
-             or (None if fixed_override is not None else
-                 "estimated from data transfer overage only — compute and "
-                 "storage costs are unknown (see detail.cost_components_unavailable); "
-                 "actual bill will be higher if either is nonzero"),
+                "pricing_source": pricing_source,
+                "consumption_v2_error": v2_error,
+                "fixed_monthly_usd_ignored": fixed_override,
+                # Always present, even when an operator note wins the `note`
+                # field: a stale operator note describing the OLD estimate
+                # must not be the only pricing explanation on the page.
+                "pricing_note": _NEON_PRICING_NOTE[pricing_source]},
+        note=_cfg_note(budgets, "neon") or _NEON_PRICING_NOTE[pricing_source],
     )
+    _finish_usd_row(row, mw, _budget_usd(budgets, "neon"), observed_frac=cost_frac)
+    # Either binding constraint puts the row "over": the $ budget (pace already
+    # set by _finish_usd_row) or the transfer quota that gates the free plan.
+    if _pace(projected_gb, quota_gb) == "over":
+        row["pace"] = "over"
     row["budget_usd"] = _budget_usd(budgets, "neon")
     return row
 
@@ -854,9 +995,9 @@ def fixed_rows(budgets: dict, produced_keys: set[str]) -> list[dict]:
 # month's finalized actual, then diffs it against what the prior month's own
 # ``expenses/monthly/{YYYY-MM}.json`` rollup last recorded — never re-derives
 # a provider's arithmetic from scratch (same anchor-to-provider principle the
-# AWS forecast fix codified). Neon has no closed-period historical read on
-# this API tier (its adapter only ever sees the CURRENT consumption period) —
-# reconciled as "not_available" rather than guessed.
+# AWS forecast fix codified). Neon re-queries its consumption-history v2
+# metrics for the closed month directly (the window is arbitrary, so the
+# final charge is read, not approximated).
 # ---------------------------------------------------------------------------
 
 def _prior_month_window(now: datetime) -> dict:
@@ -962,16 +1103,36 @@ def reconcile_counter_diff(s3, prior_period: str, current_period: str, key: str,
              "month rollover and this run")
 
 
-def reconcile_neon(prior_doc: dict | None) -> dict:
-    """Neon's Launch-plan API exposes only the CURRENT consumption period
-    (``consumption_history`` is Scale-plan-only, 403/404 verified live) —
-    there is no closed-period historical read to re-query, so reconciliation
-    is marked not_available rather than approximated from snapshots (Neon's
-    own period boundaries aren't calendar-month-aligned)."""
+def reconcile_neon(prior_mw: dict, secrets: dict, prior_doc: dict | None) -> dict:
+    """Closed-month true-up from the same invoice-aligned v2 metrics the live
+    row uses — the endpoint accepts an arbitrary historical window (history
+    from 2024-03-01, monthly granularity up to a year back), so the prior
+    month's FINAL charge is a real re-query, not an approximation. Only the
+    v1 endpoints are Scale-plan-gated, which is what previously made this row
+    ``not_available``."""
+    if SSM_NEON not in secrets:
+        return _reconciliation_row("neon", prior_doc, None, status="not_configured",
+                                   note=f"SSM {SSM_NEON} missing")
+    headers = {"Authorization": f"Bearer {secrets[SSM_NEON]}", "Accept": "application/json"}
+    listing = _http_json("https://console.neon.tech/api/v2/projects", headers)
+    org_ids = []
+    for proj in listing.get("projects", []):
+        org_id = proj.get("org_id")
+        if org_id and org_id not in org_ids:
+            org_ids.append(org_id)
+    if not org_ids:
+        return _reconciliation_row("neon", prior_doc, None, status="not_available",
+                                   note="no Neon org id on any project — cannot "
+                                        "query consumption history")
+    total = 0.0
+    for org_id in org_ids:
+        metrics = neon_consumption_v2(headers, org_id, prior_mw["start"], prior_mw["end"])
+        for bundle in metrics.values():
+            total += price_neon_project(bundle)["total_cost_usd"]
     return _reconciliation_row(
-        "neon", prior_doc, None, status="not_available",
-        note="Neon's API exposes only the current consumption period — no "
-             "historical/closed-period endpoint is reachable on this plan")
+        "neon", prior_doc, round(total, 4),
+        note="re-queried from Neon's invoice-aligned consumption metrics for "
+             "the closed month")
 
 
 def reconcile_github(prior_mw: dict, budgets: dict, secrets: dict, *, account: str,
@@ -1016,7 +1177,7 @@ def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
     fenced("deepseek", lambda: reconcile_counter_diff(
         s3, prior_mw["period"], now.strftime("%Y-%m"), "deepseek",
         "deepseek_neg_balance", prior_doc))
-    fenced("neon", lambda: reconcile_neon(prior_doc))
+    fenced("neon", lambda: reconcile_neon(prior_mw, secrets, prior_doc))
     fenced("github_org", lambda: reconcile_github(
         prior_mw, budgets, secrets, account=GITHUB_ORG, kind="org", prior_doc=prior_doc))
     fenced("github_user", lambda: reconcile_github(

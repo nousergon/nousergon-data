@@ -1,25 +1,24 @@
-"""The IAM guard and its no-op companion must stay a matched pair.
+"""The IAM guard must be able to report on EVERY PR, including an empty one.
 
-nousergon-data-I1078. `iam-policy-change-guard.yml` is path-filtered to
-`infrastructure/lambdas/*/iam-policy.json`, so making it a REQUIRED status
-check directly would block every PR that does not touch IAM — GitHub waits
-forever for a status that never reports.
+nousergon-data-I1078 made this guard's context requireable by pairing a
+`paths:`-filtered guard with a companion `iam-policy-change-guard-noop.yml`
+carrying the complementary `paths-ignore:`, on the reasoning that exactly one
+of the pair always runs so the shared context always reports.
 
-The fix is a companion workflow triggering on the exact complement
-(`paths-ignore`) with the SAME workflow name and job id, so exactly one of the
-pair runs per PR and the shared context always reports.
+That pair is NOT an exhaustive complement (alpha-engine-config#5941). GitHub
+evaluates `paths-ignore` as "at least one changed file does not match", which
+is FALSE when a PR changes ZERO files. Neither half fires, the required
+context never posts, and the PR is BLOCKED permanently — with every other
+check green and this context absent from the rollup entirely, which reads as
+nothing at all on the PR page rather than as a red check.
 
-That only holds while the two lists stay in lockstep. If they drift:
+Hit live on nousergon-data #784, #1118, #1134 and #1158; #784 sat that way for
+18 days.
 
-  - guard `paths` ⊄ noop `paths-ignore`  ->  BOTH run on some PRs (duplicate
-    context, ambiguous required status)
-  - noop `paths-ignore` ⊄ guard `paths`  ->  NEITHER runs on some PRs, and a
-    required context that never reports blocks the merge permanently
-
-Either way the required check becomes unreliable, which is worse than not
-requiring it — an unenforceable guard reads as protection that is not there.
-That is exactly what happened before: the guard was advisory-only, reported
-FAIL on nousergon-data-PR1077, and the PR merged anyway.
+The fix removes the filter rather than widening it: the guard runs on every
+PR and early-exits internally when no `infrastructure/lambdas/*/iam-policy.json`
+changed. The noop companion is deleted. These tests pin that shape, because
+re-adding a `paths:` filter here silently re-opens the hole.
 """
 
 from __future__ import annotations
@@ -44,54 +43,60 @@ def _triggers(doc: dict) -> dict:
     return doc.get("on", doc.get(True)) or {}
 
 
-def test_both_workflows_exist():
+def test_guard_exists():
     assert GUARD.is_file(), "the IAM policy-change guard is missing"
-    assert NOOP.is_file(), (
-        "the guard's no-op companion is missing — without it the guard's context "
-        "cannot be required without deadlocking non-IAM PRs"
+
+
+def test_noop_companion_is_gone():
+    """The companion only existed to cover the guard's path filter. With the
+    filter removed it would double-report the same context."""
+    assert not NOOP.exists(), (
+        "iam-policy-change-guard-noop.yml is back — with an unfiltered guard the "
+        "pair reports the same context twice, and the pair never covered the "
+        "zero-changed-file case anyway (config#5941)"
     )
 
 
-def test_workflow_names_match():
-    """Branch protection keys off the reported context, which derives from the
-    workflow name + job id. Divergent names produce two distinct contexts."""
-    assert _load(GUARD)["name"] == _load(NOOP)["name"]
-
-
-def test_job_ids_match_and_are_specific():
-    guard_jobs = list(_load(GUARD)["jobs"])
-    noop_jobs = list(_load(NOOP)["jobs"])
-    assert guard_jobs == noop_jobs, (
-        f"job ids diverged: guard={guard_jobs} noop={noop_jobs} — the pair would "
-        f"report two different check contexts"
+def test_guard_trigger_is_unfiltered():
+    """The whole defect. A required context served by a path-filtered workflow
+    cannot report on a PR that changes no files."""
+    pr = _triggers(_load(GUARD))["pull_request"]
+    assert "paths" not in pr and "paths-ignore" not in pr, (
+        f"iam-policy-change-guard is a REQUIRED status check and must run on every "
+        f"PR, but its trigger is filtered: {pr!r}. A zero-changed-file PR matches "
+        f"neither `paths` nor `paths-ignore`, so the context never posts and the "
+        f"PR is blocked forever (config#5941)."
     )
-    assert guard_jobs == ["iam-policy-change-guard"], (
+
+
+def test_job_id_is_the_required_context_and_stays_specific():
+    jobs = list(_load(GUARD)["jobs"])
+    assert jobs == ["iam-policy-change-guard"], (
         "the job id IS the required branch-protection context; keep it specific "
         "so a future workflow's generic job name cannot collide with a required "
-        "status"
+        "status (nousergon-data-I1078)"
     )
 
 
-def test_path_filters_are_exact_complements():
-    guard_paths = _triggers(_load(GUARD))["pull_request"]["paths"]
-    noop_ignores = _triggers(_load(NOOP))["pull_request"]["paths-ignore"]
-    assert guard_paths == noop_ignores, (
-        f"guard paths {guard_paths} and noop paths-ignore {noop_ignores} must be "
-        f"identical. Drift means some PR gets BOTH checks (ambiguous) or NEITHER "
-        f"(required context never reports -> permanent merge block)."
+def test_guard_exits_cleanly_when_no_policy_changed():
+    """Unfiltered means the guard now runs on PRs touching no IAM at all — it
+    must pass them, not fail them."""
+    body = GUARD.read_text()
+    assert "No iam-policy.json changes detected" in body, (
+        "the guard runs on every PR now; it needs its no-policy-changed early "
+        "exit or every non-IAM PR goes red"
     )
 
 
-def test_both_react_to_label_events():
-    """The guard's escape hatch is a `gate:operator` label, so both halves must
-    re-run on label changes — otherwise adding the label after the initial run
-    leaves the failing status in place with no way to clear it."""
-    for path in (GUARD, NOOP):
-        types = _triggers(_load(path))["pull_request"].get("types") or []
-        assert "labeled" in types and "unlabeled" in types, (
-            f"{path.name} must trigger on labeled/unlabeled so the gate:operator "
-            f"escape hatch can actually clear the check"
-        )
+def test_guard_reacts_to_label_events():
+    """The guard's escape hatch is a `gate:operator` label, so it must re-run on
+    label changes — otherwise adding the label after the initial run leaves the
+    failing status in place with no way to clear it."""
+    types = _triggers(_load(GUARD))["pull_request"].get("types") or []
+    assert "labeled" in types and "unlabeled" in types, (
+        "the guard must trigger on labeled/unlabeled so the gate:operator escape "
+        "hatch can actually clear the check"
+    )
 
 
 # ── Branch 3: ALREADY LIVE (alpha-engine-config-I5309) ──────────────────────

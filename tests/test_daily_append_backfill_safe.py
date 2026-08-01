@@ -157,12 +157,14 @@ def test_target_equal_to_latest_takes_append_path():
 
     mode = _write_row_backfill_safe(lib, "AAPL", new_row, existing_series=existing)
 
-    # target_ts > latest is False (they're equal), so backfill path runs
-    # with read+splice+write. The condition is `target_ts > existing.index.max()`.
-    # Same-date should NOT take the append path because update() at the
-    # same-date IS valid, but the >-check is conservative for safety.
-    assert mode == "backfill"
-    lib.write.assert_called_once()
+    # target_ts >= latest is True (they're equal), so the append path runs
+    # with update() — which is idempotent for same-date rows (replaces in
+    # place rather than appending duplicates). Previously the >-check
+    # (changed to >= in config-I2812) forced same-date overwrites into the
+    # backfill path — full series read+write per ticker — burning 40+ min
+    # of the preopen window on every MorningEnrich run.
+    assert mode == "append"
+    lib.update.assert_called_once()
 
 
 def test_lib_write_called_with_prune_previous_versions():

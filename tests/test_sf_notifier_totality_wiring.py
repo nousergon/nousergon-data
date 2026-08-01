@@ -362,19 +362,28 @@ class TestSuccessPathNotifiersAreNonFatal:
     otherwise-succeeded pipeline (2026-06-12 NotifyComplete incident)."""
 
     @pytest.mark.parametrize(
-        "name,degraded_next",
+        "name,degraded_next,terminal_next",
         [
-            ("NotifyComplete", "NotifyCompleteDegraded"),
-            ("NotifyShellRunComplete", "NotifyShellRunCompleteDegraded"),
+            # config#2857: the real-completion pair now converges into the
+            # SF-envelope completion marker instead of Ending directly. The
+            # Friday-PM preflight (shell_run) pair is deliberately EXCLUDED
+            # from the marker (a dry pass must not satisfy the SLA) and
+            # still Ends here exactly as before.
+            ("NotifyComplete", "NotifyCompleteDegraded", "WriteCompletionMarker"),
+            ("NotifyShellRunComplete", "NotifyShellRunCompleteDegraded", None),
         ],
     )
     def test_notifier_catches_and_still_ends_success(
-        self, weekly_states, name, degraded_next
+        self, weekly_states, name, degraded_next, terminal_next
     ):
         st = weekly_states[name]
         assert st["Type"] == "Task"
         assert st["Resource"] == "arn:aws:states:::sns:publish"
-        assert st.get("End") is True
+        if terminal_next:
+            assert "End" not in st
+            assert st["Next"] == terminal_next
+        else:
+            assert st.get("End") is True
         catches = st.get("Catch", [])
         assert catches, f"{name} must Catch a publish failure (config#1819)"
         assert any(
@@ -383,10 +392,17 @@ class TestSuccessPathNotifiersAreNonFatal:
         )
         degraded = weekly_states[degraded_next]
         assert degraded["Type"] == "Pass"
-        assert degraded["End"] is True, (
-            f"{degraded_next} must still End the execution as SUCCEEDED — "
-            f"a caught notify failure must not propagate into a Fail"
-        )
+        if terminal_next:
+            assert "End" not in degraded
+            assert degraded["Next"] == terminal_next, (
+                f"{degraded_next} must still reach the SUCCEEDED completion "
+                f"marker — a caught notify failure must not propagate into a Fail"
+            )
+        else:
+            assert degraded["End"] is True, (
+                f"{degraded_next} must still End the execution as SUCCEEDED — "
+                f"a caught notify failure must not propagate into a Fail"
+            )
 
     def test_notify_complete_subject_still_bounded(self, weekly_states):
         """NotifyComplete/NotifyShellRunComplete's Subjects are hardcoded
@@ -468,11 +484,27 @@ class TestDailyAndEodAudited:
         for name, st in _iter_states(eod_states):
             for c in st.get("Catch", []):
                 if c.get("Next") == "HandleFailure" and c.get("ResultPath") != "$.error":
-                    offenders.append(name)
+                    offenders.append(f"{name}.Catch (ResultPath={c.get('ResultPath')!r})")
             if st.get("Next") == "HandleFailure" and not (
                 st.get("Type") == "Pass" and st.get("ResultPath") == "$.error"
             ):
-                offenders.append(name)
+                offenders.append(f"{name}.Next (type={st.get('Type')}, ResultPath={st.get('ResultPath')!r})")
+            # Choice-state edges — the 2026-07-31 SSMReadyChoice incident.
+            # Neither the per-Catch loop above nor the bare Next check covers
+            # Choice[].Next or Default edges, which can route to HandleFailure
+            # with no $.error set (the SSM agent never came Online, so there
+            # was no caught exception to carry).
+            if st.get("Type") == "Choice":
+                for i, choice in enumerate(st.get("Choices", [])):
+                    if choice.get("Next") == "HandleFailure":
+                        offenders.append(
+                            f"{name}.Choices[{i}].Next -> HandleFailure "
+                            f"(Choice edge — no ResultPath)"
+                        )
+                if st.get("Default") == "HandleFailure":
+                    offenders.append(
+                        f"{name}.Default -> HandleFailure (Choice Default — no ResultPath)"
+                    )
         assert not offenders, (
             f"EOD state(s) reach HandleFailure without $.error set: {offenders}"
         )
@@ -497,4 +529,183 @@ class TestAllThreeSfsHaveNoUnboundedSubjectFormat:
             f"{sf_path.name}: Subject.$ references $.error in {offenders} — "
             f"an arbitrary-size error blob must never be interpolated into "
             f"an SNS Subject (100-char cap)"
+        )
+
+
+# ── Derived notifier inbound-edge sweep (config#1819 generalization) ──────
+# config#2167 audited PublishResearchFailureImmediate and declared it total;
+# 2026-07-31's incident falsified that audit.  A hand-maintained list is
+# fragile — the same defect class (Choice edge → sns:publish with a missing
+# $.field) recurred.  Instead of adding one more list entry, this class
+# DERIVES every inbound edge to every sns:publish state across all three SF
+# definitions, extracts the $.field refs each publish state consumes, and
+# asserts each edge structurally guarantees the required fields.
+#
+# Floor-default coverage sources (checked in order):
+#   1. The publish state's own Parameters hardcoded values (e.g. TopicArn).
+#   2. InitializeInput's JsonMerge defaults blob (weekly + daily carry one;
+#      EOD's HandleFailure hardcodes TopicArn instead).
+#   3. The inbound edge: a Catch.ResultPath, a Pass.Parameters/Result, or
+#      a Task.ResultPath that sets the field.
+#   4. A field set unconditionally by a repin chain before the publish state
+#      (e.g. $.pipeline_label in the weekly SF's NormalizeFailureContextRepin).
+#
+# Fields covered by (1)-(4) are subtracted from the required set; anything
+# remaining on any edge is a gap — the SNS publish would crash on that edge
+# with States.Runtime, masking the true pipeline failure.
+
+def _field_refs_from_params(params: dict) -> set[str]:
+    """Extract all $.field references from an sns:publish state's Parameters,
+    covering both direct JSONPath values and States.Format(…) argument refs."""
+    refs: set[str] = set()
+    for key, val in params.items():
+        if isinstance(val, str):
+            refs |= set(re.findall(r"\$\.[A-Za-z_][A-Za-z0-9_.\[\]]*", val))
+    return refs
+
+
+def _floor_defaults_from_initialize_input(states: dict) -> set[str]:
+    """Extract field names covered by InitializeInput's JsonMerge defaults."""
+    init = states.get("InitializeInput")
+    if not init:
+        return set()
+    merge_expr = init.get("Parameters", {}).get("merged.$", "")
+    blob_match = re.search(r"StringToJson\('(\{.*?\})'\)", merge_expr)
+    if not blob_match:
+        return set()
+    try:
+        defaults = json.loads(blob_match.group(1))
+    except json.JSONDecodeError:
+        return set()
+    return {f"$.{k}" for k in defaults}
+
+
+def _fields_set_by_state(st: dict) -> set[str]:
+    """Return the set of $.fields a state structurally guarantees on its
+    output for a downstream consumer.
+
+    Covers:
+      - Pass state with Parameters+ResultPath (synthetic error injection)
+      - Pass state with Result+ResultPath
+      - Task Catch with ResultPath (caught error object)
+      - Task with ResultPath (output payload)
+      - The `$` root (always present) — States.JsonToString($) never fails.
+    """
+    fields: set[str] = set()
+    rp = st.get("ResultPath")
+    if not rp:
+        return fields
+
+    # A Catch entry's ResultPath stores the caught error at that path.
+    if st.get("Type") == "Pass":
+        if "Parameters" in st:
+            for k in st["Parameters"]:
+                fields.add(f"$.{k}")
+        if "Result" in st and rp:
+            fields.add(rp)
+    elif rp:
+        # Task/Catch ResultPath — the state produces output at this path.
+        fields.add(rp)
+    return fields
+
+
+def _is_sns_publish_edge_to(target_name: str, st: dict, edge_kind: str) -> bool:
+    """Check whether *st* has an edge of *edge_kind* that routes to
+    *target_name*."""
+    if edge_kind == "Next":
+        return st.get("Next") == target_name
+    if edge_kind == "Catch":
+        return any(c.get("Next") == target_name for c in st.get("Catch", []))
+    if edge_kind == "Choice":
+        return any(c.get("Next") == target_name for c in st.get("Choices", []))
+    if edge_kind == "Default":
+        return st.get("Default") == target_name
+    return False
+
+
+class TestDerivedSnsPublishInboundEdgeCoverage:
+    """For every sns:publish state in every SF: derive its $.field
+    requirements and verify every inbound edge satisfies them.
+
+    A HAND-MAINTAINED LIST of normalizer states is FORBIDDEN — this sweep
+    derives coverage from the SF definition itself.  The 2026-07-31 incident
+    (DataPhase2RetryGate → PublishResearchFailureImmediate with no $.error)
+    and the SSMReadyChoice → HandleFailure gap it also surfaced are both
+    caught by this test without being named anywhere in it."""
+
+    # SF-controlled fields that a repin chain unconditionally overwrites
+    # before the publish state runs — these are covered regardless of the
+    # inbound edge.  (config#1819: NormalizeFailureContextRepin re-derives
+    # $.pipeline_label from $.shell_run, so it is always present.)
+    _REPIN_GUARANTEED: dict[str, set[str]] = {
+        "step_function.json": {"$.pipeline_label"},
+        "step_function_daily.json": set(),
+        "step_function_eod.json": set(),
+    }
+
+    @pytest.mark.parametrize("sf_path", SF_JSONS)
+    def test_every_sns_publish_inbound_edge_covers_required_fields(
+        self, sf_path: pathlib.Path
+    ):
+        definition = _load(sf_path)
+        states = dict(_iter_states(definition["States"]))
+        floor_fields = _floor_defaults_from_initialize_input(states)
+        repin_fields = self._REPIN_GUARANTEED.get(sf_path.name, set())
+
+        sns_publish_states = {
+            name: st for name, st in states.items()
+            if st.get("Resource") == "arn:aws:states:::sns:publish"
+        }
+        if not sns_publish_states:
+            return  # No sns:publish states in this SF — nothing to check.
+
+        gaps: list[str] = []
+        for pub_name, pub_st in sns_publish_states.items():
+            required = _field_refs_from_params(pub_st["Parameters"])
+            # Remove fields hardcoded in the publish state's own Parameters
+            # (e.g. EOD HandleFailure's TopicArn is a literal ARN, not $.X).
+            hardcoded = {k for k in pub_st["Parameters"]
+                         if not k.endswith(".$")}
+            # Remove the $ root ref (States.JsonToString($) is always safe).
+            required.discard("$")
+
+            # For each inbound edge, compute which required fields the edge
+            # does NOT cover.
+            edges: list[tuple[str, str, str]] = []  # (source_state, edge_kind, edge_label)
+            for src_name, src_st in states.items():
+                for edge_kind in ("Next", "Catch", "Choice", "Default"):
+                    if _is_sns_publish_edge_to(pub_name, src_st, edge_kind):
+                        label = src_name
+                        edges.append((src_name, edge_kind, label))
+
+            for src_name, kind, label in edges:
+                uncovered = set(required)
+                uncovered -= floor_fields
+                uncovered -= repin_fields
+                uncovered -= hardcoded
+
+                # Fields the source edge guarantees.
+                src_st = states[src_name]
+                if kind == "Catch":
+                    for c in src_st.get("Catch", []):
+                        if c.get("Next") == pub_name and c.get("ResultPath"):
+                            uncovered.discard(c["ResultPath"])
+                elif kind == "Next" and src_st.get("ResultPath"):
+                    uncovered.discard(src_st["ResultPath"])
+                    # Pass states with Parameters inject named fields.
+                    if src_st.get("Type") == "Pass" and "Parameters" in src_st:
+                        for k in src_st["Parameters"]:
+                            uncovered.discard(f"$.{k}")
+
+                if uncovered:
+                    gaps.append(
+                        f"{sf_path.name}: {src_name} --[{kind}]--> {pub_name}  "
+                        f"MISSING {sorted(uncovered)}"
+                    )
+
+        assert not gaps, (
+            "SNS publish inbound edge(s) with unguaranteed $.field refs — "
+            "a States.Runtime crash on a missing JSONPath at this publish "
+            "state would mask the true pipeline failure:\n" +
+            "\n".join(gaps)
         )

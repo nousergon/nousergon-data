@@ -223,96 +223,192 @@ class TestDiffRow:
         assert row["mtd_cost_usd"] == 0.0  # top-up mid-month, never negative
 
 
+def neon_v2_doc(*projects: tuple[str, dict]) -> dict:
+    """Shape of a ``consumption_history/v2/projects`` response."""
+    return {"projects": [
+        {"project_id": pid, "periods": [{"period_id": "per-1", "period_plan": "launch",
+          "period_start": "2026-07-01T00:00:00Z",
+          "consumption": [{"timeframe_start": "2026-07-01T00:00:00Z",
+                           "timeframe_end": "2026-08-01T00:00:00Z",
+                           "metrics": [{"metric_name": k, "value": v}
+                                       for k, v in metrics.items()]}]}]}
+        for pid, metrics in projects]}
+
+
+def neon_routes(*, v2: dict | Exception, projects: dict | None = None) -> dict:
+    """Route table with the v2 consumption endpoint FIRST (its URL does not
+    contain ``/api/v2/projects``, but ordering keeps the intent obvious)."""
+    default = {"project": {
+        "name": "nousergon-rag", "org_id": "org-1",
+        "data_transfer_bytes": 8_000_000,
+        "consumption_period_start": "2026-07-01T00:00:00Z",
+        "consumption_period_end": "2026-08-01T00:00:00Z"}}
+    return {
+        "/consumption_history/v2/projects": v2,
+        "/api/v2/projects/p1": projects or default,
+        "/api/v2/projects": {"projects": [{"id": "p1", "org_id": "org-1"}]},
+    }
+
+
+class TestNeonPricing:
+    """``price_neon_project`` is the whole bill in one pure function — the
+    unit conversions were magnitude-verified against the live account
+    2026-07-31 (see the constants' comment in index.py)."""
+
+    def test_live_verified_conversions(self):
+        priced = index.price_neon_project({
+            "compute_unit_seconds": 43_277,          # → 12.021 CU-h
+            "root_branch_bytes_month": 1_059_273_298,  # → 1.0593 GB-month
+            "instant_restore_bytes_month": 34_025_675,  # → 0.0340 GB-month
+            "public_network_transfer_bytes": 421_855_072,  # 0.42 GB, inside 500
+        })
+        assert priced["compute_cu_hours"] == pytest.approx(12.021, abs=1e-3)
+        assert priced["compute_cost_usd"] == pytest.approx(12.021 * 0.106, abs=1e-3)
+        assert priced["storage_gb_month"] == pytest.approx(1.0933, abs=1e-3)
+        assert priced["storage_cost_usd"] == pytest.approx(1.0933 * 0.35, abs=1e-3)
+        assert priced["data_transfer_cost_usd"] == 0.0  # inside the allowance
+        assert priced["total_cost_usd"] == pytest.approx(1.6572, abs=2e-3)
+
+    def test_transfer_allowance_is_per_project(self):
+        """500 GB of egress is included PER PROJECT — two projects at 400 GB
+        each are both inside it; summing first would fabricate a 300 GB
+        overage."""
+        each = index.price_neon_project(
+            {"public_network_transfer_bytes": 400_000_000_000})
+        assert each["data_transfer_cost_usd"] == 0.0
+        over = index.price_neon_project(
+            {"public_network_transfer_bytes": 600_000_000_000})
+        assert over["data_transfer_cost_usd"] == pytest.approx(10.0)
+
+    def test_extra_branches_priced(self):
+        priced = index.price_neon_project({"extra_branches_month": 2.0})
+        assert priced["extra_branches_cost_usd"] == pytest.approx(3.0)
+        assert priced["total_cost_usd"] == pytest.approx(3.0)
+
+
 class TestNeonPeriodPacing:
     def test_period_aware_projection(self, monkeypatch):
         """Neon's consumption period can start mid-calendar-month (plan
-        change) — pacing must use ITS bounds, not the calendar month's."""
+        change) — the GB-vs-quota pacing must use ITS bounds, not the calendar
+        month's."""
         monkeypatch.setattr(index, "_now_utc", lambda: NOW)
-        monkeypatch.setattr(index, "_http_json", http_router({
-            "/api/v2/projects/p1": {"project": {
-                "name": "nousergon", "data_transfer_bytes": 2_500_000_000,
-                "compute_time_seconds": 7200,
+        monkeypatch.setattr(index, "_http_json", http_router(neon_routes(
+            v2=neon_v2_doc(("p1", {"public_network_transfer_bytes": 2_500_000_000})),
+            projects={"project": {
+                "name": "nousergon-rag", "org_id": "org-1",
+                "data_transfer_bytes": 2_500_000_000,
                 # Half the period elapsed at NOW (7/17 12:00): 2.5 GB → 5 GB
                 "consumption_period_start": "2026-07-14T12:00:00Z",
-                "consumption_period_end": "2026-07-20T12:00:00Z"}},
-            "/api/v2/projects": {"projects": [{"id": "p1"}]},
-        }))
-        mw = index._month_window(NOW)
-        row = index.collect_neon(mw, {}, {index.SSM_NEON: "k",
-                                          index.SSM_NEON_QUOTA_GB: "5"})
+                "consumption_period_end": "2026-07-20T12:00:00Z"}})))
+        row = index.collect_neon(index._month_window(NOW), {},
+                                 {index.SSM_NEON: "k", index.SSM_NEON_QUOTA_GB: "5"})
         assert row["quota"]["used"] == pytest.approx(2.5)
         assert row["quota"]["projected"] == pytest.approx(5.0)
         assert row["pace"] is None or row["pace"] == "under"  # 5.0 !> 5 GB
 
-    def test_operator_note_and_fixed_cost_surface(self, monkeypatch):
-        """A budgets note + fixed_monthly_usd (e.g. temporary paid plan) must
-        reach the row — the fixed-cost branch used to blank the note."""
+    def test_compute_and_storage_are_priced_not_unknown(self, monkeypatch):
+        """The whole point of config#2913's follow-up: compute and storage are
+        REAL line items read from the invoice-aligned v2 metrics, not `None`
+        with an excuse. 7200 CU-s = 2 CU-h = $0.212; 2 GB-month = $0.70."""
         monkeypatch.setattr(index, "_now_utc", lambda: NOW)
-        monkeypatch.setattr(index, "_http_json", http_router({
-            "/api/v2/projects/p1": {"project": {"name": "nousergon",
-                "data_transfer_bytes": 8_000_000,
-                "consumption_period_start": "2026-07-01T00:00:00Z",
-                "consumption_period_end": "2026-08-01T00:00:00Z"}},
-            "/api/v2/projects": {"projects": [{"id": "p1"}]},
-        }))
+        monkeypatch.setattr(index, "_http_json", http_router(neon_routes(
+            v2=neon_v2_doc(("p1", {"compute_unit_seconds": 7200,
+                                   "root_branch_bytes_month": 2_000_000_000,
+                                   "public_network_transfer_bytes": 8_000_000})))))
+        row = index.collect_neon(index._month_window(NOW), {}, {index.SSM_NEON: "k"})
+        assert row["detail"]["compute_cost_usd"] == pytest.approx(0.212)
+        assert row["detail"]["storage_cost_usd"] == pytest.approx(0.70)
+        assert row["detail"]["data_transfer_cost_usd"] == 0.0
+        assert row["mtd_cost_usd"] == pytest.approx(0.912)
+        assert row["source"] == "consumption_history_v2"
+        assert "cost_components_unavailable" not in row["detail"]
+        assert row["detail"]["by_project"][0]["project"] == "nousergon-rag"
+
+    def test_fixed_override_is_ignored_but_reported(self, monkeypatch):
+        """A stale ``fixed_monthly_usd`` (the $19 that config#2913 found on
+        this row) must NOT outrank a measured bill — it is reported in detail
+        so the stale config is visible, never used as the number."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router(neon_routes(
+            v2=neon_v2_doc(("p1", {"compute_unit_seconds": 7200})))))
         budgets = {"providers": {"neon": {
             "fixed_monthly_usd": 19.0, "note": "Launch plan — TEMPORARY"}}}
         row = index.collect_neon(index._month_window(NOW), budgets,
                                  {index.SSM_NEON: "k"})
-        assert row["mtd_cost_usd"] == 19.0
-        assert row["projected_month_end_usd"] == 19.0
-        assert row["note"] == "Launch plan — TEMPORARY"
+        assert row["mtd_cost_usd"] == pytest.approx(0.212)
+        assert row["detail"]["fixed_monthly_usd_ignored"] == 19.0
+        assert row["note"] == "Launch plan — TEMPORARY"  # operator note still lands
+        # …but a stale operator note must never be the ONLY pricing story on
+        # the page: the adapter's own explanation is always in detail.
+        assert "invoice-aligned" in row["detail"]["pricing_note"]
 
-    def test_computed_transfer_overage_cost(self, monkeypatch):
-        """No fixed_monthly_usd override configured (config#2913): mtd_cost_usd
-        must be a REAL computed estimate from data-transfer overage — 500 GB/mo
-        free egress, then $0.10/GB (neon.com/pricing, verified 2026-07-17) — not
-        the fabricated flat $19/mo the row used to hard-set regardless of usage.
-        600 GB used, full-month period, NOW at exactly 50% elapsed ⇒ 100 GB
-        overage MTD ($10.00), straight-line-projected usage 1200 GB month-end
-        ⇒ 700 GB overage ($70.00)."""
-        monkeypatch.setattr(index, "_now_utc",
-                            lambda: datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
-        monkeypatch.setattr(index, "_http_json", http_router({
-            "/api/v2/projects/p1": {"project": {
-                "name": "nousergon", "data_transfer_bytes": 600_000_000_000,
-                "compute_time_seconds": 7200, "written_data_bytes": 5_000_000_000,
-                "consumption_period_start": "2026-07-01T00:00:00Z",
-                "consumption_period_end": "2026-08-01T00:00:00Z"}},
-            "/api/v2/projects": {"projects": [{"id": "p1"}]},
-        }))
-        mw = index._month_window(datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
-        row = index.collect_neon(mw, {}, {index.SSM_NEON: "k"})
+    def test_transfer_overage_projection(self, monkeypatch):
+        """600 GB used, full-month period, NOW at exactly 50% elapsed ⇒ 100 GB
+        overage MTD ($10.00), straight-line-projected 1200 GB month-end ⇒ 700
+        GB overage ($70.00)."""
+        now = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(index, "_now_utc", lambda: now)
+        monkeypatch.setattr(index, "_http_json", http_router(neon_routes(
+            v2=neon_v2_doc(("p1", {"public_network_transfer_bytes": 600_000_000_000})))))
+        row = index.collect_neon(index._month_window(now), {}, {index.SSM_NEON: "k"})
         assert row["mtd_cost_usd"] == pytest.approx(10.0)
         assert row["projected_month_end_usd"] == pytest.approx(70.0)
-        assert row["detail"]["data_transfer_cost_usd"] == pytest.approx(10.0)
 
-    def test_compute_and_storage_surface_as_unknown_not_zero(self, monkeypatch):
-        """Compute (no CU-size field to convert compute_time_seconds into
-        CU-hours) and storage (written_data_bytes is cumulative writes, not a
-        point-in-time size — no logical_size_bytes field) are genuinely
-        uncomputable from this endpoint: they must render None/unknown and be
-        named in detail.cost_components_unavailable, never fabricated as 0 or
-        silently dropped from the row (config#2913 fail-loud discipline)."""
+    def test_v2_unavailable_falls_back_and_says_so(self, monkeypatch):
+        """On a plan where the v2 endpoint is gated (Free), the row must fall
+        back to the transfer counter, NAME the failure, and not pass off a
+        partial figure as the full bill."""
         monkeypatch.setattr(index, "_now_utc", lambda: NOW)
-        monkeypatch.setattr(index, "_http_json", http_router({
-            "/api/v2/projects/p1": {"project": {
-                "name": "nousergon", "data_transfer_bytes": 8_000_000,
-                "compute_time_seconds": 7200, "written_data_bytes": 5_000_000_000,
+        monkeypatch.setattr(index, "_http_json", http_router(neon_routes(
+            v2=RuntimeError("HTTP 404 from consumption_history/v2: not found"),
+            projects={"project": {
+                "name": "nousergon-rag", "org_id": "org-1",
+                "data_transfer_bytes": 600_000_000_000,
                 "consumption_period_start": "2026-07-01T00:00:00Z",
-                "consumption_period_end": "2026-08-01T00:00:00Z"}},
-            "/api/v2/projects": {"projects": [{"id": "p1"}]},
-        }))
+                "consumption_period_end": "2026-08-01T00:00:00Z"}})))
         row = index.collect_neon(index._month_window(NOW), {}, {index.SSM_NEON: "k"})
-        assert row["detail"]["compute_cost_usd"] is None
-        assert row["detail"]["storage_cost_usd"] is None
-        unavailable = {c["component"] for c in row["detail"]["cost_components_unavailable"]}
-        assert unavailable == {"compute", "storage"}
-        assert "unknown" in row["note"] or "cost_components_unavailable" in row["note"]
-        # Negligible transfer (8 MB, well under the 500 GB free tier) ⇒ the
-        # ONE computable line item is legitimately $0 — distinct from "unknown".
-        assert row["mtd_cost_usd"] == 0.0
-        assert row["detail"]["data_transfer_cost_usd"] == 0.0
+        assert row["source"] == "projects_api_fallback"
+        assert row["detail"]["pricing_source"] == "projects_api_fallback"
+        assert "404" in row["detail"]["consumption_v2_error"]
+        assert "v2 unreachable" in row["note"]
+        assert row["mtd_cost_usd"] == pytest.approx(10.0)  # transfer overage only
+        assert row["quota"]["used"] == pytest.approx(600.0)
+
+    def test_query_window_is_month_aligned(self, monkeypatch):
+        """At monthly granularity Neon truncates BOTH bounds to month
+        boundaries — a `to` of "now" collapses onto `from` and the request
+        400s ("'from' must be before 'to'", hit live 2026-07-31). The window
+        must span the whole calendar month."""
+        seen = {}
+
+        def _fake_http(url, headers=None):
+            if "/consumption_history/v2/projects" in url:
+                seen["url"] = url
+                return neon_v2_doc(("p1", {"compute_unit_seconds": 3600}))
+            if "/api/v2/projects/p1" in url:
+                return {"project": {"name": "nousergon-rag", "org_id": "org-1",
+                                    "data_transfer_bytes": 0,
+                                    "consumption_period_start": "2026-07-01T00:00:00Z",
+                                    "consumption_period_end": "2026-08-01T00:00:00Z"}}
+            return {"projects": [{"id": "p1", "org_id": "org-1"}]}
+
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        index.collect_neon(index._month_window(NOW), {}, {index.SSM_NEON: "k"})
+        assert "from=2026-07-01T00%3A00%3A00Z" in seen["url"]
+        assert "to=2026-08-01T00%3A00%3A00Z" in seen["url"]
+
+    def test_cost_and_quota_pace_both_bind(self, monkeypatch):
+        """Over the $ budget with transfer nowhere near the quota still paces
+        over — and vice versa (the free-plan quota is the other constraint)."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        monkeypatch.setattr(index, "_http_json", http_router(neon_routes(
+            v2=neon_v2_doc(("p1", {"compute_unit_seconds": 200_000})))))  # 55.6 CU-h
+        row = index.collect_neon(index._month_window(NOW),
+                                 {"providers": {"neon": {"monthly_budget_usd": 2.0}}},
+                                 {index.SSM_NEON: "k", index.SSM_NEON_QUOTA_GB: "5000"})
+        assert row["mtd_cost_usd"] > 2.0
+        assert row["pace"] == "over"
 
 
 class TestFixedRows:
@@ -373,12 +469,17 @@ def env(monkeypatch):
             "data": {"total_credits": 50.0, "total_usage": 42.5}},
         "api.deepseek.com/user/balance": {
             "balance_infos": [{"currency": "USD", "total_balance": "15.00"}]},
+        "/consumption_history/v2/projects": neon_v2_doc(
+            ("p1", {"public_network_transfer_bytes": 3_000_000_000,
+                    "compute_unit_seconds": 7200,
+                    "root_branch_bytes_month": 500_000_000})),
         "/api/v2/projects/p1": {"project": {
-            "name": "nousergon", "data_transfer_bytes": 3_000_000_000,
+            "name": "nousergon", "org_id": "org-1",
+            "data_transfer_bytes": 3_000_000_000,
             "compute_time_seconds": 7200,
             "consumption_period_start": "2026-07-01T00:00:00Z",
             "consumption_period_end": "2026-08-01T00:00:00Z"}},
-        "/api/v2/projects": {"projects": [{"id": "p1"}]},
+        "/api/v2/projects": {"projects": [{"id": "p1", "org_id": "org-1"}]},
         "organizations/nousergon/settings/billing/usage": {"usageItems": [
             {"product": "Actions", "unitType": "Minutes", "quantity": 1400,
              "netAmount": 0.0, "repositoryName": "alpha-engine-config"},
@@ -468,7 +569,10 @@ class TestHandler:
 
         # Totals: ok+fixed rows only; error row flags incomplete
         assert doc["totals"]["incomplete"] is True
-        expected_mtd = 12.34 + 2.0 + 2.5 + 5.0 + 0.0 + 1.5 + 200.0
+        # neon 0.39 = 2 CU-h ($0.212) + 0.5 GB-month ($0.175); its 3 GB of
+        # egress is inside the per-project allowance. It used to contribute
+        # $0.00 because compute and storage were reported as unpriceable.
+        expected_mtd = 12.34 + 2.0 + 2.5 + 5.0 + 0.39 + 1.5 + 200.0
         assert doc["totals"]["mtd_usd"] == pytest.approx(expected_mtd)
 
         # First-of-day snapshot written with the raw counters
@@ -844,10 +948,32 @@ class TestReconcileCounterDiff:
 
 
 class TestReconcileNeon:
-    def test_always_not_available(self):
-        row = index.reconcile_neon({"providers": [{"key": "neon", "mtd_cost_usd": 1.0}]})
-        assert row["status"] == "not_available"
-        assert "historical" in row["note"] or "current consumption period" in row["note"]
+    def test_closed_month_requeried_from_v2(self, monkeypatch):
+        """The prior month's FINAL charge is re-read from the same
+        invoice-aligned metrics (v2 accepts an arbitrary historical window) —
+        this row used to be permanently not_available."""
+        seen = {}
+
+        def _fake_http(url, headers=None):
+            if "/consumption_history/v2/projects" in url:
+                seen["url"] = url
+                return neon_v2_doc(("p1", {"compute_unit_seconds": 36_000,
+                                           "root_branch_bytes_month": 1_000_000_000}))
+            return {"projects": [{"id": "p1", "org_id": "org-1"}]}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        pmw = index._prior_month_window(NOW)
+        row = index.reconcile_neon(pmw, {index.SSM_NEON: "k"},
+                                   {"providers": [{"key": "neon", "mtd_cost_usd": 1.0}]})
+        # 10 CU-h ($1.06) + 1 GB-month ($0.35) = $1.41 final
+        assert row["actual_final"] == pytest.approx(1.41)
+        assert row["status"] == "ok"
+        assert "from=2026-06-01T00%3A00%3A00Z" in seen["url"]
+        assert "to=2026-07-01T00%3A00%3A00Z" in seen["url"]
+
+    def test_not_configured_without_key(self):
+        row = index.reconcile_neon(index._prior_month_window(NOW), {}, None)
+        assert row["status"] == "not_configured"
         assert row["actual_final"] is None
 
 
@@ -911,7 +1037,9 @@ class TestRunReconciliation:
         assert doc["period"] == "2026-06"
         assert doc["providers"]["aws"]["actual_final"] == pytest.approx(12.34)
         assert "aws" in doc["flagged"]  # (12.34-5.0)/5.0 = 146% >> 8% threshold
-        assert doc["providers"]["neon"]["status"] == "not_available"
+        # no Neon key in this fixture's secrets → honest not_configured (the
+        # row is a real re-query when the key is present, see TestReconcileNeon)
+        assert doc["providers"]["neon"]["status"] == "not_configured"
         # openrouter/deepseek reconciled purely from the two baselines above,
         # with zero HTTP calls (the unrouted http_router({}) would raise if hit).
         assert doc["providers"]["openrouter"]["actual_final"] == pytest.approx(12.5)
@@ -934,7 +1062,7 @@ class TestRunReconciliation:
         doc = json.loads(s3.store["expenses/reconciliation/2026-06.json"])
         assert doc["providers"]["aws"]["status"] == "error"
         assert "CE down" in doc["providers"]["aws"]["note"]
-        assert doc["providers"]["neon"]["status"] == "not_available"
+        assert doc["providers"]["neon"]["status"] == "not_configured"
 
 
 class TestHandlerReconcileMode:

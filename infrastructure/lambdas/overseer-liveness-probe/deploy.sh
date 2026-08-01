@@ -30,6 +30,12 @@
 # scheduled invocation once this code is deployed — see the PR body for why
 # the code deploy itself is ALSO held pending that same bootstrap pass.
 #
+# I4480 (2026-07-31): added lambda:InvokeFunction for
+# alpha-engine-overseer-backstop-responder to iam-policy.json (the liveness
+# probe can now invoke the backstop responder). Not yet applied to the live
+# role — an operator must run `deploy.sh --apply-iam` or `--bootstrap` to
+# pick it up.
+#
 # Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
 # cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
 # config-drift + run-window check, not tied to any pipeline's own schedule:
@@ -239,6 +245,14 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+
+# ----- 4. Auto-apply IAM policy (idempotent — #4472) ------------------------
+# Merge that changes iam-policy.json applies it without a deferred operator
+# step. Gracefully fails when the caller lacks iam:PutRolePolicy (CI auto-
+# deploy role); the drift check backstops any missed apply.
+TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
+  || log "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
 
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \

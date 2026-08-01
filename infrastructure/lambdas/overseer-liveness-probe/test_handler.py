@@ -419,16 +419,20 @@ class _FakeRunWindowS3:
         self._by_date = artifacts_by_date
 
     def list_objects_v2(self, Bucket, Prefix, **_):
-        # Prefix is "groom/{date}/" or "groom/decisions/{date}/"
+        # Prefix ends with "{date}/" at any depth: "groom/2026-07-17/" or
+        # "overseer/drain_ledger/2026-07-29/"
         if "decisions/" in Prefix:
             return {"Contents": []}
-        date = Prefix.split("/")[1]
+        date = Prefix.rstrip("/").split("/")[-1]
         arts = self._by_date.get(date, [])
         return {"Contents": [{"Key": f"{Prefix}run-{i}.json"} for i in range(len(arts))]}
 
     def get_object(self, Bucket, Key, **_):
+        # Key format: "<prefix>{date}/run-{idx}.json"; date is always the
+        # second-to-last segment regardless of prefix depth.
         parts = Key.split("/")
-        date, idx = parts[1], int(parts[-1].split("-")[1].split(".")[0])
+        date = parts[-2]
+        idx = int(parts[-1].split("-")[1].split(".")[0])
         art = self._by_date[date][idx]
         return {"Body": _Body(json.dumps(art).encode())}
 
@@ -1164,25 +1168,80 @@ def test_bool_is_not_treated_as_a_number_by_gt():
     assert len(problems) == 1
 
 
-def test_registry_declares_productive_when_for_groom():
-    """The live registry must actually opt groom in — the code path above is
-    inert otherwise, which is precisely how this failure stayed invisible."""
-    import yaml
-    reg = yaml.safe_load(
-        (Path(__file__).resolve().parents[2] / "overseer" / "playbooks.yaml").read_text()
-    )
-    checks = [
-        c
-        for pb in reg["playbooks"].values()
-        for c in ((pb.get("liveness") or {}).get("checks") or [])
-        if c.get("type") == "run_window" and c.get("label") == "groom"
-    ]
-    assert checks, "no run_window check labelled 'groom' in the registry"
-    for c in checks:
-        assert c.get("productive_when"), (
-            "the groom run_window check must declare productive_when — without it "
-            "a crash-cascaded run that writes an artifact reads as full coverage"
-        )
+# ══════════════════════════════════════════════════════════════════════════
+# run_window: productive_when for alert-drain
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The drain ledger is written by the charter agent at completion, not at
+# boot time (unlike the groom artifact). The exit-contract backstop
+# (alert_drain_run.sh line 202) already ensures no ledger exists unless
+# the charter completed. So productive_when is a documentary declaration:
+# the drain is productive if it ingested events OR had nothing to ingest
+# (empty queue = legitimate zero).
+
+# Verbatim fields from s3://alpha-engine-research/overseer/drain_ledger/2026-07-29/
+# drain-2026-07-29T0400Z.json — a real productive run with 43 ingested events.
+# Timestamps are re-dated into this suite's window (same approach as
+# _REAL_CRASH_CASCADE_ARTIFACT).
+_REAL_ALERT_DRAIN_LEDGER = {
+    "run_id": "drain-2026-07-29T0400Z",
+    "started_at": "2026-07-17T02:30:00+00:00",
+    "finished_at": "2026-07-29T04:12:05.292227+00:00",
+    "ingested": {"queue": 43, "fallback": 0},
+    "backlog_remaining": False,
+    "incidents": [{"key": "sample-incident", "tier": "T3", "disposition": "escalated"}],
+    "digest_text": "43 events ingested, 3 escalated, no backlog remaining.",
+}
+
+_RW_SPEC_ALERT_DRAIN = dict(
+    _RW_SPEC,
+    label="alert-drain",
+    artifact_prefix="overseer/drain_ledger/",
+    run_start_field="started_at",  # drain ledger uses started_at, never run_start
+    productive_when=[
+        {"field": "ingested.queue", "gt": 0},
+        {"field": "ingested.queue", "eq": 0},
+    ],
+)
+
+
+def test_alert_drain_productive_run_is_silent():
+    """A real drain ledger with ingested events is not flagged."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_ALERT_DRAIN_LEDGER]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_ALERT_DRAIN, NOW)
+    assert problems == [], problems
+
+
+def test_alert_drain_empty_queue_is_not_flagged():
+    """Empty intake queue is a legitimate zero — a drain that booted on an
+    empty queue completed correctly and proved the dispatch pipe works."""
+    art = dict(_REAL_ALERT_DRAIN_LEDGER, ingested={"queue": 0, "fallback": 0},
+               started_at="2026-07-17T02:30:00+00:00",
+               digest_text="0 events — empty queue, no backlog.")
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_ALERT_DRAIN, NOW)
+    assert problems == [], problems
+
+
+def test_alert_drain_ingested_nested_path_resolution():
+    """Verifies dot-notation path resolution works for ingested fields."""
+    art = dict(_REAL_ALERT_DRAIN_LEDGER, ingested={"queue": 5, "fallback": 2})
+    assert index._rw_clause_holds({"field": "ingested.queue", "gt": 0}, art)
+    assert index._rw_clause_holds({"field": "ingested.fallback", "eq": 2}, art)
+    assert not index._rw_clause_holds({"field": "ingested.queue", "lt": 1}, art)
+
+
+def test_alert_drain_list_to_length_resolution():
+    """Lists like 'incidents' are resolved to their length for comparison."""
+    art = dict(_REAL_ALERT_DRAIN_LEDGER, incidents=[{"key": "a"}, {"key": "b"}])
+    assert index._rw_clause_holds({"field": "incidents", "eq": 2}, art)
+    assert index._rw_clause_holds({"field": "incidents", "gt": 0}, art)
+
+    art_empty = dict(_REAL_ALERT_DRAIN_LEDGER, incidents=[])
+    assert index._rw_clause_holds({"field": "incidents", "eq": 0}, art_empty)
+    assert not index._rw_clause_holds({"field": "incidents", "gt": 0}, art_empty)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1229,9 +1288,10 @@ def test_run_window_default_start_field_is_unchanged_for_groom():
     assert problems == []
 
 
-def test_registry_declares_started_at_for_the_alert_drain_ledger():
-    """The live registry must name the drain ledger's real field. Without this
-    the check above is inert and the drain leg pages on every mature trigger."""
+def test_registry_alert_drain_contracts():
+    """The live registry must declare both productive_when AND run_start_field
+    for alert-drain — each code path is inert without its registry entry, and
+    a future schema change could silently lose either contract."""
     import yaml
     reg = yaml.safe_load(
         (Path(__file__).resolve().parents[2] / "overseer" / "playbooks.yaml").read_text()
@@ -1240,10 +1300,14 @@ def test_registry_declares_started_at_for_the_alert_drain_ledger():
         c
         for pb in reg["playbooks"].values()
         for c in ((pb.get("liveness") or {}).get("checks") or [])
-        if c.get("type") == "run_window" and c.get("artifact_prefix", "").startswith("overseer/drain_ledger")
+        if c.get("type") == "run_window" and c.get("label") == "alert-drain"
     ]
-    assert checks, "no run_window check over the alert-drain ledger in the registry"
+    assert checks, "no run_window check labelled 'alert-drain' in the registry"
     for c in checks:
+        assert c.get("productive_when"), (
+            "the alert-drain run_window check must declare productive_when — "
+            "without it a drain that ran but drained nothing reads as full coverage"
+        )
         assert c.get("run_start_field") == "started_at", (
             "the drain ledger keys its start timestamp 'started_at'; reading the "
             "groom artifact's 'run_start' name against it reports 100% of mature "

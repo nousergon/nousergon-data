@@ -147,20 +147,51 @@ class TestAlarmSemantics:
         assert "--threshold 1" in script_text
         assert '--statistic "Sum"' in script_text
 
-    def test_treat_missing_data_is_not_breaching(self, script_text):
+    def test_treat_missing_data_default_is_not_breaching(self, script_text):
         # Opposite of the deadman alarms: these alarm on PRESENCE of errors,
         # and AWS/Lambda emits no Errors datapoint when idle — "breaching"
-        # would page continuously on every quiet 5-minute window.
-        # Must check only the Errors/Throttles section (the new
-        # Invocations-floor alarms use breaching intentionally).
-        errors_block = script_text[:script_text.find("invocations-floor")] if "invocations-floor" in script_text else script_text
-        assert '--treat-missing-data "notBreaching"' in errors_block
-        assert '--treat-missing-data "breaching"' not in errors_block
+        # would page continuously on every quiet 5-minute window. This is the
+        # correct default for event-driven Lambdas.
+        # Slow-cadence probes (config#4477) override TreatMissingData to
+        # breaching because missing data IS the "not running" failure mode
+        # for a scheduled probe. These overrides appear EARLIER in the
+        # script (in _LAMBDA_CADENCE_SECONDS / _effective_treat_missing),
+        # never inside the per-Lambda loop body which is the default path.
+        # The Invocations-floor alarm section (added in #1157) intentionally
+        # uses breaching but lives outside the Errors/Throttles loop body
+        # — scope the check to exclude it.
+        loop_start = script_text.find("for metric in Errors Throttles")
+        loop_end = script_text.find("invocations-floor", loop_start) if "invocations-floor" in script_text else len(script_text)
+        loop_body = script_text[loop_start:loop_end]
+        lines_with_breaching = [
+            ln.strip() for ln in loop_body.splitlines()
+            if '--treat-missing-data "breaching"' in ln
+        ]
+        assert len(lines_with_breaching) == 0, (
+            "the default per-Lambda loop must use notBreaching — "
+            "per-override breaching values are set in _LAMBDA_CADENCE_SECONDS "
+            "outside this block"
+        )
 
-    def test_five_minute_single_period_window(self, script_text):
-        assert "--period 300" in script_text
-        assert "--evaluation-periods 1" in script_text
-        assert "--datapoints-to-alarm 1" in script_text
+    def test_default_period_five_minutes_single_eval(self, script_text):
+        # The default alarm shape is Period=300 (5 min), EvaluationPeriods=1
+        # for event-driven Lambdas. Slow-cadence probes (config#4477) can
+        # override per Lambda via _LAMBDA_CADENCE_SECONDS. The per-Lambda
+        # loop body uses computed variables ($period, $evals, $treat) that
+        # default to the constants below — verify the scaffolding.
+        assert 'DEFAULT_ALARM_PERIOD=300' in script_text
+        assert 'DEFAULT_ALARM_EVALS=1' in script_text
+        assert 'DEFAULT_ALARM_TREAT_MISSING="notBreaching"' in script_text
+        # The loop body references the computed vars.
+        default_block = script_text[script_text.find("for metric in Errors Throttles"):]
+        assert '--period "$period"' in default_block
+        assert '--evaluation-periods "$evals"' in default_block
+        assert '--treat-missing-data "$treat"' in default_block
+        # Override mechanism is wired.
+        assert '_effective_period "$label"' in script_text
+        assert '_effective_evals "$label"' in script_text
+        assert '_effective_treat_missing "$label"' in script_text
+        assert 'overseer-liveness-probe' in script_text and '28800' in script_text
 
     def test_alarm_naming_convention(self, script_text):
         assert 'alarm_name="alpha-engine-watch-plane-${label}-${metric_lc}"' in script_text

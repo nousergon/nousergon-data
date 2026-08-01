@@ -262,7 +262,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-I2749 (cross-repo, private): register
     # data/heal/daily/{run_date}.json in alpha-engine-config/private-docs/
     # ARTIFACT_REGISTRY.yaml.
-    "weekly_collector.py": 7,
+    "weekly_collector.py": 8,
 }
 
 

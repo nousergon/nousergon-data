@@ -28,7 +28,7 @@
     "neon": {
       "label": "Neon Postgres",
       "monthly_budget_usd": 15.0,
-      "note": "mtd_cost_usd is computed from data-transfer overage only (500 GB/mo free egress, then $0.10/GB — neon.com/pricing, verified 2026-07-17); compute ($0.106/CU-hour) and storage ($0.35/GB-month) render unknown in detail.cost_components_unavailable because the project detail API exposes no CU-size or current-storage-size field to price them from (config#2913). No fixed_monthly_usd is set — if a manually-confirmed paid-plan invoice needs to override this estimate, set fixed_monthly_usd and replace this note."
+      "note": "mtd_cost_usd is the real bill: compute (CU-hours x $0.106), storage (GB-months x $0.35), public egress above the per-project 500 GB allowance (x $0.10/GB) and extra branches, all read from Neon's invoice-aligned consumption-history v2 metrics (available on Launch; only the v1 endpoints are Scale-gated). Launch has NO flat monthly fee — do NOT set fixed_monthly_usd here: the neon adapter deliberately ignores it and reports it as detail.fixed_monthly_usd_ignored, because a hardcoded figure outranking a measured one is the config#2913 defect."
     },
     "github_org": {
       "label": "GitHub (nousergon org)",

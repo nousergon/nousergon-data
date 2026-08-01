@@ -217,7 +217,7 @@ def _write_row_backfill_safe(
             lib.write(symbol, new_row, prune_previous_versions=True)
             return "append"
 
-    if existing_series.empty or target_ts > existing_series.index.max():
+    if existing_series.empty or target_ts >= existing_series.index.max():
         # Append at head — fast path. update() is idempotent for same-date
         # rows (replaces in place rather than appending duplicates).
         new_row = _align_schema_for_update(new_row, existing_series)
@@ -2434,7 +2434,7 @@ def _daily_append_impl(
         # instrumentation becomes obsolete with this refactor (no per-task
         # threadpool to time) and is removed in this PR.
         #
-        # Path split: append-at-head (target_ts > existing.index.max(), the
+        # Path split: append-at-head (target_ts >= existing.index.max(), the
         # common morning-enrich case) → UpdatePayload + update_batch.
         # Backfill (target_ts in middle of series, rare — historical VWAP
         # repair etc.) → splice + WritePayload + write_batch. Mirrors
@@ -2447,7 +2447,7 @@ def _daily_append_impl(
         for ticker, today_row, hist, nan_features in write_tasks:
             target_ts = today_row.index[0]
             payload_meta[ticker] = (nan_features, len(hist))
-            if hist.empty or target_ts > hist.index.max():
+            if hist.empty or target_ts >= hist.index.max():
                 # Append at head — fast path. update_batch with upsert=True
                 # also handles the rare "symbol doesn't exist yet" case
                 # (replaces _write_row_backfill_safe's lib.write fallback).

@@ -1,522 +1,364 @@
-"""Tests for the overseer backstop responder (alpha-engine-config-I4480).
+"""Tests for the overseer-backstop-responder (alpha-engine-config-I4480).
 
-Tests run WITHOUT live AWS or Telegram — they stub boto3 and urllib at the
-function level. The hermetic-import guard applies (no nousergon_lib, no krepis,
-no flow_doctor_telegram) — the backstop must stay independent.
+The properties that matter are behavioural, not cosmetic:
+
+  1. an alarm NOT in the reviewed allowlist never triggers an action;
+  2. a second firing inside the cooldown window escalates instead of retrying;
+  3. the page still goes out when evidence-gathering partially fails — a
+     backstop that crashes while reporting an outage is worse than one that
+     reports "could not read X";
+  4. the responder never raises, whatever AWS does to it.
+
+Every boto3 client is faked. Nothing here touches AWS, SNS, or Telegram.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import unittest
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-# Ensure no nousergon_lib/krepis imports at module level
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import index  # noqa: E402
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Unit tests — pure functions
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestEscapeMarkdown(unittest.TestCase):
-    def test_escapes_special_chars(self):
-        result = index._escape_markdown("hello_world [test] (yep)")
-        self.assertEqual(result, r"hello\_world \[test\] \(yep\)")
-
-    def test_noop_on_clean_text(self):
-        result = index._escape_markdown("just plain text 123")
-        self.assertEqual(result, "just plain text 123")
+class NoSuchKey(Exception):
+    """Named to match botocore's real exception — _is_missing_key matches on
+    the class NAME, so a differently-named fake would not exercise the path."""
 
 
-class TestAlarmSlug(unittest.TestCase):
-    def test_deterministic(self):
-        a = index._alarm_slug("test-alarm")
-        b = index._alarm_slug("test-alarm")
-        self.assertEqual(a, b)
-        self.assertEqual(len(a), 16)
+class FakeS3:
+    def __init__(self, existing: dict | None = None, raise_on_get: bool = False):
+        self.objects = existing or {}
+        self.puts: list[str] = []
+        self.raise_on_get = raise_on_get
+        self.exceptions = type("E", (), {"NoSuchKey": NoSuchKey})
 
-    def test_different_alarms_different_slugs(self):
-        a = index._alarm_slug("alarm-a")
-        b = index._alarm_slug("alarm-b")
-        self.assertNotEqual(a, b)
+    def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg casing
+        if self.raise_on_get:
+            raise RuntimeError("s3 down")
+        if Key not in self.objects:
+            raise NoSuchKey()
+        body = json.dumps(self.objects[Key]).encode()
+        return {"Body": type("B", (), {"read": lambda self, b=body: b})()}
 
+    def put_object(self, Bucket, Key, Body, ContentType=None):  # noqa: N803
+        self.puts.append(Key)
+        self.objects[Key] = json.loads(Body)
 
-class TestWithinCooldown(unittest.TestCase):
-    def setUp(self):
-        self.now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
-
-    def test_no_prior(self):
-        self.assertFalse(index._within_cooldown(None, self.now))
-
-    def test_outside_window(self):
-        old = (self.now - timedelta(minutes=61)).isoformat()
-        self.assertFalse(index._within_cooldown(old, self.now))
-
-    def test_inside_window(self):
-        recent = (self.now - timedelta(minutes=30)).isoformat()
-        self.assertTrue(index._within_cooldown(recent, self.now))
-
-    def test_bad_timestamp(self):
-        self.assertFalse(index._within_cooldown("not-a-timestamp", self.now))
+    def list_objects_v2(self, Bucket, Prefix):  # noqa: N803
+        return {"Contents": []}
 
 
-class TestRecoveryActionsForAlarm(unittest.TestCase):
-    def test_intake_age_maps_to_probe_and_redispatch(self):
-        actions = index._recovery_actions_for_alarm(
-            "alpha-engine-watch-plane-overseer-intake-age"
+class FakeLambda:
+    def __init__(self):
+        self.invocations: list[dict] = []
+
+    def get_function_configuration(self, FunctionName):  # noqa: N803
+        return {"Environment": {"Variables": {}}}
+
+    def invoke(self, FunctionName, InvocationType, Payload):  # noqa: N803
+        self.invocations.append(
+            {"function": FunctionName, "payload": json.loads(Payload or b"{}")}
         )
-        self.assertIn("invoke_liveness_probe", actions)
-        self.assertIn("redispatch_alert_drain", actions)
-
-    def test_liveness_probe_errors_maps_to_probe_only(self):
-        actions = index._recovery_actions_for_alarm(
-            "alpha-engine-watch-plane-overseer-liveness-probe-errors"
-        )
-        self.assertIn("invoke_liveness_probe", actions)
-        self.assertNotIn("redispatch_alert_drain", actions)
-
-    def test_unknown_alarm_gets_default(self):
-        actions = index._recovery_actions_for_alarm("some-unknown-alarm")
-        self.assertEqual(actions, index.DEFAULT_RECOVERY_ACTIONS)
+        body = json.dumps({"routed": True, "verdict": {"launched": True}}).encode()
+        return {"Payload": type("P", (), {"read": lambda self, b=body: b})()}
 
 
-class TestFormatDurationMinutes(unittest.TestCase):
-    def test_minutes_only(self):
-        self.assertEqual(index._format_duration_minutes(30), "30m")
+class FakeSqs:
+    """Validates attribute names the way SQS actually does.
 
-    def test_hours_only(self):
-        self.assertEqual(index._format_duration_minutes(120), "2h")
+    The first version of this fake returned whatever it was asked for,
+    including `ApproximateAgeOfOldestMessage` — which is an AWS/SQS *metric*,
+    not a queue attribute. Real SQS answers `InvalidAttributeName` and fails
+    the WHOLE call, taking the depth reading with it. The permissive fake
+    turned an absent guarantee into a believed one, which is the exact class
+    overseer-policy §4 inv. 13 exists to prevent; the defect surfaced only on
+    a live invoke of the deployed function.
+    """
 
-    def test_hours_and_minutes(self):
-        self.assertEqual(index._format_duration_minutes(150), "2h30m")
+    VALID = {
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+        "ApproximateNumberOfMessagesDelayed",
+        "All",
+    }
 
+    def get_queue_url(self, QueueName):  # noqa: N803
+        return {"QueueUrl": f"https://sqs/{QueueName}"}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Format tests
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestFormatRecoverySection(unittest.TestCase):
-    def test_empty_results(self):
-        text = index._format_recovery_section([])
-        self.assertEqual(text, "")
-
-    def test_probe_clean(self):
-        results = [{
-            "action": "invoke_liveness_probe",
-            "ok": True,
-            "verdict": {
-                "problems": [],
-                "clean": True,
-                "kill_switches": {"ALERT_DRAIN_DISPATCH_ENABLED": "true"},
-                "checks_run": 25,
-                "checks_failed": 0,
-            },
-        }]
-        text = index._format_recovery_section(results)
-        self.assertIn("clean", text)
-        self.assertIn("25 checks", text)
-
-    def test_probe_with_problems(self):
-        results = [{
-            "action": "invoke_liveness_probe",
-            "ok": True,
-            "verdict": {
-                "problems": ["intake queue backed up"],
-                "clean": False,
-                "kill_switches": {},
-                "checks_run": 25,
-                "checks_failed": 2,
-            },
-        }]
-        text = index._format_recovery_section(results)
-        self.assertIn("problem", text)
-        self.assertIn("2 failed", text)
-
-    def test_redispatch_launched(self):
-        results = [{
-            "action": "redispatch_alert_drain",
-            "ok": True,
-            "verdict": {
-                "routed": True,
-                "verdict": {"launched": True, "reason": "dispatched"},
-            },
-        }]
-        text = index._format_recovery_section(results)
-        self.assertIn("launched", text.lower())
-
-    def test_redispatch_not_launched(self):
-        results = [{
-            "action": "redispatch_alert_drain",
-            "ok": True,
-            "verdict": {
-                "routed": True,
-                "verdict": {"launched": False, "reason": "concurrent_skip"},
-            },
-        }]
-        text = index._format_recovery_section(results)
-        self.assertIn("NOT launched", text)
-
-    def test_action_failed(self):
-        results = [{
-            "action": "invoke_liveness_probe",
-            "ok": False,
-            "error": "AccessDenied",
-        }]
-        text = index._format_recovery_section(results)
-        self.assertIn("AccessDenied", text)
-
-
-class TestFormatStateSection(unittest.TestCase):
-    def test_queue_metrics(self):
-        state = {
-            "intake_queue": {
-                "queue": "nousergon-overseer-intake",
-                "depth": 362,
-                "in_flight": 0,
-                "oldest_message_age_minutes": 4320,
-                "ok": True,
-            },
-            "intake_dlq": {"queue": "dlq", "depth": 0, "ok": True},
-            "dispatch_ledger": {"prefix": "overseer/dispatch_ledger", "key": None, "ok": True},
-            "drain_ledger": {
-                "prefix": "overseer/drain_ledger",
-                "key": "overseer/drain_ledger/2026-07-23/160000-drain-abc.json",
-                "last_modified": "2026-07-23T16:05:00Z",
-                "run_start": "2026-07-23T16:00:00Z",
-                "ok": True,
-            },
-            "probe_state": {"ok": True, "healthy": False, "fingerprint": "abc123", "updated_at": "2026-07-27T00:00:00Z"},
-        }
-        text = index._format_state_section(state)
-        self.assertIn("362", text)
-        self.assertIn("72h", text)  # 4320 minutes = 72 hours
-        self.assertIn("drain", text.lower())
-
-    def test_queue_unreadable(self):
-        state = {
-            "intake_queue": {"ok": False, "error": "AccessDenied"},
-            "intake_dlq": {"ok": False, "error": "AccessDenied"},
-            "dispatch_ledger": {"prefix": "x", "ok": False, "error": "blah"},
-            "drain_ledger": {"prefix": "x", "ok": False, "error": "blah"},
-            "probe_state": {"ok": False, "error": "blah"},
-        }
-        text = index._format_state_section(state)
-        self.assertIn("UNREADABLE", text)
-
-    def test_probe_healthy(self):
-        state = {
-            "intake_queue": {"depth": 0, "in_flight": 0, "oldest_message_age_minutes": 0, "ok": True},
-            "intake_dlq": {"depth": 0, "ok": True},
-            "dispatch_ledger": {"prefix": "x", "key": "x/date/file.json", "last_modified": "t", "ok": True},
-            "drain_ledger": {"prefix": "x", "key": "x/date/file.json", "last_modified": "t", "ok": True},
-            "probe_state": {"ok": True, "healthy": True},
-        }
-        text = index._format_state_section(state)
-        self.assertIn("healthy", text)
-
-
-class TestFormatEscalationNote(unittest.TestCase):
-    def test_escalation(self):
-        text = index._format_escalation_note(True)
-        self.assertIn("ESCALATED", text)
-
-    def test_no_escalation(self):
-        text = index._format_escalation_note(False)
-        self.assertEqual(text, "")
-
-
-class TestFormatPage(unittest.TestCase):
-    def setUp(self):
-        self.alarm = {
-            "AlarmName": "test-alarm",
-            "OldStateValue": "OK",
-            "NewStateValue": "ALARM",
-            "NewStateReason": "Threshold Crossed: 1 >= 1",
-            "Region": "us-east-1",
-            "Trigger": {
-                "MetricName": "ApproximateAgeOfOldestMessage",
-                "Namespace": "AWS/SQS",
-            },
-        }
-        self.state = {
-            "intake_queue": {"depth": 10, "in_flight": 0, "oldest_message_age_minutes": 120, "ok": True},
-            "intake_dlq": {"depth": 0, "ok": True},
-            "dispatch_ledger": {"prefix": "x", "key": None, "ok": True},
-            "drain_ledger": {"prefix": "x", "key": "x/file.json", "last_modified": "t", "ok": True},
-            "probe_state": {"ok": True, "healthy": True},
-        }
-        self.recovery = [{
-            "action": "invoke_liveness_probe",
-            "ok": True,
-            "verdict": {"problems": [], "clean": True, "kill_switches": {}, "checks_run": 25, "checks_failed": 0},
-        }]
-
-    def test_full_page(self):
-        text = index._format_page(self.alarm, self.state, self.recovery, False, "_cooldown info_")
-        self.assertIn("BACKSTOP", text)
-        self.assertIn("test-alarm", text)
-        self.assertIn("Fleet state", text)
-        self.assertIn("Recovery attempt", text)
-        self.assertIn("AWS Console", text)
-
-    def test_escalation_page(self):
-        text = index._format_page(self.alarm, self.state, self.recovery, True, "_cooldown info_")
-        self.assertIn("ESCALATION", text)
-
-    def test_long_reason_truncated(self):
-        alarm = dict(self.alarm)
-        alarm["NewStateReason"] = "x" * 1000
-        text = index._format_page(alarm, self.state, [], False, "_ok_")
-        self.assertLess(len(text), 3000)  # well under Telegram's 4096
-
-    def test_no_recovery_actions(self):
-        text = index._format_page(self.alarm, self.state, [], False, "_ok_")
-        self.assertIn("No recovery actions configured", text)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Handler integration tests (stubbed AWS + Telegram)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestHandler(unittest.TestCase):
-    """Full handler tests with stubbed boto3 + urllib."""
-
-    def _make_alarm_event(self, alarm_name="test-alarm", state="ALARM"):
-        return {
-            "Records": [{
-                "Sns": {
-                    "MessageId": "test-msg-1",
-                    "Message": json.dumps({
-                        "AlarmName": alarm_name,
-                        "OldStateValue": "OK",
-                        "NewStateValue": state,
-                        "NewStateReason": "Threshold crossed",
-                        "Region": "us-east-1",
-                        "Trigger": {"MetricName": "Errors", "Namespace": "AWS/Lambda"},
-                    }),
-                }
-            }]
-        }
-
-    @patch("index.urllib.request.urlopen")
-    @patch("index.boto3.client")
-    def test_handler_sends_enhanced_alarm(self, mock_boto, mock_urlopen):
-        # SSM returns Telegram creds
-        ssm_mock = MagicMock()
-        ssm_mock.get_parameter.side_effect = [
-            {"Parameter": {"Value": "fake-token"}},
-            {"Parameter": {"Value": "12345"}},
-        ]
-        # S3 returns no cooldown state (NoSuchKey)
-        s3_mock = MagicMock()
-        s3_mock.get_object.side_effect = Exception("NoSuchKey")
-        # SQS returns queue metrics
-        sqs_mock = MagicMock()
-        sqs_mock.get_queue_url.return_value = {"QueueUrl": "https://sqs.test/q"}
-        sqs_mock.get_queue_attributes.return_value = {
-            "Attributes": {
-                "ApproximateNumberOfMessages": "362",
-                "ApproximateNumberOfMessagesNotVisible": "0",
-                "ApproximateAgeOfOldestMessage": "259200",
-            }
-        }
-        # Lambda invoke returns probe verdict
-        lam_mock = MagicMock()
-        probe_payload = MagicMock()
-        probe_payload.read.return_value = json.dumps({
-            "problems": [],
-            "clean": True,
-            "kill_switches": {"ALERT_DRAIN_DISPATCH_ENABLED": "true"},
-            "checks_run": 25,
-            "checks_failed": 0,
-        }).encode("utf-8")
-        lam_mock.invoke.return_value = {
-            "Payload": probe_payload,
-        }
-
-        def boto_client(service, **kwargs):
-            if service == "ssm":
-                return ssm_mock
-            if service == "s3":
-                return s3_mock
-            if service == "sqs":
-                return sqs_mock
-            if service == "lambda":
-                return lam_mock
-            return MagicMock()
-
-        mock_boto.side_effect = boto_client
-
-        # Telegram send succeeds
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b'{"ok": true, "result": {"message_id": 1}}'
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
-
-        event = self._make_alarm_event()
-        result = index.handler(event, None)
-
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["sent"], 1)
-        self.assertEqual(result["results"][0]["status"], "sent")
-        # Recovery should have been attempted
-        self.assertTrue(result["results"][0]["recovery_attempted"])
-
-    @patch("index.urllib.request.urlopen")
-    @patch("index.boto3.client")
-    def test_handler_skips_non_alarm(self, mock_boto, mock_urlopen):
-        ssm_mock = MagicMock()
-        ssm_mock.get_parameter.side_effect = [
-            {"Parameter": {"Value": "fake-token"}},
-            {"Parameter": {"Value": "12345"}},
-        ]
-        mock_boto.return_value = ssm_mock
-
-        event = {
-            "Records": [{
-                "Sns": {
-                    "MessageId": "test-2",
-                    "Message": json.dumps({"notification": "something-else"}),
-                }
-            }]
-        }
-        result = index.handler(event, None)
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["sent"], 0)
-        self.assertEqual(result["results"][0]["status"], "skipped")
-
-    @patch("index.urllib.request.urlopen")
-    @patch("index.boto3.client")
-    def test_handler_ok_state_skips_recovery(self, mock_boto, mock_urlopen):
-        ssm_mock = MagicMock()
-        ssm_mock.get_parameter.side_effect = [
-            {"Parameter": {"Value": "fake-token"}},
-            {"Parameter": {"Value": "12345"}},
-        ]
-        # S3 returns prior cooldown state
-        s3_mock = MagicMock()
-        s3_mock.get_object.return_value = {
-            "Body": MagicMock(read=MagicMock(return_value=json.dumps({
-                "last_fired_at": "2026-07-28T11:00:00+00:00",
-                "recovery_attempted": True,
-            }).encode("utf-8")))
-        }
-        mock_boto.side_effect = lambda service, **kw: {
-            "ssm": ssm_mock,
-            "s3": s3_mock,
-        }.get(service, MagicMock())
-
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b'{"ok": true}'
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
-
-        # OK state — should send but NOT attempt recovery
-        event = self._make_alarm_event(state="OK")
-        result = index.handler(event, None)
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["sent"], 1)
-        self.assertFalse(result["results"][0]["recovery_attempted"])
-
-    @patch("index.urllib.request.urlopen")
-    @patch("index.boto3.client")
-    def test_handler_ssm_failure(self, mock_boto, mock_urlopen):
-        ssm_mock = MagicMock()
-        ssm_mock.get_parameter.side_effect = Exception("SSM down")
-        mock_boto.return_value = ssm_mock
-
-        event = self._make_alarm_event()
-        result = index.handler(event, None)
-        self.assertEqual(result["status"], "error")
-        self.assertIn("SSM", result["reason"])
-
-    @patch("index.urllib.request.urlopen")
-    @patch("index.boto3.client")
-    def test_handler_second_occurrence_escalates(self, mock_boto, mock_urlopen):
-        """Second firing within cooldown with prior recovery → escalated, no retry."""
-        ssm_mock = MagicMock()
-        ssm_mock.get_parameter.side_effect = [
-            {"Parameter": {"Value": "fake-token"}},
-            {"Parameter": {"Value": "12345"}},
-        ]
-
-        # S3: prior state shows recovery already attempted within cooldown
-        s3_mock = MagicMock()
-        recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        s3_mock.get_object.return_value = {
-            "Body": MagicMock(read=MagicMock(return_value=json.dumps({
-                "last_fired_at": recent,
-                "recovery_attempted": True,
-                "occurrence": 1,
-            }).encode("utf-8")))
-        }
-
-        # SQS for state gathering
-        sqs_mock = MagicMock()
-        sqs_mock.get_queue_url.return_value = {"QueueUrl": "https://sqs.test/q"}
-        sqs_mock.get_queue_attributes.return_value = {
-            "Attributes": {
-                "ApproximateNumberOfMessages": "100",
-                "ApproximateNumberOfMessagesNotVisible": "0",
-                "ApproximateAgeOfOldestMessage": "3600",
-            }
-        }
-
-        def boto_client(service, **kwargs):
-            return {"ssm": ssm_mock, "s3": s3_mock, "sqs": sqs_mock}.get(
-                service, MagicMock()
+    def get_queue_attributes(self, QueueUrl, AttributeNames):  # noqa: N803
+        bad = set(AttributeNames) - self.VALID
+        if bad:
+            raise type("InvalidAttributeName", (Exception,), {})(
+                f"Unknown Attribute {sorted(bad)[0]}."
             )
-
-        mock_boto.side_effect = boto_client
-
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b'{"ok": true}'
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
-
-        event = self._make_alarm_event()
-        result = index.handler(event, None)
-
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["sent"], 1)
-        # Should be escalated, NOT recovered
-        self.assertTrue(result["results"][0]["escalated"])
-        self.assertFalse(result["results"][0]["recovery_attempted"])
+        return {"Attributes": {
+            "ApproximateNumberOfMessages": "99",
+            "ApproximateNumberOfMessagesNotVisible": "0",
+        }}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Hermetic import guard
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestHermeticImportGuard(unittest.TestCase):
-    """The handler must NOT import nousergon_lib, krepis, or flow_doctor_telegram
-    — sharing code with the smart path would violate backstop independence
-    (overseer-policy §4 invariant 3)."""
-
-    def test_no_forbidden_imports_in_index(self):
-        import ast
-
-        with open(os.path.join(os.path.dirname(__file__), "index.py")) as f:
-            tree = ast.parse(f.read())
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    name = alias.name.split(".")[0]
-                    self.assertNotIn(
-                        name,
-                        ["nousergon_lib", "krepis", "flow_doctor_telegram"],
-                        f"index.py must not import {name} (violates backstop independence)",
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    base = node.module.split(".")[0]
-                    self.assertNotIn(
-                        base,
-                        ["nousergon_lib", "krepis", "flow_doctor_telegram"],
-                        f"index.py must not import from {node.module} (violates backstop independence)",
-                    )
+class FakeCw:
+    def get_metric_statistics(self, **kw):
+        from datetime import datetime as _dt
+        return {"Datapoints": [
+            {"Sum": 6.0, "Maximum": 7200.0,
+             "Timestamp": _dt(2026, 7, 28, 16, 0, tzinfo=timezone.utc)}
+        ]}
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.fixture
+def wired(monkeypatch):
+    """Wire fakes in and capture the page instead of sending it."""
+    state = {
+        "s3": FakeS3(), "lambda": FakeLambda(), "sqs": FakeSqs(),
+        "cloudwatch": FakeCw(), "pages": [],
+    }
+    monkeypatch.setattr(index, "boto3", type("B", (), {
+        "client": staticmethod(lambda name, region_name=None: state[name])
+    }))
+    monkeypatch.setattr(index, "_telegram",
+                        lambda text: (state["pages"].append(text), True)[1])
+    monkeypatch.setattr(index, "RECOVERY_ENABLED", True)
+    return state
+
+
+def _sns(alarm: str, reason: str = "Threshold crossed") -> dict:
+    return {"Records": [{"Sns": {"Message": json.dumps(
+        {"AlarmName": alarm, "NewStateReason": reason})}}]}
+
+
+INTAKE_AGE = "alpha-engine-watch-plane-overseer-intake-age"
+PROBE_ERRORS = "alpha-engine-watch-plane-overseer-liveness-probe-errors"
+
+
+# ── Property 1: the allowlist is the entire authority ───────────────────────
+
+
+def test_unmapped_alarm_takes_no_action(wired):
+    out = index.handler(_sns("some-unrelated-billing-alarm"), None)
+    assert wired["lambda"].invocations == [], "an unmapped alarm must never act"
+    assert "allowlist" in out["outcome"]["skipped"]
+    assert wired["pages"], "it must still page — reporting is unconditional"
+
+
+def test_intake_age_alarm_redispatches_the_drain_once(wired):
+    index.handler(_sns(INTAKE_AGE), None)
+    invs = wired["lambda"].invocations
+    assert len(invs) == 1
+    assert invs[0]["function"] == index.ROUTER_FUNCTION
+    assert invs[0]["payload"]["playbook"] == "alert-drain"
+    assert invs[0]["payload"]["payload"]["is_drill"] == "false", (
+        "a drill would prove the pipe works while leaving the backlog untouched"
+    )
+
+
+def test_probe_errors_alarm_reinvokes_the_probe(wired):
+    index.handler(_sns(PROBE_ERRORS), None)
+    invs = wired["lambda"].invocations
+    assert len(invs) == 1
+    assert invs[0]["function"] == index.PROBE_FUNCTION
+
+
+def test_kill_switch_disables_action_but_not_the_page(wired, monkeypatch):
+    monkeypatch.setattr(index, "RECOVERY_ENABLED", False)
+    out = index.handler(_sns(INTAKE_AGE), None)
+    assert wired["lambda"].invocations == []
+    assert "kill switch" in out["outcome"]["skipped"]
+    assert wired["pages"]
+
+
+def test_every_allowlist_entry_is_a_known_action():
+    """Guards against a typo'd action name silently becoming a no-op."""
+    for alarm, spec in index.ALARM_ACTIONS.items():
+        assert spec["action"] in ("redispatch", "invoke_probe"), alarm
+        assert spec.get("rationale"), f"{alarm} must carry a rationale"
+        if spec["action"] == "redispatch":
+            assert spec.get("playbook") and isinstance(spec.get("payload"), dict)
+
+
+# ── Property 2: one attempt per window, then escalate ───────────────────────
+
+
+def test_second_firing_in_window_escalates_instead_of_retrying(wired):
+    index.handler(_sns(INTAKE_AGE), None)
+    assert len(wired["lambda"].invocations) == 1
+    out = index.handler(_sns(INTAKE_AGE), None)
+    assert len(wired["lambda"].invocations) == 1, "must NOT retry in-window"
+    assert out["outcome"]["escalated"] is True
+    assert "SECOND firing" in wired["pages"][-1]
+
+
+def test_a_different_alarm_is_not_blocked_by_anothers_cooldown(wired):
+    index.handler(_sns(INTAKE_AGE), None)
+    index.handler(_sns(PROBE_ERRORS), None)
+    assert len(wired["lambda"].invocations) == 2
+
+
+def test_window_key_is_stable_within_and_changes_across_windows(monkeypatch):
+    monkeypatch.setattr(index, "COOLDOWN_HOURS", 6)
+    at = lambda h: datetime(2026, 7, 28, h, 30, tzinfo=timezone.utc)  # noqa: E731
+    assert index._window_start(at(1)) == index._window_start(at(5))
+    assert index._window_start(at(5)) != index._window_start(at(7))
+
+
+def test_cooldown_state_unreadable_fails_open(wired, monkeypatch):
+    """If S3 cannot be read we make ONE extra bounded attempt rather than none —
+    and the alternative (fail closed) would silently disable recovery exactly
+    when the plane is least healthy."""
+    monkeypatch.setattr(index, "boto3", type("B", (), {
+        "client": staticmethod(lambda name, region_name=None: (
+            FakeS3(raise_on_get=True) if name == "s3" else wired[name]
+        ))
+    }))
+    index.handler(_sns(INTAKE_AGE), None)
+    assert len(wired["lambda"].invocations) == 1
+
+
+# ── Property 3+4: the page survives partial blindness; nothing raises ───────
+
+
+def test_page_still_sent_when_every_evidence_call_fails(monkeypatch):
+    pages: list[str] = []
+
+    class Dead:
+        def __getattr__(self, _name):
+            def _boom(*a, **kw):
+                raise RuntimeError("aws down")
+            return _boom
+
+    monkeypatch.setattr(index, "boto3", type("B", (), {
+        "client": staticmethod(lambda name, region_name=None: Dead())
+    }))
+    monkeypatch.setattr(index, "_telegram",
+                        lambda text: (pages.append(text), True)[1])
+    out = index.handler(_sns(INTAKE_AGE), None)
+    assert pages, "the page is the primary deliverable and must survive"
+    assert "UNREADABLE" in pages[0], "blindness must be named, not hidden"
+    assert out["alarm"] == INTAKE_AGE
+
+
+def test_malformed_sns_event_still_pages(wired):
+    out = index.handler({"Records": [{"Sns": {"Message": "not json"}}]}, None)
+    assert wired["pages"]
+    assert out["alarm"] == "(unknown)"
+
+
+def test_empty_event_does_not_raise(wired):
+    assert index.handler({}, None)["alarm"] == "(unknown)"
+
+
+def test_router_returning_a_decline_is_reported_as_failure(wired, monkeypatch):
+    class Declining(FakeLambda):
+        def invoke(self, FunctionName, InvocationType, Payload):  # noqa: N803
+            self.invocations.append({"function": FunctionName, "payload": {}})
+            body = json.dumps({"routed": False, "reason": "playbook_disabled"}).encode()
+            return {"Payload": type("P", (), {"read": lambda self, b=body: b})()}
+
+    declining = Declining()
+    monkeypatch.setattr(index, "boto3", type("B", (), {
+        "client": staticmethod(lambda name, region_name=None: (
+            declining if name == "lambda" else wired[name]
+        ))
+    }))
+    out = index.handler(_sns(INTAKE_AGE), None)
+    assert out["outcome"]["result"]["ok"] is False
+    assert "FAILED" in wired["pages"][-1]
+
+
+# ── The dumbness invariant (§4 inv. 3) ──────────────────────────────────────
+
+
+def test_no_agent_bus_or_queue_dependency_in_the_source():
+    """§4 inv. 3: the backstop stays dumb forever.
+
+    Asserted over the parsed AST, not the raw text — the module docstring
+    NAMES the forbidden dependencies in order to explain why they are absent,
+    so a substring scan would flag its own rationale. Imports and attribute
+    calls are the things that can actually erode the invariant.
+    """
+    import ast
+
+    tree = ast.parse(Path(index.__file__).read_text())
+
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+
+    forbidden_imports = {"krepis", "flow_doctor", "nousergon_lib", "anthropic",
+                         "openai", "requests"}
+    assert not (imported & forbidden_imports), (
+        f"{sorted(imported & forbidden_imports)} imported by the backstop "
+        f"responder — it must have no agent or bus dependency "
+        f"(overseer-policy §4 inv. 3)"
+    )
+    assert imported <= {"__future__", "json", "os", "urllib", "datetime", "boto3"}, (
+        f"unexpected import(s) {sorted(imported - {'__future__', 'json', 'os', 'urllib', 'datetime', 'boto3'})} "
+        f"— the backstop's dependency set is boto3 + stdlib, by design"
+    )
+
+    called = {n.func.attr for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    forbidden_calls = {"receive_message", "delete_message", "publish"}
+    assert not (called & forbidden_calls), (
+        f"{sorted(called & forbidden_calls)} called — the backstop must never "
+        f"consume the intake queue or re-publish onto the bus it may be rescuing"
+    )
+
+
+def test_unreadable_state_still_claims_so_the_second_firing_escalates(wired, monkeypatch):
+    """Regression anchor for the unbounded-retry loop.
+
+    The first version returned early when the state read failed, so the claim
+    was never written — every subsequent firing also read-failed and also
+    acted. Unbounded retries in the one component whose whole contract is
+    'one bounded attempt'.
+    """
+    broken = FakeS3(raise_on_get=True)
+    monkeypatch.setattr(index, "boto3", type("B", (), {
+        "client": staticmethod(lambda name, region_name=None: (
+            broken if name == "s3" else wired[name]
+        ))
+    }))
+    index.handler(_sns(INTAKE_AGE), None)
+    assert broken.puts, "the claim must be written even when the read failed"
+
+    # Second firing: the claim is now present, so the read succeeds and escalates.
+    broken.raise_on_get = False
+    out = index.handler(_sns(INTAKE_AGE), None)
+    assert out["outcome"].get("escalated") is True
+    assert len(wired["lambda"].invocations) == 1, "must not act twice in-window"
+
+
+def test_queue_state_reports_depth_and_age_without_an_invalid_attribute(wired):
+    """Regression anchor: age comes from CloudWatch, depth from SQS. Asking SQS
+    for the age attribute fails the whole call and loses the depth too."""
+    out = index.handler(_sns("unmapped-for-this-test"), None)
+    intake = out["evidence"]["queues"]["intake"]
+    assert "UNREADABLE" not in intake, intake
+    assert "99 visible" in intake
+    assert "oldest 2h00m" in intake
+
+
+OWN_ALARM = "alpha-engine-watch-plane-backstop-responder-errors"
+
+
+def test_the_responders_own_alarm_is_never_actionable(wired):
+    """The responder's own error alarm publishes to the topic it subscribes to,
+    so it invokes itself. That is safe ONLY because its own alarm has no
+    allowlist entry — it reports and stops. If someone ever adds one, this
+    fails. (The human leg of that topic is an email subscription sharing no
+    component with the responder, which is what satisfies inv. 1; the
+    self-invoke is a harmless second reader, not the terminating path.)"""
+    assert OWN_ALARM not in index.ALARM_ACTIONS
+    out = index.handler(_sns(OWN_ALARM), None)
+    assert wired["lambda"].invocations == []
+    assert "allowlist" in out["outcome"]["skipped"]
+    assert wired["pages"], "it must still page with full plane state"

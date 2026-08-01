@@ -193,8 +193,8 @@ playbooks:
     # intake EventBridge rules are cross-cutting infra, checked under the
     # top-level watch_plane_liveness block below.
     #
-    # Run-window accounting (config#4474): for each MATURE expected trigger
-    # (the 4x-daily scheduler cadence below), assert an S3 drain-ledger
+    # Run-window accounting (alpha-engine-config#4474): for each MATURE expected
+    # trigger (the 4x-daily scheduler cadence below), assert an S3 drain-ledger
     # artifact's run_start landed in [T, T+ceiling+margin]. Key on the LEDGER
     # (overseer/drain_ledger/) rather than the completion marker
     # (_control/completed/) — the marker is written even on rc=1 (a crashing
@@ -227,6 +227,27 @@ playbooks:
           ceiling_min: 210
           margin_min: 30
           lookback_hours: 30
+          # An artifact proves the drain CHARTER RAN, not that it drained
+          # anything. The exit-contract backstop (alert_drain_run.sh line 202)
+          # already ensures the ledger only exists for a run that completed
+          # the charter steps, but unlike the groom artifact (which is written
+          # at BOOT time — a crash-cascade writes an artifact but no groom
+          # agent ever runs), the drain ledger is written at charter completion
+          # by the agent itself. So the ledger IS the proof of a complete run.
+          #
+          # productive_when tracks whether the drain found ACTUAL events:
+          # ingested:queue > 0 means the intake queue had messages and the
+          # drain consumed them. The empty-queue case (ingested.queue == 0)
+          # is the legitimate zero — "nothing to drain" is a complete,
+          # successful run of the dispatch pipe. The two clauses together
+          # ensure that ANY well-formed ledger (with an ingested dict)
+          # is recognized as productive, making this a DOCUMENTARY
+          # declaration rather than a detection tool — the real value is
+          # in having the contract explicit so a future schema change
+          # cannot silently break it.
+          productive_when:
+            - {field: ingested.queue, gt: 0}
+            - {field: ingested.queue, eq: 0}
           schedule:
             - hour: 4
               minute: 0
@@ -267,7 +288,13 @@ playbooks:
     wake:
       - "eventbridge: three daily fixed crons 04:00/12:00/20:00 UTC + Sun 09:00 UTC (demand-driven tier launches)"
       - "demand: end-of-SF Haiku PR-sweep leg (groom_run.sh --mode pr_sweep)"
-    cadence: "3x daily fixed crons (+ a weekly Sunday slot) + end-of-SF sweep leg"
+    # config-I4988 retirement (2026-07-31): this playbook's coverage is the
+    # 5-min lane-death + trigger-health reconciler probe INSIDE the dispatcher
+    # Lambda (config-I5229 / I4988), NOT a run_window check — the registry no
+    # longer mirrors SCHED_CRONS (the §2.7 derive-once defect I4988 was about).
+    # The cadence string documents that sibling probe so the config#4474
+    # coverage test's documented-sibling exemption applies.
+    cadence: "3x daily fixed crons (+ a weekly Sunday slot) + end-of-SF sweep leg — covered by the dispatcher's own 5-min lane-death + trigger-health reconciler liveness probe (config-I5229/I4988), not a run_window check"
     executor_lambda_dir: scheduled-groom-dispatcher
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
@@ -280,53 +307,28 @@ playbooks:
     # injecting dispatch-semantics fields for this playbook.
     custom_executor: true
     kill_switch_env: GROOM_DISPATCH_ENABLED
-    # Run-window accounting migrated from groom-liveness-probe (config#2414/#2667):
-    # for each MATURE expected trigger (fixed-cron schedule below UNION the
-    # dispatcher's own groom/decisions/ log, covering sweep-mode which has no
-    # cron), assert an S3 run artifact's run_start landed in [T, T+ceiling+margin].
-    # A trigger with no covering artifact = a silent groom death → problem line.
-    # `schedule` MIRRORS scheduled-groom-dispatcher/deploy.sh SCHED_CRONS — the
-    # registry is now the SSoT (was GROOM_SCHEDULE env / _DEFAULT_SCHEDULE const).
+    # Run_window liveness check RETIRED 2026-07-31 (config-I4988/I5229) — the
+    # reconciler (config-I5229, merged 2026-07-30 in nousergon-data#1111)
+    # replaced it with two receipt-based legs inside the dispatcher Lambda,
+    # both firing on the same 5-min EventBridge Scheduler tick:
     #
-    # config-I4988 (corrected 2026-07-28): these hours sat at 01:00/07:00/19:00,
-    # the RETIRED tier-per-slot schedule, three retirements behind the live
-    # crons. Because _rw_expected_triggers enumerates from this list, the check
-    # was accounting for triggers that no longer fire and blind to the ones that
-    # do — so on 2026-07-27/28, when four consecutive cycles failed and one lost
-    # all three lanes to a capacity event, the check that exists precisely to
-    # page on a silent groom death could not fire. A mirrored schedule with
-    # nothing enforcing the mirror is the §2.7 derive-once defect; the lockstep
-    # test added alongside this fix (tests/test_groom_schedule_lockstep.py) now
-    # fails CI the moment deploy.sh's SCHED_CRONS and this list disagree.
+    #   1. lane-death leg — screens the dispatch-ledger expectations against
+    #      live EC2 state (launched-but-dead lanes, page in ~5 min vs the old
+    #      405-min maturity).
+    #   2. trigger-health leg (config-I4988, added with this retirement) —
+    #      screens the dispatch SF's OWN execution receipts: every scheduled
+    #      fire records an execution, and the dispatcher's decision record
+    #      (groom/decisions/{date}/trigger-{HHMM}.json incl. the zero-launch
+    #      skip path, sweep-{HHMM}.json for sweep mode) is that fire's
+    #      receipt. An execution with no receipt = the Scheduler→SF→Lambda
+    #      chain broke below the scheduler → page.
     #
-    # NOTE this remains a SLOW backstop, not a fast pager: maturity is
-    # ceiling+margin = 405 min, so a lane that dies at bootstrap is still
-    # invisible here for ~7h. The fast instance-death signal is tracked
-    # separately — see the epic (config-I5194 Phase 1).
-    liveness:
-      checks:
-        - type: run_window
-          label: groom
-          artifact_prefix: groom/
-          decision_record_prefix: groom/decisions/
-          ceiling_min: 360   # groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS (360 min)
-          margin_min: 45     # box boot + report latency slack
-          lookback_hours: 30
-          # An artifact proves a box BOOTED, not that the run did anything.
-          # 2026-07-28: all three lanes crash-cascaded 2 min in (a truncated
-          # `runuser` left groom_run.sh as root, so every chunk agent refused
-          # to start), each still wrote a well-formed artifact, and this check
-          # reported full coverage while 378 issues went un-dispositioned.
-          # A run counts as coverage only if it engaged work — or there was no
-          # work to engage, which is the legitimate zero.
-          productive_when:
-            - {field: engaged, gt: 0}
-            - {field: total_issues, eq: 0}
-          schedule:
-            - {hour: 4, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "04:00 UTC daily (demand-all)"}
-            - {hour: 12, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "12:00 UTC daily (demand-all)"}
-            - {hour: 20, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "20:00 UTC daily (demand-all)"}
-            - {hour: 9, minute: 0, dows: [0], label: "Sun 09:00 UTC (weekly extra slot)"}
+    # The registry deliberately carries NO schedule mirror anymore — the
+    # mirrored SCHED_CRONS list whose drift left the check blind on
+    # 2026-07-27/28 was the §2.7 derive-once defect this issue is about. The
+    # one residual hole (a Scheduler rule that never fires at all produces no
+    # execution) is the four scheduler_schedule_exists wiring checks for the
+    # groom schedules in watch_plane_liveness (name+state only, no cron).
 
   gate-sweeps:
     description: >-
@@ -378,6 +380,25 @@ playbooks:
     routed: false
     enabled: true
     executor_function: alpha-engine-canary-replay-dispatcher
+    # alpha-engine-config#4474: run-window liveness accounting. The dedicated
+    # canary-replay-liveness-probe sibling Lambda ticks every 15min and provides
+    # per-invocation health; this registry-level run_window is an additional
+    # backstop asserting that a completion marker exists for each scheduled
+    # trigger (Wednesday drills + Thursday weekly canary). The marker prefix
+    # is tmp/canary/ (written by canary_replay_spot_bootstrap.sh even on probe
+    # failure, so only missing markers = completely skipped launch = problem).
+    liveness:
+      checks:
+        - type: run_window
+          label: canary-replay
+          artifact_prefix: tmp/canary/
+          ceiling_min: 120
+          margin_min: 60
+          lookback_hours: 240
+          schedule:
+            - {hour: 15, minute: 0, dows: [3], label: "Wednesday sf-watch canary drill"}
+            - {hour: 15, minute: 30, dows: [3], label: "Wednesday ci-watch canary drill"}
+            - {hour: 9, minute: 0, dows: [4], label: "Thursday weekly canary replay"}
     wake:
       - "scheduler:alpha-engine-ci-watch-canary-drill-weekly + alpha-engine-sf-watch-canary-drill-weekly (Wednesday drills; router re-point tracked config-I2832)"
     cadence: "weekly Wednesday drills; liveness tick every 15min (eventbridge:alpha-engine-canary-replay-liveness-probe-tick)"
@@ -438,6 +459,16 @@ watch_plane_liveness:
   checks:
     - type: lambda_active
       function: alpha-engine-overseer-dispatcher
+    # alpha-engine-config-I4480 — the bounded non-agentic responder on the
+    # dumb backstop topic. Watched here so a deleted or disabled responder is
+    # a finding rather than silence. Its own LAST-RESORT watcher is a
+    # CloudWatch alarm on its Errors metric
+    # (alpha-engine-watch-plane-backstop-responder-errors) terminating in an
+    # SNS email that shares no component with this probe or the responder —
+    # the probe watching the responder and the responder re-invoking the probe
+    # is mutual, not circular, precisely because that dumb leg exists.
+    - type: lambda_active
+      function: alpha-engine-overseer-backstop-responder
     - type: sqs_queue_exists
       queue_name: nousergon-overseer-intake
       expect_dlq: nousergon-overseer-intake-dlq
@@ -470,6 +501,22 @@ watch_plane_liveness:
       schedule_name: alpha-engine-ci-watch-canary-drill-weekly
     - type: scheduler_schedule_exists
       schedule_name: alpha-engine-sf-watch-canary-drill-weekly
+    # alpha-engine-config-I4988: the four groom dispatch schedules. The
+    # run_window check that used to watch them is retired — its trigger-
+    # health leg inside the dispatcher reconciler covers fires that never
+    # write a decision record, but a rule that never FIRES at all produces no
+    # execution and is only visible here. NAME + STATE only — no cron mirror,
+    # so this cannot drift like the retired schedule list did. Names must
+    # stay in sync with SCHED_NAMES in scheduled-groom-dispatcher/deploy.sh
+    # (a mismatch is a loud reviewable finding, never a silent blind spot).
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-scheduled-groom-0400-daily
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-scheduled-groom-1200-daily
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-scheduled-groom-2000-daily
+    - type: scheduler_schedule_exists
+      schedule_name: alpha-engine-scheduled-groom-sun0900-weekly
 
 # ── Alert-class registry (config-I3211; Brian directive 2026-07-22) ──────────
 # One row per DISTINCT notification class the fleet emits. This answers, in

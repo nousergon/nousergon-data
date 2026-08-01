@@ -19,6 +19,7 @@ Two independent fixes, one test module:
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -53,6 +54,113 @@ class ManifestS3:
                     "tickers_succeeded": count,
                 }).encode())}
         raise KeyError(Key)
+
+
+# The real reader, captured before the autouse fixture below replaces it, so
+# the tier-0 tests can exercise the genuinely committed declaration.
+_REAL_READ_APPROVED_SCOPE = alternative._read_approved_scope
+
+
+@pytest.fixture(autouse=True)
+def _tier0_disabled_by_default(monkeypatch):
+    """Disable the approved-scope declaration for the prior-run tests.
+
+    Tier 0 is a committed repo artifact declaring ~903 as approved
+    (alpha-engine-config-I5814), so once it exists it legitimately
+    short-circuits any run near that scope — which would make every
+    prior-run-comparison test below pass for the wrong reason. These tests
+    target tiers 1 and 2, so they pin tier 0 out explicitly rather than
+    depending on the declaration's current contents; the tier-0 tests opt
+    back in.
+    """
+    monkeypatch.setattr(alternative, "_read_approved_scope", lambda: None)
+
+
+class TestApprovedScopeDeclaration:
+    """Tier 0 — the operator-approved baseline (alpha-engine-config-I5951).
+
+    This is the tier that breaks the deadlock: the manifest baseline is written
+    only on collection SUCCESS, so after a deliberate step change the only run
+    that could advance it is a run the guard blocks. A declared approved scope
+    is the escape, and it is exactly what the guard's own error message asks
+    for ("record why and widen the tolerance deliberately").
+    """
+
+    def test_the_declaration_is_a_repo_artifact_not_an_s3_object(self):
+        """It must ship with the checkout, so the merge button alone deploys it.
+
+        An S3 object would have to be written by hand after merge — the
+        post-merge operator step pull-request-policy.md 4.2 forbids. Nothing
+        about it fails when it never runs: the guard just keeps taking its
+        fail-open path while reading green.
+        """
+        path = alternative._APPROVED_SCOPE_PATH
+        assert path.is_file(), f"{path} must be committed alongside the collector"
+        assert path.parent == pathlib.Path(alternative.__file__).parent
+
+    def test_the_declaration_carries_its_ruling(self):
+        """A bound with no provenance cannot be reviewed or re-examined."""
+        declared = _REAL_READ_APPROVED_SCOPE()
+        assert declared is not None
+        assert isinstance(declared["approved_n"], int)
+        assert declared["approved_n"] > 0
+        assert declared["ruling"], "the approved scope must name the ruling"
+        assert declared["approved_on"], "the approved scope must carry its date"
+
+    def test_the_approved_scope_passes_with_no_prior_baseline_at_all(
+        self, monkeypatch
+    ):
+        """THE DEADLOCK FIX.
+
+        Every run since 2026-07-21 failed mid-collection, so no manifest was
+        written and the newest baseline stayed the pre-ruling 27. Without a
+        declared approved scope, the ruled ~903 could never be collected —
+        the only run able to write a new baseline was the run being blocked.
+        """
+        monkeypatch.setattr(
+            alternative, "_read_approved_scope", _REAL_READ_APPROVED_SCOPE
+        )
+        approved_n = _REAL_READ_APPROVED_SCOPE()["approved_n"]
+        # No manifests, no scope markers — the state the fleet was actually in.
+        _assert_scope_stable(ManifestS3({}), "alpha-engine-research", PREFIX,
+                             "2026-07-31", approved_n)
+
+    def test_a_scope_far_from_the_approved_bound_still_raises(self, monkeypatch):
+        """The declaration blesses ONE scope, not any scope.
+
+        Falling back to the prior-run comparison on disagreement is what stops
+        this from becoming a blanket disable.
+        """
+        monkeypatch.setattr(
+            alternative, "_read_approved_scope", _REAL_READ_APPROVED_SCOPE
+        )
+        # 200 is far outside the tolerance of BOTH the approved ~903 and the
+        # prior run's 903, so neither tier can bless it.
+        with pytest.raises(ScopeChangedUnexpectedly):
+            _assert_scope_stable(ManifestS3({"2026-07-30": 903}),
+                                 "alpha-engine-research", PREFIX,
+                                 "2026-07-31", 200)
+
+    def test_the_approved_bound_does_not_swallow_a_disagreeing_prior_silently(
+        self, monkeypatch, caplog
+    ):
+        """A run matching neither tier must say what it was compared against.
+
+        The fall-through from tier 0 is the subtle path: if it were silent, an
+        operator would see only the prior-run message and never learn that a
+        declared approved scope existed and also disagreed.
+        """
+        import logging
+
+        monkeypatch.setattr(
+            alternative, "_read_approved_scope", _REAL_READ_APPROVED_SCOPE
+        )
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ScopeChangedUnexpectedly):
+                _assert_scope_stable(ManifestS3({"2026-07-30": 903}),
+                                     "alpha-engine-research", PREFIX,
+                                     "2026-07-31", 200)
+        assert "approved" in caplog.text.lower()
 
 
 def test_the_actual_regression_would_have_raised():
@@ -98,7 +206,7 @@ def test_no_baseline_fails_open_but_says_so(caplog):
     s3 = ManifestS3({})
     with caplog.at_level("WARNING"):
         _assert_scope_stable(s3, "alpha-engine-research", PREFIX, "2026-07-25", 903)
-    assert "no prior manifest" in caplog.text
+    assert "no prior scope/manifest" in caplog.text
     assert "cannot be detected" in caplog.text
 
 

@@ -1,0 +1,31 @@
+name: Empty PR Guard
+
+# Calls the fleet primitive in nousergon-lib: fail a PR that changes zero
+# files against its merge base (alpha-engine-config#5940).
+#
+# Adopted here first because this is where the defect surfaced: #784, #1118,
+# #1134 and #1158 all sat open contributing nothing — #784 for 18 days —
+# while every posted check stayed green, because an empty PR has nothing left
+# to break. Two of them were routed to Brian as `needs:human-review`, reading
+# as pending work.
+#
+# The job id is the branch-protection context ("empty-pr-guard /
+# empty-pr-guard"). It is NOT yet in required status checks: a context has to
+# report on real PRs before it can be required, or every open PR deadlocks
+# waiting for a status that has never posted — which is precisely the failure
+# this repo just spent two weeks demonstrating (config#5941). Promoting it to
+# required is the follow-up on config#5940 once it has run a cycle.
+#
+# Deliberately unfiltered, and the reusable workflow is too. A guard about
+# empty PRs must be able to run on an empty PR.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  empty-pr-guard:
+    uses: nousergon/nousergon-lib/.github/workflows/empty-pr-guard.yml@main

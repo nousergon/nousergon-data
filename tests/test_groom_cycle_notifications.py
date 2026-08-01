@@ -22,12 +22,13 @@ cosmetic: the SF actually routes through the notifier on BOTH terminal paths,
 the notifier is total (no lane silently omitted from the roll-up), and the
 buzz-vs-silent posture is explicit rather than inherited.
 
-The schedule-lockstep test is a separate concern riding the same PR: the
-Overseer's ``run_window`` liveness check enumerates expected triggers from
-``playbooks.yaml``, and that list had drifted three retirements behind the live
-crons (config-I4988), so the one check that should have paged on 2026-07-27/28
-structurally could not fire. A mirrored schedule with nothing enforcing the
-mirror is the §2.7 derive-once defect; this test is the enforcement.
+The schedule-lockstep test that rode the original config-I4988 PR was
+REMOVED with the check it enforced: the run_window groom liveness check is
+retired (config-I4988, riding config-I5229's reconciler), replaced by the
+dispatcher's own 5-min lane-death + trigger-health reconciler legs and the
+scheduler_schedule_exists wiring checks in ``playbooks.yaml`` — no schedule
+mirror remains in the registry, so there is no mirror left to enforce (the
+mirror itself was the §2.7 derive-once defect this issue is about).
 """
 
 import importlib.util
@@ -38,13 +39,11 @@ import types
 from pathlib import Path
 
 import pytest
-import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SF_FILE = REPO_ROOT / "infrastructure" / "step_function_groom.json"
 DISPATCHER_DIR = REPO_ROOT / "infrastructure" / "lambdas" / "scheduled-groom-dispatcher"
 DISPATCHER_DEPLOY = DISPATCHER_DIR / "deploy.sh"
-PLAYBOOKS = REPO_ROOT / "infrastructure" / "overseer" / "playbooks.yaml"
 NOTIFIER_DEPLOY = (
     REPO_ROOT / "infrastructure" / "lambdas" / "sf-telegram-notifier" / "deploy.sh"
 )
@@ -317,43 +316,15 @@ def test_a_failed_cycle_reports_degraded(dispatcher, monkeypatch):
     assert "not dispatched" in text
 
 
-# ── Schedule lockstep (config-I4988) ─────────────────────────────────────────
-
-
-def _deploy_sched_crons() -> list[tuple[int, int]]:
-    """(hour, minute) of every cron in the dispatcher's SCHED_CRONS array."""
-    src = DISPATCHER_DEPLOY.read_text()
-    block = re.search(r"SCHED_CRONS=\((.*?)\n\)", src, re.S)
-    assert block, "SCHED_CRONS array not found in scheduled-groom-dispatcher/deploy.sh"
-    out = []
-    for minute, hour in re.findall(r'"cron\((\d+)\s+(\d+)\s', block.group(1)):
-        out.append((int(hour), int(minute)))
-    assert out, "no cron expressions parsed from SCHED_CRONS"
-    return sorted(out)
-
-
-def _registry_run_window_schedule() -> list[tuple[int, int]]:
-    doc = yaml.safe_load(PLAYBOOKS.read_text())
-    groom = doc["playbooks"]["groom"] if "playbooks" in doc else doc["groom"]
-    checks = groom["liveness"]["checks"]
-    rw = [c for c in checks if c["type"] == "run_window"]
-    assert len(rw) == 1
-    return sorted((s["hour"], s["minute"]) for s in rw[0]["schedule"])
-
-
-def test_liveness_run_window_schedule_matches_the_deployed_crons():
-    """config-I4988: the mirror must be enforced, not merely asserted in a comment.
-
-    ``_rw_expected_triggers`` enumerates from the registry, so a stale list
-    means the check accounts for triggers that never fire and is blind to the
-    ones that do — which is why the groom's own liveness check could not fire
-    across four consecutive failed cycles.
-    """
-    assert _registry_run_window_schedule() == _deploy_sched_crons(), (
-        "playbooks.yaml groom run_window schedule has drifted from "
-        "scheduled-groom-dispatcher/deploy.sh SCHED_CRONS — the liveness check "
-        "is enumerating triggers that do not fire (config-I4988)"
-    )
+# ── Schedule lockstep (config-I4988) — REMOVED 2026-07-31 ──────────────────────
+# The run_window groom liveness check this test enforced is retired
+# (config-I4988 retirement, riding config-I5229's reconciler): the trigger-
+# health reconciler leg screens the dispatch SF's own execution receipts for
+# decision records, and the four scheduler_schedule_exists wiring checks in
+# playbooks.yaml watch_plane_liveness cover rule existence/enabled — no
+# schedule mirror remains in the registry, so there is no mirror left to
+# enforce. (The mirror itself was the §2.7 derive-once defect this test was
+# papering over.)
 
 
 def test_groom_sf_failures_reach_telegram():

@@ -193,10 +193,19 @@
         {
           "Variable": "$.ssm_poll.attempts",
           "NumericGreaterThanEquals": 12,
-          "Next": "HandleFailure"
+          "Next": "SetSSMReadyExhaustedError"
         }
       ],
       "Default": "WaitSSMPoll"
+    },
+    "SetSSMReadyExhaustedError": {
+      "Type": "Pass",
+      "Comment": "Normalize SSM-ready exhaustion into $.error so HandleFailure's States.JsonToString($.error) has an object to serialize — the Choice path from SSMReadyChoice does not carry a caught error (the SSM DescribeInstanceInfo calls succeeded; the agent simply never went Online). Without this, HandleFailure itself crashes with States.Runtime on the missing $.error JsonPath, masking the real 'trading instance unreachable' cause behind a broken error-reporting state.",
+      "Parameters": {
+        "error": "SSM agent did not come Online within 12 attempts (~3 min) — the trading instance is unreachable. The EOD pipeline cannot proceed without an SSM connection to the box (every work step is SSM:sendCommand)."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
     "WaitSSMPoll": {
       "Type": "Wait",

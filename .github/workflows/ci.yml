@@ -31,6 +31,21 @@ jobs:
       - name: shellcheck (infrastructure/*.sh, error severity)
         run: shellcheck --severity=error infrastructure/*.sh
 
+  # config#4223: the 2026-07-25 weekly-SF kill was a krepis CLI contract
+  # change deployed between SF phases — every ssm_log_capture caller in the
+  # pipeline started hard-failing mid-execution, and restoring the invocation
+  # shape took 4 re-run attempts. The module now auto-generates a correlation
+  # id (absence no longer hard-fails), but a MALFORMED invocation is still a
+  # hard argparse error that would re-kill the same pipeline. This job lints
+  # every ssm_log_capture invocation in the step_function*.json definitions
+  # against the krepis CLI contract at definition-edit time, before deploy.
+  ssm-log-capture-contract-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Validate ssm_log_capture invocations in SF definitions
+        run: python3 validators/ssm_log_capture_contract.py
+
   # config#2878: S3 returns 403 AccessDenied instead of 404 NoSuchKey for
   # GetObject on a nonexistent key when the caller lacks s3:ListBucket. Every
   # lambda iam-policy.json that grants GetObject must also grant a matching

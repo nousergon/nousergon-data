@@ -312,8 +312,13 @@ class TestBranchAContents:
         # Exhaustion falls to the retry gate, never to the judge chain.
         assert branch_a["CheckDataPhase2Status"]["Default"] == "DataPhase2RetryGate"
         assert branch_a["DataPhase2RetryGate"]["Choices"][0]["Next"] == (
+            "SetDataPhase2ExhaustedError"
+        )
+        assert branch_a["SetDataPhase2ExhaustedError"]["Next"] == (
             "PublishResearchFailureImmediate"
         )
+        assert branch_a["SetDataPhase2ExhaustedError"]["ResultPath"] == "$.error"
+        assert branch_a["SetDataPhase2ExhaustedError"]["Parameters"]["phase"] == "DataPhase2"
 
     def test_eval_judge_quartet_preserved(self, branch_a):
         assert branch_a["EvalJudgePollChoice"]["Type"] == "Choice"

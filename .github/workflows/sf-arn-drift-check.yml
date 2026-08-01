@@ -46,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0  # full history — needed for PR diff in scheduler step
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
@@ -67,5 +69,33 @@ jobs:
       # merge, which closes drift caused by a merge; this catches what no merge
       # can see — a rule disabled or retimed in the console, or one belonging to
       # a dispatcher whose repo has no deploy workflow at all.
-      - name: EventBridge Scheduler rule drift (codified vs live)
+      #
+      # On PRs: scope to only the deploy.sh files this PR changed
+      # (HEAD^1 = base, HEAD^2 = PR head — the merge commit gives us both).
+      # The fleet-wide check still runs daily via the schedule trigger.
+      - name: Find changed deploy.sh files (PR only)
+        if: github.event_name == 'pull_request'
+        id: changed-deploys
+        run: |
+          FILES=$(git diff --name-only HEAD^1...HEAD^2 -- 'infrastructure/lambdas/*/deploy.sh' || true)
+          if [ -n "$FILES" ]; then
+            {
+              echo "files<<DEPLOY_EOF"
+              echo "$FILES"
+              echo "DEPLOY_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: EventBridge Scheduler rule drift (PR-scoped, codified vs live)
+        if: github.event_name == 'pull_request' && steps.changed-deploys.outputs.files != ''
+        run: |
+          echo "${{ steps.changed-deploys.outputs.files }}" | while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "::group::check-schedule-drift --source-file $f"
+            python3 infrastructure/scheduler/check-schedule-drift.py --source-file "$f"
+            echo "::endgroup::"
+          done
+
+      - name: EventBridge Scheduler rule drift (fleet-wide, codified vs live)
+        if: github.event_name != 'pull_request'
         run: python3 infrastructure/scheduler/check-schedule-drift.py

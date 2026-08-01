@@ -242,19 +242,39 @@ class TestDeployAssertionIsScopedToItsOwnDispatcher:
         assert self.GROOM_DEPLOY_SH in wf
 
     def test_daily_sweep_stays_unscoped(self):
-        """Fleet-wide coverage has to live somewhere, and this is the only place."""
+        """Fleet-wide coverage has to live somewhere, and this is the only place.
+
+        The workflow now runs the checker twice — once scoped to changed deploy.sh
+        files on PR events, once fleet-wide on schedule/workflow_dispatch. This
+        test verifies the fleet-wide invocation is unscoped (the daily sweep must
+        cover every schedule, including those from dispatchers whose deploy
+        workflows don't exist).
+        """
         sweep = (REPO_ROOT / ".github" / "workflows" / self.SWEEP_WORKFLOW).read_text(
             encoding="utf-8"
         )
         assert "check-schedule-drift.py" in sweep, (
             f"{self.SWEEP_WORKFLOW} must run the fleet-wide schedule drift check"
         )
-        after = sweep.split("check-schedule-drift.py", 1)[1][:200]
-        assert "--source-file" not in after and "--source " not in after, (
-            f"{self.SWEEP_WORKFLOW} must run the checker UNSCOPED. It owns no "
-            "deploy, so it is the ONLY surface on which a sibling dispatcher's "
-            "missing schedule can appear. Scoping it too would make findings "
-            "like alpha-engine-config-I5815 permanently invisible."
+        # Find every run: line that invokes the checker.
+        invocations = [
+            line.strip()
+            for line in sweep.splitlines()
+            if "check-schedule-drift.py" in line
+        ]
+        assert invocations, "no check-schedule-drift.py invocation found"
+        # At least one invocation must be unscoped — the fleet-wide check that
+        # runs on schedule/workflow_dispatch. On PRs, a separate scoped step
+        # checks only the deploy.sh files the PR changed.
+        unscoped = [
+            inv for inv in invocations
+            if "--source-file" not in inv and "--source " not in inv
+        ]
+        assert unscoped, (
+            f"{self.SWEEP_WORKFLOW} must have at least one unscoped invocation. "
+            "It owns no deploy, so it is the ONLY surface on which a sibling "
+            "dispatcher's missing schedule can appear. Scoping every invocation "
+            "would make findings like alpha-engine-config-I5815 permanently invisible."
         )
 
     def test_scoping_selects_a_strict_subset(self):

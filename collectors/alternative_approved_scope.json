@@ -1,0 +1,29 @@
+{
+  "approved_n": 903,
+  "approved_on": "2026-07-31",
+  "ruling": "alpha-engine-config-I5814",
+  "_comment": [
+    "Operator-approved scope baseline for the DataPhase2 `alternative` collector.",
+    "",
+    "This is a DECLARATION, not a produced artifact: it records a human ruling about",
+    "what the collector's scope is allowed to be, and it is compared against a scope",
+    "the run DERIVES from constituents.json at collection time. Per overseer-policy",
+    "invariant 18, the bound stays declared and the measurement stays derived.",
+    "",
+    "It lives in the repo rather than in S3 so that (a) the merge button alone deploys",
+    "it -- a hand-written S3 object would be the post-merge operator step",
+    "pull-request-policy.md 4.2 forbids, and nothing about it fails when it never runs",
+    "-- and (b) changing the approved scope shows up in a diff with its ruling",
+    "attached, which is the whole provenance question a bucket cannot answer.",
+    "",
+    "Ruling: Brian, 2026-07-31 on alpha-engine-config-I5814 -- DataPhase2 collects",
+    "alternative data for the WHOLE universe (~903) rather than the pre-2026-07-21",
+    "decision set (~27), and moves to the spot substrate. Comparison is +/- the",
+    "collector's _SCOPE_CHANGE_TOLERANCE, so ordinary constituent churn passes and",
+    "another unintended 33x scope change still fails loudly.",
+    "",
+    "To change the approved scope: open a PR editing this file, cite the ruling that",
+    "authorises it, and say why. Do not widen _SCOPE_CHANGE_TOLERANCE to make a real",
+    "step change fit -- that disarms the guard for every future change too."
+  ]
+}

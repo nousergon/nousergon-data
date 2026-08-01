@@ -40,10 +40,30 @@ name: IAM Policy Change Guard
 #
 # Usage: required status check on main branch protection.
 
+# ── Trigger is deliberately UNFILTERED (alpha-engine-config#5941) ───────────
+#
+# This was `paths: ['infrastructure/lambdas/*/iam-policy.json']`, paired with
+# a companion `iam-policy-change-guard-noop.yml` carrying the complementary
+# `paths-ignore:` so that exactly one of the pair always reported the shared
+# required context. That pair is NOT an exhaustive complement: GitHub
+# evaluates `paths-ignore` as "at least one changed file does not match",
+# which is FALSE when a PR changes ZERO files. Neither workflow fires, the
+# required context never posts, and the PR is `BLOCKED` permanently with
+# every other check green.
+#
+# Hit live on nousergon-data #784, #1118, #1134 and #1158 — all four sat
+# mergeable-but-blocked with `iam-policy-change-guard` absent from the check
+# rollup entirely, #784 for 18 days. A missing context reads as nothing at
+# all on the PR page, not as a red check, which is why it went unnoticed.
+#
+# Running on every PR costs one ~10s job and removes two failure modes: the
+# empty-changed-file hole above, and the standing requirement that the noop's
+# `paths-ignore` list stay byte-identical to this `paths:` list forever. The
+# job body already early-exits when no `iam-policy.json` changed — that path
+# was always reachable (a `paths:` match fires the whole workflow, not just
+# the matching file), so no guard logic changes here.
 on:
   pull_request:
-    paths:
-      - 'infrastructure/lambdas/*/iam-policy.json'
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
