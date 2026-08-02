@@ -24,6 +24,12 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 FUNCTION_NAME="alpha-engine-thinktank-spot-dispatcher"
 ROLE_NAME="alpha-engine-thinktank-spot-dispatcher-role"
+# Authoritative inline-policy assignment — the consolidated drift checker
+# (nous-ergon-ops/infrastructure/iam/check-drift.py --lambdas-root) maps each
+# lambda's iam-policy.json to a live policy via these two top-level lines; a
+# policy file without both is a coverage gap that fails the IAM drift sweep
+# (alpha-engine-config#6061, config#2340 surface 3).
+POLICY_NAME="alpha-engine-thinktank-spot-dispatcher-role-policy"
 RULE_NAME="alpha-research-thinktank-daily"
 # Same topic the alarms this cutover replaces already publish to, so the
 # rotation does not silently change where a Think Tank page lands.
@@ -53,7 +59,7 @@ if [ "$BOOTSTRAP" -eq 1 ]; then
         --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
         --region "$REGION" >/dev/null 2>&1 || echo "    (role exists)"
     aws iam put-role-policy --role-name "$ROLE_NAME" \
-        --policy-name "${ROLE_NAME}-policy" \
+        --policy-name "$POLICY_NAME" \
         --policy-document "file://$SCRIPT_DIR/iam-policy.json" \
         --region "$REGION"
     echo "    waiting for IAM propagation..."
