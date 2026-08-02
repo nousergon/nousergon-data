@@ -204,8 +204,15 @@ class TestDegradedTerminalState:
         assert guard == {"Variable": "$.degraded_summary.degraded", "IsPresent": True}
         assert comparison["Variable"] == "$.degraded_summary.degraded"
         assert comparison["BooleanEquals"] is True
-        assert c["Next"] == "DegradedRun"
-        assert cdo["Default"] == "NormalSucceeded"
+        # config#2857: both outcomes now route through their own
+        # SF-envelope completion marker before their terminal state.
+        # The degraded terminal is DegradedRun (Type: Fail, per Brian's
+        # 2026-07-28 Option-A ruling, alpha-engine-config#2699) — the
+        # marker still fires so the completion artifact exists.
+        assert c["Next"] == "WriteCompletionMarkerDegraded"
+        assert cdo["Default"] == "WriteCompletionMarkerNormal"
+        assert states["WriteCompletionMarkerNormal"]["Next"] == "NormalSucceeded"
+        assert states["WriteCompletionMarkerDegraded"]["Next"] == "DegradedRun"
 
     def test_degraded_run_is_a_fail_state(self, states):
         """Brian's 2026-07-28 Option-A ruling (alpha-engine-config#2699):
@@ -220,13 +227,14 @@ class TestDegradedTerminalState:
 
     def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_run(self, states):
         # Structural sanity: DegradedRun is reachable ONLY via
-        # CheckDegradedOutcome, which is reachable ONLY via StopTradingInstance
-        # — there is no direct edge from anywhere else in the file.
+        # WriteCompletionMarkerDegraded (the config#2857 marker), which
+        # is reachable ONLY via CheckDegradedOutcome — there is no direct
+        # edge from anywhere else in the file.
         producers = [
             name for name, st in states.items()
             if "DegradedRun" in _targets(st)
         ]
-        assert producers == ["CheckDegradedOutcome"]
+        assert producers == ["WriteCompletionMarkerDegraded"]
 
 
 # ── Deliverable #3: closed self-heal loop ────────────────────────────────────
