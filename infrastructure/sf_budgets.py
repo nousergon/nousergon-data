@@ -223,6 +223,19 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         pipeline_segment="sequential",
     ),
     # ── Quality-assurance stages (NOT universe-scaling) ────────────────────
+    # CALIBRATION (alpha-engine-config-I6026/I6027 — measured from SSM logs
+    # of the two healthy pit_parity completions, 2026-07-03 + 2026-07-11):
+    #   pit_parity 22m48s/23m18s (pass1 12m31s/12m59s, pass2 10m11s/10m12s)
+    #   + parity replay 2m44s/2m26s → healthy full stage ≈ 25-26 min (~1550s).
+    #   7200s = ~4.6× healthy — generous per the calibration philosophy
+    #   ("start generous, tighten as baselines stabilise"), KEPT because the
+    #   2026-08-01 run took >5× healthy (anomaly under profile,
+    #   alpha-engine-config-I6029) and was SIGKILLed at the bound; tightening
+    #   before that lands would turn a slow-but-progressing run into a faster
+    #   failure. Per-run wall-clock is now recorded automatically in
+    #   backtest/{date}/pit_parity.json (wall_clock block, crucible-backtester
+    #   I6027) — the next calibration tightening must be seeded from that
+    #   series, not from logs.
     "Parity": StageBudget(
         name="Parity",
         current_timeout_seconds=7_200,

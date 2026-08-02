@@ -3713,7 +3713,7 @@
     },
     "Parity": {
       "Type": "Task",
-      "Comment": "Backtester\u2194executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. spot_backtest.sh is invoked with --skip-stages=backtest,evaluator so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized \u2014 same Retry/Catch/Timeout pattern). If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtester\u2194executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. spot_backtest.sh is invoked with --skip-stages=backtest,evaluator so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized \u2014 same Retry/Catch/Timeout pattern). DEGRADE-NOT-FAIL (alpha-engine-config-I6025, Brian ruling 2026-08-01): parity's VERDICT is the future gate (parity_alarms, in OBSERVE), but its EXECUTION is observability \u2014 every downstream consumer of parity artifacts is display or best-effort (evaluate.py::_load_pit_parity_report explicitly excludes them from critical-artifact accounting). So a Parity timeout/crash degrades the run (ParityDegraded \u2192 PublishParityDegraded pages distinctly, SF continues to Evaluator) instead of failing the SF \u2014 the 2026-08-01 failure where a non-gating stage's 2h timeout killed a run that had already cleared Backtester/PredictorBacktest/PortfolioOptimizerBacktest. Absence of a verdict must never read as a clean pass: the page + the completion record carry $.parity_degraded, and ARTIFACT_REGISTRY freshness-monitor SLA still alarms on missing parity artifacts. Per-stage executionTimeout derived via infrastructure/sf_budgets.py (config#3095).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3757,8 +3757,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
+          "Next": "ParityDegraded",
+          "ResultPath": "$.parity_error"
         }
       ],
       "ResultPath": "$.parity_result",
@@ -3766,7 +3766,7 @@
     },
     "WaitForParity": {
       "Type": "Task",
-      "Comment": "Poll SSM command until parity complete",
+      "Comment": "Poll SSM command until parity complete. Poll/send infra failure degrades (ParityDegraded) rather than failing the SF — same degrade-not-fail posture as the Parity state itself (alpha-engine-config-I6025).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.parity_result.Command.CommandId",
@@ -3797,8 +3797,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
+          "Next": "ParityDegraded",
+          "ResultPath": "$.parity_error"
         }
       ],
       "ResultSelector": {
@@ -3812,6 +3812,7 @@
     },
     "CheckParityStatus": {
       "Type": "Choice",
+      "Comment": "Terminal non-Success (TimedOut / Failed / Cancelled) degrades the run via ParityDegraded instead of failing the SF (alpha-engine-config-I6025): parity's verdict is observational today (the parity_alarms gate sits in OBSERVE), and no downstream SF stage consumes its artifacts (evaluate.py::_load_pit_parity_report is best-effort) — so a timeout that kills the stage must not also kill Evaluator/ReportCard/Director. The degradation pages distinctly and lands on the execution record as $.parity_degraded (with specifics at $.parity_poll / $.parity_error).",
       "Choices": [
         {
           "Variable": "$.parity_poll.Status",
@@ -3829,7 +3830,7 @@
           "Next": "ParityWait"
         }
       ],
-      "Default": "ExtractParityError"
+      "Default": "ParityDegraded"
     },
     "ParityWait": {
       "Type": "Wait",
@@ -4619,16 +4620,35 @@
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
     },
-    "ExtractParityError": {
+    "ParityDegraded": {
       "Type": "Pass",
-      "Comment": "Normalize Parity SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckParityStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Comment": "THE VISIBLE PARITY DEGRADED FLAG (alpha-engine-config-I6025). Every Parity non-success path converges here \u2014 SSM command timeout/crash (CheckParityStatus.Default), send/poll infra failure (the Parity + WaitForParity Task Catches). Mirrors the SaturdayHealthCheckDegraded / ThinkTankDegraded / LibPinGateDegraded shape (config#2276/config#2278/I5758): an SF-controlled flag that (a) pages distinctly via PublishParityDegraded and (b) lands on the execution record ($.parity_degraded=true, specifics at $.parity_poll / $.parity_error / $.parity_result) so a pipeline-status reader can tell 'parity measured clean' from 'parity not measured' \u2014 absence-of-verdict must never render identically to a clean pass. weekly-sf-policy \u00a72.3 honest-degradation: the run continues to Evaluator/ReportCard/Director (none consume parity artifacts \u2014 verified dependency audit in alpha-engine-config-I6025), and the ARTIFACT_REGISTRY freshness-monitor SLA still alarms on the missing pit_parity.json/parity_report.json.",
+      "Result": true,
+      "ResultPath": "$.parity_degraded",
+      "Next": "PublishParityDegraded"
+    },
+    "PublishParityDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6025: page the parity degradation NOW, distinctly from a breach. Mirrors PublishDirectorDegraded / PublishLibPinGateDegraded exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal degrade path this alert decorates). WARNING-severity signal: the weekly run's real trading artifacts are unaffected \u2014 only the parity VERDICT is absent, and it must not be read as clean.",
+      "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
-        "phase": "Parity",
-        "source": "CheckParityStatus.Default",
-        "poll.$": "$.parity_poll"
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity DEGRADED (continuing to Evaluator)",
+        "Message": "The Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass. Artifacts backtest/{run_date}/pit_parity.json + parity_report.json + parity_metrics.csv may be absent (the ARTIFACT_REGISTRY freshness-monitor SLA will also flag them). Specifics on the execution record: $.parity_poll / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status",
+        "TimeoutSeconds": 60
       },
-      "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "ResultPath": "$.parity_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal degrade path this alert decorates.",
+          "ResultPath": "$.parity_degraded_notify_error",
+          "Next": "CheckSkipEvaluator"
+        }
+      ],
+      "Next": "CheckSkipEvaluator"
     },
     "ExtractPredictorBacktestError": {
       "Type": "Pass",
