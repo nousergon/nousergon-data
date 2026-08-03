@@ -2962,6 +2962,10 @@ def test_completed_lane_reclaimed_post_run_is_not_paged_as_a_death(monkeypatch):
     assert kw["severity"] == "warning", (
         "a lane that completed its work must not page at error severity"
     )
+    assert kw["silent"] is True, (
+        "2026-08-03 notification cleanup: reclaimed-post-run is recorded, not "
+        "buzzed — no work was lost and it is in the reconcile ledger"
+    )
     assert "DEATH" not in text
     assert "completing" in text or "completed" in text
 

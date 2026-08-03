@@ -801,6 +801,21 @@ alert_classes:
     intake: cw-alarm
     response: drain-queue
 
+  # ── infra (box health + deploy-on-merge — config-I3211 alert-drain registry) ──
+  # Both emitters were added without declaring a class; the config-I3211
+  # completeness chokepoint reported them as undeclared every drain run until
+  # rows matched the emitted source strings exactly (alpha-engine-config#5326).
+  - class: box_health
+    source: "box-health"
+    severities: [warning, critical]
+    intake: bus
+    response: drain-queue
+  - class: deploy_on_merge
+    source: "deploy-on-merge"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
   - class: executor_emergency_shutdown
     source: "raw-sns:executor/emergency_shutdown.py"

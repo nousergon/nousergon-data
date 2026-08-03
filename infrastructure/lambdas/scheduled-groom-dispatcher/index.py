@@ -137,6 +137,11 @@ _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # the ~18 per-box pings/day is how the 11-day alert-fatigue outage happened.
 # Per-box pings keep their existing silent-in-topic posture untouched.
 #
+# 2026-08-03 notification cleanup: the CYCLE rail buzzes only STARTED /
+# COMPLETE / lane-death / trigger-death (the "started / stopped-early /
+# finished" contract). lane_reclaimed_post_run is silent (no work lost;
+# durably recorded in the reconcile ledger).
+#
 # Distinct flow_name is REQUIRED, not cosmetic: flow_doctor_telegram caches the
 # built config by flow_name, so sharing one with the silent rail would serve
 # whichever posture initialized first.
@@ -255,7 +260,7 @@ INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
         "GROOM_INSTANCE_TYPES",
-        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+        "c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
     ).split(",")
     if t.strip()
 ]
@@ -880,8 +885,16 @@ def _utc_today() -> str:
     return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
 
 
-def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) -> None:
-    """Send one CYCLE-level lifecycle ping (buzzing) — never raises.
+def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict,
+                  silent: bool = False) -> None:
+    """Send one CYCLE-level lifecycle ping (buzzing unless ``silent``) — never raises.
+
+    ``silent=True`` suppresses the Telegram notification (2026-08-03
+    notification cleanup): used for events that are durably recorded elsewhere
+    and would read as confusing noise if they buzzed (e.g.
+    ``lane_reclaimed_post_run`` — no work lost, recorded in the reconcile
+    ledger). Default stays buzzing so STARTED / COMPLETE / lane-death /
+    trigger-death keep their loud posture.
 
     Best-effort per groom-sweep-policy §8 ("a notify hiccup must never block a
     relaunch or a status check"): the dispatch decision and the SF's terminal
@@ -890,7 +903,7 @@ def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) ->
     """
     try:
         notify_via_flow_doctor(
-            text, silent=False, severity=severity, dedup_key=dedup_key,
+            text, silent=silent, severity=severity, dedup_key=dedup_key,
             flow_name=_CYCLE_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_CYCLE_DB_BASENAME,
             context=context,
@@ -1677,14 +1690,19 @@ def _reconcile_lane_death() -> dict:
                 f"tier={tier_tag}  schedule={schedule_label}\n"
                 f"run_token={run_token}  instance={instance_id}\n"
                 f"work completed; evidence={evidence}",
-                # WARNING, not error: no work was lost. Paging this at error
-                # severity is what made a successful cycle read as a failed one.
+                # 2026-08-03 notification cleanup: SILENT — no work was lost,
+                # it is durably recorded in the reconcile ledger, and a
+                # buzzing "lane reclaimed AFTER completing" ping read as a
+                # confusing incident. (Was warning, not error, for that same
+                # reason: paging this at error severity made a successful
+                # cycle read as a failed one.)
                 severity="warning",
                 dedup_key=f"{_CYCLE_FLOW_NAME}:lane_reclaimed_post_run:{run_token}",
                 context={"expectation": {k: v for k, v in exp.items()
                                          if not k.startswith("_")},
                          "reason": reason, "instance_state": state,
                          "completion_evidence": evidence},
+                silent=True,
             )
         else:
             if gone:
