@@ -547,6 +547,33 @@ watch_plane_liveness:
       schedule_name: alpha-engine-scheduled-groom-2000-daily
     - type: scheduler_schedule_exists
       schedule_name: alpha-engine-scheduled-groom-sun0900-weekly
+    # alpha-engine-config#6164: AGENT DISPATCH COMPLETENESS — for every dispatch
+    # the dispatch ledger records as launched=True within lookback_hours, the
+    # corresponding SSM command must have reached a terminal Success status. A
+    # dispatch that reported success and whose command terminated non-success
+    # (Failed/TimedOut/Cancelled) is a finding, immediately. This is the
+    # 2026-08-01 outage class (nous-ergon-ops-I368): the entire Overseer response
+    # plane was dead for ~11 hours and nothing reported it because every sensor
+    # upstream of the agent reported success — the SF dispatcher fired, routed
+    # via overseer-dispatcher (http=202, launched=True), spot box launched — but
+    # the bootstrap aborted 75s in with SECRET_ENV_FILE: unbound variable. SSM
+    # recorded Failed at PT1M75.6S. No issue, no PR, no alert. Found by a human
+    # nine hours later.
+    #
+    # Tolerates the window between dispatch-ledger write and SSM command reaching
+    # a terminal state (the ledger writes dispatched=True BEFORE the command is
+    # known to have started). Commands still InProgress/Delayed/Pending within
+    # response_window_min are skipped; commands past the window whose invocation
+    # is absent (beyond SSM's ~30-day retention) are also skipped (the ledger
+    # entry itself is the only surviving record).
+    #
+    # Per overseer-policy.md §5 Layer B: reads SSM (the upstream system's own
+    # record), never the response plane's log.
+    - type: agent_dispatch_completeness
+      dispatch_ledger_prefix: overseer/dispatch_ledger/
+      response_window_min: 15
+      lookback_hours: 24
+      ssm_retention_days: 30
 
 # ── Alert-class registry (config-I3211; Brian directive 2026-07-22) ──────────
 # One row per DISTINCT notification class the fleet emits. This answers, in
