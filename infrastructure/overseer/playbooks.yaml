@@ -811,6 +811,22 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: check_systemd_unit_drift
+    # config-I3211 backstop registration (alpha-engine-config#5715): installed
+    # systemd units on a box diverge from what the repo expects. Alert
+    # payload's raw `Source:` field is the hyphenated `check-systemd-unit-drift`.
+    source: "alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: boot_pull
+    # config-I3211 backstop registration (alpha-engine-config#5714 / #4793):
+    # boot-time repo pull on a box failed, risking stale code at session start.
+    # Alert payload's raw `Source:` field is the hyphenated `boot-pull`.
+    source: "alpha-engine/infrastructure/boot-pull.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
 
   # ── groom (alpha-engine-config emitter) ──
   - class: groom_lifecycle_bus_events
