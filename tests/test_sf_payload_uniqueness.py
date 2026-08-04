@@ -195,6 +195,10 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # {data_spot:{launched,instance_id,...}}.
     "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$"}),
     "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$"}),
+    # alpha-engine-config-I6494: weekday Scanner — same Lambda as Saturday SF
+    # Scanner, payload is run_date only (no research_dry / dry_run_llm on the
+    # weekday cadence).
+    "Scanner": frozenset({"run_date.$"}),
 }
 
 
