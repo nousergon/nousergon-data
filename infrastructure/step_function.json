@@ -5031,10 +5031,39 @@
         {
           "Variable": "$.ec2_instance_id",
           "IsPresent": true,
-          "Next": "CheckShellRun"
+          "Next": "NormalizeEc2InstanceId"
         }
       ],
       "Default": "DispatchWeeklyFreshnessSpot"
+    },
+    "NormalizeEc2InstanceId": {
+      "Type": "Choice",
+      "Comment": "config#2248 normalization guard: the CheckSpotDispatchNeeded escape hatch (ec2_instance_id already present on the execution input) passes the value through verbatim — but some callers (e.g. certain director-verify input shapes) supply it as a plain string instead of the [\"i-...\"] array every downstream sendCommand InstanceIds.$ expects. This gate inspects the shape: a string gets wrapped into a one-element array by WrapEc2InstanceIdInArray; an array passes straight through to CheckShellRun. The dispatch path (Default → DispatchWeeklyFreshnessSpot → MergeWeeklyFreshnessSpotInstanceId) already guarantees array shape, so this gate is only reached via the escape hatch. IsPresent-guarded (per config#2275 Choice guard convention) — though the upstream CheckSpotDispatchNeeded.IsPresent already guarantees the field exists by the time we reach this gate, the guard is defensive against future topology changes.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.ec2_instance_id",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ec2_instance_id",
+              "IsString": true
+            }
+          ],
+          "Next": "WrapEc2InstanceIdInArray"
+        }
+      ],
+      "Default": "CheckShellRun"
+    },
+    "WrapEc2InstanceIdInArray": {
+      "Type": "Pass",
+      "Comment": "config#2248: wrap a bare-string $.ec2_instance_id (from the CheckSpotDispatchNeeded escape hatch) into the one-element array [\"i-...\"] that every downstream sendCommand InstanceIds.$ expects. Mirrors MergeWeeklyFreshnessSpotInstanceId's JsonMerge pattern exactly — the only difference is the source field ($.ec2_instance_id instead of $.weekly_freshness_spot_result.instance_id).",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.ec2_instance_id)), false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "CheckShellRun"
     },
     "DispatchWeeklyFreshnessSpot": {
       "Type": "Task",

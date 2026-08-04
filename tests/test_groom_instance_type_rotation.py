@@ -49,20 +49,46 @@ def lane_states() -> dict:
 
 # ── The ladder has room for spot attempts before the on-demand rung ───────────
 
-def test_ladder_leaves_at_least_two_spot_retries_before_on_demand(item_selector):
-    """Brian ruling: at least two DIFFERENT types tried on spot first.
+def test_there_is_no_in_cycle_ladder(item_selector):
+    """SUPERSEDED RULING, recorded rather than deleted.
 
-    CheckForceOnDemand fires when retry_count == max_retries, so the number of
-    spot attempts is max_retries (attempt 0 plus retries 1..max_retries-1) and
-    the final retry is the on-demand rung. max_retries must therefore be >= 3
-    to give three spot attempts.
+    Was `test_ladder_leaves_at_least_two_spot_retries_before_on_demand`,
+    asserting `max_retries >= 3` — Brian's ruling of 2026-07-31 (I5923), which
+    existed so a reclaim would try two alternate spot pools before falling back
+    to on-demand during prime time.
+
+    **Superseded 2026-08-03**, by the same person: *"lets set max retry to 0...
+    so if a spot dies, it dies."* The two could not both hold. Each relaunch is
+    a NEW BOX with its own 3.5h wall (alpha-engine-config
+    groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS=12600), so two attempts is ~7h
+    of wall-clock whatever the SF ceiling allows — a bounded cycle and a
+    multi-rung in-cycle ladder are arithmetically incompatible, and the 7h
+    cycles were the thing being fixed.
+
+    **What was given up:** the two alternate-spot-pool rungs and the on-demand
+    rung. A reclaimed lane now waits for the next cycle instead of relaunching
+    inside this one. Safe because the reconciler is level-triggered
+    (groom-sweep-policy.md §5.1) — the lane loses latency, never work.
+
+    **What replaced it:** the outcome rollup
+    (`alpha-engine-config scripts/groom_run_outcomes.py`), which reports the
+    got-through / died / hit-the-wall rates. That measurement was Brian's
+    stated condition for accepting max_retries=0, so a bad spot afternoon is
+    now visible as reduced throughput rather than hidden inside a cycle that
+    never ends.
+
+    The pool-rotation machinery below is deliberately LEFT INTACT: it costs
+    nothing while unused, and restoring a ladder should be a one-value change
+    rather than a rebuild.
     """
     max_retries = item_selector["max_retries"]
-    spot_attempts = max_retries  # attempt 0 .. max_retries-1
-    assert spot_attempts >= 3, (
-        f"max_retries={max_retries} yields only {spot_attempts} spot attempt(s) "
-        "before the forced on-demand rung. The ruling requires at least two "
-        "DIFFERENT instance types tried on spot first."
+    assert max_retries == 0, (
+        f"max_retries={max_retries}, expected 0 (Brian's ruling 2026-08-03). "
+        "Raising it re-opens the conflict with the 3.5h box wall: each retry is "
+        "a new box with its own full budget, so N attempts is N x 3.5h of "
+        "wall-clock. If a ladder is wanted again, the box wall and the SF "
+        "ceiling have to move with it — see "
+        "tests/test_sf_groom_relaunch_wiring.py::test_state_machine_declares_a_global_ceiling."
     )
 
 

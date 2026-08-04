@@ -915,6 +915,131 @@ def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[
     )], {}
 
 
+# ── Check: dispatch_invocation_success ────────────────────────────────────────
+# Generalized from the sf-watch-only check above — covers all four dispatch
+# families (alpha-engine-config-I5262). The sf-watch check had an independent
+# signal (the pipeline SF's own execution history). The other three families
+# (groom, ci-watch, alert-drain) use the dispatcher's own decision log as the
+# "expected dispatch" source — a dispatcher that writes a launch record but
+# whose box dies before the completion marker lands IS a real gap (exactly
+# what happened 2026-07-28 when all 3 groom lanes were reclaimed).
+#
+# Each family declares:
+#   dispatch_prefix  — S3 prefix for records of "a box was launched"
+#   completion_prefix — S3 prefix for "the box finished + wrote its outcome"
+#   completion_key_field — field within the dispatch record that names the
+#     completion marker key (e.g. "run_token", "completion_key")
+#   response_window_min — how long after dispatch to wait before a missing
+#     completion marker is a finding
+#   lookback_hours — how far back to look for dispatched-but-unfinished boxes
+
+
+def _family_dispatch_records(s3, spec: dict, now: datetime) -> list[dict]:
+    """Enumerate dispatch records within the lookback window. Each record must
+    carry at minimum the ``completion_key_field`` value and a timestamp field
+    (``dispatched_at``, ``decided_at``, or ``at``). Returns list of
+    {key, timestamp, completion_key} dicts.
+
+    If ``completion_key_field`` is absent, the completion key is derived from
+    the dispatch record's S3 key filename (stripped of path prefix) — used
+    when the dispatch record and completion marker share the same base key
+    (e.g. ci-watch: ``dispatched/repo-sha.json`` → ``completed/repo-sha.json``).
+    """
+    prefix = spec["dispatch_prefix"]
+    lookback_hours = spec["lookback_hours"]
+    mature_before = now - timedelta(minutes=spec["response_window_min"])
+    horizon = now - timedelta(hours=lookback_hours)
+    key_field = spec.get("completion_key_field")
+    records: list[dict] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": WATCH_BUCKET, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        try:
+            resp = s3.list_objects_v2(**kwargs)
+        except Exception:  # noqa: BLE001 — best-effort enumeration
+            logger.warning("dispatch_invocation_success: list failed for %s", prefix, exc_info=True)
+            break
+        for obj in resp.get("Contents", []) or []:
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            last_modified = obj.get("LastModified")
+            if last_modified and last_modified < horizon:
+                continue
+            try:
+                body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
+                record = json.loads(body)
+            except Exception:
+                logger.warning("dispatch_invocation_success: unreadable %s", key)
+                continue
+            # Extract the completion key
+            completion_key = None
+            if key_field:
+                # Field-based: the record itself names its completion key
+                completion_key = record.get(key_field)
+            if not completion_key:
+                # Filename-based: dispatch and completion share the same filename
+                filename = key.rsplit("/", 1)[-1]
+                completion_key = filename  # e.g. "nousergon-crucible-research-abc1234.json"
+            # Skip records missing a timestamp (we need to know when the dispatch happened)
+            timestamp = record.get("dispatched_at") or record.get("decided_at") or record.get("at")
+            if timestamp:
+                try:
+                    ts = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    ts = last_modified or now
+            else:
+                ts = last_modified or now
+            if ts < horizon:
+                continue
+            if ts > mature_before:
+                continue  # not mature yet
+            records.append({
+                "dispatch_key": key,
+                "dispatch_time": ts,
+                "completion_key": completion_key,
+            })
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return records
+
+
+def _check_dispatch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """For every mature dispatch record in the lookback window, assert a
+    completion marker exists at ``{completion_prefix}/{completion_key}.json``.
+    A missing marker means the box was launched but never finished — it died
+    before writing an outcome (spot reclaim / OOM / pre-trap crash / SSM
+    command failure)."""
+    problems: list[str] = []
+    s3 = _s3_client()
+    family = spec.get("family", spec.get("label", "unknown"))
+    completion_prefix = spec["completion_prefix"]
+    records = _family_dispatch_records(s3, spec, now)
+    if not records:
+        logger.info("dispatch_invocation_success[%s]: no mature dispatch records in window", family)
+        return [], {}
+
+    for rec in records:
+        completion_key = f"{completion_prefix}{rec['completion_key']}.json"
+        try:
+            s3.head_object(Bucket=WATCH_BUCKET, Key=completion_key)
+        except Exception as exc:
+            if _error_code(exc) in {"NoSuchKey", "404", ""}:
+                problems.append(
+                    f"{family}: dispatch recorded at {rec['dispatch_time'].strftime('%Y-%m-%d %H:%M')}Z "
+                    f"(s3://{WATCH_BUCKET}/{rec['dispatch_key']}) — NO completion marker at "
+                    f"s3://{WATCH_BUCKET}/{completion_key} after "
+                    f"{spec['response_window_min']}+ min. Box likely died silently "
+                    "(spot reclaim / OOM / SSM failure / pre-trap crash) before writing its outcome."
+                )
+            else:
+                raise
+    return problems, {}
+
+
 # ── Check dispatch table + aggregation ───────────────────────────────────────
 
 CHECKERS = {
@@ -925,6 +1050,7 @@ CHECKERS = {
     "run_window": _check_run_window,
     "scheduler_schedule_exists": _check_scheduler_schedule_exists,
     "sf_watch_invocation_success": _check_sf_watch_invocation_success,
+    "dispatch_invocation_success": _check_dispatch_invocation_success,
 }
 
 

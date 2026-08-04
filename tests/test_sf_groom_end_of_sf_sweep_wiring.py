@@ -218,7 +218,11 @@ def test_launch_groom_spot_uses_wait_for_task_token(states):
     """
     lg = states["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
     assert lg["Resource"] == "arn:aws:states:::lambda:invoke.waitForTaskToken"
-    assert lg["TimeoutSeconds"] == 10800
+    # 13800 (3h50m) since 2026-08-03. The lane bound must clear the box's 3.75h
+    # dead-man (alpha-engine-config groom_spot_bootstrap.sh) so the SF waits for a
+    # box that is winding down rather than abandoning it. Full ladder:
+    # tests/test_groom_cycle_notifications.py::test_sf_timeout_sits_above_the_box_budget_hierarchy
+    assert lg["TimeoutSeconds"] == 13800
     assert "TaskToken.$" not in lg["Parameters"]
     assert "TaskToken" not in lg["Parameters"]
     assert "$$.Task" in lg["Parameters"]["Payload.$"]

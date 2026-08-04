@@ -1,0 +1,5 @@
+# boto3 is provided by the Lambda python3.12 runtime; declared for local test
+# runs and reproducible builds. This Lambda deliberately has NO other
+# dependency — it is the detector for the transport every other workload rides
+# on, so it must not be able to fail because of a third-party package.
+boto3>=1.34.0

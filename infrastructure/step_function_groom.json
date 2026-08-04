@@ -77,7 +77,7 @@
         "schedInput.$": "$.schedInput",
         "launchDecision.$": "$$.Map.Item.Value",
         "retry_count": 0,
-        "max_retries": 3,
+        "max_retries": 0,
         "fod": {
           "force_on_demand": false,
           "launch_decided": true,
@@ -108,7 +108,7 @@
               "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
               "Payload.$": "States.JsonMerge(States.JsonMerge(States.JsonMerge($.schedInput, $.launchDecision, false), $.fod, false), $$.Task, false)"
             },
-            "TimeoutSeconds": 10800,
+            "TimeoutSeconds": 13800,
             "Retry": [
               {
                 "ErrorEquals": [
@@ -634,5 +634,5 @@
       "Cause": "Backlog groom dispatch failed during the decide phase — see the SNS alert / Lambda logs for detail."
     }
   },
-  "TimeoutSeconds": 25200
+  "TimeoutSeconds": 15000
 }

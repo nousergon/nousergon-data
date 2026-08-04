@@ -181,7 +181,7 @@ echo "✓ Code deployed."
 # deploy role); the drift check backstops any missed apply.
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
-  || log "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
+  || echo "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
 
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \

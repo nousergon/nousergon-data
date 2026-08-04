@@ -294,6 +294,22 @@ GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf
 #                                                        -> the reconciler's deadline_utc
 #   groom_spot_bootstrap.sh watchdog   21600s (360 min)  -> the box's own kill
 #
+# RE-ALIGNED 2026-08-03, and the same class recurred in the other direction.
+# Brian's 3.5h ruling moved the bootstrap watchdog to 12600 and its dead-man to
+# 13500 (alpha-engine-config-PR6356), leaving this constant and the SF lane at
+# 10800 — so the SSM command and the SF would abandon a lane at 3h while the
+# box worked on until 3.5h and was killed at 3.75h. The invariant's own words,
+# "the box must never outlive the lane the SF is waiting on", were violated by
+# a layer the binding test CANNOT SEE: it reads this constant, and the real box
+# bound lives in another repo.
+#
+# The ladder is now monotonic, each layer above the one it waits on:
+#   box soft budget      10800 (3.0h)   alpha-engine-config groom_run.sh
+#   box watchdog         12600 (3.5h)   alpha-engine-config bootstrap
+#   box dead-man         13500 (3.75h)  alpha-engine-config bootstrap
+#   this constant + lane 13800 (3.83h)  SSM timeout / reconciler / SF lane
+#   SF ceiling           14400 (4.0h)   step_function_groom.json
+#
 # The comment above this line claimed it "matches the bootstrap watchdog" — it
 # did, and both were wrong, because the SF had been tightened to 180 min
 # without them. The consequence is not cosmetic: the SF gives up on the lane at
@@ -309,7 +325,7 @@ GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf
 # 10800 is therefore the value, and it is BOUND to the SF definition by
 # test_runtime_bound_is_single_and_authoritative — both files live in this
 # repo, so the binding is enforceable rather than aspirational.
-MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "10800"))
+MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "13800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
@@ -1624,12 +1640,21 @@ def _reconcile_lane_death() -> dict:
     instance_ids = [e["instance_id"] for e in open_expectations
                     if e.get("instance_id")]
     instance_states: dict[str, str] = {}
+    # I6199: the reason THIS dispatcher terminated a box, tagged by
+    # spot_dispatch.terminate_on_failure at teardown. Tags survive on a
+    # terminated instance long enough for this reconciler (5-minute cadence) to
+    # read them. Without this, the page below can only restate EC2 state as if
+    # it were a diagnosis.
+    termination_reasons: dict[str, str] = {}
     if instance_ids:
         try:
             resp = ec2.describe_instances(InstanceIds=instance_ids)
             for reservation in resp.get("Reservations", []):
                 for inst in reservation.get("Instances", []):
                     instance_states[inst["InstanceId"]] = inst["State"]["Name"]
+                    for tag in inst.get("Tags", []):
+                        if tag.get("Key") == spot_dispatch.TERMINATION_REASON_TAG and tag.get("Value"):
+                            termination_reasons[inst["InstanceId"]] = tag["Value"]
         except Exception as exc:
             logger.warning("reconciler: describe-instances failed: %s", exc)
             # Fail-safe: treat ALL as unknown (not dead) — never page on a
@@ -1656,7 +1681,17 @@ def _reconcile_lane_death() -> dict:
             # Instance not found in describe-instances, or is in a terminal
             # state (stopped, terminated, shutting-down).
             page = True
-            reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
+            # I6199: prefer the reason THIS dispatcher recorded when it tore the
+            # box down. EC2 state is a proxy — `is shutting-down` is true of a
+            # spot reclaim, a completed run winding down, and a dispatcher
+            # terminate after a failed bootstrap alike, and on 2026-08-03 it
+            # sent two cycles of investigation at the wrong subsystem.
+            dispatcher_reason = termination_reasons.get(instance_id, "")
+            if dispatcher_reason:
+                reason = (f"lane_died: dispatcher terminated instance {instance_id} "
+                          f"before bootstrap — {dispatcher_reason}")
+            else:
+                reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
         elif exp.get("deadline_utc"):
             try:
                 deadline = datetime.fromisoformat(exp["deadline_utc"])
@@ -1672,6 +1707,33 @@ def _reconcile_lane_death() -> dict:
         tier_tag = exp.get("tier_tag", "unknown")
         schedule_label = exp.get("schedule", "unknown")
         run_token = str(exp.get("run_token") or "")
+        # Human-readable RENDERING of the token, for the notification body only.
+        #
+        # A bare `run_token=<32 lowercase hex>` is, to gitleaks' stock
+        # `generic-api-key` rule, indistinguishable from a leaked credential: the
+        # keyword `token` adjacent to a high-entropy 32-char value is exactly what
+        # that rule looks for. It is not a credential — it is a correlation id this
+        # Lambda mints per lane — but the scanner cannot know that.
+        #
+        # It matters because of where these bodies travel. `_notify_cycle` publishes
+        # onto the Overseer intake bus, alert-drain reads the queue into its LLM
+        # request, and the DLP egress proxy gitleaks-scans that outbound body. A
+        # match returns HTTP 400, the drain agent exits rc=1, and — because nothing
+        # is deleted from the queue without a ledger record (overseer-policy.md
+        # invariant 8) — the same message is re-read by the next run. One lane-death
+        # alert therefore wedges the entire response plane indefinitely.
+        #
+        # Measured 2026-08-03: 12 of 79 sampled intake messages carried this shape,
+        # every one from this emitter and this field; four consecutive drain runs
+        # died on it, and the retry ladder pushed the queue's other messages toward
+        # the DLQ five receives at a time.
+        #
+        # 12 hex chars keeps the prefix long enough to correlate a body against the
+        # dispatch ledger by eye, and short enough that no entropy rule fires. The
+        # FULL token is unchanged everywhere it is machine-read — `dedup_key` below,
+        # the `context` payload, and every log line — so nothing that consumes it
+        # programmatically is affected.
+        run_token_display = f"{run_token[:12]}…" if len(run_token) > 12 else run_token
 
         # alpha-engine-config-I5914: instance state is not a proxy for run
         # completion. A lane that finished its work and was reclaimed during
@@ -1688,7 +1750,7 @@ def _reconcile_lane_death() -> dict:
             _notify_cycle(
                 f"🟡 Groom lane reclaimed AFTER completing — {reason}\n"
                 f"tier={tier_tag}  schedule={schedule_label}\n"
-                f"run_token={run_token}  instance={instance_id}\n"
+                f"run_token={run_token_display}  instance={instance_id}\n"
                 f"work completed; evidence={evidence}",
                 # 2026-08-03 notification cleanup: SILENT — no work was lost,
                 # it is durably recorded in the reconcile ledger, and a
@@ -1715,7 +1777,7 @@ def _reconcile_lane_death() -> dict:
             _notify_cycle(
                 f"🔴 Groom lane DEATH — {reason}\n"
                 f"tier={tier_tag}  schedule={schedule_label}\n"
-                f"run_token={run_token}  instance={instance_id}",
+                f"run_token={run_token_display}  instance={instance_id}",
                 severity="error",
                 dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{run_token}",
                 context={"expectation": {k: v for k, v in exp.items()
@@ -1935,13 +1997,20 @@ def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
         logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
 
 
-def _terminate_instance(instance_id: str) -> None:
+def _terminate_instance(instance_id: str, reason: str = "") -> None:
     """Best-effort terminate of a just-launched box whose post-launch steps
     failed. Without this the box orphans: it received no bootstrap, so neither
     the in-script watchdog nor the EXIT trap (both armed BY the bootstrap) is
     running to tear it down — it idles until manually killed. Never masks the
-    original error (logged, not raised)."""
-    spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="groom")
+    original error (logged, not raised).
+
+    ``reason`` (I6199) is tagged onto the instance so the lane reconciler can
+    page the cause instead of restating EC2 state. Callers pass the exception
+    that triggered the teardown; omitting it degrades the page to the old
+    state-only wording rather than failing."""
+    spot_dispatch.terminate_on_failure(
+        instance_id, region=REGION, label="groom", reason=reason
+    )
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
@@ -1971,8 +2040,41 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # concurrent box racing the identical GitHub queue. config#2201: sweep
     # boxes guard on the distinct 'sweep' lane (see _tier_tag) so the
     # end-of-SF sweep never collides with a live mid-only groom box.
+    #
+    # Reclaim-aware bypass (2026-08-02 spot-reclaim race): the guard sees a
+    # spot-reclaimed instance as "live" for ~2 min after the interruption
+    # notice — AWS retains it `running` while the on-box watcher has already
+    # fired send_task_failure(SpotInterrupted) and the SF has already decided
+    # to relaunch. Without this leg the relaunch suppresses itself as a
+    # "duplicate" and the lane dies unworked (measured 2026-08-02 20:00 UTC:
+    # low-only reclaimed, relaunch attempt 1 skipped, lane lost). On a relaunch
+    # (attempt > 0 — ONLY the SF's bounded-retry ladder sets this), re-probe
+    # the "live" instances: any that are termination-imminent (terminal state
+    # OR a spot request marked-for-termination) are the dying prior attempt,
+    # not a competing workload — proceed past the guard for those. A genuinely
+    # healthy prior box (attempt 0, or a real duplicate on attempt > 0) still
+    # suppresses, preserving config#1979's intent. The probe is fail-safe: an
+    # API error returns an empty set and the guard suppresses as before, never
+    # risking a duplicate launch on a broken read.
     tier_tag = _tier_tag(run_mode, issue_filter)
     existing = _running_tier_instance_ids(tier_tag)
+    if existing and attempt > 0:
+        dying = spot_dispatch.termination_imminent(existing, region=REGION)
+        if dying:
+            live = [i for i in existing if i not in dying]
+            if not live:
+                logger.info(
+                    "relaunch attempt %d for lane %s: prior instance(s) %s are "
+                    "termination-imminent (spot reclaim / terminal state) — "
+                    "proceeding with the replacement, NOT a duplicate",
+                    attempt, tier_tag, existing)
+                existing = []  # fall through to launch
+            else:
+                logger.warning(
+                    "relaunch attempt %d for lane %s: mixed live (%s) + dying "
+                    "(%s) prior boxes — suppressing on the genuinely-live one(s)",
+                    attempt, tier_tag, live, [i for i in existing if i in dying])
+                existing = live
     if existing:
         logger.warning(
             "lane %s already has a live groom box (%s) — skipping launch to avoid "
@@ -2040,9 +2142,9 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             task_token=task_token,
             instance_type=_describe_instance_type(instance_id), market=market,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(_LEDGER_WRITE_FAILED_MSG)
-        _terminate_instance(instance_id)
+        _terminate_instance(instance_id, reason=f"{type(exc).__name__}: {exc}")
         raise
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
@@ -2063,8 +2165,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
             queue_manifest_key, backend, task_token,
         )
-    except Exception:
-        _terminate_instance(instance_id)
+    except Exception as exc:
+        _terminate_instance(instance_id, reason=f"{type(exc).__name__}: {exc}")
         raise
     logger.info(
         "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s "

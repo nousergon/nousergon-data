@@ -187,7 +187,7 @@ def test_telegram_fires_when_dispatch_enabled(monkeypatch):
     assert "Weekly Freshness SF: FAILED" in text  # pipeline-aware label
     assert "Failed state: `RAGIngestion`" in text
     assert "consolidated/saturday_sf_watch/2023-11-14.json" in text
-    assert "autonomous fix ACTIVE" in text
+    assert "autonomous fix LAUNCHING" in text
 
 
 def test_watch_log_path_is_code_fenced(monkeypatch):
@@ -457,7 +457,7 @@ def test_pat_never_appears_in_result(monkeypatch):
 def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkeypatch):
     """Regression guard for the has_listener MECHANISM itself (config#1535):
     a pipeline registered with has_listener=False must never fire a
-    repository_dispatch nor claim "autonomous fix ACTIVE", regardless of the
+    repository_dispatch nor claim "autonomous fix LAUNCHING", regardless of the
     global kill-switch."""
     fake_pipelines = dict(index.PIPELINES)
     fake_pipelines["some-other-pipeline"] = {
@@ -1592,7 +1592,7 @@ def test_m2_default_target_is_overseer():
 def test_weekday_does_not_dispatch_on_repository_dispatch_path(monkeypatch):
     """The defect this closes: a weekday failure POSTed a repository_dispatch
     that GitHub accepted (204) and no job consumed, while Telegram claimed
-    "autonomous fix ACTIVE". sf-watch.yml gates its dispatch job to
+    "autonomous fix LAUNCHING". sf-watch.yml gates its dispatch job to
     saturday-sf-failure only (config#2004), so weekday has no listener here."""
     monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch")
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)

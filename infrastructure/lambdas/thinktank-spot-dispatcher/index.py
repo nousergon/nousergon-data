@@ -125,6 +125,44 @@ WATCHDOG_SECONDS = int(os.environ.get("THINKTANK_SPOT_WATCHDOG_SECONDS", "9000")
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("THINKTANK_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("THINKTANK_SPOT_CW_LOG_GROUP", "/alpha-engine/thinktank-spot")
 
+# ── Router addressing (alpha-engine-config-I6367 / I6373) ──────────────────
+# Brian's ruling 2026-08-03: no agent may be directly linked to OpenRouter.
+# The Think Tank's tiers address model GROUPS, resolved through the
+# authenticated router edge. Three facts the box cannot derive for itself:
+#
+#   where it runs        — a stock-AMI spot box, so the dashboard box's local
+#                          egress proxy at 127.0.0.1:8990 does NOT answer here
+#                          and the edge is the only path;
+#   which URL             — model-router-policy §3.4a R27a: the router is
+#                          addressed by (url, credential) and reaching it may
+#                          not depend on host, VPC, subnet, SG or private IP;
+#   which credential     — the edge identifies a consumer BY its credential
+#                          VALUE, and krepis.secrets resolves SSM BEFORE
+#                          os.environ, so sharing the secret NAME
+#                          `LITELLM_MASTER_KEY` would collapse this box into
+#                          the director's identity however the environment is
+#                          set. `thinktank` is its own consumer in
+#                          nous-ergon-ops bin/render-router-secrets.sh.
+#
+# The registry itself comes from AppConfig: crucible-research is PUBLIC, so
+# private-docs/LLM_MODEL_REGISTRY.yaml is correctly absent from the clone.
+KREPIS_EXEC_CONTEXT = os.environ.get("THINKTANK_SPOT_EXEC_CONTEXT", "ec2")
+KREPIS_LITELLM_PROXY_URL = os.environ.get(
+    "THINKTANK_SPOT_ROUTER_URL", "https://router.nousergon.ai:8443"
+)
+KREPIS_ROUTER_CREDENTIAL_SECRET = os.environ.get(
+    "THINKTANK_SPOT_ROUTER_CREDENTIAL_SECRET", "ROUTER_CONSUMER_THINKTANK"
+)
+KREPIS_APPCONFIG_APPLICATION = os.environ.get(
+    "THINKTANK_SPOT_APPCONFIG_APPLICATION", "alpha-engine"
+)
+KREPIS_APPCONFIG_CONFIG_PROFILE = os.environ.get(
+    "THINKTANK_SPOT_APPCONFIG_CONFIG_PROFILE", "llm-model-registry"
+)
+KREPIS_APPCONFIG_ENVIRONMENT = os.environ.get(
+    "THINKTANK_SPOT_APPCONFIG_ENVIRONMENT", "production"
+)
+
 INSTANCE_TAG_NAME = "alpha-engine-thinktank-spot"
 
 
@@ -169,6 +207,12 @@ git clone --depth 1 --branch {RESEARCH_BRANCH} \\
 cd /home/ec2-user/crucible-research
 export THINKTANK_RUN_BUDGET_SECONDS={RUN_BUDGET_SECONDS}
 export THINKTANK_SPOT_RUN_TOKEN={run_token}
+export KREPIS_EXEC_CONTEXT={KREPIS_EXEC_CONTEXT}
+export KREPIS_LITELLM_PROXY_URL={KREPIS_LITELLM_PROXY_URL}
+export KREPIS_ROUTER_CREDENTIAL_SECRET={KREPIS_ROUTER_CREDENTIAL_SECRET}
+export KREPIS_APPCONFIG_APPLICATION={KREPIS_APPCONFIG_APPLICATION}
+export KREPIS_APPCONFIG_CONFIG_PROFILE={KREPIS_APPCONFIG_CONFIG_PROFILE}
+export KREPIS_APPCONFIG_ENVIRONMENT={KREPIS_APPCONFIG_ENVIRONMENT}
 exec bash infrastructure/thinktank_spot_bootstrap.sh
 """
 

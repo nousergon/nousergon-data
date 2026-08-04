@@ -153,7 +153,8 @@
       ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/groom/*",
-        "arn:aws:s3:::alpha-engine-research/overseer/*"
+        "arn:aws:s3:::alpha-engine-research/overseer/*",
+        "arn:aws:s3:::alpha-engine-research/ci_watch/*"
       ]
     },
     {
@@ -182,7 +183,8 @@
         "StringLike": {
           "s3:prefix": [
             "groom/*",
-            "overseer/*"
+            "overseer/*",
+            "ci_watch/*"
           ]
         }
       }

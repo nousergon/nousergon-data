@@ -1,0 +1,94 @@
+name: Deploy arctic-migration-dispatcher
+
+# Auto-deploy the alpha-engine-arctic-migration-dispatcher Lambda CODE on merge
+# to main. Mirrors deploy-scheduled-groom-dispatcher.yml — same gap, same fix:
+# the dispatcher was previously operator-deployed only end-to-end (code AND
+# IAM/function bundled behind --bootstrap), so a merged code fix sat inert
+# until someone remembered to run deploy.sh by hand (alpha-engine-config#3905).
+# This closes that gap for the CODE path only.
+#
+# Separation of concerns: this deploys CODE only (deploy.sh with NO flag —
+# unlike freshness-monitor, this script's default/flagless run IS already
+# code-only; --bootstrap is what ADDS the IAM-role-creation + Lambda-function-
+# creation, not the reverse, so no new script flag was needed here). The
+# operator bootstrap step (`deploy.sh --bootstrap`) is still a one-time
+# manual action — the github-actions-lambda-deploy OIDC role deliberately has
+# no iam:CreateRole / iam:PutRolePolicy (fleet-wide policy after 4 IAM-clobber
+# incidents in 2 months traced to auto-applied IAM writes; see
+# nous-ergon-ops/infrastructure/iam/README.md).
+#
+# INERT UNTIL BOOTSTRAPPED: the --bootstrap step must be run once for the
+# Lambda function to exist. Until then, deploy.sh's code-only path 404s
+# deliberately (set -e aborts). This workflow merges safely to main — it
+# fails CI on the first push touching infrastructure/lambdas/arctic-migration-
+# dispatcher/** after merge, exactly the signal that the missing bootstrap
+# needs operator attention.
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-
+# actions-lambda-deploy.json), which already includes this function.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/arctic-migration-dispatcher/**'
+      - '.github/workflows/deploy-arctic-migration-dispatcher.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-arctic-migration-dispatcher-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy arctic-migration-dispatcher Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy arctic-migration-dispatcher (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/arctic-migration-dispatcher/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-arctic-migration-dispatcher \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-arctic-migration-dispatcher.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

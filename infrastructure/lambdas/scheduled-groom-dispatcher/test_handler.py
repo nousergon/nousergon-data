@@ -131,14 +131,28 @@ class _FakeWaiter:
 
 
 class _FakeEc2:
-    def __init__(self, running_tier_instances=None):
+    def __init__(self, running_tier_instances=None, spot_reclaimed=None):
         self.terminated = []
+        # `create_tags` appended to this list without it ever being initialised
+        # — an AttributeError waiting for the first test to exercise the tag
+        # path. I6199 is that first test.
+        self.tags_created: list[tuple[list[str], list[dict]]] = []
         # config#1979: (issue_filter -> [instance_ids]) already "live" for the
         # concurrent-tier guard's describe_instances check to find.
         self._running_tier_instances = dict(running_tier_instances or {})
         # config-I5229: instance_id -> state name for the reconciler's
         # InstanceIds-based describe_instances.
         self._instance_states: dict[str, str] = {}
+        # 2026-08-02 spot-reclaim race: instance_ids whose spot request is
+        # marked-for-termination / closed (Status.Code) while the instance is
+        # still `running`. termination_imminent() probes these via
+        # describe_spot_instance_requests to see past State.Name during the
+        # 2-min interruption-notice window. Each id maps to the fake spot
+        # request record the paginator returns.
+        self._spot_reclaimed: dict[str, dict] = dict(spot_reclaimed or {})
+        # I6199: instance_id -> tags the reconciler reads to recover WHY the
+        # dispatcher tore a box down.
+        self._instance_tags: dict[str, list[dict]] = {}
 
     def get_waiter(self, name):
         return _FakeWaiter()
@@ -156,11 +170,20 @@ class _FakeEc2:
         # InstanceIds (batch lookup). The concurrent-tier guard uses Filters
         # (tag-based lookup). Support BOTH call shapes.
         if InstanceIds:
-            # Reconciler path — return the stubbed states for these ids.
+            # Reconciler / termination_imminent path — return the stubbed states
+            # for these ids, plus a SpotInstanceRequestId when one is registered
+            # (so the reclaim probe can look it up). Default state is `terminated`
+            # (a dead lane's instance) — tests exercising the reclaim race set
+            # `running` explicitly via _instance_states.
             instances = []
             for iid in InstanceIds:
                 state = self._instance_states.get(iid, "terminated")
-                instances.append({"InstanceId": iid, "State": {"Name": state}})
+                inst = {"InstanceId": iid, "State": {"Name": state}}
+                if iid in self._spot_reclaimed:
+                    inst["SpotInstanceRequestId"] = f"sir-{iid}"
+                if iid in self._instance_tags:
+                    inst["Tags"] = self._instance_tags[iid]
+                instances.append(inst)
             return {"Reservations": [{"Instances": instances}]} if instances else {"Reservations": []}
         if Filters:
             by_name = {f["Name"]: f["Values"] for f in Filters}
@@ -168,6 +191,26 @@ class _FakeEc2:
             ids = self._running_tier_instances.get(issue_filter, [])
             return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
         return {"Reservations": []}
+
+    def get_paginator(self, name):
+        # 2026-08-02: termination_imminent paginates describe_spot_instance_requests
+        # to read Status.Code for instances still `running` but spot-reclaimed.
+        if name == "describe_spot_instance_requests":
+            requests = list(self._spot_reclaimed.values())
+            return _FakeSpotRequestPaginator(requests)
+        raise AssertionError(f"unexpected EC2 paginator in hermetic tests: {name!r}")
+
+
+class _FakeSpotRequestPaginator:
+    """Yields the stubbed spot-instance-request records for termination_imminent."""
+
+    def __init__(self, requests: list[dict]):
+        self._requests = requests
+
+    def paginate(self, SpotInstanceRequestIds=None):  # noqa: N803 — boto3 kwarg name
+        wanted = set(SpotInstanceRequestIds or [])
+        page = [r for r in self._requests if r.get("SpotInstanceRequestId") in wanted]
+        yield {"SpotInstanceRequests": page}
 
 
 class _FakeSsm:
@@ -247,11 +290,13 @@ class _FakeS3:
 
 
 def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None,
-         running_tier_instances=None, sfn_executions=None, sfn_error=None):
+         running_tier_instances=None, sfn_executions=None, sfn_error=None,
+         spot_reclaimed=None):
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     ssm = _FakeSsm(ssm_parameters)
-    ec2 = _FakeEc2(running_tier_instances=running_tier_instances)
+    ec2 = _FakeEc2(running_tier_instances=running_tier_instances,
+                   spot_reclaimed=spot_reclaimed)
     s3 = _FakeS3(s3_objects)
     sfn = _FakeSfn(executions=sfn_executions, error=sfn_error)
     clients = {"ec2": ec2, "ssm": ssm, "s3": s3, "stepfunctions": sfn}
@@ -734,6 +779,162 @@ def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
     # A broken check must never block a launch — it's an optimization, not a
     # correctness gate (mirrors the demand gate fail-safe posture).
     assert out["groom"]["launched"] is True
+
+
+# ── 2026-08-02: spot-reclaim race — reclaim-aware relaunch (attempt > 0) ──────
+# The on-box watcher fires send_task_failure(SpotInterrupted) on the IMDS notice
+# ~2 min before AWS terminates the box, so the SF's relaunch runs while the prior
+# instance is still `running` and the concurrent guard (config#1979) would
+# suppress the replacement as a "duplicate" — the lane dies unworked. A relaunch
+# (attempt > 0) re-probes the "live" instances and proceeds past any that are
+# termination-imminent (the dying prior attempt, not a competing workload).
+
+def _reclaimed_sir(instance_id, status_code="marked-for-termination", state="active"):
+    """A spot-instance-request record the fake paginator returns for a
+    spot-reclaimed instance still in `running` state."""
+    return {"SpotInstanceRequestId": f"sir-{instance_id}",
+            "State": state, "Status": {"Code": status_code}}
+
+
+def test_relaunch_proceeds_when_prior_instance_is_spot_reclaimed(monkeypatch):
+    """The race case (2026-08-02 20:00 UTC low-only): attempt 1 finds the prior
+    box still `running` but its spot request is marked-for-termination. The
+    replacement MUST launch — suppressing here loses the lane."""
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-replacement"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"low-only": ["i-dying"]},
+        spot_reclaimed={"i-dying": _reclaimed_sir("i-dying")},
+    )
+    # The concurrent guard (Filters) returns i-dying as "live"; the reclaim
+    # probe (InstanceIds) must see it as `running` (not the default terminated)
+    # so the spot-request lookup is the thing that flags it imminent.
+    idx._test_ec2._instance_states["i-dying"] = "running"
+    out = idx.handler(
+        {"run_mode": "full", "issue_filter": "low-only", "schedule": "0 20 * * *",
+         "launch_decided": True, "attempt": 1, "Token": "tok-1"},
+        None,
+    )
+    assert out["groom"]["launched"] is True
+    assert out["groom"]["instance_id"] == "i-replacement"
+    assert launched == [True]
+
+
+def test_relaunch_proceeds_when_prior_instance_is_already_terminated(monkeypatch):
+    """The reconciler-late case: by the time the relaunch fires, the prior box
+    has flipped to `terminated` (describe-instances still returns it for ~1h).
+    State alone is enough to see this one — no spot-request lookup needed."""
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-replacement"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"low-only": ["i-dead"]},
+    )
+    idx._test_ec2._instance_states["i-dead"] = "terminated"
+    out = idx.handler(
+        {"run_mode": "full", "issue_filter": "low-only", "schedule": "0 20 * * *",
+         "launch_decided": True, "attempt": 1, "Token": "tok-1"},
+        None,
+    )
+    assert out["groom"]["launched"] is True
+    assert launched == [True]
+
+
+def test_relaunch_still_skips_when_prior_instance_is_genuinely_live(monkeypatch):
+    """A real duplicate (attempt > 0 but the prior box is healthy) still
+    suppresses — config#1979's intent is preserved for the genuine case."""
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        # Prior box running, no spot-reclaim entry -> healthy.
+        running_tier_instances={"mid-only": ["i-healthy"]},
+    )
+    idx._test_ec2._instance_states["i-healthy"] = "running"
+    out = idx.handler(
+        {"run_mode": "full", "issue_filter": "mid-only", "schedule": "0 20 * * *",
+         "launch_decided": True, "attempt": 1, "Token": "tok-1"},
+        None,
+    )
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "concurrent_tier_skip"
+    assert out["groom"]["existing_instance_ids"] == ["i-healthy"]
+    assert launched == []
+
+
+def test_first_launch_attempt_zero_still_skips_on_live_box(monkeypatch):
+    """attempt 0 (a first launch, not a relaunch) with a live box is a genuine
+    duplicate — the reclaim bypass is scoped to attempt > 0 only."""
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-should-not-launch"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"low-only": ["i-existing"]},
+        # Even with a reclaim signal, attempt 0 must NOT bypass — a first launch
+        # has no prior attempt to be "dying," so this would be a true duplicate.
+        spot_reclaimed={"i-existing": _reclaimed_sir("i-existing")},
+    )
+    idx._test_ec2._instance_states["i-existing"] = "running"
+    out = idx.handler(
+        {"run_mode": "full", "issue_filter": "low-only", "schedule": "0 20 * * *",
+         "launch_decided": True, "attempt": 0, "Token": "tok-0"},
+        None,
+    )
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "concurrent_tier_skip"
+    assert launched == []
+
+
+def test_reclaim_probe_failure_fails_safe_to_skip(monkeypatch):
+    """A broken spot-request probe must never risk a duplicate — degrade to the
+    original guard suppression. The lane is lost for this cycle (the reconciler
+    pages), but a duplicate-launch is the worse failure."""
+    launched = []
+
+    def _launch(types_, subnets, **kw):
+        launched.append(True)
+        return "i-maybe"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"low-only": ["i-maybe"]},
+    )
+    # The concurrent probe (running_instance_ids) succeeds and returns the id;
+    # the reclaim probe (termination_imminent) calls describe_instances with
+    # InstanceIds and we make THAT raise.
+    original_describe = idx._test_ec2.describe_instances
+
+    def _describe(Filters=None, InstanceIds=None):  # noqa: N803 — boto3 kwarg names
+        if InstanceIds:
+            raise RuntimeError("EC2 API hiccup on reclaim probe")
+        return original_describe(Filters=Filters)
+
+    idx._test_ec2.describe_instances = _describe
+    out = idx.handler(
+        {"run_mode": "full", "issue_filter": "low-only", "schedule": "0 20 * * *",
+         "launch_decided": True, "attempt": 1, "Token": "tok-1"},
+        None,
+    )
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "concurrent_tier_skip"
+    assert launched == []
 
 
 # ── config#1933: demand-driven dispatch (enumerate-then-decide) ──────────────
@@ -3090,3 +3291,145 @@ def test_retry_marker_fails_soft_when_the_ledger_is_unreadable(monkeypatch):
     out = idx.handler({"retryMarker": True, "run_mode": "full",
                        "launchDecision": {"issue_filter": "mid-only"}}, None)
     assert out["lane_completed"] is False
+
+
+# ── The page must name the dispatcher's reason, not the EC2 state (I6199) ─────
+#
+# On 2026-08-03 eleven boxes were terminated by THIS Lambda after
+# `RuntimeError: SSM agent not Online after 180s`, and every page read
+# `instance is shutting-down — not in ('pending', 'running')`. EC2 state is a
+# proxy: `shutting-down` is equally true of a spot reclaim, a completed run
+# winding down, and a dispatcher terminate after a failed bootstrap. Two groom
+# cycles were spent looking for a groom defect that did not exist.
+
+_SSM_TIMEOUT_REASON = "RuntimeError: SSM agent not Online after 180s for i-dead"
+
+
+def _tag_dead_lane(idx, reason: str = _SSM_TIMEOUT_REASON) -> None:
+    idx._test_ec2._instance_tags["i-dead"] = [
+        {"Key": "Name", "Value": "alpha-engine-groom-spot"},
+        {"Key": "termination-reason", "Value": reason},
+        {"Key": "termination-source", "Value": "dispatcher"},
+    ]
+
+
+def test_lane_death_page_names_the_dispatcher_reason_not_the_instance_state(monkeypatch):
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-ssm"))
+    _tag_dead_lane(idx)
+    notifications = _spy_notify(monkeypatch, idx)
+
+    out = idx.handler({"mode": "reconcile"}, None)
+
+    assert out["deaths"] == 1
+    text, kw = notifications[0]
+    assert kw["severity"] == "error"
+    assert "SSM agent not Online after 180s" in text, (
+        f"page must carry the reason the dispatcher recorded, got: {text}"
+    )
+    assert "not in ['pending', 'running']" not in text, (
+        "page must not restate the EC2 state as if it were a diagnosis"
+    )
+
+
+def test_lane_death_page_records_the_dispatcher_reason_on_the_actioned_marker(monkeypatch):
+    """Every downstream consumer of the marker reads `reason` too."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-ssm2"))
+    _tag_dead_lane(idx)
+    _spy_notify(monkeypatch, idx)
+
+    idx.handler({"mode": "reconcile"}, None)
+
+    marker = json.loads(
+        idx._test_s3._objects["groom/_control/reconciled/tok-ssm2.json"].decode()
+    )
+    assert marker["outcome"] == "lane_died"
+    assert "SSM agent not Online" in marker["reason"]
+
+
+def test_lane_death_falls_back_to_instance_state_when_untagged(monkeypatch):
+    """A spot reclaim carries no dispatcher tag — behaviour must be unchanged."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-reclaim"))
+    notifications = _spy_notify(monkeypatch, idx)
+
+    out = idx.handler({"mode": "reconcile"}, None)
+
+    assert out["deaths"] == 1
+    text, _ = notifications[0]
+    assert "is terminated" in text
+    assert "dispatcher terminated" not in text
+
+
+def test_launch_failure_tags_the_instance_with_the_real_exception(monkeypatch):
+    """The producer half: the reason must reach EC2 before the terminate."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(
+        idx, "_wait_ssm_online",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("SSM agent not Online after 180s for i-test")
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        idx.handler({"run_mode": "full", "schedule": "0 4 * * *"}, None)
+
+    assert idx._test_ec2.terminated, "a box whose bootstrap never landed must be torn down"
+    tagged = {t["Key"]: t["Value"]
+              for _, tags in idx._test_ec2.tags_created for t in tags}
+    assert "SSM agent not Online after 180s" in tagged.get("termination-reason", "")
+    assert tagged.get("termination-source") == "dispatcher"
+
+
+# ── Alert bodies must not carry a credential-shaped run token ────────────────
+#
+# A bare `run_token=<32 lowercase hex>` matches gitleaks' stock `generic-api-key`
+# rule. These bodies travel onto the Overseer intake bus, alert-drain reads the
+# queue into its LLM request, and the DLP egress proxy scans that outbound body —
+# so one lane-death alert returns HTTP 400, the drain exits rc=1, and because
+# nothing is deleted from the queue without a ledger record the SAME message
+# wedges every subsequent run. Measured 2026-08-03: 12 of 79 sampled intake
+# messages, all this emitter, all this field, four consecutive drain runs dead.
+
+_HEX32_TOKEN = "af87ec3d9b1e4c7a2f60d583be914c02"
+
+
+def _lane_death_body(monkeypatch, token):
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects(token))
+    _tag_dead_lane(idx)
+    notifications = _spy_notify(monkeypatch, idx)
+    idx.handler({"mode": "reconcile"}, None)
+    return notifications[0]
+
+
+def test_lane_death_body_truncates_the_run_token(monkeypatch):
+    """The rendered body must not contain the full 32-char token."""
+    text, _kw = _lane_death_body(monkeypatch, _HEX32_TOKEN)
+    assert _HEX32_TOKEN not in text, (
+        "the full run_token reached the notification body; gitleaks' "
+        "generic-api-key rule matches `run_token=<32 hex>` and the DLP egress "
+        "proxy will 400 every alert-drain run that reads this message"
+    )
+    assert _HEX32_TOKEN[:12] in text, (
+        "the truncated prefix must survive — it is what correlates a body "
+        "against the dispatch ledger by eye"
+    )
+
+
+def test_lane_death_dedup_key_keeps_the_full_token(monkeypatch):
+    """Truncation is a RENDERING change; machine-read fields are untouched.
+
+    The dedup key is what collapses repeated pages for one dead lane into one
+    alert. Truncating it there would widen the key and could collide two lanes
+    sharing a 12-char prefix.
+    """
+    _text, kw = _lane_death_body(monkeypatch, _HEX32_TOKEN)
+    assert kw["dedup_key"].endswith(_HEX32_TOKEN), (
+        f"dedup_key lost the full token: {kw['dedup_key']}"
+    )
+
+
+def test_short_token_is_rendered_whole(monkeypatch):
+    """No ellipsis on a token that was never long enough to look like a key."""
+    text, _kw = _lane_death_body(monkeypatch, "tok-short")
+    assert "run_token=tok-short " in text or "run_token=tok-short\n" in text, (
+        f"a short token must render verbatim, got: {text}"
+    )
