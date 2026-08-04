@@ -157,7 +157,7 @@
     },
     "CheckSkipLibPinDriftCheck": {
       "Type": "Choice",
-      "Comment": "Skip-gate (L4517). {\"skip_lib_pin_drift_check\": true} bypasses the preventive cross-repo lib-pin drift check \u2014 e.g. an operator rerun where pins are known-good.",
+      "Comment": "Skip-gate (L4517). {\"skip_lib_pin_drift_check\": true} bypasses the preventive cross-repo lib-pin drift check \u2014 e.g. an operator rerun where pins are known-good. Skipping THIS gate specifically must not skip its siblings (PipelineContractCheck/Evaluator*/WeeklyPreflight) too \u2014 config#2278's sibling-gate discipline applies to the skip-path exactly as it does to the degraded-path (I4494 fix, 2026-08-04: this branch previously jumped straight to CheckMutexRole, which let a lib-pin skip silently bypass every other pre-spend probe as well).",
       "Choices": [
         {
           "And": [
@@ -170,7 +170,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckMutexRole"
+          "Next": "PipelineContractCheck"
         }
       ],
       "Default": "LibPinDriftCheck"

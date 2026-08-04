@@ -195,18 +195,27 @@ def test_preflight_state_precedes_every_send_command(states):
 
 
 def test_pipeline_contract_gate_defers_to_preflight(states):
-    """PipelineContractGate's pass path must go through WeeklyPreflight,
-    not directly to CheckMutexRole."""
+    """PipelineContractGate's pass path must eventually reach WeeklyPreflight
+    before any spend, not jump directly to CheckMutexRole. It does not need
+    to go there directly: main's EvaluatorDeployDriftCheck/EvaluatorDirector
+    pre-spend gates (config#2348) were added after this test was first
+    written and now sit between PipelineContractGate and WeeklyPreflight,
+    composed per the sibling-gate convention — so the immediate next hop is
+    EvaluatorDeployDriftCheck, with WeeklyPreflight still guaranteed downstream
+    (asserted generically by test_preflight_state_precedes_every_send_command)."""
     gate = states["PipelineContractGate"]
-    assert gate["Default"] == "WeeklyPreflight", (
-        "PipelineContractGate default must go to WeeklyPreflight, "
+    assert gate["Default"] == "EvaluatorDeployDriftCheck", (
+        "PipelineContractGate default must go to EvaluatorDeployDriftCheck "
+        "(the next pre-spend gate in the composed chain), "
         f"got {gate['Default']}"
     )
 
 
 def test_pipeline_contract_degraded_defers_to_preflight(states):
-    """The degraded path from PipelineContractGate must also route through
-    WeeklyPreflight, not bypass it."""
+    """The degraded path from PipelineContractGate must also route into the
+    composed pre-spend gate chain, not bypass it straight to CheckMutexRole.
+    See test_pipeline_contract_gate_defers_to_preflight for why the immediate
+    hop is EvaluatorDeployDriftCheck rather than WeeklyPreflight directly."""
     degraded = states["PublishPipelineContractGateDegraded"]
     next_states = []
     if "Next" in degraded:
@@ -217,7 +226,7 @@ def test_pipeline_contract_degraded_defers_to_preflight(states):
                 next_states.append(c["Next"])
 
     for n in next_states:
-        assert n == "WeeklyPreflight", (
-            f"PublishPipelineContractGateDegraded must route to WeeklyPreflight, "
-            f"got {n} (one or more paths bypass the preflight)"
+        assert n == "EvaluatorDeployDriftCheck", (
+            f"PublishPipelineContractGateDegraded must route to EvaluatorDeployDriftCheck, "
+            f"got {n} (one or more paths bypass the composed pre-spend chain)"
         )
