@@ -1175,6 +1175,10 @@ class TestHappyPathTraversal:
         # then director Lambda) is now composed directly after
         # PipelineContractGate's pass-through, before CheckMutexRole — four
         # extra states in the visited order.
+        # I4494: WeeklyPreflight is composed as the fourth pre-spend gate
+        # between EvaluatorDirectorDeployDriftGate and CheckMutexRole (its
+        # verdict Choice Default proceeds to the mutex on a clean pass) — two
+        # extra states in the visited order.
         # config#2249: CheckSkipMorningEnrich.Default now routes through the
         # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
         # MorningEnrich (fast fail on a dead dispatch box) — two extra states
@@ -1201,6 +1205,8 @@ class TestHappyPathTraversal:
             "EvaluatorDeployDriftGate",
             "EvaluatorDirectorDeployDriftCheck",
             "EvaluatorDirectorDeployDriftGate",
+            "WeeklyPreflight",
+            "WeeklyPreflightGate",
             "CheckMutexRole",
             "CheckSpotDispatchNeeded",
             "DispatchWeeklyFreshnessSpot",

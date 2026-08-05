@@ -55,8 +55,11 @@ def test_skip_gate_default_runs_check_and_skip_bypasses(states):
     skip = states["CheckSkipLibPinDriftCheck"]
     assert skip["Default"] == "LibPinDriftCheck"
     c = skip["Choices"][0]
-    # skip_lib_pin_drift_check == true bypasses straight into the pipeline
-    assert c["Next"] == "CheckMutexRole"
+    # skip_lib_pin_drift_check == true bypasses THIS gate only, re-entering
+    # the chain at its sibling PipelineContractCheck (I4494: skipping lib-pin
+    # must not skip the other pre-spend gates too — the old direct jump to
+    # CheckMutexRole let a lib-pin skip silently bypass every sibling probe).
+    assert c["Next"] == "PipelineContractCheck"
     variables = {x["Variable"] for x in c["And"]}
     assert variables == {"$.skip_lib_pin_drift_check"}
 

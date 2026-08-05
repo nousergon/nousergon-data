@@ -272,7 +272,13 @@ class TestMutexWiring:
         # down (see test_sf_prespend_gate_alerting.py for the full quartet).
         assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "EvaluatorDeployDriftCheck"
         assert saturday_sf["States"]["EvaluatorDeployDriftGate"]["Default"] == "EvaluatorDirectorDeployDriftCheck"
-        assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "CheckMutexRole"
+        # I4494: WeeklyPreflight is composed as the fourth pre-spend gate
+        # between the evaluator-director drift gate and CheckMutexRole — the
+        # mutex is still the entry point's next gate-free state, one gate
+        # further down (see test_sf_prespend_gate_alerting.py for the quartet).
+        assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "WeeklyPreflight"
+        assert saturday_sf["States"]["WeeklyPreflight"]["Next"] == "WeeklyPreflightGate"
+        assert saturday_sf["States"]["WeeklyPreflightGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"

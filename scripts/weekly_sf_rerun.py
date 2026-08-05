@@ -146,12 +146,16 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "lib_pin_drift_check", "skip_lib_pin_drift_check",
         "CheckSkipLibPinDriftCheck", "LibPinDriftCheck",
-        frozenset({"CheckMutexRole"}),
-        # the whole pre-workload gate chain (lib-pin / pipeline-contract /
-        # evaluator / evaluator-director drift gates, config#2278 +
-        # config#2348) degrades fail-open through these Pass+Publish pairs —
-        # no skip flag is emitted either way (emit_skip=False), but the
-        # summary must say "degraded", not "completed", when one was hit.
+        frozenset({"PipelineContractCheck"}),
+        # Witness is the first sibling gate the chain re-enters on either the
+        # skip path (I4494: skipping lib-pin no longer jumps straight to
+        # CheckMutexRole — it re-enters at PipelineContractCheck) or the clean
+        # pass path (LibPinDriftGate.Default). The whole pre-workload gate
+        # chain (lib-pin / pipeline-contract / evaluator / evaluator-director
+        # drift gates, config#2278 + config#2348) degrades fail-open through
+        # these Pass+Publish pairs — no skip flag is emitted either way
+        # (emit_skip=False), but the summary must say "degraded", not
+        # "completed", when one was hit.
         degraded_witness=frozenset({
             "LibPinGateDegraded", "PublishLibPinGateDegraded",
             "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",

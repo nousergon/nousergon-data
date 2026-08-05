@@ -57,7 +57,7 @@ GATES = [
      "EvaluatorDirectorDeployDriftCheck"),
     ("EvaluatorDirectorDeployDriftCheck", "$.evaluator_director_deploy_drift_result.Payload.has_drift",
      "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
-     "CheckMutexRole"),
+     "WeeklyPreflight"),
 ]
 
 

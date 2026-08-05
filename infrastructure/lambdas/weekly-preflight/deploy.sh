@@ -114,11 +114,12 @@ fi
 
 # ----- 3. Grant SF execution role permission to invoke this Lambda -----------
 # The step functions execution role needs lambda:InvokeFunction on this
-# new preflight Lambda. This grant lives in the SF IAM role policy managed
-# by infrastructure/iam/alpha-engine-step-functions-role.json and is applied
-# SEPARATELY by infrastructure/iam/apply.sh. For reference:
+# new preflight Lambda. The SF execution role policy now lives in the
+# nous-ergon-ops repo (nous-ergon-ops/infrastructure/iam/alpha-engine-
+# step-functions-role.json) and is applied by that repo's apply.sh — IAM is
+# no longer owned by this repo (infrastructure-ownership-policy.md §35). For
+# reference, the grant to add there:
 #
-# Add to alpha-engine-step-functions-role.json:
 #   {
 #     "Sid": "InvokeWeeklyPreflight",
 #     "Effect": "Allow",
@@ -127,8 +128,8 @@ fi
 #   }
 echo ""
 echo "NOTE: The SF execution role grant (lambda:InvokeFunction on ${FUNCTION_NAME})"
-echo "must be added to infrastructure/iam/alpha-engine-step-functions-role.json"
-echo "and applied via infrastructure/iam/apply.sh before the step function can"
+echo "must be added to the SF execution role policy in the nous-ergon-ops repo"
+echo "and applied via that repo's apply.sh before the step function can"
 echo "invoke this Lambda."
 echo ""
 

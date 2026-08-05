@@ -30,6 +30,19 @@
             "Effect": "Allow",
             "Action": "s3:GetObject",
             "Resource": "arn:aws:s3:::alpha-engine-research/*"
+        },
+        {
+            "Sid": "ListS3ConfigPrefix",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::alpha-engine-research",
+            "Condition": {
+                "StringLike": {
+                    "s3:prefix": [
+                        "*"
+                    ]
+                }
+            }
         }
     ]
 }
