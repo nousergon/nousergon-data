@@ -18,7 +18,8 @@
         "ec2:RunInstances",
         "ec2:CreateTags",
         "ec2:DescribeInstances",
-        "ec2:DescribeInstanceStatus"
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeSpotInstanceRequests"
       ],
       "Resource": "*"
     },
@@ -127,6 +128,29 @@
       "Effect": "Allow",
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/*"
+    },
+    {
+      "Sid": "ListGroomDispatchLeases",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "locks/*"
+        }
+      }
+    },
+    {
+      "Sid": "GroomDispatchLeaseRW",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/locks/groom-*"
     },
     {
       "Sid": "FlowDoctorDedupStore",

@@ -190,6 +190,15 @@
       }
     },
     {
+      "Sid": "AgentDispatchCompletenessSSM",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:ListCommandInvocations",
+        "ssm:DescribeInstanceInformation"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "FlowDoctorDedupStore",
       "Effect": "Allow",
       "Action": [

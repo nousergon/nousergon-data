@@ -54,6 +54,16 @@
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
 # (deleted) on deploy, so removing a cadence here removes it live too.
 #
+# alpha-engine-config-I6461 (groom-sweep-policy §2.9/§4.8):
+# ../../scheduler/schedule-manifest.json is the declarative record of every
+# trigger below — name, stated reason, and (for the sweep rules) the
+# attended-window flag — checked against these arrays by
+# ../../scheduler/check-manifest-drift.py. GROOM_TARGET_DETECTION_LATENCY_MIN
+# and the GROOM_ATTENDED_WINDOW_* env vars set on the Lambda below (steps 2b/
+# 3) are bound to the SAME manifest by
+# tests/test_attended_window_gate.py::test_env_defaults_match_manifest — edit
+# the manifest first, then these values, never only one.
+#
 # Managed OUTSIDE CloudFormation — same rationale as the sibling dispatchers
 # (keeps the github-actions-lambda-deploy OIDC role's blast radius narrow: it
 # deliberately lacks iam:CreateRole/iam:PutRolePolicy, a fleet-wide policy
@@ -301,7 +311,7 @@ if $BOOTSTRAP_IAM; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high",GROOM_ATTENDED_WINDOW_TZ="America/Los_Angeles",GROOM_ATTENDED_WINDOW_START_HOUR="8",GROOM_ATTENDED_WINDOW_END_HOUR="21",GROOM_TARGET_DETECTION_LATENCY_MIN="240"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -645,7 +655,7 @@ fi
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high",GROOM_ATTENDED_WINDOW_TZ="America/Los_Angeles",GROOM_ATTENDED_WINDOW_START_HOUR="8",GROOM_ATTENDED_WINDOW_END_HOUR="21",GROOM_TARGET_DETECTION_LATENCY_MIN="240"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

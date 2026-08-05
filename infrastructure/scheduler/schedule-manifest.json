@@ -1,0 +1,123 @@
+{
+  "_meta": {
+    "purpose": "Single source of truth for every dispatch trigger driving the backlog groom/sweep loop (groom-sweep-policy.md §2.9, §4.8; alpha-engine-config-I6461). Every EventBridge Scheduler rule and reconciler interval that can start the loop is named here, with the detection-latency target it serves and whether it is allowed to take an irreversible (expensive-tier, §4.6) action.",
+    "scope": "Scheduler-level triggers only — rules that EventBridge Scheduler fires. The SF's own internal DispatchEndOfSfSweep state (step_function_groom.json) is NOT a Scheduler trigger (it has no cron of its own; it fires as the unconditional tail of an already-running cycle, schedule label \"end-of-sf-sweep\") and is out of scope by design — gating it would contradict its purpose as the drain-the-backlog tail-catcher (see deploy.sh's SWEEP_SCHED comment and §2.5).",
+    "checked_by": "infrastructure/scheduler/check-manifest-drift.py",
+    "assumption": "attended_window is a STATED ASSUMPTION (Brian has not ruled on exact hours): America/Los_Angeles 08:00-21:00, the daytime complement of the §4.8-measured 21:00-05:00 local dead zone. Revisit if Brian rules a different window.",
+    "last_verified": "2026-08-04"
+  },
+  "dispatch_interval": {
+    "status": "STUBBED — not yet derived",
+    "derivation_formula": "interval = f(target_detection_latency_min, observed_arrival_rate_per_day)",
+    "blocked_on": "alpha-engine-config-I6319 (F1-F7 emitter: not yet landed as of 2026-08-04 — no arrival-rate feed exists). Once it lands, replace target_detection_latency_min below with the computed interval and cite the emitted arrival-rate artifact here.",
+    "target_detection_latency_min": 240,
+    "target_detection_latency_source": "config value, GROOM_TARGET_DETECTION_LATENCY_MIN (infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh) — NOT auto-derived. Centralizing it here (rather than a bare literal buried in deploy.sh's SCHED_CRONS) is the interim closes-when I6461 asks for pending I6319.",
+    "note": "This value does not yet DRIVE the crons below — SCHED_CRONS in deploy.sh remains the literal source EventBridge reads. It is the config value the eventual derivation will consume; test_dispatch_interval_is_not_a_buried_literal asserts it is centralized here rather than only inline in deploy.sh comments."
+  },
+  "triggers": [
+    {
+      "name": "alpha-engine-scheduled-groom-0400-daily",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 4 * * ? *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SCHED_NAMES/SCHED_CRONS",
+      "run_mode": "full",
+      "reason": "F7 detection-latency target (§2.9): full-backlog demand-all evaluation. Interval is a config value pending I6319, not yet arrival-rate-derived — see dispatch_interval above.",
+      "actuation_tier": "reversible",
+      "actuation_tier_rationale": "Launches a groom box whose only GitHub-observable effect is opening PRs/labels (§4.6 'Free' tier) — it never merges.",
+      "attended_window": null,
+      "adjustment_rule": "none — fires unconditionally on the declared cron; no holiday/Friday shift applies to this trigger today"
+    },
+    {
+      "name": "alpha-engine-scheduled-groom-1200-daily",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 12 * * ? *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SCHED_NAMES/SCHED_CRONS",
+      "run_mode": "full",
+      "reason": "F7 detection-latency target (§2.9): full-backlog demand-all evaluation. Interval is a config value pending I6319 — see dispatch_interval above.",
+      "actuation_tier": "reversible",
+      "actuation_tier_rationale": "Launches a groom box whose only GitHub-observable effect is opening PRs/labels (§4.6 'Free' tier) — it never merges.",
+      "attended_window": null,
+      "adjustment_rule": "none"
+    },
+    {
+      "name": "alpha-engine-scheduled-groom-2000-daily",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 20 * * ? *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SCHED_NAMES/SCHED_CRONS",
+      "run_mode": "full",
+      "reason": "F7 detection-latency target (§2.9): full-backlog demand-all evaluation. Interval is a config value pending I6319 — see dispatch_interval above.",
+      "actuation_tier": "reversible",
+      "actuation_tier_rationale": "Launches a groom box whose only GitHub-observable effect is opening PRs/labels (§4.6 'Free' tier) — it never merges.",
+      "attended_window": null,
+      "adjustment_rule": "none"
+    },
+    {
+      "name": "alpha-engine-scheduled-groom-sun0900-weekly",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 9 ? * SUN *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SCHED_NAMES/SCHED_CRONS",
+      "run_mode": "full",
+      "reason": "F7 detection-latency target (§2.9): weekly extra demand-all slot. Interval is a config value pending I6319 — see dispatch_interval above.",
+      "actuation_tier": "reversible",
+      "actuation_tier_rationale": "Launches a groom box whose only GitHub-observable effect is opening PRs/labels (§4.6 'Free' tier) — it never merges.",
+      "attended_window": null,
+      "adjustment_rule": "none identified — fires unconditionally every Sunday. Distinct from the weekly-SF pipeline's own holiday-aware run-day gate (step_function.json CheckWeeklyRunDay, alpha-engine-config-I1557), which governs the Saturday DATA pipeline, not this groom trigger. If a future change makes this Sunday slot holiday/Friday-aware (I6177's gotcha anticipates this), record the rule here, not only in deploy.sh."
+    },
+    {
+      "name": "alpha-engine-groom-sweep-0000-daily",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 0 * * ? *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SWEEP_SCHED_NAMES/SWEEP_SCHED_CRONS",
+      "run_mode": "sweep",
+      "reason": "F5 open-queue trustworthiness (§2.6): independent PR-sweep cadence, decoupled from groom cycle health (Brian ruling 2026-07-30).",
+      "actuation_tier": "irreversible",
+      "actuation_tier_rationale": "PR sweep is the fleet's merge-capable machinery (standing self-merge exceptions in auto-merge-policy.md) — the nearest thing this Lambda dispatches to §4.6's 'Expensive' tier (merging/closing an issue/deleting a branch), even though the merge call itself happens on-box in a different repo.",
+      "attended_window": {"tz": "America/Los_Angeles", "start_hour": 8, "end_hour": 21},
+      "adjustment_rule": "none — fires unconditionally on the declared cron"
+    },
+    {
+      "name": "alpha-engine-groom-sweep-0800-daily",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 8 * * ? *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SWEEP_SCHED_NAMES/SWEEP_SCHED_CRONS",
+      "run_mode": "sweep",
+      "reason": "F5 open-queue trustworthiness (§2.6): independent PR-sweep cadence, decoupled from groom cycle health (Brian ruling 2026-07-30).",
+      "actuation_tier": "irreversible",
+      "actuation_tier_rationale": "PR sweep is the fleet's merge-capable machinery (standing self-merge exceptions in auto-merge-policy.md) — the nearest thing this Lambda dispatches to §4.6's 'Expensive' tier.",
+      "attended_window": {"tz": "America/Los_Angeles", "start_hour": 8, "end_hour": 21},
+      "adjustment_rule": "none"
+    },
+    {
+      "name": "alpha-engine-groom-sweep-1600-daily",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "cron(0 16 * * ? *)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "SWEEP_SCHED_NAMES/SWEEP_SCHED_CRONS",
+      "run_mode": "sweep",
+      "reason": "F5 open-queue trustworthiness (§2.6): independent PR-sweep cadence, decoupled from groom cycle health (Brian ruling 2026-07-30).",
+      "actuation_tier": "irreversible",
+      "actuation_tier_rationale": "PR sweep is the fleet's merge-capable machinery (standing self-merge exceptions in auto-merge-policy.md) — the nearest thing this Lambda dispatches to §4.6's 'Expensive' tier.",
+      "attended_window": {"tz": "America/Los_Angeles", "start_hour": 8, "end_hour": 21},
+      "adjustment_rule": "none"
+    },
+    {
+      "name": "alpha-engine-groom-lane-reconciler-5min",
+      "trigger_kind": "eventbridge-scheduler-rule",
+      "cron": "rate(5 minutes)",
+      "source_file": "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh",
+      "declared_as": "RECON_SCHED_NAME/RECON_SCHED_CRON",
+      "run_mode": "reconcile",
+      "reason": "F8 availability (§2.8): screens live EC2 lane state + dispatch-SF execution receipts for a dead lane/trigger inside the ~3.83h lane budget it watches (groom-sweep-policy §2.7, alpha-engine-config-I5229/I4988) — the interval must stay well inside that budget, not itself derived from arrival rate.",
+      "actuation_tier": "reversible",
+      "actuation_tier_rationale": "Invokes the Lambda in mode=reconcile: reads EC2/SF state and sends notifications only — never launches a box or touches GitHub.",
+      "attended_window": null,
+      "adjustment_rule": "none"
+    }
+  ]
+}

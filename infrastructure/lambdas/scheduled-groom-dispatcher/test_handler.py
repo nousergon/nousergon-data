@@ -1744,7 +1744,13 @@ def test_dispatch_ledger_write_failure_terminates_box_and_raises(monkeypatch):
     monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 0)
 
     def _boom(**kw):
-        raise RuntimeError("S3 down")
+        # I6460: the per-lane dispatch lease also writes via put_object
+        # (a different key, locks/groom-lane-*.lock) BEFORE the ledger —
+        # only the ledger key must fail here, so the lease acquire still
+        # succeeds and the launch proceeds far enough to need terminating.
+        if "dispatch-ledger" in kw.get("Key", ""):
+            raise RuntimeError("S3 down")
+        return idx._test_s3.__class__.put_object(idx._test_s3, **kw)
 
     monkeypatch.setattr(idx._test_s3, "put_object", _boom)
     with pytest.raises(RuntimeError, match="S3 down"):
@@ -2745,6 +2751,219 @@ def test_trigger_health_pages_running_execution_without_record(monkeypatch):
     assert th["missing"][0]["execution_status"] == "RUNNING"
 
 
+# ── F8 scheduled-cycle record (groom-sweep-policy §2.8, alpha-engine-config-
+# I6325) ─────────────────────────────────────────────────────────────────────
+# Deliverable 1: the scheduler emits a scheduled-cycle record independently
+# of the cycle — sourced from the dispatch SF's own execution history, the
+# same source the trigger-health leg already reads.
+
+
+def test_scheduled_cycle_record_written_for_mature_execution(monkeypatch):
+    """A mature execution gets a groom/_control/scheduled/{date}/{hhmm}.json
+    record, regardless of whether its decision record exists."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    idx.handler({"mode": "reconcile"}, None)
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    key = f"groom/_control/scheduled/{started:%Y-%m-%d}/{started:%H%M}.json"
+    assert key in idx._test_s3._objects
+    body = json.loads(idx._test_s3._objects[key])
+    assert body["execution_arn"] == exec_["executionArn"]
+
+
+def test_scheduled_cycle_record_written_even_when_decision_record_present(monkeypatch):
+    """A healthy execution (decision record present, no page) still gets its
+    scheduled record — F8's 'scheduled' count must not depend on the cycle's
+    own health."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={
+        _decision_key_for_execution(exec_): b'{"trigger": "demand-all"}',
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["trigger_health"]["paged"] == 0
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    key = f"groom/_control/scheduled/{started:%Y-%m-%d}/{started:%H%M}.json"
+    assert key in idx._test_s3._objects
+
+
+def test_scheduled_cycle_record_idempotent_across_ticks(monkeypatch):
+    """A slot already carrying a scheduled record is not overwritten on the
+    next tick — the write is a plain existence check, not a refresh."""
+    exec_ = _sfn_exec(hours_ago=3)
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    key = f"groom/_control/scheduled/{started:%Y-%m-%d}/{started:%H%M}.json"
+    seeded = json.dumps({"execution_arn": "PRE-EXISTING", "sentinel": True}).encode()
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={key: seeded})
+    idx.handler({"mode": "reconcile"}, None)
+    assert idx._test_s3._objects[key] == seeded
+
+
+def test_scheduled_cycle_record_not_written_within_maturity_window(monkeypatch):
+    """An execution still within its maturity window is not yet examined at
+    all, so no scheduled record is written for it prematurely — mirrors the
+    trigger-health leg's own 'checked == 0' behavior for the same input."""
+    exec_ = _sfn_exec(hours_ago=0.25)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    idx.handler({"mode": "reconcile"}, None)
+    assert not any(k.startswith("groom/_control/scheduled/") for k in idx._test_s3._objects)
+
+
+# ── F8 lane-start-health reconciler (alpha-engine-config-I6325) ─────────────
+# Deliverable 3 (fast paging leg): a decided lane launch (a dispatch-ledger
+# entry that reached EC2) that never wrote its on-box started marker within
+# the maturity window pages — the I4987 failure mode, caught in ~15 minutes
+# instead of the 6h SF timeout. Distinct population from the trigger-health
+# tests above: those cover "the Lambda never decided"; these cover "the
+# Lambda decided and launched, but the charter never ran."
+
+
+def _mature_ledger_entry(run_token: str = "tok1", *, minutes_ago: float = 20,
+                         schedule: str = "0 4 * * *") -> bytes:
+    from datetime import datetime, timedelta, timezone
+    recorded = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    return json.dumps({
+        "run_token": run_token, "tier_tag": "mid-only", "schedule": schedule,
+        "instance_id": "i-launched", "deadline_utc": _future_deadline(),
+        "recorded_at": recorded,
+    }).encode()
+
+
+def _started_key(run_token: str = "tok1", *, days_ago: int = 0) -> str:
+    from datetime import datetime, timedelta, timezone
+    day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    return f"groom/_control/started/{day}/{run_token}.json"
+
+
+def test_lane_start_health_pages_when_never_started(monkeypatch):
+    """A mature, decided, launched lane with no started or completed marker
+    pages — the box never reached its charter."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 1
+    assert "groom/_control/reconciled-lane-start/tok1.json" in idx._test_s3._objects
+
+
+def test_lane_start_health_quiet_when_started_marker_present(monkeypatch):
+    """A started marker (the charter began) satisfies the check — no page."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+        _started_key(): json.dumps({"mode": "full", "started_at": "2026-08-04T00:00:00Z"}).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_quiet_when_completed_marker_present(monkeypatch):
+    """A completed marker with no started marker still satisfies the check —
+    the lane reached SOME terminal outcome; it is not silently stuck."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+        "groom/_control/completed/tok1.json": json.dumps({"outcome": "failure", "rc": 1}).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_not_yet_mature_is_not_checked(monkeypatch):
+    """A lane decided moments ago (well under the maturity window) is not yet
+    a miss — bootstrap (dnf install + git clone) legitimately takes minutes."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(minutes_ago=2),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 0
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_actioned_lane_is_not_repaged(monkeypatch):
+    """An already-actioned never-started lane is not re-paged on the next tick."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+        "groom/_control/reconciled-lane-start/tok1.json": json.dumps(
+            {"outcome": "lane_never_started"}).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_ignores_pre_launch_only_ledger_entry(monkeypatch):
+    """config#3173's FIRST (pre-launch) ledger write carries no instance_id —
+    there is no EC2 request yet to check a started marker against, so it must
+    never be counted or paged."""
+    from datetime import datetime, timezone
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 4 * * *",
+            "instance_id": "", "deadline_utc": "",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 0
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_listing_error_is_fail_safe(monkeypatch):
+    """A broken S3 listing must never page — the tick is skipped and retried.
+
+    Calls the reconciler leg directly (not through handler({"mode":
+    "reconcile"})) because `_reconcile_lane_death` reads the SAME dispatch-
+    ledger prefix earlier in that dispatch chain and has no fail-safe wrapper
+    of its own around its listing call — patching `get_paginator` globally
+    would fail that unrelated, earlier leg instead of exercising this one.
+    """
+    idx = _load(monkeypatch, s3_objects={_ledger_key(): _mature_ledger_entry()})
+
+    class _RaisingPaginator:
+        def paginate(self, **kw):
+            raise RuntimeError("simulated S3 outage")
+
+    idx._test_s3.get_paginator = lambda name: _RaisingPaginator()
+    result = idx._reconcile_lane_start_health()
+    assert result["checked"] == 0
+    assert result["paged"] == 0
+
+
+def test_lane_start_health_batches_multiple_lanes_into_one_page(monkeypatch):
+    """2026-08-04 incident: this leg's first-ever run found a 2-day backlog of
+    27 never-started lanes and paged each individually, flooding the operator
+    channel and plausibly tripping Telegram's own rate limit. N discoveries in
+    one cycle must produce exactly ONE notify call, not N."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok1"): _mature_ledger_entry("tok1"),
+        _ledger_key("tok2"): _mature_ledger_entry("tok2"),
+        _ledger_key("tok3"): _mature_ledger_entry("tok3"),
+    })
+    notified = _spy_notify(monkeypatch, idx)
+    result = idx._reconcile_lane_start_health()
+    assert result["checked"] == 3
+    assert result["paged"] == 3
+    assert len(notified) == 1  # one digest, not three individual pages
+    text, kw = notified[0]
+    assert "3 groom lane(s) NEVER STARTED" in text
+    assert "tok1" in text and "tok2" in text and "tok3" in text
+    assert kw["context"]["count"] == 3
+    # Each lane is still individually actioned, so a later tick doesn't
+    # re-discover (and re-page) any of them.
+    for tok in ("tok1", "tok2", "tok3"):
+        assert f"groom/_control/reconciled-lane-start/{tok}.json" in idx._test_s3._objects
+
+
 def test_reconcile_sends_task_failure_for_dead_lane_with_token(monkeypatch):
     """Lane death with a task_token → send-task-failure collapses the hung SF
     execution immediately instead of waiting for the 6h timeout."""
@@ -3433,3 +3652,273 @@ def test_short_token_is_rendered_whole(monkeypatch):
     assert "run_token=tok-short " in text or "run_token=tok-short\n" in text, (
         f"a short token must render verbatim, got: {text}"
     )
+
+
+# ── alpha-engine-config-I6460 (§5.9): per-lane singleton dispatch lease ──────
+# groom-sweep-policy.md §5.9: "The loop holds a singleton lease per lane. A
+# dispatch that cannot take the lease exits, recording that it yielded; it
+# does not queue behind the holder and it does not run beside it." The lease
+# PRIMITIVE itself (acquire/TTL-self-recovery/force-override) is unit-tested
+# directly in nousergon-lib's own test_dispatch_lease.py — these tests pin
+# the DISPATCHER's behavior around that primitive: what it does when the
+# lease can/cannot be acquired, and that it never bypasses the mechanism.
+#
+# `idx.dispatch_lease` is the real `nousergon_lib.dispatch_lease` module
+# (not stubbed — only ec2_spot/boto3/github_app are hermetic stubs here), so
+# these tests monkeypatch its `acquire_lease`/`release_lease` functions
+# directly per groom-sweep-conformance's own "mock the lease backend"
+# guidance rather than relying on `_FakeS3`, which does not implement S3's
+# `IfNoneMatch` conditional-PUT semantics at all (every `put_object` call
+# unconditionally succeeds) and so cannot exercise a real acquire conflict.
+
+def test_lane_lease_yield_when_held_by_another(monkeypatch):
+    """The core §5.9 property applied to the actual dispatch path: when the
+    per-lane lease cannot be acquired, the dispatcher yields IMMEDIATELY —
+    it never queues, never launches, and records why."""
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(True) or "i-should-never-launch",
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
+    holder = idx.dispatch_lease.LeaseHolder(
+        owner_id="other-cycle", started_at="2026-08-04T00:00:00Z",
+        ttl_epoch=9_999_999_999, hostname="box-y", pid=2,
+    )
+
+    def _acquire(lock_key, *, owner_id, ttl_seconds, bucket, s3_client=None, force=False):
+        return idx.dispatch_lease.LeaseAcquireResult(acquired=False, holder=holder)
+
+    monkeypatch.setattr(idx.dispatch_lease, "acquire_lease", _acquire)
+
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    g = out["groom"]
+    assert g["launched"] is False
+    assert g["reason"] == "lane_lease_yielded"
+    assert g["lease_holder_owner_id"] == "other-cycle"
+    assert launched == []  # never attempted a spot launch — zero spend
+
+
+def test_lane_lease_acquired_allows_normal_launch(monkeypatch):
+    """A successfully-acquired lease does not block or alter a normal
+    launch — the happy path is unchanged."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    calls = []
+
+    def _acquire(lock_key, *, owner_id, ttl_seconds, bucket, s3_client=None, force=False):
+        calls.append({"lock_key": lock_key, "force": force})
+        holder = idx.dispatch_lease.LeaseHolder(
+            owner_id=owner_id, started_at="x", ttl_epoch=1, hostname="h", pid=1)
+        return idx.dispatch_lease.LeaseAcquireResult(acquired=True, holder=holder)
+
+    monkeypatch.setattr(idx.dispatch_lease, "acquire_lease", _acquire)
+    monkeypatch.setattr(idx.dispatch_lease, "release_lease", lambda *a, **kw: None)
+
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+    # Both leases were taken: the lane lease, and the shared spot-launch
+    # lease wrapping the RunInstances call.
+    lock_keys = {c["lock_key"] for c in calls}
+    assert "locks/groom-lane-mid-only.lock" in lock_keys
+    assert "locks/groom-spot-capacity-pool.lock" in lock_keys
+    # attempt=0 (no live-EC2 proof of a dead holder) — never forces.
+    assert all(c["force"] is False for c in calls)
+
+
+def test_lane_lease_relaunch_attempt_forces_override(monkeypatch):
+    """A bounded SF relaunch (attempt > 0) whose prior box was confirmed
+    termination-imminent must pass force=True for the LANE lease — it has
+    independent, live proof the recorded holder is dead."""
+    idx = _load(
+        monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"},
+        running_tier_instances={"low-only": ["i-dying"]},
+        spot_reclaimed={"i-dying": _reclaimed_sir("i-dying")},
+    )
+    lane_calls = []
+
+    def _acquire(lock_key, *, owner_id, ttl_seconds, bucket, s3_client=None, force=False):
+        if lock_key == "locks/groom-lane-low-only.lock":
+            lane_calls.append(force)
+        holder = idx.dispatch_lease.LeaseHolder(
+            owner_id=owner_id, started_at="x", ttl_epoch=1, hostname="h", pid=1)
+        return idx.dispatch_lease.LeaseAcquireResult(acquired=True, holder=holder)
+
+    monkeypatch.setattr(idx.dispatch_lease, "acquire_lease", _acquire)
+    monkeypatch.setattr(idx.dispatch_lease, "release_lease", lambda *a, **kw: None)
+
+    out = idx.handler(
+        {"run_mode": "full", "issue_filter": "low-only", "schedule": "x", "attempt": 1}, None)
+    assert out["groom"]["launched"] is True
+    assert lane_calls == [True]
+
+
+def test_lane_lease_released_on_dispatch_ceiling_skip(monkeypatch):
+    """A lease acquired but then not used (daily ceiling exhausted) must be
+    released immediately rather than blocking the lane for the full TTL."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "0"})
+    released = []
+
+    def _acquire(lock_key, *, owner_id, ttl_seconds, bucket, s3_client=None, force=False):
+        holder = idx.dispatch_lease.LeaseHolder(
+            owner_id=owner_id, started_at="x", ttl_epoch=1, hostname="h", pid=1)
+        return idx.dispatch_lease.LeaseAcquireResult(acquired=True, holder=holder)
+
+    def _release(lock_key, *, bucket, s3_client=None):
+        released.append(lock_key)
+
+    monkeypatch.setattr(idx.dispatch_lease, "acquire_lease", _acquire)
+    monkeypatch.setattr(idx.dispatch_lease, "release_lease", _release)
+    monkeypatch.setattr(idx, "_prior_launch_count_today", lambda: 0)
+
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is False
+    assert out["groom"]["reason"] == "dispatch_ceiling_exhausted"
+    assert "locks/groom-lane-mid-only.lock" in released
+
+
+def test_spot_launch_lease_exhausted_retries_raises_without_launching(monkeypatch):
+    """§5.9.3 shared-resource lease: if the brief RunInstances critical
+    section can never be claimed (bounded retries exhausted), the dispatch
+    fails loud rather than launching un-serialized — a silent bypass would
+    reopen the exact 2026-07-28 race this lease exists to close."""
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(True) or "i-should-never-launch",
+        env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
+    monkeypatch.setattr(idx.time, "sleep", lambda *_a, **_kw: None)  # no real waiting in tests
+
+    def _acquire(lock_key, *, owner_id, ttl_seconds, bucket, s3_client=None, force=False):
+        holder = idx.dispatch_lease.LeaseHolder(
+            owner_id="rival", started_at="x", ttl_epoch=1, hostname="h", pid=1)
+        if lock_key == "locks/groom-spot-capacity-pool.lock":
+            return idx.dispatch_lease.LeaseAcquireResult(acquired=False, holder=holder)
+        return idx.dispatch_lease.LeaseAcquireResult(
+            acquired=True,
+            holder=idx.dispatch_lease.LeaseHolder(
+                owner_id=owner_id, started_at="x", ttl_epoch=1, hostname="h", pid=1),
+        )
+
+    released = []
+    monkeypatch.setattr(idx.dispatch_lease, "acquire_lease", _acquire)
+    monkeypatch.setattr(idx.dispatch_lease, "release_lease",
+                        lambda lock_key, **kw: released.append(lock_key))
+
+    with pytest.raises(RuntimeError, match="spot-launch lease"):
+        idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert launched == []  # never reached RunInstances
+    # The LANE lease (acquired successfully) was released on the failure path.
+    assert "locks/groom-lane-mid-only.lock" in released
+
+
+def test_spot_launch_lease_wraps_and_releases_around_launch_instance(monkeypatch):
+    """The shared spot-launch lease is acquired immediately before, and
+    released immediately after, the RunInstances call — never held across
+    the lane's subsequent SSM/bootstrap steps."""
+    order = []
+
+    def _launch(types_, subnets, **kw):
+        order.append("run_instances")
+        return "i-stub"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"})
+
+    def _acquire(lock_key, *, owner_id, ttl_seconds, bucket, s3_client=None, force=False):
+        if lock_key == "locks/groom-spot-capacity-pool.lock":
+            order.append("acquire_spot_launch")
+        holder = idx.dispatch_lease.LeaseHolder(
+            owner_id=owner_id, started_at="x", ttl_epoch=1, hostname="h", pid=1)
+        return idx.dispatch_lease.LeaseAcquireResult(acquired=True, holder=holder)
+
+    def _release(lock_key, *, bucket, s3_client=None):
+        if lock_key == "locks/groom-spot-capacity-pool.lock":
+            order.append("release_spot_launch")
+
+    monkeypatch.setattr(idx.dispatch_lease, "acquire_lease", _acquire)
+    monkeypatch.setattr(idx.dispatch_lease, "release_lease", _release)
+
+    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    assert out["groom"]["launched"] is True
+    assert order == ["acquire_spot_launch", "run_instances", "release_spot_launch"]
+
+
+# ── §5.9.4: yielded-dispatch paging when a lane starves for a whole day ──────
+
+class _FixedNow(datetime):
+    """Subclasses stdlib datetime so `index.py`'s `datetime.now(tz)` calls
+    resolve to a fixed instant — only `.now()` is overridden, every other
+    classmethod (`.fromisoformat`, the constructor, etc.) is unchanged."""
+    _fixed = datetime(2026, 8, 4, 23, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is not None else cls._fixed.replace(tzinfo=None)
+
+
+def _decision_record(*entries):
+    return json.dumps({"schema_version": 2, "decisions": list(entries)}).encode()
+
+
+def test_lane_yield_starvation_pages_when_all_yielded(monkeypatch):
+    idx = _load(monkeypatch, s3_objects={
+        "groom/decisions/2026-08-04/trigger-0400.json": _decision_record(
+            {"tier_tag": "mid-only", "launch": False, "reason": "lane_lease_yielded"}),
+        "groom/decisions/2026-08-04/trigger-1200.json": _decision_record(
+            {"tier_tag": "mid-only", "launch": False, "reason": "lane_lease_yielded"}),
+    })
+    monkeypatch.setattr(idx, "datetime", _FixedNow)
+    result = idx.handler({"mode": "reconcile"}, None)
+    ys = result["lane_yield_starvation"]
+    assert ys["evaluated"] is True
+    assert ys["starved_lanes"] == ["mid-only"]
+    assert ys["paged"] == 1
+    assert "groom/_control/reconciled-lane-yield-starvation/2026-08-04.json" in idx._test_s3._objects
+
+
+def test_lane_yield_starvation_no_page_when_a_launch_occurred(monkeypatch):
+    idx = _load(monkeypatch, s3_objects={
+        "groom/decisions/2026-08-04/trigger-0400.json": _decision_record(
+            {"tier_tag": "mid-only", "launch": False, "reason": "lane_lease_yielded"}),
+        "groom/decisions/2026-08-04/trigger-1200.json": _decision_record(
+            {"tier_tag": "mid-only", "launch": True}),
+    })
+    monkeypatch.setattr(idx, "datetime", _FixedNow)
+    result = idx.handler({"mode": "reconcile"}, None)
+    ys = result["lane_yield_starvation"]
+    assert ys["starved_lanes"] == []
+    assert ys["paged"] == 0
+
+
+def test_lane_yield_starvation_skipped_before_eval_hour(monkeypatch):
+    class _EarlyNow(datetime):
+        _fixed = datetime(2026, 8, 4, 13, 0, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls._fixed if tz is not None else cls._fixed.replace(tzinfo=None)
+
+    idx = _load(monkeypatch, s3_objects={
+        "groom/decisions/2026-08-04/trigger-0400.json": _decision_record(
+            {"tier_tag": "mid-only", "launch": False, "reason": "lane_lease_yielded"}),
+    })
+    monkeypatch.setattr(idx, "datetime", _EarlyNow)
+    result = idx.handler({"mode": "reconcile"}, None)
+    ys = result["lane_yield_starvation"]
+    assert ys["evaluated"] is False
+    assert ys["paged"] == 0
+
+
+def test_lane_yield_starvation_ignores_non_yield_skip_reasons(monkeypatch):
+    """A lane that was skipped for an unrelated reason (e.g. the ceiling)
+    every time is not a lease-starvation condition — only lane_lease_yielded
+    counts toward this specific page."""
+    idx = _load(monkeypatch, s3_objects={
+        "groom/decisions/2026-08-04/trigger-0400.json": _decision_record(
+            {"tier_tag": "mid-only", "launch": False, "reason": "dispatch_ceiling_exhausted"}),
+    })
+    monkeypatch.setattr(idx, "datetime", _FixedNow)
+    result = idx.handler({"mode": "reconcile"}, None)
+    ys = result["lane_yield_starvation"]
+    assert ys["starved_lanes"] == []
+    assert ys["paged"] == 0
