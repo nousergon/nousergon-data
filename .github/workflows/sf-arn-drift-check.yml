@@ -1,9 +1,10 @@
 name: SF-ARN Drift Check
 
-# Catches drift on three config#1464 axes: EventBridge rule stateMachineArn
-# drift, Step Function LoggingConfiguration drift, and SF lambda:invoke
-# states referencing Lambdas that don't exist live (the 2026-07-08 EOD
-# incident class). Mirrors iam-drift-check.yml's trigger/auth shape exactly
+# Catches drift on four config#1464 axes: EventBridge rule stateMachineArn
+# drift, Step Function LoggingConfiguration drift, SF lambda:invoke
+# states referencing Lambdas that don't exist live, and SF definition drift
+# (codified vs live vs S3-staged — see check-definition-drift.py). Mirrors
+# iam-drift-check.yml's trigger/auth shape exactly
 # (same OIDC role, same PR-touching-path + daily + workflow_dispatch
 # trigger set) — see that workflow's header for why this shape (PR-time
 # catch + daily out-of-band sweep).
@@ -64,6 +65,9 @@ jobs:
       - name: SF lambda:invoke Lambda-existence check (codified vs live)
         run: python3 infrastructure/step-functions/check-lambda-existence.py
 
+      - name: SF definition drift (codified vs live vs S3-staged)
+        run: python3 infrastructure/step-functions/check-definition-drift.py
+
       # alpha-engine-config-I5805. The out-of-band half of schedule coverage.
       # deploy-scheduled-groom-dispatcher.yml reconciles + asserts on every
       # merge, which closes drift caused by a merge; this catches what no merge
@@ -99,3 +103,13 @@ jobs:
       - name: EventBridge Scheduler rule drift (fleet-wide, codified vs live)
         if: github.event_name != 'pull_request'
         run: python3 infrastructure/scheduler/check-schedule-drift.py
+
+      # alpha-engine-config-I6461: the manifest-vs-live leg check-schedule-
+      # drift.py above does not cover (manifest completeness — reason +
+      # actuation_tier + attended_window present — and manifest cron vs LIVE
+      # AWS state, not just vs the deploy.sh literal). Daily-only, like the
+      # fleet-wide check above: --live makes an AWS call per manifest entry,
+      # too costly to run on every PR.
+      - name: schedule-manifest.json drift (fleet-wide, vs live AWS)
+        if: github.event_name != 'pull_request'
+        run: python3 infrastructure/scheduler/check-manifest-drift.py --live

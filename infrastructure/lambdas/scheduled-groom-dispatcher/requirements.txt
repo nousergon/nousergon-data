@@ -54,5 +54,26 @@ boto3>=1.34.0
 # and CI green throughout. A floor is not an exemption; root >= floor satisfies it.
 # The exemption is removed and the tier-model floor is asserted explicitly in
 # tests/test_lib_pin_lockstep.py::test_groom_dispatcher_pin_can_express_the_policy_tier_table.
-# Bump this in lockstep with the root pin.
-nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.27
+# v0.124.34 (nousergon-lib-PR286, merged 2026-08-03) adds spot_dispatch.termination_imminent —
+# the reclaim-aware leg of the concurrent guard (config#1979). A spot-reclaimed
+# instance is observably `running` for ~2 min after the interruption notice, so
+# the relaunch ladder (attempt > 0) must see past State.Name via the spot
+# request's Status.Code or it suppresses its own replacement and the lane dies
+# unworked (measured 2026-08-02 20:00 UTC). This Lambda's _launch_groom_spot
+# calls it directly; pin must stay >= v0.124.34. (The branch was authored against
+# a predicted v0.124.33; main autobumped past it twice before this merged, so the
+# version this symbol actually shipped in is .34 — see PR286.)
+# v0.124.36 (PREDICTED — nousergon-lib PR#290, alpha-engine-config-I6460) adds
+# nousergon_lib.dispatch_lease.acquire_lease/release_lease, the per-lane
+# singleton dispatch lease this Lambda's _launch_groom_spot/_launch_instance_
+# serialized now import and call directly. main was at v0.124.36 when PR#290
+# was opened, so .36 is the predicted post-merge auto-bump tag — mirrors the
+# PR286 precedent above (a predicted version, corrected if main autobumps past
+# it before merge). THIS PIN CANNOT RESOLVE until nousergon-lib PR#290 merges
+# and its version auto-bump tags the resulting release — see that PR for
+# status. If CI on THIS PR is red on a `pip install` / `ModuleNotFoundError:
+# nousergon_lib.dispatch_lease` failure, that is why; re-verify the actual
+# post-merge tag against `git -C nousergon-lib tag --sort=-v:refname | head -1`
+# and correct this line if it drifted from .36, then bump this in lockstep
+# with the root pin.
+nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.36

@@ -30,6 +30,14 @@
 # scheduled invocation once this code is deployed — see the PR body for why
 # the code deploy itself is ALSO held pending that same bootstrap pass.
 #
+# alpha-engine-config-I5262 (2026-07-29): added s3:GetObject + s3:ListBucket
+# on the ci_watch/* prefix (ci-watch dispatch-invocation-success check, a new
+# subtype of the generalized dispatch_outcome check that reads
+# ci_watch/_control/dispatched/ records and asserts matching completion markers
+# at ci_watch/_control/completed/). Also added the same for groom/*
+# dispatch-ledger and alert-drain/* completion markers (all three dispatch
+# families). An operator must re-run `deploy.sh --apply-iam` to pick these up.
+#
 # I4480 (2026-07-31): added lambda:InvokeFunction for
 # alpha-engine-overseer-backstop-responder to iam-policy.json (the liveness
 # probe can now invoke the backstop responder). Not yet applied to the live
@@ -252,7 +260,7 @@ echo "✓ Code deployed."
 # deploy role); the drift check backstops any missed apply.
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
-  || log "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
+  || echo "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
 
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \

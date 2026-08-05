@@ -10,7 +10,15 @@ history's event vocabulary):
 - ``tail_stage_failure``: Parity fails with everything through the
   portfolio-optimizer backtest completed — exercises the skip_backtester
   OVERSHOOT drop (its skip route jumps the failed stage's gate);
-- ``early_failure``: DataPhase1 fails with only MorningEnrich completed.
+- ``early_failure``: DataPhase1 fails with only MorningEnrich completed;
+- ``director_degraded``: the REAL watch-rerun-2026-08-01-4 history (the
+  "permanent fixture" for alpha-engine-config-I6055 — see its test) — the
+  Director hard-failed (ModuleNotFoundError: openai, event 858),
+  PublishDirectorDegraded absorbed it, the tail's health checks degraded
+  too, and the run only failed terminally at WriteCompletionMarker
+  (S3.AccessDeniedException). Its tail states are real events, filtered
+  from the live Step Functions history to the event types this script
+  consumes.
 
 Plus the config#2280 mutex-steal decision matrix and the role-gating
 verification (config#2277 deliverable 2).
@@ -188,6 +196,50 @@ class TestDerivePlan:
         started["executionStartedEventDetails"]["input"] = json.dumps(inp)
         with pytest.raises(SystemExit, match="unreachable"):
             mod.derive_plan(events)
+
+    def test_degraded_tail_is_rerun_not_skipped(self, mod):
+        """alpha-engine-config-I6055: a stage that DEGRADED (ran, failed,
+        and was absorbed by a Publish*Degraded route so the pipeline could
+        continue) must NEVER be treated as complete — skipping it is what
+        made watch-rerun-2026-08-01-5 go green while doing nothing about
+        the Director hard-fail its rerun was started for. This fixture IS
+        the real watch-rerun-2026-08-01-4 history: Director failed with
+        'No module named openai' (event 858), PublishDirectorDegraded
+        absorbed it, the health checks degraded too, and the run only
+        failed terminally at WriteCompletionMarker."""
+        plan = mod.derive_plan(_events("director_degraded"))
+        # the degraded tail must re-run — never skipped, never "completed"
+        assert "post_eval" in plan.degraded
+        assert "post_eval" not in plan.completed
+        assert "skip_post_eval" not in plan.skip_flags
+        # the degradation must be surfaced in the derivation notes
+        assert any("DEGRADED" in n and "PublishDirectorDegraded" in n for n in plan.notes)
+        # stages that genuinely completed cleanly keep their skip flags
+        # (evaluator and parity really ran to completion on this execution)
+        assert plan.skip_flags.get("skip_evaluator") is True
+        assert plan.skip_flags.get("skip_parity") is True
+        assert "evaluator" in plan.completed and "parity" in plan.completed
+        # and the rerun input must not bypass the tail
+        assert "skip_post_eval" not in plan.rerun_input()
+
+    def test_degraded_branch_a_stage_is_rerun_not_skipped(self, mod):
+        """The same degraded-overrides-witness rule holds for branch A:
+        ThinkTankDegraded (alpha-engine-config-I5758) must drop
+        skip_thinktank_coverage even when the stage's witness was also
+        entered — degraded beats completed."""
+        events = _events("tail_stage_failure")  # thinktank_coverage completed
+        events = list(events) + [
+            {
+                "type": "PassStateEntered",
+                "id": 99999,
+                "timestamp": "2026-07-11T09:00:00Z",
+                "stateEnteredEventDetails": {"name": "ThinkTankDegraded"},
+            }
+        ]
+        plan = mod.derive_plan(events)
+        assert "thinktank_coverage" in plan.degraded
+        assert "thinktank_coverage" not in plan.completed
+        assert "skip_thinktank_coverage" not in plan.skip_flags
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +481,35 @@ class TestStageTableLockstep:
                 f"parity degraded witness {d} is not a state in "
                 f"infrastructure/step_function.json — update STAGES"
             )
+
+    def test_every_degraded_state_is_mapped(self, mod, all_states):
+        """Completeness (alpha-engine-config-I6055): a NEW *Degraded /
+        Publish*Degraded route in the SF without a STAGES degraded_witness
+        row means the helper would silently treat a degraded stage as
+        completed and skip it on the rerun — the exact 2026-08-01 defect.
+        The Notify*Degraded family is the terminal degraded-completion
+        EMAIL surface, not a stage degrading, so it is deliberately
+        unmapped."""
+        mapped: dict = {}
+        for stage in mod.STAGES:
+            for d in stage.degraded_witness:
+                assert d in all_states, (
+                    f"{stage.name}: degraded witness {d} is not a state in "
+                    f"infrastructure/step_function.json — update STAGES"
+                )
+                assert d not in mapped, (
+                    f"degraded state {d} is mapped to both {mapped[d]} and "
+                    f"{stage.name} — each degraded route must own exactly "
+                    f"one stage"
+                )
+                mapped[d] = stage.name
+        for name in all_states:
+            if name.endswith("Degraded") and not name.startswith("Notify"):
+                assert name in mapped, (
+                    f"degraded route {name} is not covered by any STAGES "
+                    f"degraded_witness — a degraded {name} stage would be "
+                    f"skipped as complete on a rerun; add it to STAGES"
+                )
 
 
 # ---------------------------------------------------------------------------

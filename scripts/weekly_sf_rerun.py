@@ -9,8 +9,15 @@ Derives, from a FAILED ``ne-weekly-freshness-pipeline`` execution, the exact
   stamped from Execution.StartTime and writes to different artifact prefixes,
   orphaning the prior partial run);
 - the derived ``skip_*`` flag set for every stage the failed execution
-  completed (re-running a succeeded side-effecting stage duplicates its
-  effects — 2026-07-11: duplicate model-zoo promotion emails, config#2252);
+  completed CLEANLY (re-running a succeeded side-effecting stage duplicates
+  its effects — 2026-07-11: duplicate model-zoo promotion emails,
+  config#2252). A stage that DEGRADED — ran, failed, and was absorbed by a
+  ``Publish*Degraded`` route so the pipeline could continue (alpha-engine-
+  config-I6055: observed 2026-08-01 when the Director hard-failed on
+  ``No module named 'openai'`` but the run kept going) — is recorded as
+  degraded and NEVER skipped: it is exactly the thing a mechanical rerun
+  exists to retry, and skipping it would make the rerun's green
+  indistinguishable from a real one;
 - ``pipeline_role="watch-rerun"`` (see ROLE GATING below);
 - ``sns_topic_arn`` / ``ec2_instance_id`` passthrough (the emitted input
   starts from the failed execution's own input, so both carry over).
@@ -107,7 +114,12 @@ RERUNNABLE_SOURCE_STATUSES = frozenset({"FAILED", "TIMED_OUT", "ABORTED"})
 # by tests/test_weekly_sf_rerun.py (witness = the state the SF enters iff the
 # stage completed successfully OR was skipped; either way the rerun must not
 # re-run it, and originally-skipped stages carry their flag from the
-# preserved original input anyway).
+# preserved original input anyway). degraded_witness = a *Degraded /
+# Publish*Degraded state entered iff the stage ran but FAILED and was
+# absorbed fail-open so the pipeline could continue (weekly-sf-policy §2.3);
+# entering one OVERRIDES witness: the stage is re-run, never skipped — the
+# whole point of a mechanical rerun is to retry exactly what degraded
+# (alpha-engine-config-I6055).
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -138,6 +150,17 @@ STAGES: tuple[Stage, ...] = (
         "lib_pin_drift_check", "skip_lib_pin_drift_check",
         "CheckSkipLibPinDriftCheck", "LibPinDriftCheck",
         frozenset({"CheckMutexRole"}),
+        # the whole pre-workload gate chain (lib-pin / pipeline-contract /
+        # evaluator / evaluator-director drift gates, config#2278 +
+        # config#2348) degrades fail-open through these Pass+Publish pairs —
+        # no skip flag is emitted either way (emit_skip=False), but the
+        # summary must say "degraded", not "completed", when one was hit.
+        degraded_witness=frozenset({
+            "LibPinGateDegraded", "PublishLibPinGateDegraded",
+            "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",
+            "EvaluatorGateDegraded", "PublishEvaluatorGateDegraded",
+            "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
+        }),
         emit_skip=False,
         note=(
             "deliberately NEVER skipped on a rerun: the lib-pin drift +"
@@ -205,6 +228,10 @@ STAGES: tuple[Stage, ...] = (
         "thinktank_coverage", "skip_thinktank_coverage",
         "CheckSkipThinkTankCoverage", "ThinkTankCoverage",
         frozenset({"CheckSkipRegimeRetrospectiveEval"}),
+        # ThinkTankDegraded (alpha-engine-config-I5758) sets the visible
+        # thinktank_degraded flag and converges into this stage's witness —
+        # a degraded ThinkTank must re-run, not be skipped as completed.
+        degraded_witness=frozenset({"ThinkTankDegraded"}),
     ),
     Stage(
         "regime_retrospective_eval", "skip_regime_retrospective_eval",
@@ -318,6 +345,15 @@ STAGES: tuple[Stage, ...] = (
         "post_eval", "skip_post_eval",
         "CheckSkipPostEval", "SaturdayHealthCheck",
         frozenset({"CheckShellRunNotify"}),
+        # Every degraded route in the tail (config#2276 health checks +
+        # config#2302 ReportCard/Director) — entering ANY of them means the
+        # tail ran but something inside it failed and was absorbed; the
+        # tail must re-run, never be skipped as complete (I6055: the
+        # 2026-08-01 Director hard-fail that the next rerun skipped).
+        degraded_witness=frozenset({
+            "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
+            "PublishReportCardDegraded", "PublishDirectorDegraded",
+        }),
         note=(
             "skip_post_eval covers the whole health-check/report-card/"
             "director tail; a failure inside it re-runs the whole tail"
@@ -404,6 +440,7 @@ class RerunPlan:
     run_date_provenance: str
     original_input: dict
     completed: list = field(default_factory=list)   # stage names
+    degraded: list = field(default_factory=list)    # stage names (re-run!)
     failed: list = field(default_factory=list)      # stage names
     skip_flags: dict = field(default_factory=dict)  # flag -> True
     warnings: list = field(default_factory=list)
@@ -459,7 +496,19 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
                      original_input=original_input)
 
     for stage in STAGES:
-        if entered & stage.witness:
+        if entered & stage.degraded_witness:
+            # Ran, failed, absorbed fail-open (Publish*Degraded route): the
+            # stage must RE-RUN. Degraded overrides witness — the pipeline
+            # continuing past a degradation is NOT evidence of completion
+            # (I6055: the 2026-08-01 Director hard-fail recorded as
+            # "post_eval complete", then skipped by the next rerun).
+            plan.degraded.append(stage.name)
+            plan.notes.append(
+                f"{stage.name}: DEGRADED (entered "
+                f"{sorted(entered & stage.degraded_witness)}) — NOT skipped; "
+                "the rerun re-runs it to retry the absorbed failure"
+            )
+        elif entered & stage.witness:
             plan.completed.append(stage.name)
             if stage.emit_skip:
                 plan.skip_flags[stage.flag] = True
@@ -468,11 +517,12 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
         elif stage.detect_failure and stage.work in entered:
             plan.failed.append(stage.name)
 
-    if not plan.failed:
+    if not plan.failed and not plan.degraded:
         plan.warnings.append(
-            "no failed WORK stage identified — the failure was pre-workload "
-            "(gate / mutex / notifier). Fix the root cause first; this rerun "
-            "input re-runs everything not witnessed complete."
+            "no failed or degraded WORK stage identified — the failure was "
+            "pre-workload (gate / mutex / notifier). Fix the root cause "
+            "first; this rerun input re-runs everything not witnessed "
+            "complete."
         )
 
     # Anti-swallow / reachability guard: every failed stage's work must
@@ -757,6 +807,7 @@ def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str,
     print(f"rerun name       : {name}")
     print(f"pipeline_role    : {EMITTED_ROLE}")
     print(f"completed stages : {', '.join(plan.completed) or '(none)'}")
+    print(f"degraded stages  : {', '.join(plan.degraded) or '(none)'}")
     print(f"failed stages    : {', '.join(plan.failed) or '(none identified)'}")
     print(f"derived skips    : {', '.join(sorted(plan.skip_flags)) or '(none)'}")
     for n in plan.notes:

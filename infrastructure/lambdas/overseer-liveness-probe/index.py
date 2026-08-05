@@ -36,6 +36,12 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
                                 watch-log doc has a matching event — catches a
                                 dispatcher that is wired correctly but crashes
                                 on invocation (alpha-engine-config-I2901).
+  * ``agent_dispatch_completeness`` — for every dispatch the dispatch ledger
+                                records as launched=True, the corresponding SSM
+                                command must have reached a terminal Success
+                                status; catches a dispatch that reported success
+                                but whose agent never completed (the 2026-08-01
+                                outage class, alpha-engine-config#6164).
 
 Conventions preserved from both source probes:
   * silent-unless-broken: a clean pass logs + returns, no Telegram noise.
@@ -915,6 +921,380 @@ def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[
     )], {}
 
 
+# ── Check: dispatch_invocation_success ────────────────────────────────────────
+# Generalized from the sf-watch-only check above — covers all four dispatch
+# families (alpha-engine-config-I5262). The sf-watch check had an independent
+# signal (the pipeline SF's own execution history). The other three families
+# (groom, ci-watch, alert-drain) use the dispatcher's own decision log as the
+# "expected dispatch" source — a dispatcher that writes a launch record but
+# whose box dies before the completion marker lands IS a real gap (exactly
+# what happened 2026-07-28 when all 3 groom lanes were reclaimed).
+#
+# Each family declares:
+#   dispatch_prefix  — S3 prefix for records of "a box was launched"
+#   completion_prefix — S3 prefix for "the box finished + wrote its outcome"
+#   completion_key_field — field within the dispatch record that names the
+#     completion marker key (e.g. "run_token", "completion_key")
+#   response_window_min — how long after dispatch to wait before a missing
+#     completion marker is a finding
+#   lookback_hours — how far back to look for dispatched-but-unfinished boxes
+
+
+def _family_dispatch_records(s3, spec: dict, now: datetime) -> list[dict]:
+    """Enumerate dispatch records within the lookback window. Each record must
+    carry at minimum the ``completion_key_field`` value and a timestamp field
+    (``dispatched_at``, ``decided_at``, or ``at``). Returns list of
+    {key, timestamp, completion_key} dicts.
+
+    If ``completion_key_field`` is absent, the completion key is derived from
+    the dispatch record's S3 key filename (stripped of path prefix) — used
+    when the dispatch record and completion marker share the same base key
+    (e.g. ci-watch: ``dispatched/repo-sha.json`` → ``completed/repo-sha.json``).
+    """
+    prefix = spec["dispatch_prefix"]
+    lookback_hours = spec["lookback_hours"]
+    mature_before = now - timedelta(minutes=spec["response_window_min"])
+    horizon = now - timedelta(hours=lookback_hours)
+    key_field = spec.get("completion_key_field")
+    records: list[dict] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": WATCH_BUCKET, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        try:
+            resp = s3.list_objects_v2(**kwargs)
+        except Exception:  # noqa: BLE001 — best-effort enumeration
+            logger.warning("dispatch_invocation_success: list failed for %s", prefix, exc_info=True)
+            break
+        for obj in resp.get("Contents", []) or []:
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            last_modified = obj.get("LastModified")
+            if last_modified and last_modified < horizon:
+                continue
+            try:
+                body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
+                record = json.loads(body)
+            except Exception:
+                logger.warning("dispatch_invocation_success: unreadable %s", key)
+                continue
+            # Extract the completion key
+            completion_key = None
+            if key_field:
+                # Field-based: the record itself names its completion key
+                completion_key = record.get(key_field)
+            if not completion_key:
+                # Filename-based: dispatch and completion share the same filename
+                filename = key.rsplit("/", 1)[-1]
+                completion_key = filename  # e.g. "nousergon-crucible-research-abc1234.json"
+            # Skip records missing a timestamp (we need to know when the dispatch happened)
+            timestamp = record.get("dispatched_at") or record.get("decided_at") or record.get("at")
+            if timestamp:
+                try:
+                    ts = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    ts = last_modified or now
+            else:
+                ts = last_modified or now
+            if ts < horizon:
+                continue
+            if ts > mature_before:
+                continue  # not mature yet
+            records.append({
+                "dispatch_key": key,
+                "dispatch_time": ts,
+                "completion_key": completion_key,
+            })
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return records
+
+
+def _check_dispatch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """For every mature dispatch record in the lookback window, assert a
+    completion marker exists at ``{completion_prefix}/{completion_key}.json``.
+    A missing marker means the box was launched but never finished — it died
+    before writing an outcome (spot reclaim / OOM / pre-trap crash / SSM
+    command failure)."""
+    problems: list[str] = []
+    s3 = _s3_client()
+    family = spec.get("family", spec.get("label", "unknown"))
+    completion_prefix = spec["completion_prefix"]
+    records = _family_dispatch_records(s3, spec, now)
+    if not records:
+        logger.info("dispatch_invocation_success[%s]: no mature dispatch records in window", family)
+        return [], {}
+
+    for rec in records:
+        completion_key = f"{completion_prefix}{rec['completion_key']}.json"
+        try:
+            s3.head_object(Bucket=WATCH_BUCKET, Key=completion_key)
+        except Exception as exc:
+            if _error_code(exc) in {"NoSuchKey", "404", ""}:
+                problems.append(
+                    f"{family}: dispatch recorded at {rec['dispatch_time'].strftime('%Y-%m-%d %H:%M')}Z "
+                    f"(s3://{WATCH_BUCKET}/{rec['dispatch_key']}) — NO completion marker at "
+                    f"s3://{WATCH_BUCKET}/{completion_key} after "
+                    f"{spec['response_window_min']}+ min. Box likely died silently "
+                    "(spot reclaim / OOM / SSM failure / pre-trap crash) before writing its outcome."
+                )
+            else:
+                raise
+    return problems, {}
+
+
+# ── Check: agent_dispatch_completeness ────────────────────────────────────────
+# alpha-engine-config#6164: for every dispatch the dispatch ledger records as
+# launched=True, the corresponding SSM command must have reached a terminal
+# Success status. A dispatch that reported success and whose command terminated
+# non-success (Failed/TimedOut/Cancelled) is a finding, immediately.
+#
+# This is the 2026-08-01 outage class (nous-ergon-ops-I368): every sensor
+# upstream of the agent reported success — the SF dispatcher fired, routed via
+# overseer-dispatcher (http=202, launched=True), spot box launched — but the
+# bootstrap aborted 75s in with SECRET_ENV_FILE: unbound variable. SSM recorded
+# Failed at PT1M75.6S. No issue, no PR, no alert. Found by a human nine hours
+# later.
+#
+# Per overseer-policy.md §5 Layer B: reads SSM (the upstream system's own
+# record), never the response plane's log.
+
+# Terminal SSM command statuses that are NOT Success — these mean the command
+# reached a terminal state without the agent completing successfully.
+_ADC_FAILED_STATUSES = {"Failed", "TimedOut", "Cancelled", "Cancelling"}
+
+# Non-terminal statuses — the command is still running or pending.
+_ADC_RUNNING_STATUSES = {"Pending", "InProgress", "Delayed"}
+
+
+def _check_agent_dispatch_completeness(spec: dict, now: datetime) -> tuple[list[dict], dict]:
+    """For every dispatch the dispatch ledger records as launched=True within
+    lookback_hours, the corresponding SSM command must have reached a terminal
+    Success status. A command that terminated non-success (or is still running
+    past the response window with the instance unresponsive) is a finding.
+
+    Tolerates: (a) the window between ledger write and SSM command reaching a
+    terminal state — commands still InProgress/Pending/Delayed within
+    response_window_min are skipped; (b) commands whose SSM invocation no
+    longer exists (beyond ~30-day retention) — the ledger entry is the only
+    surviving record, so skip rather than false-flag.
+    """
+    problems: list[str] = []
+    s3 = _s3_client()
+    horizon = now - timedelta(hours=spec["lookback_hours"])
+    mature_before = now - timedelta(minutes=spec["response_window_min"])
+    ssm_retention = timedelta(days=spec.get("ssm_retention_days", 30))
+
+    # 1. Enumerate recent dispatch-ledger entries.
+    prefix_root = spec["dispatch_ledger_prefix"]
+    lookup_dates: list[str] = []
+    d = (horizon - timedelta(days=1)).date()
+    last = now.date()
+    while d <= last:
+        lookup_dates.append(d.isoformat())
+        d += timedelta(days=1)
+
+    dispatched: list[dict] = []
+    for date in lookup_dates:
+        prefix = f"{prefix_root}{date}/"
+        token = None
+        while True:
+            kwargs = {"Bucket": WATCH_BUCKET, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = s3.list_objects_v2(**kwargs)
+            for obj in resp.get("Contents", []) or []:
+                key = obj["Key"]
+                if not key.endswith(".json"):
+                    continue
+                try:
+                    body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
+                    record = json.loads(body)
+                except Exception as exc:  # noqa: BLE001 — one bad record must not hide the rest
+                    logger.warning(
+                        "agent_dispatch_completeness: ledger entry %s unreadable (%s) — skipped",
+                        key, exc,
+                    )
+                    continue
+                outcome = record.get("outcome") if isinstance(record, dict) else None
+                if not isinstance(outcome, dict):
+                    continue
+                if outcome.get("launched") is not True:
+                    continue
+                launched_at = record.get("started_at")
+                if not launched_at:
+                    continue
+                try:
+                    t = datetime.fromisoformat(str(launched_at).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+                if not (horizon <= t <= mature_before):
+                    continue
+                command_id = outcome.get("command_id")
+                if not command_id:
+                    # launched=True but no command_id — the executor returned a
+                    # malformed verdict (the dispatcher writes what it gets).
+                    # Record as a finding (the dispatch is unverifiable).
+                    problems.append(
+                        f"dispatch ledger entry s3://{WATCH_BUCKET}/{key}: "
+                        f"launched=True but NO command_id in outcome — "
+                        "unverifiable dispatch (executor verdict missing command_id)"
+                    )
+                    continue
+                dispatched.append({
+                    "ledger_key": key,
+                    "command_id": command_id,
+                    "playbook": record.get("playbook", "unknown"),
+                    "launched_at": t,
+                })
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+
+    if not dispatched:
+        logger.info(
+            "agent_dispatch_completeness: no mature launched dispatches in window"
+        )
+        return [], {}
+
+    # 2. For each dispatched entry, check the SSM command invocation status.
+    # Guard: ssm:ListCommandInvocations + ssm:DescribeInstanceInformation must
+    # be in the probe's IAM role before this check can produce results (the
+    # CHECKERS dispatch table isolates a per-check runtime error — an
+    # AccessDenied will become its own problem line, not crash the probe).
+    ssm = boto3.client("ssm", region_name=REGION)
+    missed: list[dict] = []
+    for entry in dispatched:
+        command_id = entry["command_id"]
+        try:
+            invocations = ssm.list_command_invocations(
+                CommandId=command_id, Details=False
+            )
+        except Exception as exc:  # noqa: BLE001 — isolate per I4473
+            err_code = _error_code(exc)
+            if err_code == "AccessDeniedException":
+                # The IAM grant hasn't landed yet — report once, not per-entry.
+                problems.append(
+                    "agent_dispatch_completeness: ssm:ListCommandInvocations "
+                    f"AccessDenied — IAM grant missing on the probe role; "
+                    "all dispatched entries are UNVERIFIED this run"
+                )
+                break
+            if err_code == "InvocationDoesNotExist":
+                # Command is beyond SSM retention — skip (the ledger entry is
+                # the only surviving record; we cannot verify it).
+                continue
+            logger.warning(
+                "agent_dispatch_completeness: SSM ListCommandInvocations "
+                "failed for command_id=%s: %s", command_id, exc,
+            )
+            continue
+
+        cmd_invocations = invocations.get("CommandInvocations") or []
+        if not cmd_invocations:
+            # No invocation record at all — the command may not have been
+            # delivered. If mature_before has passed, this is a finding.
+            launched_age = now - entry["launched_at"]
+            if launched_age > timedelta(minutes=spec["response_window_min"]):
+                missed.append(entry)
+            continue
+
+        # SSM can return multiple invocations (one per instance); we care
+        # about the aggregate: did ANY instance reach Success?
+        terminal_success = False
+        terminal_failed = False
+        still_running = False
+        failed_detail = ""
+        for inv in cmd_invocations:
+            status = inv.get("Status", "Unknown")
+            if status == "Success":
+                terminal_success = True
+                break
+            if status in _ADC_FAILED_STATUSES:
+                terminal_failed = True
+                status_details = inv.get("StatusDetails", "")
+                failed_detail = f"Status={status}"
+                if status_details:
+                    failed_detail += f" StatusDetails={status_details}"
+            elif status in _ADC_RUNNING_STATUSES:
+                still_running = True
+
+        if terminal_success:
+            continue  # The agent completed — dispatch is whole.
+
+        if terminal_failed:
+            missed.append(entry)
+            problems.append(
+                f"{entry['playbook']} dispatch @ {entry['launched_at'].strftime('%Y-%m-%d %H:%M')}Z "
+                f"(command_id={command_id}): launched=True but SSM command "
+                f"terminated non-success ({failed_detail}) — the agent never "
+                f"completed. Ledger: s3://{WATCH_BUCKET}/{entry['ledger_key']}"
+            )
+            continue
+
+        if still_running:
+            # Command still running past the response window — check instance
+            # liveness the same way ssm-liveness-poller does.
+            launched_age = now - entry["launched_at"]
+            if launched_age > timedelta(minutes=spec["response_window_min"]):
+                # Attempt to read PingStatus via DescribeInstanceInformation.
+                # The instance_id is not in the dispatch ledger entry by
+                # default (the ledger stores the dispatcher-level outcome,
+                # which carries command_id but not instance_id). Fall back to
+                # listing by command_id and reading instance IDs from the
+                # invocation record.
+                instance_ids = [
+                    inv.get("InstanceId") for inv in cmd_invocations
+                    if inv.get("InstanceId")
+                ]
+                instance_unresponsive = False
+                for iid in instance_ids:
+                    try:
+                        info = ssm.describe_instance_information(
+                            Filters=[
+                                {"Key": "InstanceIds", "Values": [iid]}
+                            ]
+                        )
+                        instances = info.get("InstanceInformationList") or []
+                        if not instances:
+                            instance_unresponsive = True
+                            break
+                        ping = instances[0].get("PingStatus", "Unknown")
+                        if ping != "Online":
+                            instance_unresponsive = True
+                            break
+                    except Exception:
+                        continue
+                if instance_unresponsive:
+                    missed.append(entry)
+                    problems.append(
+                        f"{entry['playbook']} dispatch @ "
+                        f"{entry['launched_at'].strftime('%Y-%m-%d %H:%M')}Z "
+                        f"(command_id={command_id}): SSM command still "
+                        f"InProgress past {spec['response_window_min']}min "
+                        f"window AND instance unresponsive — the box is "
+                        f"wedged or gone. Ledger: "
+                        f"s3://{WATCH_BUCKET}/{entry['ledger_key']}"
+                    )
+
+    if not problems:
+        return [], {}
+
+    playbooks = sorted(set(m["playbook"] for m in missed))
+    named = ", ".join(playbooks[:_HEADLINE_ITEMS])
+    if len(playbooks) > _HEADLINE_ITEMS:
+        named += f", +{len(playbooks) - _HEADLINE_ITEMS} more"
+    return [_finding(
+        "dispatch-completeness",
+        f"{len(problems)} dispatch(es) launched but agent never completed "
+        f"({named})",
+        "\n".join(problems),
+    )], {}
+
+
 # ── Check dispatch table + aggregation ───────────────────────────────────────
 
 CHECKERS = {
@@ -925,6 +1305,8 @@ CHECKERS = {
     "run_window": _check_run_window,
     "scheduler_schedule_exists": _check_scheduler_schedule_exists,
     "sf_watch_invocation_success": _check_sf_watch_invocation_success,
+    "dispatch_invocation_success": _check_dispatch_invocation_success,
+    "agent_dispatch_completeness": _check_agent_dispatch_completeness,
 }
 
 

@@ -1079,7 +1079,27 @@ def _load_promoted_tickers(
         if t:
             tickers.add(t)
 
-    # Tracked universe (currently held + watchlist)
+    # Full board-width universe (~903 names), NOT "currently held + watchlist"
+    # as this comment previously (incorrectly) claimed — measured 2026-07-29,
+    # alpha-engine-config#5809. This function is DEPRECATED and reachable
+    # only via a direct/ad-hoc call that supplies no explicit `tickers` (see
+    # the module docstring above); the production path
+    # (`weekly_collector._run_phase2`) never reaches this loop.
+    #
+    # alpha-engine-config#6450 audited this site and its initial verdict was
+    # REPOINT to `nousergon_lib.decision_set` (a narrow ~60-name cut). That
+    # verdict does not hold for `alternative.collect`'s actual consumer: per
+    # `infrastructure/step_function.json`'s DataPhase2 state comment and
+    # PR #1186 (merged 2026-07-31), this collector's per-ticker output feeds
+    # 7 registered `alternative`-family feature-store columns
+    # (`features/registry.py::CATALOG`, consumers='predictor') for the WHOLE
+    # ArcticDB universe — a ticker with no alt data reads as 0.0, which is
+    # indistinguishable from a real zero. Narrowing this loop's source to a
+    # decision_set cut would silently zero those 7 columns for the ~843
+    # names outside the cut. That is why the production resolver
+    # (`weekly_collector._run_phase2`) passes the FULL constituent universe
+    # explicitly via `tickers=`, sourced from `constituents.json`, not a
+    # narrower decision_set cut — see #6450 for the corrected verdict.
     for entry in signals.get("universe", []):
         t = entry.get("ticker") or entry.get("symbol")
         if t:

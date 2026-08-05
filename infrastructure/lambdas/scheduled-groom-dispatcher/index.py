@@ -94,6 +94,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -104,6 +105,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from nousergon_lib import dispatch_lease
 from nousergon_lib import groom_eligibility as ge
 from nousergon_lib import spot_dispatch
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
@@ -136,6 +138,11 @@ _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # lane's terminal state. Deliberately CYCLE-level, not per-lane — un-silencing
 # the ~18 per-box pings/day is how the 11-day alert-fatigue outage happened.
 # Per-box pings keep their existing silent-in-topic posture untouched.
+#
+# 2026-08-03 notification cleanup: the CYCLE rail buzzes only STARTED /
+# COMPLETE / lane-death / trigger-death (the "started / stopped-early /
+# finished" contract). lane_reclaimed_post_run is silent (no work lost;
+# durably recorded in the reconcile ledger).
 #
 # Distinct flow_name is REQUIRED, not cosmetic: flow_doctor_telegram caches the
 # built config by flow_name, so sharing one with the silent rail would serve
@@ -255,7 +262,7 @@ INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
         "GROOM_INSTANCE_TYPES",
-        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+        "c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
     ).split(",")
     if t.strip()
 ]
@@ -289,6 +296,22 @@ GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf
 #                                                        -> the reconciler's deadline_utc
 #   groom_spot_bootstrap.sh watchdog   21600s (360 min)  -> the box's own kill
 #
+# RE-ALIGNED 2026-08-03, and the same class recurred in the other direction.
+# Brian's 3.5h ruling moved the bootstrap watchdog to 12600 and its dead-man to
+# 13500 (alpha-engine-config-PR6356), leaving this constant and the SF lane at
+# 10800 — so the SSM command and the SF would abandon a lane at 3h while the
+# box worked on until 3.5h and was killed at 3.75h. The invariant's own words,
+# "the box must never outlive the lane the SF is waiting on", were violated by
+# a layer the binding test CANNOT SEE: it reads this constant, and the real box
+# bound lives in another repo.
+#
+# The ladder is now monotonic, each layer above the one it waits on:
+#   box soft budget      10800 (3.0h)   alpha-engine-config groom_run.sh
+#   box watchdog         12600 (3.5h)   alpha-engine-config bootstrap
+#   box dead-man         13500 (3.75h)  alpha-engine-config bootstrap
+#   this constant + lane 13800 (3.83h)  SSM timeout / reconciler / SF lane
+#   SF ceiling           14400 (4.0h)   step_function_groom.json
+#
 # The comment above this line claimed it "matches the bootstrap watchdog" — it
 # did, and both were wrong, because the SF had been tightened to 180 min
 # without them. The consequence is not cosmetic: the SF gives up on the lane at
@@ -304,9 +327,51 @@ GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf
 # 10800 is therefore the value, and it is BOUND to the SF definition by
 # test_runtime_bound_is_single_and_authoritative — both files live in this
 # repo, so the binding is enforceable rather than aspirational.
-MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "10800"))
+MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "13800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
+
+# ── Attended-window gate for the irreversible-actuation tier (alpha-engine-
+# config-I6461, groom-sweep-policy §4.8) ────────────────────────────────────
+# The manifest (infrastructure/scheduler/schedule-manifest.json) is the
+# declarative source of BOTH values below — bound to it by
+# test_attended_window_gate.py::test_env_defaults_match_manifest, mirroring
+# the MAX_RUNTIME_SECONDS binding-test pattern this file already uses. A
+# stated assumption (Brian has not ruled on exact hours, see the manifest's
+# _meta.assumption): the daytime complement of the §4.8-measured 21:00-05:00
+# local dead zone. zoneinfo (not a fixed UTC offset) so DST is handled
+# automatically — the fleet spans PST/PDT across the year.
+ATTENDED_WINDOW_TZ = os.environ.get("GROOM_ATTENDED_WINDOW_TZ", "America/Los_Angeles")
+ATTENDED_WINDOW_START_HOUR = int(os.environ.get("GROOM_ATTENDED_WINDOW_START_HOUR", "8"))
+ATTENDED_WINDOW_END_HOUR = int(os.environ.get("GROOM_ATTENDED_WINDOW_END_HOUR", "21"))
+# Which SCHEDULED (EventBridge Scheduler `schedule` label) dispatches carry
+# the irreversible tier (§4.6's "Expensive": merging/closing an issue/
+# deleting a branch) — the PR sweep is the fleet's only merge-capable
+# machinery (standing self-merge exceptions, auto-merge-policy.md), even
+# though the merge call itself happens on-box in a different repo. The three
+# STANDALONE sweep Scheduler rules are gated; the SF's own unconditional
+# end-of-SF tail-catcher (schedule label "end-of-sf-sweep",
+# DispatchEndOfSfSweep in step_function_groom.json) is deliberately NOT a
+# member — gating it would contradict its designed purpose as the drain-the-
+# backlog tail of a cycle that may have started inside the window (see that
+# state's own comment; removing its unconditional posture needs a policy
+# amendment, not a schedule tweak). Bound to the manifest by the same test.
+_IRREVERSIBLE_SCHEDULE_LABELS = frozenset({
+    "alpha-engine-groom-sweep-0000-daily",
+    "alpha-engine-groom-sweep-0800-daily",
+    "alpha-engine-groom-sweep-1600-daily",
+})
+
+
+def _in_attended_window(now: datetime | None = None) -> bool:
+    """True iff `now` (default: the current instant) falls inside the
+    declared attended window, evaluated in ATTENDED_WINDOW_TZ."""
+    moment = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo(ATTENDED_WINDOW_TZ))
+    return ATTENDED_WINDOW_START_HOUR <= moment.hour < ATTENDED_WINDOW_END_HOUR
+
+
+def _is_irreversible_dispatch(schedule_label: str) -> bool:
+    return schedule_label in _IRREVERSIBLE_SCHEDULE_LABELS
 
 _VALID_RUN_MODES = {"full", "sweep"}
 _DEFAULT_RUN_MODE = "full"
@@ -700,6 +765,64 @@ def _launch_instance(force_on_demand: bool = False,
     )
 
 
+def _launch_instance_serialized(*, force_on_demand: bool = False, tier_tag: str = "",
+                                attempt: int = 0, run_token: str = "") -> tuple[str, str]:
+    """``_launch_instance`` wrapped in the shared spot-launch lease
+    (alpha-engine-config-I6460, groom-sweep-policy.md §5.9.3: "lanes that
+    share a resource share a lease, not one per lane").
+
+    The 2026-07-28 incident was three concurrently-dispatching tiers
+    (high/mid/low, MaxConcurrency=3 on the dispatch SF's Map state) issuing
+    RunInstances in the same instant against the same underlying spot-
+    capacity pool — all three reclaimed together. This wraps ONLY the
+    RunInstances call itself (a few seconds), not the lane's multi-hour
+    life, so concurrently-dispatching tiers serialize their capacity claim
+    by seconds rather than colliding in the same instant — without
+    reducing how many tiers launch per cycle (see the module-level comment
+    on ``_SPOT_LAUNCH_LEASE_KEY`` for why a full per-lane merge was
+    rejected).
+
+    A short bounded retry (``_SPOT_LAUNCH_LEASE_MAX_ATTEMPTS``, a few
+    seconds total) covers the case where a sibling lane's launch is
+    mid-flight — this is a sub-second mutual exclusion around ONE atomic
+    AWS API call, not a queued dispatch cycle, so it does not violate
+    §5.9's "does not queue behind the holder" (that rule bounds a whole
+    per-lane reconciliation cycle, not a millisecond-scale critical
+    section around a single AWS call already inherent to the lease's own
+    conditional-PUT retry). If every attempt is exhausted, this raises
+    rather than launching un-serialized — fail-loud, matching this
+    function's existing fail-loud posture (a silent bypass here would
+    reopen exactly the race this exists to close).
+    """
+    owner_id = f"spot-launch:{tier_tag}:attempt{attempt}:{run_token or uuid.uuid4().hex[:12]}"
+    acquired = False
+    last_holder = None
+    for i in range(_SPOT_LAUNCH_LEASE_MAX_ATTEMPTS):
+        result = dispatch_lease.acquire_lease(
+            _SPOT_LAUNCH_LEASE_KEY, owner_id=owner_id,
+            ttl_seconds=_SPOT_LAUNCH_LEASE_TTL_SECONDS, bucket=_RESEARCH_BUCKET,
+        )
+        if result.acquired:
+            acquired = True
+            break
+        last_holder = result.holder
+        logger.info(
+            "spot-launch lease busy (held by %s) — retry %d/%d for lane %s",
+            result.holder.owner_id, i + 1, _SPOT_LAUNCH_LEASE_MAX_ATTEMPTS, tier_tag)
+        time.sleep(_SPOT_LAUNCH_LEASE_RETRY_SLEEP_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"could not acquire spot-launch lease for lane {tier_tag!r} after "
+            f"{_SPOT_LAUNCH_LEASE_MAX_ATTEMPTS} attempts — last held by "
+            f"{last_holder.owner_id if last_holder else '?'}"
+        )
+    try:
+        return _launch_instance(force_on_demand=force_on_demand, tier_tag=tier_tag,
+                                attempt=attempt)
+    finally:
+        dispatch_lease.release_lease(_SPOT_LAUNCH_LEASE_KEY, bucket=_RESEARCH_BUCKET)
+
+
 def _wait_ssm_online(instance_id: str) -> None:
     """Block until the instance is running AND its SSM agent registers Online."""
     spot_dispatch.wait_ssm_online(
@@ -745,6 +868,67 @@ def _tier_tag(run_mode: str, issue_filter: str) -> str:
     groom boxes guard per issue_filter tier; sweep boxes guard as one
     distinct 'sweep' lane regardless of the (inert) issue_filter they carry."""
     return _SWEEP_TIER_TAG if run_mode == "sweep" else issue_filter
+
+
+# ── Per-lane singleton dispatch lease (alpha-engine-config-I6460, groom-
+# sweep-policy.md §5.9) ─────────────────────────────────────────────────────
+# §5.9: "The loop holds a singleton lease per lane. A dispatch that cannot
+# take the lease exits, recording that it yielded; it does not queue behind
+# the holder and it does not run beside it." Closes two gaps the existing
+# config#1979 `_running_tier_instance_ids` guard cannot: (1) it is fail-OPEN
+# by its own docstring ("an optimization, not a correctness gate") — a
+# DescribeInstances error lets a duplicate launch through rather than
+# blocking it; (2) it is a scan-then-launch TOCTOU race — two invocations
+# can both observe an empty tag set and both launch, since nothing makes the
+# observe-and-claim step atomic. `dispatch_lease.acquire_lease` (nousergon-
+# lib) is an S3 `PutObject(IfNoneMatch="*")` compare-and-swap, so the SAME
+# lane cannot be claimed twice regardless of API propagation delay or a
+# probe failure.
+#
+# Deliberately does NOT replace `_running_tier_instance_ids` — that check
+# stays exactly as-is, including its reclaim-aware bounded-relaunch bypass
+# (spot_dispatch.termination_imminent), because only live EC2 state can
+# distinguish "a box is genuinely still working this lane" from "a box is
+# mid-reclaim and about to die"; a lease token alone cannot see that. The
+# lease is the ADDITIONAL atomic-exclusion layer around the same decision:
+# acquired only once the EC2-state check has already concluded the lane
+# looks free, so it closes exactly the residual TOCTOU/fail-open window
+# rather than re-deciding something the EC2 check already answered.
+#
+# TTL = MAX_RUNTIME_SECONDS (the one authoritative runtime bound the box
+# ladder is built against, see that constant's own comment) — a live box can
+# never legitimately outlive it, so the lease can never expire out from
+# under a genuinely still-running lane, and a killed box (the normal case on
+# interruptible compute) releases the lane without an actor once the TTL
+# elapses.
+_LANE_LEASE_TTL_SECONDS = MAX_RUNTIME_SECONDS
+
+
+def _lane_lease_key(tier_tag: str) -> str:
+    return f"locks/groom-lane-{tier_tag}.lock"
+
+
+# Shared-resource lease (§5.9.3: "lanes that share a resource share a
+# lease, not one per lane"). The 2026-07-28 incident (three lanes reclaimed
+# `instance-terminated-no-capacity` at the SAME SECOND) was three
+# concurrently-dispatching tiers (high/mid/low, MaxConcurrency=3 on the
+# dispatch SF's Map state) landing their RunInstances calls in the same
+# instant against the same underlying spot-capacity pool. This lease
+# serializes only that brief moment — the RunInstances call inside
+# `_launch_instance`, held for a short TTL and released immediately after —
+# not the lane's multi-hour life. A full per-lane merge onto one shared
+# lease (only one of the three tiers ever launching per cycle) was
+# considered and rejected: it would cut daily groom throughput 3x, directly
+# regressing the deliberately-ratified "every tier launches independently"
+# design (config#1933/#5, this file's module README). Bounded retry here
+# (a few seconds, NOT a queued dispatch) is a sub-second mutual exclusion
+# around one atomic AWS API call — categorically different from queuing an
+# entire multi-hour reconciliation cycle behind another, which is what
+# §5.9's "does not queue" forbids.
+_SPOT_LAUNCH_LEASE_KEY = "locks/groom-spot-capacity-pool.lock"
+_SPOT_LAUNCH_LEASE_TTL_SECONDS = 180
+_SPOT_LAUNCH_LEASE_MAX_ATTEMPTS = 5
+_SPOT_LAUNCH_LEASE_RETRY_SLEEP_SECONDS = 2
 
 
 class ConcurrentCycleError(RuntimeError):
@@ -880,8 +1064,16 @@ def _utc_today() -> str:
     return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
 
 
-def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) -> None:
-    """Send one CYCLE-level lifecycle ping (buzzing) — never raises.
+def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict,
+                  silent: bool = False) -> None:
+    """Send one CYCLE-level lifecycle ping (buzzing unless ``silent``) — never raises.
+
+    ``silent=True`` suppresses the Telegram notification (2026-08-03
+    notification cleanup): used for events that are durably recorded elsewhere
+    and would read as confusing noise if they buzzed (e.g.
+    ``lane_reclaimed_post_run`` — no work lost, recorded in the reconcile
+    ledger). Default stays buzzing so STARTED / COMPLETE / lane-death /
+    trigger-death keep their loud posture.
 
     Best-effort per groom-sweep-policy §8 ("a notify hiccup must never block a
     relaunch or a status check"): the dispatch decision and the SF's terminal
@@ -890,7 +1082,7 @@ def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) ->
     """
     try:
         notify_via_flow_doctor(
-            text, silent=False, severity=severity, dedup_key=dedup_key,
+            text, silent=silent, severity=severity, dedup_key=dedup_key,
             flow_name=_CYCLE_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_CYCLE_DB_BASENAME,
             context=context,
@@ -1235,6 +1427,66 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
 
 
+def _notify_lane_lease_yielded(tier_tag: str, holder_owner_id: str, schedule_label: str) -> None:
+    """Best-effort loud ping for a §5.9 lane-lease yield — never raises.
+
+    Distinct from ``_notify_concurrent_skip``: that one fires off a live EC2
+    tag scan (a box is confirmed running); this one fires when the ATOMIC
+    lease itself could not be taken — the TOCTOU/fail-open window the EC2
+    scan alone cannot close. Both are recorded, non-launch dispositions
+    (groom-sweep-policy §5.9.2: "yielding is a recorded disposition, not a
+    silent no-op") — this record is what ``_reconcile_lane_yield_starvation``
+    later reads to decide whether a lane yielded all day."""
+    text = (
+        "⚪ Backlog groom slot YIELDED — could not take the per-lane dispatch "
+        f"lease (alpha-engine-config-I6460). lane={tier_tag}, lease held by "
+        f"owner_id={holder_owner_id}. schedule={schedule_label}. Zero spot/WET "
+        "spend; this slot's queue rides the next trigger once the lease "
+        "expires or the holder releases it."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=True, severity="info",
+            dedup_key=f"{_FLOW_NAME}:lane_lease_yielded:{tier_tag}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "tier_tag": tier_tag,
+                     "lease_holder_owner_id": holder_owner_id},
+            silent_topic=FleetTelegramTopic.GROOM,
+            source="flow-doctor:scheduled-groom-dispatcher",
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("lane-lease-yielded Telegram failed (non-fatal): %s", exc)
+
+
+def _notify_attended_window_deferred(schedule_label: str, window_moment: datetime) -> None:
+    """Best-effort loud ping for an irreversible-tier dispatch deferred outside
+    the attended window (groom-sweep-policy §4.8, alpha-engine-config-I6461).
+    Never raises — the deferral itself (recorded via _write_sweep_decision_
+    record's `reason` field, the same ledger every other named skip reason
+    uses) is the durable count; this is the real-time signal."""
+    text = (
+        "⚪ PR sweep DEFERRED — outside the attended window "
+        f"({ATTENDED_WINDOW_START_HOUR:02d}:00-{ATTENDED_WINDOW_END_HOUR:02d}:00 "
+        f"{ATTENDED_WINDOW_TZ}, groom-sweep-policy §4.8). schedule={schedule_label}, "
+        f"local_time={window_moment.astimezone(ZoneInfo(ATTENDED_WINDOW_TZ)).isoformat()}. "
+        "Zero merge-capable spend this slot; the next attended-window cycle "
+        "covers it."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=True, severity="info",
+            dedup_key=f"{_FLOW_NAME}:attended_window_deferred:{schedule_label}:{window_moment:%Y-%m-%d}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "reason": "attended_window_deferred"},
+            silent_topic=FleetTelegramTopic.GROOM,
+            source="flow-doctor:scheduled-groom-dispatcher",
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("attended-window deferral Telegram failed (non-fatal): %s", exc)
+
+
 # config#3173 — dedicated ceiling ledger, deliberately SEPARATE from the
 # groom/decisions/{date}/ decision-record ecosystem (which has two
 # heterogeneous schemas — schema_version 1's flattened single-slot record and
@@ -1365,6 +1617,18 @@ def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: 
 # the same verdict.
 
 _RECONCILE_COMPLETED_PREFIX = "groom/_control/completed"
+
+# groom-sweep-policy §2.8/F8 (alpha-engine-config-I6325) — the on-box "the
+# charter actually began" marker, written by groom_run.sh (NOT this Lambda)
+# once a decided lane's box reaches its own Start-ping point. Distinct from
+# `_RECONCILE_COMPLETED_PREFIX` (terminal) and from a decision record
+# (proves only that THIS LAMBDA decided to launch, not that the box's agent
+# ever ran) — the gap between "decided" and "started" is exactly the
+# alpha-engine-config-I4987 failure mode (box reclaimed during/before
+# bootstrap). Date-prefixed (`{prefix}/{date}/{run_token}.json`), unlike
+# `_RECONCILE_COMPLETED_PREFIX`, so F8's daily emitter can bucket by day via
+# a plain prefix listing instead of parsing `aws s3 ls` modification times.
+_LANE_STARTED_PREFIX = "groom/_control/started"
 
 # Expectations this reconciler has already ACTIONED (paged + send-task-failure).
 # Without it the reconciler re-detects the same dead lane on every 5-minute
@@ -1611,12 +1875,21 @@ def _reconcile_lane_death() -> dict:
     instance_ids = [e["instance_id"] for e in open_expectations
                     if e.get("instance_id")]
     instance_states: dict[str, str] = {}
+    # I6199: the reason THIS dispatcher terminated a box, tagged by
+    # spot_dispatch.terminate_on_failure at teardown. Tags survive on a
+    # terminated instance long enough for this reconciler (5-minute cadence) to
+    # read them. Without this, the page below can only restate EC2 state as if
+    # it were a diagnosis.
+    termination_reasons: dict[str, str] = {}
     if instance_ids:
         try:
             resp = ec2.describe_instances(InstanceIds=instance_ids)
             for reservation in resp.get("Reservations", []):
                 for inst in reservation.get("Instances", []):
                     instance_states[inst["InstanceId"]] = inst["State"]["Name"]
+                    for tag in inst.get("Tags", []):
+                        if tag.get("Key") == spot_dispatch.TERMINATION_REASON_TAG and tag.get("Value"):
+                            termination_reasons[inst["InstanceId"]] = tag["Value"]
         except Exception as exc:
             logger.warning("reconciler: describe-instances failed: %s", exc)
             # Fail-safe: treat ALL as unknown (not dead) — never page on a
@@ -1643,7 +1916,17 @@ def _reconcile_lane_death() -> dict:
             # Instance not found in describe-instances, or is in a terminal
             # state (stopped, terminated, shutting-down).
             page = True
-            reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
+            # I6199: prefer the reason THIS dispatcher recorded when it tore the
+            # box down. EC2 state is a proxy — `is shutting-down` is true of a
+            # spot reclaim, a completed run winding down, and a dispatcher
+            # terminate after a failed bootstrap alike, and on 2026-08-03 it
+            # sent two cycles of investigation at the wrong subsystem.
+            dispatcher_reason = termination_reasons.get(instance_id, "")
+            if dispatcher_reason:
+                reason = (f"lane_died: dispatcher terminated instance {instance_id} "
+                          f"before bootstrap — {dispatcher_reason}")
+            else:
+                reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
         elif exp.get("deadline_utc"):
             try:
                 deadline = datetime.fromisoformat(exp["deadline_utc"])
@@ -1659,6 +1942,33 @@ def _reconcile_lane_death() -> dict:
         tier_tag = exp.get("tier_tag", "unknown")
         schedule_label = exp.get("schedule", "unknown")
         run_token = str(exp.get("run_token") or "")
+        # Human-readable RENDERING of the token, for the notification body only.
+        #
+        # A bare `run_token=<32 lowercase hex>` is, to gitleaks' stock
+        # `generic-api-key` rule, indistinguishable from a leaked credential: the
+        # keyword `token` adjacent to a high-entropy 32-char value is exactly what
+        # that rule looks for. It is not a credential — it is a correlation id this
+        # Lambda mints per lane — but the scanner cannot know that.
+        #
+        # It matters because of where these bodies travel. `_notify_cycle` publishes
+        # onto the Overseer intake bus, alert-drain reads the queue into its LLM
+        # request, and the DLP egress proxy gitleaks-scans that outbound body. A
+        # match returns HTTP 400, the drain agent exits rc=1, and — because nothing
+        # is deleted from the queue without a ledger record (overseer-policy.md
+        # invariant 8) — the same message is re-read by the next run. One lane-death
+        # alert therefore wedges the entire response plane indefinitely.
+        #
+        # Measured 2026-08-03: 12 of 79 sampled intake messages carried this shape,
+        # every one from this emitter and this field; four consecutive drain runs
+        # died on it, and the retry ladder pushed the queue's other messages toward
+        # the DLQ five receives at a time.
+        #
+        # 12 hex chars keeps the prefix long enough to correlate a body against the
+        # dispatch ledger by eye, and short enough that no entropy rule fires. The
+        # FULL token is unchanged everywhere it is machine-read — `dedup_key` below,
+        # the `context` payload, and every log line — so nothing that consumes it
+        # programmatically is affected.
+        run_token_display = f"{run_token[:12]}…" if len(run_token) > 12 else run_token
 
         # alpha-engine-config-I5914: instance state is not a proxy for run
         # completion. A lane that finished its work and was reclaimed during
@@ -1675,16 +1985,21 @@ def _reconcile_lane_death() -> dict:
             _notify_cycle(
                 f"🟡 Groom lane reclaimed AFTER completing — {reason}\n"
                 f"tier={tier_tag}  schedule={schedule_label}\n"
-                f"run_token={run_token}  instance={instance_id}\n"
+                f"run_token={run_token_display}  instance={instance_id}\n"
                 f"work completed; evidence={evidence}",
-                # WARNING, not error: no work was lost. Paging this at error
-                # severity is what made a successful cycle read as a failed one.
+                # 2026-08-03 notification cleanup: SILENT — no work was lost,
+                # it is durably recorded in the reconcile ledger, and a
+                # buzzing "lane reclaimed AFTER completing" ping read as a
+                # confusing incident. (Was warning, not error, for that same
+                # reason: paging this at error severity made a successful
+                # cycle read as a failed one.)
                 severity="warning",
                 dedup_key=f"{_CYCLE_FLOW_NAME}:lane_reclaimed_post_run:{run_token}",
                 context={"expectation": {k: v for k, v in exp.items()
                                          if not k.startswith("_")},
                          "reason": reason, "instance_state": state,
                          "completion_evidence": evidence},
+                silent=True,
             )
         else:
             if gone:
@@ -1697,7 +2012,7 @@ def _reconcile_lane_death() -> dict:
             _notify_cycle(
                 f"🔴 Groom lane DEATH — {reason}\n"
                 f"tier={tier_tag}  schedule={schedule_label}\n"
-                f"run_token={run_token}  instance={instance_id}",
+                f"run_token={run_token_display}  instance={instance_id}",
                 severity="error",
                 dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{run_token}",
                 context={"expectation": {k: v for k, v in exp.items()
@@ -1785,6 +2100,15 @@ def _reconcile_trigger_health() -> dict:
 
     Fail-safe: a list-executions error skips the tick (never page on a broken
     SF API); the next 5-min tick retries.
+
+    **F8 side effect (alpha-engine-config-I6325):** every execution this tick
+    examines gets a `groom/_control/scheduled/{date}/{hhmm}.json` record
+    written (idempotent — see `_write_scheduled_cycle_record`), regardless of
+    whether its decision record is present. This is deliverable 1 of F8: "the
+    scheduler emits a scheduled-cycle record independently of the cycle" —
+    sourced from the SF's OWN execution history, which exists the instant
+    EventBridge Scheduler fires it, before any of this Lambda's own code has
+    had a chance to run (let alone fail).
     """
     now = datetime.now(ZoneInfo("UTC"))
     s3 = boto3.client("s3", region_name=REGION)
@@ -1821,6 +2145,13 @@ def _reconcile_trigger_health() -> dict:
         date = started.strftime("%Y-%m-%d")
         hhmm = started.strftime("%H%M")
         slot_id = f"{date}-{hhmm}"
+
+        # F8 deliverable 1 — written for EVERY examined execution, ahead of
+        # the "already actioned" (paging) short-circuit below: the scheduled
+        # record's existence must never depend on whether this slot has
+        # already been paged for a missing decision record.
+        _write_scheduled_cycle_record(s3, date, hhmm, started, ex)
+
         actioned_key = f"groom/_control/reconciled-trigger/{slot_id}.json"
         try:
             s3.head_object(Bucket=_RESEARCH_BUCKET, Key=actioned_key)
@@ -1878,6 +2209,112 @@ def _reconcile_trigger_health() -> dict:
     return {"checked": checked, "missing": missing, "paged": paged}
 
 
+# alpha-engine-config-I6460 (§5.9.2): "yielding is a recorded disposition,
+# not a silent no-op. A cycle that yielded every time for a day is a
+# stalled lane wearing the appearance of a quiet backlog — the §6.2 failure
+# applied to dispatch." Only evaluated after this UTC hour: the three known
+# daily groom slots (0400/1200/2000 UTC) have all had their chance by then
+# with margin, so a lane that shows ONLY yields (zero launches) in today's
+# decision records by this point is trustworthy regardless of how many
+# triggers actually fired — deliberately NOT a hardcoded trigger COUNT,
+# since the weekly-schedule-adjuster (I6177) can move slot times and this
+# leg must not assume a fixed slot calendar.
+_LANE_YIELD_STARVATION_EVAL_HOUR_UTC = 22
+
+
+def _reconcile_lane_yield_starvation() -> dict:
+    """Page when a lane yielded its per-lane dispatch lease (I6460) on
+    EVERY decision recorded for it today, with zero successful launches.
+
+    Reads the SAME ``groom/decisions/{date}/*.json`` records every other
+    dispatch path already writes (``_write_trigger_record``/``_write_skip_
+    record``/``_write_sweep_decision_record``/``_write_fallback_decision_
+    record``) — no new record schema. A lane's per-decision entry carries
+    ``tier_tag``, ``launch``, and (for a non-launch) ``reason``; a yield is
+    ``launch: false, reason: "lane_lease_yielded"`` (see ``_launch_groom_
+    spot``'s return on lease-acquire failure).
+
+    Fail-safe: an S3 listing error skips the tick (never page on a broken
+    API); the next 5-min tick retries.
+    """
+    now = datetime.now(ZoneInfo("UTC"))
+    if now.hour < _LANE_YIELD_STARVATION_EVAL_HOUR_UTC:
+        return {"evaluated": False, "reason": "before_eval_hour", "paged": 0}
+
+    date = now.strftime("%Y-%m-%d")
+    s3 = boto3.client("s3", region_name=REGION)
+    prefix = f"groom/decisions/{date}/"
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        keys = [
+            obj["Key"]
+            for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix)
+            for obj in page.get("Contents", [])
+        ]
+    except Exception as exc:  # noqa: BLE001 — fail-safe, never page on a broken API
+        logger.warning(
+            "lane-yield-starvation: decision-record listing failed (%s) — "
+            "skipping this tick (fail-safe; the next 5-min tick retries)", exc)
+        return {"evaluated": False, "error": str(exc), "paged": 0}
+
+    # tier_tag -> {"launched": bool, "yielded": int, "other": int}
+    tallies: dict[str, dict] = {}
+    for key in keys:
+        try:
+            body = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read())
+        except Exception as exc:  # noqa: BLE001 — one bad record must not sink the whole tick
+            logger.warning("lane-yield-starvation: could not read %s (skipping record): %s", key, exc)
+            continue
+        for d in body.get("decisions") or []:
+            tier_tag = str(d.get("tier_tag") or "")
+            if not tier_tag:
+                continue
+            t = tallies.setdefault(tier_tag, {"launched": False, "yielded": 0, "other": 0})
+            if d.get("launch"):
+                t["launched"] = True
+            elif d.get("reason") == "lane_lease_yielded":
+                t["yielded"] += 1
+            else:
+                t["other"] += 1
+
+    paged = 0
+    starved: list[str] = []
+    actioned_key = f"groom/_control/reconciled-lane-yield-starvation/{date}.json"
+    if _s3_key_exists(s3, actioned_key):
+        return {"evaluated": True, "already_actioned": True, "paged": 0}
+
+    for tier_tag, t in tallies.items():
+        if t["launched"] or t["yielded"] == 0:
+            continue
+        starved.append(tier_tag)
+        paged += 1
+        _notify_cycle(
+            f"🔴 Groom lane STARVED — {tier_tag} yielded its dispatch lease "
+            f"{t['yielded']} time(s) today with ZERO successful launches "
+            f"(alpha-engine-config-I6460). The lane's per-lane lease has "
+            "been contended (or held stale) for the whole scheduled day — "
+            "manual triage needed.",
+            severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_yield_starvation:{date}:{tier_tag}",
+            context={"tier_tag": tier_tag, "date": date, "tally": t},
+        )
+
+    if starved:
+        try:
+            s3.put_object(
+                Bucket=_RESEARCH_BUCKET, Key=actioned_key,
+                Body=json.dumps({
+                    "outcome": "lane_yield_starvation", "date": date,
+                    "starved_lanes": starved, "tallies": tallies,
+                    "actioned_at": now.isoformat(),
+                }).encode(),
+                ContentType="application/json")
+        except Exception as exc:  # noqa: BLE001 — a marker-write failure re-pages next tick, bounded by the dedup_key above
+            logger.warning("lane-yield-starvation: actioned-marker write failed (will re-check next tick): %s", exc)
+
+    return {"evaluated": True, "starved_lanes": starved, "paged": paged, "tallies": tallies}
+
+
 def _s3_key_exists(s3, key: str) -> bool:
     """True iff ``key`` exists. head_object on a missing key raises
     ClientError/404 — the same shape the lane-death leg relies on."""
@@ -1886,6 +2323,171 @@ def _s3_key_exists(s3, key: str) -> bool:
         return True
     except Exception:  # noqa: BLE001 — any failure reads as "no receipt"
         return False
+
+
+# groom-sweep-policy §2.8/F8 (alpha-engine-config-I6325) ─────────────────────
+_SCHEDULED_CYCLE_PREFIX = "groom/_control/scheduled"
+
+
+def _write_scheduled_cycle_record(s3, date: str, hhmm: str, started, ex: dict) -> None:
+    """F8 deliverable 1 — the scheduled-cycle record, produced by the
+    SCHEDULER (this reconciler tick, reading the dispatch SF's own execution
+    history) independently of the cycle it describes. ``started-versus-
+    scheduled must be computable without trusting the thing that failed to
+    run``: an SF execution exists from the moment EventBridge Scheduler fires
+    it, regardless of whether the Lambda invocation that follows ever
+    completes — so this is strictly upstream of, and independent from, the
+    I4988 decision record and the on-box started marker.
+
+    Idempotent (head_object-gated): re-attempted on every tick that still
+    sees this slot in its lookback window, but only the first successful call
+    actually PUTs — cheap even at the 5-min cadence over a 30h window.
+    Best-effort: a write failure here must never affect trigger-health
+    paging, which reads live SF execution history directly and does not
+    depend on this record existing.
+    """
+    key = f"{_SCHEDULED_CYCLE_PREFIX}/{date}/{hhmm}.json"
+    if _s3_key_exists(s3, key):
+        return
+    try:
+        s3.put_object(
+            Bucket=_RESEARCH_BUCKET,
+            Key=key,
+            Body=json.dumps({
+                "execution_arn": ex.get("executionArn"),
+                "execution_name": ex.get("name"),
+                "started_at": started.isoformat(),
+            }).encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — best-effort, mirrors every other decision-record writer in this file
+        logger.warning("scheduled-cycle record write failed for %s (non-fatal): %s", key, exc)
+
+
+# F8 deliverable 3 — fast paging on "decided but never started" (alpha-
+# engine-config-I6325, I4987's exact failure mode: a box reclaimed during or
+# before bootstrap, so nothing on-box ever runs). Distinct from
+# `_reconcile_trigger_health` (I4988), which pages when the LAMBDA never
+# reached a decision at all — this leg pages when the Lambda DID decide and
+# launch (a dispatch-ledger entry reached EC2, i.e. carries an instance_id),
+# but the CHARTER never wrote its started marker. Mirrors the
+# SF_IS_DRILL/CI_IS_DRILL/DRAIN_IS_DRILL family's own distinction elsewhere in
+# this fleet: being dispatched and reaching the charter are different facts,
+# and only the second is "started" for F8's purposes.
+_LANE_START_MATURITY_MIN = 12  # SSM online budget (180s) + dnf/git-clone (~2-4min) + margin
+
+
+def _reconcile_lane_start_health() -> dict:
+    """Page a decided lane launch that never wrote its on-box started marker
+    within `_LANE_START_MATURITY_MIN` of being dispatched — instead of the 6h
+    SF timeout. Scans today's + yesterday's dispatch ledger (mirrors
+    `_reconcile_lane_death`'s own scan window) so a maturity check straddling
+    UTC midnight still finds its ledger entry.
+
+    A lane that already has a COMPLETED marker is not paged even absent a
+    started marker — it reached a terminal outcome by some other path (e.g. a
+    very fast classified failure) and is not silently stuck; that is a
+    diagnosability gap for a human to read off the two markers directly, not
+    a paging condition.
+
+    Fail-safe: an S3 listing/read error skips that day's scan; the next
+    5-min tick retries.
+    """
+    now = datetime.now(ZoneInfo("UTC"))
+    s3 = boto3.client("s3", region_name=REGION)
+    checked = 0
+    paged = 0
+    newly_found: list[dict] = []
+    for delta_days in range(2):
+        day = (now - timedelta(days=delta_days)).strftime("%Y-%m-%d")
+        prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        try:
+            keys: list[str] = []
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix):
+                keys.extend(obj["Key"] for obj in page.get("Contents", []))
+        except Exception as exc:  # noqa: BLE001 — fail-safe, never page on a broken listing
+            logger.warning(
+                "lane-start health: listing %s failed (%s) — skipping this "
+                "day this tick (fail-safe; the next 5-min tick retries)",
+                prefix, exc)
+            continue
+        for key in keys:
+            try:
+                body = json.loads(
+                    s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read())
+            except Exception as exc:  # noqa: BLE001 — a single unreadable ledger entry must not stall the scan
+                logger.warning("lane-start health: could not read %s (%s) — skipping", key, exc)
+                continue
+            run_token = str(body.get("run_token") or "")
+            instance_id = str(body.get("instance_id") or "")
+            recorded_at = str(body.get("recorded_at") or "")
+            if not run_token or not instance_id or not recorded_at:
+                # The FIRST (pre-launch, config#3173) ledger write for this
+                # token, not yet the post-launch one — no EC2 request exists
+                # yet, so there is nothing to check a "started" marker
+                # against. The post-launch write (same key, overwritten) is
+                # what this leg evaluates.
+                continue
+            try:
+                recorded = datetime.fromisoformat(recorded_at)
+            except ValueError:
+                continue
+            age_min = (now - recorded).total_seconds() / 60.0
+            if age_min < _LANE_START_MATURITY_MIN:
+                continue
+            checked += 1
+            actioned_key = f"groom/_control/reconciled-lane-start/{run_token}.json"
+            if _s3_key_exists(s3, actioned_key):
+                continue  # already paged — one page per never-started lane
+            started_key = f"{_LANE_STARTED_PREFIX}/{day}/{run_token}.json"
+            completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
+            if _s3_key_exists(s3, started_key) or _s3_key_exists(s3, completed_key):
+                continue  # the charter began (or the lane already reached a terminal outcome) — healthy
+            paged += 1
+            newly_found.append({
+                "run_token": run_token, "instance_id": instance_id,
+                "recorded_at": recorded_at, "age_min": age_min,
+            })
+            try:
+                s3.put_object(
+                    Bucket=_RESEARCH_BUCKET, Key=actioned_key,
+                    Body=json.dumps({
+                        "outcome": "lane_never_started", "run_token": run_token,
+                        "actioned_at": now.isoformat(),
+                    }).encode(),
+                    ContentType="application/json")
+            except Exception as exc:  # noqa: BLE001 — re-pages next tick, bounded by the flow-doctor dedup key above
+                logger.warning(
+                    "lane-start health: actioned-marker write failed for %s "
+                    "(will re-page next tick): %s", run_token, exc)
+
+    # ONE aggregate page per cycle, never one per lane (2026-08-04 incident:
+    # this leg's first-ever run discovered a 2-day backlog of 27 pre-existing
+    # I4987 failures — all already the SAME known, tracked gap — and paged
+    # each individually, flooding the operator channel and plausibly tripping
+    # Telegram's own rate limit (flow-doctor's "ALL notifiers failed" alert
+    # fired in the same window). A burst belongs in one digest; the per-token
+    # actioned-key above still gives idempotency across ticks.
+    if newly_found:
+        lines = "\n".join(
+            f"  • run_token={f['run_token']} instance={f['instance_id']} "
+            f"decided {f['recorded_at']} ({f['age_min']:.0f}m ago)"
+            for f in sorted(newly_found, key=lambda f: -f["age_min"])[:20]
+        )
+        more = f"\n  … and {len(newly_found) - 20} more" if len(newly_found) > 20 else ""
+        _notify_cycle(
+            f"🔴 {len(newly_found)} groom lane(s) NEVER STARTED — dispatch-ledger "
+            "entries decided, no groom/_control/started/ or /completed/ marker "
+            "exists. Charter never ran (box likely reclaimed during/before "
+            "bootstrap — alpha-engine-config-I4987, same known cause for all "
+            f"listed below). Manual triage needed (alpha-engine-config-I6325).\n"
+            f"{lines}{more}",
+            severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_never_started_batch:{now:%Y-%m-%dT%H:%M}",
+            context={"count": len(newly_found),
+                     "run_tokens": [f["run_token"] for f in newly_found]},
+        )
+    return {"checked": checked, "paged": paged}
 
 
 def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
@@ -1917,13 +2519,20 @@ def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
         logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
 
 
-def _terminate_instance(instance_id: str) -> None:
+def _terminate_instance(instance_id: str, reason: str = "") -> None:
     """Best-effort terminate of a just-launched box whose post-launch steps
     failed. Without this the box orphans: it received no bootstrap, so neither
     the in-script watchdog nor the EXIT trap (both armed BY the bootstrap) is
     running to tear it down — it idles until manually killed. Never masks the
-    original error (logged, not raised)."""
-    spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="groom")
+    original error (logged, not raised).
+
+    ``reason`` (I6199) is tagged onto the instance so the lane reconciler can
+    page the cause instead of restating EC2 state. Callers pass the exception
+    that triggered the teardown; omitting it degrades the page to the old
+    state-only wording rather than failing."""
+    spot_dispatch.terminate_on_failure(
+        instance_id, region=REGION, label="groom", reason=reason
+    )
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
@@ -1947,14 +2556,68 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
 
+    # groom-sweep-policy §4.8 (alpha-engine-config-I6461): the irreversible
+    # tier (the standalone PR-sweep Scheduler rules — see
+    # _IRREVERSIBLE_SCHEDULE_LABELS) executes only inside the declared
+    # attended window. Checked FIRST — before the concurrency probe or any
+    # AWS call — so a deferred dispatch costs nothing. Reversible dispatches
+    # (every groom rule, the lane reconciler, and the SF's own unconditional
+    # end-of-SF sweep tail) are never gated by the clock (§4.8: "a quiet
+    # night is a night with no merges, not a night with no loop").
+    if _is_irreversible_dispatch(schedule_label):
+        now = datetime.now(ZoneInfo("UTC"))
+        if not _in_attended_window(now):
+            logger.warning(
+                "irreversible-tier dispatch DEFERRED — outside attended window "
+                "(%02d:00-%02d:00 %s): schedule=%s",
+                ATTENDED_WINDOW_START_HOUR, ATTENDED_WINDOW_END_HOUR,
+                ATTENDED_WINDOW_TZ, schedule_label,
+            )
+            _notify_attended_window_deferred(schedule_label, now)
+            return {"launched": False, "reason": "attended_window_deferred",
+                    "issue_filter": issue_filter, "schedule": schedule_label}
+
     # config#1979: skip if a box for THIS SAME lane is already live — a prior
     # trigger's run that's still working its queue (now more likely to run
     # long thanks to config#1969's adaptive re-queue) must not get a second,
     # concurrent box racing the identical GitHub queue. config#2201: sweep
     # boxes guard on the distinct 'sweep' lane (see _tier_tag) so the
     # end-of-SF sweep never collides with a live mid-only groom box.
+    #
+    # Reclaim-aware bypass (2026-08-02 spot-reclaim race): the guard sees a
+    # spot-reclaimed instance as "live" for ~2 min after the interruption
+    # notice — AWS retains it `running` while the on-box watcher has already
+    # fired send_task_failure(SpotInterrupted) and the SF has already decided
+    # to relaunch. Without this leg the relaunch suppresses itself as a
+    # "duplicate" and the lane dies unworked (measured 2026-08-02 20:00 UTC:
+    # low-only reclaimed, relaunch attempt 1 skipped, lane lost). On a relaunch
+    # (attempt > 0 — ONLY the SF's bounded-retry ladder sets this), re-probe
+    # the "live" instances: any that are termination-imminent (terminal state
+    # OR a spot request marked-for-termination) are the dying prior attempt,
+    # not a competing workload — proceed past the guard for those. A genuinely
+    # healthy prior box (attempt 0, or a real duplicate on attempt > 0) still
+    # suppresses, preserving config#1979's intent. The probe is fail-safe: an
+    # API error returns an empty set and the guard suppresses as before, never
+    # risking a duplicate launch on a broken read.
     tier_tag = _tier_tag(run_mode, issue_filter)
     existing = _running_tier_instance_ids(tier_tag)
+    if existing and attempt > 0:
+        dying = spot_dispatch.termination_imminent(existing, region=REGION)
+        if dying:
+            live = [i for i in existing if i not in dying]
+            if not live:
+                logger.info(
+                    "relaunch attempt %d for lane %s: prior instance(s) %s are "
+                    "termination-imminent (spot reclaim / terminal state) — "
+                    "proceeding with the replacement, NOT a duplicate",
+                    attempt, tier_tag, existing)
+                existing = []  # fall through to launch
+            else:
+                logger.warning(
+                    "relaunch attempt %d for lane %s: mixed live (%s) + dying "
+                    "(%s) prior boxes — suppressing on the genuinely-live one(s)",
+                    attempt, tier_tag, live, [i for i in existing if i in dying])
+                existing = live
     if existing:
         logger.warning(
             "lane %s already has a live groom box (%s) — skipping launch to avoid "
@@ -1963,6 +2626,33 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         return {"launched": False, "reason": "concurrent_tier_skip",
                 "issue_filter": issue_filter, "tier_tag": tier_tag,
                 "existing_instance_ids": existing}
+
+    # alpha-engine-config-I6460 (§5.9): the EC2-state check above has just
+    # concluded the lane LOOKS free — but that check is fail-open and a
+    # scan-then-launch TOCTOU race (see the module comment above
+    # `_LANE_LEASE_TTL_SECONDS`). Atomically claim the lane before doing
+    # anything else. `force=True` only when `attempt > 0` AND the guard
+    # above already independently confirmed (via live EC2 state, never
+    # inferred here) that any prior holder is dying/gone — the exact same
+    # condition that let `existing` fall through to empty above. A genuine
+    # concurrent duplicate (a fresh trigger, attempt=0, racing an existing
+    # live lane) always goes through the normal, non-forced path and is
+    # excluded by construction.
+    lane_lease_owner_id = f"{schedule_label}:{tier_tag}:attempt{attempt}:{uuid.uuid4().hex[:12]}"
+    lane_lease = dispatch_lease.acquire_lease(
+        _lane_lease_key(tier_tag), owner_id=lane_lease_owner_id,
+        ttl_seconds=_LANE_LEASE_TTL_SECONDS, bucket=_RESEARCH_BUCKET,
+        force=(attempt > 0),
+    )
+    if not lane_lease.acquired:
+        logger.warning(
+            "lane %s lease could not be acquired (held by owner_id=%s, "
+            "ttl_epoch=%d) — yielding, NOT queuing or launching", tier_tag,
+            lane_lease.holder.owner_id, lane_lease.holder.ttl_epoch)
+        _notify_lane_lease_yielded(tier_tag, lane_lease.holder.owner_id, schedule_label)
+        return {"launched": False, "reason": "lane_lease_yielded",
+                "issue_filter": issue_filter, "tier_tag": tier_tag,
+                "lease_holder_owner_id": lane_lease.holder.owner_id}
 
     # config#3173: outermost runaway backstop — checked LAST, after every
     # other suppression, so it fires even when a caller bypasses the demand
@@ -1977,6 +2667,10 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             GROOM_MAX_DISPATCHES_DAILY, tier_tag)
         _notify_dispatch_ceiling_exhausted(
             prior_dispatches, GROOM_MAX_DISPATCHES_DAILY, tier_tag, schedule_label)
+        # We hold the lane lease but are NOT going to launch — release it
+        # immediately rather than leaving the lane needlessly blocked for
+        # the full TTL. Best-effort: release() never raises.
+        dispatch_lease.release_lease(_lane_lease_key(tier_tag), bucket=_RESEARCH_BUCKET)
         return {"launched": False, "reason": "dispatch_ceiling_exhausted",
                 "issue_filter": issue_filter, "tier_tag": tier_tag,
                 "prior_dispatch_count": prior_dispatches,
@@ -1996,9 +2690,20 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     except Exception as exc:
         logger.warning("dispatch ledger pre-launch write failed (non-fatal): %s", exc)
 
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand,
-                                           tier_tag=tier_tag,
-                                           attempt=attempt)
+    try:
+        instance_id, market = _launch_instance_serialized(
+            force_on_demand=force_on_demand, tier_tag=tier_tag, attempt=attempt,
+            run_token=run_token,
+        )
+    except Exception:
+        # No instance exists — the lane was never actually used. Release the
+        # lane lease so a launch failure (e.g. spot-launch lease contention
+        # exhausted, or ec2_spot itself raising) does not additionally block
+        # the lane for the full TTL on top of whatever caused the failure.
+        # Best-effort: release() never raises, and the raise below is
+        # unconditional either way (fail-loud, unchanged from prior behavior).
+        dispatch_lease.release_lease(_lane_lease_key(tier_tag), bucket=_RESEARCH_BUCKET)
+        raise
     logger.info("launched groom box %s (%s)", instance_id, market)
 
     # config#5303: the load-bearing groom-issue-filter tag is now passed as
@@ -2022,9 +2727,9 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             task_token=task_token,
             instance_type=_describe_instance_type(instance_id), market=market,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(_LEDGER_WRITE_FAILED_MSG)
-        _terminate_instance(instance_id)
+        _terminate_instance(instance_id, reason=f"{type(exc).__name__}: {exc}")
         raise
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
@@ -2045,8 +2750,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
             queue_manifest_key, backend, task_token,
         )
-    except Exception:
-        _terminate_instance(instance_id)
+    except Exception as exc:
+        _terminate_instance(instance_id, reason=f"{type(exc).__name__}: {exc}")
         raise
     logger.info(
         "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s "
@@ -2790,12 +3495,25 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # cadence) invokes this mode to screen open expectations against
         # live EC2 state. config-I4988 (trigger-health leg, added with the
         # run_window retirement): the same tick also screens dispatch-SF
-        # executions for their decision-record receipts. No other caller
-        # sets a top-level `mode`, so this cannot collide with any other
-        # invocation shape.
+        # executions for their decision-record receipts. alpha-engine-
+        # config-I6325 (F8 lane-start-health leg): the same tick also
+        # screens decided lane launches for a charter that never started. No
+        # other caller sets a top-level `mode`, so this cannot collide with
+        # any other invocation shape.
         lane = _reconcile_lane_death()
         trigger = _reconcile_trigger_health()
-        return {**lane, "trigger_health": trigger}
+        lane_start = _reconcile_lane_start_health()
+        # alpha-engine-config-I6460 (§5.9.4): same 5-min cadence, additive
+        # leg — pages once per day per lane that yielded its dispatch lease
+        # every time with zero launches (see _LANE_YIELD_STARVATION_EVAL_
+        # HOUR_UTC for why this is time-gated rather than trigger-counted).
+        yield_starvation = _reconcile_lane_yield_starvation()
+        return {
+            **lane,
+            "trigger_health": trigger,
+            "lane_start_health": lane_start,
+            "lane_yield_starvation": yield_starvation,
+        }
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)

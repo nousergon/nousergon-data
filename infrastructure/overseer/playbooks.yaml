@@ -156,6 +156,18 @@ playbooks:
         - type: lambda_active
           function: alpha-engine-ci-watch-dispatcher
           report_kill_switch: CI_WATCH_DISPATCH_ENABLED
+        # config-I5262: ci-watch dispatches are recorded at
+        # ci_watch/_control/dispatched/{repo}-{sha}.json; completion markers
+        # live at ci_watch/_control/completed/{repo}-{sha}.json with the
+        # same filename. A dispatched record with no matching completion
+        # marker after response_window_min means the box died before writing
+        # its outcome (the exact failure that triggered this issue).
+        - type: dispatch_invocation_success
+          family: ci-watch
+          dispatch_prefix: ci_watch/_control/dispatched/
+          completion_prefix: ci_watch/_control/completed/
+          response_window_min: 60
+          lookback_hours: 24
 
   alert-drain:
     description: >-
@@ -329,6 +341,24 @@ playbooks:
     # one residual hole (a Scheduler rule that never fires at all produces no
     # execution) is the four scheduler_schedule_exists wiring checks for the
     # groom schedules in watch_plane_liveness (name+state only, no cron).
+    #
+    # config-I5262: the reconciler's lane-death leg screens live EC2 state —
+    # but a lane can be alive on EC2 yet never write an outcome (hung boot,
+    # crashed charter), so the completion-marker signal is checked here, on
+    # the read-only probe plane. This check is the INVOCATION-SUCCESS signal:
+    # for every dispatch-ledger entry (a box was launched with a run_token),
+    # assert a completion marker exists at groom/_control/completed/{run_token}.json.
+    # A mature dispatch with no completion marker means the box died before
+    # writing any outcome.
+    liveness:
+      checks:
+        - type: dispatch_invocation_success
+          family: groom
+          dispatch_prefix: groom/_control/dispatch-ledger/
+          completion_prefix: groom/_control/completed/
+          completion_key_field: run_token
+          response_window_min: 30
+          lookback_hours: 30
 
   gate-sweeps:
     description: >-
@@ -517,6 +547,33 @@ watch_plane_liveness:
       schedule_name: alpha-engine-scheduled-groom-2000-daily
     - type: scheduler_schedule_exists
       schedule_name: alpha-engine-scheduled-groom-sun0900-weekly
+    # alpha-engine-config#6164: AGENT DISPATCH COMPLETENESS — for every dispatch
+    # the dispatch ledger records as launched=True within lookback_hours, the
+    # corresponding SSM command must have reached a terminal Success status. A
+    # dispatch that reported success and whose command terminated non-success
+    # (Failed/TimedOut/Cancelled) is a finding, immediately. This is the
+    # 2026-08-01 outage class (nous-ergon-ops-I368): the entire Overseer response
+    # plane was dead for ~11 hours and nothing reported it because every sensor
+    # upstream of the agent reported success — the SF dispatcher fired, routed
+    # via overseer-dispatcher (http=202, launched=True), spot box launched — but
+    # the bootstrap aborted 75s in with SECRET_ENV_FILE: unbound variable. SSM
+    # recorded Failed at PT1M75.6S. No issue, no PR, no alert. Found by a human
+    # nine hours later.
+    #
+    # Tolerates the window between dispatch-ledger write and SSM command reaching
+    # a terminal state (the ledger writes dispatched=True BEFORE the command is
+    # known to have started). Commands still InProgress/Delayed/Pending within
+    # response_window_min are skipped; commands past the window whose invocation
+    # is absent (beyond SSM's ~30-day retention) are also skipped (the ledger
+    # entry itself is the only surviving record).
+    #
+    # Per overseer-policy.md §5 Layer B: reads SSM (the upstream system's own
+    # record), never the response plane's log.
+    - type: agent_dispatch_completeness
+      dispatch_ledger_prefix: overseer/dispatch_ledger/
+      response_window_min: 15
+      lookback_hours: 24
+      ssm_retention_days: 30
 
 # ── Alert-class registry (config-I3211; Brian directive 2026-07-22) ──────────
 # One row per DISTINCT notification class the fleet emits. This answers, in
@@ -781,6 +838,22 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: check_systemd_unit_drift
+    # config-I3211 backstop registration (alpha-engine-config#5715): installed
+    # systemd units on a box diverge from what the repo expects. Alert
+    # payload's raw `Source:` field is the hyphenated `check-systemd-unit-drift`.
+    source: "alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: boot_pull
+    # config-I3211 backstop registration (alpha-engine-config#5714 / #4793):
+    # boot-time repo pull on a box failed, risking stale code at session start.
+    # Alert payload's raw `Source:` field is the hyphenated `boot-pull`.
+    source: "alpha-engine/infrastructure/boot-pull.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
 
   # ── groom (alpha-engine-config emitter) ──
   - class: groom_lifecycle_bus_events
@@ -799,6 +872,21 @@ alert_classes:
     source: "cloudwatch-alarm:*"
     severities: [alarm]
     intake: cw-alarm
+    response: drain-queue
+
+  # ── infra (box health + deploy-on-merge — config-I3211 alert-drain registry) ──
+  # Both emitters were added without declaring a class; the config-I3211
+  # completeness chokepoint reported them as undeclared every drain run until
+  # rows matched the emitted source strings exactly (alpha-engine-config#5326).
+  - class: box_health
+    source: "box-health"
+    severities: [warning, critical]
+    intake: bus
+    response: drain-queue
+  - class: deploy_on_merge
+    source: "deploy-on-merge"
+    severities: [critical]
+    intake: bus
     response: drain-queue
 
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──

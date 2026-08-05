@@ -7,6 +7,7 @@ the handler hands to the primitive, plus the return value shape.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -362,3 +363,78 @@ def test_succeeded_hollow_predictor_training_flags_loud(reset_send_message):
     assert "⚠️" in text
     assert result["hollow_suspect"] is True
     assert result["silent"] is False
+
+
+class TestPartialRunsDoNotPageAsCadenceFailures:
+    """A narrowed run is labelled as one and does not buzz.
+
+    `director-verify-20260804T003005Z` on ne-weekly-freshness-pipeline carried
+    24 `skip_*: true` flags and no `pipeline_role`. It ran one stage, failed in
+    0m, and paged as "🔴 Weekly Freshness SF — FAILED / Duration: 0m / States:
+    (no workload states in history)" — a message carrying, in its own body, the
+    evidence that it was not a weekly run. overseer-policy invariant 17:
+    severity is a property of the invariant breached, not of the check that
+    emitted it.
+    """
+
+    _WEEKLY_ARN = (
+        "arn:aws:states:us-east-1:711398986525:stateMachine:"
+        "ne-weekly-freshness-pipeline"
+    )
+
+    def _detail(self, name="director-verify-20260804T003005Z"):
+        return {
+            "stateMachineArn": self._WEEKLY_ARN,
+            "executionArn": f"{self._WEEKLY_ARN}:{name}".replace(
+                ":stateMachine:", ":execution:"
+            ),
+            "name": name,
+            "status": "FAILED",
+            "startDate": 0,
+            "stopDate": 0,
+        }
+
+    def test_skip_flagged_run_is_labelled_partial_and_silent(self):
+        describe = {"input": json.dumps({
+            "run_date": "2026-08-03",
+            "skip_scanner": True,
+            "skip_evaluator": True,
+            "skip_post_eval": False,
+        })}
+        text, silent, _hollow, is_partial = index._build_message(
+            self._detail(), describe
+        )
+        assert is_partial is True
+        assert silent is True, "a narrowed run must not buzz"
+        assert "partial run — 2 stage(s) skipped" in text, text
+        assert "Weekly Freshness SF (partial run" in text, text
+
+    def test_canonical_cadence_role_wins_over_skip_flags(self):
+        """A real weekly rerun skipping completed stages is still the weekly run."""
+        describe = {"input": json.dumps({
+            "pipeline_role": "weekly",
+            "run_date": "2026-08-03",
+            "skip_data_phase1": True,
+        })}
+        text, silent, _hollow, is_partial = index._build_message(
+            self._detail("weekly-2026-08-03"), describe
+        )
+        assert is_partial is False
+        assert silent is False, "a cadence run failing must still page"
+        assert "partial run" not in text, text
+
+    def test_full_run_with_no_skips_is_not_partial(self):
+        describe = {"input": json.dumps({"run_date": "2026-08-03"})}
+        _text, silent, _hollow, is_partial = index._build_message(
+            self._detail("abc-123"), describe
+        )
+        assert is_partial is False
+        assert silent is False
+
+    def test_unparseable_input_is_not_treated_as_partial(self):
+        """Absence of evidence is never evidence of a narrowed run."""
+        _text, silent, _hollow, is_partial = index._build_message(
+            self._detail("abc-123"), {"input": "not json"}
+        )
+        assert is_partial is False
+        assert silent is False, "an unreadable input must fail toward paging"

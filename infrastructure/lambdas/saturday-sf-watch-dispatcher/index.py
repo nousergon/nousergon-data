@@ -981,7 +981,7 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
             "plain rerun started, no agent (zero-token recovery, config#1900)_"
         )
     elif will_dispatch:
-        footer = "_autonomous fix ACTIVE — resilience agent dispatched (diagnose→fix→merge→rerun)_"
+        footer = "_autonomous fix LAUNCHING — resilience agent dispatched; outcome reported on box completion (diagnose→fix→merge→rerun)_"
     elif suppressed == "operator_abort":
         footer = "_operator abort — recorded loudly, no autonomous recovery (deliberate human stop)_"
     elif suppressed == "already_escalated_today":

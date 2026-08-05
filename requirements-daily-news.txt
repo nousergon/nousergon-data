@@ -1,19 +1,25 @@
-# Slim dependency set for running ONLY the standalone daily-news collector
-# (`python -m collectors.daily_news`) on a memory/disk-constrained host.
+# Slim dependency set for running the standalone daily-news collector
+# (`python -m collectors.daily_news`) on the shared dashboard box (t3.small).
 #
 # Why this exists: the full `requirements.txt` pulls the entire data stack
-# (arcticdb, voyageai, edgartools, beautifulsoup4/lxml, jsonschema, yfinance,
-# lib[arcticdb,rag,contracts], ...) — ~1.5 GB installed. The daily-news
-# collector imports NONE of those; its true external surface is just the
-# packages below (verified by tracing `collectors.daily_news`'s import
-# closure: nlp.loughran_mcdonald, news_aggregator_async, news_sources/*,
-# data/derived/news_{aggregates,articles}, polygon_client). This lets the
-# collector run on the shared dashboard box (t3.small) without the heavy
-# stack. Measured peak RSS of a full 96-ticker run: ~0.17 GB.
+# (arcticdb, edgartools, beautifulsoup4/lxml, jsonschema, yfinance,
+# lib[arcticdb,contracts], ...) — ~1.5 GB installed. The daily-news
+# collector's true external surface is the packages below (verified by
+# tracing `collectors.daily_news`'s import closure: nlp.loughran_mcdonald,
+# news_aggregator_async, news_sources/*, data/derived/news_{aggregates,articles},
+# polygon_client) PLUS the RAG corpus-ingest chain config-I5702 added
+# (rag.pipelines.{ingest_news,_watermarks,run_news_pipeline} →
+# nousergon_lib.rag → psycopg2-binary/pgvector, and voyageai embeddings at
+# embed time). The DB deps ride the lib's [rag] extra so they stay in
+# lockstep with the lib pin; voyageai has no lib extra and mirrors
+# requirements.txt's own pin. Measured peak RSS of a full 96-ticker run:
+# ~0.17 GB.
 #
 # Keep in lockstep with the lib pin in requirements.txt. If a future change
 # adds an import to the daily-news chain, add the dep here too (the standalone
-# run will fail loud on a missing import).
+# run will fail loud on a missing import — the 2026-07-30 config-I5702 wiring
+# missed exactly this and every daily run's corpus ingest failed for days,
+# alpha-engine-config#6063).
 boto3>=1.43.59
 pandas>=2.0
 pyarrow>=25.0.0
@@ -23,4 +29,5 @@ feedparser>=6.0.14
 anyio>=4.14.2
 tenacity>=9.1.4
 pyyaml>=6.0.3
-nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.27
+voyageai>=0.5.0
+nousergon-lib[rag,flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.36

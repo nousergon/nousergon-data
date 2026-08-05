@@ -107,12 +107,14 @@ class TestChainOrdering:
             "cadence runs reach the same downstream chain after grabbing the "
             "mutex"
         )
-        # CheckSpotDispatchNeeded's IsPresent branch reaches CheckShellRun
-        # directly (operator override skips the dispatch); its Default
-        # dispatches a fresh spot and reaches CheckShellRun after the
-        # bootstrap-poll chain resolves — either way CheckShellRun.Default is
-        # still the pre-spine target.
-        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "CheckShellRun"
+        # CheckSpotDispatchNeeded's IsPresent branch reaches
+        # NormalizeEc2InstanceId — the normalization gate inserted before
+        # CheckShellRun (config#2248 guard: wraps a bare-string
+        # ec2_instance_id into the ["i-..."] array). Its Default dispatches
+        # a fresh spot and reaches CheckShellRun after the bootstrap-poll
+        # chain resolves — either way CheckShellRun.Default is still the
+        # pre-spine target.
+        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "NormalizeEc2InstanceId"
         assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich", (
             "CheckShellRun.Default must be CheckSkipMorningEnrich so the "
             "real Saturday run is byte-identical pre-spine."

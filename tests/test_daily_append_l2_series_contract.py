@@ -234,9 +234,25 @@ def test_l2_block_gates_env_override_promotes_continuity(monkeypatch):
     # after _patch_targets sets it up.
     universe_lib = _da.get_universe_lib("any-bucket")
     hist = universe_lib.read_batch.return_value[0].data
-    # Drop the middle row to create a real gap that isn't a weekend/holiday.
+    # Drop a row near the middle that IS an NYSE trading day — pd.bdate_range
+    # includes market holidays (weekdays that aren't trading days), and
+    # dropping a holiday creates no continuity-gate gap (the gate is
+    # calendar-aware and only counts NYSE trading days). Walk forward from
+    # mid to find the first trading day so this test doesn't silently pass
+    # on dates where mid happens to land on MLK Day, Presidents Day, etc.
+    from nousergon_lib.trading_calendar import is_trading_day as _is_td
+
     mid = len(hist) // 2
-    dropped = hist.drop(hist.index[mid])
+    dropped = hist
+    for i in range(mid, len(hist)):
+        if _is_td(hist.index[i].date()):
+            dropped = hist.drop(hist.index[i])
+            break
+    else:
+        pytest.skip(
+            "No NYSE trading day found in second half of hist — "
+            "cannot create a genuine continuity gap"
+        )
     universe_lib.read_batch.return_value = [
         MagicMock(spec=[], data=dropped) for _ in universe
     ]

@@ -424,6 +424,30 @@
             "response_window_min": { "type": "integer", "minimum": 1 },
             "lookback_hours": { "type": "integer", "minimum": 1 }
           }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "family", "dispatch_prefix", "completion_prefix", "response_window_min", "lookback_hours"],
+          "properties": {
+            "type": { "const": "dispatch_invocation_success" },
+            "family": { "type": "string", "minLength": 1 },
+            "dispatch_prefix": { "type": "string", "minLength": 1 },
+            "completion_prefix": { "type": "string", "minLength": 1 },
+            "completion_key_field": { "type": "string", "minLength": 1 },
+            "response_window_min": { "type": "integer", "minimum": 1 },
+            "lookback_hours": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["type", "dispatch_ledger_prefix", "response_window_min", "lookback_hours"],
+          "properties": {
+            "type": { "const": "agent_dispatch_completeness" },
+            "dispatch_ledger_prefix": { "type": "string", "minLength": 1 },
+            "response_window_min": { "type": "integer", "minimum": 1 },
+            "lookback_hours": { "type": "integer", "minimum": 1 },
+            "ssm_retention_days": { "type": "integer", "minimum": 1, "maximum": 60 }
+          }
         }
       ]
     }

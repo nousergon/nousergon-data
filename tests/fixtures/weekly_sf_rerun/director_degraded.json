@@ -1,0 +1,2400 @@
+{
+ "events": [
+  {
+   "timestamp": "2026-08-01T22:17:53.378000+00:00",
+   "type": "ExecutionStarted",
+   "id": 1,
+   "previousEventId": 0,
+   "executionStartedEventDetails": {
+    "input": "{\"pipeline_role\": \"watch-rerun\", \"run_date\": \"2026-08-01\", \"skip_aggregate_costs\": true, \"skip_backtester_stage_only\": true, \"skip_challenger_shadow\": true, \"skip_counterfactual\": true, \"skip_data_phase1\": true, \"skip_data_phase2\": true, \"skip_eval_judge\": true, \"skip_morning_enrich\": true, \"skip_portfolio_optimizer_backtest\": true, \"skip_predictor_backtest\": true, \"skip_predictor_training\": true, \"skip_rag_ingestion\": true, \"skip_rationale_clustering\": true, \"skip_regime_retrospective_eval\": true, \"skip_regime_substrate\": true, \"skip_replay_concordance\": true, \"skip_scanner\": true, \"skip_signals_envelope\": true, \"skip_thinktank_coverage\": true, \"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}",
+    "inputDetails": {
+     "truncated": false
+    },
+    "roleArn": "arn:aws:iam::711398986525:role/alpha-engine-step-functions-role"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 2,
+   "timestamp": "2026-08-01T22:17:53.394000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "InitializeInput"
+   }
+  },
+  {
+   "timestamp": "2026-08-01T22:17:53.394000+00:00",
+   "type": "PassStateExited",
+   "id": 3,
+   "previousEventId": 2,
+   "stateExitedEventDetails": {
+    "name": "InitializeInput",
+    "output": "{\"research_dry\":false,\"data_phase2_dry\":false,\"skip_backtester_stage_only\":true,\"skip_rationale_clustering\":true,\"skip_eval_judge\":true,\"pipeline_label\":\"\",\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_scanner\":true,\"skip_replay_concordance\":true,\"preflight_args\":\"\",\"skip_predictor_backtest\":true,\"skip_counterfactual\":true,\"skip_morning_enrich\":true,\"pipeline_role\":\"watch-rerun\",\"skip_thinktank_coverage\":true,\"skip_predictor_training\":true,\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"regime_action\":\"produce\",\"skip_portfolio_optimizer_backtest\":true,\"skip_data_phase2\":true,\"skip_regime_retrospective_eval\":true,\"skip_data_phase1\":true,\"skip_weekly_run_day_gate\":false,\"skip_signals_envelope\":true,\"skip_regime_substrate\":true,\"skip_aggregate_costs\":true,\"run_date\":\"2026-08-01\"}",
+    "outputDetails": {
+     "truncated": false
+    }
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 4,
+   "timestamp": "2026-08-01T22:17:53.394000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckWeeklyRunDayGate"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 6,
+   "timestamp": "2026-08-01T22:17:53.394000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckRunMode"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 8,
+   "timestamp": "2026-08-01T22:17:53.394000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipLibPinDriftCheck"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 10,
+   "timestamp": "2026-08-01T22:17:53.394000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "LibPinDriftCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 15,
+   "timestamp": "2026-08-01T22:17:56.475000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "LibPinDriftGate"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 17,
+   "timestamp": "2026-08-01T22:17:56.475000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "PipelineContractCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 22,
+   "timestamp": "2026-08-01T22:17:56.724000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "PipelineContractGate"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 24,
+   "timestamp": "2026-08-01T22:17:56.724000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorDeployDriftCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 29,
+   "timestamp": "2026-08-01T22:17:59.296000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorDeployDriftGate"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 31,
+   "timestamp": "2026-08-01T22:17:59.296000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorDirectorDeployDriftCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 36,
+   "timestamp": "2026-08-01T22:18:01.691000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorDirectorDeployDriftGate"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 38,
+   "timestamp": "2026-08-01T22:18:01.691000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckMutexRole"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 40,
+   "timestamp": "2026-08-01T22:18:01.691000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSpotDispatchNeeded"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 42,
+   "timestamp": "2026-08-01T22:18:01.691000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "DispatchWeeklyFreshnessSpot"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 47,
+   "timestamp": "2026-08-01T22:18:22.243000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "MergeWeeklyFreshnessSpotInstanceId"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 49,
+   "timestamp": "2026-08-01T22:18:22.243000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForWeeklyFreshnessSpotBootstrap"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 54,
+   "timestamp": "2026-08-01T22:18:22.382000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckWeeklyFreshnessSpotBootstrapStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 56,
+   "timestamp": "2026-08-01T22:18:22.382000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WeeklyFreshnessSpotBootstrapWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 58,
+   "timestamp": "2026-08-01T22:18:52.444000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForWeeklyFreshnessSpotBootstrap"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 63,
+   "timestamp": "2026-08-01T22:18:52.587000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckWeeklyFreshnessSpotBootstrapStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 65,
+   "timestamp": "2026-08-01T22:18:52.587000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WeeklyFreshnessSpotBootstrapWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 67,
+   "timestamp": "2026-08-01T22:19:22.652000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForWeeklyFreshnessSpotBootstrap"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 72,
+   "timestamp": "2026-08-01T22:19:22.783000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckWeeklyFreshnessSpotBootstrapStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 74,
+   "timestamp": "2026-08-01T22:19:22.783000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WeeklyFreshnessSpotBootstrapWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 76,
+   "timestamp": "2026-08-01T22:19:52.852000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForWeeklyFreshnessSpotBootstrap"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 81,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckWeeklyFreshnessSpotBootstrapStatus"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 83,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckShellRun"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 85,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipMorningEnrich"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 87,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipDataPhase1"
+   }
+  },
+  {
+   "type": "ParallelStateEntered",
+   "id": 89,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ResearchPredictorParallel"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 91,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipScanner"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 93,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipPredictorTraining"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 95,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipRegimeSubstrate"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 97,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ValidatePredictorSkipWeightsFresh"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 99,
+   "timestamp": "2026-08-01T22:19:53.010000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipSignalsEnvelope"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 102,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipChallengerShadow"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 104,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipRAGIngestion"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 106,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipThinkTankCoverage"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 108,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipRegimeRetrospectiveEval"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 110,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipDataPhase2"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 112,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipEvalJudge"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 114,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipRationaleClustering"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 116,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipReplayConcordance"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 118,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipCounterfactual"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 120,
+   "timestamp": "2026-08-01T22:19:53.090000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipAggregateCosts"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 124,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "BranchAComplete"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 126,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckPredictorSkipWeightsFresh"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 128,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "PredictorTrainingSkipped"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 132,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "AggregateBranchOutcomes"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 134,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckBranchOutcomes"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 136,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipBacktester"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 138,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipBacktesterStageOnly"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 140,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipPredictorBacktest"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 142,
+   "timestamp": "2026-08-01T22:19:53.185000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipPortfolioOptimizerBacktest"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 144,
+   "timestamp": "2026-08-01T22:19:53.266000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipParity"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 146,
+   "timestamp": "2026-08-01T22:19:53.266000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "Parity"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 151,
+   "timestamp": "2026-08-01T22:19:53.470000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 156,
+   "timestamp": "2026-08-01T22:19:53.601000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 158,
+   "timestamp": "2026-08-01T22:19:53.601000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 160,
+   "timestamp": "2026-08-01T22:20:53.662000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 165,
+   "timestamp": "2026-08-01T22:20:53.805000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 167,
+   "timestamp": "2026-08-01T22:20:53.805000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 169,
+   "timestamp": "2026-08-01T22:21:53.868000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 174,
+   "timestamp": "2026-08-01T22:21:54.011000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 176,
+   "timestamp": "2026-08-01T22:21:54.011000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 178,
+   "timestamp": "2026-08-01T22:22:54.062000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 183,
+   "timestamp": "2026-08-01T22:22:54.217000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 185,
+   "timestamp": "2026-08-01T22:22:54.217000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 187,
+   "timestamp": "2026-08-01T22:23:54.282000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 192,
+   "timestamp": "2026-08-01T22:23:54.408000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 194,
+   "timestamp": "2026-08-01T22:23:54.408000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 196,
+   "timestamp": "2026-08-01T22:24:54.474000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 201,
+   "timestamp": "2026-08-01T22:24:54.609000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 203,
+   "timestamp": "2026-08-01T22:24:54.609000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 205,
+   "timestamp": "2026-08-01T22:25:54.671000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 210,
+   "timestamp": "2026-08-01T22:25:54.772000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 212,
+   "timestamp": "2026-08-01T22:25:54.772000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 214,
+   "timestamp": "2026-08-01T22:26:54.845000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 219,
+   "timestamp": "2026-08-01T22:26:54.986000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 221,
+   "timestamp": "2026-08-01T22:26:54.986000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 223,
+   "timestamp": "2026-08-01T22:27:55.053000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 228,
+   "timestamp": "2026-08-01T22:27:55.181000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 230,
+   "timestamp": "2026-08-01T22:27:55.181000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 232,
+   "timestamp": "2026-08-01T22:28:55.240000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 237,
+   "timestamp": "2026-08-01T22:28:55.388000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 239,
+   "timestamp": "2026-08-01T22:28:55.388000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 241,
+   "timestamp": "2026-08-01T22:29:55.444000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 246,
+   "timestamp": "2026-08-01T22:29:55.587000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 248,
+   "timestamp": "2026-08-01T22:29:55.587000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 250,
+   "timestamp": "2026-08-01T22:30:55.647000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 255,
+   "timestamp": "2026-08-01T22:30:55.774000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 257,
+   "timestamp": "2026-08-01T22:30:55.774000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 259,
+   "timestamp": "2026-08-01T22:31:55.828000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 264,
+   "timestamp": "2026-08-01T22:31:55.963000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 266,
+   "timestamp": "2026-08-01T22:31:55.963000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 268,
+   "timestamp": "2026-08-01T22:32:56.015000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 273,
+   "timestamp": "2026-08-01T22:32:56.146000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 275,
+   "timestamp": "2026-08-01T22:32:56.146000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 277,
+   "timestamp": "2026-08-01T22:33:56.207000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 282,
+   "timestamp": "2026-08-01T22:33:56.342000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 284,
+   "timestamp": "2026-08-01T22:33:56.342000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 286,
+   "timestamp": "2026-08-01T22:34:56.410000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 291,
+   "timestamp": "2026-08-01T22:34:56.566000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 293,
+   "timestamp": "2026-08-01T22:34:56.566000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 295,
+   "timestamp": "2026-08-01T22:35:56.621000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 300,
+   "timestamp": "2026-08-01T22:35:56.777000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 302,
+   "timestamp": "2026-08-01T22:35:56.777000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 304,
+   "timestamp": "2026-08-01T22:36:56.836000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 309,
+   "timestamp": "2026-08-01T22:36:56.997000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 311,
+   "timestamp": "2026-08-01T22:36:56.997000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 313,
+   "timestamp": "2026-08-01T22:37:57.071000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 318,
+   "timestamp": "2026-08-01T22:37:57.200000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 320,
+   "timestamp": "2026-08-01T22:37:57.200000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 322,
+   "timestamp": "2026-08-01T22:38:57.254000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 327,
+   "timestamp": "2026-08-01T22:38:57.382000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 329,
+   "timestamp": "2026-08-01T22:38:57.382000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 331,
+   "timestamp": "2026-08-01T22:39:57.437000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 336,
+   "timestamp": "2026-08-01T22:39:57.571000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 338,
+   "timestamp": "2026-08-01T22:39:57.571000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 340,
+   "timestamp": "2026-08-01T22:40:57.629000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 345,
+   "timestamp": "2026-08-01T22:40:57.763000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 347,
+   "timestamp": "2026-08-01T22:40:57.763000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 349,
+   "timestamp": "2026-08-01T22:41:57.831000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 354,
+   "timestamp": "2026-08-01T22:41:57.967000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 356,
+   "timestamp": "2026-08-01T22:41:57.967000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 358,
+   "timestamp": "2026-08-01T22:42:58.027000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 363,
+   "timestamp": "2026-08-01T22:42:58.162000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 365,
+   "timestamp": "2026-08-01T22:42:58.162000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 367,
+   "timestamp": "2026-08-01T22:43:58.219000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 372,
+   "timestamp": "2026-08-01T22:43:58.351000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 374,
+   "timestamp": "2026-08-01T22:43:58.351000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 376,
+   "timestamp": "2026-08-01T22:44:58.410000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 381,
+   "timestamp": "2026-08-01T22:44:58.551000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 383,
+   "timestamp": "2026-08-01T22:44:58.551000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 385,
+   "timestamp": "2026-08-01T22:45:58.616000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 390,
+   "timestamp": "2026-08-01T22:45:58.746000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 392,
+   "timestamp": "2026-08-01T22:45:58.746000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 394,
+   "timestamp": "2026-08-01T22:46:58.822000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 399,
+   "timestamp": "2026-08-01T22:46:58.966000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 401,
+   "timestamp": "2026-08-01T22:46:58.966000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 403,
+   "timestamp": "2026-08-01T22:47:59.027000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 408,
+   "timestamp": "2026-08-01T22:47:59.211000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 410,
+   "timestamp": "2026-08-01T22:47:59.211000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 412,
+   "timestamp": "2026-08-01T22:48:59.266000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 417,
+   "timestamp": "2026-08-01T22:48:59.403000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 419,
+   "timestamp": "2026-08-01T22:48:59.403000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 421,
+   "timestamp": "2026-08-01T22:49:59.467000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 426,
+   "timestamp": "2026-08-01T22:49:59.604000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 428,
+   "timestamp": "2026-08-01T22:49:59.604000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 430,
+   "timestamp": "2026-08-01T22:50:59.664000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 435,
+   "timestamp": "2026-08-01T22:50:59.808000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 437,
+   "timestamp": "2026-08-01T22:50:59.808000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 439,
+   "timestamp": "2026-08-01T22:51:59.888000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 444,
+   "timestamp": "2026-08-01T22:52:00.029000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 446,
+   "timestamp": "2026-08-01T22:52:00.029000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 448,
+   "timestamp": "2026-08-01T22:53:00.088000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 453,
+   "timestamp": "2026-08-01T22:53:00.216000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 455,
+   "timestamp": "2026-08-01T22:53:00.216000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 457,
+   "timestamp": "2026-08-01T22:54:00.269000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 462,
+   "timestamp": "2026-08-01T22:54:00.403000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 464,
+   "timestamp": "2026-08-01T22:54:00.403000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 466,
+   "timestamp": "2026-08-01T22:55:00.471000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 471,
+   "timestamp": "2026-08-01T22:55:00.619000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 473,
+   "timestamp": "2026-08-01T22:55:00.619000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 475,
+   "timestamp": "2026-08-01T22:56:00.689000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 480,
+   "timestamp": "2026-08-01T22:56:00.822000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 482,
+   "timestamp": "2026-08-01T22:56:00.822000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 484,
+   "timestamp": "2026-08-01T22:57:00.874000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 489,
+   "timestamp": "2026-08-01T22:57:01.011000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 491,
+   "timestamp": "2026-08-01T22:57:01.011000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 493,
+   "timestamp": "2026-08-01T22:58:01.074000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 498,
+   "timestamp": "2026-08-01T22:58:01.219000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 500,
+   "timestamp": "2026-08-01T22:58:01.219000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 502,
+   "timestamp": "2026-08-01T22:59:01.287000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 507,
+   "timestamp": "2026-08-01T22:59:01.447000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 509,
+   "timestamp": "2026-08-01T22:59:01.447000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 511,
+   "timestamp": "2026-08-01T23:00:01.520000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 516,
+   "timestamp": "2026-08-01T23:00:01.692000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 518,
+   "timestamp": "2026-08-01T23:00:01.692000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 520,
+   "timestamp": "2026-08-01T23:01:01.750000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 525,
+   "timestamp": "2026-08-01T23:01:01.891000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 527,
+   "timestamp": "2026-08-01T23:01:01.891000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 529,
+   "timestamp": "2026-08-01T23:02:01.958000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 534,
+   "timestamp": "2026-08-01T23:02:02.081000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 536,
+   "timestamp": "2026-08-01T23:02:02.081000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 538,
+   "timestamp": "2026-08-01T23:03:02.146000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 543,
+   "timestamp": "2026-08-01T23:03:02.280000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 545,
+   "timestamp": "2026-08-01T23:03:02.280000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 547,
+   "timestamp": "2026-08-01T23:04:02.343000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 552,
+   "timestamp": "2026-08-01T23:04:02.495000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 554,
+   "timestamp": "2026-08-01T23:04:02.495000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 556,
+   "timestamp": "2026-08-01T23:05:02.559000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 561,
+   "timestamp": "2026-08-01T23:05:02.687000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 563,
+   "timestamp": "2026-08-01T23:05:02.687000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 565,
+   "timestamp": "2026-08-01T23:06:02.745000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 570,
+   "timestamp": "2026-08-01T23:06:02.893000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 572,
+   "timestamp": "2026-08-01T23:06:02.893000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 574,
+   "timestamp": "2026-08-01T23:07:02.954000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 579,
+   "timestamp": "2026-08-01T23:07:03.080000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 581,
+   "timestamp": "2026-08-01T23:07:03.080000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 583,
+   "timestamp": "2026-08-01T23:08:03.147000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 588,
+   "timestamp": "2026-08-01T23:08:03.570000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 590,
+   "timestamp": "2026-08-01T23:08:03.570000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 592,
+   "timestamp": "2026-08-01T23:09:03.631000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 597,
+   "timestamp": "2026-08-01T23:09:03.773000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 599,
+   "timestamp": "2026-08-01T23:09:03.773000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 601,
+   "timestamp": "2026-08-01T23:10:03.836000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 606,
+   "timestamp": "2026-08-01T23:10:03.961000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 608,
+   "timestamp": "2026-08-01T23:10:03.961000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 610,
+   "timestamp": "2026-08-01T23:11:04.026000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 615,
+   "timestamp": "2026-08-01T23:11:04.163000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 617,
+   "timestamp": "2026-08-01T23:11:04.163000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 619,
+   "timestamp": "2026-08-01T23:12:04.247000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 624,
+   "timestamp": "2026-08-01T23:12:04.387000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 626,
+   "timestamp": "2026-08-01T23:12:04.387000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 628,
+   "timestamp": "2026-08-01T23:13:04.446000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 633,
+   "timestamp": "2026-08-01T23:13:04.586000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 635,
+   "timestamp": "2026-08-01T23:13:04.586000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 637,
+   "timestamp": "2026-08-01T23:14:04.617000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 642,
+   "timestamp": "2026-08-01T23:14:04.753000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 644,
+   "timestamp": "2026-08-01T23:14:04.753000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 646,
+   "timestamp": "2026-08-01T23:15:04.817000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 651,
+   "timestamp": "2026-08-01T23:15:04.952000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 653,
+   "timestamp": "2026-08-01T23:15:04.952000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 655,
+   "timestamp": "2026-08-01T23:16:05.028000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 660,
+   "timestamp": "2026-08-01T23:16:05.164000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 662,
+   "timestamp": "2026-08-01T23:16:05.164000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 664,
+   "timestamp": "2026-08-01T23:17:05.223000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 669,
+   "timestamp": "2026-08-01T23:17:05.370000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 671,
+   "timestamp": "2026-08-01T23:17:05.370000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 673,
+   "timestamp": "2026-08-01T23:18:05.432000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 678,
+   "timestamp": "2026-08-01T23:18:05.571000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 680,
+   "timestamp": "2026-08-01T23:18:05.571000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 682,
+   "timestamp": "2026-08-01T23:19:05.635000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 687,
+   "timestamp": "2026-08-01T23:19:05.774000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 689,
+   "timestamp": "2026-08-01T23:19:05.774000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 691,
+   "timestamp": "2026-08-01T23:20:05.833000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 696,
+   "timestamp": "2026-08-01T23:20:05.962000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 698,
+   "timestamp": "2026-08-01T23:20:05.962000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 700,
+   "timestamp": "2026-08-01T23:21:06.038000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 705,
+   "timestamp": "2026-08-01T23:21:06.181000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 707,
+   "timestamp": "2026-08-01T23:21:06.181000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 709,
+   "timestamp": "2026-08-01T23:22:06.249000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 714,
+   "timestamp": "2026-08-01T23:22:06.378000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 716,
+   "timestamp": "2026-08-01T23:22:06.378000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ParityWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 718,
+   "timestamp": "2026-08-01T23:23:06.447000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForParity"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 723,
+   "timestamp": "2026-08-01T23:23:06.657000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckParityStatus"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 725,
+   "timestamp": "2026-08-01T23:23:06.657000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipEvaluator"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 727,
+   "timestamp": "2026-08-01T23:23:06.657000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "Evaluator"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 732,
+   "timestamp": "2026-08-01T23:23:06.897000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 737,
+   "timestamp": "2026-08-01T23:23:07.042000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 739,
+   "timestamp": "2026-08-01T23:23:07.042000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 741,
+   "timestamp": "2026-08-01T23:24:07.101000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 746,
+   "timestamp": "2026-08-01T23:24:07.244000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 748,
+   "timestamp": "2026-08-01T23:24:07.244000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 750,
+   "timestamp": "2026-08-01T23:25:07.301000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 755,
+   "timestamp": "2026-08-01T23:25:07.424000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 757,
+   "timestamp": "2026-08-01T23:25:07.424000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 759,
+   "timestamp": "2026-08-01T23:26:07.494000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 764,
+   "timestamp": "2026-08-01T23:26:07.626000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 766,
+   "timestamp": "2026-08-01T23:26:07.626000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 768,
+   "timestamp": "2026-08-01T23:27:07.683000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 773,
+   "timestamp": "2026-08-01T23:27:07.808000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 775,
+   "timestamp": "2026-08-01T23:27:07.808000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 777,
+   "timestamp": "2026-08-01T23:28:07.871000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 782,
+   "timestamp": "2026-08-01T23:28:08.045000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 784,
+   "timestamp": "2026-08-01T23:28:08.045000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 786,
+   "timestamp": "2026-08-01T23:29:08.116000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 791,
+   "timestamp": "2026-08-01T23:29:08.252000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 793,
+   "timestamp": "2026-08-01T23:29:08.252000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "EvaluatorWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 795,
+   "timestamp": "2026-08-01T23:30:08.360000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForEvaluator"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 800,
+   "timestamp": "2026-08-01T23:30:08.574000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckEvaluatorStatus"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 802,
+   "timestamp": "2026-08-01T23:30:08.574000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipPostEval"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 804,
+   "timestamp": "2026-08-01T23:30:08.574000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "SaturdayHealthCheck"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 809,
+   "timestamp": "2026-08-01T23:30:08.774000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForSaturdayHealthCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 814,
+   "timestamp": "2026-08-01T23:30:08.936000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSaturdayHealthCheckStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 816,
+   "timestamp": "2026-08-01T23:30:08.936000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "SaturdayHealthCheckPollWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 818,
+   "timestamp": "2026-08-01T23:30:38.997000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForSaturdayHealthCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 823,
+   "timestamp": "2026-08-01T23:30:39.190000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSaturdayHealthCheckStatus"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 825,
+   "timestamp": "2026-08-01T23:30:39.190000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "SaturdayHealthCheckDegraded"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 827,
+   "timestamp": "2026-08-01T23:30:39.190000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WeeklySubstrateHealthCheck"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 832,
+   "timestamp": "2026-08-01T23:30:39.362000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForWeeklySubstrateHealthCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 837,
+   "timestamp": "2026-08-01T23:30:39.522000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSubstrateHealthCheckStatus"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 839,
+   "timestamp": "2026-08-01T23:30:39.522000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "SubstrateHealthCheckPollWait"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 841,
+   "timestamp": "2026-08-01T23:31:09.598000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WaitForWeeklySubstrateHealthCheck"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 846,
+   "timestamp": "2026-08-01T23:31:09.811000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckSubstrateHealthCheckStatus"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 848,
+   "timestamp": "2026-08-01T23:31:09.811000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "SubstrateHealthCheckDegraded"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 850,
+   "timestamp": "2026-08-01T23:31:09.811000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "ReportCard"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 855,
+   "timestamp": "2026-08-01T23:31:41.930000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "Director"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 860,
+   "timestamp": "2026-08-01T23:31:48.524000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "PublishDirectorDegraded"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 865,
+   "timestamp": "2026-08-01T23:31:48.697000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckShellRunNotify"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 867,
+   "timestamp": "2026-08-01T23:31:48.697000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "CheckGateDegradedNotify"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 869,
+   "timestamp": "2026-08-01T23:31:48.697000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "NotifyCompleteHealthDegraded"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 874,
+   "timestamp": "2026-08-01T23:31:48.838000+00:00",
+   "stateEnteredEventDetails": {
+    "name": "WriteCompletionMarker"
+   }
+  },
+  {
+   "timestamp": "2026-08-01T23:32:03.639000+00:00",
+   "type": "ExecutionFailed",
+   "id": 887,
+   "previousEventId": 886,
+   "executionFailedEventDetails": {
+    "error": "S3.AccessDeniedException",
+    "cause": "... (S3.AccessDeniedException writing _sf_completion marker)"
+   }
+  }
+ ]
+}

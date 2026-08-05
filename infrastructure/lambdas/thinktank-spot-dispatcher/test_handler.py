@@ -277,3 +277,61 @@ class TestDiscriminatorTags:
         hours_to_midnight = 24 - dispatch_hour_utc
         assert mod.RUN_TIMEOUT_SECONDS / 3600 < hours_to_midnight
         assert mod.WATCHDOG_SECONDS / 3600 < hours_to_midnight
+
+
+# ── Router addressing (alpha-engine-config-I6367 / I6373) ────────────────
+
+
+class TestRouterEnvReachesTheBox:
+    """Brian's ruling 2026-08-03: no agent directly linked to OpenRouter. The
+    Think Tank's tiers address model groups through the authenticated router
+    edge, and the box cannot derive any of what that needs for itself."""
+
+    def _prelude(self):
+        return _load()._bootstrap_command("tok123")
+
+    def test_every_router_var_is_exported(self):
+        prelude = self._prelude()
+        for var in (
+            "KREPIS_EXEC_CONTEXT",
+            "KREPIS_LITELLM_PROXY_URL",
+            "KREPIS_ROUTER_CREDENTIAL_SECRET",
+            "KREPIS_APPCONFIG_APPLICATION",
+            "KREPIS_APPCONFIG_CONFIG_PROFILE",
+            "KREPIS_APPCONFIG_ENVIRONMENT",
+        ):
+            assert f"export {var}=" in prelude, (
+                f"{var} never reaches the box — krepis' AppConfig path is "
+                "opt-in on all three APPCONFIG vars and SWALLOWS its errors, "
+                "so a missing one surfaces later as "
+                "'LLM_MODEL_REGISTRY.yaml not found', naming neither"
+            )
+
+    def test_exec_context_is_ec2_not_lambda(self):
+        """It names WHERE CODE RUNS (R28), never how it is attached, and never
+        which routes are wanted. Declaring `lambda` from an EC2 box to force a
+        route would be a lie the registry then acts on."""
+        assert "export KREPIS_EXEC_CONTEXT=ec2" in self._prelude()
+
+    def test_credential_secret_is_the_boxs_own_not_the_shared_one(self):
+        """The edge identifies a consumer BY its credential VALUE, and
+        krepis.secrets resolves SSM BEFORE os.environ — so naming
+        LITELLM_MASTER_KEY here would collapse this box into the director's
+        identity at the edge no matter what the environment says."""
+        prelude = self._prelude()
+        assert (
+            "export KREPIS_ROUTER_CREDENTIAL_SECRET=ROUTER_CONSUMER_THINKTANK"
+            in prelude
+        )
+        assert "KREPIS_ROUTER_CREDENTIAL_SECRET=LITELLM_MASTER_KEY" not in prelude
+
+    def test_router_url_is_the_edge_not_a_loopback(self):
+        """This is a stock-AMI spot box: the dashboard box's local egress
+        proxy at 127.0.0.1:8990 does not answer here. A loopback URL would
+        make every call fail connect and read as the router being down."""
+        prelude = self._prelude()
+        assert "export KREPIS_LITELLM_PROXY_URL=https://router.nousergon.ai:8443" in prelude
+        assert "KREPIS_LITELLM_PROXY_URL=http://127.0.0.1" not in prelude
+
+    def test_no_openrouter_credential_is_handed_to_the_box(self):
+        assert "OPENROUTER" not in self._prelude()

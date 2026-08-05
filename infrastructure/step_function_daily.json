@@ -1,12 +1,12 @@
 {
-  "Comment": "Alpha Engine Weekday Pipeline \u2014 morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it \u2014 fixes the 2026-04-17\u21922026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only. alpha-engine-config-I2717/I2722 (2026-07-16): the universe-gap + chronic-polygon-gap self-heal (formerly ChronicGapSelfHeal) and the PredictorHealthCheck/PredictorDriftCheck observability producers were REMOVED from this SF entirely \u2014 the heal now runs standalone (weekly_collector.py --daily-heal, EventBridge 09:00 UTC weekdays) and the two health checks now fire on their own direct EventBridge triggers (13:40 UTC weekdays), both off this critical path. See infrastructure/cloudformation/alpha-engine-orchestration.yaml.",
+  "Comment": "Alpha Engine Weekday Pipeline \u2014 morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it \u2014 fixes the 2026-04-17\u21922026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only. alpha-engine-config-I2717/I2722 (2026-07-16): the universe-gap + chronic-polygon-gap self-heal (formerly ChronicGapSelfHeal) and the PredictorHealthCheck/PredictorDriftCheck observability producers were REMOVED from this SF entirely \u2014 the heal now runs standalone (weekly_collector.py --daily-heal, EventBridge 09:00 UTC weekdays) and the two health checks now fire on their own direct EventBridge triggers (13:40 UTC weekdays), both off this critical path. See infrastructure/cloudformation/alpha-engine-orchestration.yaml. alpha-engine-config-I6494: after MorningArcticAppend, CheckSkipScanner \u2192 Scanner invokes alpha-engine-research-scanner:live (same entrypoint as the Saturday weekly SF) before PredictorInference so weekday universe_membership/{date} + factor profiles stay fresh without running the full Saturday pipeline (distinct from I5489 weekday weekly-SF exercise).",
   "StartAt": "InitializeInput",
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + trading_instance_id explicitly; manual reruns (which happened multiple times 2026-04-23) often omit sns_topic_arn, which caused HandleFailure to error on missing $.sns_topic_arn JSONPath. Mirrors the Saturday SF InitializeInput pattern \u2014 States.JsonMerge with user-input as the second arg lets explicit values win.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + trading_instance_id explicitly; manual reruns often omit sns_topic_arn. Mirrors the Saturday SF InitializeInput pattern \u2014 States.JsonMerge with user-input as the second arg lets explicit values win. | alpha-engine-config-I6494: also stamps run_date = date($$.Execution.StartTime) so the weekday Scanner state (same alpha-engine-research-scanner:live entrypoint as the Saturday SF) keys universe_membership/{date} + factor profiles off ONE date. User-passed run_date still wins. Preopen always starts after UTC midnight for its trading day (America/Los_Angeles cron(15 5) MON-FRI), so the StartTime date IS the trading day; Scanner additionally normalizes via trading_calendar.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'), $$.Execution.Input, false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckMutexRole"
@@ -966,16 +966,39 @@
             "States.ALL"
           ],
           "Comment": "Daemon restart failure is non-fatal \u2014 systemd boot trigger is backup",
-          "Next": "PipelineComplete",
+          "Next": "WriteCompletionMarker",
           "ResultPath": "$.daemon_error"
         }
       ],
       "ResultPath": "$.daemon_result",
+      "Next": "WriteCompletionMarker"
+    },
+    "WriteCompletionMarker": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Reached only via RunDaemon/CheckSkipRunDaemon's success Next (including RunDaemon's own best-effort daemon-restart-failure Catch, which is still an overall pipeline SUCCESS) \u2014 NotifyHolidaySkip (NYSE closed, no run occurred) and TradingDayGateFailed/HandleFailure are NOT redirected here, so a holiday skip or a real failure never satisfies the SLA. cycle_key is the execution-start date (no run_date is threaded through this SF today, unlike the Saturday SF) \u2014 safe because this pipeline always starts well after UTC midnight for its trading day. Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline (cadence weekday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-preopen-trading-pipeline/{}.json', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-preopen-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
       "Next": "PipelineComplete"
     },
     "CheckSkipMorningEnrich": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate. Input {\"skip_morning_enrich\": true} routes past the entire data phase (enrich + Arctic append, now on the ephemeral spot box per config#1767) straight to CheckSkipPredictorInference; missing flag = run as normal. The old on-trading MorningEnrich/MorningArcticAppend SSM states were relocated to the data spot (LaunchMorningEnrichSpot ...) so the always-on ae-trading box no longer does the ~30-50 min data fetch + ArcticDB append (config#1767).",
+      "Comment": "Per-task rerun gate. Input {\"skip_morning_enrich\": true} routes past the entire data phase (enrich + Arctic append, now on the ephemeral spot box per config#1767) straight to CheckSkipScanner (alpha-engine-config-I6494 \u2014 Scanner still runs on ArcticDB/carried fundamentals when the spot data phase is skipped); missing flag = run as normal. The old on-trading MorningEnrich/MorningArcticAppend SSM states were relocated to the data spot (LaunchMorningEnrichSpot ...) so the always-on ae-trading box no longer does the ~30-50 min data fetch + ArcticDB append (config#1767).",
       "Choices": [
         {
           "And": [
@@ -988,7 +1011,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipPredictorInference"
+          "Next": "CheckSkipScanner"
         }
       ],
       "Default": "InitMorningEnrichRetryCounter"
@@ -1002,6 +1025,62 @@
       },
       "ResultPath": "$.morning_enrich_retry",
       "Next": "LaunchMorningEnrichSpot"
+    },
+    "CheckSkipScanner": {
+      "Type": "Choice",
+      "Comment": "Skip-gate (alpha-engine-config-I6494). {\"skip_scanner\": true} bypasses the weekday Scanner Lambda and jumps straight to CheckSkipPredictorInference \u2014 Scanner's own success and Catch edges converge there, so skipping it is behaviorally identical to a Scanner run that did nothing. Defaults to running (Default: Scanner) so scheduled Mon\u2013Fri preopen runs and any rerun that has not explicitly set the flag are unaffected. Same entrypoint as the Saturday SF Scanner state (alpha-engine-research-scanner:live); this is the daily cadence of ONE Scanner, not a second implementation. Distinct from I5489 (weekday exercise of the FULL weekly SF).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_scanner",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_scanner",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPredictorInference"
+        }
+      ],
+      "Default": "Scanner"
+    },
+    "Scanner": {
+      "Type": "Task",
+      "Comment": "Weekday invoke of the SAME standalone scanner Lambda the Saturday SF runs (alpha-engine-research-scanner:live \u2014 ROADMAP L1995 / alpha-engine-config-I6494). Placed AFTER MorningArcticAppend so ArcticDB technicals for the trading day are present, and BEFORE PredictorInference so universe_membership/{date} + factor profiles (+ provenance) are fresh for the membership consumer (I6495). Features are daily-capable (I5360 / research-PR545; SCANNER_FEATURE_SOURCE default arcticdb). Status contract OK / ERROR \u2014 Catch is non-blocking at the SF layer (mirrors Saturday): Catch and Next converge on CheckSkipPredictorInference; a missing/stale membership surfaces at the predictor's own age gate rather than hard-failing preopen. dry_run_llm omitted \u2014 weekday cadence has no Friday-Preflight research_dry shell path.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-scanner:live",
+        "Payload": {
+          "run_date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Scanner failure must NOT halt the weekday pipeline at the SF layer (mirrors Saturday Catch \u2192 CheckSkipRegimeSubstrate). Catch and Next converge on CheckSkipPredictorInference so daemon start still happens; membership freshness is an independent consumer concern.",
+          "Next": "CheckSkipPredictorInference",
+          "ResultPath": "$.scanner_error"
+        }
+      ],
+      "ResultPath": "$.scanner_result",
+      "Next": "CheckSkipPredictorInference"
     },
     "CheckSkipPredictorInference": {
       "Type": "Choice",
@@ -1058,7 +1137,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "PipelineComplete"
+          "Next": "WriteCompletionMarker"
         }
       ],
       "Default": "RunDaemon"
@@ -1146,7 +1225,7 @@
           "Next": "ExtractDataSpotError"
         }
       ],
-      "Default": "CheckSkipPredictorInference"
+      "Default": "CheckSkipScanner"
     },
     "PollMorningEnrichSpot": {
       "Type": "Task",
@@ -1321,7 +1400,7 @@
           "Next": "ExtractDataSpotError"
         }
       ],
-      "Default": "CheckSkipPredictorInference"
+      "Default": "CheckSkipScanner"
     },
     "PollMorningArcticAppendSpot": {
       "Type": "Task",
@@ -1376,7 +1455,7 @@
         {
           "Variable": "$.arctic_append_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipPredictorInference"
+          "Next": "CheckSkipScanner"
         },
         {
           "Variable": "$.arctic_append_poll.Status",
@@ -1449,10 +1528,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "CheckSkipPredictorInference"
+          "Next": "CheckSkipScanner"
         }
       ],
-      "Next": "CheckSkipPredictorInference"
+      "Next": "CheckSkipScanner"
     }
   }
 }

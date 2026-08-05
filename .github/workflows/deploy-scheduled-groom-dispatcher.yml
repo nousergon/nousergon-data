@@ -114,6 +114,15 @@ jobs:
         working-directory: alpha-engine-data
         run: python3 infrastructure/scheduler/check-schedule-drift.py --source-file infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh
 
+      # alpha-engine-config-I6461 (groom-sweep-policy §2.9/§4.8): the manifest
+      # must stay in lockstep with these same deploy.sh declarations — an
+      # AWS-free check (schedule-manifest.json vs the codified SCHED_NAMES/
+      # SWEEP_SCHED_NAMES/RECON_SCHED_NAME arrays this deploy just pushed),
+      # so it costs nothing extra beyond the assertion above.
+      - name: Assert schedule-manifest.json matches codified declarations
+        working-directory: alpha-engine-data
+        run: python3 infrastructure/scheduler/check-manifest-drift.py
+
       - name: Append to system-wide deploy changelog
         if: always()
         uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
