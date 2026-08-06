@@ -108,7 +108,7 @@ if $BOOTSTRAP; then
       --environment 'Variables={LOG_LEVEL=INFO,SF_DEFINITION_BUCKET=alpha-engine-research}' \
       --region "${REGION}" --query 'FunctionArn' --output text
   else
-    echo "  Lambda exists, code will be updated in step 3"
+    echo "  Lambda exists, code will be updated in step 4"
   fi
 fi
 
@@ -141,6 +141,36 @@ run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
 
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+fi
+
+# ----- 5. Publish a version + point the 'live' alias (the SF invokes :live) --
+# The Saturday SF invokes this Lambda as 'alpha-engine-weekly-preflight:live'
+# (the fleet's stable-version convention for SF-invoked lambdas — the same
+# ':live' shape predictor-inference/evaluator/evaluator-director use). A
+# created or code-updated function has NO alias until publish-version +
+# create-alias run: without this step the state machine would 404 on the
+# ':live' alias the moment WeeklyPreflight executes, even though the bare
+# function exists. Publish after every code update and point the alias at the
+# new version, so a deploy is immediately live for the next run.
+
+if ! $DRY_RUN; then
+  NEW_VERSION="$(aws lambda publish-version --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}" --query 'Version' --output text)"
+  echo "  Published version ${NEW_VERSION}."
+  if aws lambda get-alias --function-name "${FUNCTION_NAME}" --name live \
+      --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
+    echo "  Updating 'live' alias -> ${NEW_VERSION}"
+    aws lambda update-alias --function-name "${FUNCTION_NAME}" --name live \
+      --function-version "${NEW_VERSION}" --region "${REGION}" \
+      --query 'AliasArn' --output text
+  else
+    echo "  Creating 'live' alias -> ${NEW_VERSION}"
+    aws lambda create-alias --function-name "${FUNCTION_NAME}" --name live \
+      --function-version "${NEW_VERSION}" --region "${REGION}" \
+      --query 'AliasArn' --output text
+  fi
+else
+  echo "DRY: publish-version + ensure 'live' alias for ${FUNCTION_NAME}"
 fi
 
 echo "✓ ${FUNCTION_NAME} deployed."
